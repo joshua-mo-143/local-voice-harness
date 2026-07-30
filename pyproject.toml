@@ -1,0 +1,57 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "local-voice-harness"
+version = "0.1.0"
+description = "Local Linux voice assistant with Herdr-managed Cursor agents"
+readme = "README.md"
+requires-python = ">=3.11,<3.13"
+dependencies = []
+
+[project.optional-dependencies]
+wake = [
+  "numpy==2.4.6",
+  "openwakeword==0.6.0",
+  "webrtcvad-wheels==2.0.14",
+]
+dictation = [
+  "faster-whisper==1.2.1",
+  "nvidia-cublas-cu12==12.9.2.10",
+  "nvidia-cudnn-cu12==9.24.0.43",
+]
+tts = [
+  "chatterbox-tts==0.1.7",
+  "soundfile==0.14.0",
+]
+dev = [
+  "build>=1.2",
+  "pytest>=8",
+]
+
+[project.scripts]
+voice-harness = "local_voice_harness.cli:main"
+voice-harness-wake = "local_voice_harness.wake.daemon:main"
+voice-harness-dictation = "local_voice_harness.stt.launcher:main"
+voice-harness-tts = "local_voice_harness.tts.server:main"
+voice-harness-cursor-worker = "local_voice_harness.cursor.worker:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/local_voice_harness"]
+
+[tool.uv]
+override-dependencies = [
+  "torch==2.10.0",
+  "torchaudio==2.10.0",
+]
+conflicts = [
+  [
+    { extra = "dictation" },
+    { extra = "tts" },
+  ],
+  [
+    { extra = "wake" },
+    { extra = "tts" },
+  ],
+]

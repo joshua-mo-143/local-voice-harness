@@ -1,0 +1,16 @@
+[Unit]
+Description=Hey Jarvis local voice conversation listener
+Requires=dictation.service
+After=dictation.service pipewire.service wireplumber.service
+
+[Service]
+Type=simple
+WorkingDirectory=%h/local-voice-harness
+ExecStart=%h/local-voice-harness/.venv/bin/voice-harness-wake
+Environment=PYTHONUNBUFFERED=1
+Restart=on-failure
+RestartSec=2
+TimeoutStopSec=10
+
+[Install]
+WantedBy=default.target

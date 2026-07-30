@@ -1,0 +1,14 @@
+[Unit]
+Description=Voice harness faster-whisper dictation daemon
+After=graphical-session.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/local-voice-harness
+ExecStart=%h/local-voice-harness/.venv-dictation/bin/voice-harness-dictation
+Restart=on-failure
+RestartSec=2
+TimeoutStopSec=15
+
+[Install]
+WantedBy=default.target

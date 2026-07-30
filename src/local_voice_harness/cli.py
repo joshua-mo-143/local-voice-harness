@@ -1,0 +1,94 @@
+from __future__ import annotations
+
+import argparse
+
+from .app import respond, status
+from .notifications import notify
+from .recording import cancel_recording, start_recording, stop_recording
+from .service_manager import (
+    install_services,
+    logs,
+    restart_services,
+    start_services,
+    status as service_status,
+    stop_services,
+    uninstall_services,
+)
+from .stt.client import transcribe
+
+
+def parser() -> argparse.ArgumentParser:
+    root = argparse.ArgumentParser(description="Local voice agent harness")
+    commands = root.add_subparsers(dest="command", required=True)
+    commands.add_parser("begin")
+    commands.add_parser("end")
+    commands.add_parser("cancel")
+    commands.add_parser("transcribe")
+    text = commands.add_parser("text")
+    text.add_argument("text", nargs="+")
+    commands.add_parser("status")
+
+    services = commands.add_parser("services")
+    service_commands = services.add_subparsers(dest="service_command", required=True)
+    install = service_commands.add_parser("install")
+    install.add_argument("--force", action="store_true")
+    install.add_argument("--replace-dictation", action="store_true")
+    service_commands.add_parser("start")
+    stop = service_commands.add_parser("stop")
+    stop.add_argument("--include-herdr", action="store_true")
+    restart = service_commands.add_parser("restart")
+    restart.add_argument("--include-herdr", action="store_true")
+    service_commands.add_parser("status")
+    service_logs = service_commands.add_parser("logs")
+    service_logs.add_argument("-f", "--follow", action="store_true")
+    service_logs.add_argument("-n", "--lines", type=int, default=100)
+    uninstall = service_commands.add_parser("uninstall")
+    uninstall.add_argument("--include-herdr", action="store_true")
+
+    return root
+
+
+def dispatch(args: argparse.Namespace) -> None:
+    if args.command == "begin":
+        start_recording()
+    elif args.command == "end":
+        stop_recording()
+        respond(transcribe())
+    elif args.command == "cancel":
+        cancel_recording()
+    elif args.command == "transcribe":
+        respond(transcribe())
+    elif args.command == "text":
+        respond(" ".join(args.text))
+    elif args.command == "status":
+        status()
+    elif args.service_command == "install":
+        install_services(
+            force=args.force, replace_dictation=args.replace_dictation
+        )
+    elif args.service_command == "start":
+        start_services()
+    elif args.service_command == "stop":
+        stop_services(include_herdr=args.include_herdr)
+    elif args.service_command == "restart":
+        restart_services(include_herdr=args.include_herdr)
+    elif args.service_command == "status":
+        service_status()
+    elif args.service_command == "logs":
+        logs(follow=args.follow, lines=max(args.lines, 1))
+    else:
+        uninstall_services(include_herdr=args.include_herdr)
+
+
+def main() -> None:
+    try:
+        dispatch(parser().parse_args())
+    except Exception as exc:
+        message = str(exc) or type(exc).__name__
+        print(f"voice-harness: {message}", file=__import__("sys").stderr)
+        notify(message, error=True)
+        raise SystemExit(1) from exc
+
+
+if __name__ == "__main__":
+    main()

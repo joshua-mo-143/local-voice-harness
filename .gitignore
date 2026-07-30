@@ -1,0 +1,21 @@
+.venv/
+.venv-*/
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.migration-backup/
+
+# Download these during installation; do not commit model weights.
+models/
+*.gguf
+*.onnx
+*.safetensors
+
+# Runtime audio, logs, and local configuration.
+*.wav
+*.log
+.env
+.env.*
+!.env.example

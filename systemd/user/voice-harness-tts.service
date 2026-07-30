@@ -1,0 +1,15 @@
+[Unit]
+Description=Local voice harness Chatterbox Turbo server
+After=graphical-session.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/local-voice-harness
+ExecStart=%h/chatterbox-audition/.venv/bin/voice-harness-tts
+Environment=HF_HUB_OFFLINE=1
+Restart=on-failure
+RestartSec=2
+TimeoutStopSec=15
+
+[Install]
+WantedBy=default.target
