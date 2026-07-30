@@ -279,6 +279,7 @@ class WakeConversationDaemon:
             print(f"Assistant: {response}", flush=True)
             synthesize_and_play(response)
             self.conversation_deadline = time.monotonic() + CONVERSATION_TIMEOUT_SECONDS
+            self.awaiting_followup = True
             notify("Listening for a follow-up…")
         except Exception as exc:
             log(f"turn failed: {type(exc).__name__}: {exc}")
@@ -303,6 +304,7 @@ class WakeConversationDaemon:
                 ).strip()
                 self.cursor_session = job_id
                 self.conversation_deadline = time.monotonic() + CONVERSATION_TIMEOUT_SECONDS
+                self.awaiting_followup = True
                 conversation_active = True
             elif job.get("status") == "blocked":
                 response = str(
