@@ -35,6 +35,26 @@ class CursorJobStateTests(unittest.TestCase):
         self.assertEqual(updated["repository_hint"], "example-repo")
         launch.assert_called_once_with("123456789abc")
 
+    def test_submit_starts_new_job_despite_existing_session(self) -> None:
+        with (
+            mock.patch.object(jobs, "start_job", return_value="newjob123456") as start,
+            mock.patch.object(
+                jobs,
+                "read_job",
+                return_value={"status": "completed", "result": "done"},
+            ),
+            mock.patch.object(jobs, "mark_delivered"),
+            mock.patch.object(jobs, "reply_job") as reply,
+        ):
+            result, session = jobs.cursor_turn(
+                "Work on APP-43", session_id="oldjob123456"
+            )
+
+        start.assert_called_once_with("Work on APP-43", repository=None, agent=None)
+        reply.assert_not_called()
+        self.assertEqual(result, "done")
+        self.assertIsNone(session)
+
     def test_latest_voice_marker_controls_terminal_state(self) -> None:
         job: dict[str, object] = {"id": "123456789abc", "turn_token": "token"}
         jobs.complete_from_output(

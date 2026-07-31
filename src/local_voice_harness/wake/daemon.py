@@ -28,7 +28,7 @@ FRAME_BYTES = FRAME_SAMPLES * 2
 VAD_CHUNK_BYTES = SAMPLE_RATE * 20 // 1000 * 2
 END_SILENCE_MS = 720
 MAX_UTTERANCE_SECONDS = 15
-CONVERSATION_TIMEOUT_SECONDS = 15
+CONVERSATION_TIMEOUT_SECONDS = 60
 WAKE_THRESHOLD = float(os.environ.get("VOICE_HARNESS_WAKE_THRESHOLD", "0.55"))
 MIN_SPEECH_RMS = float(os.environ.get("VOICE_HARNESS_MIN_SPEECH_RMS", "1100"))
 SOURCE = os.environ.get("VOICE_HARNESS_SOURCE", DEFAULT_SOURCE)
@@ -263,8 +263,8 @@ class WakeConversationDaemon:
                 response, self.cursor_session = cursor_turn(
                     "", self.cursor_session, action="status", job_id=self.cursor_session
                 )
-            elif self.cursor_session is not None or CURSOR_PATTERN.match(text):
-                response, self.cursor_session = cursor_turn(text, self.cursor_session)
+            elif CURSOR_PATTERN.match(text):
+                response, self.cursor_session = cursor_turn(text)
             else:
                 response, self.cursor_session = qwen_turn(
                     text, self.history, self.cursor_session

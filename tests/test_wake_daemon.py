@@ -70,6 +70,48 @@ class ProcessUtteranceTests(unittest.TestCase):
         self.assertTrue(daemon.awaiting_followup)
         self.assertGreater(daemon.conversation_deadline, 0.0)
 
+    def test_active_job_followup_is_classified_by_qwen(self) -> None:
+        daemon = _bare_daemon()
+        daemon.cursor_session = "oldjob123456"
+        with (
+            mock.patch.object(
+                wake_daemon, "transcribe", return_value="work on APP-43 instead"
+            ),
+            mock.patch.object(wake_daemon, "start_components"),
+            mock.patch.object(
+                wake_daemon, "qwen_turn", return_value=("started", None)
+            ) as qwen_turn,
+            mock.patch.object(wake_daemon, "cursor_turn") as cursor_turn,
+            mock.patch.object(wake_daemon, "synthesize_and_play", return_value={}),
+            mock.patch.object(wake_daemon, "notify"),
+        ):
+            daemon.process_utterance(woke=False)
+
+        qwen_turn.assert_called_once_with(
+            "work on APP-43 instead", mock.ANY, "oldjob123456"
+        )
+        cursor_turn.assert_not_called()
+
+    def test_explicit_cursor_request_starts_fresh_job(self) -> None:
+        daemon = _bare_daemon()
+        daemon.cursor_session = "oldjob123456"
+        with (
+            mock.patch.object(
+                wake_daemon, "transcribe", return_value="ask Cursor to work on APP-43"
+            ),
+            mock.patch.object(wake_daemon, "start_components"),
+            mock.patch.object(
+                wake_daemon, "cursor_turn", return_value=("started", None)
+            ) as cursor_turn,
+            mock.patch.object(wake_daemon, "qwen_turn") as qwen_turn,
+            mock.patch.object(wake_daemon, "synthesize_and_play", return_value={}),
+            mock.patch.object(wake_daemon, "notify"),
+        ):
+            daemon.process_utterance(woke=False)
+
+        cursor_turn.assert_called_once_with("ask Cursor to work on APP-43")
+        qwen_turn.assert_not_called()
+
 
 class AnnounceJobTests(unittest.TestCase):
     def test_awaiting_user_job_enables_followup(self) -> None:

@@ -489,7 +489,7 @@ def cursor_turn(
         if not job_id:
             raise HarnessError("a Cursor job ID is required to cancel")
         return cancel_job(job_id), None
-    if action == "reply" or session_id:
+    if action == "reply":
         reply_id = job_id or session_id
         if not reply_id:
             raise HarnessError("a Cursor job ID is required for a reply")

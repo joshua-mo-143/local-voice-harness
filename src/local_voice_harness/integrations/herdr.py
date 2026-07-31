@@ -14,7 +14,9 @@ HERDR_BIN = os.environ.get("VOICE_HARNESS_HERDR_BIN", str(Path.home() / ".local/
 HERDR_UNIT = "voice-harness-herdr.service"
 HOME_ROOT = Path(os.environ.get("VOICE_HARNESS_PROJECT_ROOT", Path.home())).resolve()
 SETTLED = {"idle", "done"}
-LINEAR_ISSUE = re.compile(r"\b([A-Z][A-Z0-9]+-\d+)\b", re.IGNORECASE)
+LINEAR_ISSUE = re.compile(
+    r"\b([A-Z][A-Z0-9]+)(?:\s*-\s*|\s+)(\d+)\b", re.IGNORECASE
+)
 
 
 class HerdrError(RuntimeError):
@@ -43,7 +45,7 @@ class PromptOutcome:
 
 def extract_linear_issue(text: str) -> str | None:
     match = LINEAR_ISSUE.search(text)
-    return match.group(1).upper() if match else None
+    return f"{match.group(1)}-{match.group(2)}".upper() if match else None
 
 
 def normalize_name(value: str) -> str:

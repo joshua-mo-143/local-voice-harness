@@ -16,8 +16,11 @@ SYSTEM_PROMPT = (
     "requiring code inspection, file edits, shell commands, or other software-engineering work. "
     "Cursor agents are managed through Herdr and can use configured MCP servers such as Linear. "
     "Delegate requests involving code or connected services to Cursor. If a Cursor job asks a "
-    "question, send the user's answer back as a reply to that job. Use the Cursor tool's status "
-    "or cancel action when the user asks about or cancels a job. Never claim you lack tool access."
+    "question and the user answers that question, use the reply action. If the user asks to work "
+    "on a new or different ticket, always use submit, even when another job is awaiting a reply. "
+    "For a Linear ticket, preserve its issue key in the submitted task so Herdr can create its "
+    "dedicated worktree and Cursor can read the ticket through Linear MCP. Use status or cancel "
+    "when the user asks about or cancels a job. Never claim you lack tool access."
 )
 QWEN_TOOLS = [
     {
@@ -37,6 +40,10 @@ QWEN_TOOLS = [
                     "action": {
                         "type": "string",
                         "enum": ["submit", "reply", "status", "cancel"],
+                        "description": (
+                            "Use submit for every new task or different ticket. Use reply only "
+                            "to answer a clarification from the current job."
+                        ),
                     },
                     "job_id": {"type": "string"},
                 },
@@ -46,6 +53,7 @@ QWEN_TOOLS = [
         },
     }
 ]
+MAX_TOOL_CALL_ROUNDS = 6
 
 
 def qwen_turn(
@@ -55,10 +63,23 @@ def qwen_turn(
 ) -> tuple[str, str | None]:
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
+        *(
+            [
+                {
+                    "role": "system",
+                    "content": (
+                        "A Cursor job is awaiting the user's reply. Continue it only when the "
+                        "user is answering its clarification; otherwise submit a new job."
+                    ),
+                }
+            ]
+            if cursor_session
+            else []
+        ),
         *(history or [])[-8:],
         {"role": "user", "content": text},
     ]
-    for tool_round in range(3):
+    for tool_round in range(MAX_TOOL_CALL_ROUNDS):
         payload = json.dumps(
             {
                 "model": "qwen3.5-4b",
