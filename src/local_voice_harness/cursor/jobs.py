@@ -3,12 +3,14 @@ from __future__ import annotations
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
 import threading
 import time
 import uuid
 from pathlib import Path
+from typing import Callable
 
 from ..config import CURSOR_FOREGROUND_SECONDS, JOBS_DIR
 from ..errors import HarnessError
@@ -19,6 +21,23 @@ from ..integrations.herdr import (
     extract_marker,
 )
 from .prompts import cursor_prompt
+from .store import locked, read_all_unlocked, read_unlocked, write_unlocked
+
+ACTIVE_STATUSES = {
+    "queued",
+    "routing",
+    "running",
+    "reconciling",
+    "awaiting_user",
+    "blocked",
+}
+WORKER_STATUSES = {"queued", "routing", "running", "reconciling"}
+TERMINAL_STATUSES = {"completed", "failed", "cancelled"}
+DELIVERABLE_STATUSES = TERMINAL_STATUSES | {"awaiting_user", "blocked"}
+DELIVERY_CLAIM_SECONDS = 300.0
+DELIVERY_RETRY_SECONDS = 5.0
+FOREGROUND_GRACE_SECONDS = 2.0
+DeliveryClaims = list[tuple[str, str]]
 
 
 def job_path(job_id: str) -> Path:
@@ -29,47 +48,79 @@ def job_path(job_id: str) -> Path:
 
 def read_job(job_id: str) -> dict[str, object]:
     try:
-        return json.loads(job_path(job_id).read_text())
+        with locked(JOBS_DIR):
+            return read_unlocked(job_path(job_id))
     except (OSError, json.JSONDecodeError) as exc:
         raise HarnessError(f"could not read Cursor job {job_id}") from exc
 
 
 def write_job(job: dict[str, object]) -> None:
     path = job_path(str(job["id"]))
-    JOBS_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
-    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-    temporary.write_text(json.dumps(job, sort_keys=True))
-    os.replace(temporary, path)
+    with locked(JOBS_DIR):
+        write_unlocked(path, job)
+
+
+def _mutate_job(
+    job_id: str,
+    mutate: Callable[[dict[str, object]], bool],
+) -> dict[str, object] | None:
+    with locked(JOBS_DIR):
+        try:
+            job = read_unlocked(job_path(job_id))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise HarnessError(f"could not read Cursor job {job_id}") from exc
+        if not mutate(job):
+            return None
+        job["revision"] = int(job.get("revision") or 0) + 1
+        write_unlocked(job_path(job_id), job)
+        return dict(job)
+
+
+def _clear_worker(job: dict[str, object]) -> None:
+    job.update(
+        {
+            "worker_pid": None,
+            "worker_process_start": None,
+            "worker_token": None,
+        }
+    )
+
+
+def _prepare_delivery(job: dict[str, object], *, now: float | None = None) -> None:
+    job.update(
+        {
+            "delivered": False,
+            "delivery_generation": int(job.get("delivery_generation") or 0) + 1,
+            "delivery_claim_token": None,
+            "delivery_claimed_at": None,
+            "delivery_retry_at": 0,
+            "delivery_attempts": 0,
+            "updated_at": time.time() if now is None else now,
+        }
+    )
+
+
+def _all_jobs() -> list[dict[str, object]]:
+    if not JOBS_DIR.is_dir():
+        return []
+    with locked(JOBS_DIR):
+        return read_all_unlocked(JOBS_DIR)
 
 
 def active_jobs() -> list[dict[str, object]]:
-    if not JOBS_DIR.is_dir():
-        return []
-    jobs = []
-    for path in JOBS_DIR.glob("*.json"):
-        try:
-            job = json.loads(path.read_text())
-        except (OSError, json.JSONDecodeError):
-            continue
-        if job.get("status") in {
-            "queued",
-            "routing",
-            "running",
-            "reconciling",
-            "awaiting_user",
-            "blocked",
-        }:
-            jobs.append(job)
-    return jobs
+    return [job for job in _all_jobs() if job.get("status") in ACTIVE_STATUSES]
 
 
 def reserved_targets(exclude_job_id: str | None = None) -> set[str]:
     return {
         str(job["herdr_target"])
-        for job in active_jobs()
+        for job in _all_jobs()
         if job.get("herdr_target")
         and job.get("id") != exclude_job_id
-        and job.get("status") not in {"completed", "failed", "cancelled"}
+        and (
+            job.get("status") in ACTIVE_STATUSES
+            or job.get("target_release_pending")
+        )
     }
 
 
@@ -98,19 +149,19 @@ def complete_from_output(
                 "question": question,
                 "result": question,
                 "clarification_kind": "agent",
-                "delivered": False,
                 "updated_at": time.time(),
             }
         )
+        _prepare_delivery(job)
     elif summary and summary_position > question_position:
         job.update(
             {
                 "status": "completed",
                 "result": summary,
                 "completed_at": time.time(),
-                "delivered": False,
             }
         )
+        _prepare_delivery(job)
     else:
         job.update(
             {
@@ -120,14 +171,14 @@ def complete_from_output(
                     f"it settled as {agent_status} without a voice summary."
                 ),
                 "completed_at": time.time(),
-                "delivered": False,
             }
         )
+        _prepare_delivery(job)
 
 
 def read_agent_completion(
     client: HerdrClient, job: dict[str, object], *, wait: bool
-) -> None:
+) -> tuple[str, str]:
     target = str(job.get("herdr_target") or "")
     if not target:
         raise HarnessError("Cursor job has no Herdr agent")
@@ -140,34 +191,264 @@ def read_agent_completion(
     output = client.run_text(
         "agent", "read", target, "--source", "recent-unwrapped", "--lines", "160"
     )
-    complete_from_output(
-        job, output=output, agent_status=str(agent.get("agent_status") or "unknown")
+    return output, str(agent.get("agent_status") or "unknown")
+
+
+def _process_identity(pid: int) -> str | None:
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text()
+    except OSError:
+        return None
+    closing = stat.rfind(")")
+    fields = stat[closing + 2 :].split()
+    return fields[19] if closing >= 0 and len(fields) > 19 else None
+
+
+def _worker_is_alive(job: dict[str, object]) -> bool:
+    pid = int(job.get("worker_pid") or 0)
+    expected = str(job.get("worker_process_start") or "")
+    if not pid:
+        return False
+    if expected:
+        return _process_identity(pid) == expected
+    try:
+        command = Path(f"/proc/{pid}/cmdline").read_bytes().replace(b"\0", b" ")
+    except OSError:
+        return False
+    return (
+        b"local_voice_harness.cursor.worker" in command
+        and str(job.get("id") or "").encode() in command
     )
 
 
-def run_worker(job_id: str) -> None:
+def _stop_legacy_worker(job_id: str, timeout: float = 2.0) -> bool:
     job = read_job(job_id)
-    job.update(
-        {
-            "status": "reconciling" if job.get("reconcile") else "routing",
-            "worker_pid": os.getpid(),
-            "started_at": time.time(),
-        }
+    if job.get("worker_token") or not _worker_is_alive(job):
+        return True
+    pid = int(job.get("worker_pid") or 0)
+    try:
+        if os.getpgid(pid) == pid:
+            os.killpg(pid, signal.SIGTERM)
+        else:
+            os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return True
+    except PermissionError:
+        return False
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            current = read_job(job_id)
+        except HarnessError:
+            return True
+        if not _worker_is_alive(current):
+            return True
+        time.sleep(0.05)
+    return False
+
+
+def _target_release_owner_alive(job: dict[str, object]) -> bool:
+    pid = int(job.get("target_release_owner_pid") or 0)
+    expected = str(job.get("target_release_owner_start") or "")
+    return bool(pid and expected and _process_identity(pid) == expected)
+
+
+def _worker_change(
+    job_id: str,
+    token: str,
+    allowed_statuses: set[str],
+    change: Callable[[dict[str, object]], None],
+) -> dict[str, object] | None:
+    def guarded(job: dict[str, object]) -> bool:
+        if (
+            job.get("worker_token") != token
+            or job.get("status") not in allowed_statuses
+        ):
+            return False
+        change(job)
+        return True
+
+    return _mutate_job(job_id, guarded)
+
+
+def _begin_worker(job_id: str, claim_token: str | None) -> tuple[dict[str, object], str] | None:
+    token = claim_token or uuid.uuid4().hex
+
+    def begin(job: dict[str, object]) -> bool:
+        if job.get("status") != "queued":
+            return False
+        existing = str(job.get("worker_token") or "")
+        if claim_token and existing != claim_token:
+            return False
+        if not claim_token and existing and _worker_is_alive(job):
+            return False
+        reconcile = bool(job.get("reconcile"))
+        job.update(
+            {
+                "status": "reconciling" if reconcile else "routing",
+                "worker_token": token,
+                "worker_pid": os.getpid(),
+                "worker_process_start": _process_identity(os.getpid()),
+                "attempt_started_at": time.time(),
+                "started_at": time.time(),
+            }
+        )
+        return True
+
+    job = _mutate_job(job_id, begin)
+    return (job, token) if job is not None else None
+
+
+def _worker_question(
+    job_id: str,
+    token: str,
+    question: str,
+    *,
+    clarification_kind: str,
+) -> None:
+    def ask(job: dict[str, object]) -> None:
+        job.update(
+            {
+                "status": "awaiting_user",
+                "question": question,
+                "result": question,
+                "clarification_kind": clarification_kind,
+            }
+        )
+        job.pop("reconcile", None)
+        _clear_worker(job)
+        _prepare_delivery(job)
+
+    _worker_change(job_id, token, {"routing", "running"}, ask)
+
+
+def _worker_complete(
+    job_id: str,
+    token: str,
+    *,
+    output: str,
+    agent_status: str,
+    preserve_blocked_delivery: bool = False,
+) -> None:
+    delivery_keys = (
+        "delivered",
+        "delivery_generation",
+        "delivery_claim_token",
+        "delivery_claimed_at",
+        "delivery_retry_at",
+        "delivery_attempts",
     )
-    write_job(job)
+
+    def finish(job: dict[str, object]) -> None:
+        previous_delivery = {key: job.get(key) for key in delivery_keys}
+        complete_from_output(job, output=output, agent_status=agent_status)
+        if preserve_blocked_delivery and job.get("status") == "blocked":
+            job.update(previous_delivery)
+            job["next_reconcile_at"] = time.time() + DELIVERY_RETRY_SECONDS
+        else:
+            job["next_reconcile_at"] = time.time() + DELIVERY_RETRY_SECONDS
+        job.pop("reconcile", None)
+        _clear_worker(job)
+
+    _worker_change(
+        job_id,
+        token,
+        {"running", "reconciling"},
+        finish,
+    )
+
+
+def _worker_fail(job_id: str, token: str, exc: Exception) -> None:
+    message = (str(exc) or type(exc).__name__)[:500]
+
+    def fail(job: dict[str, object]) -> None:
+        job.update(
+            {
+                "status": "failed",
+                "error": message,
+                "result": message,
+                "completed_at": time.time(),
+            }
+        )
+        job.pop("reconcile", None)
+        _clear_worker(job)
+        _prepare_delivery(job)
+
+    _worker_change(job_id, token, WORKER_STATUSES, fail)
+
+
+def _reserve_worker_target(
+    job_id: str,
+    token: str,
+    selection: object,
+    repository: Path,
+    issue_key: str,
+) -> dict[str, object] | None:
+    target = str(getattr(selection, "target"))
+    with locked(JOBS_DIR):
+        try:
+            job = read_unlocked(job_path(job_id))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise HarnessError(f"could not read Cursor job {job_id}") from exc
+        if job.get("worker_token") != token or job.get("status") != "routing":
+            return None
+        for other in read_all_unlocked(JOBS_DIR):
+            if (
+                other.get("id") != job_id
+                and other.get("herdr_target") == target
+                and (
+                    other.get("status") in ACTIVE_STATUSES
+                    or other.get("target_release_pending")
+                )
+            ):
+                return None
+        job.update(
+            {
+                "repository": str(repository),
+                "issue_key": issue_key,
+                "herdr_target": target,
+                "herdr_pane_id": getattr(selection, "pane_id"),
+                "herdr_workspace_id": getattr(selection, "workspace_id"),
+                "worktree_path": getattr(selection, "worktree_path"),
+                "agent_name": getattr(selection, "name"),
+                "revision": int(job.get("revision") or 0) + 1,
+            }
+        )
+        write_unlocked(job_path(job_id), job)
+        return dict(job)
+
+
+def run_worker(job_id: str, claim_token: str | None = None) -> None:
+    claimed = _begin_worker(job_id, claim_token)
+    if claimed is None:
+        return
+    job, token = claimed
     try:
         client = HerdrClient()
         client.ensure_server()
-        if job.pop("reconcile", False):
-            read_agent_completion(client, job, wait=True)
-            job["worker_pid"] = None
-            write_job(job)
+        if job.get("reconcile"):
+            output, agent_status = read_agent_completion(client, job, wait=True)
+            _worker_complete(
+                job_id,
+                token,
+                output=output,
+                agent_status=agent_status,
+                preserve_blocked_delivery=bool(job.get("delivered")),
+            )
             return
 
         turn = int(job.get("turn") or 0) + 1
         token = f"{job_id}-{turn}"
-        job.update({"turn": turn, "turn_token": token})
-        continuation = bool(job.pop("continuation", False))
+        worker_token = claimed[1]
+
+        def begin_turn(current: dict[str, object]) -> None:
+            current.update({"turn": turn, "turn_token": token})
+
+        updated = _worker_change(job_id, worker_token, {"routing"}, begin_turn)
+        if updated is None:
+            return
+        job = updated
+        continuation = bool(job.get("continuation"))
         target = str(job.get("herdr_target") or "")
         if not target:
             repositories = client.repository_roots()
@@ -184,18 +465,12 @@ def run_worker(job_id: str) -> None:
                 )
                 if repository is None:
                     question = repository_question(repositories, reason)
-                    job.update(
-                        {
-                            "status": "awaiting_user",
-                            "question": question,
-                            "result": question,
-                            "clarification_kind": "repository",
-                            "delivered": False,
-                            "updated_at": time.time(),
-                            "worker_pid": None,
-                        }
+                    _worker_question(
+                        job_id,
+                        worker_token,
+                        question,
+                        clarification_kind="repository",
                     )
-                    write_job(job)
                     return
             if repository is None:
                 question = repository_question(
@@ -204,85 +479,105 @@ def run_worker(job_id: str) -> None:
                     if hint or issue_key
                     else "",
                 )
-                job.update(
-                    {
-                        "status": "awaiting_user",
-                        "question": question,
-                        "result": question,
-                        "clarification_kind": "repository",
-                        "delivered": False,
-                        "updated_at": time.time(),
-                        "worker_pid": None,
-                    }
+                _worker_question(
+                    job_id,
+                    worker_token,
+                    question,
+                    clarification_kind="repository",
                 )
-                write_job(job)
                 return
-            selection = client.ensure_agent(
-                repository,
-                issue_key=issue_key or None,
-                agent_hint=str(job.get("agent_hint") or "") or None,
-                reserved=reserved_targets(job_id),
-            )
-            job.update(
-                {
-                    "repository": str(repository),
-                    "issue_key": issue_key,
-                    "herdr_target": selection.target,
-                    "herdr_pane_id": selection.pane_id,
-                    "herdr_workspace_id": selection.workspace_id,
-                    "worktree_path": selection.worktree_path,
-                    "agent_name": selection.name,
-                }
-            )
-            target = selection.target
-            write_job(job)
-        job["status"] = "running"
-        write_job(job)
+            for _attempt in range(3):
+                selection = client.ensure_agent(
+                    repository,
+                    issue_key=issue_key or None,
+                    agent_hint=str(job.get("agent_hint") or "") or None,
+                    reserved=reserved_targets(job_id),
+                )
+                reserved = _reserve_worker_target(
+                    job_id, worker_token, selection, repository, issue_key
+                )
+                if reserved is not None:
+                    job = reserved
+                    target = selection.target
+                    break
+            else:
+                raise HarnessError("could not reserve a Cursor agent")
+
+        def mark_running(current: dict[str, object]) -> None:
+            current["status"] = "running"
+            current.pop("continuation", None)
+
+        if _worker_change(job_id, worker_token, {"routing"}, mark_running) is None:
+            return
         outcome = client.prompt_and_wait(
             target,
             cursor_prompt(str(job.get("request") or ""), token, continuation=continuation),
             token=token,
         )
-        if read_job(job_id).get("status") == "cancelled":
-            return
-        complete_from_output(job, output=outcome.output, agent_status=outcome.status)
-    except Exception as exc:
-        try:
-            if read_job(job_id).get("status") == "cancelled":
-                return
-        except HarnessError:
-            pass
-        job.update(
-            {
-                "status": "failed",
-                "error": (str(exc) or type(exc).__name__)[:500],
-                "result": (str(exc) or type(exc).__name__)[:500],
-                "completed_at": time.time(),
-                "delivered": False,
-            }
+        _worker_complete(
+            job_id,
+            worker_token,
+            output=outcome.output,
+            agent_status=outcome.status,
         )
-    job["worker_pid"] = None
-    write_job(job)
+    except Exception as exc:
+        _worker_fail(job_id, claimed[1], exc)
 
 
 def launch_worker(job_id: str) -> None:
-    JOBS_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
-    log_handle = (JOBS_DIR / f"{job_id}.log").open("ab")
-    try:
-        process = subprocess.Popen(
-            [
-                sys.executable,
-                "-m",
-                "local_voice_harness.cursor.worker",
-                job_id,
-            ],
-            stdin=subprocess.DEVNULL,
-            stdout=log_handle,
-            stderr=subprocess.STDOUT,
-            start_new_session=True,
+    process: subprocess.Popen[bytes] | None = None
+    with locked(JOBS_DIR):
+        try:
+            job = read_unlocked(job_path(job_id))
+        except (OSError, json.JSONDecodeError) as exc:
+            raise HarnessError(f"could not read Cursor job {job_id}") from exc
+        if job.get("status") != "queued" or job.get("worker_token"):
+            return
+        claim_token = uuid.uuid4().hex
+        log_handle = (JOBS_DIR / f"{job_id}.log").open("ab")
+        try:
+            process = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-m",
+                    "local_voice_harness.cursor.worker",
+                    job_id,
+                    "--claim",
+                    claim_token,
+                ],
+                stdin=subprocess.DEVNULL,
+                stdout=log_handle,
+                stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+        except Exception as exc:
+            message = (str(exc) or type(exc).__name__)[:500]
+            job.update(
+                {
+                    "status": "failed",
+                    "error": message,
+                    "result": message,
+                    "completed_at": time.time(),
+                }
+            )
+            _prepare_delivery(job)
+            job["revision"] = int(job.get("revision") or 0) + 1
+            write_unlocked(job_path(job_id), job)
+            raise
+        finally:
+            log_handle.close()
+        pid = process.pid
+        job.update(
+            {
+                "worker_token": claim_token,
+                "worker_pid": pid,
+                "worker_process_start": _process_identity(pid),
+                "attempt_started_at": time.time(),
+                "revision": int(job.get("revision") or 0) + 1,
+            }
         )
-    finally:
-        log_handle.close()
+        write_unlocked(job_path(job_id), job)
+    assert process is not None
     threading.Thread(target=process.wait, daemon=True).start()
 
 
@@ -290,16 +585,23 @@ def start_job(
     text: str, *, repository: str | None = None, agent: str | None = None
 ) -> str:
     job_id = uuid.uuid4().hex[:12]
+    now = time.time()
     write_job(
         {
             "id": job_id,
+            "schema_version": 2,
+            "revision": 0,
             "request": text,
             "repository_hint": repository,
             "agent_hint": agent,
             "issue_key": extract_linear_issue(text),
             "status": "queued",
             "delivered": False,
-            "created_at": time.time(),
+            "created_at": now,
+            "queued_at": now,
+            "foreground_until": now
+            + CURSOR_FOREGROUND_SECONDS
+            + FOREGROUND_GRACE_SECONDS,
         }
     )
     launch_worker(job_id)
@@ -307,51 +609,109 @@ def start_job(
 
 
 def reply_job(job_id: str, text: str) -> None:
-    job = read_job(job_id)
-    if job.get("status") != "awaiting_user":
+    now = time.time()
+
+    def reply(job: dict[str, object]) -> bool:
+        if job.get("status") != "awaiting_user":
+            return False
+        if job.get("clarification_kind") == "repository":
+            job.update(
+                {"repository_hint": text, "herdr_target": None, "continuation": False}
+            )
+        else:
+            job.update({"continuation": True, "request": text})
+        job.update(
+            {
+                "status": "queued",
+                "question": None,
+                "clarification_kind": None,
+                "delivered": True,
+                "delivery_claim_token": None,
+                "delivery_claimed_at": None,
+                "queued_at": now,
+                "updated_at": now,
+                "foreground_until": now
+                + CURSOR_FOREGROUND_SECONDS
+                + FOREGROUND_GRACE_SECONDS,
+            }
+        )
+        _clear_worker(job)
+        return True
+
+    if _mutate_job(job_id, reply) is None:
         raise HarnessError(f"Cursor job {job_id} is not waiting for a reply")
-    if job.get("clarification_kind") == "repository":
-        job.update({"repository_hint": text, "herdr_target": None, "continuation": False})
-    else:
-        job.update({"continuation": True, "request": text})
-    job.update(
-        {
-            "status": "queued",
-            "question": None,
-            "clarification_kind": None,
-            "delivered": False,
-            "updated_at": time.time(),
-        }
-    )
-    write_job(job)
     launch_worker(job_id)
 
 
 def cancel_job(job_id: str) -> str:
-    job = read_job(job_id)
-    target = str(job.get("herdr_target") or "")
-    if target and job.get("status") in {
-        "running",
-        "reconciling",
-        "awaiting_user",
-        "blocked",
-    }:
+    initial = read_job(job_id)
+    if (
+        initial.get("status") in WORKER_STATUSES
+        and not initial.get("worker_token")
+        and _worker_is_alive(initial)
+        and not _stop_legacy_worker(job_id)
+    ):
+        raise HarnessError(f"could not safely stop legacy Cursor worker for {job_id}")
+    target = ""
+    cancelled_at = time.time()
+
+    def cancel(job: dict[str, object]) -> bool:
+        nonlocal target
+        status = str(job.get("status") or "")
+        if status == "cancelled":
+            return False
+        if status in {"completed", "failed"}:
+            raise HarnessError(f"Cursor job {job_id} is already {status}")
+        if status not in ACTIVE_STATUSES:
+            raise HarnessError(f"Cursor job {job_id} cannot be cancelled")
+        target = str(job.get("herdr_target") or "")
+        job.update(
+            {
+                "status": "cancelled",
+                "result": f"Cursor job {job_id} was cancelled.",
+                "completed_at": cancelled_at,
+                "foreground_until": cancelled_at
+                + CURSOR_FOREGROUND_SECONDS
+                + FOREGROUND_GRACE_SECONDS,
+                "target_release_pending": bool(target),
+                "target_release_owner_pid": os.getpid() if target else None,
+                "target_release_owner_start": (
+                    _process_identity(os.getpid()) if target else None
+                ),
+            }
+        )
+        job.pop("reconcile", None)
+        _clear_worker(job)
+        _prepare_delivery(job)
+        return True
+
+    updated = _mutate_job(job_id, cancel)
+    if updated is None:
+        current = read_job(job_id)
+        return str(current.get("result") or f"Cursor job {job_id} was cancelled.")
+    if target:
         try:
-            client = HerdrClient()
-            client.ensure_server()
-            client.cancel_agent(target)
-        except HerdrError:
-            pass
-    job.update(
-        {
-            "status": "cancelled",
-            "result": f"Cursor job {job_id} was cancelled.",
-            "completed_at": time.time(),
-            "delivered": True,
-        }
-    )
-    write_job(job)
-    return str(job["result"])
+            try:
+                client = HerdrClient()
+                client.ensure_server()
+                client.cancel_agent(target)
+            except HerdrError:
+                pass
+        finally:
+            def release_target(job: dict[str, object]) -> bool:
+                if job.get("status") != "cancelled":
+                    return False
+                job.update(
+                    {
+                        "target_release_pending": False,
+                        "target_release_owner_pid": None,
+                        "target_release_owner_start": None,
+                    }
+                )
+                return True
+
+            _mutate_job(job_id, release_target)
+    return str(updated["result"])
 
 
 def job_status(job_id: str | None = None) -> str:
@@ -368,110 +728,235 @@ def job_status(job_id: str | None = None) -> str:
 
 
 def mark_delivered(job_id: str) -> dict[str, object]:
-    job = read_job(job_id)
-    job["delivered"] = True
-    write_job(job)
-    return job
+    def deliver(job: dict[str, object]) -> bool:
+        job.update(
+            {
+                "delivered": True,
+                "delivery_claim_token": None,
+                "delivery_claimed_at": None,
+                "delivery_retry_at": 0,
+            }
+        )
+        return True
+
+    delivered = _mutate_job(job_id, deliver)
+    assert delivered is not None
+    return delivered
 
 
-def pending_results() -> list[dict[str, object]]:
+def claim_delivery(
+    job_id: str | None = None, *, foreground: bool = False
+) -> dict[str, object] | None:
     if not JOBS_DIR.is_dir():
-        return []
-    pending = []
-    for path in JOBS_DIR.glob("*.json"):
-        try:
-            job = json.loads(path.read_text())
-        except (OSError, json.JSONDecodeError):
-            continue
-        status = job.get("status")
+        return None
+    now = time.time()
+    with locked(JOBS_DIR):
+        jobs = read_all_unlocked(JOBS_DIR)
+        if job_id is not None:
+            jobs = [job for job in jobs if job.get("id") == job_id]
+        jobs.sort(
+            key=lambda job: float(
+                job.get("completed_at") or job.get("created_at") or 0
+            )
+        )
+        for job in jobs:
+            status = str(job.get("status") or "")
+            if status not in DELIVERABLE_STATUSES or job.get("delivered"):
+                continue
+            if not foreground and now < float(job.get("foreground_until") or 0):
+                continue
+            if now < float(job.get("delivery_retry_at") or 0):
+                continue
+            completed_age = now - float(job.get("completed_at") or now)
+            if (
+                not foreground
+                and status not in {"awaiting_user", "blocked"}
+                and completed_age < 1
+            ):
+                continue
+            claimed_at = float(job.get("delivery_claimed_at") or 0)
+            if job.get("delivery_claim_token") and (
+                now - claimed_at < DELIVERY_CLAIM_SECONDS
+            ):
+                continue
+            token = uuid.uuid4().hex
+            job.update(
+                {
+                    "delivery_claim_token": token,
+                    "delivery_claimed_at": now,
+                    "delivery_attempts": int(job.get("delivery_attempts") or 0) + 1,
+                    "revision": int(job.get("revision") or 0) + 1,
+                }
+            )
+            write_unlocked(job_path(str(job["id"])), job)
+            claimed = dict(job)
+            claimed["_delivery_token"] = token
+            return claimed
+    return None
+
+
+def acknowledge_delivery(job_id: str, token: str) -> bool:
+    def acknowledge(job: dict[str, object]) -> bool:
+        if job.get("delivery_claim_token") != token or job.get("delivered"):
+            return False
+        job.update(
+            {
+                "delivered": True,
+                "delivery_claim_token": None,
+                "delivery_claimed_at": None,
+                "delivery_retry_at": 0,
+                "delivered_at": time.time(),
+            }
+        )
+        return True
+
+    return _mutate_job(job_id, acknowledge) is not None
+
+
+def release_delivery(job_id: str, token: str, *, retry: bool = True) -> bool:
+    def release(job: dict[str, object]) -> bool:
+        if job.get("delivery_claim_token") != token or job.get("delivered"):
+            return False
+        job.update(
+            {
+                "delivery_claim_token": None,
+                "delivery_claimed_at": None,
+                "delivery_retry_at": (
+                    time.time() + DELIVERY_RETRY_SECONDS if retry else 0
+                ),
+            }
+        )
+        return True
+
+    return _mutate_job(job_id, release) is not None
+
+
+def acknowledge_deliveries(claims: DeliveryClaims) -> None:
+    for job_id, token in claims:
+        acknowledge_delivery(job_id, token)
+    claims.clear()
+
+
+def release_deliveries(claims: DeliveryClaims) -> None:
+    for job_id, token in claims:
+        release_delivery(job_id, token)
+    claims.clear()
+
+
+def _defer_or_acknowledge(
+    job_id: str, claims: DeliveryClaims | None
+) -> dict[str, object] | None:
+    claimed = claim_delivery(job_id, foreground=True)
+    if claimed is None:
+        return None
+    token = str(claimed["_delivery_token"])
+    if claims is None:
+        acknowledge_delivery(job_id, token)
+    else:
+        claims.append((job_id, token))
+    return claimed
+
+
+def recover_jobs() -> None:
+    if not JOBS_DIR.is_dir():
+        return
+    for existing in _all_jobs():
         if (
-            status == "blocked"
-            and job.get("delivered")
-            and job.get("herdr_target")
-            and time.time() >= float(job.get("next_reconcile_at") or 0)
+            existing.get("status") in WORKER_STATUSES
+            and not existing.get("worker_token")
+            and _worker_is_alive(existing)
         ):
-            job["next_reconcile_at"] = time.time() + 5
-            try:
-                client = HerdrClient()
-                client.ensure_server()
-                agent = client.get_agent(str(job["herdr_target"]))
-                if agent.get("agent_status") == "working":
-                    job.update(
-                        {"status": "queued", "reconcile": True, "worker_pid": None}
-                    )
-                    write_job(job)
-                    launch_worker(str(job["id"]))
-                elif agent.get("agent_status") in {"idle", "done"}:
-                    output = client.run_text(
-                        "agent",
-                        "read",
-                        str(job["herdr_target"]),
-                        "--source",
-                        "recent-unwrapped",
-                        "--lines",
-                        "160",
-                    )
-                    complete_from_output(
-                        job,
-                        output=output,
-                        agent_status=str(agent.get("agent_status")),
-                    )
-                    if job.get("status") == "blocked":
-                        job["delivered"] = True
-                    write_job(job)
-                else:
-                    write_job(job)
-            except (HarnessError, HerdrError):
-                write_job(job)
-            status = job.get("status")
-        if status in {"queued", "routing", "running", "reconciling"}:
-            worker_pid = int(job.get("worker_pid") or 0)
-            age = time.time() - float(job.get("created_at") or time.time())
-            if status == "queued" and not worker_pid and age > 10:
+            _stop_legacy_worker(str(existing["id"]))
+    now = time.time()
+    launch: list[str] = []
+    with locked(JOBS_DIR):
+        for job in read_all_unlocked(JOBS_DIR):
+            status = str(job.get("status") or "")
+            changed = False
+            should_launch = False
+            if job.get("target_release_pending") and not _target_release_owner_alive(job):
                 job.update(
                     {
-                        "status": "failed",
-                        "error": "Cursor job did not start",
-                        "result": "Cursor job did not start",
-                        "completed_at": time.time(),
+                        "target_release_pending": False,
+                        "target_release_owner_pid": None,
+                        "target_release_owner_start": None,
                     }
                 )
-                write_job(job)
-                status = "failed"
-            elif worker_pid and age > 5:
-                try:
-                    os.kill(worker_pid, 0)
-                except ProcessLookupError:
+                changed = True
+            if status == "blocked":
+                if (
+                    job.get("delivered")
+                    and job.get("herdr_target")
+                    and now >= float(job.get("next_reconcile_at") or 0)
+                ):
+                    job.update(
+                        {
+                            "status": "queued",
+                            "reconcile": True,
+                            "queued_at": now,
+                            "next_reconcile_at": now + DELIVERY_RETRY_SECONDS,
+                        }
+                    )
+                    _clear_worker(job)
+                    changed = True
+                    should_launch = True
+            elif status == "queued":
+                if not job.get("worker_token") or not _worker_is_alive(job):
+                    _clear_worker(job)
+                    job["queued_at"] = float(job.get("queued_at") or now)
+                    changed = True
+                    should_launch = True
+            elif status == "routing":
+                if not _worker_is_alive(job):
+                    _clear_worker(job)
+                    job.update({"status": "queued", "queued_at": now})
+                    job.pop("reconcile", None)
+                    should_launch = True
+                    changed = True
+            elif status in {"running", "reconciling"}:
+                if not _worker_is_alive(job):
+                    _clear_worker(job)
                     if job.get("herdr_target"):
                         job.update(
-                            {"status": "queued", "reconcile": True, "worker_pid": None}
+                            {
+                                "status": "queued",
+                                "reconcile": True,
+                                "queued_at": now,
+                            }
                         )
-                        write_job(job)
-                        launch_worker(str(job["id"]))
+                        should_launch = True
                     else:
+                        message = (
+                            "Cursor job was interrupted before an agent started"
+                        )
                         job.update(
                             {
                                 "status": "failed",
-                                "error": "Cursor job was interrupted before an agent started",
-                                "result": "Cursor job was interrupted before an agent started",
-                                "completed_at": time.time(),
+                                "error": message,
+                                "result": message,
+                                "completed_at": now,
                             }
                         )
-                        write_job(job)
-                    status = job.get("status")
-                except PermissionError:
-                    pass
-        completed_age = time.time() - float(job.get("completed_at") or time.time())
-        if (
-            status in {"completed", "failed", "blocked", "awaiting_user", "cancelled"}
-            and not job.get("delivered")
-            and (status in {"awaiting_user", "blocked"} or completed_age >= 1)
-        ):
-            pending.append(job)
-    return sorted(
-        pending,
-        key=lambda job: float(job.get("completed_at") or job.get("created_at") or 0),
-    )
+                        job.pop("reconcile", None)
+                        _prepare_delivery(job, now=now)
+                    changed = True
+            if changed:
+                job["revision"] = int(job.get("revision") or 0) + 1
+                write_unlocked(job_path(str(job["id"])), job)
+            if should_launch:
+                launch.append(str(job["id"]))
+    for queued_job_id in launch:
+        try:
+            launch_worker(queued_job_id)
+        except Exception:
+            # launch_worker has already persisted a deliverable failure.
+            continue
+
+
+def pending_results() -> list[dict[str, object]]:
+    recover_jobs()
+    claimed = claim_delivery()
+    return [claimed] if claimed is not None else []
 
 
 def cursor_turn(
@@ -482,13 +967,16 @@ def cursor_turn(
     agent: str | None = None,
     action: str = "submit",
     job_id: str | None = None,
+    delivery_claims: DeliveryClaims | None = None,
 ) -> tuple[str, str | None]:
     if action == "status":
         return job_status(job_id), session_id
     if action == "cancel":
         if not job_id:
             raise HarnessError("a Cursor job ID is required to cancel")
-        return cancel_job(job_id), None
+        result = cancel_job(job_id)
+        _defer_or_acknowledge(job_id, delivery_claims)
+        return result, None
     if action == "reply":
         reply_id = job_id or session_id
         if not reply_id:
@@ -503,7 +991,7 @@ def cursor_turn(
         job = read_job(job_id)
         status = job.get("status")
         if status == "completed":
-            mark_delivered(job_id)
+            job = _defer_or_acknowledge(job_id, delivery_claims) or job
             print(
                 json.dumps(
                     {
@@ -516,18 +1004,24 @@ def cursor_turn(
             )
             return str(job.get("result") or "").strip(), None
         if status == "awaiting_user":
-            mark_delivered(job_id)
+            job = _defer_or_acknowledge(job_id, delivery_claims) or job
             return str(job.get("question") or job.get("result") or "").strip(), job_id
         if status == "blocked":
-            mark_delivered(job_id)
+            job = _defer_or_acknowledge(job_id, delivery_claims) or job
             return str(job.get("result") or "Cursor needs attention in Herdr"), None
         if status == "failed":
-            mark_delivered(job_id)
+            job = _defer_or_acknowledge(job_id, delivery_claims) or job
             raise HarnessError(str(job.get("error") or "Cursor failed"))
         if status == "cancelled":
-            mark_delivered(job_id)
+            job = _defer_or_acknowledge(job_id, delivery_claims) or job
             return str(job.get("result") or "Cursor job was cancelled"), None
         time.sleep(0.1)
+    _mutate_job(
+        job_id,
+        lambda job: (
+            job.update({"foreground_until": 0, "updated_at": time.time()}) is None
+        ),
+    )
     print(
         json.dumps(
             {

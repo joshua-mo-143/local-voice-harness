@@ -14,7 +14,16 @@ from pathlib import Path
 
 from ..components import llm_ready, start_components, stop_components
 from ..config import CURSOR_PATTERN, DEFAULT_SOURCE, STATE_DIR, WAV_PATH
-from ..cursor.jobs import cursor_turn, mark_delivered, pending_results
+from ..cursor.jobs import (
+    DeliveryClaims,
+    acknowledge_deliveries,
+    acknowledge_delivery,
+    cursor_turn,
+    pending_results,
+    recover_jobs,
+    release_deliveries,
+    release_delivery,
+)
 from ..errors import HarnessError
 from ..llm import qwen_turn
 from ..notifications import notify
@@ -86,6 +95,7 @@ class WakeConversationDaemon:
         self.microphone: subprocess.Popen[bytes] | None = None
         self.activation_thread: threading.Thread | None = None
         self.activation_error: Exception | None = None
+        self.component_lock = threading.Lock()
 
     def is_speech(self, frame: bytes) -> bool:
         samples = self.np.frombuffer(frame, dtype="<i2").astype(self.np.float64)
@@ -194,24 +204,25 @@ class WakeConversationDaemon:
 
         def activate() -> None:
             try:
-                subprocess.run(
-                    [
-                        "systemctl",
-                        "--user",
-                        "start",
-                        "voice-harness-llm.service",
-                        "voice-harness-tts.service",
-                    ],
-                    check=True,
-                )
-                deadline = time.monotonic() + 30
-                while time.monotonic() < deadline and not llm_ready():
-                    time.sleep(0.1)
-                if not llm_ready():
-                    raise HarnessError("Qwen did not become ready within 30 seconds")
-                qwen_turn("Reply with only OK. Do not call a tool.")
-                start_components()
-                log("Qwen tool graph and Chatterbox are warm")
+                with self.component_lock:
+                    subprocess.run(
+                        [
+                            "systemctl",
+                            "--user",
+                            "start",
+                            "voice-harness-llm.service",
+                            "voice-harness-tts.service",
+                        ],
+                        check=True,
+                    )
+                    deadline = time.monotonic() + 30
+                    while time.monotonic() < deadline and not llm_ready():
+                        time.sleep(0.1)
+                    if not llm_ready():
+                        raise HarnessError("Qwen did not become ready within 30 seconds")
+                    qwen_turn("Reply with only OK. Do not call a tool.")
+                    start_components()
+                    log("Qwen tool graph and Chatterbox are warm")
             except Exception as exc:
                 self.activation_error = exc
 
@@ -222,7 +233,8 @@ class WakeConversationDaemon:
 
     def ensure_components(self) -> None:
         if self.activation_thread is None:
-            start_components()
+            with self.component_lock:
+                start_components()
             return
         self.activation_thread.join(timeout=60)
         if self.activation_thread.is_alive():
@@ -230,9 +242,11 @@ class WakeConversationDaemon:
         if self.activation_error is not None:
             raise HarnessError(f"model activation failed: {self.activation_error}")
 
+    def stop_components_when_idle(self) -> None:
+        with self.component_lock:
+            stop_components()
+
     def close_conversation(self, reason: str) -> None:
-        if not self.conversation_deadline and not self.history and not self.cursor_session:
-            return
         log(f"conversation closed: {reason}")
         self.history.clear()
         self.cursor_session = None
@@ -240,12 +254,14 @@ class WakeConversationDaemon:
         self.awaiting_followup = False
         self.pause_microphone()
         try:
-            stop_components()
+            self.stop_components_when_idle()
         finally:
             self.resume_microphone()
         notify("Conversation closed")
 
     def process_utterance(self, *, woke: bool) -> None:
+        had_active_conversation = bool(self.conversation_deadline)
+        delivery_claims: DeliveryClaims = []
         self.pause_microphone()
         try:
             text = transcribe()
@@ -253,9 +269,7 @@ class WakeConversationDaemon:
                 match = WAKE_PREFIX.match(text)
                 if match is None:
                     log(f"rejected wake candidate: {text!r}")
-                    if self.activation_thread is not None:
-                        self.activation_thread.join(timeout=60)
-                    stop_components()
+                    self.stop_components_when_idle()
                     return
                 text = text[match.end() :].strip()
             if not text:
@@ -271,57 +285,77 @@ class WakeConversationDaemon:
                 return
             self.ensure_components()
             print(f"You: {text}", flush=True)
+            next_cursor_session = self.cursor_session
+            next_history = list(self.history)
             if self.cursor_session is not None and JOB_CANCEL_PATTERN.search(text):
-                response, self.cursor_session = cursor_turn(
-                    "", action="cancel", job_id=self.cursor_session
+                response, next_cursor_session = cursor_turn(
+                    "",
+                    action="cancel",
+                    job_id=self.cursor_session,
+                    delivery_claims=delivery_claims,
                 )
             elif self.cursor_session is not None and JOB_STATUS_PATTERN.search(text):
-                response, self.cursor_session = cursor_turn(
-                    "", self.cursor_session, action="status", job_id=self.cursor_session
+                response, next_cursor_session = cursor_turn(
+                    "",
+                    self.cursor_session,
+                    action="status",
+                    job_id=self.cursor_session,
+                    delivery_claims=delivery_claims,
                 )
             elif CURSOR_PATTERN.match(text):
-                response, self.cursor_session = cursor_turn(text)
-            else:
-                response, self.cursor_session = qwen_turn(
-                    text, self.history, self.cursor_session
+                response, next_cursor_session = cursor_turn(
+                    text, delivery_claims=delivery_claims
                 )
-                self.history.extend(
+            else:
+                response, next_cursor_session = qwen_turn(
+                    text,
+                    self.history,
+                    self.cursor_session,
+                    delivery_claims=delivery_claims,
+                )
+                next_history.extend(
                     [
                         {"role": "user", "content": text},
                         {"role": "assistant", "content": response},
                     ]
                 )
-                self.history = self.history[-8:]
+                next_history = next_history[-8:]
             print(f"Assistant: {response}", flush=True)
             synthesize_and_play(response)
+            acknowledge_deliveries(delivery_claims)
+            self.cursor_session = next_cursor_session
+            self.history = next_history
             self.conversation_deadline = time.monotonic() + CONVERSATION_TIMEOUT_SECONDS
             self.awaiting_followup = True
             notify("Listening for a follow-up…")
         except Exception as exc:
+            release_deliveries(delivery_claims)
             log(f"turn failed: {type(exc).__name__}: {exc}")
             notify(str(exc) or type(exc).__name__, error=True)
             self.awaiting_followup = False
+            if not had_active_conversation:
+                self.history.clear()
+                self.cursor_session = None
+                self.conversation_deadline = 0.0
+                self.stop_components_when_idle()
         finally:
             self.resume_microphone()
             self.wake_model.reset()
 
     def announce_job(self, job: dict[str, object]) -> None:
         job_id = str(job.get("id") or "")
-        mark_delivered(job_id)
+        delivery_token = str(job.get("_delivery_token") or "")
         self.pause_microphone()
         conversation_active = bool(self.conversation_deadline)
         try:
-            start_components()
+            with self.component_lock:
+                start_components()
             if job.get("status") == "completed":
                 response = f"Cursor finished. {str(job.get('result') or '').strip()}"
             elif job.get("status") == "awaiting_user":
                 response = "Cursor needs clarification. " + str(
                     job.get("question") or job.get("result") or ""
                 ).strip()
-                self.cursor_session = job_id
-                self.conversation_deadline = time.monotonic() + CONVERSATION_TIMEOUT_SECONDS
-                self.awaiting_followup = True
-                conversation_active = True
             elif job.get("status") == "blocked":
                 response = str(
                     job.get("result")
@@ -336,16 +370,31 @@ class WakeConversationDaemon:
             log(f"job {job_id} completion: {response}")
             print(f"Assistant: {response}", flush=True)
             synthesize_and_play(response)
+            acknowledged = (
+                acknowledge_delivery(job_id, delivery_token)
+                if delivery_token
+                else True
+            )
+            if job.get("status") == "awaiting_user" and acknowledged:
+                self.cursor_session = job_id
+                self.conversation_deadline = (
+                    time.monotonic() + CONVERSATION_TIMEOUT_SECONDS
+                )
+                self.awaiting_followup = True
+                conversation_active = True
         except Exception as exc:
+            if delivery_token:
+                release_delivery(job_id, delivery_token)
             log(f"job {job_id} announcement failed: {type(exc).__name__}: {exc}")
             notify(str(exc) or type(exc).__name__, error=True)
         finally:
             if not conversation_active:
-                stop_components()
+                self.stop_components_when_idle()
             self.resume_microphone()
             self.wake_model.reset()
 
     def run(self) -> None:
+        recover_jobs()
         self.start_microphone()
         speech_streak = 0
         while self.running:

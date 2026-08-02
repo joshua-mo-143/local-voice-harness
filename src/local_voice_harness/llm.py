@@ -5,7 +5,7 @@ import time
 import urllib.request
 
 from .config import LLM_CHAT
-from .cursor.jobs import cursor_turn
+from .cursor.jobs import DeliveryClaims, cursor_turn
 from .errors import HarnessError
 from .notifications import notify
 
@@ -60,6 +60,8 @@ def qwen_turn(
     text: str,
     history: list[dict[str, object]] | None = None,
     cursor_session: str | None = None,
+    *,
+    delivery_claims: DeliveryClaims | None = None,
 ) -> tuple[str, str | None]:
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
@@ -148,6 +150,7 @@ def qwen_turn(
                             agent=agent,
                             action=action,
                             job_id=job_id,
+                            delivery_claims=delivery_claims,
                         )
                     except Exception as exc:
                         tool_result = f"Cursor tool failed: {type(exc).__name__}: {exc}"
@@ -162,5 +165,10 @@ def qwen_turn(
     raise HarnessError("Qwen exceeded the tool-call round limit")
 
 
-def qwen_response(text: str, history: list[dict[str, object]] | None = None) -> str:
-    return qwen_turn(text, history)[0]
+def qwen_response(
+    text: str,
+    history: list[dict[str, object]] | None = None,
+    *,
+    delivery_claims: DeliveryClaims | None = None,
+) -> str:
+    return qwen_turn(text, history, delivery_claims=delivery_claims)[0]

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import collections
 import io
+import threading
 import time
 import unittest
 from unittest import mock
@@ -22,6 +23,7 @@ def _bare_daemon() -> WakeConversationDaemon:
     instance.microphone = None
     instance.activation_thread = None
     instance.activation_error = None
+    instance.component_lock = threading.Lock()
     instance.pre_roll = collections.deque(maxlen=wake_daemon.PRE_ROLL_FRAMES)
     instance.wake_model = mock.Mock()
     return instance
@@ -129,7 +131,10 @@ class ProcessUtteranceTests(unittest.TestCase):
             daemon.process_utterance(woke=False)
 
         qwen_turn.assert_called_once_with(
-            "work on APP-43 instead", mock.ANY, "oldjob123456"
+            "work on APP-43 instead",
+            mock.ANY,
+            "oldjob123456",
+            delivery_claims=mock.ANY,
         )
         cursor_turn.assert_not_called()
 
@@ -150,24 +155,101 @@ class ProcessUtteranceTests(unittest.TestCase):
         ):
             daemon.process_utterance(woke=False)
 
-        cursor_turn.assert_called_once_with("ask Cursor to work on APP-43")
+        cursor_turn.assert_called_once_with(
+            "ask Cursor to work on APP-43", delivery_claims=mock.ANY
+        )
         qwen_turn.assert_not_called()
+
+    def test_failed_fresh_turn_stops_components(self) -> None:
+        daemon = _bare_daemon()
+        with (
+            mock.patch.object(wake_daemon, "transcribe", return_value="what time is it"),
+            mock.patch.object(wake_daemon, "start_components"),
+            mock.patch.object(
+                wake_daemon, "qwen_turn", side_effect=RuntimeError("LLM failed")
+            ),
+            mock.patch.object(wake_daemon, "stop_components") as stop_components,
+            mock.patch.object(wake_daemon, "notify"),
+        ):
+            daemon.process_utterance(woke=False)
+
+        stop_components.assert_called_once()
+        self.assertEqual(daemon.conversation_deadline, 0.0)
+        self.assertEqual(daemon.history, [])
+        self.assertIsNone(daemon.cursor_session)
+
+    def test_failed_active_followup_keeps_components_until_timeout(self) -> None:
+        daemon = _bare_daemon()
+        daemon.conversation_deadline = time.monotonic() + 30
+        daemon.history = [{"role": "user", "content": "earlier"}]
+        with (
+            mock.patch.object(wake_daemon, "transcribe", return_value="try again"),
+            mock.patch.object(wake_daemon, "start_components"),
+            mock.patch.object(
+                wake_daemon, "qwen_turn", side_effect=RuntimeError("LLM failed")
+            ),
+            mock.patch.object(wake_daemon, "stop_components") as stop_components,
+            mock.patch.object(wake_daemon, "notify"),
+        ):
+            daemon.process_utterance(woke=False)
+
+        stop_components.assert_not_called()
+        self.assertGreater(daemon.conversation_deadline, time.monotonic())
+        self.assertEqual(daemon.history, [{"role": "user", "content": "earlier"}])
+
+    def test_failed_playback_releases_foreground_delivery(self) -> None:
+        daemon = _bare_daemon()
+
+        def qwen_with_delivery(
+            _text: str,
+            _history: object,
+            _session: object,
+            *,
+            delivery_claims: list[tuple[str, str]],
+        ) -> tuple[str, None]:
+            delivery_claims.append(("123456789abc", "claim"))
+            return "answer", None
+
+        with (
+            mock.patch.object(wake_daemon, "transcribe", return_value="question"),
+            mock.patch.object(wake_daemon, "start_components"),
+            mock.patch.object(wake_daemon, "qwen_turn", side_effect=qwen_with_delivery),
+            mock.patch.object(
+                wake_daemon,
+                "synthesize_and_play",
+                side_effect=RuntimeError("playback failed"),
+            ),
+            mock.patch.object(wake_daemon, "release_deliveries") as release,
+            mock.patch.object(wake_daemon, "stop_components"),
+            mock.patch.object(wake_daemon, "notify"),
+        ):
+            daemon.process_utterance(woke=False)
+
+        release.assert_called_once_with([("123456789abc", "claim")])
+        self.assertEqual(daemon.history, [])
 
 
 class AnnounceJobTests(unittest.TestCase):
     def test_awaiting_user_job_enables_followup(self) -> None:
         daemon = _bare_daemon()
         with (
-            mock.patch.object(wake_daemon, "mark_delivered"),
+            mock.patch.object(wake_daemon, "acknowledge_delivery") as acknowledge,
+            mock.patch.object(wake_daemon, "release_delivery"),
             mock.patch.object(wake_daemon, "start_components"),
             mock.patch.object(wake_daemon, "stop_components") as stop_components,
             mock.patch.object(wake_daemon, "synthesize_and_play", return_value={}),
             mock.patch.object(wake_daemon, "notify"),
         ):
             daemon.announce_job(
-                {"id": "job1", "status": "awaiting_user", "question": "which repo?"}
+                {
+                    "id": "job1",
+                    "status": "awaiting_user",
+                    "question": "which repo?",
+                    "_delivery_token": "claim",
+                }
             )
 
+        acknowledge.assert_called_once_with("job1", "claim")
         self.assertTrue(daemon.awaiting_followup)
         self.assertEqual(daemon.cursor_session, "job1")
         self.assertGreater(daemon.conversation_deadline, 0.0)
@@ -176,7 +258,8 @@ class AnnounceJobTests(unittest.TestCase):
     def test_completed_job_does_not_enable_followup(self) -> None:
         daemon = _bare_daemon()
         with (
-            mock.patch.object(wake_daemon, "mark_delivered"),
+            mock.patch.object(wake_daemon, "acknowledge_delivery"),
+            mock.patch.object(wake_daemon, "release_delivery"),
             mock.patch.object(wake_daemon, "start_components"),
             mock.patch.object(wake_daemon, "stop_components"),
             mock.patch.object(wake_daemon, "synthesize_and_play", return_value={}),
@@ -185,6 +268,101 @@ class AnnounceJobTests(unittest.TestCase):
             daemon.announce_job({"id": "job2", "status": "completed", "result": "done"})
 
         self.assertFalse(daemon.awaiting_followup)
+
+    def test_playback_failure_releases_delivery_without_acknowledging(self) -> None:
+        daemon = _bare_daemon()
+        with (
+            mock.patch.object(wake_daemon, "acknowledge_delivery") as acknowledge,
+            mock.patch.object(wake_daemon, "release_delivery") as release,
+            mock.patch.object(wake_daemon, "start_components"),
+            mock.patch.object(wake_daemon, "stop_components"),
+            mock.patch.object(
+                wake_daemon,
+                "synthesize_and_play",
+                side_effect=RuntimeError("speaker unavailable"),
+            ),
+            mock.patch.object(wake_daemon, "notify"),
+        ):
+            daemon.announce_job(
+                {
+                    "id": "job2",
+                    "status": "completed",
+                    "result": "done",
+                    "_delivery_token": "claim",
+                }
+            )
+
+        acknowledge.assert_not_called()
+        release.assert_called_once_with("job2", "claim")
+
+    def test_acknowledgement_happens_after_playback(self) -> None:
+        daemon = _bare_daemon()
+        events: list[str] = []
+        with (
+            mock.patch.object(wake_daemon, "start_components"),
+            mock.patch.object(wake_daemon, "stop_components"),
+            mock.patch.object(
+                wake_daemon,
+                "synthesize_and_play",
+                side_effect=lambda _text: events.append("played"),
+            ),
+            mock.patch.object(
+                wake_daemon,
+                "acknowledge_delivery",
+                side_effect=lambda _job, _token: events.append("acknowledged"),
+            ),
+            mock.patch.object(wake_daemon, "release_delivery"),
+        ):
+            daemon.announce_job(
+                {
+                    "id": "job2",
+                    "status": "completed",
+                    "result": "done",
+                    "_delivery_token": "claim",
+                }
+            )
+
+        self.assertEqual(events, ["played", "acknowledged"])
+
+
+class ComponentSynchronizationTests(unittest.TestCase):
+    def test_cleanup_waits_for_activation_before_stopping(self) -> None:
+        daemon = _bare_daemon()
+        activation_started = threading.Event()
+        finish_activation = threading.Event()
+        events: list[str] = []
+
+        def warm_qwen(*_args: object, **_kwargs: object) -> tuple[str, None]:
+            activation_started.set()
+            finish_activation.wait(timeout=2)
+            return "OK", None
+
+        with (
+            mock.patch.object(wake_daemon.subprocess, "run"),
+            mock.patch.object(wake_daemon, "llm_ready", return_value=True),
+            mock.patch.object(wake_daemon, "qwen_turn", side_effect=warm_qwen),
+            mock.patch.object(
+                wake_daemon,
+                "start_components",
+                side_effect=lambda: events.append("started"),
+            ),
+            mock.patch.object(
+                wake_daemon,
+                "stop_components",
+                side_effect=lambda: events.append("stopped"),
+            ),
+        ):
+            daemon.begin_activation()
+            self.assertTrue(activation_started.wait(timeout=1))
+            cleanup = threading.Thread(target=daemon.stop_components_when_idle)
+            cleanup.start()
+            self.assertNotIn("stopped", events)
+            finish_activation.set()
+            assert daemon.activation_thread is not None
+            daemon.activation_thread.join(timeout=2)
+            cleanup.join(timeout=2)
+
+        self.assertEqual(events, ["started", "stopped"])
 
 
 class RunLoopFollowupTests(unittest.TestCase):
@@ -209,9 +387,13 @@ class RunLoopFollowupTests(unittest.TestCase):
         daemon.record_utterance = fake_record  # type: ignore[method-assign]
         daemon.process_utterance = fake_process  # type: ignore[method-assign]
 
-        with mock.patch.object(wake_daemon, "pending_results", return_value=[]):
+        with (
+            mock.patch.object(wake_daemon, "recover_jobs") as recover,
+            mock.patch.object(wake_daemon, "pending_results", return_value=[]),
+        ):
             daemon.run()
 
+        recover.assert_called_once()
         self.assertEqual(processed, [False], "follow-up must be handled as woke=False")
         self.assertEqual(len(recorded), 1)
 
