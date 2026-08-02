@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import collections
+import io
 import time
 import unittest
 from unittest import mock
@@ -24,6 +25,46 @@ def _bare_daemon() -> WakeConversationDaemon:
     instance.pre_roll = collections.deque(maxlen=wake_daemon.PRE_ROLL_FRAMES)
     instance.wake_model = mock.Mock()
     return instance
+
+
+class MicrophoneStartupTests(unittest.TestCase):
+    def test_retries_until_pipewire_target_is_available(self) -> None:
+        daemon = _bare_daemon()
+        unavailable = mock.Mock()
+        unavailable.poll.return_value = 1
+        unavailable.stderr = io.BytesIO(b"stream error: no target node available")
+        available = mock.Mock()
+        available.poll.return_value = None
+
+        with (
+            mock.patch.object(
+                wake_daemon.subprocess,
+                "Popen",
+                side_effect=[unavailable, available],
+            ) as popen,
+            mock.patch.object(wake_daemon.time, "sleep"),
+            mock.patch.object(wake_daemon, "log"),
+        ):
+            daemon.start_microphone()
+
+        self.assertEqual(popen.call_count, 2)
+        self.assertIs(daemon.microphone, available)
+
+    def test_other_pipewire_errors_fail_without_retrying(self) -> None:
+        daemon = _bare_daemon()
+        failed = mock.Mock()
+        failed.poll.return_value = 1
+        failed.returncode = 1
+        failed.stderr = io.BytesIO(b"permission denied")
+
+        with (
+            mock.patch.object(wake_daemon.subprocess, "Popen", return_value=failed) as popen,
+            mock.patch.object(wake_daemon.time, "sleep"),
+            self.assertRaisesRegex(wake_daemon.HarnessError, "permission denied"),
+        ):
+            daemon.start_microphone()
+
+        popen.assert_called_once()
 
 
 class ProcessUtteranceTests(unittest.TestCase):

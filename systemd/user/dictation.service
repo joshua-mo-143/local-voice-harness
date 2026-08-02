@@ -4,6 +4,7 @@ After=graphical-session.target
 
 [Service]
 Type=simple
+EnvironmentFile=-%h/.config/dictation/backend.env
 WorkingDirectory=%h/local-voice-harness
 ExecStart=%h/local-voice-harness/.venv-dictation/bin/voice-harness-dictation
 Restart=on-failure

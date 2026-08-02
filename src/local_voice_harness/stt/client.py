@@ -2,15 +2,16 @@ from __future__ import annotations
 
 import json
 import time
+from pathlib import Path
 
 from ..config import STT_SOCKET, WAV_PATH
 from ..errors import HarnessError
 from ..ipc import unix_request
 
 
-def transcribe() -> str:
+def transcribe(audio_path: Path = WAV_PATH) -> str:
     started = time.perf_counter()
-    response = unix_request(STT_SOCKET, f"{WAV_PATH}\n".encode(), timeout=120)
+    response = unix_request(STT_SOCKET, f"{audio_path}\n".encode(), timeout=120)
     text = response.decode(errors="replace").strip()
     if text.startswith("__DICTATION_ERROR__:"):
         raise HarnessError(text.removeprefix("__DICTATION_ERROR__:"))

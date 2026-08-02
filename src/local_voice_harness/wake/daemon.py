@@ -33,6 +33,8 @@ WAKE_THRESHOLD = float(os.environ.get("VOICE_HARNESS_WAKE_THRESHOLD", "0.55"))
 MIN_SPEECH_RMS = float(os.environ.get("VOICE_HARNESS_MIN_SPEECH_RMS", "1100"))
 SOURCE = os.environ.get("VOICE_HARNESS_SOURCE", DEFAULT_SOURCE)
 PRE_ROLL_FRAMES = 25
+MICROPHONE_START_ATTEMPTS = 30
+MICROPHONE_RETRY_SECONDS = 1
 WAKE_PREFIX = re.compile(
     r"^\s*hey[,\s]+(?:jarvis|travis)\b[\s,;:!?.-]*", re.IGNORECASE
 )
@@ -118,22 +120,36 @@ class WakeConversationDaemon:
         if SOURCE:
             command.extend(("--target", SOURCE))
         command.extend(("--channels=1", "--rate=16000", "--format=s16", "-"))
-        self.microphone = subprocess.Popen(
-            command,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            start_new_session=True,
-        )
-        time.sleep(0.2)
-        if self.microphone.poll() is not None:
+        for attempt in range(1, MICROPHONE_START_ATTEMPTS + 1):
+            self.microphone = subprocess.Popen(
+                command,
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                start_new_session=True,
+            )
+            time.sleep(0.2)
+            if self.microphone.poll() is None:
+                log(f"listening for Hey Jarvis on {SOURCE or 'PipeWire default source'}")
+                return
+
             detail = (
                 self.microphone.stderr.read().decode(errors="replace").strip()
                 if self.microphone.stderr
                 else ""
             )
-            raise HarnessError(f"pw-record failed: {detail or self.microphone.returncode}")
-        log(f"listening for Hey Jarvis on {SOURCE or 'PipeWire default source'}")
+            if (
+                "no target node available" not in detail.lower()
+                or attempt == MICROPHONE_START_ATTEMPTS
+            ):
+                raise HarnessError(
+                    f"pw-record failed: {detail or self.microphone.returncode}"
+                )
+            log(
+                f"microphone is not ready; retrying in "
+                f"{MICROPHONE_RETRY_SECONDS}s ({attempt}/{MICROPHONE_START_ATTEMPTS})"
+            )
+            time.sleep(MICROPHONE_RETRY_SECONDS)
 
     def pause_microphone(self) -> None:
         if self.microphone is not None and self.microphone.poll() is None:

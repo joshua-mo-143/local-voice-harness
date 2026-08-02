@@ -327,12 +327,24 @@ voice-harness begin
 voice-harness end
 voice-harness cancel
 voice-harness transcribe
+voice-harness dictate toggle
 voice-harness text "Use Cursor to inspect this repository."
 voice-harness status
 ```
 
 `begin` records audio. `end` stops capture, transcribes, routes the request, speaks
-the response, and prints stage timings.
+the response, and prints stage timings. `dictate toggle` records on the first
+invocation, then transcribes and inserts text into the focused window on the next
+invocation without starting the conversational models. Automatic injection uses
+native Herdr delivery for Cursor panes, simulated typing for terminals, and
+clipboard paste for other graphical applications. Dictation is blocked while
+RuneLite is focused because generated input may violate Jagex's rules.
+
+For example, bind Super+D in i3:
+
+```text
+bindsym $mod+d exec --no-startup-id /home/joshuam/.local/bin/voice-harness dictate toggle
+```
 
 ## Service management
 
@@ -379,6 +391,7 @@ Environment variables can be added to systemd drop-ins:
 | `VOICE_HARNESS_PROJECT_ROOT` | Allowed root for inferred repositories | Home directory |
 | `DICTATION_MODEL` | faster-whisper model | `large-v3` |
 | `DICTATION_COMPUTE` | faster-whisper compute type | `float16` |
+| `DICTATION_INJECT` | Focused-window insertion mode (`auto`, `paste`, `type`, or `stdout`) | `auto` |
 | `DICTATION_REPLACEMENTS` | Semicolon-separated STT corrections | Cursor/Herdr defaults |
 
 `VOICE_HARNESS_PROJECT_ROOT` can narrow repository discovery to another directory.

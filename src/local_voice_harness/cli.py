@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 
 from .app import respond, status
+from .dictation import run as run_dictation
 from .notifications import notify
 from .recording import cancel_recording, start_recording, stop_recording
 from .service_manager import (
@@ -24,6 +25,14 @@ def parser() -> argparse.ArgumentParser:
     commands.add_parser("end")
     commands.add_parser("cancel")
     commands.add_parser("transcribe")
+    dictate = commands.add_parser(
+        "dictate", help="record and type transcription into the focused window"
+    )
+    dictate_commands = dictate.add_subparsers(
+        dest="dictation_command", required=True
+    )
+    for command in ("begin", "end", "toggle", "transcribe", "cancel"):
+        dictate_commands.add_parser(command)
     text = commands.add_parser("text")
     text.add_argument("text", nargs="+")
     commands.add_parser("status")
@@ -58,6 +67,8 @@ def dispatch(args: argparse.Namespace) -> None:
         cancel_recording()
     elif args.command == "transcribe":
         respond(transcribe())
+    elif args.command == "dictate":
+        run_dictation(args.dictation_command)
     elif args.command == "text":
         respond(" ".join(args.text))
     elif args.command == "status":
