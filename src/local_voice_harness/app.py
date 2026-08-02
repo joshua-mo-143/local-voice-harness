@@ -8,7 +8,7 @@ from .cursor.jobs import cursor_turn
 from .errors import HarnessError
 from .ipc import socket_ready
 from .llm import qwen_response
-from .tts.client import synthesize_and_play
+from .tts.client import stream_and_play
 
 
 def respond(text: str) -> None:
@@ -19,7 +19,7 @@ def respond(text: str) -> None:
     print(f"You: {text}")
     response = cursor_turn(text)[0] if CURSOR_PATTERN.match(text) else qwen_response(text)
     print(f"Assistant: {response}")
-    synthesize_and_play(response)
+    stream_and_play(response)
 
 
 def status() -> None:

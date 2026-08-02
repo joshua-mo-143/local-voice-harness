@@ -33,6 +33,11 @@ The always-on wake daemon verifies OpenWakeWord candidates with Whisper to rejec
 false activations. A request that takes longer than five seconds becomes a persisted
 background job, and its completion or clarification question is spoken later.
 
+Spoken responses use chunk-level streaming. Chatterbox still generates a complete
+waveform for each short sentence or clause, but the next chunk is synthesized while
+the current chunk is sent through one low-latency PipeWire playback stream. This is
+not native sample streaming from the model.
+
 Cursor routing works as follows:
 
 1. Prefer an idle Cursor agent already running in the requested checkout.
@@ -245,6 +250,34 @@ Optional Chatterbox voice cloning accepts a reference WAV:
 Environment=VOICE_HARNESS_VOICE=/absolute/path/to/reference.wav
 ```
 
+The default playback interruption mode is `wake`: saying “Hey Jarvis” while the
+assistant is speaking stops queued audio and starts a new wake-prefixed request. The
+wake detector is reset at playback boundaries, the microphone must become quiet
+before ordinary follow-up VAD is re-armed, and wake interruption is temporarily
+suppressed if the assistant's own response contains the wake phrase.
+
+Natural speech barge-in is available with
+`VOICE_HARNESS_BARGE_IN_MODE=vad`, but it should only be used with a PipeWire
+echo-cancelled source. A physical microphone will usually classify speaker output as
+speech and interrupt every response. PipeWire's PulseAudio compatibility layer can
+create a session-scoped WebRTC echo-cancel source for testing:
+
+```bash
+pactl load-module module-echo-cancel \
+  aec_method=webrtc \
+  source_name=voice_harness_aec \
+  sink_name=voice_harness_aec_sink
+wpctl status
+```
+
+Set `VOICE_HARNESS_SOURCE=voice_harness_aec` and
+`VOICE_HARNESS_BARGE_IN_MODE=vad` in the wake service drop-in. The virtual source
+must use the same physical capture/playback devices as the harness; make this module
+persistent through the machine's PipeWire/WirePlumber configuration after validating
+it interactively. Use `VOICE_HARNESS_BARGE_IN_MODE=off` if no acoustic interruption
+is wanted. The streaming client also exposes `StreamingPlayback.cancel()` for an
+explicit stop control in local integrations.
+
 ### 7. Install and enable services
 
 Use the packaged CLI to install the units, reload systemd, and enable the two
@@ -340,6 +373,12 @@ native Herdr delivery for Cursor panes, simulated typing for terminals, and
 clipboard paste for other graphical applications. Dictation is blocked while
 RuneLite is focused because generated input may violate Jagex's rules.
 
+Playback starts after the first sentence/clause is synthesized instead of waiting for
+the complete response. In the default configuration, say “Hey Jarvis” during
+playback to interrupt and immediately ask another question. Chatterbox cannot cancel
+an active `generate()` call, so server-side cancellation may take up to one short
+chunk; PipeWire playback and already queued chunks stop immediately.
+
 For example, bind Super+D in i3:
 
 ```text
@@ -386,6 +425,11 @@ Environment variables can be added to systemd drop-ins:
 | `VOICE_HARNESS_VOICE` | Chatterbox reference WAV | Built-in voice |
 | `VOICE_HARNESS_WAKE_THRESHOLD` | OpenWakeWord activation threshold | `0.55` |
 | `VOICE_HARNESS_MIN_SPEECH_RMS` | Speech energy gate | `1100` |
+| `VOICE_HARNESS_BARGE_IN_MODE` | Playback interruption (`wake`, `vad`, or `off`) | `wake` |
+| `VOICE_HARNESS_BARGE_IN_SPEECH_FRAMES` | Consecutive 80 ms speech frames for VAD barge-in | `5` |
+| `VOICE_HARNESS_PLAYBACK_QUIET_FRAMES` | Quiet 80 ms frames required after playback | `4` |
+| `VOICE_HARNESS_PLAYBACK_QUIET_TIMEOUT_SECONDS` | Maximum post-playback echo drain | `2` |
+| `VOICE_HARNESS_PLAYBACK_LATENCY` | `pw-play` raw-stream target latency | `100ms` |
 | `VOICE_HARNESS_CURSOR_FOREGROUND_SECONDS` | Time before a Cursor job backgrounds | `5` |
 | `VOICE_HARNESS_HERDR_BIN` | Herdr executable | `~/.local/bin/herdr` |
 | `VOICE_HARNESS_PROJECT_ROOT` | Allowed root for inferred repositories | Home directory |
@@ -402,11 +446,9 @@ Measured with all models warm on the RTX 5070 Ti Laptop GPU:
 
 - Whisper large-v3: approximately 0.58 seconds for a short request.
 - Qwen response: 0.22–0.53 seconds; first Vulkan request approximately 5 seconds.
-- Chatterbox: 0.53 seconds for 2.72 seconds of audio.
+- Chatterbox: 0.53 seconds for 2.72 seconds of audio; longer replies now begin
+  playing after their first sentence/clause is ready.
 - Cursor delegation: task-dependent and normally handled as a background job.
-
-Chatterbox produces a complete waveform rather than streaming audio, so keeping
-spoken replies short reduces time to playback.
 
 ## Security notes
 
