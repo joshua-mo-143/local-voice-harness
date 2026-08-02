@@ -302,11 +302,23 @@ voice-harness text "Why is the sky blue?"
 voice-harness text "Use Cursor to summarize the api-docs repository."
 ```
 
-Run the integration tests:
+### Development quality checks
+
+The default development environment contains only the package and quality tools;
+it does not install the CUDA, audio, wake-word, or model extras:
 
 ```bash
-.venv/bin/python -m unittest discover -s tests -v
+uv sync --python 3.12
+uv run ruff format --check .
+uv run ruff check .
+uv run pyright
+uv run pytest
 ```
+
+Use `uv run ruff format .` to apply formatting. Pytest includes branch coverage and
+enforces the initial 40% project threshold. CI runs the same checks on every
+supported Python version (3.11 and 3.12) without starting services or downloading
+models.
 
 ## Usage
 

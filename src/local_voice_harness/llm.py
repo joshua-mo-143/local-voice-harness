@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import json
 import time
+import urllib.error
 import urllib.request
+from collections.abc import Mapping, Sequence
 
 from .config import LLM_CHAT
 from .cursor.jobs import cursor_turn
@@ -56,9 +58,30 @@ QWEN_TOOLS = [
 MAX_TOOL_CALL_ROUNDS = 6
 
 
+def _response_message(result: object) -> dict[str, object]:
+    if not isinstance(result, dict):
+        raise HarnessError("Qwen returned a malformed response")
+    choices = result.get("choices")
+    if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
+        raise HarnessError("Qwen returned a malformed response")
+    message = choices[0].get("message")
+    if not isinstance(message, dict):
+        raise HarnessError("Qwen returned a malformed response")
+    return message
+
+
+def _message_tool_calls(message: dict[str, object]) -> list[dict[str, object]]:
+    value = message.get("tool_calls")
+    if value is None:
+        return []
+    if not isinstance(value, list) or not all(isinstance(call, dict) for call in value):
+        raise HarnessError("Qwen returned malformed tool calls")
+    return value
+
+
 def qwen_turn(
     text: str,
-    history: list[dict[str, object]] | None = None,
+    history: Sequence[Mapping[str, object]] | None = None,
     cursor_session: str | None = None,
 ) -> tuple[str, str | None]:
     messages = [
@@ -96,8 +119,11 @@ def qwen_turn(
             LLM_CHAT, data=payload, headers={"Content-Type": "application/json"}
         )
         started = time.perf_counter()
-        with urllib.request.urlopen(request, timeout=60) as response:
-            result = json.load(response)
+        try:
+            with urllib.request.urlopen(request, timeout=60) as response:
+                result = json.load(response)
+        except (OSError, urllib.error.URLError, json.JSONDecodeError) as exc:
+            raise HarnessError(f"Qwen request failed: {exc}") from exc
         print(
             json.dumps(
                 {
@@ -107,8 +133,8 @@ def qwen_turn(
                 }
             )
         )
-        message = result["choices"][0]["message"]
-        tool_calls = message.get("tool_calls") or []
+        message = _response_message(result)
+        tool_calls = _message_tool_calls(message)
         if not tool_calls:
             answer = str(message.get("content") or "").strip()
             if not answer:
@@ -122,7 +148,8 @@ def qwen_turn(
             }
         )
         for call in tool_calls:
-            function = call.get("function") or {}
+            function_value = call.get("function")
+            function = function_value if isinstance(function_value, dict) else {}
             name = str(function.get("name", ""))
             if name != "cursor":
                 tool_result = f"Unknown tool: {name}"
@@ -135,7 +162,13 @@ def qwen_turn(
                     action = str(arguments.get("action", "submit")).strip() or "submit"
                     job_id = str(arguments.get("job_id", "")).strip() or cursor_session
                 except (json.JSONDecodeError, AttributeError):
-                    task, repository, agent, action, job_id = "", None, None, "submit", None
+                    task, repository, agent, action, job_id = (
+                        "",
+                        None,
+                        None,
+                        "submit",
+                        None,
+                    )
                 if action in {"submit", "reply"} and not task:
                     tool_result = "Cursor tool error: task must not be empty"
                 else:
@@ -162,5 +195,7 @@ def qwen_turn(
     raise HarnessError("Qwen exceeded the tool-call round limit")
 
 
-def qwen_response(text: str, history: list[dict[str, object]] | None = None) -> str:
+def qwen_response(
+    text: str, history: Sequence[Mapping[str, object]] | None = None
+) -> str:
     return qwen_turn(text, history)[0]

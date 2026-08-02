@@ -12,15 +12,28 @@ from ..ipc import unix_request
 
 def synthesize_and_play(text: str) -> dict[str, object]:
     output = STATE_DIR / "reply.wav"
-    request = json.dumps(
-        {
-            "text": text,
-            "output": str(output),
-            "voice": os.environ.get("VOICE_HARNESS_VOICE", ""),
-        }
-    ).encode() + b"\n"
+    request = (
+        json.dumps(
+            {
+                "text": text,
+                "output": str(output),
+                "voice": os.environ.get("VOICE_HARNESS_VOICE", ""),
+            }
+        ).encode()
+        + b"\n"
+    )
     started = time.perf_counter()
-    result = json.loads(unix_request(TTS_SOCKET, request, timeout=120))
+    try:
+        response = unix_request(TTS_SOCKET, request, timeout=120)
+    except OSError as exc:
+        raise HarnessError(f"Chatterbox request failed: {exc}") from exc
+    try:
+        decoded = json.loads(response)
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise HarnessError("Chatterbox returned an invalid response") from exc
+    if not isinstance(decoded, dict):
+        raise HarnessError("Chatterbox returned an invalid response")
+    result: dict[str, object] = decoded
     if not result.get("ok"):
         raise HarnessError(f"Chatterbox failed: {result.get('error', 'unknown error')}")
     result.update(

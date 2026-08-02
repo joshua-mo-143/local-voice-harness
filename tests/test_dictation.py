@@ -44,7 +44,9 @@ class DictationTests(unittest.TestCase):
 
     def test_transcribes_typed_dictation_audio(self) -> None:
         with (
-            mock.patch.object(dictation, "transcribe", return_value="hello") as transcribe,
+            mock.patch.object(
+                dictation, "transcribe", return_value="hello"
+            ) as transcribe,
             mock.patch.object(dictation, "inject") as inject,
         ):
             dictation.transcribe_and_type()

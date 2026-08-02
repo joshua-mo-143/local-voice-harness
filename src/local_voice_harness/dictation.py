@@ -2,8 +2,8 @@ from __future__ import annotations
 
 import json
 import os
-import signal
 import shutil
+import signal
 import subprocess
 import time
 from pathlib import Path

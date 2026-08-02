@@ -21,7 +21,7 @@ class CursorJobStateTests(unittest.TestCase):
         self.temporary.cleanup()
 
     def test_repository_reply_preserves_original_task(self) -> None:
-        job = {
+        job: dict[str, object] = {
             "id": "123456789abc",
             "request": "Fix APP-42",
             "status": "awaiting_user",
@@ -87,9 +87,7 @@ class CursorJobStateTests(unittest.TestCase):
         ):
             jobs.launch_worker("123456789abc")
         command = popen.call_args.args[0]
-        self.assertEqual(
-            command[1:3], ["-m", "local_voice_harness.cursor.worker"]
-        )
+        self.assertEqual(command[1:3], ["-m", "local_voice_harness.cursor.worker"])
         thread.assert_called_once()
 
     def test_dead_worker_reconciles_existing_agent(self) -> None:

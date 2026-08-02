@@ -164,7 +164,7 @@ def run_worker(job_id: str) -> None:
             write_job(job)
             return
 
-        turn = int(job.get("turn") or 0) + 1
+        turn = int(str(job.get("turn") or 0)) + 1
         token = f"{job_id}-{turn}"
         job.update({"turn": turn, "turn_token": token})
         continuation = bool(job.pop("continuation", False))
@@ -240,7 +240,9 @@ def run_worker(job_id: str) -> None:
         write_job(job)
         outcome = client.prompt_and_wait(
             target,
-            cursor_prompt(str(job.get("request") or ""), token, continuation=continuation),
+            cursor_prompt(
+                str(job.get("request") or ""), token, continuation=continuation
+            ),
             token=token,
         )
         if read_job(job_id).get("status") == "cancelled":
@@ -311,7 +313,9 @@ def reply_job(job_id: str, text: str) -> None:
     if job.get("status") != "awaiting_user":
         raise HarnessError(f"Cursor job {job_id} is not waiting for a reply")
     if job.get("clarification_kind") == "repository":
-        job.update({"repository_hint": text, "herdr_target": None, "continuation": False})
+        job.update(
+            {"repository_hint": text, "herdr_target": None, "continuation": False}
+        )
     else:
         job.update({"continuation": True, "request": text})
     job.update(
@@ -361,10 +365,14 @@ def job_status(job_id: str | None = None) -> str:
     jobs = active_jobs()
     if not jobs:
         return "There are no active Cursor jobs."
-    return "Active Cursor jobs: " + "; ".join(
-        f"{job.get('id')} is {str(job.get('status')).replace('_', ' ')}"
-        for job in jobs
-    ) + "."
+    return (
+        "Active Cursor jobs: "
+        + "; ".join(
+            f"{job.get('id')} is {str(job.get('status')).replace('_', ' ')}"
+            for job in jobs
+        )
+        + "."
+    )
 
 
 def mark_delivered(job_id: str) -> dict[str, object]:
@@ -461,7 +469,7 @@ def pending_results() -> list[dict[str, object]]:
                     status = job.get("status")
                 except PermissionError:
                     pass
-        completed_age = time.time() - float(job.get("completed_at") or time.time())
+        completed_age = time.time() - float(str(job.get("completed_at") or time.time()))
         if (
             status in {"completed", "failed", "blocked", "awaiting_user", "cancelled"}
             and not job.get("delivered")
@@ -470,7 +478,9 @@ def pending_results() -> list[dict[str, object]]:
             pending.append(job)
     return sorted(
         pending,
-        key=lambda job: float(job.get("completed_at") or job.get("created_at") or 0),
+        key=lambda job: float(
+            str(job.get("completed_at") or job.get("created_at") or 0)
+        ),
     )
 
 
@@ -538,4 +548,7 @@ def cursor_turn(
             }
         )
     )
-    return f"Cursor is still working on job {job_id}. I will report back when it finishes.", None
+    return (
+        f"Cursor is still working on job {job_id}. I will report back when it finishes.",
+        None,
+    )
