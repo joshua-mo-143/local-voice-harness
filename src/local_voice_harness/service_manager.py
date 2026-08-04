@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import importlib.resources
 import subprocess
-from pathlib import Path
 
 from .config import (
     PROJECT_ROOT,

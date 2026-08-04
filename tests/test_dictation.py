@@ -45,7 +45,9 @@ class DictationTests(unittest.TestCase):
 
     def test_transcribes_typed_dictation_audio(self) -> None:
         with (
-            mock.patch.object(dictation, "transcribe", return_value="hello") as transcribe,
+            mock.patch.object(
+                dictation, "transcribe", return_value="hello"
+            ) as transcribe,
             mock.patch.object(dictation, "inject") as inject,
         ):
             dictation.transcribe_and_type()
@@ -129,7 +131,9 @@ class DictationTests(unittest.TestCase):
             mock.patch.dict("os.environ", {"DICTATION_INJECT": "auto"}),
             mock.patch.object(dictation, "_ensure_dictation_allowed"),
             mock.patch.object(dictation, "_send_to_herdr", return_value=False),
-            mock.patch.object(dictation, "_active_window_class", return_value="firefox"),
+            mock.patch.object(
+                dictation, "_active_window_class", return_value="firefox"
+            ),
             mock.patch.object(dictation.shutil, "which", return_value="/usr/bin/xclip"),
             mock.patch.object(
                 dictation,

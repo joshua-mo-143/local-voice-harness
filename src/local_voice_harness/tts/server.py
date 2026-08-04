@@ -39,7 +39,9 @@ class RequestHandler(socketserver.StreamRequestHandler):
                 str(request.get("output", OUTPUT_ROOT / "reply.wav"))
             ).resolve()
             if OUTPUT_ROOT.resolve() not in output.parents:
-                raise ValueError("output must be inside the runtime voice-harness directory")
+                raise ValueError(
+                    "output must be inside the runtime voice-harness directory"
+                )
             voice_value = str(request.get("voice", "")).strip()
             voice = Path(voice_value).expanduser().resolve() if voice_value else None
             if voice is not None and not voice.is_file():

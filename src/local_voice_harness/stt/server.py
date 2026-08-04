@@ -36,7 +36,7 @@ def normalize(text: str) -> str:
     for source, target in REPLACEMENTS.items():
         text = re.sub(
             rf"(?<!\w){re.escape(source)}(?!\w)",
-            lambda _match: target,
+            lambda _match, replacement=target: replacement,
             text,
             flags=re.IGNORECASE,
         )

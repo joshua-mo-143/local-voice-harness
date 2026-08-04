@@ -34,7 +34,9 @@ def start_components(timeout: float = 30.0) -> None:
         if llm_ready() and socket_ready(TTS_SOCKET):
             return
         time.sleep(0.25)
-    raise HarnessError("Qwen or Chatterbox did not become ready within 30 seconds")
+    raise HarnessError(
+        f"Qwen or Chatterbox did not become ready within {timeout:g} seconds"
+    )
 
 
 def stop_components() -> None:

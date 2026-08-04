@@ -35,9 +35,7 @@ SOURCE = os.environ.get("VOICE_HARNESS_SOURCE", DEFAULT_SOURCE)
 PRE_ROLL_FRAMES = 25
 MICROPHONE_START_ATTEMPTS = 30
 MICROPHONE_RETRY_SECONDS = 1
-WAKE_PREFIX = re.compile(
-    r"^\s*hey[,\s]+(?:jarvis|travis)\b[\s,;:!?.-]*", re.IGNORECASE
-)
+WAKE_PREFIX = re.compile(r"^\s*hey[,\s]+(?:jarvis|travis)\b[\s,;:!?.-]*", re.IGNORECASE)
 CLOSE_PATTERN = re.compile(
     r"\b(?:goodbye|stop listening|go to sleep|end conversation)\b", re.IGNORECASE
 )
@@ -61,11 +59,11 @@ class WakeConversationDaemon:
         from openwakeword.model import Model
 
         self.np = np
+        module_path = openwakeword.__file__
+        if module_path is None:
+            raise HarnessError("Could not locate OpenWakeWord package resources")
         model_path = (
-            Path(openwakeword.__file__).parent
-            / "resources"
-            / "models"
-            / "hey_jarvis_v0.1.onnx"
+            Path(module_path).parent / "resources" / "models" / "hey_jarvis_v0.1.onnx"
         )
         self.wake_model = Model(
             wakeword_models=[str(model_path)],
@@ -130,7 +128,9 @@ class WakeConversationDaemon:
             )
             time.sleep(0.2)
             if self.microphone.poll() is None:
-                log(f"listening for Hey Jarvis on {SOURCE or 'PipeWire default source'}")
+                log(
+                    f"listening for Hey Jarvis on {SOURCE or 'PipeWire default source'}"
+                )
                 return
 
             detail = (
@@ -231,7 +231,11 @@ class WakeConversationDaemon:
             raise HarnessError(f"model activation failed: {self.activation_error}")
 
     def close_conversation(self, reason: str) -> None:
-        if not self.conversation_deadline and not self.history and not self.cursor_session:
+        if (
+            not self.conversation_deadline
+            and not self.history
+            and not self.cursor_session
+        ):
             return
         log(f"conversation closed: {reason}")
         self.history.clear()
@@ -262,7 +266,9 @@ class WakeConversationDaemon:
                 log("wake phrase contained no request; waiting for follow-up")
                 notify("Listening for a follow-up…")
                 self.awaiting_followup = True
-                self.conversation_deadline = time.monotonic() + CONVERSATION_TIMEOUT_SECONDS
+                self.conversation_deadline = (
+                    time.monotonic() + CONVERSATION_TIMEOUT_SECONDS
+                )
                 return
             self.awaiting_followup = False
             log(f"user: {text}")
@@ -315,11 +321,14 @@ class WakeConversationDaemon:
             if job.get("status") == "completed":
                 response = f"Cursor finished. {str(job.get('result') or '').strip()}"
             elif job.get("status") == "awaiting_user":
-                response = "Cursor needs clarification. " + str(
-                    job.get("question") or job.get("result") or ""
-                ).strip()
+                response = (
+                    "Cursor needs clarification. "
+                    + str(job.get("question") or job.get("result") or "").strip()
+                )
                 self.cursor_session = job_id
-                self.conversation_deadline = time.monotonic() + CONVERSATION_TIMEOUT_SECONDS
+                self.conversation_deadline = (
+                    time.monotonic() + CONVERSATION_TIMEOUT_SECONDS
+                )
                 self.awaiting_followup = True
                 conversation_active = True
             elif job.get("status") == "blocked":
@@ -330,9 +339,7 @@ class WakeConversationDaemon:
             elif job.get("status") == "cancelled":
                 response = str(job.get("result") or "Cursor job was cancelled.").strip()
             else:
-                response = (
-                    f"Cursor job failed. {str(job.get('error') or 'Unknown error').strip()}"
-                )
+                response = f"Cursor job failed. {str(job.get('error') or 'Unknown error').strip()}"
             log(f"job {job_id} completion: {response}")
             print(f"Assistant: {response}", flush=True)
             synthesize_and_play(response)
