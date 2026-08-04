@@ -209,7 +209,16 @@ def _ensure_dictation_allowed() -> None:
 def _copy_to_clipboard(text: str) -> None:
     if shutil.which("xclip") is None:
         raise HarnessError("xclip is required to paste recognized text")
-    if _run(["xclip", "-selection", "clipboard"], input_text=text).returncode:
+    process = subprocess.run(
+        ["xclip", "-selection", "clipboard"],
+        input=text,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        text=True,
+        timeout=5,
+        check=False,
+    )
+    if process.returncode:
         raise HarnessError("could not copy recognized text to the clipboard")
 
 
