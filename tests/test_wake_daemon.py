@@ -59,7 +59,9 @@ class MicrophoneStartupTests(unittest.TestCase):
         failed.stderr = io.BytesIO(b"permission denied")
 
         with (
-            mock.patch.object(wake_daemon.subprocess, "Popen", return_value=failed) as popen,
+            mock.patch.object(
+                wake_daemon.subprocess, "Popen", return_value=failed
+            ) as popen,
             mock.patch.object(wake_daemon.time, "sleep"),
             self.assertRaisesRegex(wake_daemon.HarnessError, "permission denied"),
         ):
@@ -72,7 +74,9 @@ class ProcessUtteranceTests(unittest.TestCase):
     def test_completed_turn_enables_followup(self) -> None:
         daemon = _bare_daemon()
         with (
-            mock.patch.object(wake_daemon, "transcribe", return_value="what time is it"),
+            mock.patch.object(
+                wake_daemon, "transcribe", return_value="what time is it"
+            ),
             mock.patch.object(wake_daemon, "start_components"),
             mock.patch.object(
                 wake_daemon, "qwen_turn", return_value=("it is noon", None)
@@ -191,7 +195,7 @@ class AnnounceJobTests(unittest.TestCase):
 class PlaybackBargeInTests(unittest.TestCase):
     def test_wake_word_cancels_playback_and_preserves_preroll(self) -> None:
         daemon = _bare_daemon()
-        daemon.np = mock.Mock()
+        daemon.np = mock.Mock()  # type: ignore[reportAttributeAccessIssue]
         daemon.np.frombuffer.return_value = object()
         daemon.wake_key = "hey_jarvis"
         daemon.read_frame = mock.Mock(side_effect=[b"quiet", b"wake"])  # type: ignore[method-assign]
@@ -269,7 +273,7 @@ class PlaybackBargeInTests(unittest.TestCase):
 
     def test_response_wake_phrase_cannot_trigger_itself(self) -> None:
         daemon = _bare_daemon()
-        daemon.np = mock.Mock()
+        daemon.np = mock.Mock()  # type: ignore[reportAttributeAccessIssue]
         daemon.np.frombuffer.return_value = object()
         daemon.wake_key = "hey_jarvis"
         daemon.read_frame = mock.Mock(return_value=b"echo")  # type: ignore[method-assign]

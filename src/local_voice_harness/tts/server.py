@@ -9,6 +9,7 @@ import sys
 import threading
 import time
 from pathlib import Path
+from typing import Any
 
 RUNTIME = Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp"))
 SOCKET_PATH = RUNTIME / "voice-harness-tts.sock"
@@ -19,7 +20,7 @@ ACTIVE_STREAMS: dict[str, threading.Event] = {}
 ACTIVE_STREAMS_LOCK = threading.Lock()
 MAX_CHUNK_CHARS = 160
 REQUEST_ID = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
-MODEL: object | None = None
+MODEL: Any = None
 
 
 def log(message: str) -> None:
@@ -98,7 +99,7 @@ def _request_voice(request: dict[str, object]) -> Path | None:
     return voice
 
 
-def _generate(text: str, voice: Path | None) -> tuple[object, float]:
+def _generate(text: str, voice: Path | None) -> tuple[Any, float]:
     import torch
 
     started = time.perf_counter()
@@ -240,7 +241,9 @@ class RequestHandler(socketserver.StreamRequestHandler):
                 str(request.get("output", OUTPUT_ROOT / "reply.wav"))
             ).resolve()
             if OUTPUT_ROOT.resolve() not in output.parents:
-                raise ValueError("output must be inside the runtime voice-harness directory")
+                raise ValueError(
+                    "output must be inside the runtime voice-harness directory"
+                )
             voice = _request_voice(request)
             with LOCK:
                 audio, elapsed = _generate(text, voice)

@@ -240,7 +240,7 @@ class ClientPlaybackTests(unittest.TestCase):
     def test_explicit_cancel_notifies_server_and_stops_process(self) -> None:
         session = client.StreamingPlayback("hello")
         process = _FakeProcess()
-        session._process = process
+        session._process = process  # type: ignore[reportAttributeAccessIssue]
 
         with mock.patch.object(client, "unix_request", return_value=b'{"ok":true}\n') as send:
             session.cancel()

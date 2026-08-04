@@ -17,7 +17,9 @@ def respond(text: str) -> None:
         raise HarnessError("request text is empty")
     start_components()
     print(f"You: {text}")
-    response = cursor_turn(text)[0] if CURSOR_PATTERN.match(text) else qwen_response(text)
+    response = (
+        cursor_turn(text)[0] if CURSOR_PATTERN.match(text) else qwen_response(text)
+    )
     print(f"Assistant: {response}")
     stream_and_play(response)
 
