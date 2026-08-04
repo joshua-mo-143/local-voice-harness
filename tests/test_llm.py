@@ -16,6 +16,31 @@ def _response(message: dict[str, object]) -> io.BytesIO:
 
 
 class QwenClientTests(unittest.TestCase):
+    def test_cursor_followup_uses_only_one_leading_system_message(self) -> None:
+        with (
+            mock.patch.object(
+                llm.urllib.request,
+                "urlopen",
+                return_value=_response({"content": "Continuing now."}),
+            ) as urlopen,
+            redirect_stdout(io.StringIO()),
+        ):
+            answer, session = llm.qwen_turn(
+                "Continue please.",
+                [{"role": "assistant", "content": "The job needs authentication."}],
+                "123456789abc",
+            )
+
+        request = urlopen.call_args.args[0]
+        payload = json.loads(request.data)
+        system_messages = [
+            message for message in payload["messages"] if message["role"] == "system"
+        ]
+        self.assertEqual(len(system_messages), 1)
+        self.assertEqual(payload["messages"][0]["role"], "system")
+        self.assertIn("awaiting the user's reply", system_messages[0]["content"])
+        self.assertEqual((answer, session), ("Continuing now.", "123456789abc"))
+
     def test_sends_expected_chat_payload_and_limits_history(self) -> None:
         history = [
             {"role": "user", "content": f"message {index}"} for index in range(10)
