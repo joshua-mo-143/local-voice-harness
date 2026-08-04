@@ -84,21 +84,14 @@ def qwen_turn(
     history: Sequence[Mapping[str, object]] | None = None,
     cursor_session: str | None = None,
 ) -> tuple[str, str | None]:
+    system_prompt = SYSTEM_PROMPT
+    if cursor_session:
+        system_prompt += (
+            " A Cursor job is awaiting the user's reply. Continue it only when the user "
+            "is answering its clarification; otherwise submit a new job."
+        )
     messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        *(
-            [
-                {
-                    "role": "system",
-                    "content": (
-                        "A Cursor job is awaiting the user's reply. Continue it only when the "
-                        "user is answering its clarification; otherwise submit a new job."
-                    ),
-                }
-            ]
-            if cursor_session
-            else []
-        ),
+        {"role": "system", "content": system_prompt},
         *(history or [])[-8:],
         {"role": "user", "content": text},
     ]
