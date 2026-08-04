@@ -46,12 +46,8 @@ PLAYBACK_QUIET_FRAMES = max(
 PLAYBACK_QUIET_TIMEOUT_SECONDS = max(
     0.0, float(os.environ.get("VOICE_HARNESS_PLAYBACK_QUIET_TIMEOUT_SECONDS", "2"))
 )
-WAKE_PREFIX = re.compile(
-    r"^\s*hey[,\s]+(?:jarvis|travis)\b[\s,;:!?.-]*", re.IGNORECASE
-)
-SPOKEN_WAKE_PATTERN = re.compile(
-    r"\bhey[,\s]+(?:jarvis|travis)\b", re.IGNORECASE
-)
+WAKE_PREFIX = re.compile(r"^\s*hey[,\s]+(?:jarvis|travis)\b[\s,;:!?.-]*", re.IGNORECASE)
+SPOKEN_WAKE_PATTERN = re.compile(r"\bhey[,\s]+(?:jarvis|travis)\b", re.IGNORECASE)
 CLOSE_PATTERN = re.compile(
     r"\b(?:goodbye|stop listening|go to sleep|end conversation)\b", re.IGNORECASE
 )
@@ -309,7 +305,9 @@ class WakeConversationDaemon:
         interruption: BargeIn | None = None
         wake_barge_enabled = SPOKEN_WAKE_PATTERN.search(response) is None
         if BARGE_IN_MODE == "wake" and not wake_barge_enabled:
-            log("wake barge-in suppressed because the response contains the wake phrase")
+            log(
+                "wake barge-in suppressed because the response contains the wake phrase"
+            )
 
         def should_interrupt() -> bool:
             nonlocal speech_streak, interruption
@@ -323,9 +321,7 @@ class WakeConversationDaemon:
                 woke = False
             else:
                 samples = self.np.frombuffer(frame, dtype="<i2")
-                score = float(
-                    self.wake_model.predict(samples).get(self.wake_key, 0.0)
-                )
+                score = float(self.wake_model.predict(samples).get(self.wake_key, 0.0))
                 detected = wake_barge_enabled and score >= WAKE_THRESHOLD
                 woke = True
             if detected:
@@ -487,9 +483,7 @@ class WakeConversationDaemon:
                     self.pre_roll.clear()
                     speech_streak = 0
                     self.record_utterance(initial)
-                    self.continue_after_barge_in(
-                        self.process_utterance(woke=False)
-                    )
+                    self.continue_after_barge_in(self.process_utterance(woke=False))
                 continue
             samples = self.np.frombuffer(frame, dtype="<i2")
             score = float(self.wake_model.predict(samples).get(self.wake_key, 0.0))

@@ -86,8 +86,7 @@ class StreamingPlayback:
             return
         self._cancel_sent.set()
         request = (
-            json.dumps({"op": "cancel", "request_id": self.request_id}).encode()
-            + b"\n"
+            json.dumps({"op": "cancel", "request_id": self.request_id}).encode() + b"\n"
         )
         with contextlib.suppress(OSError, ValueError, json.JSONDecodeError):
             unix_request(TTS_SOCKET, request, timeout=2)
@@ -161,9 +160,7 @@ class StreamingPlayback:
                         or source.getsampwidth() != 2
                         or source.getframerate() != sample_rate
                     ):
-                        raise HarnessError(
-                            f"unexpected streaming WAV format: {output}"
-                        )
+                        raise HarnessError(f"unexpected streaming WAV format: {output}")
                     while not self.cancelled.is_set():
                         audio = source.readframes(4096)
                         if not audio:
@@ -256,9 +253,7 @@ class StreamingPlayback:
                         sentinel_sent = True
                     worker.join(
                         timeout=(
-                            0
-                            if should_interrupt is not None
-                            else STREAM_POLL_SECONDS
+                            0 if should_interrupt is not None else STREAM_POLL_SECONDS
                         )
                     )
                     if not worker.is_alive():

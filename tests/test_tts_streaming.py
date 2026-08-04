@@ -65,7 +65,9 @@ class ServerStreamingTests(unittest.TestCase):
             )
 
         self.assertEqual(generate.call_count, 1)
-        self.assertEqual([event["event"] for event in events], ["start", "chunk", "done"])
+        self.assertEqual(
+            [event["event"] for event in events], ["start", "chunk", "done"]
+        )
         self.assertTrue(events[-1]["cancelled"])
         self.assertNotIn("request-1", server.ACTIVE_STREAMS)
 
@@ -242,7 +244,9 @@ class ClientPlaybackTests(unittest.TestCase):
         process = _FakeProcess()
         session._process = process  # type: ignore[reportAttributeAccessIssue]
 
-        with mock.patch.object(client, "unix_request", return_value=b'{"ok":true}\n') as send:
+        with mock.patch.object(
+            client, "unix_request", return_value=b'{"ok":true}\n'
+        ) as send:
             session.cancel()
             session.cancel()
 
@@ -263,7 +267,9 @@ class ClientPlaybackTests(unittest.TestCase):
 
         with (
             mock.patch.object(client.socket, "socket", return_value=fake_socket),
-            mock.patch.object(client.select, "select", side_effect=cancel_while_waiting),
+            mock.patch.object(
+                client.select, "select", side_effect=cancel_while_waiting
+            ),
             mock.patch.object(client, "unix_request", return_value=b'{"ok":true}\n'),
         ):
             result = session.run()
