@@ -131,7 +131,9 @@ class DictationTests(unittest.TestCase):
             mock.patch.dict("os.environ", {"DICTATION_INJECT": "auto"}),
             mock.patch.object(dictation, "_ensure_dictation_allowed"),
             mock.patch.object(dictation, "_send_to_herdr", return_value=False),
-            mock.patch.object(dictation, "_active_window_class", return_value="firefox"),
+            mock.patch.object(
+                dictation, "_active_window_class", return_value="firefox"
+            ),
             mock.patch.object(dictation.shutil, "which", return_value="/usr/bin/xclip"),
             mock.patch.object(
                 dictation,
