@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import io
-import subprocess
 import unittest
 from contextlib import redirect_stdout
 from unittest import mock
@@ -96,37 +95,28 @@ class DictationTests(unittest.TestCase):
         ):
             dictation.inject("hello")
 
-    def test_xclip_does_not_capture_background_owner_output(self) -> None:
-        command = ["xclip", "-selection", "clipboard"]
-        completed = subprocess.CompletedProcess(command, 0)
+    def test_copy_uses_desktop_clipboard(self) -> None:
+        desktop = mock.Mock()
+        desktop.write_clipboard.return_value = True
         with (
-            mock.patch.object(dictation.shutil, "which", return_value="/usr/bin/xclip"),
-            mock.patch.object(
-                dictation.subprocess, "run", return_value=completed
-            ) as run,
+            mock.patch.object(dictation, "get_desktop", return_value=desktop),
         ):
             dictation._copy_to_clipboard("hello")
-        run.assert_called_once_with(
-            command,
-            input="hello",
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            text=True,
-            timeout=5,
-            check=False,
-        )
+        desktop.write_clipboard.assert_called_once_with("hello")
 
-    def test_xclip_failure_is_reported(self) -> None:
-        completed = subprocess.CompletedProcess([], 1)
+    def test_clipboard_failure_is_reported(self) -> None:
+        desktop = mock.Mock()
+        desktop.write_clipboard.return_value = False
         with (
-            mock.patch.object(dictation.shutil, "which", return_value="/usr/bin/xclip"),
-            mock.patch.object(dictation.subprocess, "run", return_value=completed),
+            mock.patch.object(dictation, "get_desktop", return_value=desktop),
             self.assertRaisesRegex(HarnessError, "could not copy"),
         ):
             dictation._copy_to_clipboard("hello")
 
-    def test_auto_injection_pastes_after_copying_to_xclip(self) -> None:
+    def test_auto_injection_pastes_after_copying_to_clipboard(self) -> None:
         operations: list[tuple[str, object]] = []
+        desktop = mock.Mock()
+        desktop.has_clipboard.return_value = True
         with (
             mock.patch.dict("os.environ", {"DICTATION_INJECT": "auto"}),
             mock.patch.object(dictation, "_ensure_dictation_allowed"),
@@ -134,7 +124,7 @@ class DictationTests(unittest.TestCase):
             mock.patch.object(
                 dictation, "_active_window_class", return_value="firefox"
             ),
-            mock.patch.object(dictation.shutil, "which", return_value="/usr/bin/xclip"),
+            mock.patch.object(dictation, "get_desktop", return_value=desktop),
             mock.patch.object(
                 dictation,
                 "_copy_to_clipboard",
@@ -142,8 +132,8 @@ class DictationTests(unittest.TestCase):
             ),
             mock.patch.object(
                 dictation,
-                "_xdotool",
-                side_effect=lambda *args: operations.append(("xdotool", args)),
+                "_send_key",
+                side_effect=lambda key: operations.append(("key", key)),
             ),
             mock.patch.object(dictation.time, "sleep"),
         ):
@@ -152,9 +142,35 @@ class DictationTests(unittest.TestCase):
             operations,
             [
                 ("copy", "hello"),
-                ("xdotool", ("key", "--clearmodifiers", "ctrl+v")),
+                ("key", "ctrl+v"),
             ],
         )
+
+    def test_wayland_terminal_uses_ctrl_shift_v(self) -> None:
+        desktop = mock.Mock()
+        desktop.has_clipboard.return_value = True
+        with (
+            mock.patch.dict("os.environ", {"DICTATION_INJECT": "paste"}),
+            mock.patch.object(dictation, "_ensure_dictation_allowed"),
+            mock.patch.object(dictation, "_send_to_herdr", return_value=False),
+            mock.patch.object(dictation, "_active_window_class", return_value="foot"),
+            mock.patch.object(dictation, "get_desktop", return_value=desktop),
+            mock.patch.object(dictation, "_copy_to_clipboard"),
+            mock.patch.object(dictation, "_send_key") as send_key,
+            mock.patch.object(dictation.time, "sleep"),
+        ):
+            dictation.inject("hello")
+        send_key.assert_called_once_with("ctrl+shift+v")
+
+    def test_unsupported_wayland_session_is_reported(self) -> None:
+        with (
+            mock.patch.dict("os.environ", {"DICTATION_INJECT": "paste"}),
+            mock.patch.object(dictation, "_ensure_dictation_allowed"),
+            mock.patch.object(dictation, "_send_to_herdr", return_value=False),
+            mock.patch.object(dictation, "get_desktop", return_value=None),
+            self.assertRaisesRegex(HarnessError, "Hyprland, and Sway"),
+        ):
+            dictation.inject("hello")
 
     def test_auto_injection_keeps_native_herdr_path(self) -> None:
         with (
@@ -162,12 +178,14 @@ class DictationTests(unittest.TestCase):
             mock.patch.object(dictation, "_ensure_dictation_allowed"),
             mock.patch.object(dictation, "_send_to_herdr", return_value=True) as send,
             mock.patch.object(dictation, "_copy_to_clipboard") as copy,
-            mock.patch.object(dictation, "_xdotool") as xdotool,
+            mock.patch.object(dictation, "_send_key") as send_key,
+            mock.patch.object(dictation, "_type_text") as type_text,
         ):
             dictation.inject("hello")
         send.assert_called_once_with("hello")
         copy.assert_not_called()
-        xdotool.assert_not_called()
+        send_key.assert_not_called()
+        type_text.assert_not_called()
 
 
 if __name__ == "__main__":
