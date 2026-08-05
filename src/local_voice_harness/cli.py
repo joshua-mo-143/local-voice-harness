@@ -11,9 +11,11 @@ from .service_manager import (
     logs,
     restart_services,
     start_services,
-    status as service_status,
     stop_services,
     uninstall_services,
+)
+from .service_manager import (
+    status as service_status,
 )
 from .stt.client import transcribe
 
@@ -28,9 +30,7 @@ def parser() -> argparse.ArgumentParser:
     dictate = commands.add_parser(
         "dictate", help="record and type transcription into the focused window"
     )
-    dictate_commands = dictate.add_subparsers(
-        dest="dictation_command", required=True
-    )
+    dictate_commands = dictate.add_subparsers(dest="dictation_command", required=True)
     for command in ("begin", "end", "toggle", "transcribe", "cancel"):
         dictate_commands.add_parser(command)
     text = commands.add_parser("text")
@@ -74,9 +74,7 @@ def dispatch(args: argparse.Namespace) -> None:
     elif args.command == "status":
         status()
     elif args.service_command == "install":
-        install_services(
-            force=args.force, replace_dictation=args.replace_dictation
-        )
+        install_services(force=args.force, replace_dictation=args.replace_dictation)
     elif args.service_command == "start":
         start_services()
     elif args.service_command == "stop":

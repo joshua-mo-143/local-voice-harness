@@ -37,6 +37,12 @@ are recovered at daemon startup and during normal polling. Spoken background res
 use at-least-once delivery: playback is acknowledged only after it succeeds, so a
 crash at that boundary may repeat a result but will not silently lose it.
 
+Spoken responses use chunk-level streaming. Chatterbox still generates a complete
+waveform for each short sentence or clause, but the next chunk is synthesized while
+the current chunk is sent through one low-latency PipeWire playback stream. This is
+not native sample streaming from the model. Playback sessions are serialized across
+processes so manual commands and daemon announcements cannot overlap.
+
 Cursor routing works as follows:
 
 1. Prefer an idle Cursor agent already running in the requested checkout.
@@ -85,7 +91,8 @@ Install these before setting up Python environments:
 
 - PipeWire tools (`pw-record` and `pw-play`).
 - `libnotify`/`notify-send`.
-- Git, curl, and systemd user services.
+- Git, curl, the GitHub CLI (`gh`), and systemd user services.
+- `xdotool` and `xclip` for X11 focused-window automation.
 - [uv](https://docs.astral.sh/uv/) for reproducible Python versions/environments.
 - A recent [llama.cpp](https://github.com/ggml-org/llama.cpp) build with Vulkan and
   `llama-server`.
@@ -96,7 +103,7 @@ Install these before setting up Python environments:
 On Arch/CachyOS, the base packages are approximately:
 
 ```bash
-paru -S --needed pipewire libnotify git curl uv libsndfile
+paru -S --needed pipewire libnotify git curl github-cli xdotool xclip uv libsndfile
 ```
 
 Package names for llama.cpp and NVIDIA drivers vary. Verify the required commands:
@@ -106,6 +113,14 @@ pw-record --version
 pw-play --version
 llama-server --version
 nvidia-smi
+```
+
+Authenticate the GitHub CLI to let focused issue pages include private-repository
+details:
+
+```bash
+gh auth login
+gh auth status
 ```
 
 ## Installation
@@ -249,6 +264,34 @@ Optional Chatterbox voice cloning accepts a reference WAV:
 Environment=VOICE_HARNESS_VOICE=/absolute/path/to/reference.wav
 ```
 
+The default playback interruption mode is `wake`: saying “Hey Jarvis” while the
+assistant is speaking stops queued audio and starts a new wake-prefixed request. The
+wake detector is reset at playback boundaries, the microphone must become quiet
+before ordinary follow-up VAD is re-armed, and wake interruption is temporarily
+suppressed if the assistant's own response contains the wake phrase.
+
+Natural speech barge-in is available with
+`VOICE_HARNESS_BARGE_IN_MODE=vad`, but it should only be used with a PipeWire
+echo-cancelled source. A physical microphone will usually classify speaker output as
+speech and interrupt every response. PipeWire's PulseAudio compatibility layer can
+create a session-scoped WebRTC echo-cancel source for testing:
+
+```bash
+pactl load-module module-echo-cancel \
+  aec_method=webrtc \
+  source_name=voice_harness_aec \
+  sink_name=voice_harness_aec_sink
+wpctl status
+```
+
+Set `VOICE_HARNESS_SOURCE=voice_harness_aec` and
+`VOICE_HARNESS_BARGE_IN_MODE=vad` in the wake service drop-in. The virtual source
+must use the same physical capture/playback devices as the harness; make this module
+persistent through the machine's PipeWire/WirePlumber configuration after validating
+it interactively. Use `VOICE_HARNESS_BARGE_IN_MODE=off` if no acoustic interruption
+is wanted. The streaming client also exposes `StreamingPlayback.cancel()` for an
+explicit stop control in local integrations.
+
 ### 7. Install and enable services
 
 Use the packaged CLI to install the units, reload systemd, and enable the two
@@ -266,7 +309,8 @@ to the bundled backend.
 
 Qwen and Chatterbox are intentionally not enabled at login. The wake daemon starts
 them on demand and stops them when a conversation closes. It also stops them after a
-failed turn when no earlier conversation remains active.
+failed turn when no earlier conversation remains active. Manual text turns hold a
+cross-process usage lease so daemon cleanup cannot stop their models mid-response.
 
 ### Existing standalone dictation installations
 
@@ -307,11 +351,23 @@ voice-harness text "Why is the sky blue?"
 voice-harness text "Use Cursor to summarize the api-docs repository."
 ```
 
-Run the integration tests:
+### Development quality checks
+
+The default development environment contains only the package and quality tools;
+it does not install the CUDA, audio, wake-word, or model extras:
 
 ```bash
-.venv/bin/python -m unittest discover -s tests -v
+uv sync --python 3.12
+uv run ruff format --check .
+uv run ruff check .
+uv run pyright
+uv run pytest
 ```
+
+Use `uv run ruff format .` to apply formatting. Pytest includes branch coverage and
+enforces the initial 40% project threshold. CI runs the same checks on every
+supported Python version (3.11 and 3.12) without starting services or downloading
+models.
 
 ## Usage
 
@@ -321,6 +377,7 @@ Wake mode:
 Hey Jarvis, what time is it?
 Hey Jarvis, ask Cursor to summarize the api-docs repository.
 Hey Jarvis, ask Cursor to work on Linear issue API-79.
+Hey Jarvis, summarize this issue.  # with a GitHub issue focused in Firefox
 Hey Jarvis, what is the status of that Cursor job?
 Hey Jarvis, cancel that Cursor job.
 ```
@@ -344,6 +401,21 @@ invocation without starting the conversational models. Automatic injection uses
 native Herdr delivery for Cursor panes, simulated typing for terminals, and
 clipboard paste for other graphical applications. Dictation is blocked while
 RuneLite is focused because generated input may violate Jagex's rules.
+
+Playback starts after the first sentence/clause is synthesized instead of waiting for
+the complete response. In the default configuration, say “Hey Jarvis” during
+playback to interrupt and immediately ask another question. Chatterbox cannot cancel
+an active `generate()` call, so server-side cancellation may take up to one short
+chunk; PipeWire playback and already queued chunks stop immediately.
+
+On X11, each new conversational request checks whether Firefox is focused. The
+harness briefly selects and copies the address bar, restores the previous clipboard,
+and dismisses the address bar without navigating. A focused GitHub page contributes
+its URL; a focused issue page also contributes title, state, body, labels, and recent
+comments fetched through the authenticated `gh` CLI. Page content is treated as
+untrusted input. Missing tools, unsupported sessions such as native Wayland, focus
+changes during capture, and GitHub errors simply omit some or all browser context
+without failing the voice request.
 
 For example, bind Super+D in i3:
 
@@ -391,6 +463,11 @@ Environment variables can be added to systemd drop-ins:
 | `VOICE_HARNESS_VOICE` | Chatterbox reference WAV | Built-in voice |
 | `VOICE_HARNESS_WAKE_THRESHOLD` | OpenWakeWord activation threshold | `0.55` |
 | `VOICE_HARNESS_MIN_SPEECH_RMS` | Speech energy gate | `1100` |
+| `VOICE_HARNESS_BARGE_IN_MODE` | Playback interruption (`wake`, `vad`, or `off`) | `wake` |
+| `VOICE_HARNESS_BARGE_IN_SPEECH_FRAMES` | Consecutive 80 ms speech frames for VAD barge-in | `5` |
+| `VOICE_HARNESS_PLAYBACK_QUIET_FRAMES` | Quiet 80 ms frames required after playback | `4` |
+| `VOICE_HARNESS_PLAYBACK_QUIET_TIMEOUT_SECONDS` | Maximum post-playback echo drain | `2` |
+| `VOICE_HARNESS_PLAYBACK_LATENCY` | `pw-play` raw-stream target latency | `100ms` |
 | `VOICE_HARNESS_CURSOR_FOREGROUND_SECONDS` | Time before a Cursor job backgrounds | `5` |
 | `VOICE_HARNESS_HERDR_BIN` | Herdr executable | `~/.local/bin/herdr` |
 | `VOICE_HARNESS_PROJECT_ROOT` | Allowed root for inferred repositories | Home directory |
@@ -407,11 +484,9 @@ Measured with all models warm on the RTX 5070 Ti Laptop GPU:
 
 - Whisper large-v3: approximately 0.58 seconds for a short request.
 - Qwen response: 0.22–0.53 seconds; first Vulkan request approximately 5 seconds.
-- Chatterbox: 0.53 seconds for 2.72 seconds of audio.
+- Chatterbox: 0.53 seconds for 2.72 seconds of audio; longer replies now begin
+  playing after their first sentence/clause is ready.
 - Cursor delegation: task-dependent and normally handled as a background job.
-
-Chatterbox produces a complete waveform rather than streaming audio, so keeping
-spoken replies short reduces time to playback.
 
 ## Security notes
 
@@ -419,6 +494,8 @@ spoken replies short reduces time to playback.
 - Herdr agents are started with workspace trust but not Cursor `--force`.
 - Ticket and MCP content is treated as untrusted input and inferred paths are
   validated against local Git repositories.
+- Focused GitHub issue content is read through `gh`, bounded before prompting, and
+  treated as untrusted external data.
 - Jobs never automatically commit, push, open pull requests, or remove worktrees.
 - Runtime job metadata and audio live under `$XDG_RUNTIME_DIR/voice-harness`.
 

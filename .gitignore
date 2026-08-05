@@ -5,6 +5,11 @@ __pycache__/
 *.egg-info/
 dist/
 build/
+.coverage
+.coverage.*
+htmlcov/
+.pytest_cache/
+.ruff_cache/
 .migration-backup/
 
 # Download these during installation; do not commit model weights.

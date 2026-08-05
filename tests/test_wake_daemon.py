@@ -21,6 +21,7 @@ def _bare_daemon() -> WakeConversationDaemon:
     instance.last_wake = 0.0
     instance.running = True
     instance.microphone = None
+    instance.microphone_paused = False
     instance.activation_thread = None
     instance.activation_error = None
     instance.component_lock = threading.Lock()
@@ -60,7 +61,9 @@ class MicrophoneStartupTests(unittest.TestCase):
         failed.stderr = io.BytesIO(b"permission denied")
 
         with (
-            mock.patch.object(wake_daemon.subprocess, "Popen", return_value=failed) as popen,
+            mock.patch.object(
+                wake_daemon.subprocess, "Popen", return_value=failed
+            ) as popen,
             mock.patch.object(wake_daemon.time, "sleep"),
             self.assertRaisesRegex(wake_daemon.HarnessError, "permission denied"),
         ):
@@ -73,17 +76,29 @@ class ProcessUtteranceTests(unittest.TestCase):
     def test_completed_turn_enables_followup(self) -> None:
         daemon = _bare_daemon()
         with (
-            mock.patch.object(wake_daemon, "transcribe", return_value="what time is it"),
+            mock.patch.object(
+                wake_daemon, "transcribe", return_value="what time is it"
+            ),
             mock.patch.object(wake_daemon, "start_components"),
             mock.patch.object(
                 wake_daemon, "qwen_turn", return_value=("it is noon", None)
             ) as qwen_turn,
-            mock.patch.object(wake_daemon, "synthesize_and_play", return_value={}),
+            mock.patch.object(wake_daemon, "stream_and_play", return_value={}),
+            mock.patch.object(
+                wake_daemon,
+                "enrich_request",
+                return_value="what time is it\n\nGitHub context",
+            ),
             mock.patch.object(wake_daemon, "notify"),
         ):
             daemon.process_utterance(woke=False)
 
-        qwen_turn.assert_called_once()
+        qwen_turn.assert_called_once_with(
+            "what time is it\n\nGitHub context",
+            mock.ANY,
+            None,
+            delivery_claims=mock.ANY,
+        )
         self.assertTrue(
             daemon.awaiting_followup,
             "a completed turn must re-arm follow-up listening",
@@ -103,7 +118,7 @@ class ProcessUtteranceTests(unittest.TestCase):
             mock.patch.object(wake_daemon, "transcribe", return_value="hey jarvis"),
             mock.patch.object(wake_daemon, "start_components"),
             mock.patch.object(wake_daemon, "qwen_turn") as qwen_turn,
-            mock.patch.object(wake_daemon, "synthesize_and_play") as play,
+            mock.patch.object(wake_daemon, "stream_and_play") as play,
             mock.patch.object(wake_daemon, "notify"),
         ):
             daemon.process_utterance(woke=True)
@@ -124,8 +139,13 @@ class ProcessUtteranceTests(unittest.TestCase):
             mock.patch.object(
                 wake_daemon, "qwen_turn", return_value=("started", None)
             ) as qwen_turn,
+            mock.patch.object(
+                wake_daemon,
+                "enrich_request",
+                side_effect=lambda text: text,
+            ),
             mock.patch.object(wake_daemon, "cursor_turn") as cursor_turn,
-            mock.patch.object(wake_daemon, "synthesize_and_play", return_value={}),
+            mock.patch.object(wake_daemon, "stream_and_play", return_value={}),
             mock.patch.object(wake_daemon, "notify"),
         ):
             daemon.process_utterance(woke=False)
@@ -149,24 +169,35 @@ class ProcessUtteranceTests(unittest.TestCase):
             mock.patch.object(
                 wake_daemon, "cursor_turn", return_value=("started", None)
             ) as cursor_turn,
+            mock.patch.object(
+                wake_daemon,
+                "enrich_request",
+                return_value="ask Cursor to work on APP-43\n\nGitHub context",
+            ),
             mock.patch.object(wake_daemon, "qwen_turn") as qwen_turn,
-            mock.patch.object(wake_daemon, "synthesize_and_play", return_value={}),
+            mock.patch.object(wake_daemon, "stream_and_play", return_value={}),
             mock.patch.object(wake_daemon, "notify"),
         ):
             daemon.process_utterance(woke=False)
 
         cursor_turn.assert_called_once_with(
-            "ask Cursor to work on APP-43", delivery_claims=mock.ANY
+            "ask Cursor to work on APP-43\n\nGitHub context",
+            delivery_claims=mock.ANY,
         )
         qwen_turn.assert_not_called()
 
     def test_failed_fresh_turn_stops_components(self) -> None:
         daemon = _bare_daemon()
         with (
-            mock.patch.object(wake_daemon, "transcribe", return_value="what time is it"),
+            mock.patch.object(
+                wake_daemon, "transcribe", return_value="what time is it"
+            ),
             mock.patch.object(wake_daemon, "start_components"),
             mock.patch.object(
                 wake_daemon, "qwen_turn", side_effect=RuntimeError("LLM failed")
+            ),
+            mock.patch.object(
+                wake_daemon, "enrich_request", side_effect=lambda text: text
             ),
             mock.patch.object(wake_daemon, "stop_components") as stop_components,
             mock.patch.object(wake_daemon, "notify"),
@@ -187,6 +218,9 @@ class ProcessUtteranceTests(unittest.TestCase):
             mock.patch.object(wake_daemon, "start_components"),
             mock.patch.object(
                 wake_daemon, "qwen_turn", side_effect=RuntimeError("LLM failed")
+            ),
+            mock.patch.object(
+                wake_daemon, "enrich_request", side_effect=lambda text: text
             ),
             mock.patch.object(wake_daemon, "stop_components") as stop_components,
             mock.patch.object(wake_daemon, "notify"),
@@ -215,8 +249,11 @@ class ProcessUtteranceTests(unittest.TestCase):
             mock.patch.object(wake_daemon, "start_components"),
             mock.patch.object(wake_daemon, "qwen_turn", side_effect=qwen_with_delivery),
             mock.patch.object(
+                wake_daemon, "enrich_request", side_effect=lambda text: text
+            ),
+            mock.patch.object(
                 wake_daemon,
-                "synthesize_and_play",
+                "stream_and_play",
                 side_effect=RuntimeError("playback failed"),
             ),
             mock.patch.object(wake_daemon, "release_deliveries") as release,
@@ -237,7 +274,7 @@ class AnnounceJobTests(unittest.TestCase):
             mock.patch.object(wake_daemon, "release_delivery"),
             mock.patch.object(wake_daemon, "start_components"),
             mock.patch.object(wake_daemon, "stop_components") as stop_components,
-            mock.patch.object(wake_daemon, "synthesize_and_play", return_value={}),
+            mock.patch.object(wake_daemon, "stream_and_play", return_value={}),
             mock.patch.object(wake_daemon, "notify"),
         ):
             daemon.announce_job(
@@ -262,7 +299,7 @@ class AnnounceJobTests(unittest.TestCase):
             mock.patch.object(wake_daemon, "release_delivery"),
             mock.patch.object(wake_daemon, "start_components"),
             mock.patch.object(wake_daemon, "stop_components"),
-            mock.patch.object(wake_daemon, "synthesize_and_play", return_value={}),
+            mock.patch.object(wake_daemon, "stream_and_play", return_value={}),
             mock.patch.object(wake_daemon, "notify"),
         ):
             daemon.announce_job({"id": "job2", "status": "completed", "result": "done"})
@@ -278,7 +315,7 @@ class AnnounceJobTests(unittest.TestCase):
             mock.patch.object(wake_daemon, "stop_components"),
             mock.patch.object(
                 wake_daemon,
-                "synthesize_and_play",
+                "stream_and_play",
                 side_effect=RuntimeError("speaker unavailable"),
             ),
             mock.patch.object(wake_daemon, "notify"),
@@ -303,8 +340,8 @@ class AnnounceJobTests(unittest.TestCase):
             mock.patch.object(wake_daemon, "stop_components"),
             mock.patch.object(
                 wake_daemon,
-                "synthesize_and_play",
-                side_effect=lambda _text: events.append("played"),
+                "stream_and_play",
+                side_effect=lambda _text, **_kwargs: events.append("played") or {},
             ),
             mock.patch.object(
                 wake_daemon,
@@ -363,6 +400,189 @@ class ComponentSynchronizationTests(unittest.TestCase):
             cleanup.join(timeout=2)
 
         self.assertEqual(events, ["started", "stopped"])
+
+
+class PlaybackBargeInTests(unittest.TestCase):
+    def test_wake_word_cancels_playback_and_preserves_preroll(self) -> None:
+        daemon = _bare_daemon()
+        daemon.np = mock.Mock()  # type: ignore[reportAttributeAccessIssue]
+        daemon.np.frombuffer.return_value = object()
+        daemon.wake_key = "hey_jarvis"
+        daemon.read_frame = mock.Mock(side_effect=[b"quiet", b"wake"])  # type: ignore[method-assign]
+        daemon.wake_model.predict.side_effect = [
+            {"hey_jarvis": 0.1},
+            {"hey_jarvis": 0.9},
+        ]
+
+        def fake_stream(
+            _response: str, *, should_interrupt: object
+        ) -> dict[str, object]:
+            check = should_interrupt
+            self.assertFalse(check())  # type: ignore[operator]
+            interrupted = check()  # type: ignore[operator]
+            return {"interrupted": interrupted, "played_text": "first sentence"}
+
+        with (
+            mock.patch.object(wake_daemon, "BARGE_IN_MODE", "wake"),
+            mock.patch.object(wake_daemon, "stream_and_play", side_effect=fake_stream),
+        ):
+            result, interruption = daemon.play_response("A harmless response.")
+
+        self.assertTrue(result["interrupted"])
+        self.assertIsNotNone(interruption)
+        assert interruption is not None
+        self.assertTrue(interruption.woke)
+        self.assertEqual(interruption.initial, [b"quiet", b"wake"])
+
+    def test_vad_requires_configured_sustained_speech(self) -> None:
+        daemon = _bare_daemon()
+        daemon.read_frame = mock.Mock(return_value=b"speech")  # type: ignore[method-assign]
+        daemon.is_speech = mock.Mock(return_value=True)  # type: ignore[method-assign]
+
+        def fake_stream(
+            _response: str, *, should_interrupt: object
+        ) -> dict[str, object]:
+            check = should_interrupt
+            decisions = [check() for _ in range(3)]  # type: ignore[operator]
+            return {"interrupted": decisions[-1], "played_text": ""}
+
+        with (
+            mock.patch.object(wake_daemon, "BARGE_IN_MODE", "vad"),
+            mock.patch.object(wake_daemon, "BARGE_IN_SPEECH_FRAMES", 3),
+            mock.patch.object(wake_daemon, "stream_and_play", side_effect=fake_stream),
+        ):
+            _, interruption = daemon.play_response("response")
+
+        self.assertIsNotNone(interruption)
+        assert interruption is not None
+        self.assertFalse(interruption.woke)
+        self.assertEqual(len(interruption.initial), 3)
+
+    def test_off_mode_drains_frames_without_acoustic_cancellation(self) -> None:
+        daemon = _bare_daemon()
+        daemon.read_frame = mock.Mock(return_value=b"speaker echo")  # type: ignore[method-assign]
+
+        def fake_stream(
+            _response: str, *, should_interrupt: object
+        ) -> dict[str, object]:
+            check = should_interrupt
+            self.assertFalse(check())  # type: ignore[operator]
+            self.assertFalse(check())  # type: ignore[operator]
+            return {"interrupted": False, "played_text": "response"}
+
+        with (
+            mock.patch.object(wake_daemon, "BARGE_IN_MODE", "off"),
+            mock.patch.object(wake_daemon, "stream_and_play", side_effect=fake_stream),
+            mock.patch.object(daemon, "wait_for_playback_quiet") as quiet,
+        ):
+            _, interruption = daemon.play_response("response")
+
+        self.assertIsNone(interruption)
+        quiet.assert_called_once()
+        daemon.wake_model.predict.assert_not_called()
+
+    def test_response_wake_phrase_cannot_trigger_itself(self) -> None:
+        daemon = _bare_daemon()
+        daemon.np = mock.Mock()  # type: ignore[reportAttributeAccessIssue]
+        daemon.np.frombuffer.return_value = object()
+        daemon.wake_key = "hey_jarvis"
+        daemon.read_frame = mock.Mock(return_value=b"echo")  # type: ignore[method-assign]
+        daemon.wake_model.predict.return_value = {"hey_jarvis": 1.0}
+
+        def fake_stream(
+            _response: str, *, should_interrupt: object
+        ) -> dict[str, object]:
+            self.assertFalse(should_interrupt())  # type: ignore[operator]
+            return {"interrupted": False, "played_text": "Hey Jarvis."}
+
+        with (
+            mock.patch.object(wake_daemon, "BARGE_IN_MODE", "wake"),
+            mock.patch.object(wake_daemon, "stream_and_play", side_effect=fake_stream),
+            mock.patch.object(daemon, "wait_for_playback_quiet"),
+            mock.patch.object(wake_daemon, "log"),
+        ):
+            _, interruption = daemon.play_response("Say Hey Jarvis.")
+
+        self.assertIsNone(interruption)
+
+    def test_quiet_gate_clears_echo_before_followup_rearms(self) -> None:
+        daemon = _bare_daemon()
+        daemon.microphone = mock.Mock()
+        daemon.microphone.poll.return_value = None
+        daemon.pre_roll.extend([b"old"])
+        daemon.read_frame = mock.Mock(  # type: ignore[method-assign]
+            side_effect=[b"speech", b"quiet", b"quiet"]
+        )
+        daemon.is_speech = lambda frame: frame == b"speech"  # type: ignore[method-assign]
+
+        with (
+            mock.patch.object(wake_daemon, "PLAYBACK_QUIET_FRAMES", 2),
+            mock.patch.object(wake_daemon, "PLAYBACK_QUIET_TIMEOUT_SECONDS", 1),
+        ):
+            daemon.wait_for_playback_quiet()
+
+        self.assertEqual(daemon.read_frame.call_count, 3)
+        self.assertEqual(list(daemon.pre_roll), [])
+
+
+class InterruptedTurnTests(unittest.TestCase):
+    def test_only_played_assistant_prefix_is_added_to_history(self) -> None:
+        daemon = _bare_daemon()
+        interruption = wake_daemon.BargeIn(initial=[b"user"], woke=False)
+        with (
+            mock.patch.object(wake_daemon, "transcribe", return_value="tell me more"),
+            mock.patch.object(wake_daemon, "start_components"),
+            mock.patch.object(
+                wake_daemon, "qwen_turn", return_value=("first. second.", None)
+            ),
+            mock.patch.object(
+                daemon,
+                "play_response",
+                return_value=(
+                    {"interrupted": True, "played_text": "first."},
+                    interruption,
+                ),
+            ),
+            mock.patch.object(wake_daemon, "notify"),
+        ):
+            result = daemon.process_utterance(woke=False)
+
+        self.assertIs(result, interruption)
+        self.assertEqual(
+            daemon.history,
+            [
+                {"role": "user", "content": "tell me more"},
+                {"role": "assistant", "content": "first."},
+            ],
+        )
+
+    def test_job_announcement_keeps_components_for_barge_in(self) -> None:
+        daemon = _bare_daemon()
+        interruption = wake_daemon.BargeIn(initial=[b"user"], woke=True)
+        with (
+            mock.patch.object(wake_daemon, "acknowledge_delivery") as acknowledge,
+            mock.patch.object(wake_daemon, "release_delivery") as release,
+            mock.patch.object(wake_daemon, "start_components"),
+            mock.patch.object(wake_daemon, "stop_components") as stop_components,
+            mock.patch.object(
+                daemon,
+                "play_response",
+                return_value=({"interrupted": True}, interruption),
+            ),
+        ):
+            result = daemon.announce_job(
+                {
+                    "id": "job3",
+                    "status": "completed",
+                    "result": "done",
+                    "_delivery_token": "claim",
+                }
+            )
+
+        self.assertIs(result, interruption)
+        acknowledge.assert_not_called()
+        release.assert_called_once_with("job3", "claim")
+        stop_components.assert_not_called()
 
 
 class RunLoopFollowupTests(unittest.TestCase):

@@ -10,13 +10,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-HERDR_BIN = os.environ.get("VOICE_HARNESS_HERDR_BIN", str(Path.home() / ".local/bin/herdr"))
+HERDR_BIN = os.environ.get(
+    "VOICE_HARNESS_HERDR_BIN", str(Path.home() / ".local/bin/herdr")
+)
 HERDR_UNIT = "voice-harness-herdr.service"
 HOME_ROOT = Path(os.environ.get("VOICE_HARNESS_PROJECT_ROOT", Path.home())).resolve()
 SETTLED = {"idle", "done"}
-LINEAR_ISSUE = re.compile(
-    r"\b([A-Z][A-Z0-9]+)(?:\s*-\s*|\s+)(\d+)\b", re.IGNORECASE
-)
+LINEAR_ISSUE = re.compile(r"\b([A-Z][A-Z0-9]+)(?:\s*-\s*|\s+)(\d+)\b", re.IGNORECASE)
 
 
 class HerdrError(RuntimeError):
@@ -151,9 +151,10 @@ class HerdrClient:
                 text=True,
                 check=False,
             )
-            if process.returncode and "already exists" not in (
-                process.stdout + process.stderr
-            ).casefold():
+            if (
+                process.returncode
+                and "already exists" not in (process.stdout + process.stderr).casefold()
+            ):
                 raise HerdrError(process.stderr.strip() or "Could not start Herdr")
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
@@ -279,14 +280,21 @@ class HerdrClient:
         for agent in self.live_agents():
             if self.target(agent) in reserved:
                 continue
-            if agent_hint and normalize_name(str(agent.get("name") or "")) != normalize_name(
-                agent_hint
+            if agent_hint and normalize_name(
+                str(agent.get("name") or "")
+            ) != normalize_name(agent_hint):
+                continue
+            if (
+                expected is not None
+                and Path(str(agent.get("cwd") or "")).resolve() != expected.resolve()
             ):
                 continue
-            if expected is not None and Path(str(agent.get("cwd") or "")).resolve() != expected.resolve():
-                continue
             matches.append(agent)
-        return self.selection(matches[0], str(expected) if expected else None) if len(matches) == 1 else None
+        return (
+            self.selection(matches[0], str(expected) if expected else None)
+            if len(matches) == 1
+            else None
+        )
 
     def workspace_for(self, checkout: Path) -> dict[str, Any] | None:
         for workspace in self.list_workspaces():
@@ -371,9 +379,15 @@ class HerdrClient:
         if issue_key:
             label = issue_key.casefold()
             branch = f"voice/{label}"
-            listing = self.run_json("worktree", "list", "--cwd", str(repository), "--json")
+            listing = self.run_json(
+                "worktree", "list", "--cwd", str(repository), "--json"
+            )
             existing = next(
-                (item for item in listing.get("worktrees") or [] if item.get("branch") == branch),
+                (
+                    item
+                    for item in listing.get("worktrees") or []
+                    if item.get("branch") == branch
+                ),
                 None,
             )
             if existing:
@@ -381,18 +395,43 @@ class HerdrClient:
                 workspace_id = str(existing.get("open_workspace_id") or "") or None
                 if not workspace_id:
                     opened = self.run_json(
-                        "worktree", "open", "--cwd", str(repository), "--path",
-                        str(checkout), "--label", label, "--no-focus", "--json"
+                        "worktree",
+                        "open",
+                        "--cwd",
+                        str(repository),
+                        "--path",
+                        str(checkout),
+                        "--label",
+                        label,
+                        "--no-focus",
+                        "--json",
                     )
-                    workspace_id = str((opened.get("workspace") or {}).get("workspace_id") or "")
-                    root_pane = str((opened.get("root_pane") or {}).get("pane_id") or "")
+                    workspace_id = str(
+                        (opened.get("workspace") or {}).get("workspace_id") or ""
+                    )
+                    root_pane = str(
+                        (opened.get("root_pane") or {}).get("pane_id") or ""
+                    )
             else:
                 created = self.run_json(
-                    "worktree", "create", "--cwd", str(repository), "--branch", branch,
-                    "--label", label, "--no-focus", "--json", timeout=120
+                    "worktree",
+                    "create",
+                    "--cwd",
+                    str(repository),
+                    "--branch",
+                    branch,
+                    "--label",
+                    label,
+                    "--no-focus",
+                    "--json",
+                    timeout=120,
                 )
-                checkout = Path(str((created.get("worktree") or {}).get("path") or "")).resolve()
-                workspace_id = str((created.get("workspace") or {}).get("workspace_id") or "")
+                checkout = Path(
+                    str((created.get("worktree") or {}).get("path") or "")
+                ).resolve()
+                workspace_id = str(
+                    (created.get("workspace") or {}).get("workspace_id") or ""
+                )
                 root_pane = str((created.get("root_pane") or {}).get("pane_id") or "")
         existing_agent = self.find_agent(
             repository=repository,
@@ -423,7 +462,9 @@ class HerdrClient:
             None,
         )
         workspace_id = str(workspace.get("workspace_id") or "") if workspace else None
-        pane, workspace_id = self.new_pane(HOME_ROOT, "voice-router", workspace_id or None)
+        pane, workspace_id = self.new_pane(
+            HOME_ROOT, "voice-router", workspace_id or None
+        )
         return self.start_agent(HOME_ROOT, "router", pane, workspace_id)
 
     def prompt_and_wait(
@@ -432,8 +473,13 @@ class HerdrClient:
         before = self.get_agent(target)
         process = subprocess.Popen(
             self.command(
-                "agent", "prompt", target, text, "--wait", "--timeout",
-                str(int(timeout * 1000))
+                "agent",
+                "prompt",
+                target,
+                text,
+                "--wait",
+                "--timeout",
+                str(int(timeout * 1000)),
             ),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -488,7 +534,10 @@ class HerdrClient:
         confidence = (
             extract_marker(outcome.output, "ROUTE_CONFIDENCE", token) or "low"
         ).casefold()
-        reason = extract_marker(outcome.output, "ROUTE_REASON", token) or "No routing reason."
+        reason = (
+            extract_marker(outcome.output, "ROUTE_REASON", token)
+            or "No routing reason."
+        )
         resolved, _ = self.resolve_repository(name, "", repositories)
         return (resolved if confidence == "high" else None), confidence, reason
 

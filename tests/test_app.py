@@ -18,10 +18,11 @@ class ForegroundDeliveryTests(unittest.TestCase):
 
         with (
             mock.patch.object(app, "start_components"),
+            mock.patch.object(app, "enrich_request", side_effect=lambda text: text),
             mock.patch.object(app, "cursor_turn", side_effect=cursor_turn),
             mock.patch.object(
                 app,
-                "synthesize_and_play",
+                "stream_and_play",
                 side_effect=lambda _text: events.append("played"),
             ),
             mock.patch.object(
@@ -44,10 +45,11 @@ class ForegroundDeliveryTests(unittest.TestCase):
 
         with (
             mock.patch.object(app, "start_components"),
+            mock.patch.object(app, "enrich_request", side_effect=lambda text: text),
             mock.patch.object(app, "cursor_turn", side_effect=cursor_turn),
             mock.patch.object(
                 app,
-                "synthesize_and_play",
+                "stream_and_play",
                 side_effect=RuntimeError("playback failed"),
             ),
             mock.patch.object(app, "acknowledge_deliveries") as acknowledge,
@@ -58,6 +60,41 @@ class ForegroundDeliveryTests(unittest.TestCase):
 
         acknowledge.assert_not_called()
         release.assert_called_once_with([("123456789abc", "claim")])
+
+
+class AppContextTests(unittest.TestCase):
+    def test_manual_cursor_request_includes_focused_context(self) -> None:
+        with (
+            mock.patch.object(app, "start_components"),
+            mock.patch.object(
+                app, "enrich_request", return_value="ask Cursor to fix this\n\ncontext"
+            ) as enrich,
+            mock.patch.object(
+                app, "cursor_turn", return_value=("done", None)
+            ) as cursor_turn,
+            mock.patch.object(app, "stream_and_play"),
+        ):
+            app.respond("ask Cursor to fix this")
+
+        enrich.assert_called_once_with("ask Cursor to fix this")
+        cursor_turn.assert_called_once_with(
+            "ask Cursor to fix this\n\ncontext", delivery_claims=mock.ANY
+        )
+
+    def test_manual_conversation_includes_focused_context(self) -> None:
+        with (
+            mock.patch.object(app, "start_components"),
+            mock.patch.object(
+                app, "enrich_request", return_value="summarize this\n\ncontext"
+            ),
+            mock.patch.object(app, "qwen_response", return_value="summary") as qwen,
+            mock.patch.object(app, "stream_and_play"),
+        ):
+            app.respond("summarize this")
+
+        qwen.assert_called_once_with(
+            "summarize this\n\ncontext", delivery_claims=mock.ANY
+        )
 
 
 if __name__ == "__main__":

@@ -9,12 +9,13 @@ import sys
 import threading
 import time
 import uuid
+from collections.abc import Callable
 from pathlib import Path
-from typing import Callable
 
 from ..config import CURSOR_FOREGROUND_SECONDS, JOBS_DIR
 from ..errors import HarnessError
 from ..integrations.herdr import (
+    AgentSelection,
     HerdrClient,
     HerdrError,
     extract_linear_issue,
@@ -71,7 +72,7 @@ def _mutate_job(
             raise HarnessError(f"could not read Cursor job {job_id}") from exc
         if not mutate(job):
             return None
-        job["revision"] = int(job.get("revision") or 0) + 1
+        job["revision"] = int(str(job.get("revision") or 0)) + 1
         write_unlocked(job_path(job_id), job)
         return dict(job)
 
@@ -90,7 +91,7 @@ def _prepare_delivery(job: dict[str, object], *, now: float | None = None) -> No
     job.update(
         {
             "delivered": False,
-            "delivery_generation": int(job.get("delivery_generation") or 0) + 1,
+            "delivery_generation": int(str(job.get("delivery_generation") or 0)) + 1,
             "delivery_claim_token": None,
             "delivery_claimed_at": None,
             "delivery_retry_at": 0,
@@ -117,10 +118,7 @@ def reserved_targets(exclude_job_id: str | None = None) -> set[str]:
         for job in _all_jobs()
         if job.get("herdr_target")
         and job.get("id") != exclude_job_id
-        and (
-            job.get("status") in ACTIVE_STATUSES
-            or job.get("target_release_pending")
-        )
+        and (job.get("status") in ACTIVE_STATUSES or job.get("target_release_pending"))
     }
 
 
@@ -205,7 +203,7 @@ def _process_identity(pid: int) -> str | None:
 
 
 def _worker_is_alive(job: dict[str, object]) -> bool:
-    pid = int(job.get("worker_pid") or 0)
+    pid = int(str(job.get("worker_pid") or 0))
     expected = str(job.get("worker_process_start") or "")
     if not pid:
         return False
@@ -225,7 +223,7 @@ def _stop_legacy_worker(job_id: str, timeout: float = 2.0) -> bool:
     job = read_job(job_id)
     if job.get("worker_token") or not _worker_is_alive(job):
         return True
-    pid = int(job.get("worker_pid") or 0)
+    pid = int(str(job.get("worker_pid") or 0))
     try:
         if os.getpgid(pid) == pid:
             os.killpg(pid, signal.SIGTERM)
@@ -248,7 +246,7 @@ def _stop_legacy_worker(job_id: str, timeout: float = 2.0) -> bool:
 
 
 def _target_release_owner_alive(job: dict[str, object]) -> bool:
-    pid = int(job.get("target_release_owner_pid") or 0)
+    pid = int(str(job.get("target_release_owner_pid") or 0))
     expected = str(job.get("target_release_owner_start") or "")
     return bool(pid and expected and _process_identity(pid) == expected)
 
@@ -271,7 +269,9 @@ def _worker_change(
     return _mutate_job(job_id, guarded)
 
 
-def _begin_worker(job_id: str, claim_token: str | None) -> tuple[dict[str, object], str] | None:
+def _begin_worker(
+    job_id: str, claim_token: str | None
+) -> tuple[dict[str, object], str] | None:
     token = claim_token or uuid.uuid4().hex
 
     def begin(job: dict[str, object]) -> bool:
@@ -380,11 +380,11 @@ def _worker_fail(job_id: str, token: str, exc: Exception) -> None:
 def _reserve_worker_target(
     job_id: str,
     token: str,
-    selection: object,
+    selection: AgentSelection,
     repository: Path,
-    issue_key: str,
+    issue_key: str | None,
 ) -> dict[str, object] | None:
-    target = str(getattr(selection, "target"))
+    target = str(selection.target)
     with locked(JOBS_DIR):
         try:
             job = read_unlocked(job_path(job_id))
@@ -407,11 +407,11 @@ def _reserve_worker_target(
                 "repository": str(repository),
                 "issue_key": issue_key,
                 "herdr_target": target,
-                "herdr_pane_id": getattr(selection, "pane_id"),
-                "herdr_workspace_id": getattr(selection, "workspace_id"),
-                "worktree_path": getattr(selection, "worktree_path"),
-                "agent_name": getattr(selection, "name"),
-                "revision": int(job.get("revision") or 0) + 1,
+                "herdr_pane_id": selection.pane_id,
+                "herdr_workspace_id": selection.workspace_id,
+                "worktree_path": selection.worktree_path,
+                "agent_name": selection.name,
+                "revision": int(str(job.get("revision") or 0)) + 1,
             }
         )
         write_unlocked(job_path(job_id), job)
@@ -437,7 +437,7 @@ def run_worker(job_id: str, claim_token: str | None = None) -> None:
             )
             return
 
-        turn = int(job.get("turn") or 0) + 1
+        turn = int(str(job.get("turn") or 0)) + 1
         token = f"{job_id}-{turn}"
         worker_token = claimed[1]
 
@@ -511,7 +511,9 @@ def run_worker(job_id: str, claim_token: str | None = None) -> None:
             return
         outcome = client.prompt_and_wait(
             target,
-            cursor_prompt(str(job.get("request") or ""), token, continuation=continuation),
+            cursor_prompt(
+                str(job.get("request") or ""), token, continuation=continuation
+            ),
             token=token,
         )
         _worker_complete(
@@ -561,7 +563,7 @@ def launch_worker(job_id: str) -> None:
                 }
             )
             _prepare_delivery(job)
-            job["revision"] = int(job.get("revision") or 0) + 1
+            job["revision"] = int(str(job.get("revision") or 0)) + 1
             write_unlocked(job_path(job_id), job)
             raise
         finally:
@@ -573,7 +575,7 @@ def launch_worker(job_id: str) -> None:
                 "worker_pid": pid,
                 "worker_process_start": _process_identity(pid),
                 "attempt_started_at": time.time(),
-                "revision": int(job.get("revision") or 0) + 1,
+                "revision": int(str(job.get("revision") or 0)) + 1,
             }
         )
         write_unlocked(job_path(job_id), job)
@@ -698,6 +700,7 @@ def cancel_job(job_id: str) -> str:
             except HerdrError:
                 pass
         finally:
+
             def release_target(job: dict[str, object]) -> bool:
                 if job.get("status") != "cancelled":
                     return False
@@ -721,10 +724,14 @@ def job_status(job_id: str | None = None) -> str:
     jobs = active_jobs()
     if not jobs:
         return "There are no active Cursor jobs."
-    return "Active Cursor jobs: " + "; ".join(
-        f"{job.get('id')} is {str(job.get('status')).replace('_', ' ')}"
-        for job in jobs
-    ) + "."
+    return (
+        "Active Cursor jobs: "
+        + "; ".join(
+            f"{job.get('id')} is {str(job.get('status')).replace('_', ' ')}"
+            for job in jobs
+        )
+        + "."
+    )
 
 
 def mark_delivered(job_id: str) -> dict[str, object]:
@@ -756,25 +763,25 @@ def claim_delivery(
             jobs = [job for job in jobs if job.get("id") == job_id]
         jobs.sort(
             key=lambda job: float(
-                job.get("completed_at") or job.get("created_at") or 0
+                str(job.get("completed_at") or job.get("created_at") or 0)
             )
         )
         for job in jobs:
             status = str(job.get("status") or "")
             if status not in DELIVERABLE_STATUSES or job.get("delivered"):
                 continue
-            if not foreground and now < float(job.get("foreground_until") or 0):
+            if not foreground and now < float(str(job.get("foreground_until") or 0)):
                 continue
-            if now < float(job.get("delivery_retry_at") or 0):
+            if now < float(str(job.get("delivery_retry_at") or 0)):
                 continue
-            completed_age = now - float(job.get("completed_at") or now)
+            completed_age = now - float(str(job.get("completed_at") or now))
             if (
                 not foreground
                 and status not in {"awaiting_user", "blocked"}
                 and completed_age < 1
             ):
                 continue
-            claimed_at = float(job.get("delivery_claimed_at") or 0)
+            claimed_at = float(str(job.get("delivery_claimed_at") or 0))
             if job.get("delivery_claim_token") and (
                 now - claimed_at < DELIVERY_CLAIM_SECONDS
             ):
@@ -784,8 +791,9 @@ def claim_delivery(
                 {
                     "delivery_claim_token": token,
                     "delivery_claimed_at": now,
-                    "delivery_attempts": int(job.get("delivery_attempts") or 0) + 1,
-                    "revision": int(job.get("revision") or 0) + 1,
+                    "delivery_attempts": int(str(job.get("delivery_attempts") or 0))
+                    + 1,
+                    "revision": int(str(job.get("revision") or 0)) + 1,
                 }
             )
             write_unlocked(job_path(str(job["id"])), job)
@@ -874,7 +882,9 @@ def recover_jobs() -> None:
             status = str(job.get("status") or "")
             changed = False
             should_launch = False
-            if job.get("target_release_pending") and not _target_release_owner_alive(job):
+            if job.get("target_release_pending") and not _target_release_owner_alive(
+                job
+            ):
                 job.update(
                     {
                         "target_release_pending": False,
@@ -887,7 +897,7 @@ def recover_jobs() -> None:
                 if (
                     job.get("delivered")
                     and job.get("herdr_target")
-                    and now >= float(job.get("next_reconcile_at") or 0)
+                    and now >= float(str(job.get("next_reconcile_at") or 0))
                 ):
                     job.update(
                         {
@@ -903,7 +913,7 @@ def recover_jobs() -> None:
             elif status == "queued":
                 if not job.get("worker_token") or not _worker_is_alive(job):
                     _clear_worker(job)
-                    job["queued_at"] = float(job.get("queued_at") or now)
+                    job["queued_at"] = float(str(job.get("queued_at") or now))
                     changed = True
                     should_launch = True
             elif status == "routing":
@@ -926,9 +936,7 @@ def recover_jobs() -> None:
                         )
                         should_launch = True
                     else:
-                        message = (
-                            "Cursor job was interrupted before an agent started"
-                        )
+                        message = "Cursor job was interrupted before an agent started"
                         job.update(
                             {
                                 "status": "failed",
@@ -941,7 +949,7 @@ def recover_jobs() -> None:
                         _prepare_delivery(job, now=now)
                     changed = True
             if changed:
-                job["revision"] = int(job.get("revision") or 0) + 1
+                job["revision"] = int(str(job.get("revision") or 0)) + 1
                 write_unlocked(job_path(str(job["id"])), job)
             if should_launch:
                 launch.append(str(job["id"]))
@@ -1032,4 +1040,7 @@ def cursor_turn(
             }
         )
     )
-    return f"Cursor is still working on job {job_id}. I will report back when it finishes.", None
+    return (
+        f"Cursor is still working on job {job_id}. I will report back when it finishes.",
+        None,
+    )

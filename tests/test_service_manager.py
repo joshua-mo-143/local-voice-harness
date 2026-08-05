@@ -52,7 +52,9 @@ class ServiceManagementTests(unittest.TestCase):
                     Path("/definitely/not/a/source/tree"),
                 ),
             ):
-                self.assertEqual(source.read_text(), service_manager.unit_text(source.name))
+                self.assertEqual(
+                    source.read_text(), service_manager.unit_text(source.name)
+                )
 
     def test_all_console_entry_points_load(self) -> None:
         expected = {

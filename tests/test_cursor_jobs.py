@@ -22,7 +22,7 @@ class CursorJobStateTests(unittest.TestCase):
         self.temporary.cleanup()
 
     def test_repository_reply_preserves_original_task(self) -> None:
-        job = {
+        job: dict[str, object] = {
             "id": "123456789abc",
             "request": "Fix APP-42",
             "status": "awaiting_user",
@@ -98,9 +98,7 @@ class CursorJobStateTests(unittest.TestCase):
         ):
             jobs.launch_worker("123456789abc")
         command = popen.call_args.args[0]
-        self.assertEqual(
-            command[1:3], ["-m", "local_voice_harness.cursor.worker"]
-        )
+        self.assertEqual(command[1:3], ["-m", "local_voice_harness.cursor.worker"])
         thread.assert_called_once()
 
     def test_dead_worker_reconciles_existing_agent(self) -> None:
@@ -287,9 +285,14 @@ class CursorJobStateTests(unittest.TestCase):
             "id": "123456789abc",
             "worker_pid": 42,
         }
-        command = (
-            b"/usr/bin/python\0-m\0local_voice_harness.cursor.worker\0"
-            b"123456789abc\0"
+        command = b"\0".join(
+            (
+                b"/usr/bin/python",
+                b"-m",
+                b"local_voice_harness.cursor.worker",
+                b"123456789abc",
+                b"",
+            )
         )
         with mock.patch.object(Path, "read_bytes", return_value=command):
             self.assertTrue(jobs._worker_is_alive(job))

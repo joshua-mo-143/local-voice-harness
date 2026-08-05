@@ -10,8 +10,10 @@ import sys
 import threading
 import time
 import wave
+from dataclasses import dataclass
 from pathlib import Path
 
+from ..browser_context import enrich_request
 from ..components import llm_ready, start_components, stop_components
 from ..config import CURSOR_PATTERN, DEFAULT_SOURCE, STATE_DIR, WAV_PATH
 from ..cursor.jobs import (
@@ -28,7 +30,7 @@ from ..errors import HarnessError
 from ..llm import qwen_turn
 from ..notifications import notify
 from ..stt.client import transcribe
-from ..tts.client import synthesize_and_play
+from ..tts.client import stream_and_play
 
 SAMPLE_RATE = 16_000
 FRAME_MS = 80
@@ -44,9 +46,18 @@ SOURCE = os.environ.get("VOICE_HARNESS_SOURCE", DEFAULT_SOURCE)
 PRE_ROLL_FRAMES = 25
 MICROPHONE_START_ATTEMPTS = 30
 MICROPHONE_RETRY_SECONDS = 1
-WAKE_PREFIX = re.compile(
-    r"^\s*hey[,\s]+(?:jarvis|travis)\b[\s,;:!?.-]*", re.IGNORECASE
+BARGE_IN_MODE = os.environ.get("VOICE_HARNESS_BARGE_IN_MODE", "wake").strip().lower()
+BARGE_IN_SPEECH_FRAMES = max(
+    1, int(os.environ.get("VOICE_HARNESS_BARGE_IN_SPEECH_FRAMES", "5"))
 )
+PLAYBACK_QUIET_FRAMES = max(
+    1, int(os.environ.get("VOICE_HARNESS_PLAYBACK_QUIET_FRAMES", "4"))
+)
+PLAYBACK_QUIET_TIMEOUT_SECONDS = max(
+    0.0, float(os.environ.get("VOICE_HARNESS_PLAYBACK_QUIET_TIMEOUT_SECONDS", "2"))
+)
+WAKE_PREFIX = re.compile(r"^\s*hey[,\s]+(?:jarvis|travis)\b[\s,;:!?.-]*", re.IGNORECASE)
+SPOKEN_WAKE_PATTERN = re.compile(r"\bhey[,\s]+(?:jarvis|travis)\b", re.IGNORECASE)
 CLOSE_PATTERN = re.compile(
     r"\b(?:goodbye|stop listening|go to sleep|end conversation)\b", re.IGNORECASE
 )
@@ -56,6 +67,12 @@ JOB_CANCEL_PATTERN = re.compile(
 JOB_STATUS_PATTERN = re.compile(
     r"\b(?:status|progress|what(?:'s| is)\s+happening)\b", re.IGNORECASE
 )
+
+
+@dataclass
+class BargeIn:
+    initial: list[bytes]
+    woke: bool
 
 
 def log(message: str) -> None:
@@ -69,12 +86,16 @@ class WakeConversationDaemon:
         import webrtcvad
         from openwakeword.model import Model
 
+        if BARGE_IN_MODE not in {"wake", "vad", "off"}:
+            raise HarnessError(
+                "VOICE_HARNESS_BARGE_IN_MODE must be 'wake', 'vad', or 'off'"
+            )
         self.np = np
+        module_path = openwakeword.__file__
+        if module_path is None:
+            raise HarnessError("Could not locate OpenWakeWord package resources")
         model_path = (
-            Path(openwakeword.__file__).parent
-            / "resources"
-            / "models"
-            / "hey_jarvis_v0.1.onnx"
+            Path(module_path).parent / "resources" / "models" / "hey_jarvis_v0.1.onnx"
         )
         self.wake_model = Model(
             wakeword_models=[str(model_path)],
@@ -93,6 +114,7 @@ class WakeConversationDaemon:
         self.last_wake = 0.0
         self.running = True
         self.microphone: subprocess.Popen[bytes] | None = None
+        self.microphone_paused = False
         self.activation_thread: threading.Thread | None = None
         self.activation_error: Exception | None = None
         self.component_lock = threading.Lock()
@@ -140,7 +162,9 @@ class WakeConversationDaemon:
             )
             time.sleep(0.2)
             if self.microphone.poll() is None:
-                log(f"listening for Hey Jarvis on {SOURCE or 'PipeWire default source'}")
+                log(
+                    f"listening for Hey Jarvis on {SOURCE or 'PipeWire default source'}"
+                )
                 return
 
             detail = (
@@ -162,13 +186,22 @@ class WakeConversationDaemon:
             time.sleep(MICROPHONE_RETRY_SECONDS)
 
     def pause_microphone(self) -> None:
-        if self.microphone is not None and self.microphone.poll() is None:
+        if (
+            not self.microphone_paused
+            and self.microphone is not None
+            and self.microphone.poll() is None
+        ):
             os.kill(self.microphone.pid, signal.SIGSTOP)
+            self.microphone_paused = True
 
     def resume_microphone(self) -> None:
+        if not self.microphone_paused:
+            return
         if self.microphone is None or self.microphone.poll() is not None:
+            self.microphone_paused = False
             return
         os.kill(self.microphone.pid, signal.SIGCONT)
+        self.microphone_paused = False
         for _ in range(4):
             self.read_frame()
         self.pre_roll.clear()
@@ -219,7 +252,9 @@ class WakeConversationDaemon:
                     while time.monotonic() < deadline and not llm_ready():
                         time.sleep(0.1)
                     if not llm_ready():
-                        raise HarnessError("Qwen did not become ready within 30 seconds")
+                        raise HarnessError(
+                            "Qwen did not become ready within 30 seconds"
+                        )
                     qwen_turn("Reply with only OK. Do not call a tool.")
                     start_components()
                     log("Qwen tool graph and Chatterbox are warm")
@@ -259,7 +294,70 @@ class WakeConversationDaemon:
             self.resume_microphone()
         notify("Conversation closed")
 
-    def process_utterance(self, *, woke: bool) -> None:
+    def wait_for_playback_quiet(self) -> None:
+        if self.microphone is None or self.microphone.poll() is not None:
+            self.pre_roll.clear()
+            return
+        quiet = 0
+        max_frames = max(
+            PLAYBACK_QUIET_FRAMES,
+            int(PLAYBACK_QUIET_TIMEOUT_SECONDS * 1000 / FRAME_MS),
+        )
+        for _ in range(max_frames):
+            frame = self.read_frame()
+            quiet = quiet + 1 if not self.is_speech(frame) else 0
+            if quiet >= PLAYBACK_QUIET_FRAMES:
+                break
+        self.pre_roll.clear()
+
+    def play_response(self, response: str) -> tuple[dict[str, object], BargeIn | None]:
+        self.resume_microphone()
+        self.pre_roll.clear()
+        self.wake_model.reset()
+        speech_streak = 0
+        interruption: BargeIn | None = None
+        wake_barge_enabled = SPOKEN_WAKE_PATTERN.search(response) is None
+        if BARGE_IN_MODE == "wake" and not wake_barge_enabled:
+            log(
+                "wake barge-in suppressed because the response contains the wake phrase"
+            )
+
+        def should_interrupt() -> bool:
+            nonlocal speech_streak, interruption
+            frame = self.read_frame()
+            self.pre_roll.append(frame)
+            if BARGE_IN_MODE == "off":
+                return False
+            if BARGE_IN_MODE == "vad":
+                speech_streak = speech_streak + 1 if self.is_speech(frame) else 0
+                detected = speech_streak >= BARGE_IN_SPEECH_FRAMES
+                woke = False
+            else:
+                samples = self.np.frombuffer(frame, dtype="<i2")
+                score = float(self.wake_model.predict(samples).get(self.wake_key, 0.0))
+                detected = wake_barge_enabled and score >= WAKE_THRESHOLD
+                woke = True
+            if detected:
+                interruption = BargeIn(initial=list(self.pre_roll), woke=woke)
+                self.pre_roll.clear()
+                log(f"barge-in detected ({BARGE_IN_MODE})")
+                return True
+            return False
+
+        try:
+            result = stream_and_play(response, should_interrupt=should_interrupt)
+        finally:
+            self.wake_model.reset()
+        if interruption is None:
+            self.wait_for_playback_quiet()
+        return result, interruption
+
+    def continue_after_barge_in(self, interruption: BargeIn | None) -> None:
+        while interruption is not None and self.running:
+            self.record_utterance(interruption.initial)
+            interruption = self.process_utterance(woke=interruption.woke)
+
+    def process_utterance(self, *, woke: bool) -> BargeIn | None:
         had_active_conversation = bool(self.conversation_deadline)
         delivery_claims: DeliveryClaims = []
         self.pause_microphone()
@@ -270,23 +368,26 @@ class WakeConversationDaemon:
                 if match is None:
                     log(f"rejected wake candidate: {text!r}")
                     self.stop_components_when_idle()
-                    return
+                    return None
                 text = text[match.end() :].strip()
             if not text:
                 log("wake phrase contained no request; waiting for follow-up")
                 notify("Listening for a follow-up…")
                 self.awaiting_followup = True
-                self.conversation_deadline = time.monotonic() + CONVERSATION_TIMEOUT_SECONDS
-                return
+                self.conversation_deadline = (
+                    time.monotonic() + CONVERSATION_TIMEOUT_SECONDS
+                )
+                return None
             self.awaiting_followup = False
             log(f"user: {text}")
             if CLOSE_PATTERN.search(text):
                 self.close_conversation("spoken command")
-                return
+                return None
             self.ensure_components()
             print(f"You: {text}", flush=True)
             next_cursor_session = self.cursor_session
             next_history = list(self.history)
+            remember_response = False
             if self.cursor_session is not None and JOB_CANCEL_PATTERN.search(text):
                 response, next_cursor_session = cursor_turn(
                     "",
@@ -304,24 +405,32 @@ class WakeConversationDaemon:
                 )
             elif CURSOR_PATTERN.match(text):
                 response, next_cursor_session = cursor_turn(
-                    text, delivery_claims=delivery_claims
+                    enrich_request(text), delivery_claims=delivery_claims
                 )
             else:
                 response, next_cursor_session = qwen_turn(
-                    text,
+                    enrich_request(text),
                     self.history,
                     self.cursor_session,
                     delivery_claims=delivery_claims,
                 )
-                next_history.extend(
-                    [
-                        {"role": "user", "content": text},
-                        {"role": "assistant", "content": response},
-                    ]
-                )
-                next_history = next_history[-8:]
+                remember_response = True
             print(f"Assistant: {response}", flush=True)
-            synthesize_and_play(response)
+            playback, interruption = self.play_response(response)
+            if remember_response:
+                played_text = (
+                    str(playback.get("played_text") or "").strip()
+                    if playback.get("interrupted")
+                    else response
+                )
+                next_history.append({"role": "user", "content": text})
+                if played_text:
+                    next_history.append({"role": "assistant", "content": played_text})
+                next_history = next_history[-8:]
+            if interruption is not None:
+                release_deliveries(delivery_claims)
+                self.history = next_history
+                return interruption
             acknowledge_deliveries(delivery_claims)
             self.cursor_session = next_cursor_session
             self.history = next_history
@@ -341,8 +450,9 @@ class WakeConversationDaemon:
         finally:
             self.resume_microphone()
             self.wake_model.reset()
+        return None
 
-    def announce_job(self, job: dict[str, object]) -> None:
+    def announce_job(self, job: dict[str, object]) -> BargeIn | None:
         job_id = str(job.get("id") or "")
         delivery_token = str(job.get("_delivery_token") or "")
         self.pause_microphone()
@@ -353,9 +463,10 @@ class WakeConversationDaemon:
             if job.get("status") == "completed":
                 response = f"Cursor finished. {str(job.get('result') or '').strip()}"
             elif job.get("status") == "awaiting_user":
-                response = "Cursor needs clarification. " + str(
-                    job.get("question") or job.get("result") or ""
-                ).strip()
+                response = (
+                    "Cursor needs clarification. "
+                    + str(job.get("question") or job.get("result") or "").strip()
+                )
             elif job.get("status") == "blocked":
                 response = str(
                     job.get("result")
@@ -364,16 +475,17 @@ class WakeConversationDaemon:
             elif job.get("status") == "cancelled":
                 response = str(job.get("result") or "Cursor job was cancelled.").strip()
             else:
-                response = (
-                    f"Cursor job failed. {str(job.get('error') or 'Unknown error').strip()}"
-                )
+                response = f"Cursor job failed. {str(job.get('error') or 'Unknown error').strip()}"
             log(f"job {job_id} completion: {response}")
             print(f"Assistant: {response}", flush=True)
-            synthesize_and_play(response)
+            _, interruption = self.play_response(response)
+            if interruption is not None:
+                if delivery_token:
+                    release_delivery(job_id, delivery_token)
+                conversation_active = True
+                return interruption
             acknowledged = (
-                acknowledge_delivery(job_id, delivery_token)
-                if delivery_token
-                else True
+                acknowledge_delivery(job_id, delivery_token) if delivery_token else True
             )
             if job.get("status") == "awaiting_user" and acknowledged:
                 self.cursor_session = job_id
@@ -392,6 +504,7 @@ class WakeConversationDaemon:
                 self.stop_components_when_idle()
             self.resume_microphone()
             self.wake_model.reset()
+        return None
 
     def run(self) -> None:
         recover_jobs()
@@ -400,7 +513,7 @@ class WakeConversationDaemon:
         while self.running:
             jobs = pending_results()
             if jobs:
-                self.announce_job(jobs[0])
+                self.continue_after_barge_in(self.announce_job(jobs[0]))
                 speech_streak = 0
                 continue
             frame = self.read_frame()
@@ -418,7 +531,7 @@ class WakeConversationDaemon:
                     self.pre_roll.clear()
                     speech_streak = 0
                     self.record_utterance(initial)
-                    self.process_utterance(woke=False)
+                    self.continue_after_barge_in(self.process_utterance(woke=False))
                 continue
             samples = self.np.frombuffer(frame, dtype="<i2")
             score = float(self.wake_model.predict(samples).get(self.wake_key, 0.0))
@@ -430,11 +543,15 @@ class WakeConversationDaemon:
                 initial = list(self.pre_roll)
                 self.pre_roll.clear()
                 self.record_utterance(initial)
-                self.process_utterance(woke=True)
+                self.continue_after_barge_in(self.process_utterance(woke=True))
 
     def stop(self) -> None:
         self.running = False
         if self.microphone is not None and self.microphone.poll() is None:
+            if self.microphone_paused:
+                with contextlib.suppress(ProcessLookupError):
+                    os.kill(self.microphone.pid, signal.SIGCONT)
+                self.microphone_paused = False
             with contextlib.suppress(ProcessLookupError):
                 os.killpg(self.microphone.pid, signal.SIGTERM)
             with contextlib.suppress(subprocess.TimeoutExpired):
