@@ -82,6 +82,9 @@ class TextToSpeechClientTests(unittest.TestCase):
             mock.patch.object(
                 tts_client.time, "perf_counter", side_effect=[20.0, 20.125]
             ),
+            mock.patch.object(
+                tts_client.uuid, "uuid4", return_value=mock.Mock(hex="request-id")
+            ),
             mock.patch.dict(
                 os.environ, {"VOICE_HARNESS_VOICE": "/tmp/voice.wav"}, clear=True
             ),
@@ -95,12 +98,14 @@ class TextToSpeechClientTests(unittest.TestCase):
             json.loads(payload),
             {
                 "text": "hello",
-                "output": "/runtime/reply.wav",
+                "output": "/runtime/reply-request-id.wav",
                 "voice": "/tmp/voice.wav",
             },
         )
         request.assert_called_once_with(tts_client.TTS_SOCKET, payload, timeout=120)
-        run.assert_called_once_with(["pw-play", "/runtime/reply.wav"], check=True)
+        run.assert_called_once_with(
+            ["pw-play", "/runtime/reply-request-id.wav"], check=True
+        )
         self.assertEqual(result["stage"], "tts")
         self.assertEqual(result["request_seconds"], 0.125)
         self.assertEqual(json.loads(output.getvalue())["stage"], "tts")
