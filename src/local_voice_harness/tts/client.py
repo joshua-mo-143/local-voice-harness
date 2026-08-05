@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import fcntl
 import json
 import os
 import queue
@@ -12,7 +13,7 @@ import threading
 import time
 import uuid
 import wave
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from pathlib import Path
 
 from ..config import STATE_DIR, TTS_SOCKET
@@ -21,6 +22,17 @@ from ..ipc import unix_request
 
 STREAM_POLL_SECONDS = 0.08
 PLAYBACK_LATENCY = os.environ.get("VOICE_HARNESS_PLAYBACK_LATENCY", "100ms")
+
+
+@contextlib.contextmanager
+def playback_slot() -> Iterator[None]:
+    STATE_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with (STATE_DIR / "playback.lock").open("a+b") as lock:
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
 
 
 def synthesize_and_play(text: str) -> dict[str, object]:
@@ -35,29 +47,35 @@ def synthesize_and_play(text: str) -> dict[str, object]:
         ).encode()
         + b"\n"
     )
-    started = time.perf_counter()
     try:
-        response = unix_request(TTS_SOCKET, request, timeout=120)
-    except OSError as exc:
-        raise HarnessError(f"Chatterbox request failed: {exc}") from exc
-    try:
-        decoded = json.loads(response)
-    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
-        raise HarnessError("Chatterbox returned an invalid response") from exc
-    if not isinstance(decoded, dict):
-        raise HarnessError("Chatterbox returned an invalid response")
-    result: dict[str, object] = decoded
-    if not result.get("ok"):
-        raise HarnessError(f"Chatterbox failed: {result.get('error', 'unknown error')}")
-    result.update(
-        {
-            "stage": "tts",
-            "request_seconds": round(time.perf_counter() - started, 3),
-        }
-    )
-    print(json.dumps(result))
-    subprocess.run(["pw-play", str(output)], check=True)
-    return result
+        started = time.perf_counter()
+        try:
+            response = unix_request(TTS_SOCKET, request, timeout=120)
+        except OSError as exc:
+            raise HarnessError(f"Chatterbox request failed: {exc}") from exc
+        try:
+            decoded = json.loads(response)
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            raise HarnessError("Chatterbox returned an invalid response") from exc
+        if not isinstance(decoded, dict):
+            raise HarnessError("Chatterbox returned an invalid response")
+        result: dict[str, object] = decoded
+        if not result.get("ok"):
+            raise HarnessError(
+                f"Chatterbox failed: {result.get('error', 'unknown error')}"
+            )
+        result.update(
+            {
+                "stage": "tts",
+                "request_seconds": round(time.perf_counter() - started, 3),
+            }
+        )
+        print(json.dumps(result))
+        with playback_slot():
+            subprocess.run(["pw-play", str(output)], check=True)
+        return result
+    finally:
+        output.unlink(missing_ok=True)
 
 
 class StreamingPlayback:
@@ -334,4 +352,5 @@ def stream_and_play(
     *,
     should_interrupt: Callable[[], bool] | None = None,
 ) -> dict[str, object]:
-    return StreamingPlayback(text).run(should_interrupt=should_interrupt)
+    with playback_slot():
+        return StreamingPlayback(text).run(should_interrupt=should_interrupt)

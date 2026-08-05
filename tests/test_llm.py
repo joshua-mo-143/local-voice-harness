@@ -104,6 +104,7 @@ class QwenClientTests(unittest.TestCase):
             agent=None,
             action="submit",
             job_id=None,
+            delivery_claims=None,
         )
         second_request = urlopen.call_args_list[1].args[0]
         second_payload = json.loads(second_request.data)

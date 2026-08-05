@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import contextlib
 import io
 import json
 import os
+import tempfile
+import threading
+import time
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
@@ -80,6 +84,9 @@ class TextToSpeechClientTests(unittest.TestCase):
             ) as request,
             mock.patch.object(tts_client.subprocess, "run") as run,
             mock.patch.object(
+                tts_client, "playback_slot", return_value=contextlib.nullcontext()
+            ),
+            mock.patch.object(
                 tts_client.time, "perf_counter", side_effect=[20.0, 20.125]
             ),
             mock.patch.object(
@@ -123,6 +130,40 @@ class TextToSpeechClientTests(unittest.TestCase):
             tts_client.synthesize_and_play("hello")
 
         run.assert_not_called()
+
+    def test_streaming_playback_is_serialized_across_callers(self) -> None:
+        active = 0
+        maximum_active = 0
+        state_lock = threading.Lock()
+
+        def run_playback(*, should_interrupt: object = None) -> dict[str, object]:
+            del should_interrupt
+            nonlocal active, maximum_active
+            with state_lock:
+                active += 1
+                maximum_active = max(maximum_active, active)
+            time.sleep(0.02)
+            with state_lock:
+                active -= 1
+            return {"ok": True}
+
+        playback = mock.Mock()
+        playback.run.side_effect = run_playback
+        with (
+            tempfile.TemporaryDirectory() as temporary,
+            mock.patch.object(tts_client, "STATE_DIR", Path(temporary)),
+            mock.patch.object(tts_client, "StreamingPlayback", return_value=playback),
+        ):
+            threads = [
+                threading.Thread(target=tts_client.stream_and_play, args=("hello",))
+                for _ in range(2)
+            ]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+
+        self.assertEqual(maximum_active, 1)
 
     def test_synthesize_rejects_malformed_responses(self) -> None:
         for response in (b"not json", b"[]"):

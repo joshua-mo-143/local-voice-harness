@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import tempfile
+import threading
+import time
 import unittest
 import urllib.error
+from pathlib import Path
 from types import TracebackType
 from unittest import mock
 
@@ -91,6 +95,33 @@ class ComponentReadinessTests(unittest.TestCase):
             stdout=components.subprocess.DEVNULL,
             stderr=components.subprocess.DEVNULL,
         )
+
+    def test_stop_waits_for_active_cross_process_usage(self) -> None:
+        usage_started = threading.Event()
+        release_usage = threading.Event()
+
+        def use_components() -> None:
+            with components.component_usage():
+                usage_started.set()
+                release_usage.wait(timeout=2)
+
+        with (
+            tempfile.TemporaryDirectory() as temporary,
+            mock.patch.object(components, "STATE_DIR", Path(temporary)),
+            mock.patch.object(components.subprocess, "run") as run,
+        ):
+            usage = threading.Thread(target=use_components)
+            usage.start()
+            self.assertTrue(usage_started.wait(timeout=1))
+            stopping = threading.Thread(target=components.stop_components)
+            stopping.start()
+            time.sleep(0.02)
+            run.assert_not_called()
+            release_usage.set()
+            usage.join(timeout=2)
+            stopping.join(timeout=2)
+
+        run.assert_called_once()
 
 
 if __name__ == "__main__":

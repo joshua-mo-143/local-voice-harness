@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import subprocess
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -80,10 +81,20 @@ class CursorJobStateTests(unittest.TestCase):
 
     def test_worker_spawns_package_module(self) -> None:
         process = mock.Mock(spec=subprocess.Popen)
+        process.pid = 1234
         process.wait.return_value = 0
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "status": "queued",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
         with (
             mock.patch("subprocess.Popen", return_value=process) as popen,
             mock.patch("threading.Thread") as thread,
+            mock.patch.object(jobs, "_process_identity", return_value="worker-start"),
         ):
             jobs.launch_worker("123456789abc")
         command = popen.call_args.args[0]
@@ -97,13 +108,15 @@ class CursorJobStateTests(unittest.TestCase):
                 "status": "running",
                 "created_at": 1,
                 "worker_pid": 999999,
+                "worker_process_start": "old-worker",
+                "worker_token": "old-claim",
                 "herdr_target": "cursor-agent",
                 "delivered": False,
             }
         )
         with (
             mock.patch("time.time", return_value=100),
-            mock.patch("os.kill", side_effect=ProcessLookupError),
+            mock.patch.object(jobs, "_process_identity", return_value=None),
             mock.patch.object(jobs, "launch_worker") as launch,
         ):
             self.assertEqual(jobs.pending_results(), [])
@@ -112,6 +125,263 @@ class CursorJobStateTests(unittest.TestCase):
         )
         self.assertTrue(updated["reconcile"])
         launch.assert_called_once_with("123456789abc")
+
+    def test_stale_worker_cannot_overwrite_cancellation(self) -> None:
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "status": "running",
+                "turn_token": "turn",
+                "worker_token": "worker-claim",
+                "worker_pid": 42,
+                "worker_process_start": "old-worker",
+                "delivered": False,
+            }
+        )
+
+        jobs.cancel_job("123456789abc")
+        jobs._worker_complete(
+            "123456789abc",
+            "worker-claim",
+            output="VOICE_SUMMARY[turn]: stale success",
+            agent_status="idle",
+        )
+
+        updated = jobs.read_job("123456789abc")
+        self.assertEqual(updated["status"], "cancelled")
+        self.assertNotEqual(updated["result"], "stale success")
+
+    def test_only_one_concurrent_reply_transitions_job(self) -> None:
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "original",
+                "status": "awaiting_user",
+                "clarification_kind": "agent",
+                "delivered": True,
+            }
+        )
+        barrier = threading.Barrier(2)
+        successes: list[str] = []
+        errors: list[Exception] = []
+
+        def reply(text: str) -> None:
+            barrier.wait()
+            try:
+                jobs.reply_job("123456789abc", text)
+                successes.append(text)
+            except Exception as exc:
+                errors.append(exc)
+
+        with mock.patch.object(jobs, "launch_worker"):
+            threads = [
+                threading.Thread(target=reply, args=("first",)),
+                threading.Thread(target=reply, args=("second",)),
+            ]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+
+        self.assertEqual(len(successes), 1)
+        self.assertEqual(len(errors), 1)
+        self.assertEqual(jobs.read_job("123456789abc")["status"], "queued")
+
+    def test_delivery_claim_has_single_concurrent_winner(self) -> None:
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "status": "completed",
+                "result": "done",
+                "completed_at": 1,
+                "delivered": False,
+            }
+        )
+        barrier = threading.Barrier(2)
+        claims: list[dict[str, object] | None] = []
+
+        def claim() -> None:
+            barrier.wait()
+            claims.append(jobs.claim_delivery())
+
+        with mock.patch("time.time", return_value=100):
+            threads = [threading.Thread(target=claim) for _ in range(2)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+
+        self.assertEqual(sum(claim is not None for claim in claims), 1)
+
+    def test_launch_failure_is_persisted_for_delivery(self) -> None:
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "status": "queued",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        with (
+            mock.patch("subprocess.Popen", side_effect=OSError("spawn failed")),
+            self.assertRaisesRegex(OSError, "spawn failed"),
+        ):
+            jobs.launch_worker("123456789abc")
+
+        updated = jobs.read_job("123456789abc")
+        self.assertEqual(updated["status"], "failed")
+        self.assertFalse(updated["delivered"])
+        self.assertEqual(updated["error"], "spawn failed")
+
+    def test_abandoned_queued_job_is_launched_only_once(self) -> None:
+        process = mock.Mock(spec=subprocess.Popen)
+        process.pid = 4321
+        process.wait.return_value = 0
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "status": "queued",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        with (
+            mock.patch("subprocess.Popen", return_value=process) as popen,
+            mock.patch("threading.Thread"),
+            mock.patch.object(jobs, "_process_identity", return_value="worker-start"),
+        ):
+            jobs.recover_jobs()
+            jobs.recover_jobs()
+
+        popen.assert_called_once()
+        updated = jobs.read_job("123456789abc")
+        self.assertTrue(updated["worker_token"])
+
+    def test_interrupted_routing_worker_restarts_before_dispatch(self) -> None:
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "status": "routing",
+                "worker_token": "old",
+                "worker_pid": 999999,
+                "worker_process_start": "old-worker",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        with (
+            mock.patch.object(jobs, "_process_identity", return_value=None),
+            mock.patch.object(jobs, "launch_worker") as launch,
+        ):
+            jobs.recover_jobs()
+
+        updated = jobs.read_job("123456789abc")
+        self.assertEqual(updated["status"], "queued")
+        self.assertNotIn("reconcile", updated)
+        launch.assert_called_once_with("123456789abc")
+
+    def test_legacy_worker_pid_is_verified_by_command_line(self) -> None:
+        job = {
+            "id": "123456789abc",
+            "worker_pid": 42,
+        }
+        command = b"\0".join(
+            (
+                b"/usr/bin/python",
+                b"-m",
+                b"local_voice_harness.cursor.worker",
+                b"123456789abc",
+                b"",
+            )
+        )
+        with mock.patch.object(Path, "read_bytes", return_value=command):
+            self.assertTrue(jobs._worker_is_alive(job))
+
+    def test_cancel_keeps_target_reserved_until_interrupt_finishes(self) -> None:
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "status": "running",
+                "herdr_target": "cursor-agent",
+                "worker_token": "worker",
+                "worker_pid": 42,
+                "worker_process_start": "old-worker",
+                "delivered": False,
+            }
+        )
+        client = mock.Mock()
+        reserved_during_cancel: set[str] = set()
+
+        def inspect_reservation(_target: str) -> None:
+            reserved_during_cancel.update(jobs.reserved_targets())
+
+        client.cancel_agent.side_effect = inspect_reservation
+        with mock.patch.object(jobs, "HerdrClient", return_value=client):
+            jobs.cancel_job("123456789abc")
+
+        self.assertIn("cursor-agent", reserved_during_cancel)
+        self.assertNotIn("cursor-agent", jobs.reserved_targets())
+
+    def test_cancel_retires_unfenced_legacy_worker_first(self) -> None:
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "status": "running",
+                "worker_pid": 42,
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        with (
+            mock.patch.object(jobs, "_worker_is_alive", return_value=True),
+            mock.patch.object(
+                jobs, "_stop_legacy_worker", return_value=True
+            ) as stop_legacy,
+        ):
+            jobs.cancel_job("123456789abc")
+
+        stop_legacy.assert_called_once_with("123456789abc")
+        self.assertEqual(jobs.read_job("123456789abc")["status"], "cancelled")
+
+    def test_recovery_releases_abandoned_cancellation_fence(self) -> None:
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "status": "cancelled",
+                "herdr_target": "cursor-agent",
+                "target_release_pending": True,
+                "target_release_owner_pid": 999999,
+                "target_release_owner_start": "old-process",
+                "completed_at": 1,
+                "delivered": True,
+            }
+        )
+        with mock.patch.object(jobs, "_process_identity", return_value=None):
+            jobs.recover_jobs()
+
+        updated = jobs.read_job("123456789abc")
+        self.assertFalse(updated["target_release_pending"])
+
+    def test_foreground_delivery_is_acknowledged_explicitly(self) -> None:
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "status": "completed",
+                "result": "done",
+                "completed_at": 1,
+                "delivered": False,
+            }
+        )
+        claims: jobs.DeliveryClaims = []
+        with mock.patch.object(jobs, "start_job", return_value="123456789abc"):
+            result, session = jobs.cursor_turn("do it", delivery_claims=claims)
+
+        self.assertEqual(result, "done")
+        self.assertIsNone(session)
+        self.assertFalse(jobs.read_job("123456789abc")["delivered"])
+        self.assertEqual(len(claims), 1)
+        jobs.acknowledge_deliveries(claims)
+        self.assertTrue(jobs.read_job("123456789abc")["delivered"])
 
 
 if __name__ == "__main__":

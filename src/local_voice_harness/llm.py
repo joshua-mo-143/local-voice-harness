@@ -7,7 +7,7 @@ import urllib.request
 from collections.abc import Mapping, Sequence
 
 from .config import LLM_CHAT
-from .cursor.jobs import cursor_turn
+from .cursor.jobs import DeliveryClaims, cursor_turn
 from .errors import HarnessError
 from .notifications import notify
 
@@ -85,6 +85,8 @@ def qwen_turn(
     text: str,
     history: Sequence[Mapping[str, object]] | None = None,
     cursor_session: str | None = None,
+    *,
+    delivery_claims: DeliveryClaims | None = None,
 ) -> tuple[str, str | None]:
     system_prompt = SYSTEM_PROMPT
     if cursor_session:
@@ -176,6 +178,7 @@ def qwen_turn(
                             agent=agent,
                             action=action,
                             job_id=job_id,
+                            delivery_claims=delivery_claims,
                         )
                     except Exception as exc:
                         tool_result = f"Cursor tool failed: {type(exc).__name__}: {exc}"
@@ -191,6 +194,9 @@ def qwen_turn(
 
 
 def qwen_response(
-    text: str, history: Sequence[Mapping[str, object]] | None = None
+    text: str,
+    history: Sequence[Mapping[str, object]] | None = None,
+    *,
+    delivery_claims: DeliveryClaims | None = None,
 ) -> str:
-    return qwen_turn(text, history)[0]
+    return qwen_turn(text, history, delivery_claims=delivery_claims)[0]

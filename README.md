@@ -31,12 +31,17 @@ PipeWire microphone
 
 The always-on wake daemon verifies OpenWakeWord candidates with Whisper to reject
 false activations. A request that takes longer than five seconds becomes a persisted
-background job, and its completion or clarification question is spoken later.
+background job, and its completion or clarification question is spoken later. Job
+transitions are serialized across the daemon and detached workers; abandoned jobs
+are recovered at daemon startup and during normal polling. Spoken background results
+use at-least-once delivery: playback is acknowledged only after it succeeds, so a
+crash at that boundary may repeat a result but will not silently lose it.
 
 Spoken responses use chunk-level streaming. Chatterbox still generates a complete
 waveform for each short sentence or clause, but the next chunk is synthesized while
 the current chunk is sent through one low-latency PipeWire playback stream. This is
-not native sample streaming from the model.
+not native sample streaming from the model. Playback sessions are serialized across
+processes so manual commands and daemon announcements cannot overlap.
 
 Cursor routing works as follows:
 
@@ -303,7 +308,9 @@ preserved by default; pass `--replace-dictation` only when intentionally migrati
 to the bundled backend.
 
 Qwen and Chatterbox are intentionally not enabled at login. The wake daemon starts
-them on demand and stops them when a conversation closes.
+them on demand and stops them when a conversation closes. It also stops them after a
+failed turn when no earlier conversation remains active. Manual text turns hold a
+cross-process usage lease so daemon cleanup cannot stop their models mid-response.
 
 ### Existing standalone dictation installations
 
