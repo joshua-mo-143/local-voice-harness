@@ -378,6 +378,7 @@ Hey Jarvis, what time is it?
 Hey Jarvis, ask Cursor to summarize the api-docs repository.
 Hey Jarvis, ask Cursor to work on Linear issue API-79.
 Hey Jarvis, summarize this issue.  # with a GitHub issue focused in Firefox
+Hey Jarvis, summarize this ticket. # with a Zendesk ticket focused in Firefox
 Hey Jarvis, what is the status of that Cursor job?
 Hey Jarvis, cancel that Cursor job.
 ```
@@ -412,10 +413,14 @@ On X11, each new conversational request checks whether Firefox is focused. The
 harness briefly selects and copies the address bar, restores the previous clipboard,
 and dismisses the address bar without navigating. A focused GitHub page contributes
 its URL; a focused issue page also contributes title, state, body, labels, and recent
-comments fetched through the authenticated `gh` CLI. Page content is treated as
-untrusted input. Missing tools, unsupported sessions such as native Wayland, focus
-changes during capture, and GitHub errors simply omit some or all browser context
-without failing the voice request.
+comments fetched through the authenticated `gh` CLI. A focused
+`https://<tenant>.zendesk.com/agent/tickets/<number>` page contributes its URL,
+tenant, ticket number, and bounded rendered page text copied from the authenticated
+browser session; no Zendesk API credentials are required. Only text currently loaded
+and selectable in the page is available, so collapsed or unloaded comments may be
+absent. Page content is treated as untrusted input. Missing tools, unsupported
+sessions such as native Wayland, focus changes during capture, and browser or GitHub
+errors simply omit some or all browser context without failing the voice request.
 
 For example, bind Super+D in i3:
 
@@ -494,8 +499,8 @@ Measured with all models warm on the RTX 5070 Ti Laptop GPU:
 - Herdr agents are started with workspace trust but not Cursor `--force`.
 - Ticket and MCP content is treated as untrusted input and inferred paths are
   validated against local Git repositories.
-- Focused GitHub issue content is read through `gh`, bounded before prompting, and
-  treated as untrusted external data.
+- Focused GitHub issue and rendered Zendesk ticket content is bounded before
+  prompting and treated as untrusted external data.
 - Jobs never automatically commit, push, open pull requests, or remove worktrees.
 - Runtime job metadata and audio live under `$XDG_RUNTIME_DIR/voice-harness`.
 
