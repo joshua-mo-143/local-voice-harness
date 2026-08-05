@@ -16,7 +16,7 @@ class AppContextTests(unittest.TestCase):
             mock.patch.object(
                 app, "cursor_turn", return_value=("done", None)
             ) as cursor_turn,
-            mock.patch.object(app, "synthesize_and_play"),
+            mock.patch.object(app, "stream_and_play"),
         ):
             app.respond("ask Cursor to fix this")
 
@@ -30,7 +30,7 @@ class AppContextTests(unittest.TestCase):
                 app, "enrich_request", return_value="summarize this\n\ncontext"
             ),
             mock.patch.object(app, "qwen_response", return_value="summary") as qwen,
-            mock.patch.object(app, "synthesize_and_play"),
+            mock.patch.object(app, "stream_and_play"),
         ):
             app.respond("summarize this")
 

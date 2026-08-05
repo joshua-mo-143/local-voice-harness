@@ -87,7 +87,6 @@ class ProcessUtteranceTests(unittest.TestCase):
                 "enrich_request",
                 return_value="what time is it\n\nGitHub context",
             ),
-            mock.patch.object(wake_daemon, "synthesize_and_play", return_value={}),
             mock.patch.object(wake_daemon, "notify"),
         ):
             daemon.process_utterance(woke=False)
