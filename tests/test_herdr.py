@@ -46,6 +46,63 @@ should I use?
             self.assertEqual(repository, alpha)
             self.assertEqual(matches, [alpha])
 
+    def test_live_agents_accepts_detected_idle_cursor_without_readiness(self) -> None:
+        client = herdr.HerdrClient("herdr")
+        agents = [
+            {
+                "agent": "cursor",
+                "agent_status": "idle",
+                "cwd": "/repo",
+                "pane_id": "w1:p1",
+            },
+            {
+                "agent": "cursor",
+                "agent_status": "idle",
+                "cwd": "/repo",
+                "interactive_ready": False,
+                "pane_id": "w1:p2",
+            },
+        ]
+        with mock.patch.object(client, "list_agents", return_value=agents):
+            live = client.live_agents()
+        self.assertEqual([agent["pane_id"] for agent in live], ["w1:p1"])
+
+    def test_existing_detected_agent_avoids_new_tab(self) -> None:
+        client = herdr.HerdrClient("herdr")
+        repository = Path("/repo")
+        checkout = Path("/checkout")
+        agent = {
+            "agent": "cursor",
+            "agent_status": "idle",
+            "cwd": str(checkout),
+            "pane_id": "w1:p1",
+            "workspace_id": "w1",
+        }
+        listing = {
+            "worktrees": [
+                {
+                    "branch": "voice/api-98",
+                    "path": str(checkout),
+                    "open_workspace_id": "w1",
+                }
+            ]
+        }
+        with (
+            mock.patch.object(client, "run_json", return_value=listing),
+            mock.patch.object(client, "list_agents", return_value=[agent]),
+            mock.patch.object(client, "new_pane") as new_pane,
+            mock.patch.object(client, "start_agent") as start_agent,
+        ):
+            selection = client.ensure_agent(
+                repository,
+                issue_key="API-98",
+                agent_hint=None,
+                reserved=set(),
+            )
+        self.assertEqual(selection.target, "w1:p1")
+        new_pane.assert_not_called()
+        start_agent.assert_not_called()
+
     def test_server_start_falls_back_to_transient_unit(self) -> None:
         client = herdr.HerdrClient("herdr")
         states = iter([False, False, True])

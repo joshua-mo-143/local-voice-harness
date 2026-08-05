@@ -247,7 +247,7 @@ class HerdrClient:
             agent
             for agent in self.list_agents()
             if agent.get("agent") == "cursor"
-            and agent.get("interactive_ready") is True
+            and agent.get("interactive_ready") is not False
             and agent.get("agent_status") in SETTLED
         ]
 
