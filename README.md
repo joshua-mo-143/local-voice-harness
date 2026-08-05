@@ -48,9 +48,11 @@ Cursor routing works as follows:
 1. Prefer an idle Cursor agent already running in the requested checkout.
 2. For a Linear issue without a repository name, ask a dedicated routing agent to
    inspect the ticket through Linear MCP and infer the repository.
-3. Create or reuse a `voice/<issue-key>` Git worktree for Linear implementation work.
-4. Start a new Cursor agent through Herdr when no suitable agent exists.
-5. Reserve that agent until it finishes, is blocked, or the job is cancelled.
+3. If no repository can be resolved, open Rofi to select a local repository or paste
+   a Git URL; cloning requires a second confirmation.
+4. Create or reuse a `voice/<issue-key>` Git worktree for Linear implementation work.
+5. Start a new Cursor agent through Herdr when no suitable agent exists.
+6. Reserve that agent until it finishes, is blocked, or the job is cancelled.
 
 The harness never automatically commits, pushes, opens pull requests, modifies
 Linear, or deletes generated worktrees.
@@ -93,6 +95,7 @@ Install these before setting up Python environments:
 - `libnotify`/`notify-send`.
 - Git, curl, the GitHub CLI (`gh`), and systemd user services.
 - `xdotool` and `xclip` for X11 focused-window automation.
+- Rofi for repository selection and pasteable clone-URL prompts.
 - [uv](https://docs.astral.sh/uv/) for reproducible Python versions/environments.
 - A recent [llama.cpp](https://github.com/ggml-org/llama.cpp) build with Vulkan and
   `llama-server`.
@@ -103,7 +106,7 @@ Install these before setting up Python environments:
 On Arch/CachyOS, the base packages are approximately:
 
 ```bash
-paru -S --needed pipewire libnotify git curl github-cli xdotool xclip uv libsndfile
+paru -S --needed pipewire libnotify git curl github-cli xdotool xclip rofi uv libsndfile
 ```
 
 Package names for llama.cpp and NVIDIA drivers vary. Verify the required commands:
@@ -496,6 +499,8 @@ Measured with all models warm on the RTX 5070 Ti Laptop GPU:
   validated against local Git repositories.
 - Focused GitHub issue content is read through `gh`, bounded before prompting, and
   treated as untrusted external data.
+- Repository cloning requires explicit Rofi confirmation, accepts only HTTPS or SSH
+  Git URLs, and places the checkout beneath the configured project root.
 - Jobs never automatically commit, push, open pull requests, or remove worktrees.
 - Runtime job metadata and audio live under `$XDG_RUNTIME_DIR/voice-harness`.
 

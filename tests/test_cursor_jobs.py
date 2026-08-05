@@ -9,6 +9,7 @@ from pathlib import Path
 from unittest import mock
 
 from local_voice_harness.cursor import jobs
+from local_voice_harness.integrations.herdr import AgentSelection, PromptOutcome
 
 
 class CursorJobStateTests(unittest.TestCase):
@@ -100,6 +101,44 @@ class CursorJobStateTests(unittest.TestCase):
         command = popen.call_args.args[0]
         self.assertEqual(command[1:3], ["-m", "local_voice_harness.cursor.worker"])
         thread.assert_called_once()
+
+    def test_worker_uses_rofi_repository_selection_before_prompting(self) -> None:
+        repository = Path(self.temporary.name) / "cloned-project"
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "Use Cursor to fix the bug",
+                "status": "queued",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        client = mock.Mock()
+        client.repository_roots.return_value = []
+        client.resolve_repository.return_value = (None, [])
+        client.choose_or_clone_repository.return_value = (repository, "")
+        client.ensure_agent.return_value = AgentSelection(
+            target="cursor-agent",
+            pane_id="pane",
+            workspace_id="workspace",
+            cwd=str(repository),
+            name="cursor-agent",
+            worktree_path=str(repository),
+        )
+        client.prompt_and_wait.return_value = PromptOutcome(
+            status="idle",
+            summary="done",
+            question=None,
+            output="VOICE_SUMMARY[123456789abc-1]: done",
+        )
+
+        with mock.patch.object(jobs, "HerdrClient", return_value=client):
+            jobs.run_worker("123456789abc")
+
+        updated = jobs.read_job("123456789abc")
+        self.assertEqual(updated["status"], "completed")
+        self.assertEqual(updated["repository"], str(repository))
+        client.choose_or_clone_repository.assert_called_once_with([])
 
     def test_dead_worker_reconciles_existing_agent(self) -> None:
         jobs.write_job(
