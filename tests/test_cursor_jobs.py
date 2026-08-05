@@ -51,10 +51,62 @@ class CursorJobStateTests(unittest.TestCase):
                 "Work on APP-43", session_id="oldjob123456"
             )
 
-        start.assert_called_once_with("Work on APP-43", repository=None, agent=None)
+        start.assert_called_once_with(
+            "Work on APP-43",
+            repository=None,
+            agent=None,
+            utterance=None,
+            context_repository=None,
+        )
         reply.assert_not_called()
         self.assertEqual(result, "done")
         self.assertIsNone(session)
+
+    def test_spoken_repository_precedes_focused_context_fallback(self) -> None:
+        spoken = Path("/repos/spoken")
+        focused = Path("/repos/focused")
+        client = mock.Mock()
+        client.resolve_repository.return_value = (spoken, [spoken])
+        job: dict[str, object] = {
+            "request": "work on this\n\nRepository: owner/focused",
+            "utterance": "work on the spoken repository",
+            "context_repository": "owner/focused",
+        }
+
+        repository, candidates = jobs.resolve_job_repository(
+            client, job, [spoken, focused]
+        )
+
+        self.assertEqual(repository, spoken)
+        self.assertEqual(candidates, [spoken])
+        client.resolve_repository.assert_called_once_with(
+            None, "work on the spoken repository", [spoken, focused]
+        )
+
+    def test_focused_repository_is_used_when_utterance_has_no_match(self) -> None:
+        focused = Path("/repos/focused")
+        client = mock.Mock()
+        client.resolve_repository.side_effect = [
+            (None, []),
+            (focused, [focused]),
+        ]
+        job: dict[str, object] = {
+            "request": "work on this\n\nRepository: owner/focused",
+            "utterance": "work on this task",
+            "context_repository": "owner/focused",
+        }
+
+        repository, candidates = jobs.resolve_job_repository(client, job, [focused])
+
+        self.assertEqual(repository, focused)
+        self.assertEqual(candidates, [focused])
+        self.assertEqual(
+            client.resolve_repository.call_args_list,
+            [
+                mock.call(None, "work on this task", [focused]),
+                mock.call("owner/focused", "", [focused]),
+            ],
+        )
 
     def test_latest_voice_marker_controls_terminal_state(self) -> None:
         job: dict[str, object] = {"id": "123456789abc", "turn_token": "token"}

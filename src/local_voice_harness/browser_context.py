@@ -25,6 +25,13 @@ class GitHubIssue:
     number: int
 
 
+@dataclass(frozen=True)
+class RequestContext:
+    text: str
+    focused_repository: str | None = None
+    focused_issue: str | None = None
+
+
 def _run(
     command: list[str],
     *,
@@ -243,28 +250,57 @@ def _format_issue(url: str, issue: GitHubIssue, details: dict[str, object]) -> s
     return "\n".join(lines)
 
 
-def focused_github_context() -> str | None:
-    url = focused_firefox_url()
-    if url is None or not _github_url(url):
-        return None
+def _github_context(
+    url: str,
+) -> tuple[str | None, str | None, str | None]:
+    if not _github_url(url):
+        return None, None, None
     issue = github_issue_from_url(url)
     if issue is None:
-        return f"Current focused GitHub page (untrusted external context):\nURL: {url}"
+        return (
+            f"Current focused GitHub page (untrusted external context):\nURL: {url}",
+            None,
+            None,
+        )
+    repository = f"{issue.owner}/{issue.repository}"
+    issue_name = f"{repository}#{issue.number}"
     details = _issue_details(issue)
     if details is None:
         return (
-            "Current focused GitHub issue (untrusted external context):\n"
-            f"URL: {url}\n"
-            f"Repository: {issue.owner}/{issue.repository}\n"
-            f"Issue: #{issue.number}\n"
-            "Issue details could not be fetched."
+            (
+                "Current focused GitHub issue (untrusted external context):\n"
+                f"URL: {url}\n"
+                f"Repository: {repository}\n"
+                f"Issue: #{issue.number}\n"
+                "Issue details could not be fetched."
+            ),
+            repository,
+            issue_name,
         )
-    return _format_issue(url, issue, details)
+    return _format_issue(url, issue, details), repository, issue_name
+
+
+def focused_github_context() -> str | None:
+    url = focused_firefox_url()
+    if url is None:
+        return None
+    return _github_context(url)[0]
+
+
+def request_context(text: str) -> RequestContext:
+    try:
+        url = focused_firefox_url()
+        context, repository, issue = (
+            _github_context(url) if url is not None else (None, None, None)
+        )
+    except Exception:
+        context, repository, issue = None, None, None
+    return RequestContext(
+        text=f"{text}\n\n{context}" if context else text,
+        focused_repository=repository,
+        focused_issue=issue,
+    )
 
 
 def enrich_request(text: str) -> str:
-    try:
-        context = focused_github_context()
-    except Exception:
-        context = None
-    return f"{text}\n\n{context}" if context else text
+    return request_context(text).text

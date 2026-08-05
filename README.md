@@ -23,6 +23,7 @@ PipeWire microphone
   -> OpenWakeWord ("Hey Jarvis")
   -> faster-whisper large-v3 (CUDA)
   -> Qwen3.5-4B Q4_K_M via llama.cpp (Vulkan)
+       -> focused intent classification
        -> ordinary conversational response
        -> Herdr-managed Cursor agent and Linear MCP
   -> Chatterbox Turbo (CUDA)
@@ -45,12 +46,14 @@ processes so manual commands and daemon announcements cannot overlap.
 
 Cursor routing works as follows:
 
-1. Prefer an idle Cursor agent already running in the requested checkout.
-2. For a Linear issue without a repository name, ask a dedicated routing agent to
+1. Ask a focused Qwen pass to classify conversation, new work, clarification replies,
+   status, and cancellation without rewriting the user's request.
+2. Prefer an idle Cursor agent already running in the requested checkout.
+3. For a Linear issue without a repository name, ask a dedicated routing agent to
    inspect the ticket through Linear MCP and infer the repository.
-3. Create or reuse a `voice/<issue-key>` Git worktree for Linear implementation work.
-4. Start a new Cursor agent through Herdr when no suitable agent exists.
-5. Reserve that agent until it finishes, is blocked, or the job is cancelled.
+4. Create or reuse a `voice/<issue-key>` Git worktree for Linear implementation work.
+5. Start a new Cursor agent through Herdr when no suitable agent exists.
+6. Reserve that agent until it finishes, is blocked, or the job is cancelled.
 
 The harness never automatically commits, pushes, opens pull requests, modifies
 Linear, or deletes generated worktrees.

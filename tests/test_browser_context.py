@@ -180,10 +180,25 @@ class GitHubContextTests(unittest.TestCase):
     def test_enrich_request_is_fail_open(self) -> None:
         with mock.patch.object(
             browser_context,
-            "focused_github_context",
+            "focused_firefox_url",
             side_effect=RuntimeError("desktop unavailable"),
         ):
             self.assertEqual(browser_context.enrich_request("hello"), "hello")
+
+    def test_request_context_exposes_validated_issue_identity(self) -> None:
+        url = "https://github.com/example/project/issues/42"
+        with (
+            mock.patch.object(
+                browser_context, "focused_firefox_url", return_value=url
+            ) as focused_url,
+            mock.patch.object(browser_context, "_issue_details", return_value=None),
+        ):
+            context = browser_context.request_context("work on this")
+
+        self.assertEqual(context.focused_repository, "example/project")
+        self.assertEqual(context.focused_issue, "example/project#42")
+        self.assertIn("Repository: example/project", context.text)
+        focused_url.assert_called_once_with()
 
 
 if __name__ == "__main__":

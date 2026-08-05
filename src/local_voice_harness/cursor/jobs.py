@@ -132,6 +132,24 @@ def repository_question(repositories: list[Path], reason: str = "") -> str:
     )
 
 
+def resolve_job_repository(
+    client: HerdrClient,
+    job: dict[str, object],
+    repositories: list[Path],
+) -> tuple[Path | None, list[Path]]:
+    hint = str(job.get("repository_hint") or "").strip() or None
+    task = str(job.get("request") or "")
+    utterance = str(job.get("utterance") or task)
+    repository, candidates = client.resolve_repository(hint, utterance, repositories)
+    context_hint = str(job.get("context_repository") or "").strip() or None
+    if repository is None and not hint and context_hint:
+        repository, context_candidates = client.resolve_repository(
+            context_hint, "", repositories
+        )
+        candidates = context_candidates or candidates
+    return repository, candidates
+
+
 def complete_from_output(
     job: dict[str, object], *, output: str, agent_status: str
 ) -> None:
@@ -452,9 +470,9 @@ def run_worker(job_id: str, claim_token: str | None = None) -> None:
         target = str(job.get("herdr_target") or "")
         if not target:
             repositories = client.repository_roots()
-            hint = str(job.get("repository_hint") or "").strip() or None
             task = str(job.get("request") or "")
-            repository, candidates = client.resolve_repository(hint, task, repositories)
+            repository, candidates = resolve_job_repository(client, job, repositories)
+            hint = str(job.get("repository_hint") or "").strip() or None
             issue_key = str(job.get("issue_key") or "") or extract_linear_issue(task)
             if repository is None and issue_key and not hint:
                 repository, _confidence, reason = client.infer_repository(
@@ -584,7 +602,12 @@ def launch_worker(job_id: str) -> None:
 
 
 def start_job(
-    text: str, *, repository: str | None = None, agent: str | None = None
+    text: str,
+    *,
+    repository: str | None = None,
+    agent: str | None = None,
+    utterance: str | None = None,
+    context_repository: str | None = None,
 ) -> str:
     job_id = uuid.uuid4().hex[:12]
     now = time.time()
@@ -594,7 +617,9 @@ def start_job(
             "schema_version": 2,
             "revision": 0,
             "request": text,
+            "utterance": utterance,
             "repository_hint": repository,
+            "context_repository": context_repository,
             "agent_hint": agent,
             "issue_key": extract_linear_issue(text),
             "status": "queued",
@@ -973,6 +998,8 @@ def cursor_turn(
     *,
     repository: str | None = None,
     agent: str | None = None,
+    utterance: str | None = None,
+    context_repository: str | None = None,
     action: str = "submit",
     job_id: str | None = None,
     delivery_claims: DeliveryClaims | None = None,
@@ -992,7 +1019,13 @@ def cursor_turn(
         reply_job(reply_id, text)
         job_id = reply_id
     else:
-        job_id = start_job(text, repository=repository, agent=agent)
+        job_id = start_job(
+            text,
+            repository=repository,
+            agent=agent,
+            utterance=utterance,
+            context_repository=context_repository,
+        )
     started = time.perf_counter()
     deadline = time.monotonic() + CURSOR_FOREGROUND_SECONDS
     while time.monotonic() < deadline:
