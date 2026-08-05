@@ -82,11 +82,19 @@ class ProcessUtteranceTests(unittest.TestCase):
                 wake_daemon, "qwen_turn", return_value=("it is noon", None)
             ) as qwen_turn,
             mock.patch.object(wake_daemon, "stream_and_play", return_value={}),
+            mock.patch.object(
+                wake_daemon,
+                "enrich_request",
+                return_value="what time is it\n\nGitHub context",
+            ),
+            mock.patch.object(wake_daemon, "synthesize_and_play", return_value={}),
             mock.patch.object(wake_daemon, "notify"),
         ):
             daemon.process_utterance(woke=False)
 
-        qwen_turn.assert_called_once()
+        qwen_turn.assert_called_once_with(
+            "what time is it\n\nGitHub context", mock.ANY, None
+        )
         self.assertTrue(
             daemon.awaiting_followup,
             "a completed turn must re-arm follow-up listening",
@@ -127,6 +135,11 @@ class ProcessUtteranceTests(unittest.TestCase):
             mock.patch.object(
                 wake_daemon, "qwen_turn", return_value=("started", None)
             ) as qwen_turn,
+            mock.patch.object(
+                wake_daemon,
+                "enrich_request",
+                side_effect=lambda text: text,
+            ),
             mock.patch.object(wake_daemon, "cursor_turn") as cursor_turn,
             mock.patch.object(wake_daemon, "stream_and_play", return_value={}),
             mock.patch.object(wake_daemon, "notify"),
@@ -149,13 +162,20 @@ class ProcessUtteranceTests(unittest.TestCase):
             mock.patch.object(
                 wake_daemon, "cursor_turn", return_value=("started", None)
             ) as cursor_turn,
+            mock.patch.object(
+                wake_daemon,
+                "enrich_request",
+                return_value="ask Cursor to work on APP-43\n\nGitHub context",
+            ),
             mock.patch.object(wake_daemon, "qwen_turn") as qwen_turn,
             mock.patch.object(wake_daemon, "stream_and_play", return_value={}),
             mock.patch.object(wake_daemon, "notify"),
         ):
             daemon.process_utterance(woke=False)
 
-        cursor_turn.assert_called_once_with("ask Cursor to work on APP-43")
+        cursor_turn.assert_called_once_with(
+            "ask Cursor to work on APP-43\n\nGitHub context"
+        )
         qwen_turn.assert_not_called()
 
 

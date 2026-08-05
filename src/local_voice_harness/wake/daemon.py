@@ -13,6 +13,7 @@ import wave
 from dataclasses import dataclass
 from pathlib import Path
 
+from ..browser_context import enrich_request
 from ..components import llm_ready, start_components, stop_components
 from ..config import CURSOR_PATTERN, DEFAULT_SOURCE, STATE_DIR, WAV_PATH
 from ..cursor.jobs import cursor_turn, mark_delivered, pending_results
@@ -382,10 +383,10 @@ class WakeConversationDaemon:
                     "", self.cursor_session, action="status", job_id=self.cursor_session
                 )
             elif CURSOR_PATTERN.match(text):
-                response, self.cursor_session = cursor_turn(text)
+                response, self.cursor_session = cursor_turn(enrich_request(text))
             else:
                 response, self.cursor_session = qwen_turn(
-                    text, self.history, self.cursor_session
+                    enrich_request(text), self.history, self.cursor_session
                 )
                 remember_response = True
             print(f"Assistant: {response}", flush=True)

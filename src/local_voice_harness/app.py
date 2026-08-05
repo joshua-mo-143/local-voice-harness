@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 
+from .browser_context import enrich_request
 from .components import llm_ready, start_components
 from .config import CURSOR_PATTERN, PID_PATH, STT_SOCKET, TTS_SOCKET
 from .cursor.jobs import cursor_turn
@@ -17,8 +18,11 @@ def respond(text: str) -> None:
         raise HarnessError("request text is empty")
     start_components()
     print(f"You: {text}")
+    request = enrich_request(text)
     response = (
-        cursor_turn(text)[0] if CURSOR_PATTERN.match(text) else qwen_response(text)
+        cursor_turn(request)[0]
+        if CURSOR_PATTERN.match(text)
+        else qwen_response(request)
     )
     print(f"Assistant: {response}")
     stream_and_play(response)
