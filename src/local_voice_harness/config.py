@@ -8,6 +8,12 @@ PACKAGE_ROOT = Path(__file__).resolve().parent
 PROJECT_ROOT = Path(
     os.environ.get("VOICE_HARNESS_ROOT", PACKAGE_ROOT.parents[1])
 ).resolve()
+REPOSITORY_ROOT = Path(
+    os.environ.get("VOICE_HARNESS_PROJECT_ROOT", Path.home())
+).resolve()
+GITHUB_ROOT = Path(
+    os.environ.get("VOICE_HARNESS_GITHUB_ROOT", Path.home() / "src")
+).resolve()
 RUNTIME = Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp"))
 STATE_DIR = RUNTIME / "voice-harness"
 JOBS_DIR = STATE_DIR / "jobs"
@@ -25,6 +31,7 @@ DEFAULT_SOURCE = "alsa_input.pci-0000_00_1f.3-platform-sof_sdw.HiFi__Mic__source
 CURSOR_PATTERN = re.compile(
     r"^\s*(?P<verb>use|ask|call)\s+(?:cursor|curser|cursa)\b", re.IGNORECASE
 )
+FORK_PATTERN = re.compile(r"\bfork(?:ed|ing|s)?\b", re.IGNORECASE)
 
 SYSTEMD_USER_DIR = Path.home() / ".config" / "systemd" / "user"
 SERVICE_FILES = (

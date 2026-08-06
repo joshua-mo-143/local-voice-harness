@@ -25,6 +25,19 @@ REPLACEMENTS = {
     for source, target in [entry.split(":", 1)]
     if source.strip()
 }
+LANGUAGE_ALIASES = {"english": "en", "chinese": "zh", "mandarin": "zh"}
+
+
+def resolve_language(value: str) -> str | None:
+    """Map a configured language to a Whisper code, or ``None`` to auto-detect."""
+
+    normalized = value.strip().lower()
+    if normalized in {"", "auto", "detect"}:
+        return None
+    return LANGUAGE_ALIASES.get(normalized, normalized)
+
+
+LANGUAGE = resolve_language(os.environ.get("DICTATION_LANGUAGE", "auto"))
 LOCK = threading.Lock()
 
 
@@ -48,7 +61,7 @@ def main() -> None:
 
     log(f"loading faster-whisper {MODEL_NAME} on CUDA ({COMPUTE_TYPE})")
     model = WhisperModel(MODEL_NAME, device="cuda", compute_type=COMPUTE_TYPE)
-    log("model ready")
+    log(f"model ready (language={LANGUAGE or 'auto-detect'})")
     SOCKET_PATH.unlink(missing_ok=True)
     server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     try:
@@ -72,7 +85,8 @@ def main() -> None:
                     with LOCK:
                         segments, _info = model.transcribe(
                             audio_path,
-                            language="en",
+                            task="transcribe",
+                            language=LANGUAGE,
                             beam_size=5,
                             vad_filter=True,
                             condition_on_previous_text=False,

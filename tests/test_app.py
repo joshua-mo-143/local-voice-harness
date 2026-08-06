@@ -4,6 +4,7 @@ import unittest
 from unittest import mock
 
 from local_voice_harness import app
+from local_voice_harness.browser_context import GitHubContext
 
 
 class ForegroundDeliveryTests(unittest.TestCase):
@@ -94,6 +95,27 @@ class AppContextTests(unittest.TestCase):
 
         qwen.assert_called_once_with(
             "summarize this\n\ncontext", delivery_claims=mock.ANY
+        )
+
+    def test_explicit_fork_passes_validated_focused_repository(self) -> None:
+        request = GitHubContext(
+            "fork this repo and add Venice\n\ncontext",
+            github_repository="source/project",
+        )
+        with (
+            mock.patch.object(app, "start_components"),
+            mock.patch.object(app, "enrich_request", return_value=request),
+            mock.patch.object(app, "qwen_response", return_value="started") as qwen,
+            mock.patch.object(app, "stream_and_play"),
+        ):
+            app.respond("fork this repo and add Venice")
+
+        qwen.assert_called_once_with(
+            request,
+            github_repository="source/project",
+            fork_requested=True,
+            github_pull_request=None,
+            delivery_claims=mock.ANY,
         )
 
 
