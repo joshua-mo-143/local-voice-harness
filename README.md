@@ -104,7 +104,8 @@ Install these before setting up Python environments:
 - PipeWire tools (`pw-record` and `pw-play`).
 - `libnotify`/`notify-send`.
 - Git, curl, the GitHub CLI (`gh`), and systemd user services.
-- `xdotool` and `xclip` for X11 focused-window automation.
+- `xdotool` and `xclip` for X11 focused-window automation, or `wtype` and
+  `wl-clipboard` for Hyprland/Sway focused-window automation.
 - Rofi for repository selection and pasteable clone-URL prompts.
 - [uv](https://docs.astral.sh/uv/) for reproducible Python versions/environments.
 - A recent [llama.cpp](https://github.com/ggml-org/llama.cpp) build with Vulkan and
@@ -116,7 +117,8 @@ Install these before setting up Python environments:
 On Arch/CachyOS, the base packages are approximately:
 
 ```bash
-paru -S --needed pipewire libnotify git curl github-cli xdotool xclip rofi uv libsndfile
+paru -S --needed pipewire libnotify git curl github-cli xdotool xclip \
+  wl-clipboard wtype uv libsndfile
 ```
 
 Package names for llama.cpp and NVIDIA drivers vary. Verify the required commands:
@@ -423,22 +425,57 @@ playback to interrupt and immediately ask another question. Chatterbox cannot ca
 an active `generate()` call, so server-side cancellation may take up to one short
 chunk; PipeWire playback and already queued chunks stop immediately.
 
-On X11, each new conversational request checks whether Firefox is focused. The
-harness briefly selects and copies the address bar, restores the previous clipboard,
-and dismisses the address bar without navigating. A focused GitHub page contributes
-its URL; a focused issue page also contributes title, state, body, labels, and recent
-comments fetched through the authenticated `gh` CLI. A focused pull request page adds
-the same details plus its draft state, source and target branches, and change summary,
-and lets a Cursor request check the branch out locally. Page content is treated as
-untrusted input. Missing tools, unsupported sessions such as native Wayland, focus
-changes during capture, and GitHub errors simply omit some or all browser context
-without failing the voice request.
+On X11, Hyprland, and Sway, each new conversational request checks whether Firefox
+is focused. The harness briefly selects and copies the address bar, restores the
+previous clipboard, and dismisses the address bar without navigating. A focused
+GitHub page contributes its URL; a focused issue page also contributes title, state,
+body, labels, and recent comments fetched through the authenticated `gh` CLI. A
+focused pull request page adds the same details plus its draft state, source and
+target branches, and change summary, and lets a Cursor request check the branch out
+locally. Page content is treated as untrusted input. Missing tools, unsupported
+Wayland compositors, focus changes during capture, and GitHub errors simply omit some
+or all browser context without failing the voice request.
 
 For example, bind Super+D in i3:
 
 ```text
 bindsym $mod+d exec --no-startup-id /home/joshuam/.local/bin/voice-harness dictate toggle
 ```
+
+The equivalent Sway binding is:
+
+```text
+bindsym $mod+d exec /home/joshuam/.local/bin/voice-harness dictate toggle
+```
+
+For Hyprland:
+
+```text
+bind = SUPER, D, exec, /home/joshuam/.local/bin/voice-harness dictate toggle
+```
+
+Native Wayland automation is supported on Hyprland and Sway. It uses `hyprctl` or
+`swaymsg` to identify the focused window, `wl-copy`/`wl-paste` for the clipboard,
+and `wtype` for keyboard input. GNOME, KDE Plasma, and other compositors are not
+currently supported; set `DICTATION_INJECT=stdout` if focused-window insertion is
+not required there.
+
+The wake service needs the compositor environment to collect Firefox context.
+Import it into the systemd user manager from compositor startup. For Sway:
+
+```text
+exec_always systemctl --user import-environment WAYLAND_DISPLAY XDG_CURRENT_DESKTOP SWAYSOCK
+```
+
+For Hyprland:
+
+```text
+exec-once = systemctl --user import-environment WAYLAND_DISPLAY XDG_CURRENT_DESKTOP HYPRLAND_INSTANCE_SIGNATURE
+```
+
+Restart `voice-harness-wake.service` after adding the import. Dictation commands
+launched directly by compositor keybindings already inherit the required
+environment.
 
 ## Service management
 

@@ -5,79 +5,71 @@ import subprocess
 import unittest
 from unittest import mock
 
-from local_voice_harness import browser_context
+from local_voice_harness import browser_context, desktop
 
 
 class FirefoxUrlTests(unittest.TestCase):
     def test_non_browser_window_is_ignored(self) -> None:
+        backend = mock.Mock()
+        backend.has_clipboard.return_value = True
+        backend.active_window.return_value = desktop.Window("42", "alacritty", 1)
         with (
-            mock.patch.object(
-                browser_context.shutil, "which", return_value="/usr/bin/tool"
-            ),
-            mock.patch.object(browser_context, "_active_window_id", return_value="42"),
-            mock.patch.object(
-                browser_context, "_window_class", return_value="Alacritty"
-            ),
-            mock.patch.object(browser_context, "_send_key") as send_key,
+            mock.patch.object(browser_context, "get_desktop", return_value=backend),
         ):
             self.assertIsNone(browser_context.focused_firefox_url())
-        send_key.assert_not_called()
+        backend.send_key.assert_not_called()
 
     def test_url_capture_restores_address_bar_and_clipboard(self) -> None:
         url = "https://github.com/example/project/issues/42"
+        window = desktop.Window("42", "firefox", 10)
+        backend = mock.Mock()
+        backend.has_clipboard.return_value = True
+        backend.active_window.return_value = window
+        backend.read_clipboard.side_effect = [
+            (True, "previous"),
+            (True, url),
+            (True, url),
+        ]
+        backend.send_key.return_value = True
         with (
-            mock.patch.object(
-                browser_context.shutil, "which", return_value="/usr/bin/tool"
-            ),
-            mock.patch.object(browser_context, "_active_window_id", return_value="42"),
-            mock.patch.object(browser_context, "_window_class", return_value="firefox"),
-            mock.patch.object(
-                browser_context,
-                "_read_clipboard",
-                side_effect=[(True, "previous"), (True, url), (True, url)],
-            ),
-            mock.patch.object(
-                browser_context, "_send_key", return_value=True
-            ) as send_key,
-            mock.patch.object(browser_context, "_write_clipboard") as write,
+            mock.patch.object(browser_context, "get_desktop", return_value=backend),
             mock.patch.object(browser_context.time, "sleep"),
         ):
             self.assertEqual(browser_context.focused_firefox_url(), url)
 
         self.assertEqual(
-            send_key.call_args_list,
+            backend.send_key.call_args_list,
             [
-                mock.call("42", "ctrl+l"),
-                mock.call("42", "ctrl+c"),
-                mock.call("42", "Escape"),
+                mock.call("ctrl+l", window=window),
+                mock.call("ctrl+c", window=window),
+                mock.call("Escape", window=window),
             ],
         )
-        write.assert_called_once_with("previous")
+        backend.write_clipboard.assert_called_once_with("previous")
 
     def test_focus_change_aborts_capture_without_sending_more_keys(self) -> None:
+        window = desktop.Window("42", "firefox", 10)
+        changed = desktop.Window("99", "foot", 11)
+        backend = mock.Mock()
+        backend.has_clipboard.return_value = True
+        backend.active_window.side_effect = [window, changed, changed]
+        backend.read_clipboard.side_effect = [
+            (True, "previous"),
+            (True, "previous"),
+        ]
+        backend.send_key.return_value = True
         with (
-            mock.patch.object(
-                browser_context.shutil, "which", return_value="/usr/bin/tool"
-            ),
-            mock.patch.object(
-                browser_context, "_active_window_id", side_effect=["42", "99", "99"]
-            ),
-            mock.patch.object(browser_context, "_window_class", return_value="firefox"),
-            mock.patch.object(
-                browser_context,
-                "_read_clipboard",
-                side_effect=[(True, "previous"), (True, "previous")],
-            ),
-            mock.patch.object(
-                browser_context, "_send_key", return_value=True
-            ) as send_key,
-            mock.patch.object(browser_context, "_write_clipboard") as write,
+            mock.patch.object(browser_context, "get_desktop", return_value=backend),
             mock.patch.object(browser_context.time, "sleep"),
         ):
             self.assertIsNone(browser_context.focused_firefox_url())
 
-        send_key.assert_called_once_with("42", "ctrl+l")
-        write.assert_not_called()
+        backend.send_key.assert_called_once_with("ctrl+l", window=window)
+        backend.write_clipboard.assert_not_called()
+
+    def test_unsupported_wayland_session_omits_browser_context(self) -> None:
+        with mock.patch.object(browser_context, "get_desktop", return_value=None):
+            self.assertIsNone(browser_context.focused_firefox_url())
 
 
 class GitHubContextTests(unittest.TestCase):
