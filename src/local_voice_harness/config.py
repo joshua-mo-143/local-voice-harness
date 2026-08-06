@@ -24,6 +24,7 @@ STT_SOCKET = RUNTIME / "dictation.sock"
 TTS_SOCKET = RUNTIME / "voice-harness-tts.sock"
 LLM_HEALTH = "http://127.0.0.1:8090/health"
 LLM_CHAT = "http://127.0.0.1:8090/v1/chat/completions"
+LLM_MODEL = os.environ.get("VOICE_HARNESS_LLM_MODEL", "qwen3.5-9b")
 CURSOR_FOREGROUND_SECONDS = float(
     os.environ.get("VOICE_HARNESS_CURSOR_FOREGROUND_SECONDS", "5")
 )

@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 
 from .browser_context import RequestContext
-from .config import LLM_CHAT
+from .config import LLM_CHAT, LLM_MODEL
 
 ROUTER_SYSTEM_PROMPT = (
     "You are an intent router for a local voice assistant. Classify the user's next "
@@ -112,7 +112,7 @@ def route_intent(
 ) -> IntentRoute:
     payload = json.dumps(
         {
-            "model": "qwen3.5-4b",
+            "model": LLM_MODEL,
             "messages": [
                 {"role": "system", "content": ROUTER_SYSTEM_PROMPT},
                 {
