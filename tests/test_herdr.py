@@ -46,6 +46,71 @@ should I use?
             self.assertEqual(repository, alpha)
             self.assertEqual(matches, [alpha])
 
+    def test_extracts_safe_repository_name_from_git_url(self) -> None:
+        self.assertEqual(
+            herdr.repository_name_from_url(
+                "https://github.com/example/example-project.git"
+            ),
+            "example-project",
+        )
+        self.assertEqual(
+            herdr.repository_name_from_url("git@github.com:example/project.git"),
+            "project",
+        )
+        self.assertIsNone(herdr.repository_name_from_url("file:///tmp/project"))
+        self.assertIsNone(
+            herdr.repository_name_from_url("https://github.com/example/.hidden.git")
+        )
+
+    def test_confirmed_rofi_url_is_cloned_under_project_root(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            client = herdr.HerdrClient("herdr")
+
+            def clone(
+                command: list[str], **_kwargs: object
+            ) -> subprocess.CompletedProcess[str]:
+                destination = Path(command[-1])
+                destination.mkdir()
+                (destination / ".git").mkdir()
+                return subprocess.CompletedProcess(command, 0, "", "")
+
+            with (
+                mock.patch.object(herdr, "HOME_ROOT", root),
+                mock.patch.object(
+                    herdr,
+                    "choose_repository",
+                    return_value="https://github.com/example/project.git",
+                ),
+                mock.patch.object(herdr, "confirm_clone", return_value=True),
+                mock.patch("subprocess.run", side_effect=clone) as run,
+            ):
+                repository, reason = client.choose_or_clone_repository([])
+
+            self.assertEqual(repository, root / "project")
+            self.assertEqual(reason, "")
+            command = run.call_args.args[0]
+            self.assertEqual(
+                command[:4],
+                ["git", "clone", "--", "https://github.com/example/project.git"],
+            )
+            self.assertEqual(Path(command[-1]).name, "project")
+
+    def test_cancelled_rofi_clone_returns_spoken_fallback_reason(self) -> None:
+        client = herdr.HerdrClient("herdr")
+        with (
+            mock.patch.object(
+                herdr,
+                "choose_repository",
+                return_value="https://github.com/example/project.git",
+            ),
+            mock.patch.object(herdr, "confirm_clone", return_value=False),
+        ):
+            repository, reason = client.choose_or_clone_repository([])
+
+        self.assertIsNone(repository)
+        self.assertEqual(reason, "Repository cloning was cancelled.")
+
     def test_server_start_falls_back_to_transient_unit(self) -> None:
         client = herdr.HerdrClient("herdr")
         states = iter([False, False, True])
