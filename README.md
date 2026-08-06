@@ -393,6 +393,7 @@ Hey Jarvis, what time is it?
 Hey Jarvis, ask Cursor to summarize the api-docs repository.
 Hey Jarvis, ask Cursor to work on Linear issue API-79.
 Hey Jarvis, summarize this issue.  # with a GitHub issue focused in Firefox
+Hey Jarvis, summarize this ticket. # with a Zendesk ticket focused in Firefox
 Hey Jarvis, fork this repo and add Venice.  # with a public GitHub repo focused
 Hey Jarvis, ask Cursor to check out this PR and make sure it works.  # with a PR focused
 Hey Jarvis, what is the status of that Cursor job?
@@ -432,9 +433,14 @@ GitHub page contributes its URL; a focused issue page also contributes title, st
 body, labels, and recent comments fetched through the authenticated `gh` CLI. A
 focused pull request page adds the same details plus its draft state, source and
 target branches, and change summary, and lets a Cursor request check the branch out
-locally. Page content is treated as untrusted input. Missing tools, unsupported
-Wayland compositors, focus changes during capture, and GitHub errors simply omit some
-or all browser context without failing the voice request.
+locally. A focused `https://<tenant>.zendesk.com/agent/tickets/<number>` page
+contributes its URL, tenant, ticket number, and bounded rendered page text copied
+from the authenticated browser session; no Zendesk API credentials are required. Only
+text currently loaded and selectable in the page is available, so collapsed or
+unloaded comments may be absent. Page content is treated as untrusted input. Missing
+tools, unsupported Wayland compositors, focus changes during capture, and browser or
+GitHub errors simply omit some or all browser context without failing the voice
+request.
 
 For example, bind Super+D in i3:
 
@@ -554,8 +560,9 @@ Measured with all models warm on the RTX 5070 Ti Laptop GPU:
 - Herdr agents are started with workspace trust but not Cursor `--force`.
 - Ticket and MCP content is treated as untrusted input and inferred paths are
   validated against local Git repositories.
-- Focused GitHub issue and pull request content is read through `gh`, bounded before
-  prompting, and treated as untrusted external data.
+- Focused GitHub issue and pull request content is read through `gh`, and rendered
+  Zendesk ticket content is copied from the browser session; all are bounded before
+  prompting and treated as untrusted external data.
 - Repository cloning requires explicit Rofi confirmation, accepts only HTTPS or SSH
   Git URLs, and places the checkout beneath the configured project root.
 - Merely focusing a GitHub page cannot create a fork. The original spoken request must
