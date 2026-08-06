@@ -62,7 +62,7 @@ class QwenClientTests(unittest.TestCase):
         self.assertEqual(request.get_header("Content-type"), "application/json")
         self.assertEqual(urlopen.call_args.kwargs["timeout"], 60)
         payload = json.loads(request.data)
-        self.assertEqual(payload["model"], "qwen3.5-4b")
+        self.assertEqual(payload["model"], llm.LLM_MODEL)
         self.assertEqual(payload["messages"][1], history[2])
         self.assertEqual(payload["messages"][-1], {"role": "user", "content": "hello"})
         self.assertEqual(payload["tools"], llm.QWEN_TOOLS)

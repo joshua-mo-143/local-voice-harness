@@ -6,7 +6,7 @@ import urllib.error
 import urllib.request
 from collections.abc import Mapping, Sequence
 
-from .config import LLM_CHAT
+from .config import LLM_CHAT, LLM_MODEL
 from .cursor.jobs import DeliveryClaims, cursor_turn
 from .errors import HarnessError
 from .notifications import notify
@@ -112,7 +112,7 @@ def qwen_turn(
     for tool_round in range(MAX_TOOL_CALL_ROUNDS):
         payload = json.dumps(
             {
-                "model": "qwen3.5-4b",
+                "model": LLM_MODEL,
                 "messages": messages,
                 "tools": QWEN_TOOLS,
                 "tool_choice": "auto",
