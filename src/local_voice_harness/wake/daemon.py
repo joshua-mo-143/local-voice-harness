@@ -15,7 +15,7 @@ from pathlib import Path
 
 from ..browser_context import enrich_request
 from ..components import llm_ready, start_components, stop_components
-from ..config import CURSOR_PATTERN, DEFAULT_SOURCE, STATE_DIR, WAV_PATH
+from ..config import CURSOR_PATTERN, DEFAULT_SOURCE, FORK_PATTERN, STATE_DIR, WAV_PATH
 from ..cursor.jobs import (
     DeliveryClaims,
     acknowledge_deliveries,
@@ -404,16 +404,40 @@ class WakeConversationDaemon:
                     delivery_claims=delivery_claims,
                 )
             elif CURSOR_PATTERN.match(text):
-                response, next_cursor_session = cursor_turn(
-                    enrich_request(text), delivery_claims=delivery_claims
-                )
+                request = enrich_request(text)
+                github_repository = getattr(request, "github_repository", None)
+                fork_requested = bool(FORK_PATTERN.search(text))
+                if github_repository or fork_requested:
+                    response, next_cursor_session = cursor_turn(
+                        request,
+                        github_repository=github_repository,
+                        fork_requested=fork_requested,
+                        delivery_claims=delivery_claims,
+                    )
+                else:
+                    response, next_cursor_session = cursor_turn(
+                        request, delivery_claims=delivery_claims
+                    )
             else:
-                response, next_cursor_session = qwen_turn(
-                    enrich_request(text),
-                    self.history,
-                    self.cursor_session,
-                    delivery_claims=delivery_claims,
-                )
+                request = enrich_request(text)
+                github_repository = getattr(request, "github_repository", None)
+                fork_requested = bool(FORK_PATTERN.search(text))
+                if github_repository or fork_requested:
+                    response, next_cursor_session = qwen_turn(
+                        request,
+                        self.history,
+                        self.cursor_session,
+                        github_repository=github_repository,
+                        fork_requested=fork_requested,
+                        delivery_claims=delivery_claims,
+                    )
+                else:
+                    response, next_cursor_session = qwen_turn(
+                        request,
+                        self.history,
+                        self.cursor_session,
+                        delivery_claims=delivery_claims,
+                    )
                 remember_response = True
             print(f"Assistant: {response}", flush=True)
             playback, interruption = self.play_response(response)

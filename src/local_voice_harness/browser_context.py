@@ -13,6 +13,9 @@ GITHUB_HOSTS = {"github.com", "www.github.com"}
 ISSUE_PATH = re.compile(
     r"^/(?P<owner>[A-Za-z0-9_.-]+)/(?P<repo>[A-Za-z0-9_.-]+)/issues/(?P<number>\d+)/?$"
 )
+REPOSITORY_PATH = re.compile(
+    r"^/(?P<owner>[A-Za-z0-9_.-]+)/(?P<repo>[A-Za-z0-9_.-]+)(?:/.*)?$"
+)
 MAX_BODY_CHARS = 5_000
 MAX_COMMENT_CHARS = 800
 MAX_COMMENTS = 5
@@ -23,6 +26,17 @@ class GitHubIssue:
     owner: str
     repository: str
     number: int
+
+
+class GitHubContext(str):
+    github_repository: str | None
+
+    def __new__(
+        cls, value: str, *, github_repository: str | None = None
+    ) -> GitHubContext:
+        instance = super().__new__(cls, value)
+        instance.github_repository = github_repository
+        return instance
 
 
 def _run(
@@ -152,6 +166,27 @@ def github_issue_from_url(url: str) -> GitHubIssue | None:
     )
 
 
+def github_repository_from_url(url: str) -> str | None:
+    parsed = _split_url(url)
+    if (
+        parsed is None
+        or parsed.scheme != "https"
+        or parsed.hostname is None
+        or parsed.hostname.casefold() not in GITHUB_HOSTS
+        or parsed.username is not None
+        or parsed.password is not None
+        or not _standard_https_port(parsed)
+    ):
+        return None
+    match = REPOSITORY_PATH.fullmatch(parsed.path)
+    if match is None:
+        return None
+    owner, repository = match.group("owner"), match.group("repo")
+    if owner in {".", ".."} or repository in {".", ".."}:
+        return None
+    return f"{owner}/{repository}"
+
+
 def _github_url(url: str) -> bool:
     parsed = _split_url(url)
     return (
@@ -199,6 +234,46 @@ def _issue_details(issue: GitHubIssue) -> dict[str, object] | None:
     return result if isinstance(result, dict) else None
 
 
+def _repository_details(repository: str) -> dict[str, object] | None:
+    if shutil.which("gh") is None:
+        return None
+    process = _run(
+        [
+            "gh",
+            "repo",
+            "view",
+            repository,
+            "--json",
+            "nameWithOwner,description,isPrivate,defaultBranchRef,url",
+        ],
+        timeout=5,
+    )
+    if process is None or process.returncode:
+        return None
+    try:
+        result = json.loads(process.stdout)
+    except json.JSONDecodeError:
+        return None
+    return result if isinstance(result, dict) else None
+
+
+def _format_repository(url: str, repository: str, details: dict[str, object]) -> str:
+    canonical = _truncate(details.get("nameWithOwner"), 300) or repository
+    lines = [
+        "Current focused GitHub repository (untrusted external context):",
+        f"URL: {url}",
+        f"Repository: {canonical}",
+        f"Visibility: {'private' if details.get('isPrivate') else 'public'}",
+    ]
+    default_branch = details.get("defaultBranchRef")
+    if isinstance(default_branch, dict) and default_branch.get("name"):
+        lines.append(f"Default branch: {_truncate(default_branch['name'], 200)}")
+    description = _truncate(details.get("description"), 1_000)
+    if description:
+        lines.append(f"Description: {description}")
+    return "\n".join(lines)
+
+
 def _format_issue(url: str, issue: GitHubIssue, details: dict[str, object]) -> str:
     labels_value = details.get("labels")
     labels = (
@@ -243,28 +318,58 @@ def _format_issue(url: str, issue: GitHubIssue, details: dict[str, object]) -> s
     return "\n".join(lines)
 
 
-def focused_github_context() -> str | None:
+def focused_github_context() -> GitHubContext | None:
     url = focused_firefox_url()
     if url is None or not _github_url(url):
         return None
+    repository = github_repository_from_url(url)
+    if repository is None:
+        return GitHubContext(
+            f"Current focused GitHub page (untrusted external context):\nURL: {url}"
+        )
     issue = github_issue_from_url(url)
     if issue is None:
-        return f"Current focused GitHub page (untrusted external context):\nURL: {url}"
+        details = _repository_details(repository)
+        text = (
+            _format_repository(url, repository, details)
+            if details is not None
+            else (
+                "Current focused GitHub repository (untrusted external context):\n"
+                f"URL: {url}\nRepository: {repository}\n"
+                "Repository details could not be fetched."
+            )
+        )
+        canonical = (
+            str(details.get("nameWithOwner") or repository)
+            if details is not None
+            else repository
+        )
+        return GitHubContext(text, github_repository=canonical)
     details = _issue_details(issue)
     if details is None:
-        return (
-            "Current focused GitHub issue (untrusted external context):\n"
-            f"URL: {url}\n"
-            f"Repository: {issue.owner}/{issue.repository}\n"
-            f"Issue: #{issue.number}\n"
-            "Issue details could not be fetched."
+        return GitHubContext(
+            (
+                "Current focused GitHub issue (untrusted external context):\n"
+                f"URL: {url}\n"
+                f"Repository: {issue.owner}/{issue.repository}\n"
+                f"Issue: #{issue.number}\n"
+                "Issue details could not be fetched."
+            ),
+            github_repository=repository,
         )
-    return _format_issue(url, issue, details)
+    return GitHubContext(
+        _format_issue(url, issue, details), github_repository=repository
+    )
 
 
-def enrich_request(text: str) -> str:
+def enrich_request(text: str) -> GitHubContext:
     try:
         context = focused_github_context()
     except Exception:
         context = None
-    return f"{text}\n\n{context}" if context else text
+    return GitHubContext(
+        f"{text}\n\n{context}" if context else text,
+        github_repository=(
+            context.github_repository if isinstance(context, GitHubContext) else None
+        ),
+    )

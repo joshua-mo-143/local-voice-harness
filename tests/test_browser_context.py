@@ -105,6 +105,30 @@ class GitHubContextTests(unittest.TestCase):
         ):
             self.assertIsNone(browser_context.focused_github_context())
 
+    def test_extracts_repository_from_supported_subpages(self) -> None:
+        for suffix in (
+            "",
+            "/issues/42",
+            "/pull/7",
+            "/tree/main/src",
+            "/blob/main/README.md",
+        ):
+            with self.subTest(suffix=suffix):
+                self.assertEqual(
+                    browser_context.github_repository_from_url(
+                        f"https://github.com/example/project{suffix}"
+                    ),
+                    "example/project",
+                )
+        self.assertIsNone(
+            browser_context.github_repository_from_url(
+                "https://evil.example/example/project"
+            )
+        )
+        self.assertIsNone(
+            browser_context.github_repository_from_url("https://github.com/example/..")
+        )
+
     def test_fetches_and_formats_private_issue_through_gh(self) -> None:
         url = "https://github.com/example/private/issues/42"
         details = {
@@ -168,14 +192,40 @@ class GitHubContextTests(unittest.TestCase):
         self.assertLess(len(context), 10_000)
         self.assertEqual(context.count("- dev:"), browser_context.MAX_COMMENTS)
 
-    def test_plain_github_page_adds_url_only(self) -> None:
+    def test_plain_github_page_adds_structured_repository(self) -> None:
         url = "https://github.com/example/project"
-        with mock.patch.object(
-            browser_context, "focused_firefox_url", return_value=url
+        details = {
+            "nameWithOwner": "Example/Project",
+            "description": "Useful project",
+            "isPrivate": False,
+            "defaultBranchRef": {"name": "main"},
+            "url": url,
+        }
+        with (
+            mock.patch.object(browser_context, "focused_firefox_url", return_value=url),
+            mock.patch.object(
+                browser_context, "_repository_details", return_value=details
+            ),
         ):
             context = browser_context.focused_github_context()
-        self.assertIn("focused GitHub page", str(context))
+        self.assertIn("focused GitHub repository", str(context))
         self.assertIn(url, str(context))
+        self.assertIn("Default branch: main", str(context))
+        self.assertEqual(getattr(context, "github_repository", None), "Example/Project")
+
+    def test_enriched_request_preserves_validated_repository_identity(self) -> None:
+        context = browser_context.GitHubContext(
+            "GitHub context", github_repository="example/project"
+        )
+        with mock.patch.object(
+            browser_context, "focused_github_context", return_value=context
+        ):
+            request = browser_context.enrich_request("fork this repo")
+        self.assertEqual(
+            request.github_repository,
+            "example/project",
+        )
+        self.assertEqual(str(request), "fork this repo\n\nGitHub context")
 
     def test_enrich_request_is_fail_open(self) -> None:
         with mock.patch.object(

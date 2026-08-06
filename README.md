@@ -48,12 +48,17 @@ Cursor routing works as follows:
 1. Prefer an idle Cursor agent already running in the requested checkout.
 2. For a Linear issue without a repository name, ask a dedicated routing agent to
    inspect the ticket through Linear MCP and infer the repository.
-3. Create or reuse a `voice/<issue-key>` Git worktree for Linear implementation work.
-4. Start a new Cursor agent through Herdr when no suitable agent exists.
-5. Reserve that agent until it finishes, is blocked, or the job is cancelled.
+3. When the user explicitly says “fork,” validate the focused public GitHub repository,
+   create or reuse the authenticated user's fork, and clone it below the configured
+   GitHub root.
+4. Create or reuse a `voice/<issue-key>` Git worktree for Linear implementation work,
+   or create a unique `voice/github-<job-id>` worktree for a GitHub fork task.
+5. Start a new Cursor agent through Herdr when no suitable agent exists.
+6. Reserve that agent until it finishes, is blocked, or the job is cancelled.
 
-The harness never automatically commits, pushes, opens pull requests, modifies
-Linear, or deletes generated worktrees.
+The harness never automatically commits, pushes, opens pull requests, modifies Linear,
+or deletes generated worktrees. Fork creation is the only supported GitHub write and
+is performed only when the spoken request explicitly includes “fork.”
 
 ## Compute requirements
 
@@ -115,8 +120,8 @@ llama-server --version
 nvidia-smi
 ```
 
-Authenticate the GitHub CLI to let focused issue pages include private-repository
-details:
+Authenticate the GitHub CLI to let focused issue pages include repository details and
+to create forks explicitly requested through the harness:
 
 ```bash
 gh auth login
@@ -378,6 +383,7 @@ Hey Jarvis, what time is it?
 Hey Jarvis, ask Cursor to summarize the api-docs repository.
 Hey Jarvis, ask Cursor to work on Linear issue API-79.
 Hey Jarvis, summarize this issue.  # with a GitHub issue focused in Firefox
+Hey Jarvis, fork this repo and add Venice.  # with a public GitHub repo focused
 Hey Jarvis, what is the status of that Cursor job?
 Hey Jarvis, cancel that Cursor job.
 ```
@@ -471,12 +477,17 @@ Environment variables can be added to systemd drop-ins:
 | `VOICE_HARNESS_CURSOR_FOREGROUND_SECONDS` | Time before a Cursor job backgrounds | `5` |
 | `VOICE_HARNESS_HERDR_BIN` | Herdr executable | `~/.local/bin/herdr` |
 | `VOICE_HARNESS_PROJECT_ROOT` | Allowed root for inferred repositories | Home directory |
+| `VOICE_HARNESS_GITHUB_ROOT` | Owner-qualified clones of explicitly requested GitHub forks | `~/src` |
 | `DICTATION_MODEL` | faster-whisper model | `large-v3` |
 | `DICTATION_COMPUTE` | faster-whisper compute type | `float16` |
 | `DICTATION_INJECT` | Focused-window insertion mode (`auto`, `paste`, `type`, or `stdout`) | `auto` |
 | `DICTATION_REPLACEMENTS` | Semicolon-separated STT corrections | Cursor/Herdr defaults |
 
 `VOICE_HARNESS_PROJECT_ROOT` can narrow repository discovery to another directory.
+`VOICE_HARNESS_GITHUB_ROOT` must resolve inside it. Forks are cloned to
+`<github-root>/<source-owner>/<repository>`; an existing checkout is reused only when
+its `origin` identifies the expected fork. The source repository is configured as the
+`upstream` remote.
 
 ## Performance observed
 
@@ -496,6 +507,8 @@ Measured with all models warm on the RTX 5070 Ti Laptop GPU:
   validated against local Git repositories.
 - Focused GitHub issue content is read through `gh`, bounded before prompting, and
   treated as untrusted external data.
+- Merely focusing a GitHub page cannot create a fork. The original spoken request must
+  explicitly contain “fork,” and the source must be a validated public repository.
 - Jobs never automatically commit, push, open pull requests, or remove worktrees.
 - Runtime job metadata and audio live under `$XDG_RUNTIME_DIR/voice-harness`.
 

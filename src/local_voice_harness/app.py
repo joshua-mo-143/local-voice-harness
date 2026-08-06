@@ -4,7 +4,7 @@ import json
 
 from .browser_context import enrich_request
 from .components import component_usage, llm_ready, start_components
-from .config import CURSOR_PATTERN, PID_PATH, STT_SOCKET, TTS_SOCKET
+from .config import CURSOR_PATTERN, FORK_PATTERN, PID_PATH, STT_SOCKET, TTS_SOCKET
 from .cursor.jobs import (
     DeliveryClaims,
     acknowledge_deliveries,
@@ -27,11 +27,28 @@ def respond(text: str) -> None:
             start_components()
             print(f"You: {text}")
             request = enrich_request(text)
-            response = (
-                cursor_turn(request, delivery_claims=delivery_claims)[0]
-                if CURSOR_PATTERN.match(text)
-                else qwen_response(request, delivery_claims=delivery_claims)
+            github_repository = getattr(request, "github_repository", None)
+            fork_requested = bool(FORK_PATTERN.search(text))
+            github_arguments = (
+                {
+                    "github_repository": github_repository,
+                    "fork_requested": fork_requested,
+                }
+                if github_repository or fork_requested
+                else {}
             )
+            if CURSOR_PATTERN.match(text):
+                response = cursor_turn(
+                    request,
+                    **github_arguments,
+                    delivery_claims=delivery_claims,
+                )[0]
+            else:
+                response = qwen_response(
+                    request,
+                    **github_arguments,
+                    delivery_claims=delivery_claims,
+                )
             print(f"Assistant: {response}")
             stream_and_play(response)
             acknowledge_deliveries(delivery_claims)
