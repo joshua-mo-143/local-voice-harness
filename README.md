@@ -22,7 +22,7 @@ To add: I also am not looking at the code - as long as it works, I will likely k
 PipeWire microphone
   -> OpenWakeWord ("Hey Jarvis")
   -> faster-whisper large-v3-turbo (CUDA)
-  -> Qwen3.5-9B UD-Q4_K_XL via llama.cpp (Vulkan)
+  -> Qwen3.5-9B UD-Q4_K_XL via llama.cpp (CUDA)
        -> focused intent classification
        -> ordinary conversational response
        -> Herdr-managed Cursor agent and Linear MCP
@@ -77,7 +77,7 @@ Tested configuration:
 - Linux x86-64 with systemd user services and PipeWire.
 - NVIDIA GeForce RTX 5070 Ti Laptop GPU with 12 GB VRAM.
 - 32 GB system RAM and swap.
-- CUDA-capable NVIDIA driver plus a Vulkan-capable llama.cpp build.
+- CUDA-capable NVIDIA driver plus a CUDA-enabled llama.cpp build.
 - Python 3.11 for the management, wake, TTS, and bundled dictation environments.
 
 Practical requirements for the included model choices:
@@ -113,7 +113,7 @@ Install these before setting up Python environments:
   `wl-clipboard` for Hyprland/Sway focused-window automation.
 - Rofi for repository selection and pasteable clone-URL prompts.
 - [uv](https://docs.astral.sh/uv/) for reproducible Python versions/environments.
-- A recent [llama.cpp](https://github.com/ggml-org/llama.cpp) build with Vulkan and
+- A recent [llama.cpp](https://github.com/ggml-org/llama.cpp) build with CUDA and
   `llama-server`. The server runs with `--jinja` so it uses the model's native chat
   template, which llama.cpp requires for Qwen3.5 tool calling.
 - The [Cursor CLI](https://cursor.com/docs/cli/installation).
@@ -127,12 +127,20 @@ paru -S --needed pipewire libnotify git curl github-cli xdotool xclip \
   wl-clipboard wtype uv libsndfile
 ```
 
-Package names for llama.cpp and NVIDIA drivers vary. Verify the required commands:
+On Arch/CachyOS, install the CUDA-enabled llama.cpp AUR package (it conflicts with
+`llama.cpp-vulkan` and other non-CUDA variants):
+
+```bash
+paru -S --needed cuda llama.cpp-cuda
+```
+
+Verify the required commands:
 
 ```bash
 pw-record --version
 pw-play --version
 llama-server --version
+llama-server --list-devices   # expect CUDA0: NVIDIA GeForce ...
 nvidia-smi
 ```
 
@@ -227,7 +235,7 @@ List llama.cpp devices:
 llama-server --list-devices
 ```
 
-Edit `systemd/user/voice-harness-llm.service` if the NVIDIA device is not `Vulkan1`, or if
+Edit `systemd/user/voice-harness-llm.service` if the NVIDIA device is not `CUDA0`, or if
 `llama-server` is installed somewhere other than `/usr/sbin/llama-server`.
 
 ### 5. Install Cursor and Herdr
@@ -557,7 +565,8 @@ Qwen3.5-4B and Whisper large-v3. Figures for the current Qwen3.5-9B and
 large-v3-turbo defaults are pending re-measurement:
 
 - Whisper large-v3: approximately 0.58 seconds for a short request.
-- Qwen response: 0.22–0.53 seconds; first Vulkan request approximately 5 seconds.
+- Qwen response: 0.22–0.53 seconds; first CUDA request TTFT pending re-measurement
+  (Vulkan baseline was approximately 5 seconds).
 - Chatterbox: 0.53 seconds for 2.72 seconds of audio; longer replies now begin
   playing after their first sentence/clause is ready.
 - Cursor delegation: task-dependent and normally handled as a background job.
