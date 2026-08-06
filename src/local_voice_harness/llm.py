@@ -95,6 +95,7 @@ def qwen_turn(
     *,
     github_repository: str | None = None,
     fork_requested: bool = False,
+    github_pull_request: int | None = None,
     delivery_claims: DeliveryClaims | None = None,
 ) -> tuple[str, str | None]:
     system_prompt = SYSTEM_PROMPT
@@ -194,13 +195,18 @@ def qwen_turn(
                         selected_github_repository = (
                             github_repository or requested_github_repository
                         )
-                        if selected_github_repository or fork_requested:
+                        if (
+                            selected_github_repository
+                            or fork_requested
+                            or github_pull_request
+                        ):
                             tool_result, cursor_session = cursor_turn(
                                 task,
                                 job_id if action == "reply" else None,
                                 repository=repository,
                                 github_repository=selected_github_repository,
                                 fork_requested=fork_requested,
+                                github_pull_request=github_pull_request,
                                 agent=agent,
                                 action=action,
                                 job_id=job_id,
@@ -235,6 +241,7 @@ def qwen_response(
     *,
     github_repository: str | None = None,
     fork_requested: bool = False,
+    github_pull_request: int | None = None,
     delivery_claims: DeliveryClaims | None = None,
 ) -> str:
     return qwen_turn(
@@ -242,5 +249,6 @@ def qwen_response(
         history,
         github_repository=github_repository,
         fork_requested=fork_requested,
+        github_pull_request=github_pull_request,
         delivery_claims=delivery_claims,
     )[0]

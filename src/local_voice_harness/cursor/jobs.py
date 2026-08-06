@@ -458,7 +458,42 @@ def run_worker(job_id: str, claim_token: str | None = None) -> None:
             hint = str(job.get("repository_hint") or "").strip() or None
             task = str(job.get("request") or "")
             issue_key = str(job.get("issue_key") or "") or extract_linear_issue(task)
-            if job.get("fork_requested"):
+            if job.get("github_pull_request"):
+                github_repository = str(job.get("github_repository") or "").strip()
+                number = int(str(job.get("github_pull_request") or 0))
+                if not github_repository or number <= 0:
+                    _worker_question(
+                        job_id,
+                        worker_token,
+                        "Which repository's pull request should I check out? "
+                        "Please say its owner and repository name.",
+                        clarification_kind="github_repository",
+                    )
+                    return
+                provisioned_pr = GitHubClient().provision_pull_request(
+                    github_repository, number
+                )
+                repository = provisioned_pr.checkout
+                issue_key = None
+
+                def record_pull_request(current: dict[str, object]) -> None:
+                    current.update(
+                        {
+                            "github_repository": (
+                                provisioned_pr.source.name_with_owner
+                            ),
+                            "repository": str(provisioned_pr.checkout),
+                            "pull_request_branch": provisioned_pr.branch,
+                        }
+                    )
+
+                updated = _worker_change(
+                    job_id, worker_token, {"routing"}, record_pull_request
+                )
+                if updated is None:
+                    return
+                job = updated
+            elif job.get("fork_requested"):
                 github_repository = str(job.get("github_repository") or "").strip()
                 if not github_repository:
                     _worker_question(
@@ -497,6 +532,7 @@ def run_worker(job_id: str, claim_token: str | None = None) -> None:
                 and issue_key
                 and not hint
                 and not job.get("fork_requested")
+                and not job.get("github_pull_request")
             ):
                 repository, _confidence, reason = client.infer_repository(
                     issue_key,
@@ -632,6 +668,7 @@ def start_job(
     repository: str | None = None,
     github_repository: str | None = None,
     fork_requested: bool = False,
+    github_pull_request: int | None = None,
     agent: str | None = None,
 ) -> str:
     job_id = uuid.uuid4().hex[:12]
@@ -645,6 +682,7 @@ def start_job(
             "repository_hint": repository,
             "github_repository": github_repository,
             "fork_requested": fork_requested,
+            "github_pull_request": github_pull_request,
             "worktree_branch": (f"voice/github-{job_id}" if fork_requested else None),
             "worktree_label": (f"github-{job_id[:6]}" if fork_requested else None),
             "agent_hint": agent,
@@ -1034,6 +1072,7 @@ def cursor_turn(
     repository: str | None = None,
     github_repository: str | None = None,
     fork_requested: bool = False,
+    github_pull_request: int | None = None,
     agent: str | None = None,
     action: str = "submit",
     job_id: str | None = None,
@@ -1054,12 +1093,13 @@ def cursor_turn(
         reply_job(reply_id, text)
         job_id = reply_id
     else:
-        if github_repository or fork_requested:
+        if github_repository or fork_requested or github_pull_request:
             job_id = start_job(
                 text,
                 repository=repository,
                 github_repository=github_repository,
                 fork_requested=fork_requested,
+                github_pull_request=github_pull_request,
                 agent=agent,
             )
         else:

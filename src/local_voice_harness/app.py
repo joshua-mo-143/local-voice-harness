@@ -28,13 +28,15 @@ def respond(text: str) -> None:
             print(f"You: {text}")
             request = enrich_request(text)
             github_repository = getattr(request, "github_repository", None)
+            github_pull_request = getattr(request, "github_pull_request", None)
             fork_requested = bool(FORK_PATTERN.search(text))
             github_arguments = (
                 {
                     "github_repository": github_repository,
                     "fork_requested": fork_requested,
+                    "github_pull_request": github_pull_request,
                 }
-                if github_repository or fork_requested
+                if github_repository or fork_requested or github_pull_request
                 else {}
             )
             if CURSOR_PATTERN.match(text):

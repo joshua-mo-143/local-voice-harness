@@ -149,6 +149,93 @@ class GitHubClientTests(unittest.TestCase):
                 )
             self.assertFalse(outside.exists())
 
+    def test_repository_clone_uses_source_origin_without_upstream(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            allowed = Path(temporary)
+            root = allowed / "src"
+            client = GitHubClient(clone_root=root, allowed_root=allowed)
+            source = _repository("source/project")
+            commands: list[list[str]] = []
+
+            def run(
+                command: list[str],
+                *,
+                timeout: float = 30,
+                check: bool = True,
+                cwd: Path | None = None,
+            ) -> subprocess.CompletedProcess[str]:
+                commands.append(command)
+                if command[1:3] == ["repo", "clone"]:
+                    Path(command[-1]).mkdir(parents=True)
+                return _completed()
+
+            with (
+                mock.patch.object(client, "_run", side_effect=run),
+                mock.patch.object(client, "_verify_checkout") as verify,
+                mock.patch.object(client, "_ensure_upstream") as upstream,
+            ):
+                checkout = client.ensure_repository_clone(source)
+
+            self.assertEqual(checkout, (root / "source" / "project").resolve())
+            clone = next(command for command in commands if "clone" in command)
+            self.assertEqual(clone[:4], ["gh", "repo", "clone", "source/project"])
+            verify.assert_called_once()
+            upstream.assert_not_called()
+
+    def test_provision_pull_request_checks_out_in_place(self) -> None:
+        client = GitHubClient()
+        source = _repository("source/project")
+        checkout = Path("/tmp/src/source/project")
+        with (
+            mock.patch.object(
+                client, "inspect_repository", return_value=source
+            ) as inspect,
+            mock.patch.object(
+                client, "ensure_repository_clone", return_value=checkout
+            ) as clone,
+            mock.patch.object(
+                client, "checkout_pull_request", return_value="feature/cache"
+            ) as checkout_pr,
+        ):
+            provisioned = client.provision_pull_request("source/project", 42)
+
+        inspect.assert_called_once_with("source/project")
+        clone.assert_called_once_with(source)
+        checkout_pr.assert_called_once_with(checkout, 42)
+        self.assertEqual(provisioned.checkout, checkout)
+        self.assertEqual(provisioned.number, 42)
+        self.assertEqual(provisioned.branch, "feature/cache")
+
+    def test_provision_pull_request_rejects_non_positive_number(self) -> None:
+        client = GitHubClient()
+        with self.assertRaisesRegex(GitHubError, "positive"):
+            client.provision_pull_request("source/project", 0)
+
+    def test_checkout_pull_request_runs_gh_in_checkout(self) -> None:
+        client = GitHubClient()
+        checkout = Path("/tmp/src/source/project")
+        calls: list[tuple[list[str], Path | None]] = []
+
+        def run(
+            command: list[str],
+            *,
+            timeout: float = 30,
+            check: bool = True,
+            cwd: Path | None = None,
+        ) -> subprocess.CompletedProcess[str]:
+            calls.append((command, cwd))
+            if command[1:3] == ["pr", "checkout"]:
+                return _completed()
+            return _completed("feature/cache\n")
+
+        with mock.patch.object(client, "_run", side_effect=run):
+            branch = client.checkout_pull_request(checkout, 42)
+
+        self.assertEqual(branch, "feature/cache")
+        pr_command, pr_cwd = next(call for call in calls if "checkout" in call[0])
+        self.assertEqual(pr_command, ["gh", "pr", "checkout", "42"])
+        self.assertEqual(pr_cwd, checkout)
+
     def test_remote_repository_supports_https_and_ssh(self) -> None:
         self.assertEqual(
             GitHubClient._remote_repository("https://github.com/example/project.git"),

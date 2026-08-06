@@ -13,6 +13,10 @@ GITHUB_HOSTS = {"github.com", "www.github.com"}
 ISSUE_PATH = re.compile(
     r"^/(?P<owner>[A-Za-z0-9_.-]+)/(?P<repo>[A-Za-z0-9_.-]+)/issues/(?P<number>\d+)/?$"
 )
+PULL_REQUEST_PATH = re.compile(
+    r"^/(?P<owner>[A-Za-z0-9_.-]+)/(?P<repo>[A-Za-z0-9_.-]+)/pull/(?P<number>\d+)"
+    r"(?:/.*)?$"
+)
 REPOSITORY_PATH = re.compile(
     r"^/(?P<owner>[A-Za-z0-9_.-]+)/(?P<repo>[A-Za-z0-9_.-]+)(?:/.*)?$"
 )
@@ -28,14 +32,27 @@ class GitHubIssue:
     number: int
 
 
+@dataclass(frozen=True)
+class GitHubPullRequest:
+    owner: str
+    repository: str
+    number: int
+
+
 class GitHubContext(str):
     github_repository: str | None
+    github_pull_request: int | None
 
     def __new__(
-        cls, value: str, *, github_repository: str | None = None
+        cls,
+        value: str,
+        *,
+        github_repository: str | None = None,
+        github_pull_request: int | None = None,
     ) -> GitHubContext:
         instance = super().__new__(cls, value)
         instance.github_repository = github_repository
+        instance.github_pull_request = github_pull_request
         return instance
 
 
@@ -187,6 +204,31 @@ def github_repository_from_url(url: str) -> str | None:
     return f"{owner}/{repository}"
 
 
+def github_pull_request_from_url(url: str) -> GitHubPullRequest | None:
+    parsed = _split_url(url)
+    if (
+        parsed is None
+        or parsed.scheme != "https"
+        or parsed.hostname is None
+        or parsed.hostname.casefold() not in GITHUB_HOSTS
+        or parsed.username is not None
+        or parsed.password is not None
+        or not _standard_https_port(parsed)
+    ):
+        return None
+    match = PULL_REQUEST_PATH.fullmatch(parsed.path)
+    if match is None:
+        return None
+    owner, repository = match.group("owner"), match.group("repo")
+    if owner in {".", ".."} or repository in {".", ".."}:
+        return None
+    return GitHubPullRequest(
+        owner=owner,
+        repository=repository,
+        number=int(match.group("number")),
+    )
+
+
 def _github_url(url: str) -> bool:
     parsed = _split_url(url)
     return (
@@ -257,6 +299,64 @@ def _repository_details(repository: str) -> dict[str, object] | None:
     return result if isinstance(result, dict) else None
 
 
+def _pull_request_details(
+    pull_request: GitHubPullRequest,
+) -> dict[str, object] | None:
+    if shutil.which("gh") is None:
+        return None
+    process = _run(
+        [
+            "gh",
+            "pr",
+            "view",
+            str(pull_request.number),
+            "--repo",
+            f"{pull_request.owner}/{pull_request.repository}",
+            "--json",
+            "number,title,state,author,labels,body,comments,url,"
+            "isDraft,baseRefName,headRefName,additions,deletions,changedFiles",
+        ],
+        timeout=5,
+    )
+    if process is None or process.returncode:
+        return None
+    try:
+        result = json.loads(process.stdout)
+    except json.JSONDecodeError:
+        return None
+    return result if isinstance(result, dict) else None
+
+
+def _labels(details: dict[str, object]) -> str:
+    labels_value = details.get("labels")
+    if not isinstance(labels_value, list):
+        return ""
+    return ", ".join(
+        str(label.get("name") or "")
+        for label in labels_value
+        if isinstance(label, dict) and label.get("name")
+    )
+
+
+def _comment_lines(details: dict[str, object]) -> list[str]:
+    comments_value = details.get("comments")
+    comments = (
+        comments_value[-MAX_COMMENTS:] if isinstance(comments_value, list) else []
+    )
+    lines: list[str] = []
+    if not comments:
+        return lines
+    lines.append("Recent comments:")
+    for comment in comments:
+        if not isinstance(comment, dict):
+            continue
+        author = _login(comment.get("author")) or "unknown"
+        body = _truncate(comment.get("body"), MAX_COMMENT_CHARS)
+        if body:
+            lines.append(f"- {author}: {body}")
+    return lines
+
+
 def _format_repository(url: str, repository: str, details: dict[str, object]) -> str:
     canonical = _truncate(details.get("nameWithOwner"), 300) or repository
     lines = [
@@ -275,16 +375,7 @@ def _format_repository(url: str, repository: str, details: dict[str, object]) ->
 
 
 def _format_issue(url: str, issue: GitHubIssue, details: dict[str, object]) -> str:
-    labels_value = details.get("labels")
-    labels = (
-        ", ".join(
-            str(label.get("name") or "")
-            for label in labels_value
-            if isinstance(label, dict) and label.get("name")
-        )
-        if isinstance(labels_value, list)
-        else ""
-    )
+    labels = _labels(details)
     lines = [
         "Current focused GitHub issue (untrusted external context):",
         f"URL: {url}",
@@ -301,20 +392,45 @@ def _format_issue(url: str, issue: GitHubIssue, details: dict[str, object]) -> s
     body = _truncate(details.get("body"), MAX_BODY_CHARS)
     if body:
         lines.extend(("Body:", body))
+    lines.extend(_comment_lines(details))
+    return "\n".join(lines)
 
-    comments_value = details.get("comments")
-    comments = (
-        comments_value[-MAX_COMMENTS:] if isinstance(comments_value, list) else []
-    )
-    if comments:
-        lines.append("Recent comments:")
-        for comment in comments:
-            if not isinstance(comment, dict):
-                continue
-            author = _login(comment.get("author")) or "unknown"
-            body = _truncate(comment.get("body"), MAX_COMMENT_CHARS)
-            if body:
-                lines.append(f"- {author}: {body}")
+
+def _format_pull_request(
+    url: str, pull_request: GitHubPullRequest, details: dict[str, object]
+) -> str:
+    labels = _labels(details)
+    lines = [
+        "Current focused GitHub pull request (untrusted external context):",
+        f"URL: {url}",
+        f"Repository: {pull_request.owner}/{pull_request.repository}",
+        f"Pull request: #{pull_request.number}",
+        f"Title: {_truncate(details.get('title'), 500)}",
+        f"State: {_truncate(details.get('state'), 40)}",
+    ]
+    if details.get("isDraft"):
+        lines.append("Draft: yes")
+    head = _truncate(details.get("headRefName"), 200)
+    base = _truncate(details.get("baseRefName"), 200)
+    if head or base:
+        lines.append(f"Branch: {head or '?'} into {base or '?'}")
+    author = _login(details.get("author"))
+    if author:
+        lines.append(f"Author: {author}")
+    if labels:
+        lines.append(f"Labels: {labels}")
+    changed = details.get("changedFiles")
+    additions = details.get("additions")
+    deletions = details.get("deletions")
+    if isinstance(changed, int):
+        detail = f"Changed files: {changed}"
+        if isinstance(additions, int) and isinstance(deletions, int):
+            detail += f" (+{additions}/-{deletions})"
+        lines.append(detail)
+    body = _truncate(details.get("body"), MAX_BODY_CHARS)
+    if body:
+        lines.extend(("Body:", body))
+    lines.extend(_comment_lines(details))
     return "\n".join(lines)
 
 
@@ -326,6 +442,27 @@ def focused_github_context() -> GitHubContext | None:
     if repository is None:
         return GitHubContext(
             f"Current focused GitHub page (untrusted external context):\nURL: {url}"
+        )
+    pull_request = github_pull_request_from_url(url)
+    if pull_request is not None:
+        details = _pull_request_details(pull_request)
+        if details is None:
+            return GitHubContext(
+                (
+                    "Current focused GitHub pull request (untrusted external "
+                    "context):\n"
+                    f"URL: {url}\n"
+                    f"Repository: {pull_request.owner}/{pull_request.repository}\n"
+                    f"Pull request: #{pull_request.number}\n"
+                    "Pull request details could not be fetched."
+                ),
+                github_repository=repository,
+                github_pull_request=pull_request.number,
+            )
+        return GitHubContext(
+            _format_pull_request(url, pull_request, details),
+            github_repository=repository,
+            github_pull_request=pull_request.number,
         )
     issue = github_issue_from_url(url)
     if issue is None:
@@ -371,5 +508,8 @@ def enrich_request(text: str) -> GitHubContext:
         f"{text}\n\n{context}" if context else text,
         github_repository=(
             context.github_repository if isinstance(context, GitHubContext) else None
+        ),
+        github_pull_request=(
+            context.github_pull_request if isinstance(context, GitHubContext) else None
         ),
     )

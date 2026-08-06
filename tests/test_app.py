@@ -114,6 +114,7 @@ class AppContextTests(unittest.TestCase):
             request,
             github_repository="source/project",
             fork_requested=True,
+            github_pull_request=None,
             delivery_claims=mock.ANY,
         )
 

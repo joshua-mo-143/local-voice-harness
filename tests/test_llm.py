@@ -158,6 +158,7 @@ class QwenClientTests(unittest.TestCase):
             repository=None,
             github_repository="source/project",
             fork_requested=True,
+            github_pull_request=None,
             agent=None,
             action="submit",
             job_id=None,

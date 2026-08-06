@@ -7,7 +7,7 @@ import re
 import shutil
 import subprocess
 import uuid
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -41,6 +41,14 @@ class ProvisionedRepository:
     checkout: Path
 
 
+@dataclass(frozen=True)
+class ProvisionedPullRequest:
+    source: GitHubRepository
+    checkout: Path
+    number: int
+    branch: str | None = None
+
+
 class GitHubClient:
     def __init__(
         self,
@@ -69,6 +77,7 @@ class GitHubClient:
         *,
         timeout: float = 30,
         check: bool = True,
+        cwd: Path | None = None,
     ) -> subprocess.CompletedProcess[str]:
         try:
             process = subprocess.run(
@@ -77,6 +86,7 @@ class GitHubClient:
                 text=True,
                 timeout=timeout,
                 check=False,
+                cwd=str(cwd) if cwd is not None else None,
             )
         except (OSError, subprocess.TimeoutExpired) as exc:
             raise GitHubError(f"GitHub command failed: {exc}") from exc
@@ -135,6 +145,11 @@ class GitHubClient:
         assert source is not None
         if source.is_private:
             raise GitHubError("the focused GitHub repository is private")
+        return source
+
+    def inspect_repository(self, repository: str) -> GitHubRepository:
+        source = self._repo_view(self.validate_repository(repository), required=True)
+        assert source is not None
         return source
 
     def authenticated_login(self) -> str:
@@ -250,9 +265,16 @@ class GitHubClient:
             finally:
                 fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
 
-    def ensure_clone(self, source: GitHubRepository, fork: GitHubRepository) -> Path:
-        source_owner, repository_name = source.name_with_owner.split("/", 1)
-        destination = self.clone_root / source_owner / repository_name
+    def _materialize_clone(
+        self,
+        *,
+        owner: str,
+        repository_name: str,
+        clone_source: str,
+        verify: GitHubRepository,
+        finalize: Callable[[Path], None] | None = None,
+    ) -> Path:
+        destination = self.clone_root / owner / repository_name
         with self._provisioning_lock():
             destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
             resolved_parent = destination.parent.resolve()
@@ -261,8 +283,9 @@ class GitHubClient:
             except ValueError as exc:
                 raise GitHubError("GitHub clone destination escapes its root") from exc
             if destination.exists():
-                self._verify_checkout(destination, fork)
-                self._ensure_upstream(destination, source, fork)
+                self._verify_checkout(destination, verify)
+                if finalize is not None:
+                    finalize(destination)
                 return destination.resolve()
             temporary = destination.parent / (
                 f".{repository_name}.clone-{uuid.uuid4().hex}"
@@ -273,21 +296,62 @@ class GitHubClient:
                         self.gh_executable,
                         "repo",
                         "clone",
-                        fork.name_with_owner,
+                        clone_source,
                         str(temporary),
                     ],
                     timeout=300,
                 )
-                self._verify_checkout(temporary, fork)
-                self._ensure_upstream(temporary, source, fork)
+                self._verify_checkout(temporary, verify)
+                if finalize is not None:
+                    finalize(temporary)
                 os.replace(temporary, destination)
             finally:
                 if temporary.exists():
                     shutil.rmtree(temporary)
             return destination.resolve()
 
+    def ensure_clone(self, source: GitHubRepository, fork: GitHubRepository) -> Path:
+        source_owner, repository_name = source.name_with_owner.split("/", 1)
+        return self._materialize_clone(
+            owner=source_owner,
+            repository_name=repository_name,
+            clone_source=fork.name_with_owner,
+            verify=fork,
+            finalize=lambda checkout: self._ensure_upstream(checkout, source, fork),
+        )
+
+    def ensure_repository_clone(self, source: GitHubRepository) -> Path:
+        source_owner, repository_name = source.name_with_owner.split("/", 1)
+        return self._materialize_clone(
+            owner=source_owner,
+            repository_name=repository_name,
+            clone_source=source.name_with_owner,
+            verify=source,
+        )
+
+    def checkout_pull_request(self, checkout: Path, number: int) -> str | None:
+        self._run(
+            [self.gh_executable, "pr", "checkout", str(number)],
+            timeout=180,
+            cwd=checkout,
+        )
+        head = self._git(checkout, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
+        return head or None
+
     def provision_public_fork(self, repository: str) -> ProvisionedRepository:
         source = self.inspect_public_repository(repository)
         fork = self.ensure_fork(source, self.authenticated_login())
         checkout = self.ensure_clone(source, fork)
         return ProvisionedRepository(source=source, fork=fork, checkout=checkout)
+
+    def provision_pull_request(
+        self, repository: str, number: int
+    ) -> ProvisionedPullRequest:
+        if number <= 0:
+            raise GitHubError("GitHub pull request number must be positive")
+        source = self.inspect_repository(repository)
+        checkout = self.ensure_repository_clone(source)
+        branch = self.checkout_pull_request(checkout, number)
+        return ProvisionedPullRequest(
+            source=source, checkout=checkout, number=number, branch=branch
+        )
