@@ -488,6 +488,7 @@ Environment variables can be added to systemd drop-ins:
 | `VOICE_HARNESS_GITHUB_ROOT` | Owner-qualified clones of explicitly requested GitHub forks | `~/src` |
 | `DICTATION_MODEL` | faster-whisper model | `large-v3` |
 | `DICTATION_COMPUTE` | faster-whisper compute type | `float16` |
+| `DICTATION_LANGUAGE` | Spoken language to transcribe (`en`, `zh`, `english`, `chinese`, or `auto`) | `auto` |
 | `DICTATION_INJECT` | Focused-window insertion mode (`auto`, `paste`, `type`, or `stdout`) | `auto` |
 | `DICTATION_REPLACEMENTS` | Semicolon-separated STT corrections | Cursor/Herdr defaults |
 
