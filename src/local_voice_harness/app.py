@@ -4,7 +4,7 @@ import json
 
 from .browser_context import request_context
 from .components import component_usage, llm_ready, start_components
-from .config import FORK_PATTERN, PID_PATH, STT_SOCKET, TTS_SOCKET
+from .config import CURSOR_PATTERN, FORK_PATTERN, PID_PATH, STT_SOCKET, TTS_SOCKET
 from .cursor.jobs import (
     DeliveryClaims,
     acknowledge_deliveries,
@@ -12,7 +12,7 @@ from .cursor.jobs import (
     release_deliveries,
 )
 from .errors import HarnessError
-from .intent import Intent, route_intent
+from .intent import Intent, IntentRoute, route_intent
 from .ipc import socket_ready
 from .llm import qwen_response
 from .tts.client import stream_and_play
@@ -28,7 +28,10 @@ def respond(text: str) -> None:
             start_components()
             print(f"You: {text}")
             context = request_context(text)
-            route = route_intent(text, context)
+            if CURSOR_PATTERN.search(text):
+                route = IntentRoute(Intent.CURSOR_SUBMIT, "high")
+            else:
+                route = route_intent(text, context)
             fork_requested = bool(FORK_PATTERN.search(text))
             github_arguments = (
                 {

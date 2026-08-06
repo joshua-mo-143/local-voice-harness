@@ -7,6 +7,7 @@ from unittest import mock
 
 from local_voice_harness import intent
 from local_voice_harness.browser_context import RequestContext
+from local_voice_harness.config import CURSOR_PATTERN
 
 
 def _response(route: str, confidence: str = "high") -> io.BytesIO:
@@ -105,6 +106,26 @@ class IntentRouterTests(unittest.TestCase):
             ):
                 route = intent.route_intent("request", RequestContext("request"))
                 self.assertEqual(route, intent.FALLBACK_ROUTE)
+
+
+class CursorPatternTests(unittest.TestCase):
+    def test_matches_explicit_cursor_delegation(self) -> None:
+        for utterance in (
+            "use cursor to fix this",
+            "ask Cursor to inspect",
+            "call curser: refactor",
+        ):
+            with self.subTest(utterance=utterance):
+                self.assertIsNotNone(CURSOR_PATTERN.search(utterance))
+
+    def test_does_not_match_implicit_work_requests(self) -> None:
+        for utterance in (
+            "work on this",
+            "summarize this",
+            "fix the bug in auth",
+        ):
+            with self.subTest(utterance=utterance):
+                self.assertIsNone(CURSOR_PATTERN.search(utterance))
 
 
 if __name__ == "__main__":
