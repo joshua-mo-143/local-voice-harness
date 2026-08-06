@@ -10,11 +10,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from ..config import REPOSITORY_ROOT
+
 HERDR_BIN = os.environ.get(
     "VOICE_HARNESS_HERDR_BIN", str(Path.home() / ".local/bin/herdr")
 )
 HERDR_UNIT = "voice-harness-herdr.service"
-HOME_ROOT = Path(os.environ.get("VOICE_HARNESS_PROJECT_ROOT", Path.home())).resolve()
+HOME_ROOT = REPOSITORY_ROOT
 SETTLED = {"idle", "done"}
 LINEAR_ISSUE = re.compile(r"\b([A-Z][A-Z0-9]+)(?:\s*-\s*|\s+)(\d+)\b", re.IGNORECASE)
 
@@ -370,15 +372,21 @@ class HerdrClient:
         issue_key: str | None,
         agent_hint: str | None,
         reserved: set[str],
+        worktree_branch: str | None = None,
+        worktree_label: str | None = None,
     ) -> AgentSelection:
         repository = repository.resolve()
         checkout = repository
         workspace_id = None
         root_pane = None
-        label = repository.name
-        if issue_key:
+        label = worktree_label or repository.name
+        branch = worktree_branch
+        if issue_key and branch is None:
             label = issue_key.casefold()
             branch = f"voice/{label}"
+        if branch:
+            if not re.fullmatch(r"voice/[a-z0-9][a-z0-9._/-]{0,100}", branch):
+                raise HerdrError("invalid voice worktree branch")
             listing = self.run_json(
                 "worktree", "list", "--cwd", str(repository), "--json"
             )

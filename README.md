@@ -48,12 +48,22 @@ Cursor routing works as follows:
 1. Prefer an idle Cursor agent already running in the requested checkout.
 2. For a Linear issue without a repository name, ask a dedicated routing agent to
    inspect the ticket through Linear MCP and infer the repository.
-3. Create or reuse a `voice/<issue-key>` Git worktree for Linear implementation work.
-4. Start a new Cursor agent through Herdr when no suitable agent exists.
-5. Reserve that agent until it finishes, is blocked, or the job is cancelled.
+3. When the user explicitly says “fork,” validate the focused public GitHub repository,
+   create or reuse the authenticated user's fork, and clone it below the configured
+   GitHub root.
+4. When a GitHub pull request is focused, clone its repository below the configured
+   GitHub root and check the pull request out in place with `gh pr checkout`, then run
+   the request against that checkout so Cursor can verify or extend the branch.
+5. Create or reuse a `voice/<issue-key>` Git worktree for Linear implementation work,
+   or create a unique `voice/github-<job-id>` worktree for a GitHub fork task. A checked
+   out pull request runs directly on its branch without a generated worktree.
+6. Start a new Cursor agent through Herdr when no suitable agent exists.
+7. Reserve that agent until it finishes, is blocked, or the job is cancelled.
 
-The harness never automatically commits, pushes, opens pull requests, modifies
-Linear, or deletes generated worktrees.
+The harness never automatically commits, pushes, opens pull requests, modifies Linear,
+or deletes generated worktrees. Fork creation is the only supported GitHub write and
+is performed only when the spoken request explicitly includes “fork.” Checking out a
+focused pull request only reads from GitHub and writes to the local checkout.
 
 ## Compute requirements
 
@@ -115,8 +125,8 @@ llama-server --version
 nvidia-smi
 ```
 
-Authenticate the GitHub CLI to let focused issue pages include private-repository
-details:
+Authenticate the GitHub CLI to let focused issue pages include repository details and
+to create forks explicitly requested through the harness:
 
 ```bash
 gh auth login
@@ -378,6 +388,8 @@ Hey Jarvis, what time is it?
 Hey Jarvis, ask Cursor to summarize the api-docs repository.
 Hey Jarvis, ask Cursor to work on Linear issue API-79.
 Hey Jarvis, summarize this issue.  # with a GitHub issue focused in Firefox
+Hey Jarvis, fork this repo and add Venice.  # with a public GitHub repo focused
+Hey Jarvis, ask Cursor to check out this PR and make sure it works.  # with a PR focused
 Hey Jarvis, what is the status of that Cursor job?
 Hey Jarvis, cancel that Cursor job.
 ```
@@ -412,7 +424,9 @@ On X11, each new conversational request checks whether Firefox is focused. The
 harness briefly selects and copies the address bar, restores the previous clipboard,
 and dismisses the address bar without navigating. A focused GitHub page contributes
 its URL; a focused issue page also contributes title, state, body, labels, and recent
-comments fetched through the authenticated `gh` CLI. Page content is treated as
+comments fetched through the authenticated `gh` CLI. A focused pull request page adds
+the same details plus its draft state, source and target branches, and change summary,
+and lets a Cursor request check the branch out locally. Page content is treated as
 untrusted input. Missing tools, unsupported sessions such as native Wayland, focus
 changes during capture, and GitHub errors simply omit some or all browser context
 without failing the voice request.
@@ -471,12 +485,17 @@ Environment variables can be added to systemd drop-ins:
 | `VOICE_HARNESS_CURSOR_FOREGROUND_SECONDS` | Time before a Cursor job backgrounds | `5` |
 | `VOICE_HARNESS_HERDR_BIN` | Herdr executable | `~/.local/bin/herdr` |
 | `VOICE_HARNESS_PROJECT_ROOT` | Allowed root for inferred repositories | Home directory |
+| `VOICE_HARNESS_GITHUB_ROOT` | Owner-qualified clones of explicitly requested GitHub forks | `~/src` |
 | `DICTATION_MODEL` | faster-whisper model | `large-v3` |
 | `DICTATION_COMPUTE` | faster-whisper compute type | `float16` |
 | `DICTATION_INJECT` | Focused-window insertion mode (`auto`, `paste`, `type`, or `stdout`) | `auto` |
 | `DICTATION_REPLACEMENTS` | Semicolon-separated STT corrections | Cursor/Herdr defaults |
 
 `VOICE_HARNESS_PROJECT_ROOT` can narrow repository discovery to another directory.
+`VOICE_HARNESS_GITHUB_ROOT` must resolve inside it. Forks are cloned to
+`<github-root>/<source-owner>/<repository>`; an existing checkout is reused only when
+its `origin` identifies the expected fork. The source repository is configured as the
+`upstream` remote.
 
 ## Performance observed
 
@@ -494,8 +513,12 @@ Measured with all models warm on the RTX 5070 Ti Laptop GPU:
 - Herdr agents are started with workspace trust but not Cursor `--force`.
 - Ticket and MCP content is treated as untrusted input and inferred paths are
   validated against local Git repositories.
-- Focused GitHub issue content is read through `gh`, bounded before prompting, and
-  treated as untrusted external data.
+- Focused GitHub issue and pull request content is read through `gh`, bounded before
+  prompting, and treated as untrusted external data.
+- Merely focusing a GitHub page cannot create a fork. The original spoken request must
+  explicitly contain “fork,” and the source must be a validated public repository.
+- Checking out a focused pull request clones its repository below the GitHub root and
+  runs `gh pr checkout`; it reads from GitHub and writes only to the local checkout.
 - Jobs never automatically commit, push, open pull requests, or remove worktrees.
 - Runtime job metadata and audio live under `$XDG_RUNTIME_DIR/voice-harness`.
 
