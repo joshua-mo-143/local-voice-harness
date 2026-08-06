@@ -21,7 +21,7 @@ To add: I also am not looking at the code - as long as it works, I will likely k
 ```text
 PipeWire microphone
   -> OpenWakeWord ("Hey Jarvis")
-  -> faster-whisper large-v3 (CUDA)
+  -> faster-whisper large-v3-turbo (CUDA)
   -> Qwen3.5-9B UD-Q4_K_XL via llama.cpp (Vulkan)
        -> focused intent classification
        -> ordinary conversational response
@@ -89,12 +89,14 @@ Practical requirements for the included model choices:
 | Free disk | 25 GB | 30+ GB |
 | CPU | Modern 4-core x86-64 | 8+ cores |
 
-With all models warm, expect roughly 14 GB of GPU memory; the Qwen3.5-9B weights are
-the largest single consumer. The main disk consumers are:
+With all models warm, expect roughly 11-12 GB of GPU memory, which is close to the
+12 GB limit of the RTX 5070 Ti Laptop GPU; the Qwen3.5-9B weights are the largest
+single consumer, and Whisper is kept on the smaller `large-v3-turbo` model so the
+whole pipeline fits on the card. The main disk consumers are:
 
 - Qwen3.5-9B UD-Q4_K_XL GGUF: approximately 6.0 GB.
 - Chatterbox Turbo cache: 3.8 GB.
-- faster-whisper large-v3 cache: 2.9 GB.
+- faster-whisper large-v3-turbo cache: approximately 1.6 GB.
 - Current Python environments: approximately 13 GB combined.
 
 The current implementation requires CUDA for Whisper and Chatterbox. CPU-only use
@@ -172,7 +174,7 @@ UV_PROJECT_ENVIRONMENT=.venv-dictation \
   uv sync --python 3.11 --extra dictation --no-dev
 ```
 
-The first dictation start downloads faster-whisper large-v3 from Hugging Face.
+The first dictation start downloads faster-whisper large-v3-turbo from Hugging Face.
 
 ### 3. Create the Chatterbox environment
 
@@ -536,7 +538,7 @@ Environment variables can be added to systemd drop-ins:
 | `VOICE_HARNESS_HERDR_BIN` | Herdr executable | `~/.local/bin/herdr` |
 | `VOICE_HARNESS_PROJECT_ROOT` | Allowed root for inferred repositories | Home directory |
 | `VOICE_HARNESS_GITHUB_ROOT` | Owner-qualified clones of explicitly requested GitHub forks | `~/src` |
-| `DICTATION_MODEL` | faster-whisper model | `large-v3` |
+| `DICTATION_MODEL` | faster-whisper model | `large-v3-turbo` |
 | `DICTATION_COMPUTE` | faster-whisper compute type | `float16` |
 | `DICTATION_LANGUAGE` | Spoken language to transcribe (`en`, `zh`, `english`, `chinese`, or `auto`) | `auto` |
 | `DICTATION_INJECT` | Focused-window insertion mode (`auto`, `paste`, `type`, or `stdout`) | `auto` |
@@ -550,7 +552,9 @@ its `origin` identifies the expected fork. The source repository is configured a
 
 ## Performance observed
 
-Measured with all models warm on the RTX 5070 Ti Laptop GPU:
+Measured with all models warm on the RTX 5070 Ti Laptop GPU, using the earlier
+Qwen3.5-4B and Whisper large-v3. Figures for the current Qwen3.5-9B and
+large-v3-turbo defaults are pending re-measurement:
 
 - Whisper large-v3: approximately 0.58 seconds for a short request.
 - Qwen response: 0.22–0.53 seconds; first Vulkan request approximately 5 seconds.
