@@ -9,6 +9,11 @@ from pathlib import Path
 from unittest import mock
 
 from local_voice_harness.cursor import jobs
+from local_voice_harness.integrations.github import (
+    GitHubRepository,
+    ProvisionedRepository,
+)
+from local_voice_harness.integrations.herdr import AgentSelection, PromptOutcome
 
 
 class CursorJobStateTests(unittest.TestCase):
@@ -36,6 +41,88 @@ class CursorJobStateTests(unittest.TestCase):
         self.assertEqual(updated["repository_hint"], "example-repo")
         launch.assert_called_once_with("123456789abc")
 
+    def test_github_repository_reply_preserves_explicit_fork_intent(self) -> None:
+        job: dict[str, object] = {
+            "id": "123456789abc",
+            "request": "Fork this repo and add a feature",
+            "fork_requested": True,
+            "status": "awaiting_user",
+            "clarification_kind": "github_repository",
+        }
+        jobs.write_job(job)
+        with mock.patch.object(jobs, "launch_worker"):
+            jobs.reply_job("123456789abc", "example/project")
+        updated = jobs.read_job("123456789abc")
+        self.assertEqual(updated["github_repository"], "example/project")
+        self.assertTrue(updated["fork_requested"])
+        self.assertEqual(updated["request"], "Fork this repo and add a feature")
+
+    def test_worker_provisions_fork_and_uses_dedicated_worktree(self) -> None:
+        repository = Path(self.temporary.name) / "source" / "project"
+        source = GitHubRepository(
+            "source/project",
+            "https://github.com/source/project",
+            False,
+            "main",
+        )
+        fork = GitHubRepository(
+            "me/project",
+            "https://github.com/me/project",
+            False,
+            "main",
+            "source/project",
+        )
+        provisioned = ProvisionedRepository(source, fork, repository)
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "Fork this repo and add a feature",
+                "github_repository": "source/project",
+                "fork_requested": True,
+                "worktree_branch": "voice/github-123456789abc",
+                "worktree_label": "github-123456",
+                "status": "queued",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        github = mock.Mock()
+        github.provision_public_fork.return_value = provisioned
+        client = mock.Mock()
+        client.ensure_agent.return_value = AgentSelection(
+            "agent",
+            "pane",
+            "workspace",
+            str(repository),
+            "agent",
+            "/worktree",
+        )
+        client.prompt_and_wait.return_value = PromptOutcome(
+            "idle",
+            "done",
+            None,
+            "VOICE_SUMMARY[123456789abc-1]: done",
+        )
+        with (
+            mock.patch.object(jobs, "GitHubClient", return_value=github),
+            mock.patch.object(jobs, "HerdrClient", return_value=client),
+        ):
+            jobs.run_worker("123456789abc")
+
+        github.provision_public_fork.assert_called_once_with("source/project")
+        client.ensure_agent.assert_called_once_with(
+            repository,
+            issue_key=None,
+            agent_hint=None,
+            reserved=set(),
+            worktree_branch="voice/github-123456789abc",
+            worktree_label="github-123456",
+        )
+        updated = jobs.read_job("123456789abc")
+        self.assertEqual(updated["status"], "completed")
+        self.assertEqual(updated["fork_repository"], "me/project")
+        self.assertEqual(updated["repository"], str(repository))
+
     def test_submit_starts_new_job_despite_existing_session(self) -> None:
         with (
             mock.patch.object(jobs, "start_job", return_value="newjob123456") as start,
@@ -54,6 +141,9 @@ class CursorJobStateTests(unittest.TestCase):
         start.assert_called_once_with(
             "Work on APP-43",
             repository=None,
+            github_repository=None,
+            fork_requested=False,
+            github_pull_request=None,
             agent=None,
             utterance=None,
             context_repository=None,

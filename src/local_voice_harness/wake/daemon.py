@@ -15,7 +15,7 @@ from pathlib import Path
 
 from ..browser_context import request_context
 from ..components import llm_ready, start_components, stop_components
-from ..config import DEFAULT_SOURCE, STATE_DIR, WAV_PATH
+from ..config import DEFAULT_SOURCE, FORK_PATTERN, STATE_DIR, WAV_PATH
 from ..cursor.jobs import (
     DeliveryClaims,
     acknowledge_deliveries,
@@ -385,6 +385,18 @@ class WakeConversationDaemon:
             remember_response = False
             context = request_context(text)
             route = route_intent(text, context, cursor_session=self.cursor_session)
+            fork_requested = bool(FORK_PATTERN.search(text))
+            github_arguments = (
+                {
+                    "github_repository": context.github_repository,
+                    "fork_requested": fork_requested,
+                    "github_pull_request": context.github_pull_request,
+                }
+                if context.github_repository
+                or fork_requested
+                or context.github_pull_request
+                else {}
+            )
             if (
                 route.actionable
                 and route.intent == Intent.CURSOR_CANCEL
@@ -413,6 +425,7 @@ class WakeConversationDaemon:
                     context.text,
                     utterance=text,
                     context_repository=context.focused_repository,
+                    **github_arguments,
                     delivery_claims=delivery_claims,
                 )
             elif (
@@ -432,6 +445,7 @@ class WakeConversationDaemon:
                     context.text,
                     self.history,
                     self.cursor_session,
+                    **github_arguments,
                     delivery_claims=delivery_claims,
                 )
                 remember_response = True

@@ -27,6 +27,14 @@ class SpeechToTextClientTests(unittest.TestCase):
 
         self.assertEqual(result, "Cursor and Herdr, not cursative")
 
+    def test_resolve_language_maps_aliases_and_auto_detect(self) -> None:
+        self.assertEqual(stt_server.resolve_language("en"), "en")
+        self.assertEqual(stt_server.resolve_language("ZH"), "zh")
+        self.assertEqual(stt_server.resolve_language("English"), "en")
+        self.assertEqual(stt_server.resolve_language(" chinese "), "zh")
+        self.assertIsNone(stt_server.resolve_language(""))
+        self.assertIsNone(stt_server.resolve_language("auto"))
+
     def test_transcribe_sends_path_and_returns_trimmed_text(self) -> None:
         audio = Path("/tmp/request.wav")
         output = io.StringIO()

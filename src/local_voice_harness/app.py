@@ -4,7 +4,7 @@ import json
 
 from .browser_context import request_context
 from .components import component_usage, llm_ready, start_components
-from .config import PID_PATH, STT_SOCKET, TTS_SOCKET
+from .config import FORK_PATTERN, PID_PATH, STT_SOCKET, TTS_SOCKET
 from .cursor.jobs import (
     DeliveryClaims,
     acknowledge_deliveries,
@@ -29,16 +29,32 @@ def respond(text: str) -> None:
             print(f"You: {text}")
             context = request_context(text)
             route = route_intent(text, context)
-            response = (
-                cursor_turn(
+            fork_requested = bool(FORK_PATTERN.search(text))
+            github_arguments = (
+                {
+                    "github_repository": context.github_repository,
+                    "fork_requested": fork_requested,
+                    "github_pull_request": context.github_pull_request,
+                }
+                if context.github_repository
+                or fork_requested
+                or context.github_pull_request
+                else {}
+            )
+            if route.actionable and route.intent == Intent.CURSOR_SUBMIT:
+                response = cursor_turn(
                     context.text,
                     utterance=text,
                     context_repository=context.focused_repository,
+                    **github_arguments,
                     delivery_claims=delivery_claims,
                 )[0]
-                if route.actionable and route.intent == Intent.CURSOR_SUBMIT
-                else qwen_response(context.text, delivery_claims=delivery_claims)
-            )
+            else:
+                response = qwen_response(
+                    context.text,
+                    **github_arguments,
+                    delivery_claims=delivery_claims,
+                )
             print(f"Assistant: {response}")
             stream_and_play(response)
             acknowledge_deliveries(delivery_claims)

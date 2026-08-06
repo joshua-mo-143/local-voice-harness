@@ -144,6 +144,32 @@ class AppContextTests(unittest.TestCase):
             "summarize this\n\ncontext", delivery_claims=mock.ANY
         )
 
+    def test_explicit_fork_passes_validated_focused_repository(self) -> None:
+        context = RequestContext(
+            "fork this repo and add Venice\n\ncontext",
+            github_repository="source/project",
+        )
+        with (
+            mock.patch.object(app, "start_components"),
+            mock.patch.object(app, "request_context", return_value=context),
+            mock.patch.object(
+                app,
+                "route_intent",
+                return_value=IntentRoute(Intent.CONVERSATION, "high"),
+            ),
+            mock.patch.object(app, "qwen_response", return_value="started") as qwen,
+            mock.patch.object(app, "stream_and_play"),
+        ):
+            app.respond("fork this repo and add Venice")
+
+        qwen.assert_called_once_with(
+            "fork this repo and add Venice\n\ncontext",
+            github_repository="source/project",
+            fork_requested=True,
+            github_pull_request=None,
+            delivery_claims=mock.ANY,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
