@@ -48,17 +48,19 @@ Cursor routing works as follows:
 1. Prefer an idle Cursor agent already running in the requested checkout.
 2. For a Linear issue without a repository name, ask a dedicated routing agent to
    inspect the ticket through Linear MCP and infer the repository.
-3. When the user explicitly says “fork,” validate the focused public GitHub repository,
+3. If no repository can be resolved, open Rofi to select a local repository or paste
+   a Git URL; cloning requires a second confirmation.
+4. When the user explicitly says “fork,” validate the focused public GitHub repository,
    create or reuse the authenticated user's fork, and clone it below the configured
    GitHub root.
-4. When a GitHub pull request is focused, clone its repository below the configured
+5. When a GitHub pull request is focused, clone its repository below the configured
    GitHub root and check the pull request out in place with `gh pr checkout`, then run
    the request against that checkout so Cursor can verify or extend the branch.
-5. Create or reuse a `voice/<issue-key>` Git worktree for Linear implementation work,
+6. Create or reuse a `voice/<issue-key>` Git worktree for Linear implementation work,
    or create a unique `voice/github-<job-id>` worktree for a GitHub fork task. A checked
    out pull request runs directly on its branch without a generated worktree.
-6. Start a new Cursor agent through Herdr when no suitable agent exists.
-7. Reserve that agent until it finishes, is blocked, or the job is cancelled.
+7. Start a new Cursor agent through Herdr when no suitable agent exists.
+8. Reserve that agent until it finishes, is blocked, or the job is cancelled.
 
 The harness never automatically commits, pushes, opens pull requests, modifies Linear,
 or deletes generated worktrees. Fork creation is the only supported GitHub write and
@@ -103,6 +105,7 @@ Install these before setting up Python environments:
 - `libnotify`/`notify-send`.
 - Git, curl, the GitHub CLI (`gh`), and systemd user services.
 - `xdotool` and `xclip` for X11 focused-window automation.
+- Rofi for repository selection and pasteable clone-URL prompts.
 - [uv](https://docs.astral.sh/uv/) for reproducible Python versions/environments.
 - A recent [llama.cpp](https://github.com/ggml-org/llama.cpp) build with Vulkan and
   `llama-server`.
@@ -113,7 +116,7 @@ Install these before setting up Python environments:
 On Arch/CachyOS, the base packages are approximately:
 
 ```bash
-paru -S --needed pipewire libnotify git curl github-cli xdotool xclip uv libsndfile
+paru -S --needed pipewire libnotify git curl github-cli xdotool xclip rofi uv libsndfile
 ```
 
 Package names for llama.cpp and NVIDIA drivers vary. Verify the required commands:
@@ -516,6 +519,8 @@ Measured with all models warm on the RTX 5070 Ti Laptop GPU:
   validated against local Git repositories.
 - Focused GitHub issue and pull request content is read through `gh`, bounded before
   prompting, and treated as untrusted external data.
+- Repository cloning requires explicit Rofi confirmation, accepts only HTTPS or SSH
+  Git URLs, and places the checkout beneath the configured project root.
 - Merely focusing a GitHub page cannot create a fork. The original spoken request must
   explicitly contain “fork,” and the source must be a validated public repository.
 - Checking out a focused pull request clones its repository below the GitHub root and
