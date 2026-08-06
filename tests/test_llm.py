@@ -118,6 +118,53 @@ class QwenClientTests(unittest.TestCase):
             },
         )
 
+    def test_focused_repository_and_explicit_fork_are_forwarded(self) -> None:
+        tool_call = {
+            "id": "call-1",
+            "function": {
+                "name": "cursor",
+                "arguments": json.dumps(
+                    {
+                        "task": "add Venice",
+                        "github_repository": "hallucinated/wrong",
+                    }
+                ),
+            },
+        }
+        with (
+            mock.patch.object(
+                llm.urllib.request,
+                "urlopen",
+                side_effect=[
+                    _response({"content": None, "tool_calls": [tool_call]}),
+                    _response({"content": "started"}),
+                ],
+            ),
+            mock.patch.object(
+                llm, "cursor_turn", return_value=("accepted", None)
+            ) as cursor_turn,
+            mock.patch.object(llm, "notify"),
+            redirect_stdout(io.StringIO()),
+        ):
+            llm.qwen_turn(
+                "fork this repo and add Venice",
+                github_repository="source/project",
+                fork_requested=True,
+            )
+
+        cursor_turn.assert_called_once_with(
+            "add Venice",
+            None,
+            repository=None,
+            github_repository="source/project",
+            fork_requested=True,
+            github_pull_request=None,
+            agent=None,
+            action="submit",
+            job_id=None,
+            delivery_claims=None,
+        )
+
     def test_rejects_empty_and_malformed_responses(self) -> None:
         responses = [
             _response({"content": ""}),

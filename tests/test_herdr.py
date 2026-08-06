@@ -124,6 +124,56 @@ should I use?
         commands = [call.args[0] for call in run.call_args_list]
         self.assertTrue(any(command[0] == "systemd-run" for command in commands))
 
+    def test_non_linear_task_creates_requested_worktree(self) -> None:
+        client = herdr.HerdrClient("herdr")
+        selection = herdr.AgentSelection(
+            "agent", "pane", "workspace", "/tmp/worktree", "agent", "/tmp/worktree"
+        )
+        with (
+            mock.patch.object(
+                client,
+                "run_json",
+                side_effect=[
+                    {"worktrees": []},
+                    {
+                        "worktree": {"path": "/tmp/worktree"},
+                        "workspace": {"workspace_id": "workspace"},
+                        "root_pane": {"pane_id": "pane"},
+                    },
+                ],
+            ) as run_json,
+            mock.patch.object(client, "find_agent", return_value=None),
+            mock.patch.object(client, "workspace_for", return_value=None),
+            mock.patch.object(
+                client, "start_agent", return_value=selection
+            ) as start_agent,
+        ):
+            result = client.ensure_agent(
+                Path("/tmp/repository"),
+                issue_key=None,
+                agent_hint=None,
+                reserved=set(),
+                worktree_branch="voice/github-123456",
+                worktree_label="github-123456",
+            )
+
+        self.assertEqual(result, selection)
+        self.assertEqual(
+            run_json.call_args_list[1].args[:7],
+            (
+                "worktree",
+                "create",
+                "--cwd",
+                "/tmp/repository",
+                "--branch",
+                "voice/github-123456",
+                "--label",
+            ),
+        )
+        start_agent.assert_called_once_with(
+            Path("/tmp/worktree"), "github-123456", "pane", "workspace"
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

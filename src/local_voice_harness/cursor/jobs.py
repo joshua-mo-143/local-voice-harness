@@ -14,6 +14,7 @@ from pathlib import Path
 
 from ..config import CURSOR_FOREGROUND_SECONDS, JOBS_DIR
 from ..errors import HarnessError
+from ..integrations.github import GitHubClient
 from ..integrations.herdr import (
     AgentSelection,
     HerdrClient,
@@ -451,13 +452,89 @@ def run_worker(job_id: str, claim_token: str | None = None) -> None:
         continuation = bool(job.get("continuation"))
         target = str(job.get("herdr_target") or "")
         if not target:
-            repositories = client.repository_roots()
+            repository: Path | None = None
+            repositories: list[Path] = []
+            candidates: list[Path] = []
             hint = str(job.get("repository_hint") or "").strip() or None
             task = str(job.get("request") or "")
-            repository, candidates = client.resolve_repository(hint, task, repositories)
             issue_key = str(job.get("issue_key") or "") or extract_linear_issue(task)
             reason = ""
-            if repository is None and issue_key and not hint and repositories:
+            if job.get("github_pull_request"):
+                github_repository = str(job.get("github_repository") or "").strip()
+                number = int(str(job.get("github_pull_request") or 0))
+                if not github_repository or number <= 0:
+                    _worker_question(
+                        job_id,
+                        worker_token,
+                        "Which repository's pull request should I check out? "
+                        "Please say its owner and repository name.",
+                        clarification_kind="github_repository",
+                    )
+                    return
+                provisioned_pr = GitHubClient().provision_pull_request(
+                    github_repository, number
+                )
+                repository = provisioned_pr.checkout
+                issue_key = None
+
+                def record_pull_request(current: dict[str, object]) -> None:
+                    current.update(
+                        {
+                            "github_repository": (
+                                provisioned_pr.source.name_with_owner
+                            ),
+                            "repository": str(provisioned_pr.checkout),
+                            "pull_request_branch": provisioned_pr.branch,
+                        }
+                    )
+
+                updated = _worker_change(
+                    job_id, worker_token, {"routing"}, record_pull_request
+                )
+                if updated is None:
+                    return
+                job = updated
+            elif job.get("fork_requested"):
+                github_repository = str(job.get("github_repository") or "").strip()
+                if not github_repository:
+                    _worker_question(
+                        job_id,
+                        worker_token,
+                        "Which public GitHub repository should I fork? "
+                        "Please say its owner and repository name.",
+                        clarification_kind="github_repository",
+                    )
+                    return
+                provisioned = GitHubClient().provision_public_fork(github_repository)
+                repository = provisioned.checkout
+
+                def record_provisioning(current: dict[str, object]) -> None:
+                    current.update(
+                        {
+                            "github_repository": (provisioned.source.name_with_owner),
+                            "fork_repository": provisioned.fork.name_with_owner,
+                            "repository": str(provisioned.checkout),
+                        }
+                    )
+
+                updated = _worker_change(
+                    job_id, worker_token, {"routing"}, record_provisioning
+                )
+                if updated is None:
+                    return
+                job = updated
+            else:
+                repositories = client.repository_roots()
+                repository, candidates = client.resolve_repository(
+                    hint, task, repositories
+                )
+            if (
+                repository is None
+                and issue_key
+                and not hint
+                and not job.get("fork_requested")
+                and not job.get("github_pull_request")
+            ):
                 repository, _confidence, reason = client.infer_repository(
                     issue_key,
                     repositories,
@@ -492,6 +569,8 @@ def run_worker(job_id: str, claim_token: str | None = None) -> None:
                     issue_key=issue_key or None,
                     agent_hint=str(job.get("agent_hint") or "") or None,
                     reserved=reserved_targets(job_id),
+                    worktree_branch=(str(job.get("worktree_branch") or "") or None),
+                    worktree_label=(str(job.get("worktree_label") or "") or None),
                 )
                 reserved = _reserve_worker_target(
                     job_id, worker_token, selection, repository, issue_key
@@ -584,7 +663,13 @@ def launch_worker(job_id: str) -> None:
 
 
 def start_job(
-    text: str, *, repository: str | None = None, agent: str | None = None
+    text: str,
+    *,
+    repository: str | None = None,
+    github_repository: str | None = None,
+    fork_requested: bool = False,
+    github_pull_request: int | None = None,
+    agent: str | None = None,
 ) -> str:
     job_id = uuid.uuid4().hex[:12]
     now = time.time()
@@ -595,6 +680,11 @@ def start_job(
             "revision": 0,
             "request": text,
             "repository_hint": repository,
+            "github_repository": github_repository,
+            "fork_requested": fork_requested,
+            "github_pull_request": github_pull_request,
+            "worktree_branch": (f"voice/github-{job_id}" if fork_requested else None),
+            "worktree_label": (f"github-{job_id[:6]}" if fork_requested else None),
             "agent_hint": agent,
             "issue_key": extract_linear_issue(text),
             "status": "queued",
@@ -619,6 +709,14 @@ def reply_job(job_id: str, text: str) -> None:
         if job.get("clarification_kind") == "repository":
             job.update(
                 {"repository_hint": text, "herdr_target": None, "continuation": False}
+            )
+        elif job.get("clarification_kind") == "github_repository":
+            job.update(
+                {
+                    "github_repository": text.strip(),
+                    "herdr_target": None,
+                    "continuation": False,
+                }
             )
         else:
             job.update({"continuation": True, "request": text})
@@ -972,6 +1070,9 @@ def cursor_turn(
     session_id: str | None = None,
     *,
     repository: str | None = None,
+    github_repository: str | None = None,
+    fork_requested: bool = False,
+    github_pull_request: int | None = None,
     agent: str | None = None,
     action: str = "submit",
     job_id: str | None = None,
@@ -992,7 +1093,17 @@ def cursor_turn(
         reply_job(reply_id, text)
         job_id = reply_id
     else:
-        job_id = start_job(text, repository=repository, agent=agent)
+        if github_repository or fork_requested or github_pull_request:
+            job_id = start_job(
+                text,
+                repository=repository,
+                github_repository=github_repository,
+                fork_requested=fork_requested,
+                github_pull_request=github_pull_request,
+                agent=agent,
+            )
+        else:
+            job_id = start_job(text, repository=repository, agent=agent)
     started = time.perf_counter()
     deadline = time.monotonic() + CURSOR_FOREGROUND_SECONDS
     while time.monotonic() < deadline:
