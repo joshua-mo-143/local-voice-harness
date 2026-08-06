@@ -9,6 +9,7 @@ import time
 from pathlib import Path
 
 from .config import DEFAULT_SOURCE, RUNTIME, STT_SOCKET
+from .desktop import DesktopError, get_desktop
 from .errors import HarnessError
 from .ipc import socket_ready
 from .notifications import notify
@@ -137,13 +138,9 @@ def _run(
 
 
 def _active_window_pid() -> int | None:
-    if shutil.which("xdotool") is None:
-        return None
-    process = _run(["xdotool", "getactivewindow", "getwindowpid"])
-    try:
-        return int(process.stdout.strip()) if process.returncode == 0 else None
-    except ValueError:
-        return None
+    desktop = get_desktop()
+    window = desktop.active_window() if desktop is not None else None
+    return window.pid if window is not None else None
 
 
 def _process_tree(root: int) -> list[int]:
@@ -191,10 +188,9 @@ def _send_to_herdr(text: str) -> bool:
 
 
 def _active_window_class() -> str:
-    if shutil.which("xdotool") is None:
-        return ""
-    process = _run(["xdotool", "getactivewindow", "getwindowclassname"])
-    return process.stdout.strip().lower() if process.returncode == 0 else ""
+    desktop = get_desktop()
+    window = desktop.active_window() if desktop is not None else None
+    return window.window_class if window is not None else ""
 
 
 def _ensure_dictation_allowed() -> None:
@@ -207,25 +203,36 @@ def _ensure_dictation_allowed() -> None:
 
 
 def _copy_to_clipboard(text: str) -> None:
-    if shutil.which("xclip") is None:
-        raise HarnessError("xclip is required to paste recognized text")
-    process = subprocess.run(
-        ["xclip", "-selection", "clipboard"],
-        input=text,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        text=True,
-        timeout=5,
-        check=False,
-    )
-    if process.returncode:
+    desktop = get_desktop()
+    if desktop is None:
+        raise HarnessError("focused-window automation is unavailable in this session")
+    try:
+        copied = desktop.write_clipboard(text)
+    except DesktopError as exc:
+        raise HarnessError(str(exc)) from exc
+    if not copied:
         raise HarnessError("could not copy recognized text to the clipboard")
 
 
-def _xdotool(*arguments: str) -> None:
-    if shutil.which("xdotool") is None:
-        raise HarnessError("xdotool is required to insert recognized text")
-    if _run(["xdotool", *arguments]).returncode:
+def _type_text(text: str) -> None:
+    desktop = get_desktop()
+    if desktop is None:
+        raise HarnessError("focused-window automation is unavailable in this session")
+    try:
+        desktop.type_text(text)
+    except DesktopError as exc:
+        raise HarnessError(str(exc)) from exc
+
+
+def _send_key(key: str) -> None:
+    desktop = get_desktop()
+    if desktop is None:
+        raise HarnessError("focused-window automation is unavailable in this session")
+    try:
+        sent = desktop.send_key(key)
+    except DesktopError as exc:
+        raise HarnessError(str(exc)) from exc
+    if not sent:
         raise HarnessError("could not insert recognized text into the active window")
 
 
@@ -248,9 +255,14 @@ def inject(text: str) -> None:
             if any(name in _active_window_class() for name in TERMINAL_CLASSES)
             else "paste"
         )
-    if mode == "type" or shutil.which("xclip") is None:
+    desktop = get_desktop()
+    if desktop is None:
+        raise HarnessError(
+            "focused-window automation supports X11, Hyprland, and Sway only"
+        )
+    if mode == "type" or not desktop.has_clipboard():
         time.sleep(0.12)
-        _xdotool("type", "--clearmodifiers", "--", text)
+        _type_text(text)
         return
     _copy_to_clipboard(text)
     time.sleep(0.12)
@@ -259,7 +271,7 @@ def inject(text: str) -> None:
         if any(name in _active_window_class() for name in TERMINAL_CLASSES)
         else "ctrl+v"
     )
-    _xdotool("key", "--clearmodifiers", shortcut)
+    _send_key(shortcut)
 
 
 def transcribe_and_type() -> None:

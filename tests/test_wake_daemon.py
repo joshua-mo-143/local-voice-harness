@@ -7,6 +7,8 @@ import time
 import unittest
 from unittest import mock
 
+from local_voice_harness.browser_context import RequestContext
+from local_voice_harness.intent import Intent, IntentRoute
 from local_voice_harness.wake import daemon as wake_daemon
 from local_voice_harness.wake.daemon import WakeConversationDaemon
 
@@ -86,8 +88,13 @@ class ProcessUtteranceTests(unittest.TestCase):
             mock.patch.object(wake_daemon, "stream_and_play", return_value={}),
             mock.patch.object(
                 wake_daemon,
-                "enrich_request",
-                return_value="what time is it\n\nGitHub context",
+                "request_context",
+                return_value=RequestContext("what time is it\n\nGitHub context"),
+            ),
+            mock.patch.object(
+                wake_daemon,
+                "route_intent",
+                return_value=IntentRoute(Intent.CONVERSATION, "high"),
             ),
             mock.patch.object(wake_daemon, "notify"),
         ):
@@ -128,7 +135,7 @@ class ProcessUtteranceTests(unittest.TestCase):
         self.assertTrue(daemon.awaiting_followup)
         self.assertGreater(daemon.conversation_deadline, 0.0)
 
-    def test_active_job_followup_is_classified_by_qwen(self) -> None:
+    def test_fuzzy_new_task_bypasses_main_qwen(self) -> None:
         daemon = _bare_daemon()
         daemon.cursor_session = "oldjob123456"
         with (
@@ -137,26 +144,67 @@ class ProcessUtteranceTests(unittest.TestCase):
             ),
             mock.patch.object(wake_daemon, "start_components"),
             mock.patch.object(
-                wake_daemon, "qwen_turn", return_value=("started", None)
-            ) as qwen_turn,
+                wake_daemon,
+                "request_context",
+                side_effect=lambda text: RequestContext(text),
+            ),
             mock.patch.object(
                 wake_daemon,
-                "enrich_request",
-                side_effect=lambda text: text,
+                "route_intent",
+                return_value=IntentRoute(Intent.CURSOR_SUBMIT, "high"),
             ),
-            mock.patch.object(wake_daemon, "cursor_turn") as cursor_turn,
+            mock.patch.object(
+                wake_daemon, "cursor_turn", return_value=("started", None)
+            ) as cursor_turn,
+            mock.patch.object(wake_daemon, "qwen_turn") as qwen_turn,
             mock.patch.object(wake_daemon, "stream_and_play", return_value={}),
             mock.patch.object(wake_daemon, "notify"),
         ):
             daemon.process_utterance(woke=False)
 
-        qwen_turn.assert_called_once_with(
+        cursor_turn.assert_called_once_with(
             "work on APP-43 instead",
-            mock.ANY,
-            "oldjob123456",
+            utterance="work on APP-43 instead",
+            context_repository=None,
             delivery_claims=mock.ANY,
         )
-        cursor_turn.assert_not_called()
+        qwen_turn.assert_not_called()
+
+    def test_router_sends_clarification_answer_to_awaiting_job(self) -> None:
+        daemon = _bare_daemon()
+        daemon.cursor_session = "oldjob123456"
+        with (
+            mock.patch.object(
+                wake_daemon, "transcribe", return_value="use the api repository"
+            ),
+            mock.patch.object(wake_daemon, "start_components"),
+            mock.patch.object(
+                wake_daemon,
+                "request_context",
+                return_value=RequestContext("use the api repository"),
+            ),
+            mock.patch.object(
+                wake_daemon,
+                "route_intent",
+                return_value=IntentRoute(Intent.CURSOR_REPLY, "high"),
+            ),
+            mock.patch.object(
+                wake_daemon, "cursor_turn", return_value=("continued", None)
+            ) as cursor_turn,
+            mock.patch.object(wake_daemon, "qwen_turn") as qwen_turn,
+            mock.patch.object(wake_daemon, "stream_and_play", return_value={}),
+            mock.patch.object(wake_daemon, "notify"),
+        ):
+            daemon.process_utterance(woke=False)
+
+        cursor_turn.assert_called_once_with(
+            "use the api repository",
+            "oldjob123456",
+            action="reply",
+            job_id="oldjob123456",
+            delivery_claims=mock.ANY,
+        )
+        qwen_turn.assert_not_called()
 
     def test_explicit_cursor_request_starts_fresh_job(self) -> None:
         daemon = _bare_daemon()
@@ -171,8 +219,15 @@ class ProcessUtteranceTests(unittest.TestCase):
             ) as cursor_turn,
             mock.patch.object(
                 wake_daemon,
-                "enrich_request",
-                return_value="ask Cursor to work on APP-43\n\nGitHub context",
+                "request_context",
+                return_value=RequestContext(
+                    "ask Cursor to work on APP-43\n\nGitHub context"
+                ),
+            ),
+            mock.patch.object(
+                wake_daemon,
+                "route_intent",
+                return_value=IntentRoute(Intent.CURSOR_SUBMIT, "high"),
             ),
             mock.patch.object(wake_daemon, "qwen_turn") as qwen_turn,
             mock.patch.object(wake_daemon, "stream_and_play", return_value={}),
@@ -182,6 +237,8 @@ class ProcessUtteranceTests(unittest.TestCase):
 
         cursor_turn.assert_called_once_with(
             "ask Cursor to work on APP-43\n\nGitHub context",
+            utterance="ask Cursor to work on APP-43",
+            context_repository=None,
             delivery_claims=mock.ANY,
         )
         qwen_turn.assert_not_called()
@@ -197,7 +254,14 @@ class ProcessUtteranceTests(unittest.TestCase):
                 wake_daemon, "qwen_turn", side_effect=RuntimeError("LLM failed")
             ),
             mock.patch.object(
-                wake_daemon, "enrich_request", side_effect=lambda text: text
+                wake_daemon,
+                "request_context",
+                side_effect=lambda text: RequestContext(text),
+            ),
+            mock.patch.object(
+                wake_daemon,
+                "route_intent",
+                return_value=IntentRoute(Intent.CONVERSATION, "high"),
             ),
             mock.patch.object(wake_daemon, "stop_components") as stop_components,
             mock.patch.object(wake_daemon, "notify"),
@@ -220,7 +284,14 @@ class ProcessUtteranceTests(unittest.TestCase):
                 wake_daemon, "qwen_turn", side_effect=RuntimeError("LLM failed")
             ),
             mock.patch.object(
-                wake_daemon, "enrich_request", side_effect=lambda text: text
+                wake_daemon,
+                "request_context",
+                side_effect=lambda text: RequestContext(text),
+            ),
+            mock.patch.object(
+                wake_daemon,
+                "route_intent",
+                return_value=IntentRoute(Intent.CONVERSATION, "high"),
             ),
             mock.patch.object(wake_daemon, "stop_components") as stop_components,
             mock.patch.object(wake_daemon, "notify"),
@@ -249,7 +320,14 @@ class ProcessUtteranceTests(unittest.TestCase):
             mock.patch.object(wake_daemon, "start_components"),
             mock.patch.object(wake_daemon, "qwen_turn", side_effect=qwen_with_delivery),
             mock.patch.object(
-                wake_daemon, "enrich_request", side_effect=lambda text: text
+                wake_daemon,
+                "request_context",
+                side_effect=lambda text: RequestContext(text),
+            ),
+            mock.patch.object(
+                wake_daemon,
+                "route_intent",
+                return_value=IntentRoute(Intent.CONVERSATION, "high"),
             ),
             mock.patch.object(
                 wake_daemon,
@@ -534,6 +612,16 @@ class InterruptedTurnTests(unittest.TestCase):
             mock.patch.object(wake_daemon, "start_components"),
             mock.patch.object(
                 wake_daemon, "qwen_turn", return_value=("first. second.", None)
+            ),
+            mock.patch.object(
+                wake_daemon,
+                "request_context",
+                side_effect=lambda text: RequestContext(text),
+            ),
+            mock.patch.object(
+                wake_daemon,
+                "route_intent",
+                return_value=IntentRoute(Intent.CONVERSATION, "high"),
             ),
             mock.patch.object(
                 daemon,
