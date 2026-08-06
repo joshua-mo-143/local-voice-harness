@@ -51,17 +51,19 @@ Cursor routing works as follows:
 2. Prefer an idle Cursor agent already running in the requested checkout.
 3. For a Linear issue without a repository name, ask a dedicated routing agent to
    inspect the ticket through Linear MCP and infer the repository.
-4. When the user explicitly says “fork,” validate the focused public GitHub repository,
+4. If no repository can be resolved, open Rofi to select a local repository or paste
+   a Git URL; cloning requires a second confirmation.
+5. When the user explicitly says “fork,” validate the focused public GitHub repository,
    create or reuse the authenticated user's fork, and clone it below the configured
    GitHub root.
-5. When a GitHub pull request is focused, clone its repository below the configured
+6. When a GitHub pull request is focused, clone its repository below the configured
    GitHub root and check the pull request out in place with `gh pr checkout`, then run
    the request against that checkout so Cursor can verify or extend the branch.
-6. Create or reuse a `voice/<issue-key>` Git worktree for Linear implementation work,
+7. Create or reuse a `voice/<issue-key>` Git worktree for Linear implementation work,
    or create a unique `voice/github-<job-id>` worktree for a GitHub fork task. A checked
    out pull request runs directly on its branch without a generated worktree.
-7. Start a new Cursor agent through Herdr when no suitable agent exists.
-8. Reserve that agent until it finishes, is blocked, or the job is cancelled.
+8. Start a new Cursor agent through Herdr when no suitable agent exists.
+9. Reserve that agent until it finishes, is blocked, or the job is cancelled.
 
 The harness never automatically commits, pushes, opens pull requests, modifies Linear,
 or deletes generated worktrees. Fork creation is the only supported GitHub write and
@@ -105,7 +107,9 @@ Install these before setting up Python environments:
 - PipeWire tools (`pw-record` and `pw-play`).
 - `libnotify`/`notify-send`.
 - Git, curl, the GitHub CLI (`gh`), and systemd user services.
-- `xdotool` and `xclip` for X11 focused-window automation.
+- `xdotool` and `xclip` for X11 focused-window automation, or `wtype` and
+  `wl-clipboard` for Hyprland/Sway focused-window automation.
+- Rofi for repository selection and pasteable clone-URL prompts.
 - [uv](https://docs.astral.sh/uv/) for reproducible Python versions/environments.
 - A recent [llama.cpp](https://github.com/ggml-org/llama.cpp) build with Vulkan and
   `llama-server`.
@@ -116,7 +120,8 @@ Install these before setting up Python environments:
 On Arch/CachyOS, the base packages are approximately:
 
 ```bash
-paru -S --needed pipewire libnotify git curl github-cli xdotool xclip uv libsndfile
+paru -S --needed pipewire libnotify git curl github-cli xdotool xclip \
+  wl-clipboard wtype uv libsndfile
 ```
 
 Package names for llama.cpp and NVIDIA drivers vary. Verify the required commands:
@@ -391,6 +396,7 @@ Hey Jarvis, what time is it?
 Hey Jarvis, ask Cursor to summarize the api-docs repository.
 Hey Jarvis, ask Cursor to work on Linear issue API-79.
 Hey Jarvis, summarize this issue.  # with a GitHub issue focused in Firefox
+Hey Jarvis, summarize this ticket. # with a Zendesk ticket focused in Firefox
 Hey Jarvis, fork this repo and add Venice.  # with a public GitHub repo focused
 Hey Jarvis, ask Cursor to check out this PR and make sure it works.  # with a PR focused
 Hey Jarvis, what is the status of that Cursor job?
@@ -423,22 +429,62 @@ playback to interrupt and immediately ask another question. Chatterbox cannot ca
 an active `generate()` call, so server-side cancellation may take up to one short
 chunk; PipeWire playback and already queued chunks stop immediately.
 
-On X11, each new conversational request checks whether Firefox is focused. The
-harness briefly selects and copies the address bar, restores the previous clipboard,
-and dismisses the address bar without navigating. A focused GitHub page contributes
-its URL; a focused issue page also contributes title, state, body, labels, and recent
-comments fetched through the authenticated `gh` CLI. A focused pull request page adds
-the same details plus its draft state, source and target branches, and change summary,
-and lets a Cursor request check the branch out locally. Page content is treated as
-untrusted input. Missing tools, unsupported sessions such as native Wayland, focus
-changes during capture, and GitHub errors simply omit some or all browser context
-without failing the voice request.
+On X11, Hyprland, and Sway, each new conversational request checks whether Firefox
+is focused. The harness briefly selects and copies the address bar, restores the
+previous clipboard, and dismisses the address bar without navigating. A focused
+GitHub page contributes its URL; a focused issue page also contributes title, state,
+body, labels, and recent comments fetched through the authenticated `gh` CLI. A
+focused pull request page adds the same details plus its draft state, source and
+target branches, and change summary, and lets a Cursor request check the branch out
+locally. A focused `https://<tenant>.zendesk.com/agent/tickets/<number>` page
+contributes its URL, tenant, ticket number, and bounded rendered page text copied
+from the authenticated browser session; no Zendesk API credentials are required. Only
+text currently loaded and selectable in the page is available, so collapsed or
+unloaded comments may be absent. Page content is treated as untrusted input. Missing
+tools, unsupported Wayland compositors, focus changes during capture, and browser or
+GitHub errors simply omit some or all browser context without failing the voice
+request.
 
 For example, bind Super+D in i3:
 
 ```text
 bindsym $mod+d exec --no-startup-id /home/joshuam/.local/bin/voice-harness dictate toggle
 ```
+
+The equivalent Sway binding is:
+
+```text
+bindsym $mod+d exec /home/joshuam/.local/bin/voice-harness dictate toggle
+```
+
+For Hyprland:
+
+```text
+bind = SUPER, D, exec, /home/joshuam/.local/bin/voice-harness dictate toggle
+```
+
+Native Wayland automation is supported on Hyprland and Sway. It uses `hyprctl` or
+`swaymsg` to identify the focused window, `wl-copy`/`wl-paste` for the clipboard,
+and `wtype` for keyboard input. GNOME, KDE Plasma, and other compositors are not
+currently supported; set `DICTATION_INJECT=stdout` if focused-window insertion is
+not required there.
+
+The wake service needs the compositor environment to collect Firefox context.
+Import it into the systemd user manager from compositor startup. For Sway:
+
+```text
+exec_always systemctl --user import-environment WAYLAND_DISPLAY XDG_CURRENT_DESKTOP SWAYSOCK
+```
+
+For Hyprland:
+
+```text
+exec-once = systemctl --user import-environment WAYLAND_DISPLAY XDG_CURRENT_DESKTOP HYPRLAND_INSTANCE_SIGNATURE
+```
+
+Restart `voice-harness-wake.service` after adding the import. Dictation commands
+launched directly by compositor keybindings already inherit the required
+environment.
 
 ## Service management
 
@@ -517,8 +563,11 @@ Measured with all models warm on the RTX 5070 Ti Laptop GPU:
 - Herdr agents are started with workspace trust but not Cursor `--force`.
 - Ticket and MCP content is treated as untrusted input and inferred paths are
   validated against local Git repositories.
-- Focused GitHub issue and pull request content is read through `gh`, bounded before
-  prompting, and treated as untrusted external data.
+- Focused GitHub issue and pull request content is read through `gh`, and rendered
+  Zendesk ticket content is copied from the browser session; all are bounded before
+  prompting and treated as untrusted external data.
+- Repository cloning requires explicit Rofi confirmation, accepts only HTTPS or SSH
+  Git URLs, and places the checkout beneath the configured project root.
 - Merely focusing a GitHub page cannot create a fork. The original spoken request must
   explicitly contain “fork,” and the source must be a validated public repository.
 - Checking out a focused pull request clones its repository below the GitHub root and

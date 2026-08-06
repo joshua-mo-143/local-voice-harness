@@ -4,13 +4,16 @@ import json
 import os
 import re
 import subprocess
+import tempfile
 import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 from ..config import REPOSITORY_ROOT
+from .rofi import choose_repository, confirm_clone
 
 HERDR_BIN = os.environ.get(
     "VOICE_HARNESS_HERDR_BIN", str(Path.home() / ".local/bin/herdr")
@@ -19,6 +22,9 @@ HERDR_UNIT = "voice-harness-herdr.service"
 HOME_ROOT = REPOSITORY_ROOT
 SETTLED = {"idle", "done"}
 LINEAR_ISSUE = re.compile(r"\b([A-Z][A-Z0-9]+)(?:\s*-\s*|\s+)(\d+)\b", re.IGNORECASE)
+SCP_GIT_URL = re.compile(
+    r"^(?P<user>[A-Za-z0-9._-]+)@(?P<host>[A-Za-z0-9.-]+):(?P<path>[^:\s]+)$"
+)
 
 
 class HerdrError(RuntimeError):
@@ -52,6 +58,35 @@ def extract_linear_issue(text: str) -> str | None:
 
 def normalize_name(value: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", value.casefold()).strip("-")
+
+
+def repository_name_from_url(value: str) -> str | None:
+    value = value.strip()
+    match = SCP_GIT_URL.fullmatch(value)
+    if match:
+        path = match.group("path")
+    else:
+        try:
+            parsed = urlsplit(value)
+        except ValueError:
+            return None
+        if (
+            parsed.scheme not in {"https", "ssh"}
+            or not parsed.hostname
+            or parsed.password is not None
+        ):
+            return None
+        path = parsed.path
+    name = path.rstrip("/").rsplit("/", 1)[-1]
+    if name.casefold().endswith(".git"):
+        name = name[:-4]
+    if (
+        not name
+        or name.startswith(".")
+        or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", name)
+    ):
+        return None
+    return name
 
 
 def extract_marker(output: str, marker: str, token: str) -> str | None:
@@ -211,7 +246,7 @@ class HerdrClient:
     def resolve_repository(
         self, hint: str | None, task: str, repositories: list[Path] | None = None
     ) -> tuple[Path | None, list[Path]]:
-        repositories = repositories or self.repository_roots()
+        repositories = self.repository_roots() if repositories is None else repositories
         if hint:
             candidate = Path(hint).expanduser()
             if candidate.is_absolute():
@@ -239,6 +274,65 @@ class HerdrClient:
             if normalize_name(path.name) in normalized_task
         ]
         return (matches[0], matches) if len(matches) == 1 else (None, matches)
+
+    def clone_repository(self, url: str) -> Path:
+        name = repository_name_from_url(url)
+        if name is None:
+            raise HerdrError("Only Git HTTPS and SSH repository URLs are supported")
+        destination = (HOME_ROOT / name).resolve()
+        if destination.parent != HOME_ROOT:
+            raise HerdrError(
+                "Repository destination is outside the configured project root"
+            )
+        if destination.exists():
+            if self.allowed_repository(destination):
+                return destination
+            raise HerdrError(
+                f"{destination} already exists and is not a Git repository"
+            )
+        try:
+            with tempfile.TemporaryDirectory(
+                dir=HOME_ROOT, prefix=f".{name}-clone-"
+            ) as temporary:
+                staging = Path(temporary) / name
+                process = subprocess.run(
+                    ["git", "clone", "--", url, str(staging)],
+                    capture_output=True,
+                    text=True,
+                    timeout=300,
+                    check=False,
+                )
+                if process.returncode:
+                    message = process.stderr.strip() or process.stdout.strip()
+                    raise HerdrError(message or "Could not clone repository")
+                if not self.allowed_repository(staging):
+                    raise HerdrError(
+                        "Cloned destination is not an allowed Git repository"
+                    )
+                staging.rename(destination)
+        except HerdrError:
+            raise
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise HerdrError(f"Could not clone repository: {exc}") from exc
+        return destination
+
+    def choose_or_clone_repository(
+        self, repositories: list[Path]
+    ) -> tuple[Path | None, str]:
+        selected = choose_repository([path.name for path in repositories])
+        if selected is None:
+            return None, ""
+        repository, _matches = self.resolve_repository(selected, "", repositories)
+        if repository is not None:
+            return repository, ""
+        if repository_name_from_url(selected) is None:
+            return None, "The Rofi selection was not a local repository or Git URL."
+        if not confirm_clone(selected):
+            return None, "Repository cloning was cancelled."
+        try:
+            return self.clone_repository(selected), ""
+        except HerdrError as exc:
+            return None, f"Repository cloning failed: {exc}."
 
     @staticmethod
     def target(agent: dict[str, Any]) -> str:

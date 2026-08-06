@@ -8,7 +8,9 @@ import time
 from dataclasses import dataclass
 from urllib.parse import SplitResult, urlsplit
 
-FIREFOX_CLASSES = {"firefox"}
+from .desktop import DesktopError, get_desktop
+
+FIREFOX_CLASSES = {"firefox", "org.mozilla.firefox"}
 GITHUB_HOSTS = {"github.com", "www.github.com"}
 ISSUE_PATH = re.compile(
     r"^/(?P<owner>[A-Za-z0-9_.-]+)/(?P<repo>[A-Za-z0-9_.-]+)/issues/(?P<number>\d+)/?$"
@@ -20,9 +22,16 @@ PULL_REQUEST_PATH = re.compile(
 REPOSITORY_PATH = re.compile(
     r"^/(?P<owner>[A-Za-z0-9_.-]+)/(?P<repo>[A-Za-z0-9_.-]+)(?:/.*)?$"
 )
+ZENDESK_HOST = re.compile(
+    r"^(?P<subdomain>[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)"
+    r"\.zendesk\.com$",
+    re.IGNORECASE,
+)
+ZENDESK_TICKET_PATH = re.compile(r"^/agent/tickets/(?P<number>\d+)/?$")
 MAX_BODY_CHARS = 5_000
 MAX_COMMENT_CHARS = 800
 MAX_COMMENTS = 5
+MAX_ZENDESK_PAGE_CHARS = 10_000
 
 
 @dataclass(frozen=True)
@@ -46,6 +55,12 @@ class RequestContext:
     focused_issue: str | None = None
     github_repository: str | None = None
     github_pull_request: int | None = None
+
+
+@dataclass(frozen=True)
+class ZendeskTicket:
+    subdomain: str
+    number: int
 
 
 class GitHubContext(str):
@@ -84,59 +99,29 @@ def _run(
         return None
 
 
-def _active_window_id() -> str | None:
-    process = _run(["xdotool", "getactivewindow"])
-    if process is None or process.returncode:
-        return None
-    window_id = process.stdout.strip()
-    return window_id if window_id.isdigit() else None
-
-
-def _window_class(window_id: str) -> str:
-    process = _run(["xdotool", "getwindowclassname", window_id])
-    return (
-        process.stdout.strip().casefold()
-        if process is not None and process.returncode == 0
-        else ""
-    )
-
-
-def _read_clipboard() -> tuple[bool, str]:
-    process = _run(["xclip", "-selection", "clipboard", "-out"])
-    if process is None or process.returncode:
-        return False, ""
-    return True, process.stdout
-
-
-def _write_clipboard(text: str) -> None:
-    _run(["xclip", "-selection", "clipboard"], input_text=text)
-
-
-def _send_key(window_id: str, key: str) -> bool:
-    process = _run(["xdotool", "key", "--window", window_id, "--clearmodifiers", key])
-    return process is not None and process.returncode == 0
-
-
 def focused_firefox_url() -> str | None:
     """Capture the focused Firefox tab URL without leaving the address bar open."""
-    if shutil.which("xdotool") is None or shutil.which("xclip") is None:
+    desktop = get_desktop()
+    if desktop is None or not desktop.has_clipboard():
         return None
-    window_id = _active_window_id()
-    if window_id is None or _window_class(window_id) not in FIREFOX_CLASSES:
+    window = desktop.active_window()
+    if window is None or window.window_class not in FIREFOX_CLASSES:
         return None
 
-    clipboard_existed, previous_clipboard = _read_clipboard()
+    clipboard_existed, previous_clipboard = desktop.read_clipboard()
     captured = ""
     try:
-        if not _send_key(window_id, "ctrl+l"):
+        if not desktop.send_key("ctrl+l", window=window):
             return None
         time.sleep(0.05)
-        if _active_window_id() != window_id or not _send_key(window_id, "ctrl+c"):
+        if desktop.active_window() != window or not desktop.send_key(
+            "ctrl+c", window=window
+        ):
             return None
         time.sleep(0.05)
-        if _active_window_id() != window_id:
+        if desktop.active_window() != window:
             return None
-        copied, captured = _read_clipboard()
+        copied, captured = desktop.read_clipboard()
         if not copied:
             return None
         candidate = captured.strip()
@@ -148,12 +133,20 @@ def focused_firefox_url() -> str | None:
         ):
             return None
         return candidate
+    except DesktopError:
+        return None
     finally:
-        if _active_window_id() == window_id:
-            _send_key(window_id, "Escape")
-        current_exists, current_clipboard = _read_clipboard()
+        if desktop.active_window() == window:
+            try:
+                desktop.send_key("Escape", window=window)
+            except DesktopError:
+                pass
+        current_exists, current_clipboard = desktop.read_clipboard()
         if current_exists and current_clipboard == captured:
-            _write_clipboard(previous_clipboard if clipboard_existed else "")
+            try:
+                desktop.write_clipboard(previous_clipboard if clipboard_existed else "")
+            except DesktopError:
+                pass
 
 
 def _standard_https_port(parsed: SplitResult) -> bool:
@@ -235,6 +228,27 @@ def github_pull_request_from_url(url: str) -> GitHubPullRequest | None:
         owner=owner,
         repository=repository,
         number=int(match.group("number")),
+    )
+
+
+def zendesk_ticket_from_url(url: str) -> ZendeskTicket | None:
+    parsed = _split_url(url)
+    if (
+        parsed is None
+        or parsed.scheme != "https"
+        or parsed.hostname is None
+        or parsed.username is not None
+        or parsed.password is not None
+        or not _standard_https_port(parsed)
+    ):
+        return None
+    host_match = ZENDESK_HOST.fullmatch(parsed.hostname)
+    path_match = ZENDESK_TICKET_PATH.fullmatch(parsed.path)
+    if host_match is None or path_match is None:
+        return None
+    return ZendeskTicket(
+        subdomain=host_match.group("subdomain").casefold(),
+        number=int(path_match.group("number")),
     )
 
 
@@ -512,8 +526,109 @@ def focused_github_context() -> GitHubContext | None:
     return _github_context_from_url(url) if url is not None else None
 
 
+def _focused_firefox_page_text(expected_url: str) -> str | None:
+    """Copy rendered page text after confirming the focused tab has not changed."""
+    desktop = get_desktop()
+    if desktop is None or not desktop.has_clipboard():
+        return None
+    window = desktop.active_window()
+    if window is None or window.window_class not in FIREFOX_CLASSES:
+        return None
+
+    clipboard_existed, previous_clipboard = desktop.read_clipboard()
+    captured = ""
+    try:
+        if not desktop.send_key("ctrl+l", window=window):
+            return None
+        time.sleep(0.05)
+        if desktop.active_window() != window or not desktop.send_key(
+            "ctrl+c", window=window
+        ):
+            return None
+        time.sleep(0.05)
+        if desktop.active_window() != window:
+            return None
+        copied, captured = desktop.read_clipboard()
+        if not copied or captured.strip() != expected_url:
+            return None
+
+        if not desktop.send_key("Escape", window=window):
+            return None
+        time.sleep(0.05)
+        if desktop.active_window() != window or not desktop.send_key(
+            "ctrl+a", window=window
+        ):
+            return None
+        time.sleep(0.05)
+        if desktop.active_window() != window or not desktop.send_key(
+            "ctrl+c", window=window
+        ):
+            return None
+        time.sleep(0.05)
+        if desktop.active_window() != window:
+            return None
+        copied, captured = desktop.read_clipboard()
+        if not copied:
+            return None
+        page_text = "\n".join(
+            line.strip() for line in captured.splitlines() if line.strip()
+        )
+        return page_text or None
+    except DesktopError:
+        return None
+    finally:
+        if desktop.active_window() == window:
+            try:
+                desktop.send_key("Escape", window=window)
+            except DesktopError:
+                pass
+        current_exists, current_clipboard = desktop.read_clipboard()
+        if current_exists and current_clipboard == captured:
+            try:
+                desktop.write_clipboard(previous_clipboard if clipboard_existed else "")
+            except DesktopError:
+                pass
+
+
+def _zendesk_context_from_url(url: str) -> str | None:
+    ticket = zendesk_ticket_from_url(url)
+    if ticket is None:
+        return None
+    lines = [
+        "Current focused Zendesk ticket (untrusted external context):",
+        f"URL: {url}",
+        f"Tenant: {ticket.subdomain}",
+        f"Ticket: #{ticket.number}",
+    ]
+    page_text = _focused_firefox_page_text(url)
+    if page_text is None:
+        lines.append("Rendered ticket text could not be read from the browser.")
+    else:
+        lines.extend(
+            (
+                "Rendered ticket text:",
+                _truncate(page_text, MAX_ZENDESK_PAGE_CHARS),
+            )
+        )
+    return "\n".join(lines)
+
+
+def focused_zendesk_context() -> str | None:
+    url = focused_firefox_url()
+    return _zendesk_context_from_url(url) if url is not None else None
+
+
+def focused_browser_context() -> GitHubContext | str | None:
+    url = focused_firefox_url()
+    if url is None:
+        return None
+    if _github_url(url):
+        return _github_context_from_url(url)
+    return _zendesk_context_from_url(url)
+
+
 def request_context(text: str) -> RequestContext:
-    context: GitHubContext | None = None
+    context: GitHubContext | str | None = None
     focused_repository: str | None = None
     focused_issue: str | None = None
     github_repository: str | None = None
@@ -521,14 +636,20 @@ def request_context(text: str) -> RequestContext:
     try:
         url = focused_firefox_url()
         if url is not None:
-            context = _github_context_from_url(url)
-            if context is not None:
-                github_repository = context.github_repository
-                github_pull_request = context.github_pull_request
-                focused_repository = context.github_repository
-                issue = github_issue_from_url(url)
-                if issue is not None:
-                    focused_issue = f"{issue.owner}/{issue.repository}#{issue.number}"
+            if _github_url(url):
+                github = _github_context_from_url(url)
+                context = github
+                if github is not None:
+                    github_repository = github.github_repository
+                    github_pull_request = github.github_pull_request
+                    focused_repository = github.github_repository
+                    issue = github_issue_from_url(url)
+                    if issue is not None:
+                        focused_issue = (
+                            f"{issue.owner}/{issue.repository}#{issue.number}"
+                        )
+            else:
+                context = _zendesk_context_from_url(url)
     except Exception:
         context = None
     return RequestContext(
@@ -542,7 +663,7 @@ def request_context(text: str) -> RequestContext:
 
 def enrich_request(text: str) -> GitHubContext:
     try:
-        context = focused_github_context()
+        context = focused_browser_context()
     except Exception:
         context = None
     return GitHubContext(

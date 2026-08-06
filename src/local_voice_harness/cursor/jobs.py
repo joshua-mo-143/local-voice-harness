@@ -476,6 +476,7 @@ def run_worker(job_id: str, claim_token: str | None = None) -> None:
             hint = str(job.get("repository_hint") or "").strip() or None
             task = str(job.get("request") or "")
             issue_key = str(job.get("issue_key") or "") or extract_linear_issue(task)
+            reason = ""
             if job.get("github_pull_request"):
                 github_repository = str(job.get("github_repository") or "").strip()
                 number = int(str(job.get("github_pull_request") or 0))
@@ -558,21 +559,20 @@ def run_worker(job_id: str, claim_token: str | None = None) -> None:
                     token=f"{job_id}-route",
                     reserved=reserved_targets(job_id),
                 )
-                if repository is None:
-                    question = repository_question(repositories, reason)
-                    _worker_question(
-                        job_id,
-                        worker_token,
-                        question,
-                        clarification_kind="repository",
-                    )
-                    return
+            if repository is None:
+                repository, rofi_reason = client.choose_or_clone_repository(
+                    candidates or repositories
+                )
+                reason = rofi_reason or reason
             if repository is None:
                 question = repository_question(
                     candidates or repositories,
-                    "The repository could not be determined confidently."
-                    if hint or issue_key
-                    else "",
+                    reason
+                    or (
+                        "The repository could not be determined confidently."
+                        if hint or issue_key
+                        else ""
+                    ),
                 )
                 _worker_question(
                     job_id,
