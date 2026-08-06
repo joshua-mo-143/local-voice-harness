@@ -29,7 +29,7 @@ def start_recording() -> None:
         except (OSError, ValueError):
             PID_PATH.unlink(missing_ok=True)
     if not socket_ready(STT_SOCKET):
-        raise HarnessError("Whisper STT is stopped or still loading")
+        raise HarnessError("STT is stopped or still loading")
     start_components()
     source = os.environ.get("VOICE_HARNESS_SOURCE", DEFAULT_SOURCE)
     command = ["pw-record"]

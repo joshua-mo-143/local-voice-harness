@@ -1,10 +1,12 @@
 [Unit]
-Description=Voice harness faster-whisper dictation daemon
+Description=Voice harness Parakeet dictation daemon
 After=graphical-session.target
 
 [Service]
 Type=simple
-Environment=DICTATION_MODEL=large-v3-turbo
+Environment=DICTATION_BACKEND=parakeet
+Environment=DICTATION_MODEL=nemo-parakeet-tdt-0.6b-v2
+Environment=DICTATION_QUANTIZATION=int8
 EnvironmentFile=-%h/.config/dictation/backend.env
 WorkingDirectory=%h/local-voice-harness
 ExecStart=%h/local-voice-harness/.venv-dictation/bin/voice-harness-dictation

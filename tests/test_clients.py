@@ -35,6 +35,63 @@ class SpeechToTextClientTests(unittest.TestCase):
         self.assertIsNone(stt_server.resolve_language(""))
         self.assertIsNone(stt_server.resolve_language("auto"))
 
+    def test_resolve_backend_accepts_supported_values(self) -> None:
+        self.assertEqual(stt_server.resolve_backend("parakeet"), "parakeet")
+        self.assertEqual(stt_server.resolve_backend(" whisper "), "whisper")
+
+    def test_resolve_backend_rejects_unknown_values(self) -> None:
+        with self.assertRaisesRegex(ValueError, "unsupported DICTATION_BACKEND"):
+            stt_server.resolve_backend("invalid")
+
+    def test_resolve_model_name_maps_legacy_whisper_default_to_parakeet(self) -> None:
+        with mock.patch.dict(
+            os.environ, {"DICTATION_MODEL": "large-v3-turbo"}, clear=True
+        ):
+            self.assertEqual(
+                stt_server.resolve_model_name("parakeet"),
+                stt_server.PARAKEET_DEFAULT_MODEL,
+            )
+
+    def test_resolve_model_name_honors_explicit_parakeet_model(self) -> None:
+        with mock.patch.dict(
+            os.environ,
+            {"DICTATION_MODEL": "nemo-parakeet-tdt-0.6b-v3"},
+            clear=True,
+        ):
+            self.assertEqual(
+                stt_server.resolve_model_name("parakeet"),
+                "nemo-parakeet-tdt-0.6b-v3",
+            )
+
+    def test_resolve_quantization_defaults_to_int8_for_parakeet(self) -> None:
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(stt_server.resolve_quantization("parakeet"), "int8")
+
+    def test_resolve_quantization_can_be_disabled(self) -> None:
+        with mock.patch.dict(
+            os.environ, {"DICTATION_QUANTIZATION": "none"}, clear=True
+        ):
+            self.assertIsNone(stt_server.resolve_quantization("parakeet"))
+
+    def test_load_transcriber_builds_parakeet_backend(self) -> None:
+        instance = mock.Mock()
+        instance.transcribe.return_value = " hello "
+        with (
+            mock.patch.object(stt_server, "BACKEND", "parakeet"),
+            mock.patch.object(stt_server, "MODEL_NAME", "nemo-parakeet-tdt-0.6b-v2"),
+            mock.patch.object(stt_server, "QUANTIZATION", "int8"),
+            mock.patch.object(
+                stt_server, "ParakeetTranscriber", return_value=instance
+            ) as parakeet_cls,
+        ):
+            transcriber = stt_server.load_transcriber()
+
+        parakeet_cls.assert_called_once_with(
+            "nemo-parakeet-tdt-0.6b-v2",
+            quantization="int8",
+        )
+        self.assertEqual(transcriber.transcribe("/tmp/audio.wav"), " hello ")
+
     def test_transcribe_sends_path_and_returns_trimmed_text(self) -> None:
         audio = Path("/tmp/request.wav")
         output = io.StringIO()
@@ -72,7 +129,7 @@ class SpeechToTextClientTests(unittest.TestCase):
             mock.patch.object(
                 stt_client, "unix_request", side_effect=ConnectionRefusedError()
             ),
-            self.assertRaisesRegex(HarnessError, "Whisper request failed"),
+            self.assertRaisesRegex(HarnessError, "STT request failed"),
         ):
             stt_client.transcribe()
 

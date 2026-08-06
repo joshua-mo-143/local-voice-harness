@@ -17,9 +17,7 @@ wake = [
   "webrtcvad-wheels==2.0.14",
 ]
 dictation = [
-  "faster-whisper==1.2.1",
-  "nvidia-cublas-cu12==12.9.2.10",
-  "nvidia-cudnn-cu12==9.24.0.43",
+  "onnx-asr[gpu,hub]>=0.7.0",
 ]
 tts = [
   "chatterbox-tts==0.1.7",
