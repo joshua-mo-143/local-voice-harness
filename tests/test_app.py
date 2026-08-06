@@ -5,7 +5,6 @@ from unittest import mock
 
 from local_voice_harness import app
 from local_voice_harness.browser_context import RequestContext
-from local_voice_harness.intent import Intent, IntentRoute
 
 
 class ForegroundDeliveryTests(unittest.TestCase):
@@ -29,7 +28,6 @@ class ForegroundDeliveryTests(unittest.TestCase):
             mock.patch.object(
                 app, "request_context", side_effect=lambda text: RequestContext(text)
             ),
-            mock.patch.object(app, "route_intent") as route_intent,
             mock.patch.object(app, "cursor_turn", side_effect=cursor_turn),
             mock.patch.object(
                 app,
@@ -45,7 +43,6 @@ class ForegroundDeliveryTests(unittest.TestCase):
         ):
             app.respond("Use Cursor to inspect this repository")
 
-        route_intent.assert_not_called()
         self.assertEqual(events, ["played", "acknowledged"])
 
     def test_playback_failure_releases_cursor_result(self) -> None:
@@ -66,7 +63,6 @@ class ForegroundDeliveryTests(unittest.TestCase):
             mock.patch.object(
                 app, "request_context", side_effect=lambda text: RequestContext(text)
             ),
-            mock.patch.object(app, "route_intent") as route_intent,
             mock.patch.object(app, "cursor_turn", side_effect=cursor_turn),
             mock.patch.object(
                 app,
@@ -79,13 +75,12 @@ class ForegroundDeliveryTests(unittest.TestCase):
         ):
             app.respond("Use Cursor to inspect this repository")
 
-        route_intent.assert_not_called()
         acknowledge.assert_not_called()
         release.assert_called_once_with([("123456789abc", "claim")])
 
 
 class AppContextTests(unittest.TestCase):
-    def test_manual_cursor_request_includes_focused_context(self) -> None:
+    def test_explicit_cursor_request_skips_qwen_and_calls_cursor_turn(self) -> None:
         with (
             mock.patch.object(app, "start_components"),
             mock.patch.object(
@@ -96,16 +91,16 @@ class AppContextTests(unittest.TestCase):
                     focused_repository="example/project",
                 ),
             ) as enrich,
-            mock.patch.object(app, "route_intent") as route_intent,
             mock.patch.object(
                 app, "cursor_turn", return_value=("done", None)
             ) as cursor_turn,
+            mock.patch.object(app, "qwen_response") as qwen,
             mock.patch.object(app, "stream_and_play"),
         ):
             app.respond("ask Cursor to fix this")
 
-        route_intent.assert_not_called()
         enrich.assert_called_once_with("ask Cursor to fix this")
+        qwen.assert_not_called()
         cursor_turn.assert_called_once_with(
             "ask Cursor to fix this\n\ncontext",
             utterance="ask Cursor to fix this",
@@ -113,7 +108,7 @@ class AppContextTests(unittest.TestCase):
             delivery_claims=mock.ANY,
         )
 
-    def test_manual_conversation_includes_focused_context(self) -> None:
+    def test_manual_conversation_uses_single_qwen_response(self) -> None:
         with (
             mock.patch.object(app, "start_components"),
             mock.patch.object(
@@ -121,16 +116,13 @@ class AppContextTests(unittest.TestCase):
                 "request_context",
                 return_value=RequestContext("summarize this\n\ncontext"),
             ),
-            mock.patch.object(
-                app,
-                "route_intent",
-                return_value=IntentRoute(Intent.CONVERSATION, "high"),
-            ),
+            mock.patch.object(app, "cursor_turn") as cursor_turn,
             mock.patch.object(app, "qwen_response", return_value="summary") as qwen,
             mock.patch.object(app, "stream_and_play"),
         ):
             app.respond("summarize this")
 
+        cursor_turn.assert_not_called()
         qwen.assert_called_once_with(
             "summarize this\n\ncontext", delivery_claims=mock.ANY
         )
@@ -143,11 +135,6 @@ class AppContextTests(unittest.TestCase):
         with (
             mock.patch.object(app, "start_components"),
             mock.patch.object(app, "request_context", return_value=context),
-            mock.patch.object(
-                app,
-                "route_intent",
-                return_value=IntentRoute(Intent.CONVERSATION, "high"),
-            ),
             mock.patch.object(app, "qwen_response", return_value="started") as qwen,
             mock.patch.object(app, "stream_and_play"),
         ):
@@ -160,47 +147,6 @@ class AppContextTests(unittest.TestCase):
             github_pull_request=None,
             delivery_claims=mock.ANY,
         )
-
-
-class CursorFastPathTests(unittest.TestCase):
-    def test_explicit_cursor_utterance_skips_router(self) -> None:
-        with (
-            mock.patch.object(app, "start_components"),
-            mock.patch.object(
-                app, "request_context", side_effect=lambda text: RequestContext(text)
-            ),
-            mock.patch.object(app, "route_intent") as route_intent,
-            mock.patch.object(
-                app, "cursor_turn", return_value=("done", None)
-            ) as cursor_turn,
-            mock.patch.object(app, "stream_and_play"),
-        ):
-            app.respond("use cursor to refactor auth")
-
-        route_intent.assert_not_called()
-        cursor_turn.assert_called_once_with(
-            "use cursor to refactor auth",
-            utterance="use cursor to refactor auth",
-            context_repository=None,
-            delivery_claims=mock.ANY,
-        )
-
-    def test_non_cursor_utterance_uses_router(self) -> None:
-        context = RequestContext("what is the weather")
-        with (
-            mock.patch.object(app, "start_components"),
-            mock.patch.object(app, "request_context", return_value=context),
-            mock.patch.object(
-                app,
-                "route_intent",
-                return_value=IntentRoute(Intent.CONVERSATION, "high"),
-            ) as route_intent,
-            mock.patch.object(app, "qwen_response", return_value="ok"),
-            mock.patch.object(app, "stream_and_play"),
-        ):
-            app.respond("what is the weather")
-
-        route_intent.assert_called_once_with("what is the weather", context)
 
 
 if __name__ == "__main__":

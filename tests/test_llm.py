@@ -192,6 +192,29 @@ class QwenClientTests(unittest.TestCase):
         ):
             llm.qwen_turn("hello")
 
+    def test_qwen_response_forwards_github_and_delivery_claims(self) -> None:
+        claims: list[tuple[str, str]] = []
+        with mock.patch.object(
+            llm, "qwen_turn", return_value=("answer", None)
+        ) as qwen_turn:
+            answer = llm.qwen_response(
+                "hello",
+                github_repository="owner/repo",
+                fork_requested=True,
+                github_pull_request=42,
+                delivery_claims=claims,
+            )
+
+        self.assertEqual(answer, "answer")
+        qwen_turn.assert_called_once_with(
+            "hello",
+            None,
+            github_repository="owner/repo",
+            fork_requested=True,
+            github_pull_request=42,
+            delivery_claims=claims,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
