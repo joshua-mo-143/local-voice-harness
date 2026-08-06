@@ -49,6 +49,15 @@ class GitHubPullRequest:
 
 
 @dataclass(frozen=True)
+class RequestContext:
+    text: str
+    focused_repository: str | None = None
+    focused_issue: str | None = None
+    github_repository: str | None = None
+    github_pull_request: int | None = None
+
+
+@dataclass(frozen=True)
 class ZendeskTicket:
     subdomain: str
     number: int
@@ -616,6 +625,40 @@ def focused_browser_context() -> GitHubContext | str | None:
     if _github_url(url):
         return _github_context_from_url(url)
     return _zendesk_context_from_url(url)
+
+
+def request_context(text: str) -> RequestContext:
+    context: GitHubContext | str | None = None
+    focused_repository: str | None = None
+    focused_issue: str | None = None
+    github_repository: str | None = None
+    github_pull_request: int | None = None
+    try:
+        url = focused_firefox_url()
+        if url is not None:
+            if _github_url(url):
+                github = _github_context_from_url(url)
+                context = github
+                if github is not None:
+                    github_repository = github.github_repository
+                    github_pull_request = github.github_pull_request
+                    focused_repository = github.github_repository
+                    issue = github_issue_from_url(url)
+                    if issue is not None:
+                        focused_issue = (
+                            f"{issue.owner}/{issue.repository}#{issue.number}"
+                        )
+            else:
+                context = _zendesk_context_from_url(url)
+    except Exception:
+        context = None
+    return RequestContext(
+        text=f"{text}\n\n{context}" if context else text,
+        focused_repository=focused_repository,
+        focused_issue=focused_issue,
+        github_repository=github_repository,
+        github_pull_request=github_pull_request,
+    )
 
 
 def enrich_request(text: str) -> GitHubContext:

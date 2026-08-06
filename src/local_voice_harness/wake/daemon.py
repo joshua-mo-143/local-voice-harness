@@ -13,9 +13,9 @@ import wave
 from dataclasses import dataclass
 from pathlib import Path
 
-from ..browser_context import enrich_request
+from ..browser_context import request_context
 from ..components import llm_ready, start_components, stop_components
-from ..config import CURSOR_PATTERN, DEFAULT_SOURCE, FORK_PATTERN, STATE_DIR, WAV_PATH
+from ..config import DEFAULT_SOURCE, FORK_PATTERN, STATE_DIR, WAV_PATH
 from ..cursor.jobs import (
     DeliveryClaims,
     acknowledge_deliveries,
@@ -27,6 +27,7 @@ from ..cursor.jobs import (
     release_delivery,
 )
 from ..errors import HarnessError
+from ..intent import Intent, route_intent
 from ..llm import qwen_turn
 from ..notifications import notify
 from ..stt.client import transcribe
@@ -60,12 +61,6 @@ WAKE_PREFIX = re.compile(r"^\s*hey[,\s]+(?:jarvis|travis)\b[\s,;:!?.-]*", re.IGN
 SPOKEN_WAKE_PATTERN = re.compile(r"\bhey[,\s]+(?:jarvis|travis)\b", re.IGNORECASE)
 CLOSE_PATTERN = re.compile(
     r"\b(?:goodbye|stop listening|go to sleep|end conversation)\b", re.IGNORECASE
-)
-JOB_CANCEL_PATTERN = re.compile(
-    r"\b(?:cancel|stop)\s+(?:that\s+)?(?:cursor\s+)?job\b", re.IGNORECASE
-)
-JOB_STATUS_PATTERN = re.compile(
-    r"\b(?:status|progress|what(?:'s| is)\s+happening)\b", re.IGNORECASE
 )
 
 
@@ -388,14 +383,36 @@ class WakeConversationDaemon:
             next_cursor_session = self.cursor_session
             next_history = list(self.history)
             remember_response = False
-            if self.cursor_session is not None and JOB_CANCEL_PATTERN.search(text):
+            context = request_context(text)
+            route = route_intent(text, context, cursor_session=self.cursor_session)
+            fork_requested = bool(FORK_PATTERN.search(text))
+            github_arguments = (
+                {
+                    "github_repository": context.github_repository,
+                    "fork_requested": fork_requested,
+                    "github_pull_request": context.github_pull_request,
+                }
+                if context.github_repository
+                or fork_requested
+                or context.github_pull_request
+                else {}
+            )
+            if (
+                route.actionable
+                and route.intent == Intent.CURSOR_CANCEL
+                and self.cursor_session is not None
+            ):
                 response, next_cursor_session = cursor_turn(
                     "",
                     action="cancel",
                     job_id=self.cursor_session,
                     delivery_claims=delivery_claims,
                 )
-            elif self.cursor_session is not None and JOB_STATUS_PATTERN.search(text):
+            elif (
+                route.actionable
+                and route.intent == Intent.CURSOR_STATUS
+                and self.cursor_session is not None
+            ):
                 response, next_cursor_session = cursor_turn(
                     "",
                     self.cursor_session,
@@ -403,41 +420,34 @@ class WakeConversationDaemon:
                     job_id=self.cursor_session,
                     delivery_claims=delivery_claims,
                 )
-            elif CURSOR_PATTERN.match(text):
-                request = enrich_request(text)
-                github_repository = getattr(request, "github_repository", None)
-                fork_requested = bool(FORK_PATTERN.search(text))
-                if github_repository or fork_requested:
-                    response, next_cursor_session = cursor_turn(
-                        request,
-                        github_repository=github_repository,
-                        fork_requested=fork_requested,
-                        delivery_claims=delivery_claims,
-                    )
-                else:
-                    response, next_cursor_session = cursor_turn(
-                        request, delivery_claims=delivery_claims
-                    )
+            elif route.actionable and route.intent == Intent.CURSOR_SUBMIT:
+                response, next_cursor_session = cursor_turn(
+                    context.text,
+                    utterance=text,
+                    context_repository=context.focused_repository,
+                    **github_arguments,
+                    delivery_claims=delivery_claims,
+                )
+            elif (
+                route.actionable
+                and route.intent == Intent.CURSOR_REPLY
+                and self.cursor_session is not None
+            ):
+                response, next_cursor_session = cursor_turn(
+                    context.text,
+                    self.cursor_session,
+                    action="reply",
+                    job_id=self.cursor_session,
+                    delivery_claims=delivery_claims,
+                )
             else:
-                request = enrich_request(text)
-                github_repository = getattr(request, "github_repository", None)
-                fork_requested = bool(FORK_PATTERN.search(text))
-                if github_repository or fork_requested:
-                    response, next_cursor_session = qwen_turn(
-                        request,
-                        self.history,
-                        self.cursor_session,
-                        github_repository=github_repository,
-                        fork_requested=fork_requested,
-                        delivery_claims=delivery_claims,
-                    )
-                else:
-                    response, next_cursor_session = qwen_turn(
-                        request,
-                        self.history,
-                        self.cursor_session,
-                        delivery_claims=delivery_claims,
-                    )
+                response, next_cursor_session = qwen_turn(
+                    context.text,
+                    self.history,
+                    self.cursor_session,
+                    **github_arguments,
+                    delivery_claims=delivery_claims,
+                )
                 remember_response = True
             print(f"Assistant: {response}", flush=True)
             playback, interruption = self.play_response(response)
