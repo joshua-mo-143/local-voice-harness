@@ -4,7 +4,7 @@ After=graphical-session.target
 
 [Service]
 Type=simple
-ExecStart=/usr/sbin/llama-server --model %h/local-voice-harness/models/Qwen3.5-9B-UD-Q4_K_XL.gguf --host 127.0.0.1 --port 8090 --ctx-size 8192 --parallel 1 --n-gpu-layers 99 --device CUDA0 --flash-attn on --jinja --reasoning off --reasoning-budget 0
+ExecStart=%h/.local/bin/llama-server --model %h/local-voice-harness/models/Qwen3.5-9B-UD-Q4_K_XL.gguf --host 127.0.0.1 --port 8090 --ctx-size 8192 --parallel 1 --n-gpu-layers 99 --device CUDA0 --flash-attn on --jinja --reasoning off --reasoning-budget 0
 Restart=on-failure
 RestartSec=2
 TimeoutStopSec=15

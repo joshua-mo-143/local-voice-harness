@@ -236,7 +236,8 @@ llama-server --list-devices
 ```
 
 Edit `systemd/user/voice-harness-llm.service` if the NVIDIA device is not `CUDA0`, or if
-`llama-server` is installed somewhere other than `/usr/sbin/llama-server`.
+`llama-server` is installed somewhere other than `~/.local/bin/llama-server` (local CUDA
+build) or `/usr/sbin/llama-server` (AUR `llama.cpp-cuda`).
 
 ### 5. Install Cursor and Herdr
 
