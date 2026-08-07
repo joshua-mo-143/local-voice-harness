@@ -181,6 +181,34 @@ should I use?
         commands = [call.args[0] for call in run.call_args_list]
         self.assertTrue(any(command[0] == "systemd-run" for command in commands))
 
+    def test_agent_name_stays_within_herdr_limit_for_long_label(self) -> None:
+        client = herdr.HerdrClient("herdr")
+        agent = {
+            "name": "voice-issue-22-aaaaaaaaaa",
+            "pane_id": "pane",
+            "workspace_id": "workspace",
+            "cwd": "/tmp/worktree",
+        }
+        with (
+            mock.patch.object(client, "run_json", return_value={"agent": agent}) as run,
+            mock.patch.object(
+                herdr.uuid,
+                "uuid4",
+                return_value=mock.Mock(hex="a" * 32),
+            ),
+        ):
+            client.start_agent(
+                Path("/tmp/worktree"),
+                "github-joshua-mo-143-local-voice-harness-22",
+                "pane",
+                "workspace",
+            )
+
+        name = run.call_args.args[2]
+        self.assertLessEqual(len(name), 32)
+        self.assertRegex(name, r"^[a-z][a-z0-9_-]{0,31}$")
+        self.assertTrue(name.endswith("-aaaaaaaaaa"))
+
     def test_non_linear_task_creates_requested_worktree(self) -> None:
         client = herdr.HerdrClient("herdr")
         selection = herdr.AgentSelection(

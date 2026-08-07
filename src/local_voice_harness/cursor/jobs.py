@@ -756,11 +756,6 @@ def start_job(
         if issue_repository and github_issue
         else None
     )
-    issue_label = (
-        re.sub(r"[^a-z0-9-]+", "-", issue_repository.casefold().replace("/", "-"))
-        if issue_repository and github_issue
-        else ""
-    )
     write_job(
         {
             "id": job_id,
@@ -784,7 +779,7 @@ def start_job(
             "worktree_label": (
                 f"github-{job_id[:6]}"
                 if fork_requested
-                else (f"github-{issue_label}-{github_issue}" if github_issue else None)
+                else (f"issue-{github_issue}" if github_issue else None)
             ),
             "agent_hint": agent,
             "issue_key": extract_linear_issue(spoken_text),
