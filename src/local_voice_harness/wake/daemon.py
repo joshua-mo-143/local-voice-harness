@@ -504,6 +504,7 @@ class WakeConversationDaemon:
         try:
             with self.component_lock:
                 start_components()
+                self.playback_queue.start_prefetch()
             batch, interruption = self._drain_playback_queue(
                 self.playback_queue.peek_text(),
                 on_played=finish_job,
@@ -513,6 +514,7 @@ class WakeConversationDaemon:
                     finish_job(playback, interrupted, request)
             return interruption
         except Exception as exc:
+            self.playback_queue.clear()
             for request in pending_requests:
                 if (
                     id(request) not in finished

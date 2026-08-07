@@ -599,6 +599,51 @@ class AnnounceJobTests(unittest.TestCase):
 
         acknowledge.assert_not_called()
         release.assert_called_once_with("job2", "claim")
+        self.assertEqual(len(daemon.playback_queue), 0)
+
+    def test_announcement_prefetch_starts_only_after_components_are_ready(
+        self,
+    ) -> None:
+        daemon = _bare_daemon()
+        events: list[str] = []
+        handle = mock.Mock()
+        handle.wait.side_effect = wake_daemon.HarnessError("socket refused")
+
+        def create_handle(_text: str) -> object:
+            events.append("prefetch")
+            return handle
+
+        with (
+            mock.patch.object(
+                wake_daemon,
+                "start_components",
+                side_effect=lambda: events.append("components-ready"),
+            ),
+            mock.patch(
+                "local_voice_harness.tts.queue.PrefetchHandle",
+                side_effect=create_handle,
+            ),
+            mock.patch.object(wake_daemon, "acknowledge_delivery") as acknowledge,
+            mock.patch.object(wake_daemon, "release_delivery") as release,
+            mock.patch.object(wake_daemon, "stop_components"),
+            mock.patch.object(wake_daemon, "notify"),
+        ):
+            daemon._enqueue_job_announcement(
+                {
+                    "id": "job2",
+                    "status": "completed",
+                    "result": "done",
+                    "_delivery_token": "claim",
+                }
+            )
+            self.assertEqual(events, [])
+            daemon._play_pending_announcements()
+
+        self.assertEqual(events, ["components-ready", "prefetch"])
+        handle.discard.assert_called_once()
+        acknowledge.assert_not_called()
+        release.assert_called_once_with("job2", "claim")
+        self.assertEqual(len(daemon.playback_queue), 0)
 
     def test_acknowledgement_happens_after_playback(self) -> None:
         daemon = _bare_daemon()
