@@ -144,6 +144,7 @@ class CursorJobStateTests(unittest.TestCase):
         )
         self.assertEqual(job["github_issue_context"], "Issue context")
         self.assertEqual(job["worktree_branch"], "voice/github-issue-42")
+        self.assertEqual(job["worktree_label"], "issue-42")
         self.assertIsNone(job["issue_key"])
 
     def test_worker_provisions_github_issue_and_uses_stable_worktree(self) -> None:
@@ -165,7 +166,7 @@ class CursorJobStateTests(unittest.TestCase):
                 "github_issue": 42,
                 "github_issue_context": "Title: Fix it",
                 "worktree_branch": "voice/github-issue-42",
-                "worktree_label": "github-source-project-42",
+                "worktree_label": "issue-42",
                 "status": "queued",
                 "created_at": 1,
                 "delivered": False,
@@ -202,7 +203,7 @@ class CursorJobStateTests(unittest.TestCase):
             agent_hint=None,
             reserved=set(),
             worktree_branch="voice/github-issue-42",
-            worktree_label="github-source-project-42",
+            worktree_label="issue-42",
         )
         prompt = client.prompt_and_wait.call_args.args[1]
         self.assertIn("Title: Fix it", prompt)

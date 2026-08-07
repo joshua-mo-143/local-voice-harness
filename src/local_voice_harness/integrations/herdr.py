@@ -435,7 +435,8 @@ class HerdrClient:
     def start_agent(
         self, checkout: Path, label: str, pane: str, workspace: str
     ) -> AgentSelection:
-        name = f"voice-{normalize_name(label)[:36] or 'task'}-{uuid.uuid4().hex[:5]}"
+        suffix = uuid.uuid4().hex[:10]
+        name = f"voice-{normalize_name(label)[:15] or 'task'}-{suffix}"
         deadline = time.monotonic() + 15
         while True:
             try:
