@@ -57,8 +57,24 @@ PLAYBACK_QUIET_FRAMES = max(
 PLAYBACK_QUIET_TIMEOUT_SECONDS = max(
     0.0, float(os.environ.get("VOICE_HARNESS_PLAYBACK_QUIET_TIMEOUT_SECONDS", "2"))
 )
-WAKE_PREFIX = re.compile(r"^\s*hey[,\s]+(?:jarvis|travis)\b[\s,;:!?.-]*", re.IGNORECASE)
-SPOKEN_WAKE_PATTERN = re.compile(r"\bhey[,\s]+(?:jarvis|travis)\b", re.IGNORECASE)
+WAKE_NAME = r"(?:jarvis|travis|service|jarvus|jervis)"
+WAKE_PREFIX = re.compile(rf"^\s*hey[,\s]+{WAKE_NAME}\b[\s,;:!?.-]*", re.IGNORECASE)
+WAKE_ANYWHERE = re.compile(rf"\bhey[,\s]+{WAKE_NAME}\b[\s,;:!?.-]*", re.IGNORECASE)
+SPOKEN_WAKE_PATTERN = re.compile(rf"\bhey[,\s]+{WAKE_NAME}\b", re.IGNORECASE)
+
+
+def strip_wake_prefix(text: str) -> tuple[str, bool]:
+    """Remove a leading wake phrase, tolerating Parakeet mis-transcriptions."""
+
+    match = WAKE_PREFIX.match(text)
+    if match is not None:
+        return text[match.end() :].strip(), True
+    match = WAKE_ANYWHERE.search(text)
+    if match is not None:
+        return (text[: match.start()] + text[match.end() :]).strip(), True
+    return text.strip(), False
+
+
 CLOSE_PATTERN = re.compile(
     r"\b(?:goodbye|stop listening|go to sleep|end conversation)\b", re.IGNORECASE
 )
@@ -359,12 +375,17 @@ class WakeConversationDaemon:
         try:
             text = transcribe()
             if woke:
-                match = WAKE_PREFIX.match(text)
-                if match is None:
-                    log(f"rejected wake candidate: {text!r}")
-                    self.stop_components_when_idle()
-                    return None
-                text = text[match.end() :].strip()
+                text, found_wake = strip_wake_prefix(text)
+                if not found_wake:
+                    if text:
+                        log(
+                            "wake prefix absent in STT; trusting OpenWakeWord: "
+                            f"{text!r}"
+                        )
+                    else:
+                        log(f"rejected wake candidate: {text!r}")
+                        self.stop_components_when_idle()
+                        return None
             if not text:
                 log("wake phrase contained no request; waiting for follow-up")
                 notify("Listening for a follow-up…")

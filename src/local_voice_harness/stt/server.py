@@ -36,7 +36,9 @@ PROMPT = os.environ.get(
 REPLACEMENTS = {
     source.strip(): target.strip()
     for entry in os.environ.get(
-        "DICTATION_REPLACEMENTS", "herder:herdr;cursa:Cursor;curser:Cursor"
+        "DICTATION_REPLACEMENTS",
+        "herder:herdr;cursa:Cursor;curser:Cursor;"
+        "service:Jarvis;jarvus:Jarvis;jervis:Jarvis",
     ).split(";")
     if entry.strip() and ":" in entry
     for source, target in [entry.split(":", 1)]
