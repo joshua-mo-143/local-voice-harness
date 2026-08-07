@@ -57,9 +57,9 @@ Cursor routing works as follows:
    and preserve bounded issue context with the job.
 5. If no repository can be resolved, open Rofi to select a local repository or paste
    a Git URL; cloning requires a second confirmation.
-6. When the user explicitly says “fork,” validate the focused public GitHub repository,
-   create or reuse the authenticated user's fork, and clone it below the configured
-   GitHub root.
+6. When the user unambiguously asks to fork, ask for a yes-or-no confirmation, then
+   validate the focused public GitHub repository, create or reuse the authenticated
+   user's fork, and clone it below the configured GitHub root.
 7. When a GitHub pull request is focused, clone its repository below the configured
    GitHub root and check the pull request out in place with `gh pr checkout`, then run
    the request against that checkout so Cursor can verify or extend the branch.
@@ -72,8 +72,9 @@ Cursor routing works as follows:
 
 The harness never automatically commits, pushes, opens pull requests, modifies Linear,
 or deletes generated worktrees. Fork creation is the only supported GitHub write and
-is performed only when the spoken request explicitly includes “fork.” Checking out a
-focused pull request only reads from GitHub and writes to the local checkout.
+is performed only after an unambiguous spoken request and a separate affirmative
+confirmation. Checking out a focused pull request only reads from GitHub and writes to
+the local checkout.
 
 ## Compute requirements
 
@@ -612,7 +613,8 @@ the earlier Whisper large-v3 backend; Parakeet TDT 0.6B v2 measurements are pend
 - Repository cloning requires explicit Rofi confirmation, accepts only HTTPS or SSH
   Git URLs, and places the checkout beneath the configured project root.
 - Merely focusing a GitHub page cannot create a fork. The original spoken request must
-  explicitly contain “fork,” and the source must be a validated public repository.
+  unambiguously ask for one, and the user must separately confirm before the validated
+  public repository is forked.
 - Checking out a focused pull request clones its repository below the GitHub root and
   runs `gh pr checkout`; it reads from GitHub and writes only to the local checkout.
 - Jobs never automatically commit, push, open pull requests, or remove worktrees.

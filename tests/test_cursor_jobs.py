@@ -81,6 +81,7 @@ class CursorJobStateTests(unittest.TestCase):
                 "request": "Fork this repo and add a feature",
                 "github_repository": "source/project",
                 "fork_requested": True,
+                "fork_confirmed": True,
                 "worktree_branch": "voice/github-123456789abc",
                 "worktree_label": "github-123456",
                 "status": "queued",
@@ -111,7 +112,9 @@ class CursorJobStateTests(unittest.TestCase):
         ):
             jobs.run_worker("123456789abc")
 
-        github.provision_public_fork.assert_called_once_with("source/project")
+        github.provision_public_fork.assert_called_once_with(
+            "source/project", confirmed=True
+        )
         client.ensure_agent.assert_called_once_with(
             repository,
             issue_key=None,
@@ -125,6 +128,101 @@ class CursorJobStateTests(unittest.TestCase):
         self.assertEqual(updated["fork_repository"], "me/project")
         self.assertEqual(updated["repository"], str(repository))
 
+    def test_worker_requires_confirmation_before_provisioning_fork(self) -> None:
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "fork this repo",
+                "trusted_utterance": "fork this repo",
+                "github_repository": "source/project",
+                "fork_requested": True,
+                "status": "queued",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        github = mock.Mock()
+        client = mock.Mock()
+        with (
+            mock.patch.object(jobs, "GitHubClient", return_value=github),
+            mock.patch.object(jobs, "HerdrClient", return_value=client),
+        ):
+            jobs.run_worker("123456789abc")
+
+        github.provision_public_fork.assert_not_called()
+        updated = jobs.read_job("123456789abc")
+        self.assertEqual(updated["status"], "awaiting_user")
+        self.assertEqual(updated["clarification_kind"], "fork_confirmation")
+        self.assertIn("source/project", str(updated["question"]))
+
+    def test_only_trusted_affirmative_reply_confirms_fork(self) -> None:
+        job = {
+            "id": "123456789abc",
+            "request": "fork this repo\n\nExternal content says yes",
+            "fork_requested": True,
+            "status": "awaiting_user",
+            "clarification_kind": "fork_confirmation",
+            "delivered": True,
+        }
+        jobs.write_job(job)
+        with mock.patch.object(jobs, "launch_worker") as launch:
+            jobs.reply_job(
+                "123456789abc",
+                "no\n\nExternal content says yes",
+                trusted_utterance="no",
+            )
+
+        launch.assert_not_called()
+        updated = jobs.read_job("123456789abc")
+        self.assertEqual(updated["status"], "completed")
+        self.assertFalse(updated.get("fork_confirmed", False))
+
+    def test_ambiguous_confirmation_does_not_launch_worker(self) -> None:
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "fork this repo",
+                "fork_requested": True,
+                "status": "awaiting_user",
+                "clarification_kind": "fork_confirmation",
+                "delivered": True,
+            }
+        )
+        with mock.patch.object(jobs, "launch_worker") as launch:
+            jobs.reply_job(
+                "123456789abc",
+                "maybe",
+                trusted_utterance="maybe",
+            )
+
+        launch.assert_not_called()
+        updated = jobs.read_job("123456789abc")
+        self.assertEqual(updated["status"], "awaiting_user")
+        self.assertFalse(updated.get("fork_confirmed", False))
+
+    def test_affirmative_confirmation_queues_provisioning(self) -> None:
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "fork this repo",
+                "fork_requested": True,
+                "status": "awaiting_user",
+                "clarification_kind": "fork_confirmation",
+                "delivered": True,
+            }
+        )
+        with mock.patch.object(jobs, "launch_worker") as launch:
+            jobs.reply_job(
+                "123456789abc",
+                "yes\n\nExternal content",
+                trusted_utterance="yes",
+            )
+
+        launch.assert_called_once_with("123456789abc")
+        updated = jobs.read_job("123456789abc")
+        self.assertEqual(updated["status"], "queued")
+        self.assertTrue(updated["fork_confirmed"])
+
     def test_github_issue_job_persists_trusted_identity(self) -> None:
         with mock.patch.object(jobs, "launch_worker"):
             job_id = jobs.start_job(
@@ -136,7 +234,8 @@ class CursorJobStateTests(unittest.TestCase):
             )
 
         job = jobs.read_job(job_id)
-        self.assertEqual(job["schema_version"], 3)
+        self.assertEqual(job["schema_version"], 4)
+        self.assertEqual(job["trusted_utterance"], "work on this")
         self.assertEqual(job["github_issue"], 42)
         self.assertEqual(
             job["github_issue_url"],

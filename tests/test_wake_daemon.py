@@ -329,6 +329,7 @@ class ProcessUtteranceTests(unittest.TestCase):
         cursor_turn.assert_called_once_with(
             "use the api repository",
             "oldjob123456",
+            utterance="use the api repository",
             action="reply",
             job_id="oldjob123456",
             delivery_claims=mock.ANY,

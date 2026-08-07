@@ -108,6 +108,44 @@ class IntentRouterTests(unittest.TestCase):
                 self.assertEqual(route, intent.FALLBACK_ROUTE)
 
 
+class ForkIntentTests(unittest.TestCase):
+    def test_accepts_only_unambiguous_fork_requests(self) -> None:
+        for utterance in (
+            "fork this repo and add Venice",
+            "please fork owner/project",
+            "ask Cursor to fork this repository",
+            "I want you to fork this repo",
+            "I would like you to fork this repo",
+        ):
+            with self.subTest(utterance=utterance):
+                self.assertEqual(
+                    intent.decide_fork_intent(utterance),
+                    intent.ForkIntent.AFFIRMATIVE,
+                )
+
+    def test_rejects_negative_quoted_hypothetical_and_informational_uses(self) -> None:
+        for utterance in (
+            "do not fork this repository",
+            'the ticket says "fork this repo"',
+            "the ticket says please fork this repo",
+            "if we fork this repo, what happens",
+            "is this already forked",
+            "could you fork this repository",
+            "this issue discusses fork behavior",
+        ):
+            with self.subTest(utterance=utterance):
+                self.assertEqual(
+                    intent.decide_fork_intent(utterance),
+                    intent.ForkIntent.NON_AFFIRMATIVE,
+                )
+
+    def test_unrelated_request_has_no_fork_intent(self) -> None:
+        self.assertEqual(
+            intent.decide_fork_intent("work on this repository"),
+            intent.ForkIntent.NONE,
+        )
+
+
 class CursorPatternTests(unittest.TestCase):
     def test_matches_explicit_cursor_delegation(self) -> None:
         for utterance in (

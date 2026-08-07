@@ -16,7 +16,7 @@ from pathlib import Path
 
 from ..browser_context import request_context
 from ..components import llm_ready, start_components, stop_components
-from ..config import DEFAULT_SOURCE, FORK_PATTERN, STATE_DIR, WAV_PATH
+from ..config import DEFAULT_SOURCE, STATE_DIR, WAV_PATH
 from ..cursor.jobs import (
     DeliveryClaims,
     acknowledge_deliveries,
@@ -28,7 +28,7 @@ from ..cursor.jobs import (
     release_delivery,
 )
 from ..errors import HarnessError
-from ..intent import Intent, route_intent
+from ..intent import ForkIntent, Intent, decide_fork_intent, route_intent
 from ..llm import qwen_turn
 from ..notifications import notify
 from ..stt.client import transcribe
@@ -574,7 +574,7 @@ class WakeConversationDaemon:
             remember_response = False
             context = request_context(text)
             route = route_intent(text, context, cursor_session=self.cursor_session)
-            fork_requested = bool(FORK_PATTERN.search(text))
+            fork_requested = decide_fork_intent(text) == ForkIntent.AFFIRMATIVE
             github_arguments = (
                 {
                     "github_repository": context.github_repository,
@@ -628,6 +628,7 @@ class WakeConversationDaemon:
                 response, next_cursor_session = cursor_turn(
                     context.text,
                     self.cursor_session,
+                    utterance=text,
                     action="reply",
                     job_id=self.cursor_session,
                     delivery_claims=delivery_claims,

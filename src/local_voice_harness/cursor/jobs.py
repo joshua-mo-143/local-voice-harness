@@ -40,6 +40,35 @@ DELIVERY_CLAIM_SECONDS = 300.0
 DELIVERY_RETRY_SECONDS = 5.0
 FOREGROUND_GRACE_SECONDS = 2.0
 DeliveryClaims = list[tuple[str, str]]
+FORK_CONFIRMATIONS = {
+    "yes",
+    "yes please",
+    "confirm",
+    "confirmed",
+    "do it",
+    "go ahead",
+    "create it",
+    "create the fork",
+    "fork it",
+}
+FORK_REJECTIONS = {
+    "no",
+    "no thanks",
+    "do not",
+    "don't",
+    "cancel",
+    "stop",
+}
+
+
+def decide_fork_confirmation(utterance: str) -> bool | None:
+    normalized = re.sub(r"[^\w\s'’]", "", utterance.casefold())
+    normalized = re.sub(r"\s+", " ", normalized).strip().replace("’", "'")
+    if normalized in FORK_CONFIRMATIONS:
+        return True
+    if normalized in FORK_REJECTIONS:
+        return False
+    return None
 
 
 def job_path(job_id: str) -> Path:
@@ -532,7 +561,18 @@ def run_worker(job_id: str, claim_token: str | None = None) -> None:
                         clarification_kind="github_repository",
                     )
                     return
-                provisioned = GitHubClient().provision_public_fork(github_repository)
+                if not job.get("fork_confirmed"):
+                    _worker_question(
+                        job_id,
+                        worker_token,
+                        f"Please confirm: should I create a GitHub fork of "
+                        f"{github_repository}? Say yes or no.",
+                        clarification_kind="fork_confirmation",
+                    )
+                    return
+                provisioned = GitHubClient().provision_public_fork(
+                    github_repository, confirmed=True
+                )
                 repository = provisioned.checkout
 
                 def record_provisioning(current: dict[str, object]) -> None:
@@ -759,10 +799,11 @@ def start_job(
     write_job(
         {
             "id": job_id,
-            "schema_version": 3,
+            "schema_version": 4,
             "revision": 0,
             "request": text,
             "utterance": utterance,
+            "trusted_utterance": spoken_text,
             "repository_hint": repository,
             "context_repository": context_repository,
             "github_repository": github_repository,
@@ -796,10 +837,12 @@ def start_job(
     return job_id
 
 
-def reply_job(job_id: str, text: str) -> None:
+def reply_job(job_id: str, text: str, *, trusted_utterance: str | None = None) -> None:
     now = time.time()
+    should_launch = True
 
     def reply(job: dict[str, object]) -> bool:
+        nonlocal should_launch
         if job.get("status") != "awaiting_user":
             return False
         if job.get("clarification_kind") == "repository":
@@ -810,6 +853,35 @@ def reply_job(job_id: str, text: str) -> None:
             job.update(
                 {
                     "github_repository": text.strip(),
+                    "herdr_target": None,
+                    "continuation": False,
+                }
+            )
+        elif job.get("clarification_kind") == "fork_confirmation":
+            confirmation = decide_fork_confirmation(trusted_utterance or "")
+            if confirmation is False:
+                should_launch = False
+                job.update(
+                    {
+                        "status": "completed",
+                        "question": None,
+                        "clarification_kind": None,
+                        "result": "Okay, I did not create a GitHub fork.",
+                        "completed_at": now,
+                    }
+                )
+                _clear_worker(job)
+                _prepare_delivery(job, now=now)
+                return True
+            if confirmation is None:
+                should_launch = False
+                question = "Please answer yes or no. Should I create the GitHub fork?"
+                job.update({"question": question, "result": question})
+                _prepare_delivery(job, now=now)
+                return True
+            job.update(
+                {
+                    "fork_confirmed": True,
                     "herdr_target": None,
                     "continuation": False,
                 }
@@ -836,7 +908,8 @@ def reply_job(job_id: str, text: str) -> None:
 
     if _mutate_job(job_id, reply) is None:
         raise HarnessError(f"Cursor job {job_id} is not waiting for a reply")
-    launch_worker(job_id)
+    if should_launch:
+        launch_worker(job_id)
 
 
 def cancel_job(job_id: str) -> str:
@@ -1195,7 +1268,7 @@ def cursor_turn(
         reply_id = job_id or session_id
         if not reply_id:
             raise HarnessError("a Cursor job ID is required for a reply")
-        reply_job(reply_id, text)
+        reply_job(reply_id, text, trusted_utterance=utterance)
         job_id = reply_id
     else:
         job_id = start_job(
