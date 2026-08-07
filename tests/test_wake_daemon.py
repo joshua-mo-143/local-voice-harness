@@ -74,6 +74,23 @@ class MicrophoneStartupTests(unittest.TestCase):
         popen.assert_called_once()
 
 
+class StripWakePrefixTests(unittest.TestCase):
+    def test_strips_leading_wake_phrase(self) -> None:
+        text, found = wake_daemon.strip_wake_prefix("Hey Jarvis, what time is it?")
+        self.assertTrue(found)
+        self.assertEqual(text, "what time is it?")
+
+    def test_strips_common_parakeet_mishearing(self) -> None:
+        text, found = wake_daemon.strip_wake_prefix("hey service what time is it")
+        self.assertTrue(found)
+        self.assertEqual(text, "what time is it")
+
+    def test_strips_wake_phrase_not_at_start(self) -> None:
+        text, found = wake_daemon.strip_wake_prefix("um hey jarvis what time is it")
+        self.assertTrue(found)
+        self.assertEqual(text, "um what time is it")
+
+
 class ProcessUtteranceTests(unittest.TestCase):
     def test_completed_turn_enables_followup(self) -> None:
         daemon = _bare_daemon()
@@ -134,6 +151,33 @@ class ProcessUtteranceTests(unittest.TestCase):
         play.assert_not_called()
         self.assertTrue(daemon.awaiting_followup)
         self.assertGreater(daemon.conversation_deadline, 0.0)
+
+    def test_missing_wake_prefix_still_accepts_command(self) -> None:
+        daemon = _bare_daemon()
+        with (
+            mock.patch.object(
+                wake_daemon, "transcribe", return_value="what time is it"
+            ),
+            mock.patch.object(wake_daemon, "start_components"),
+            mock.patch.object(
+                wake_daemon, "qwen_turn", return_value=("it is noon", None)
+            ) as qwen_turn,
+            mock.patch.object(wake_daemon, "stream_and_play", return_value={}),
+            mock.patch.object(
+                wake_daemon,
+                "request_context",
+                return_value=RequestContext("what time is it"),
+            ),
+            mock.patch.object(
+                wake_daemon,
+                "route_intent",
+                return_value=IntentRoute(Intent.CONVERSATION, "high"),
+            ),
+            mock.patch.object(wake_daemon, "notify"),
+        ):
+            daemon.process_utterance(woke=True)
+
+        qwen_turn.assert_called_once()
 
     def test_fuzzy_new_task_bypasses_main_qwen(self) -> None:
         daemon = _bare_daemon()
