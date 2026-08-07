@@ -12,7 +12,7 @@ bench_llm() {
   payload="$("$PY" -c "
 import json, sys
 print(json.dumps({
-    'model': 'qwen3.5-9b',
+    'model': 'qwen3.5-4b',
     'messages': [{'role': 'user', 'content': sys.argv[1]}],
     'temperature': 0.7,
     'max_tokens': int(sys.argv[2]),
@@ -56,7 +56,7 @@ echo "Date: $(date -Iseconds)"
 echo ""
 echo "--- Hardware ---"
 nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader
-echo "Qwen3.5-9B-UD-Q4_K_XL | Whisper large-v3-turbo | Chatterbox Turbo"
+echo "Qwen3.5-4B-Q4_K_M | Whisper large-v3-turbo | Chatterbox Turbo"
 echo ""
 
 systemctl --user stop voice-harness-wake.service dictation.service voice-harness-llm.service voice-harness-tts.service 2>/dev/null || true
@@ -92,7 +92,7 @@ done
 echo "GPU with STT: $(nvidia-smi --query-gpu=memory.used --format=csv,noheader)"
 echo ""
 
-echo "--- LLM (Qwen3.5-9B, CUDA) ---"
+echo "--- LLM (Qwen3.5-4B, CUDA) ---"
 systemctl --user stop dictation.service
 sleep 2
 T0=$(date +%s.%N)
