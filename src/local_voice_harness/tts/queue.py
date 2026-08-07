@@ -47,6 +47,8 @@ class PrefetchHandle:
         self.text = text
         self._event = threading.Event()
         self._result: PrefetchedUtterance | None = None
+        self._discard_lock = threading.Lock()
+        self._discarded = False
         threading.Thread(
             target=self._run,
             name=f"voice-prefetch-{uuid.uuid4().hex[:8]}",
@@ -89,19 +91,30 @@ class PrefetchHandle:
         return self._result
 
     def discard(self) -> None:
+        with self._discard_lock:
+            if self._discarded:
+                return
+            self._discarded = True
+
         def cleanup() -> None:
             self._event.wait()
             assert self._result is not None
-            for output in self._result.chunks:
-                output.unlink(missing_ok=True)
-            if self._result.chunks:
-                shutil.rmtree(self._result.chunks[0].parent, ignore_errors=True)
+            _cleanup_chunks(self._result.chunks)
 
         threading.Thread(
             target=cleanup,
             name=f"voice-prefetch-cleanup-{uuid.uuid4().hex[:8]}",
             daemon=True,
         ).start()
+
+
+def _cleanup_chunks(chunks: list[Path]) -> None:
+    parents = {output.parent for output in chunks}
+    for output in chunks:
+        with contextlib.suppress(OSError):
+            output.unlink(missing_ok=True)
+    for parent in parents:
+        shutil.rmtree(parent, ignore_errors=True)
 
 
 def _prefetch_utterance(text: str) -> PrefetchedUtterance:
@@ -158,6 +171,9 @@ def _prefetch_utterance(text: str) -> PrefetchedUtterance:
             chunk_texts=chunk_texts,
             done_meta=done_meta,
         )
+    except BaseException:
+        _cleanup_chunks(chunks)
+        raise
     finally:
         stream_socket.close()
         # Chunk files live under stream-{request_id}; playback owns cleanup after play.
@@ -233,10 +249,7 @@ def play_prefetched(
                 with contextlib.suppress(subprocess.TimeoutExpired):
                     process.terminate()
                     process.wait(timeout=1)
-            for output in prefetched.chunks:
-                output.unlink(missing_ok=True)
-            if prefetched.chunks:
-                shutil.rmtree(prefetched.chunks[0].parent, ignore_errors=True)
+            _cleanup_chunks(prefetched.chunks)
     result = {
         **prefetched.done_meta,
         "ok": True,
@@ -251,15 +264,20 @@ def play_prefetched(
 
 class PlaybackQueue:
     def __init__(self) -> None:
-        self._items: collections.deque[tuple[PlaybackRequest, PrefetchHandle]] = (
-            collections.deque()
-        )
+        self._items: collections.deque[
+            tuple[PlaybackRequest, PrefetchHandle | None]
+        ] = collections.deque()
         self._lock = threading.Lock()
 
     def enqueue(self, request: PlaybackRequest) -> None:
-        handle = PrefetchHandle(request.text)
         with self._lock:
-            self._items.append((request, handle))
+            self._items.append((request, None))
+
+    def start_prefetch(self) -> None:
+        with self._lock:
+            for index, (request, handle) in enumerate(self._items):
+                if handle is None:
+                    self._items[index] = (request, PrefetchHandle(request.text))
 
     def __len__(self) -> int:
         with self._lock:
@@ -268,7 +286,8 @@ class PlaybackQueue:
     def clear(self) -> None:
         with self._lock:
             for _, handle in self._items:
-                handle.discard()
+                if handle is not None:
+                    handle.discard()
             self._items.clear()
 
     def peek_text(self) -> str:
@@ -298,7 +317,17 @@ class PlaybackQueue:
                         if not self._items:
                             break
                         request, handle = self._items[0]
-                    prefetched = handle.wait(should_interrupt=should_interrupt)
+                        if handle is None:
+                            handle = PrefetchHandle(request.text)
+                            self._items[0] = (request, handle)
+                    try:
+                        prefetched = handle.wait(should_interrupt=should_interrupt)
+                    except Exception:
+                        handle.discard()
+                        with self._lock:
+                            if self._items and self._items[0][0] is request:
+                                self._items.popleft()
+                        raise
                     if prefetched is None:
                         interrupted = True
                         handle.discard()
@@ -317,44 +346,46 @@ class PlaybackQueue:
                         if on_played is not None:
                             on_played(result, True, request)
                         break
-                    if process is None:
-                        sample_rate = prefetched.sample_rate
-                        process = _open_playback(sample_rate)
-                    if process.stdin is None:
-                        raise HarnessError("pw-play stdin is unavailable")
                     item_started = time.perf_counter()
                     chunk_texts: list[str] = []
-                    for index, output in enumerate(prefetched.chunks):
-                        if should_interrupt is not None and should_interrupt():
-                            interrupted = True
-                            break
-                        with wave.open(str(output), "rb") as source:
-                            if (
-                                source.getnchannels() != 1
-                                or source.getsampwidth() != 2
-                                or source.getframerate() != sample_rate
-                            ):
-                                raise HarnessError(
-                                    f"unexpected streaming WAV format: {output}"
-                                )
-                            while True:
-                                if should_interrupt is not None and should_interrupt():
-                                    interrupted = True
-                                    break
-                                audio = source.readframes(4096)
-                                if not audio:
-                                    break
-                                process.stdin.write(audio)
-                        if interrupted:
-                            break
-                        chunk_texts.append(prefetched.chunk_texts[index])
-                    for output in prefetched.chunks:
-                        output.unlink(missing_ok=True)
-                    if prefetched.chunks:
-                        shutil.rmtree(prefetched.chunks[0].parent, ignore_errors=True)
-                    with self._lock:
-                        if self._items and self._items[0][0] is request:
-                            self._items.popleft()
+                    try:
+                        if process is None:
+                            sample_rate = prefetched.sample_rate
+                            process = _open_playback(sample_rate)
+                        if process.stdin is None:
+                            raise HarnessError("pw-play stdin is unavailable")
+                        for index, output in enumerate(prefetched.chunks):
+                            if should_interrupt is not None and should_interrupt():
+                                interrupted = True
+                                break
+                            with wave.open(str(output), "rb") as source:
+                                if (
+                                    source.getnchannels() != 1
+                                    or source.getsampwidth() != 2
+                                    or source.getframerate() != sample_rate
+                                ):
+                                    raise HarnessError(
+                                        f"unexpected streaming WAV format: {output}"
+                                    )
+                                while True:
+                                    if (
+                                        should_interrupt is not None
+                                        and should_interrupt()
+                                    ):
+                                        interrupted = True
+                                        break
+                                    audio = source.readframes(4096)
+                                    if not audio:
+                                        break
+                                    process.stdin.write(audio)
+                            if interrupted:
+                                break
+                            chunk_texts.append(prefetched.chunk_texts[index])
+                    finally:
+                        _cleanup_chunks(prefetched.chunks)
+                        with self._lock:
+                            if self._items and self._items[0][0] is request:
+                                self._items.popleft()
                     result = {
                         **prefetched.done_meta,
                         "ok": True,
