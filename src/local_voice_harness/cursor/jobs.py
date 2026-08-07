@@ -1083,8 +1083,13 @@ def recover_jobs() -> None:
 
 def pending_results() -> list[dict[str, object]]:
     recover_jobs()
-    claimed = claim_delivery()
-    return [claimed] if claimed is not None else []
+    results: list[dict[str, object]] = []
+    while True:
+        claimed = claim_delivery()
+        if claimed is None:
+            break
+        results.append(claimed)
+    return results
 
 
 def cursor_turn(

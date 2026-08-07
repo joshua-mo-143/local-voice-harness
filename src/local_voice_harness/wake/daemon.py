@@ -10,6 +10,7 @@ import sys
 import threading
 import time
 import wave
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -31,7 +32,7 @@ from ..intent import Intent, route_intent
 from ..llm import qwen_turn
 from ..notifications import notify
 from ..stt.client import transcribe
-from ..tts.client import stream_and_play
+from ..tts.queue import PlaybackQueue, PlaybackRequest
 
 SAMPLE_RATE = 16_000
 FRAME_MS = 80
@@ -129,6 +130,7 @@ class WakeConversationDaemon:
         self.activation_thread: threading.Thread | None = None
         self.activation_error: Exception | None = None
         self.component_lock = threading.Lock()
+        self.playback_queue = PlaybackQueue()
 
     def is_speech(self, frame: bytes) -> bool:
         samples = self.np.frombuffer(frame, dtype="<i2").astype(self.np.float64)
@@ -321,7 +323,9 @@ class WakeConversationDaemon:
                 break
         self.pre_roll.clear()
 
-    def play_response(self, response: str) -> tuple[dict[str, object], BargeIn | None]:
+    def _build_interrupt_checker(
+        self, response: str
+    ) -> tuple[Callable[[], bool], Callable[[], BargeIn | None]]:
         self.resume_microphone()
         self.pre_roll.clear()
         self.wake_model.reset()
@@ -355,13 +359,175 @@ class WakeConversationDaemon:
                 return True
             return False
 
+        def interruption_result() -> BargeIn | None:
+            return interruption
+
+        return should_interrupt, interruption_result
+
+    def _drain_playback_queue(
+        self,
+        response: str,
+        *,
+        on_played: Callable[[dict[str, object], bool, PlaybackRequest], None]
+        | None = None,
+    ) -> tuple[list[tuple[dict[str, object], bool, PlaybackRequest]], BargeIn | None]:
+        should_interrupt, interruption_result = self._build_interrupt_checker(response)
         try:
-            result = stream_and_play(response, should_interrupt=should_interrupt)
+            batch = self.playback_queue.drain(
+                should_interrupt=should_interrupt,
+                on_played=on_played,
+            )
         finally:
             self.wake_model.reset()
-        if interruption is None:
+        interruption = interruption_result()
+        if interruption is None and batch and not batch[-1][1]:
             self.wait_for_playback_quiet()
-        return result, interruption
+        return batch, interruption
+
+    def play_response(self, response: str) -> tuple[dict[str, object], BargeIn | None]:
+        self.playback_queue.enqueue(PlaybackRequest(text=response))
+        finished: set[int] = set()
+
+        def finish_job(
+            playback: dict[str, object],
+            interrupted: bool,
+            request: PlaybackRequest,
+        ) -> None:
+            if request.job_id:
+                self._finish_job_playback(request, playback, interrupted=interrupted)
+            finished.add(id(request))
+
+        batch, interruption = self._drain_playback_queue(
+            response,
+            on_played=finish_job,
+        )
+        for playback, interrupted, request in batch:
+            if id(request) not in finished:
+                finish_job(playback, interrupted, request)
+        if not batch:
+            return {}, interruption
+        return batch[-1][0], interruption
+
+    def _job_response_text(self, job: dict[str, object]) -> str:
+        if job.get("status") == "completed":
+            return f"Cursor finished. {str(job.get('result') or '').strip()}"
+        if job.get("status") == "awaiting_user":
+            return (
+                "Cursor needs clarification. "
+                + str(job.get("question") or job.get("result") or "").strip()
+            )
+        if job.get("status") == "blocked":
+            return str(
+                job.get("result")
+                or f"Cursor agent {job.get('herdr_target') or ''} needs attention."
+            ).strip()
+        if job.get("status") == "cancelled":
+            return str(job.get("result") or "Cursor job was cancelled.").strip()
+        return f"Cursor job failed. {str(job.get('error') or 'Unknown error').strip()}"
+
+    def _enqueue_job_announcement(self, job: dict[str, object]) -> None:
+        job_id = str(job.get("id") or "")
+        response = self._job_response_text(job)
+        log(f"job {job_id} completion queued: {response}")
+        print(f"Assistant: {response}", flush=True)
+        self.playback_queue.enqueue(
+            PlaybackRequest(
+                text=response,
+                job_id=job_id,
+                delivery_token=str(job.get("_delivery_token") or "") or None,
+                job_status=str(job.get("status") or ""),
+            )
+        )
+
+    def _enable_post_job_conversation(
+        self,
+        *,
+        job_id: str,
+        job_status: str,
+        played_text: str,
+    ) -> None:
+        if played_text:
+            self.history.append({"role": "assistant", "content": played_text})
+            self.history = self.history[-8:]
+        if job_status == "awaiting_user":
+            self.cursor_session = job_id
+        elif job_status == "completed" and self.cursor_session == job_id:
+            self.cursor_session = None
+        self.conversation_deadline = time.monotonic() + CONVERSATION_TIMEOUT_SECONDS
+        self.awaiting_followup = True
+        notify("Listening for a follow-up…")
+
+    def _finish_job_playback(
+        self,
+        request: PlaybackRequest,
+        playback: dict[str, object],
+        *,
+        interrupted: bool,
+    ) -> None:
+        job_id = request.job_id or ""
+        delivery_token = request.delivery_token or ""
+        if interrupted:
+            if delivery_token:
+                release_delivery(job_id, delivery_token)
+            return
+        acknowledged = (
+            acknowledge_delivery(job_id, delivery_token) if delivery_token else True
+        )
+        if not acknowledged:
+            return
+        played_text = str(playback.get("played_text") or "").strip() or request.text
+        self._enable_post_job_conversation(
+            job_id=job_id,
+            job_status=str(request.job_status or ""),
+            played_text=played_text,
+        )
+
+    def _play_pending_announcements(self) -> BargeIn | None:
+        if len(self.playback_queue) == 0:
+            return None
+        self.pause_microphone()
+        batch: list[tuple[dict[str, object], bool, PlaybackRequest]] = []
+        interruption: BargeIn | None = None
+        finished: set[int] = set()
+        with self.playback_queue._lock:
+            pending_requests = [request for request, _ in self.playback_queue._items]
+
+        def finish_job(
+            playback: dict[str, object],
+            interrupted: bool,
+            request: PlaybackRequest,
+        ) -> None:
+            if request.job_id:
+                self._finish_job_playback(request, playback, interrupted=interrupted)
+            finished.add(id(request))
+
+        try:
+            with self.component_lock:
+                start_components()
+            batch, interruption = self._drain_playback_queue(
+                self.playback_queue.peek_text(),
+                on_played=finish_job,
+            )
+            for playback, interrupted, request in batch:
+                if id(request) not in finished:
+                    finish_job(playback, interrupted, request)
+            return interruption
+        except Exception as exc:
+            for request in pending_requests:
+                if (
+                    id(request) not in finished
+                    and request.delivery_token
+                    and request.job_id
+                ):
+                    release_delivery(request.job_id, request.delivery_token)
+            log(f"queued playback failed: {type(exc).__name__}: {exc}")
+            notify(str(exc) or type(exc).__name__, error=True)
+            return None
+        finally:
+            if not self.conversation_deadline and interruption is None:
+                self.stop_components_when_idle()
+            self.resume_microphone()
+            self.wake_model.reset()
 
     def continue_after_barge_in(self, interruption: BargeIn | None) -> None:
         while interruption is not None and self.running:
@@ -471,6 +637,7 @@ class WakeConversationDaemon:
                 )
                 remember_response = True
             print(f"Assistant: {response}", flush=True)
+            cursor_session_before_playback = self.cursor_session
             playback, interruption = self.play_response(response)
             if remember_response:
                 played_text = (
@@ -487,7 +654,8 @@ class WakeConversationDaemon:
                 self.history = next_history
                 return interruption
             acknowledge_deliveries(delivery_claims)
-            self.cursor_session = next_cursor_session
+            if self.cursor_session == cursor_session_before_playback:
+                self.cursor_session = next_cursor_session
             self.history = next_history
             self.conversation_deadline = time.monotonic() + CONVERSATION_TIMEOUT_SECONDS
             self.awaiting_followup = True
@@ -507,68 +675,15 @@ class WakeConversationDaemon:
             self.wake_model.reset()
         return None
 
-    def announce_job(self, job: dict[str, object]) -> BargeIn | None:
-        job_id = str(job.get("id") or "")
-        delivery_token = str(job.get("_delivery_token") or "")
-        self.pause_microphone()
-        conversation_active = bool(self.conversation_deadline)
-        try:
-            with self.component_lock:
-                start_components()
-            if job.get("status") == "completed":
-                response = f"Cursor finished. {str(job.get('result') or '').strip()}"
-            elif job.get("status") == "awaiting_user":
-                response = (
-                    "Cursor needs clarification. "
-                    + str(job.get("question") or job.get("result") or "").strip()
-                )
-            elif job.get("status") == "blocked":
-                response = str(
-                    job.get("result")
-                    or f"Cursor agent {job.get('herdr_target') or ''} needs attention."
-                ).strip()
-            elif job.get("status") == "cancelled":
-                response = str(job.get("result") or "Cursor job was cancelled.").strip()
-            else:
-                response = f"Cursor job failed. {str(job.get('error') or 'Unknown error').strip()}"
-            log(f"job {job_id} completion: {response}")
-            print(f"Assistant: {response}", flush=True)
-            _, interruption = self.play_response(response)
-            if interruption is not None:
-                if delivery_token:
-                    release_delivery(job_id, delivery_token)
-                conversation_active = True
-                return interruption
-            acknowledged = (
-                acknowledge_delivery(job_id, delivery_token) if delivery_token else True
-            )
-            if job.get("status") == "awaiting_user" and acknowledged:
-                self.cursor_session = job_id
-                self.conversation_deadline = (
-                    time.monotonic() + CONVERSATION_TIMEOUT_SECONDS
-                )
-                self.awaiting_followup = True
-                conversation_active = True
-        except Exception as exc:
-            if delivery_token:
-                release_delivery(job_id, delivery_token)
-            log(f"job {job_id} announcement failed: {type(exc).__name__}: {exc}")
-            notify(str(exc) or type(exc).__name__, error=True)
-        finally:
-            if not conversation_active:
-                self.stop_components_when_idle()
-            self.resume_microphone()
-            self.wake_model.reset()
-        return None
-
     def run(self) -> None:
         recover_jobs()
         self.start_microphone()
         speech_streak = 0
         while self.running:
-            jobs = pending_results()
-            if jobs:
-                self.continue_after_barge_in(self.announce_job(jobs[0]))
+            for job in pending_results():
+                self._enqueue_job_announcement(job)
+            if len(self.playback_queue) > 0:
+                self.continue_after_barge_in(self._play_pending_announcements())
                 speech_streak = 0
                 continue
             frame = self.read_frame()
