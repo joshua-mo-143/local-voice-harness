@@ -89,6 +89,26 @@ class GitHubContextTests(unittest.TestCase):
             )
         )
 
+    def test_extracts_spoken_issue_references(self) -> None:
+        issue = browser_context.GitHubIssue("example", "project", 42)
+        self.assertEqual(
+            browser_context.github_issue_from_text("work on example/project#42"),
+            issue,
+        )
+        self.assertEqual(
+            browser_context.github_issue_from_text(
+                "please handle issue 42 in example/project"
+            ),
+            issue,
+        )
+        self.assertEqual(
+            browser_context.github_issue_from_text(
+                "work on https://github.com/example/project/issues/42"
+            ),
+            issue,
+        )
+        self.assertIsNone(browser_context.github_issue_from_text("work on issue 42"))
+
     def test_malformed_port_is_not_github_context(self) -> None:
         url = "https://github.com:invalid/example/project/issues/42"
         self.assertIsNone(browser_context.github_issue_from_url(url))
@@ -133,13 +153,9 @@ class GitHubContextTests(unittest.TestCase):
             "comments": [{"author": {"login": "dev"}, "body": "I can reproduce"}],
             "url": url,
         }
-        completed = subprocess.CompletedProcess([], 0, json.dumps(details), "")
         with (
-            mock.patch.object(
-                browser_context.shutil, "which", return_value="/usr/bin/gh"
-            ),
             mock.patch.object(browser_context, "focused_firefox_url", return_value=url),
-            mock.patch.object(browser_context, "_run", return_value=completed) as run,
+            mock.patch.object(browser_context, "_issue_details", return_value=details),
         ):
             context = browser_context.focused_github_context()
 
@@ -147,21 +163,13 @@ class GitHubContextTests(unittest.TestCase):
         self.assertIn("Repository: example/private", str(context))
         self.assertIn("Title: Fix the reader", str(context))
         self.assertIn("- dev: I can reproduce", str(context))
-        self.assertEqual(run.call_args.kwargs["timeout"], 5)
-        self.assertEqual(
-            run.call_args.args[0][:6],
-            ["gh", "issue", "view", "42", "--repo", "example/private"],
-        )
+        self.assertEqual(getattr(context, "github_issue", None), 42)
 
     def test_gh_failure_keeps_validated_issue_identity(self) -> None:
         url = "https://github.com/example/project/issues/42"
-        completed = subprocess.CompletedProcess([], 1, "", "not found")
         with (
-            mock.patch.object(
-                browser_context.shutil, "which", return_value="/usr/bin/gh"
-            ),
             mock.patch.object(browser_context, "focused_firefox_url", return_value=url),
-            mock.patch.object(browser_context, "_run", return_value=completed),
+            mock.patch.object(browser_context, "_issue_details", return_value=None),
         ):
             context = browser_context.focused_github_context()
 
@@ -329,8 +337,25 @@ class GitHubContextTests(unittest.TestCase):
 
         self.assertEqual(context.focused_repository, "example/project")
         self.assertEqual(context.focused_issue, "example/project#42")
+        self.assertEqual(context.github_issue, 42)
+        self.assertIn("Issue: #42", str(context.github_issue_context))
         self.assertIn("Repository: example/project", context.text)
         focused_url.assert_called_once_with()
+
+    def test_spoken_issue_overrides_focused_browser_issue(self) -> None:
+        spoken = browser_context.GitHubIssue("spoken", "project", 7)
+        with (
+            mock.patch.object(browser_context, "_issue_details", return_value=None),
+            mock.patch.object(browser_context, "focused_firefox_url") as focused_url,
+        ):
+            context = browser_context.request_context(
+                "work on spoken/project#7 instead"
+            )
+
+        self.assertEqual(context.focused_issue, spoken.reference)
+        self.assertEqual(context.github_repository, spoken.name_with_owner)
+        self.assertEqual(context.github_issue, 7)
+        focused_url.assert_not_called()
 
 
 class ZendeskContextTests(unittest.TestCase):

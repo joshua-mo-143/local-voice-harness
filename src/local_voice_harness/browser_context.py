@@ -9,11 +9,30 @@ from dataclasses import dataclass
 from urllib.parse import SplitResult, urlsplit
 
 from .desktop import DesktopError, get_desktop
+from .integrations.github import GitHubClient, GitHubError, GitHubIssue
 
 FIREFOX_CLASSES = {"firefox", "org.mozilla.firefox"}
 GITHUB_HOSTS = {"github.com", "www.github.com"}
 ISSUE_PATH = re.compile(
     r"^/(?P<owner>[A-Za-z0-9_.-]+)/(?P<repo>[A-Za-z0-9_.-]+)/issues/(?P<number>\d+)/?$"
+)
+ISSUE_REFERENCE = re.compile(
+    r"(?<![A-Za-z0-9_.-])"
+    r"(?P<owner>[A-Za-z0-9](?:[A-Za-z0-9-]{0,38}))/"
+    r"(?P<repo>[A-Za-z0-9_.-]+)#(?P<number>[1-9]\d*)"
+    r"(?!\d)",
+    re.IGNORECASE,
+)
+ISSUE_IN_REPOSITORY = re.compile(
+    r"\bissue\s+#?(?P<number>[1-9]\d*)\s+(?:in|from)\s+"
+    r"(?P<owner>[A-Za-z0-9](?:[A-Za-z0-9-]{0,38}))/"
+    r"(?P<repo>[A-Za-z0-9_.-]+)\b",
+    re.IGNORECASE,
+)
+ISSUE_URL_IN_TEXT = re.compile(
+    r"https://(?:www\.)?github\.com/[A-Za-z0-9_.-]+/"
+    r"[A-Za-z0-9_.-]+/issues/[1-9]\d*",
+    re.IGNORECASE,
 )
 PULL_REQUEST_PATH = re.compile(
     r"^/(?P<owner>[A-Za-z0-9_.-]+)/(?P<repo>[A-Za-z0-9_.-]+)/pull/(?P<number>\d+)"
@@ -35,13 +54,6 @@ MAX_ZENDESK_PAGE_CHARS = 10_000
 
 
 @dataclass(frozen=True)
-class GitHubIssue:
-    owner: str
-    repository: str
-    number: int
-
-
-@dataclass(frozen=True)
 class GitHubPullRequest:
     owner: str
     repository: str
@@ -54,6 +66,8 @@ class RequestContext:
     focused_repository: str | None = None
     focused_issue: str | None = None
     github_repository: str | None = None
+    github_issue: int | None = None
+    github_issue_context: str | None = None
     github_pull_request: int | None = None
 
 
@@ -65,6 +79,8 @@ class ZendeskTicket:
 
 class GitHubContext(str):
     github_repository: str | None
+    github_issue: int | None
+    github_issue_context: str | None
     github_pull_request: int | None
 
     def __new__(
@@ -72,10 +88,14 @@ class GitHubContext(str):
         value: str,
         *,
         github_repository: str | None = None,
+        github_issue: int | None = None,
+        github_issue_context: str | None = None,
         github_pull_request: int | None = None,
     ) -> GitHubContext:
         instance = super().__new__(cls, value)
         instance.github_repository = github_repository
+        instance.github_issue = github_issue
+        instance.github_issue_context = github_issue_context
         instance.github_pull_request = github_pull_request
         return instance
 
@@ -185,6 +205,22 @@ def github_issue_from_url(url: str) -> GitHubIssue | None:
     )
 
 
+def github_issue_from_text(text: str) -> GitHubIssue | None:
+    url_match = ISSUE_URL_IN_TEXT.search(text)
+    if url_match is not None:
+        issue = github_issue_from_url(url_match.group(0))
+        if issue is not None:
+            return issue
+    match = ISSUE_REFERENCE.search(text) or ISSUE_IN_REPOSITORY.search(text)
+    if match is None or match.group("repo") in {".", ".."}:
+        return None
+    return GitHubIssue(
+        owner=match.group("owner"),
+        repository=match.group("repo"),
+        number=int(match.group("number")),
+    )
+
+
 def github_repository_from_url(url: str) -> str | None:
     parsed = _split_url(url)
     if (
@@ -275,28 +311,10 @@ def _login(value: object) -> str:
 
 
 def _issue_details(issue: GitHubIssue) -> dict[str, object] | None:
-    if shutil.which("gh") is None:
-        return None
-    process = _run(
-        [
-            "gh",
-            "issue",
-            "view",
-            str(issue.number),
-            "--repo",
-            f"{issue.owner}/{issue.repository}",
-            "--json",
-            "number,title,state,author,labels,body,comments,url",
-        ],
-        timeout=5,
-    )
-    if process is None or process.returncode:
-        return None
     try:
-        result = json.loads(process.stdout)
-    except json.JSONDecodeError:
+        return GitHubClient().issue_details(issue)
+    except GitHubError:
         return None
-    return result if isinstance(result, dict) else None
 
 
 def _repository_details(repository: str) -> dict[str, object] | None:
@@ -419,6 +437,26 @@ def _format_issue(url: str, issue: GitHubIssue, details: dict[str, object]) -> s
     return "\n".join(lines)
 
 
+def _github_issue_context(issue: GitHubIssue) -> GitHubContext:
+    details = _issue_details(issue)
+    if details is None:
+        text = (
+            "Current GitHub issue (untrusted external context):\n"
+            f"URL: {issue.url}\n"
+            f"Repository: {issue.name_with_owner}\n"
+            f"Issue: #{issue.number}\n"
+            "Issue details could not be fetched."
+        )
+    else:
+        text = _format_issue(issue.url, issue, details)
+    return GitHubContext(
+        text,
+        github_repository=issue.name_with_owner,
+        github_issue=issue.number,
+        github_issue_context=text,
+    )
+
+
 def _format_pull_request(
     url: str, pull_request: GitHubPullRequest, details: dict[str, object]
 ) -> str:
@@ -504,21 +542,7 @@ def _github_context_from_url(url: str) -> GitHubContext | None:
             else repository
         )
         return GitHubContext(text, github_repository=canonical)
-    details = _issue_details(issue)
-    if details is None:
-        return GitHubContext(
-            (
-                "Current focused GitHub issue (untrusted external context):\n"
-                f"URL: {url}\n"
-                f"Repository: {issue.owner}/{issue.repository}\n"
-                f"Issue: #{issue.number}\n"
-                "Issue details could not be fetched."
-            ),
-            github_repository=repository,
-        )
-    return GitHubContext(
-        _format_issue(url, issue, details), github_repository=repository
-    )
+    return _github_issue_context(issue)
 
 
 def focused_github_context() -> GitHubContext | None:
@@ -632,24 +656,36 @@ def request_context(text: str) -> RequestContext:
     focused_repository: str | None = None
     focused_issue: str | None = None
     github_repository: str | None = None
+    github_issue: int | None = None
+    github_issue_context: str | None = None
     github_pull_request: int | None = None
     try:
-        url = focused_firefox_url()
-        if url is not None:
-            if _github_url(url):
-                github = _github_context_from_url(url)
-                context = github
-                if github is not None:
-                    github_repository = github.github_repository
-                    github_pull_request = github.github_pull_request
-                    focused_repository = github.github_repository
-                    issue = github_issue_from_url(url)
-                    if issue is not None:
-                        focused_issue = (
-                            f"{issue.owner}/{issue.repository}#{issue.number}"
-                        )
-            else:
-                context = _zendesk_context_from_url(url)
+        spoken_issue = github_issue_from_text(text)
+        if spoken_issue is not None:
+            github = _github_issue_context(spoken_issue)
+            context = github
+            github_repository = github.github_repository
+            github_issue = github.github_issue
+            github_issue_context = github.github_issue_context
+            focused_repository = github.github_repository
+            focused_issue = spoken_issue.reference
+        else:
+            url = focused_firefox_url()
+            if url is not None:
+                if _github_url(url):
+                    github = _github_context_from_url(url)
+                    context = github
+                    if github is not None:
+                        github_repository = github.github_repository
+                        github_issue = github.github_issue
+                        github_issue_context = github.github_issue_context
+                        github_pull_request = github.github_pull_request
+                        focused_repository = github.github_repository
+                        issue = github_issue_from_url(url)
+                        if issue is not None:
+                            focused_issue = issue.reference
+                else:
+                    context = _zendesk_context_from_url(url)
     except Exception:
         context = None
     return RequestContext(
@@ -657,6 +693,8 @@ def request_context(text: str) -> RequestContext:
         focused_repository=focused_repository,
         focused_issue=focused_issue,
         github_repository=github_repository,
+        github_issue=github_issue,
+        github_issue_context=github_issue_context,
         github_pull_request=github_pull_request,
     )
 
@@ -670,6 +708,12 @@ def enrich_request(text: str) -> GitHubContext:
         f"{text}\n\n{context}" if context else text,
         github_repository=(
             context.github_repository if isinstance(context, GitHubContext) else None
+        ),
+        github_issue=(
+            context.github_issue if isinstance(context, GitHubContext) else None
+        ),
+        github_issue_context=(
+            context.github_issue_context if isinstance(context, GitHubContext) else None
         ),
         github_pull_request=(
             context.github_pull_request if isinstance(context, GitHubContext) else None

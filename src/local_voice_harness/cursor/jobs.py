@@ -14,7 +14,7 @@ from pathlib import Path
 
 from ..config import CURSOR_FOREGROUND_SECONDS, JOBS_DIR
 from ..errors import HarnessError
-from ..integrations.github import GitHubClient
+from ..integrations.github import GitHubClient, GitHubIssue
 from ..integrations.herdr import (
     AgentSelection,
     HerdrClient,
@@ -414,7 +414,13 @@ def _reserve_worker_target(
         for other in read_all_unlocked(JOBS_DIR):
             if (
                 other.get("id") != job_id
-                and other.get("herdr_target") == target
+                and (
+                    other.get("herdr_target") == target
+                    or (
+                        selection.worktree_path
+                        and other.get("worktree_path") == selection.worktree_path
+                    )
+                )
                 and (
                     other.get("status") in ACTIVE_STATUSES
                     or other.get("target_release_pending")
@@ -475,7 +481,10 @@ def run_worker(job_id: str, claim_token: str | None = None) -> None:
             candidates: list[Path] = []
             hint = str(job.get("repository_hint") or "").strip() or None
             task = str(job.get("request") or "")
-            issue_key = str(job.get("issue_key") or "") or extract_linear_issue(task)
+            utterance = str(job.get("utterance") or task)
+            issue_key = str(job.get("issue_key") or "") or extract_linear_issue(
+                utterance
+            )
             reason = ""
             if job.get("github_pull_request"):
                 github_repository = str(job.get("github_repository") or "").strip()
@@ -541,6 +550,45 @@ def run_worker(job_id: str, claim_token: str | None = None) -> None:
                 if updated is None:
                     return
                 job = updated
+            elif job.get("github_issue"):
+                github_repository = str(job.get("github_repository") or "").strip()
+                number = int(str(job.get("github_issue") or 0))
+                if not github_repository or number <= 0:
+                    _worker_question(
+                        job_id,
+                        worker_token,
+                        "Which repository's GitHub issue should I work on? "
+                        "Please say owner/repository and the issue number.",
+                        clarification_kind="github_repository",
+                    )
+                    return
+                owner, repository_name = github_repository.split("/", 1)
+                repositories = client.repository_roots()
+                provisioned_issue = GitHubClient().provision_issue(
+                    GitHubIssue(owner, repository_name, number),
+                    candidates=repositories,
+                )
+                repository = provisioned_issue.checkout
+                issue_key = None
+
+                def record_issue(current: dict[str, object]) -> None:
+                    current.update(
+                        {
+                            "github_repository": (
+                                provisioned_issue.source.name_with_owner
+                            ),
+                            "github_issue": provisioned_issue.issue.number,
+                            "github_issue_url": provisioned_issue.issue.url,
+                            "repository": str(provisioned_issue.checkout),
+                        }
+                    )
+
+                updated = _worker_change(
+                    job_id, worker_token, {"routing"}, record_issue
+                )
+                if updated is None:
+                    return
+                job = updated
             else:
                 repositories = client.repository_roots()
                 repository, candidates = resolve_job_repository(
@@ -552,6 +600,7 @@ def run_worker(job_id: str, claim_token: str | None = None) -> None:
                 and not hint
                 and not job.get("fork_requested")
                 and not job.get("github_pull_request")
+                and not job.get("github_issue")
             ):
                 repository, _confidence, reason = client.infer_repository(
                     issue_key,
@@ -609,7 +658,12 @@ def run_worker(job_id: str, claim_token: str | None = None) -> None:
         outcome = client.prompt_and_wait(
             target,
             cursor_prompt(
-                str(job.get("request") or ""), token, continuation=continuation
+                str(job.get("request") or ""),
+                token,
+                continuation=continuation,
+                github_issue_context=(
+                    str(job.get("github_issue_context") or "") or None
+                ),
             ),
             token=token,
         )
@@ -685,6 +739,8 @@ def start_job(
     *,
     repository: str | None = None,
     github_repository: str | None = None,
+    github_issue: int | None = None,
+    github_issue_context: str | None = None,
     fork_requested: bool = False,
     github_pull_request: int | None = None,
     agent: str | None = None,
@@ -693,22 +749,45 @@ def start_job(
 ) -> str:
     job_id = uuid.uuid4().hex[:12]
     now = time.time()
+    spoken_text = utterance if utterance is not None else text
+    issue_repository = (github_repository or "").strip()
+    github_issue_url = (
+        f"https://github.com/{issue_repository}/issues/{github_issue}"
+        if issue_repository and github_issue
+        else None
+    )
+    issue_label = (
+        re.sub(r"[^a-z0-9-]+", "-", issue_repository.casefold().replace("/", "-"))
+        if issue_repository and github_issue
+        else ""
+    )
     write_job(
         {
             "id": job_id,
-            "schema_version": 2,
+            "schema_version": 3,
             "revision": 0,
             "request": text,
             "utterance": utterance,
             "repository_hint": repository,
             "context_repository": context_repository,
             "github_repository": github_repository,
+            "github_issue": github_issue,
+            "github_issue_url": github_issue_url,
+            "github_issue_context": github_issue_context,
             "fork_requested": fork_requested,
             "github_pull_request": github_pull_request,
-            "worktree_branch": (f"voice/github-{job_id}" if fork_requested else None),
-            "worktree_label": (f"github-{job_id[:6]}" if fork_requested else None),
+            "worktree_branch": (
+                f"voice/github-{job_id}"
+                if fork_requested
+                else (f"voice/github-issue-{github_issue}" if github_issue else None)
+            ),
+            "worktree_label": (
+                f"github-{job_id[:6]}"
+                if fork_requested
+                else (f"github-{issue_label}-{github_issue}" if github_issue else None)
+            ),
             "agent_hint": agent,
-            "issue_key": extract_linear_issue(text),
+            "issue_key": extract_linear_issue(spoken_text),
             "status": "queued",
             "delivered": False,
             "created_at": now,
@@ -1098,6 +1177,8 @@ def cursor_turn(
     *,
     repository: str | None = None,
     github_repository: str | None = None,
+    github_issue: int | None = None,
+    github_issue_context: str | None = None,
     fork_requested: bool = False,
     github_pull_request: int | None = None,
     agent: str | None = None,
@@ -1126,6 +1207,8 @@ def cursor_turn(
             text,
             repository=repository,
             github_repository=github_repository,
+            github_issue=github_issue,
+            github_issue_context=github_issue_context,
             fork_requested=fork_requested,
             github_pull_request=github_pull_request,
             agent=agent,

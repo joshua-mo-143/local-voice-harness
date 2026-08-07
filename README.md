@@ -25,7 +25,7 @@ PipeWire microphone
   -> Qwen3.5-9B UD-Q4_K_XL via llama.cpp (CUDA)
        -> focused intent classification
        -> ordinary conversational response
-       -> Herdr-managed Cursor agent and Linear MCP
+       -> Herdr-managed Cursor agent, GitHub CLI, and Linear MCP
   -> Chatterbox Turbo (CUDA)
   -> PipeWire playback
 ```
@@ -51,19 +51,23 @@ Cursor routing works as follows:
 2. Prefer an idle Cursor agent already running in the requested checkout.
 3. For a Linear issue without a repository name, ask a dedicated routing agent to
    inspect the ticket through Linear MCP and infer the repository.
-4. If no repository can be resolved, open Rofi to select a local repository or paste
+4. For a focused or explicitly spoken GitHub issue, validate it through `gh`, reuse
+   an exact matching local checkout or clone its repository below the GitHub root,
+   and preserve bounded issue context with the job.
+5. If no repository can be resolved, open Rofi to select a local repository or paste
    a Git URL; cloning requires a second confirmation.
-5. When the user explicitly says “fork,” validate the focused public GitHub repository,
+6. When the user explicitly says “fork,” validate the focused public GitHub repository,
    create or reuse the authenticated user's fork, and clone it below the configured
    GitHub root.
-6. When a GitHub pull request is focused, clone its repository below the configured
+7. When a GitHub pull request is focused, clone its repository below the configured
    GitHub root and check the pull request out in place with `gh pr checkout`, then run
    the request against that checkout so Cursor can verify or extend the branch.
-7. Create or reuse a `voice/<issue-key>` Git worktree for Linear implementation work,
-   or create a unique `voice/github-<job-id>` worktree for a GitHub fork task. A checked
-   out pull request runs directly on its branch without a generated worktree.
-8. Start a new Cursor agent through Herdr when no suitable agent exists.
-9. Reserve that agent until it finishes, is blocked, or the job is cancelled.
+8. Create or reuse a `voice/<issue-key>` worktree for Linear work, a stable
+   `voice/github-issue-<number>` worktree for GitHub issue work, or a unique
+   `voice/github-<job-id>` worktree for a GitHub fork task. A checked-out pull request
+   runs directly on its branch without a generated worktree.
+9. Start a new Cursor agent through Herdr when no suitable agent exists.
+10. Reserve that agent and checkout until it finishes, is blocked, or is cancelled.
 
 The harness never automatically commits, pushes, opens pull requests, modifies Linear,
 or deletes generated worktrees. Fork creation is the only supported GitHub write and
@@ -406,6 +410,7 @@ Wake mode:
 Hey Jarvis, what time is it?
 Hey Jarvis, ask Cursor to summarize the api-docs repository.
 Hey Jarvis, ask Cursor to work on Linear issue API-79.
+Hey Jarvis, ask Cursor to work on owner/repository#42.
 Hey Jarvis, summarize this issue.  # with a GitHub issue focused in Firefox
 Hey Jarvis, summarize this ticket. # with a Zendesk ticket focused in Firefox
 Hey Jarvis, fork this repo and add Venice.  # with a public GitHub repo focused
@@ -445,6 +450,9 @@ is focused. The harness briefly selects and copies the address bar, restores the
 previous clipboard, and dismisses the address bar without navigating. A focused
 GitHub page contributes its URL; a focused issue page also contributes title, state,
 body, labels, and recent comments fetched through the authenticated `gh` CLI. A
+spoken `owner/repository#number` reference fetches the same bounded issue context
+without requiring Firefox to be focused. GitHub access remains required; issue
+metadata is persisted only as part of the active job and is not an offline cache. A
 focused pull request page adds the same details plus its draft state, source and
 target branches, and change summary, and lets a Cursor request check the branch out
 locally. A focused `https://<tenant>.zendesk.com/agent/tickets/<number>` page

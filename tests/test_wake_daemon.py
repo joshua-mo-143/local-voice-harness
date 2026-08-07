@@ -155,6 +155,7 @@ class ProcessUtteranceTests(unittest.TestCase):
             "what time is it\n\nGitHub context",
             mock.ANY,
             None,
+            trusted_utterance="what time is it",
             delivery_claims=mock.ANY,
         )
         self.assertTrue(
@@ -442,8 +443,10 @@ class ProcessUtteranceTests(unittest.TestCase):
             _history: object,
             _session: object,
             *,
+            trusted_utterance: str,
             delivery_claims: list[tuple[str, str]],
         ) -> tuple[str, None]:
+            self.assertEqual(trusted_utterance, "question")
             delivery_claims.append(("123456789abc", "claim"))
             return "answer", None
 
