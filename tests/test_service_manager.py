@@ -1,15 +1,18 @@
 from __future__ import annotations
 
 import importlib.metadata
+import re
 import subprocess
 import sys
 import tempfile
+import tomllib
 import unittest
 from pathlib import Path
 from unittest import mock
 
-from local_voice_harness import service_manager
+from local_voice_harness import config, service_manager
 from local_voice_harness.config import START_SERVICES
+from local_voice_harness.stt import server as stt_server
 
 
 class ServiceManagementTests(unittest.TestCase):
@@ -55,6 +58,44 @@ class ServiceManagementTests(unittest.TestCase):
                 self.assertEqual(
                     source.read_text(), service_manager.unit_text(source.name)
                 )
+
+    def test_llm_model_matches_service_and_documentation(self) -> None:
+        project_root = service_manager.PROJECT_ROOT
+        unit = (project_root / "systemd/user/voice-harness-llm.service").read_text()
+        readme = (project_root / "README.md").read_text()
+        match = re.search(r"--model \S*/(?P<filename>\S+\.gguf)\b", unit)
+
+        self.assertIsNotNone(match)
+        assert match is not None
+        filename = match.group("filename")
+        self.assertIn(f"--alias {config.LLM_MODEL}", unit)
+        self.assertEqual(
+            set(re.findall(r"Qwen3\.5-[A-Za-z0-9_.-]+\.gguf", readme)),
+            {filename},
+        )
+
+    def test_dictation_defaults_have_documented_installable_backends(self) -> None:
+        project_root = service_manager.PROJECT_ROOT
+        unit = (project_root / "systemd/user/dictation.service").read_text()
+        readme = (project_root / "README.md").read_text()
+        metadata = tomllib.loads((project_root / "pyproject.toml").read_text())
+        extras = metadata["project"]["optional-dependencies"]
+
+        self.assertIn("Environment=DICTATION_BACKEND=parakeet", unit)
+        self.assertIn(
+            f"Environment=DICTATION_MODEL={stt_server.PARAKEET_DEFAULT_MODEL}",
+            unit,
+        )
+        self.assertIn(stt_server.PARAKEET_DEFAULT_MODEL, readme)
+        self.assertTrue(
+            any(dependency.startswith("onnx-asr") for dependency in extras["dictation"])
+        )
+        self.assertTrue(
+            any(
+                dependency.startswith("faster-whisper")
+                for dependency in extras["dictation-whisper"]
+            )
+        )
 
     def test_all_console_entry_points_load(self) -> None:
         expected = {

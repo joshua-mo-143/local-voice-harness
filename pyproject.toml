@@ -19,6 +19,9 @@ wake = [
 dictation = [
   "onnx-asr[gpu,hub]>=0.7.0",
 ]
+dictation-whisper = [
+  "faster-whisper>=1.2.1",
+]
 tts = [
   "chatterbox-tts==0.1.7",
   "soundfile==0.14.0",

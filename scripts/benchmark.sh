@@ -56,7 +56,7 @@ echo "Date: $(date -Iseconds)"
 echo ""
 echo "--- Hardware ---"
 nvidia-smi --query-gpu=name,memory.total,driver_version --format=csv,noheader
-echo "Qwen3.5-4B-Q4_K_M | Whisper large-v3-turbo | Chatterbox Turbo"
+echo "Qwen3.5-4B-Q4_K_M | Parakeet TDT 0.6B v2 | Chatterbox Turbo"
 echo ""
 
 systemctl --user stop voice-harness-wake.service dictation.service voice-harness-llm.service voice-harness-tts.service 2>/dev/null || true
@@ -65,7 +65,7 @@ rm -f "${XDG_RUNTIME_DIR}/voice-harness-tts.sock"
 echo "GPU idle: $(nvidia-smi --query-gpu=memory.used --format=csv,noheader)"
 echo ""
 
-echo "--- STT (Whisper large-v3-turbo, CUDA) ---"
+echo "--- STT (Parakeet TDT 0.6B v2, CUDA) ---"
 systemctl --user start dictation.service
 sleep 2
 for _ in $(seq 1 30); do
