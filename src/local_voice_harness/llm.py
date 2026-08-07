@@ -94,8 +94,11 @@ def qwen_turn(
     cursor_session: str | None = None,
     *,
     github_repository: str | None = None,
+    github_issue: int | None = None,
+    github_issue_context: str | None = None,
     fork_requested: bool = False,
     github_pull_request: int | None = None,
+    trusted_utterance: str | None = None,
     delivery_claims: DeliveryClaims | None = None,
 ) -> tuple[str, str | None]:
     system_prompt = SYSTEM_PROMPT
@@ -197,6 +200,7 @@ def qwen_turn(
                         )
                         if (
                             selected_github_repository
+                            or github_issue
                             or fork_requested
                             or github_pull_request
                         ):
@@ -205,9 +209,12 @@ def qwen_turn(
                                 job_id if action == "reply" else None,
                                 repository=repository,
                                 github_repository=selected_github_repository,
+                                github_issue=github_issue,
+                                github_issue_context=github_issue_context,
                                 fork_requested=fork_requested,
                                 github_pull_request=github_pull_request,
                                 agent=agent,
+                                utterance=trusted_utterance,
                                 action=action,
                                 job_id=job_id,
                                 delivery_claims=delivery_claims,
@@ -218,6 +225,7 @@ def qwen_turn(
                                 job_id if action == "reply" else None,
                                 repository=repository,
                                 agent=agent,
+                                utterance=trusted_utterance,
                                 action=action,
                                 job_id=job_id,
                                 delivery_claims=delivery_claims,
@@ -240,15 +248,21 @@ def qwen_response(
     history: Sequence[Mapping[str, object]] | None = None,
     *,
     github_repository: str | None = None,
+    github_issue: int | None = None,
+    github_issue_context: str | None = None,
     fork_requested: bool = False,
     github_pull_request: int | None = None,
+    trusted_utterance: str | None = None,
     delivery_claims: DeliveryClaims | None = None,
 ) -> str:
     return qwen_turn(
         text,
         history,
         github_repository=github_repository,
+        github_issue=github_issue,
+        github_issue_context=github_issue_context,
         fork_requested=fork_requested,
         github_pull_request=github_pull_request,
+        trusted_utterance=trusted_utterance,
         delivery_claims=delivery_claims,
     )[0]

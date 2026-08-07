@@ -36,10 +36,13 @@ def respond(text: str) -> None:
             github_arguments = (
                 {
                     "github_repository": context.github_repository,
+                    "github_issue": context.github_issue,
+                    "github_issue_context": context.github_issue_context,
                     "fork_requested": fork_requested,
                     "github_pull_request": context.github_pull_request,
                 }
                 if context.github_repository
+                or context.github_issue
                 or fork_requested
                 or context.github_pull_request
                 else {}
@@ -56,6 +59,7 @@ def respond(text: str) -> None:
                 response = qwen_response(
                     context.text,
                     **github_arguments,
+                    trusted_utterance=text,
                     delivery_claims=delivery_claims,
                 )
             print(f"Assistant: {response}")

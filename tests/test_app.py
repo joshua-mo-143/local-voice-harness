@@ -132,7 +132,9 @@ class AppContextTests(unittest.TestCase):
             app.respond("summarize this")
 
         qwen.assert_called_once_with(
-            "summarize this\n\ncontext", delivery_claims=mock.ANY
+            "summarize this\n\ncontext",
+            trusted_utterance="summarize this",
+            delivery_claims=mock.ANY,
         )
 
     def test_explicit_fork_passes_validated_focused_repository(self) -> None:
@@ -156,7 +158,46 @@ class AppContextTests(unittest.TestCase):
         qwen.assert_called_once_with(
             "fork this repo and add Venice\n\ncontext",
             github_repository="source/project",
+            github_issue=None,
+            github_issue_context=None,
             fork_requested=True,
+            github_pull_request=None,
+            trusted_utterance="fork this repo and add Venice",
+            delivery_claims=mock.ANY,
+        )
+
+    def test_actionable_github_issue_metadata_reaches_cursor(self) -> None:
+        context = RequestContext(
+            "work on this\n\nIssue: #42",
+            focused_repository="source/project",
+            focused_issue="source/project#42",
+            github_repository="source/project",
+            github_issue=42,
+            github_issue_context="Issue: #42",
+        )
+        with (
+            mock.patch.object(app, "start_components"),
+            mock.patch.object(app, "request_context", return_value=context),
+            mock.patch.object(
+                app,
+                "route_intent",
+                return_value=IntentRoute(Intent.CURSOR_SUBMIT, "high"),
+            ),
+            mock.patch.object(
+                app, "cursor_turn", return_value=("started", None)
+            ) as cursor,
+            mock.patch.object(app, "stream_and_play"),
+        ):
+            app.respond("work on this")
+
+        cursor.assert_called_once_with(
+            context.text,
+            utterance="work on this",
+            context_repository="source/project",
+            github_repository="source/project",
+            github_issue=42,
+            github_issue_context="Issue: #42",
+            fork_requested=False,
             github_pull_request=None,
             delivery_claims=mock.ANY,
         )

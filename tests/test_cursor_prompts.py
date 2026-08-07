@@ -35,6 +35,16 @@ class CursorPromptTests(unittest.TestCase):
         self.assertIn("VOICE_QUESTION[token]", prompt)
         self.assertIn("VOICE_SUMMARY[token]", prompt)
 
+    def test_github_issue_context_is_read_only_and_preserved(self) -> None:
+        prompt = cursor_prompt(
+            "fix the reported bug",
+            "token",
+            github_issue_context="Repository: example/project\nIssue: #42",
+        )
+        self.assertIn("Issue: #42", prompt)
+        self.assertIn("read it with gh", prompt)
+        self.assertIn("Do not comment on, edit, label, assign, close", prompt)
+
 
 if __name__ == "__main__":
     unittest.main()

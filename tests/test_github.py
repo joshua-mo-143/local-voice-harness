@@ -10,6 +10,7 @@ from unittest import mock
 from local_voice_harness.integrations.github import (
     GitHubClient,
     GitHubError,
+    GitHubIssue,
     GitHubRepository,
 )
 
@@ -72,6 +73,46 @@ class GitHubClientTests(unittest.TestCase):
             self.assertRaisesRegex(GitHubError, "private"),
         ):
             client.inspect_public_repository("example/project")
+
+    def test_issue_details_are_read_through_gh(self) -> None:
+        client = GitHubClient()
+        issue = GitHubIssue("example", "project", 42)
+        details = {"number": 42, "title": "Fix it"}
+        with mock.patch.object(
+            client, "_run", return_value=_completed(json.dumps(details))
+        ) as run:
+            self.assertEqual(client.issue_details(issue), details)
+
+        self.assertEqual(
+            run.call_args.args[0][:6],
+            ["gh", "issue", "view", "42", "--repo", "example/project"],
+        )
+        self.assertEqual(issue.reference, "example/project#42")
+        self.assertEqual(issue.url, "https://github.com/example/project/issues/42")
+
+    def test_provision_issue_reuses_matching_checkout(self) -> None:
+        client = GitHubClient()
+        source = _repository("Example/Project", private=True)
+        checkout = Path("/repos/project")
+        with (
+            mock.patch.object(
+                client, "inspect_repository", return_value=source
+            ) as inspect,
+            mock.patch.object(
+                client, "find_repository_checkout", return_value=checkout
+            ) as find_checkout,
+            mock.patch.object(client, "ensure_repository_clone") as clone,
+        ):
+            provisioned = client.provision_issue(
+                GitHubIssue("example", "project", 42),
+                candidates=[checkout],
+            )
+
+        inspect.assert_called_once_with("example/project")
+        find_checkout.assert_called_once_with(source, [checkout])
+        clone.assert_not_called()
+        self.assertEqual(provisioned.checkout, checkout)
+        self.assertEqual(provisioned.issue, GitHubIssue("Example", "Project", 42))
 
     def test_existing_network_fork_is_reused(self) -> None:
         client = GitHubClient()

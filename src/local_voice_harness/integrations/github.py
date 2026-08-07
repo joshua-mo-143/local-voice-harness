@@ -35,6 +35,25 @@ class GitHubRepository:
 
 
 @dataclass(frozen=True)
+class GitHubIssue:
+    owner: str
+    repository: str
+    number: int
+
+    @property
+    def name_with_owner(self) -> str:
+        return f"{self.owner}/{self.repository}"
+
+    @property
+    def reference(self) -> str:
+        return f"{self.name_with_owner}#{self.number}"
+
+    @property
+    def url(self) -> str:
+        return f"https://github.com/{self.name_with_owner}/issues/{self.number}"
+
+
+@dataclass(frozen=True)
 class ProvisionedRepository:
     source: GitHubRepository
     fork: GitHubRepository
@@ -47,6 +66,13 @@ class ProvisionedPullRequest:
     checkout: Path
     number: int
     branch: str | None = None
+
+
+@dataclass(frozen=True)
+class ProvisionedIssue:
+    source: GitHubRepository
+    checkout: Path
+    issue: GitHubIssue
 
 
 class GitHubClient:
@@ -151,6 +177,31 @@ class GitHubClient:
         source = self._repo_view(self.validate_repository(repository), required=True)
         assert source is not None
         return source
+
+    def issue_details(self, issue: GitHubIssue) -> dict[str, object]:
+        if issue.number <= 0:
+            raise GitHubError("GitHub issue number must be positive")
+        repository = self.validate_repository(issue.name_with_owner)
+        process = self._run(
+            [
+                self.gh_executable,
+                "issue",
+                "view",
+                str(issue.number),
+                "--repo",
+                repository,
+                "--json",
+                "number,title,state,author,labels,body,comments,url",
+            ],
+            timeout=15,
+        )
+        try:
+            value = json.loads(process.stdout)
+        except json.JSONDecodeError as exc:
+            raise GitHubError("GitHub returned malformed issue metadata") from exc
+        if not isinstance(value, dict):
+            raise GitHubError("GitHub returned malformed issue metadata")
+        return value
 
     def authenticated_login(self) -> str:
         process = self._run(
@@ -327,6 +378,39 @@ class GitHubClient:
             repository_name=repository_name,
             clone_source=source.name_with_owner,
             verify=source,
+        )
+
+    def find_repository_checkout(
+        self, source: GitHubRepository, candidates: list[Path]
+    ) -> Path | None:
+        for candidate in candidates:
+            try:
+                self._verify_checkout(candidate.resolve(), source)
+            except GitHubError:
+                continue
+            return candidate.resolve()
+        return None
+
+    def provision_issue(
+        self,
+        issue: GitHubIssue,
+        *,
+        candidates: list[Path] | None = None,
+    ) -> ProvisionedIssue:
+        if issue.number <= 0:
+            raise GitHubError("GitHub issue number must be positive")
+        source = self.inspect_repository(issue.name_with_owner)
+        checkout = self.find_repository_checkout(source, candidates or [])
+        if checkout is None:
+            checkout = self.ensure_repository_clone(source)
+        canonical_owner, canonical_repository = source.name_with_owner.split("/", 1)
+        canonical_issue = GitHubIssue(
+            canonical_owner, canonical_repository, issue.number
+        )
+        return ProvisionedIssue(
+            source=source,
+            checkout=checkout,
+            issue=canonical_issue,
         )
 
     def checkout_pull_request(self, checkout: Path, number: int) -> str | None:

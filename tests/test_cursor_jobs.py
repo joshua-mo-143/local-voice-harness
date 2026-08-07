@@ -10,7 +10,9 @@ from unittest import mock
 
 from local_voice_harness.cursor import jobs
 from local_voice_harness.integrations.github import (
+    GitHubIssue,
     GitHubRepository,
+    ProvisionedIssue,
     ProvisionedRepository,
 )
 from local_voice_harness.integrations.herdr import AgentSelection, PromptOutcome
@@ -123,6 +125,127 @@ class CursorJobStateTests(unittest.TestCase):
         self.assertEqual(updated["fork_repository"], "me/project")
         self.assertEqual(updated["repository"], str(repository))
 
+    def test_github_issue_job_persists_trusted_identity(self) -> None:
+        with mock.patch.object(jobs, "launch_worker"):
+            job_id = jobs.start_job(
+                "work on this\n\nBody mentions API-79",
+                utterance="work on this",
+                github_repository="example/project",
+                github_issue=42,
+                github_issue_context="Issue context",
+            )
+
+        job = jobs.read_job(job_id)
+        self.assertEqual(job["schema_version"], 3)
+        self.assertEqual(job["github_issue"], 42)
+        self.assertEqual(
+            job["github_issue_url"],
+            "https://github.com/example/project/issues/42",
+        )
+        self.assertEqual(job["github_issue_context"], "Issue context")
+        self.assertEqual(job["worktree_branch"], "voice/github-issue-42")
+        self.assertIsNone(job["issue_key"])
+
+    def test_worker_provisions_github_issue_and_uses_stable_worktree(self) -> None:
+        repository = Path(self.temporary.name) / "source" / "project"
+        source = GitHubRepository(
+            "source/project",
+            "https://github.com/source/project",
+            True,
+            "main",
+        )
+        issue = GitHubIssue("source", "project", 42)
+        provisioned = ProvisionedIssue(source, repository, issue)
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "work on source/project#42",
+                "utterance": "work on source/project#42",
+                "github_repository": "source/project",
+                "github_issue": 42,
+                "github_issue_context": "Title: Fix it",
+                "worktree_branch": "voice/github-issue-42",
+                "worktree_label": "github-source-project-42",
+                "status": "queued",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        github = mock.Mock()
+        github.provision_issue.return_value = provisioned
+        client = mock.Mock()
+        client.repository_roots.return_value = [repository]
+        client.ensure_agent.return_value = AgentSelection(
+            "agent",
+            "pane",
+            "workspace",
+            str(repository),
+            "agent",
+            "/worktree/issue-42",
+        )
+        client.prompt_and_wait.return_value = PromptOutcome(
+            "idle",
+            "done",
+            None,
+            "VOICE_SUMMARY[123456789abc-1]: done",
+        )
+        with (
+            mock.patch.object(jobs, "GitHubClient", return_value=github),
+            mock.patch.object(jobs, "HerdrClient", return_value=client),
+        ):
+            jobs.run_worker("123456789abc")
+
+        github.provision_issue.assert_called_once_with(issue, candidates=[repository])
+        client.ensure_agent.assert_called_once_with(
+            repository,
+            issue_key=None,
+            agent_hint=None,
+            reserved=set(),
+            worktree_branch="voice/github-issue-42",
+            worktree_label="github-source-project-42",
+        )
+        prompt = client.prompt_and_wait.call_args.args[1]
+        self.assertIn("Title: Fix it", prompt)
+        updated = jobs.read_job("123456789abc")
+        self.assertEqual(updated["status"], "completed")
+        self.assertEqual(updated["github_issue_url"], issue.url)
+
+    def test_reservation_rejects_an_active_shared_worktree(self) -> None:
+        jobs.write_job(
+            {
+                "id": "aaaaaaaaaaaa",
+                "status": "running",
+                "herdr_target": "first-agent",
+                "worktree_path": "/worktree/issue-42",
+            }
+        )
+        jobs.write_job(
+            {
+                "id": "bbbbbbbbbbbb",
+                "status": "routing",
+                "worker_token": "worker-token",
+            }
+        )
+        selection = AgentSelection(
+            "second-agent",
+            "pane",
+            "workspace",
+            "/repo",
+            "second-agent",
+            "/worktree/issue-42",
+        )
+
+        reserved = jobs._reserve_worker_target(
+            "bbbbbbbbbbbb",
+            "worker-token",
+            selection,
+            Path("/repo"),
+            None,
+        )
+
+        self.assertIsNone(reserved)
+        self.assertNotIn("herdr_target", jobs.read_job("bbbbbbbbbbbb"))
+
     def test_submit_starts_new_job_despite_existing_session(self) -> None:
         with (
             mock.patch.object(jobs, "start_job", return_value="newjob123456") as start,
@@ -142,6 +265,8 @@ class CursorJobStateTests(unittest.TestCase):
             "Work on APP-43",
             repository=None,
             github_repository=None,
+            github_issue=None,
+            github_issue_context=None,
             fork_requested=False,
             github_pull_request=None,
             agent=None,
