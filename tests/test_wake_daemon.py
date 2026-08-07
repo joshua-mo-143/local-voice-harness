@@ -9,8 +9,37 @@ from unittest import mock
 
 from local_voice_harness.browser_context import RequestContext
 from local_voice_harness.intent import Intent, IntentRoute
+from local_voice_harness.tts.queue import PlaybackQueue, PlaybackRequest
 from local_voice_harness.wake import daemon as wake_daemon
 from local_voice_harness.wake.daemon import WakeConversationDaemon
+
+
+def _playback_batch(
+    text: str = "test",
+    *,
+    played_text: str = "",
+    interrupted: bool = False,
+    job_id: str | None = None,
+    delivery_token: str | None = None,
+    job_status: str | None = None,
+) -> list[tuple[dict[str, object], bool, PlaybackRequest]]:
+    request = PlaybackRequest(
+        text=text,
+        job_id=job_id,
+        delivery_token=delivery_token,
+        job_status=job_status,
+    )
+    return [
+        (
+            {
+                "ok": True,
+                "played_text": played_text or text,
+                "interrupted": interrupted,
+            },
+            interrupted,
+            request,
+        )
+    ]
 
 
 def _bare_daemon() -> WakeConversationDaemon:
@@ -27,6 +56,7 @@ def _bare_daemon() -> WakeConversationDaemon:
     instance.activation_thread = None
     instance.activation_error = None
     instance.component_lock = threading.Lock()
+    instance.playback_queue = PlaybackQueue()
     instance.pre_roll = collections.deque(maxlen=wake_daemon.PRE_ROLL_FRAMES)
     instance.wake_model = mock.Mock()
     return instance
@@ -102,7 +132,11 @@ class ProcessUtteranceTests(unittest.TestCase):
             mock.patch.object(
                 wake_daemon, "qwen_turn", return_value=("it is noon", None)
             ) as qwen_turn,
-            mock.patch.object(wake_daemon, "stream_and_play", return_value={}),
+            mock.patch.object(
+                daemon,
+                "_drain_playback_queue",
+                return_value=(_playback_batch("ok"), None),
+            ),
             mock.patch.object(
                 wake_daemon,
                 "request_context",
@@ -136,13 +170,51 @@ class ProcessUtteranceTests(unittest.TestCase):
             ],
         )
 
+    def test_turn_preserves_awaiting_job_session_played_before_response(
+        self,
+    ) -> None:
+        daemon = _bare_daemon()
+        batch = _playback_batch(
+            "Cursor needs clarification. which repo?",
+            job_id="job1",
+            delivery_token="claim",
+            job_status="awaiting_user",
+        ) + _playback_batch("it is noon")
+        with (
+            mock.patch.object(
+                wake_daemon, "transcribe", return_value="what time is it"
+            ),
+            mock.patch.object(wake_daemon, "start_components"),
+            mock.patch.object(
+                wake_daemon, "qwen_turn", return_value=("it is noon", None)
+            ),
+            mock.patch.object(
+                daemon, "_drain_playback_queue", return_value=(batch, None)
+            ),
+            mock.patch.object(
+                wake_daemon,
+                "request_context",
+                return_value=RequestContext("what time is it"),
+            ),
+            mock.patch.object(
+                wake_daemon,
+                "route_intent",
+                return_value=IntentRoute(Intent.CONVERSATION, "high"),
+            ),
+            mock.patch.object(wake_daemon, "acknowledge_delivery"),
+            mock.patch.object(wake_daemon, "notify"),
+        ):
+            daemon.process_utterance(woke=False)
+
+        self.assertEqual(daemon.cursor_session, "job1")
+
     def test_empty_wake_phrase_waits_for_followup(self) -> None:
         daemon = _bare_daemon()
         with (
             mock.patch.object(wake_daemon, "transcribe", return_value="hey jarvis"),
             mock.patch.object(wake_daemon, "start_components"),
             mock.patch.object(wake_daemon, "qwen_turn") as qwen_turn,
-            mock.patch.object(wake_daemon, "stream_and_play") as play,
+            mock.patch.object(daemon, "_drain_playback_queue") as play,
             mock.patch.object(wake_daemon, "notify"),
         ):
             daemon.process_utterance(woke=True)
@@ -162,7 +234,11 @@ class ProcessUtteranceTests(unittest.TestCase):
             mock.patch.object(
                 wake_daemon, "qwen_turn", return_value=("it is noon", None)
             ) as qwen_turn,
-            mock.patch.object(wake_daemon, "stream_and_play", return_value={}),
+            mock.patch.object(
+                daemon,
+                "_drain_playback_queue",
+                return_value=(_playback_batch("ok"), None),
+            ),
             mock.patch.object(
                 wake_daemon,
                 "request_context",
@@ -201,7 +277,11 @@ class ProcessUtteranceTests(unittest.TestCase):
                 wake_daemon, "cursor_turn", return_value=("started", None)
             ) as cursor_turn,
             mock.patch.object(wake_daemon, "qwen_turn") as qwen_turn,
-            mock.patch.object(wake_daemon, "stream_and_play", return_value={}),
+            mock.patch.object(
+                daemon,
+                "_drain_playback_queue",
+                return_value=(_playback_batch("ok"), None),
+            ),
             mock.patch.object(wake_daemon, "notify"),
         ):
             daemon.process_utterance(woke=False)
@@ -236,7 +316,11 @@ class ProcessUtteranceTests(unittest.TestCase):
                 wake_daemon, "cursor_turn", return_value=("continued", None)
             ) as cursor_turn,
             mock.patch.object(wake_daemon, "qwen_turn") as qwen_turn,
-            mock.patch.object(wake_daemon, "stream_and_play", return_value={}),
+            mock.patch.object(
+                daemon,
+                "_drain_playback_queue",
+                return_value=(_playback_batch("ok"), None),
+            ),
             mock.patch.object(wake_daemon, "notify"),
         ):
             daemon.process_utterance(woke=False)
@@ -274,7 +358,11 @@ class ProcessUtteranceTests(unittest.TestCase):
                 return_value=IntentRoute(Intent.CURSOR_SUBMIT, "high"),
             ),
             mock.patch.object(wake_daemon, "qwen_turn") as qwen_turn,
-            mock.patch.object(wake_daemon, "stream_and_play", return_value={}),
+            mock.patch.object(
+                daemon,
+                "_drain_playback_queue",
+                return_value=(_playback_batch("ok"), None),
+            ),
             mock.patch.object(wake_daemon, "notify"),
         ):
             daemon.process_utterance(woke=False)
@@ -374,8 +462,8 @@ class ProcessUtteranceTests(unittest.TestCase):
                 return_value=IntentRoute(Intent.CONVERSATION, "high"),
             ),
             mock.patch.object(
-                wake_daemon,
-                "stream_and_play",
+                daemon,
+                "_drain_playback_queue",
                 side_effect=RuntimeError("playback failed"),
             ),
             mock.patch.object(wake_daemon, "release_deliveries") as release,
@@ -389,24 +477,59 @@ class ProcessUtteranceTests(unittest.TestCase):
 
 
 class AnnounceJobTests(unittest.TestCase):
+    def test_play_response_finalizes_queued_job_announcements(self) -> None:
+        daemon = _bare_daemon()
+        job_batch = _playback_batch(
+            "Cursor needs clarification. which repo?",
+            job_id="job1",
+            delivery_token="claim",
+            job_status="awaiting_user",
+        )
+        response_batch = _playback_batch("Here is the answer.")
+        with (
+            mock.patch.object(wake_daemon, "acknowledge_delivery") as acknowledge,
+            mock.patch.object(
+                daemon,
+                "_drain_playback_queue",
+                return_value=(job_batch + response_batch, None),
+            ),
+            mock.patch.object(wake_daemon, "notify"),
+        ):
+            daemon.play_response("Here is the answer.")
+
+        acknowledge.assert_called_once_with("job1", "claim")
+        self.assertEqual(daemon.cursor_session, "job1")
+
     def test_awaiting_user_job_enables_followup(self) -> None:
         daemon = _bare_daemon()
+        job: dict[str, object] = {
+            "id": "job1",
+            "status": "awaiting_user",
+            "question": "which repo?",
+            "_delivery_token": "claim",
+        }
         with (
             mock.patch.object(wake_daemon, "acknowledge_delivery") as acknowledge,
             mock.patch.object(wake_daemon, "release_delivery"),
             mock.patch.object(wake_daemon, "start_components"),
             mock.patch.object(wake_daemon, "stop_components") as stop_components,
-            mock.patch.object(wake_daemon, "stream_and_play", return_value={}),
+            mock.patch.object(
+                daemon,
+                "_drain_playback_queue",
+                return_value=(
+                    _playback_batch(
+                        "Cursor needs clarification. which repo?",
+                        job_id="job1",
+                        delivery_token="claim",
+                        job_status="awaiting_user",
+                    ),
+                    None,
+                ),
+            ),
             mock.patch.object(wake_daemon, "notify"),
         ):
-            daemon.announce_job(
-                {
-                    "id": "job1",
-                    "status": "awaiting_user",
-                    "question": "which repo?",
-                    "_delivery_token": "claim",
-                }
-            )
+            daemon._enqueue_job_announcement(job)
+            daemon._play_pending_announcements()
 
         acknowledge.assert_called_once_with("job1", "claim")
         self.assertTrue(daemon.awaiting_followup)
@@ -414,19 +537,38 @@ class AnnounceJobTests(unittest.TestCase):
         self.assertGreater(daemon.conversation_deadline, 0.0)
         stop_components.assert_not_called()
 
-    def test_completed_job_does_not_enable_followup(self) -> None:
+    def test_completed_job_enables_followup(self) -> None:
         daemon = _bare_daemon()
         with (
             mock.patch.object(wake_daemon, "acknowledge_delivery"),
             mock.patch.object(wake_daemon, "release_delivery"),
             mock.patch.object(wake_daemon, "start_components"),
             mock.patch.object(wake_daemon, "stop_components"),
-            mock.patch.object(wake_daemon, "stream_and_play", return_value={}),
+            mock.patch.object(
+                daemon,
+                "_drain_playback_queue",
+                return_value=(
+                    _playback_batch(
+                        "Cursor finished. done",
+                        job_id="job2",
+                        job_status="completed",
+                    ),
+                    None,
+                ),
+            ),
             mock.patch.object(wake_daemon, "notify"),
         ):
-            daemon.announce_job({"id": "job2", "status": "completed", "result": "done"})
+            daemon._enqueue_job_announcement(
+                {"id": "job2", "status": "completed", "result": "done"}
+            )
+            daemon._play_pending_announcements()
 
-        self.assertFalse(daemon.awaiting_followup)
+        self.assertTrue(daemon.awaiting_followup)
+        self.assertIsNone(daemon.cursor_session)
+        self.assertEqual(
+            daemon.history,
+            [{"role": "assistant", "content": "Cursor finished. done"}],
+        )
 
     def test_playback_failure_releases_delivery_without_acknowledging(self) -> None:
         daemon = _bare_daemon()
@@ -436,13 +578,13 @@ class AnnounceJobTests(unittest.TestCase):
             mock.patch.object(wake_daemon, "start_components"),
             mock.patch.object(wake_daemon, "stop_components"),
             mock.patch.object(
-                wake_daemon,
-                "stream_and_play",
+                daemon,
+                "_drain_playback_queue",
                 side_effect=RuntimeError("speaker unavailable"),
             ),
             mock.patch.object(wake_daemon, "notify"),
         ):
-            daemon.announce_job(
+            daemon._enqueue_job_announcement(
                 {
                     "id": "job2",
                     "status": "completed",
@@ -450,6 +592,7 @@ class AnnounceJobTests(unittest.TestCase):
                     "_delivery_token": "claim",
                 }
             )
+            daemon._play_pending_announcements()
 
         acknowledge.assert_not_called()
         release.assert_called_once_with("job2", "claim")
@@ -457,22 +600,32 @@ class AnnounceJobTests(unittest.TestCase):
     def test_acknowledgement_happens_after_playback(self) -> None:
         daemon = _bare_daemon()
         events: list[str] = []
+
+        def fake_drain(_response: str, *, on_played: object = None):
+            events.append("played")
+            return (
+                _playback_batch(
+                    "Cursor finished. done",
+                    job_id="job2",
+                    delivery_token="claim",
+                    job_status="completed",
+                ),
+                None,
+            )
+
         with (
             mock.patch.object(wake_daemon, "start_components"),
             mock.patch.object(wake_daemon, "stop_components"),
-            mock.patch.object(
-                wake_daemon,
-                "stream_and_play",
-                side_effect=lambda _text, **_kwargs: events.append("played") or {},
-            ),
+            mock.patch.object(daemon, "_drain_playback_queue", side_effect=fake_drain),
             mock.patch.object(
                 wake_daemon,
                 "acknowledge_delivery",
                 side_effect=lambda _job, _token: events.append("acknowledged"),
             ),
             mock.patch.object(wake_daemon, "release_delivery"),
+            mock.patch.object(wake_daemon, "notify"),
         ):
-            daemon.announce_job(
+            daemon._enqueue_job_announcement(
                 {
                     "id": "job2",
                     "status": "completed",
@@ -480,8 +633,85 @@ class AnnounceJobTests(unittest.TestCase):
                     "_delivery_token": "claim",
                 }
             )
+            daemon._play_pending_announcements()
 
         self.assertEqual(events, ["played", "acknowledged"])
+
+    def test_later_completed_job_does_not_clear_awaiting_session(self) -> None:
+        daemon = _bare_daemon()
+        daemon._enqueue_job_announcement(
+            {"id": "job1", "status": "awaiting_user", "question": "which repo?"}
+        )
+        daemon._enqueue_job_announcement(
+            {"id": "job2", "status": "completed", "result": "done"}
+        )
+        batch = _playback_batch(
+            "Cursor needs clarification. which repo?",
+            job_id="job1",
+            job_status="awaiting_user",
+        ) + _playback_batch(
+            "Cursor finished. done",
+            job_id="job2",
+            job_status="completed",
+        )
+        with (
+            mock.patch.object(wake_daemon, "start_components"),
+            mock.patch.object(
+                daemon, "_drain_playback_queue", return_value=(batch, None)
+            ),
+            mock.patch.object(wake_daemon, "notify"),
+        ):
+            daemon._play_pending_announcements()
+
+        self.assertEqual(daemon.cursor_session, "job1")
+
+    def test_failure_releases_only_unplayed_deliveries(self) -> None:
+        daemon = _bare_daemon()
+        daemon._enqueue_job_announcement(
+            {
+                "id": "job1",
+                "status": "completed",
+                "result": "first",
+                "_delivery_token": "claim1",
+            }
+        )
+        daemon._enqueue_job_announcement(
+            {
+                "id": "job2",
+                "status": "completed",
+                "result": "second",
+                "_delivery_token": "claim2",
+            }
+        )
+        with daemon.playback_queue._lock:
+            first_request = daemon.playback_queue._items[0][0]
+
+        def fail_after_first(
+            _response: str,
+            *,
+            on_played: object = None,
+        ) -> None:
+            callback = on_played
+            callback(  # type: ignore[operator]
+                {"played_text": first_request.text},
+                False,
+                first_request,
+            )
+            raise RuntimeError("second item failed")
+
+        with (
+            mock.patch.object(wake_daemon, "acknowledge_delivery") as acknowledge,
+            mock.patch.object(wake_daemon, "release_delivery") as release,
+            mock.patch.object(wake_daemon, "start_components"),
+            mock.patch.object(
+                daemon, "_drain_playback_queue", side_effect=fail_after_first
+            ),
+            mock.patch.object(wake_daemon, "notify"),
+        ):
+            daemon._play_pending_announcements()
+
+        acknowledge.assert_called_once_with("job1", "claim1")
+        release.assert_called_once_with("job2", "claim2")
 
 
 class ComponentSynchronizationTests(unittest.TestCase):
@@ -536,17 +766,23 @@ class PlaybackBargeInTests(unittest.TestCase):
             {"hey_jarvis": 0.9},
         ]
 
-        def fake_stream(
-            _response: str, *, should_interrupt: object
-        ) -> dict[str, object]:
+        def fake_drain(
+            *, should_interrupt: object = None, on_played: object = None
+        ) -> list[tuple[dict[str, object], bool, PlaybackRequest]]:
             check = should_interrupt
             self.assertFalse(check())  # type: ignore[operator]
             interrupted = check()  # type: ignore[operator]
-            return {"interrupted": interrupted, "played_text": "first sentence"}
+            return [
+                (
+                    {"interrupted": interrupted, "played_text": "first sentence"},
+                    interrupted,
+                    PlaybackRequest(text="A harmless response."),
+                )
+            ]
 
         with (
             mock.patch.object(wake_daemon, "BARGE_IN_MODE", "wake"),
-            mock.patch.object(wake_daemon, "stream_and_play", side_effect=fake_stream),
+            mock.patch.object(daemon.playback_queue, "drain", side_effect=fake_drain),
         ):
             result, interruption = daemon.play_response("A harmless response.")
 
@@ -561,17 +797,23 @@ class PlaybackBargeInTests(unittest.TestCase):
         daemon.read_frame = mock.Mock(return_value=b"speech")  # type: ignore[method-assign]
         daemon.is_speech = mock.Mock(return_value=True)  # type: ignore[method-assign]
 
-        def fake_stream(
-            _response: str, *, should_interrupt: object
-        ) -> dict[str, object]:
+        def fake_drain(
+            *, should_interrupt: object = None, on_played: object = None
+        ) -> list[tuple[dict[str, object], bool, PlaybackRequest]]:
             check = should_interrupt
             decisions = [check() for _ in range(3)]  # type: ignore[operator]
-            return {"interrupted": decisions[-1], "played_text": ""}
+            return [
+                (
+                    {"interrupted": decisions[-1], "played_text": ""},
+                    decisions[-1],
+                    PlaybackRequest(text="response"),
+                )
+            ]
 
         with (
             mock.patch.object(wake_daemon, "BARGE_IN_MODE", "vad"),
             mock.patch.object(wake_daemon, "BARGE_IN_SPEECH_FRAMES", 3),
-            mock.patch.object(wake_daemon, "stream_and_play", side_effect=fake_stream),
+            mock.patch.object(daemon.playback_queue, "drain", side_effect=fake_drain),
         ):
             _, interruption = daemon.play_response("response")
 
@@ -584,17 +826,23 @@ class PlaybackBargeInTests(unittest.TestCase):
         daemon = _bare_daemon()
         daemon.read_frame = mock.Mock(return_value=b"speaker echo")  # type: ignore[method-assign]
 
-        def fake_stream(
-            _response: str, *, should_interrupt: object
-        ) -> dict[str, object]:
+        def fake_drain(
+            *, should_interrupt: object = None, on_played: object = None
+        ) -> list[tuple[dict[str, object], bool, PlaybackRequest]]:
             check = should_interrupt
             self.assertFalse(check())  # type: ignore[operator]
             self.assertFalse(check())  # type: ignore[operator]
-            return {"interrupted": False, "played_text": "response"}
+            return [
+                (
+                    {"interrupted": False, "played_text": "response"},
+                    False,
+                    PlaybackRequest(text="response"),
+                )
+            ]
 
         with (
             mock.patch.object(wake_daemon, "BARGE_IN_MODE", "off"),
-            mock.patch.object(wake_daemon, "stream_and_play", side_effect=fake_stream),
+            mock.patch.object(daemon.playback_queue, "drain", side_effect=fake_drain),
             mock.patch.object(daemon, "wait_for_playback_quiet") as quiet,
         ):
             _, interruption = daemon.play_response("response")
@@ -611,15 +859,21 @@ class PlaybackBargeInTests(unittest.TestCase):
         daemon.read_frame = mock.Mock(return_value=b"echo")  # type: ignore[method-assign]
         daemon.wake_model.predict.return_value = {"hey_jarvis": 1.0}
 
-        def fake_stream(
-            _response: str, *, should_interrupt: object
-        ) -> dict[str, object]:
+        def fake_drain(
+            *, should_interrupt: object = None, on_played: object = None
+        ) -> list[tuple[dict[str, object], bool, PlaybackRequest]]:
             self.assertFalse(should_interrupt())  # type: ignore[operator]
-            return {"interrupted": False, "played_text": "Hey Jarvis."}
+            return [
+                (
+                    {"interrupted": False, "played_text": "Hey Jarvis."},
+                    False,
+                    PlaybackRequest(text="Say Hey Jarvis."),
+                )
+            ]
 
         with (
             mock.patch.object(wake_daemon, "BARGE_IN_MODE", "wake"),
-            mock.patch.object(wake_daemon, "stream_and_play", side_effect=fake_stream),
+            mock.patch.object(daemon.playback_queue, "drain", side_effect=fake_drain),
             mock.patch.object(daemon, "wait_for_playback_quiet"),
             mock.patch.object(wake_daemon, "log"),
         ):
@@ -698,11 +952,21 @@ class InterruptedTurnTests(unittest.TestCase):
             mock.patch.object(wake_daemon, "stop_components") as stop_components,
             mock.patch.object(
                 daemon,
-                "play_response",
-                return_value=({"interrupted": True}, interruption),
+                "_drain_playback_queue",
+                return_value=(
+                    _playback_batch(
+                        "Cursor finished. done",
+                        interrupted=True,
+                        job_id="job3",
+                        delivery_token="claim",
+                        job_status="completed",
+                    ),
+                    interruption,
+                ),
             ),
+            mock.patch.object(wake_daemon, "notify"),
         ):
-            result = daemon.announce_job(
+            daemon._enqueue_job_announcement(
                 {
                     "id": "job3",
                     "status": "completed",
@@ -710,6 +974,7 @@ class InterruptedTurnTests(unittest.TestCase):
                     "_delivery_token": "claim",
                 }
             )
+            result = daemon._play_pending_announcements()
 
         self.assertIs(result, interruption)
         acknowledge.assert_not_called()
