@@ -143,6 +143,15 @@ class GitHubClientTests(unittest.TestCase):
             timeout=120,
         )
 
+    def test_public_fork_provisioning_requires_confirmation(self) -> None:
+        client = GitHubClient()
+        with (
+            mock.patch.object(client, "inspect_public_repository") as inspect,
+            self.assertRaisesRegex(GitHubError, "confirmation"),
+        ):
+            client.provision_public_fork("source/project", confirmed=False)
+        inspect.assert_not_called()
+
     def test_clone_uses_temporary_owner_qualified_destination(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             allowed = Path(temporary)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
@@ -62,6 +63,12 @@ class Intent(StrEnum):
     UNCERTAIN = "uncertain"
 
 
+class ForkIntent(StrEnum):
+    NONE = "none"
+    AFFIRMATIVE = "affirmative"
+    NON_AFFIRMATIVE = "non_affirmative"
+
+
 @dataclass(frozen=True)
 class IntentRoute:
     intent: Intent
@@ -76,6 +83,63 @@ class IntentRoute:
 
 
 FALLBACK_ROUTE = IntentRoute(Intent.UNCERTAIN, "low")
+FORK_WORD = re.compile(r"\bfork(?:ed|ing|s)?\b", re.IGNORECASE)
+FORK_NEGATION = re.compile(
+    r"\b(?:do\s+not|don['’]?t|never|no|not|without|avoid|stop)\b",
+    re.IGNORECASE,
+)
+FORK_HYPOTHETICAL = re.compile(
+    r"\b(?:if|whether|suppose|assuming|imagine|hypothetically|"
+    r"might|would|could|should)\b[^.!?]{0,60}\bfork(?:ed|ing|s)?\b",
+    re.IGNORECASE,
+)
+FORK_QUESTION = re.compile(
+    r"^\s*(?:can|could|would|will|is|are|was|were|has|have|"
+    r"do|does|did|should|may|might|what|why|when|where|who|how)\b",
+    re.IGNORECASE,
+)
+FORK_QUOTED = re.compile(
+    r"(?:[\"“][^\"”]*\bfork(?:ed|ing|s)?\b|"
+    r"\b(?:quote|the\s+word)\s+fork\b|"
+    r"\b(?:says?|said|mentions?|mentioned|quotes?|quoted|reads?|wrote)\b"
+    r"[^.!?]{0,60}\bfork(?:ed|ing|s)?\b)",
+    re.IGNORECASE,
+)
+FORK_EXPLICIT_DESIRE = re.compile(
+    r"\bi\s+(?:would\s+like|want|need)\s+(?:you\s+)?to\s+fork\b",
+    re.IGNORECASE,
+)
+FORK_REQUEST = re.compile(
+    r"(?:"
+    r"^\s*(?:please\s+)?fork\b|"
+    r"\bplease\s+fork\b|"
+    r"\b(?:ask|tell)\s+(?:cursor|curser|cursa)\s+to\s+fork\b|"
+    r"\buse\s+(?:cursor|curser|cursa)\s+to\s+fork\b|"
+    r"\b(?:i\s+want|i\s+need|i['’]d\s+like)\s+(?:you\s+)?to\s+fork\b|"
+    r"\b(?:go\s+ahead\s+and|proceed\s+to)\s+fork\b"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def decide_fork_intent(utterance: str) -> ForkIntent:
+    """Classify fork intent using only the trusted, original utterance."""
+    if not FORK_WORD.search(utterance):
+        return ForkIntent.NONE
+    if (
+        "?" in utterance
+        or FORK_NEGATION.search(utterance)
+        or FORK_QUESTION.search(utterance)
+        or FORK_QUOTED.search(utterance)
+    ):
+        return ForkIntent.NON_AFFIRMATIVE
+    if FORK_EXPLICIT_DESIRE.search(utterance):
+        return ForkIntent.AFFIRMATIVE
+    if FORK_HYPOTHETICAL.search(utterance):
+        return ForkIntent.NON_AFFIRMATIVE
+    if FORK_REQUEST.search(utterance):
+        return ForkIntent.AFFIRMATIVE
+    return ForkIntent.NON_AFFIRMATIVE
 
 
 def _parse_route(result: object) -> IntentRoute:

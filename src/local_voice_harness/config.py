@@ -32,7 +32,6 @@ DEFAULT_SOURCE = "alsa_input.pci-0000_00_1f.3-platform-sof_sdw.HiFi__Mic__source
 CURSOR_PATTERN = re.compile(
     r"^\s*(?P<verb>use|ask|call)\s+(?:cursor|curser|cursa)\b", re.IGNORECASE
 )
-FORK_PATTERN = re.compile(r"\bfork(?:ed|ing|s)?\b", re.IGNORECASE)
 
 SYSTEMD_USER_DIR = Path.home() / ".config" / "systemd" / "user"
 SERVICE_FILES = (

@@ -422,7 +422,11 @@ class GitHubClient:
         head = self._git(checkout, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
         return head or None
 
-    def provision_public_fork(self, repository: str) -> ProvisionedRepository:
+    def provision_public_fork(
+        self, repository: str, *, confirmed: bool
+    ) -> ProvisionedRepository:
+        if not confirmed:
+            raise GitHubError("GitHub fork creation requires explicit confirmation")
         source = self.inspect_public_repository(repository)
         fork = self.ensure_fork(source, self.authenticated_login())
         checkout = self.ensure_clone(source, fork)
