@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from urllib.parse import SplitResult, urlsplit
 
 from .desktop import DesktopError, get_desktop
+from .focused_app_context import focused_app_context
 from .integrations.github import GitHubClient, GitHubError, GitHubIssue
 
 FIREFOX_CLASSES = {"firefox", "org.mozilla.firefox"}
@@ -69,6 +70,9 @@ class RequestContext:
     github_issue: int | None = None
     github_issue_context: str | None = None
     github_pull_request: int | None = None
+    focused_app_class: str | None = None
+    focused_app_context: str | None = None
+    focused_app_sources: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -688,14 +692,26 @@ def request_context(text: str) -> RequestContext:
                     context = _zendesk_context_from_url(url)
     except Exception:
         context = None
+    try:
+        app_context = focused_app_context(text)
+    except Exception:
+        app_context = None
+    parts = [text]
+    if context:
+        parts.append(str(context))
+    if app_context is not None:
+        parts.append(app_context.text)
     return RequestContext(
-        text=f"{text}\n\n{context}" if context else text,
+        text="\n\n".join(parts),
         focused_repository=focused_repository,
         focused_issue=focused_issue,
         github_repository=github_repository,
         github_issue=github_issue,
         github_issue_context=github_issue_context,
         github_pull_request=github_pull_request,
+        focused_app_class=app_context.app_class if app_context is not None else None,
+        focused_app_context=app_context.text if app_context is not None else None,
+        focused_app_sources=(app_context.sources if app_context is not None else ()),
     )
 
 

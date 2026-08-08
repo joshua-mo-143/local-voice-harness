@@ -578,6 +578,28 @@ tools, unsupported Wayland compositors, focus changes during capture, and browse
 GitHub errors simply omit some or all browser context without failing the voice
 request.
 
+When the focused window is a supported code editor (Cursor, VS Code, VSCodium) or a
+terminal, a request that explicitly refers to focused content — such as "explain this
+error" or "fix this code" — additionally captures bounded, opt-in context from that
+application. Two sources are supported:
+
+- **Selected text** (`selection`): the current editor or terminal selection, copied
+  through the clipboard while preserving both the previous clipboard contents and
+  window focus. Bounded to 4,000 characters.
+- **Uncommitted git diff** (`git_diff`): `git diff` for the repository containing the
+  focused window's working directory. Bounded to 8,000 characters.
+
+The combined focused-app context is capped at 12,000 characters
+(`VOICE_HARNESS_FOCUSED_APP_MAX_CHARS`) and is labelled as untrusted external input,
+never as instructions. Capture is fenced by a deny-list of sensitive or unsupported
+window classes (password managers, secret stores, and RuneLite by default; override
+with `VOICE_HARNESS_FOCUSED_APP_DENY`) and can be disabled entirely with
+`VOICE_HARNESS_FOCUSED_APP_CONTEXT=0`. It fails closed — omitting context — when focus
+changes mid-capture, the compositor or application is unsupported, a source exceeds its
+size limit, or any capture step errors, and never fails the underlying voice request.
+There is no screenshot, OCR, or continuous screen monitoring; only these explicit,
+bounded pulls.
+
 For example, bind Super+D in i3:
 
 ```text
@@ -673,6 +695,9 @@ launcher parses through its separate allowlist.
 | `VOICE_HARNESS_HERDR_BIN` | Absolute Herdr executable path | `~/.local/bin/herdr` | Wake drop-in |
 | `VOICE_HARNESS_PROJECT_ROOT` | Absolute allowed root for inferred repositories | Home directory | Wake drop-in |
 | `VOICE_HARNESS_GITHUB_ROOT` | Absolute fork-clone root inside the project root | `~/src` | Wake drop-in |
+| `VOICE_HARNESS_FOCUSED_APP_CONTEXT` | Enable focused editor/terminal context capture | `1` | Wake drop-in |
+| `VOICE_HARNESS_FOCUSED_APP_DENY` | Comma-separated denied focused window classes | Password managers, RuneLite | Wake drop-in |
+| `VOICE_HARNESS_FOCUSED_APP_MAX_CHARS` | Positive combined focused-app context character cap | `12000` | Wake drop-in |
 | `DICTATION_INJECT` | Focused-window insertion mode (`auto`, `paste`, `type`, or `stdout`) | `auto` | Wake drop-in |
 | `DICTATION_REPLACEMENTS` | Semicolon-separated STT corrections | Cursor/Herdr defaults | Wake drop-in |
 | `DICTATION_BACKEND` | Dictation engine (`parakeet` or `whisper`) | `parakeet` | `backend.env` |
