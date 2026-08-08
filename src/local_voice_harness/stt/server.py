@@ -6,11 +6,11 @@ import socket
 import sys
 import threading
 from abc import ABC, abstractmethod
-from pathlib import Path
 from typing import Literal
 
-RUNTIME = Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp"))
-SOCKET_PATH = RUNTIME / "dictation.sock"
+from ..config import STT_SOCKET
+
+SOCKET_PATH = STT_SOCKET
 WHISPER_MODELS = frozenset(
     {
         "tiny",

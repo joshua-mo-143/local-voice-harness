@@ -1,13 +1,46 @@
 [Unit]
 Description=Local voice harness Qwen3.5-4B server
 After=graphical-session.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
 
 [Service]
 Type=simple
 ExecStart=/usr/sbin/llama-server --model %h/local-voice-harness/models/Qwen3.5-4B-Q4_K_M.gguf --alias qwen3.5-4b --host 127.0.0.1 --port 8090 --ctx-size 8192 --parallel 1 --n-gpu-layers 99 --device CUDA0 --flash-attn on --jinja --reasoning off --reasoning-budget 0
+Environment=CUDA_CACHE_PATH=%t/voice-harness-llm/cuda-cache
+RuntimeDirectory=voice-harness-llm
+RuntimeDirectoryMode=0700
+UMask=0077
 Restart=on-failure
-RestartSec=2
+RestartSec=5
 TimeoutStopSec=15
+TasksMax=256
+LimitNOFILE=4096
+LimitCORE=0
+MemoryHigh=6G
+MemoryMax=8G
+MemorySwapMax=infinity
+OOMPolicy=stop
+OOMScoreAdjust=200
+NoNewPrivileges=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ProtectControlGroups=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectKernelLogs=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+LockPersonality=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+RestrictAddressFamilies=AF_UNIX AF_INET AF_NETLINK
+SystemCallArchitectures=native
 
 [Install]
 WantedBy=default.target

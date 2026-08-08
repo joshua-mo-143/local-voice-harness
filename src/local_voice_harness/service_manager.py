@@ -12,6 +12,7 @@ from .config import (
 )
 from .errors import HarnessError
 from .integrations.herdr import HerdrClient, HerdrError
+from .service_units import audit_installed
 
 
 def systemctl(*arguments: str, check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -45,7 +46,11 @@ def install_services(*, force: bool, replace_dictation: bool = False) -> None:
             except OSError:
                 pass
             if name == "dictation.service" and not replace_dictation:
-                print(f"Preserved existing standalone {destination}.")
+                print(
+                    f"Preserved existing standalone {destination}; it may not "
+                    "include shipped hardening. Rerun with --force "
+                    "--replace-dictation only after reviewing its customizations."
+                )
                 continue
             if not force:
                 raise HarnessError(
@@ -58,6 +63,12 @@ def install_services(*, force: bool, replace_dictation: bool = False) -> None:
     systemctl("daemon-reload")
     systemctl("enable", *START_SERVICES)
     print("Installed voice harness services. Run `voice-harness services start`.")
+
+
+def audit_services() -> int:
+    """Read effective installed units and runtime state without changing them."""
+
+    return audit_installed()
 
 
 def start_services() -> None:

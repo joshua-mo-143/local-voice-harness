@@ -11,9 +11,10 @@ import time
 from pathlib import Path
 from typing import Any
 
-RUNTIME = Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp"))
-SOCKET_PATH = RUNTIME / "voice-harness-tts.sock"
-OUTPUT_ROOT = RUNTIME / "voice-harness"
+from ..config import STATE_DIR, TTS_SOCKET
+
+SOCKET_PATH = TTS_SOCKET
+OUTPUT_ROOT = STATE_DIR
 OUTPUT_ROOT.mkdir(mode=0o700, parents=True, exist_ok=True)
 LOCK = threading.Lock()
 ACTIVE_STREAMS: dict[str, threading.Event] = {}
