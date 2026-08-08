@@ -28,6 +28,7 @@ from .intent import ForkIntent, Intent, IntentRoute, decide_fork_intent, route_i
 from .ipc import socket_ready
 from .llm import qwen_response
 from .tts.client import stream_and_play
+from .vocabulary import resolve_aliases
 
 CURSOR_STORE = JobStore(JOBS_DIR, LEGACY_JOBS_DIR)
 
@@ -44,6 +45,7 @@ def respond(text: str) -> None:
     text = text.strip()
     if not text:
         raise HarnessError("request text is empty")
+    text = resolve_aliases(text)
     delivery_claims: DeliveryClaims = []
     with component_usage():
         try:

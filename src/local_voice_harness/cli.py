@@ -26,6 +26,15 @@ from .service_manager import (
     status as service_status,
 )
 from .stt.client import transcribe
+from .vocabulary import (
+    add_alias,
+    add_replacement,
+    export_entries,
+    import_entries,
+    list_entries,
+    remove_alias,
+    remove_replacement,
+)
 
 
 def parser() -> argparse.ArgumentParser:
@@ -66,7 +75,73 @@ def parser() -> argparse.ArgumentParser:
     uninstall = service_commands.add_parser("uninstall")
     uninstall.add_argument("--include-herdr", action="store_true")
 
+    _add_vocabulary_parser(commands)
+
     return root
+
+
+def _add_vocabulary_parser(
+    commands: argparse._SubParsersAction[argparse.ArgumentParser],
+) -> None:
+    vocabulary = commands.add_parser(
+        "vocabulary", help="manage local STT corrections and entity aliases"
+    )
+    vocabulary_commands = vocabulary.add_subparsers(
+        dest="vocabulary_command", required=True
+    )
+
+    listing = vocabulary_commands.add_parser("list", help="show stored entries")
+    listing.add_argument("--kind", choices=("replacement", "alias"))
+
+    add = vocabulary_commands.add_parser("add", help="add or update an entry")
+    add_kinds = add.add_subparsers(dest="vocabulary_kind", required=True)
+    add_replacement_parser = add_kinds.add_parser(
+        "replacement", help="add an STT text correction"
+    )
+    add_replacement_parser.add_argument("spoken")
+    add_replacement_parser.add_argument("written")
+    add_replacement_parser.add_argument("--force", action="store_true")
+    add_alias_parser = add_kinds.add_parser(
+        "alias", help="map a spoken phrase to owner/repo or owner/repo#number"
+    )
+    add_alias_parser.add_argument("phrase")
+    add_alias_parser.add_argument("target")
+    add_alias_parser.add_argument("--force", action="store_true")
+
+    remove = vocabulary_commands.add_parser("remove", help="delete an entry")
+    remove_kinds = remove.add_subparsers(dest="vocabulary_kind", required=True)
+    remove_replacement_parser = remove_kinds.add_parser("replacement")
+    remove_replacement_parser.add_argument("spoken")
+    remove_alias_parser = remove_kinds.add_parser("alias")
+    remove_alias_parser.add_argument("phrase")
+
+    export = vocabulary_commands.add_parser(
+        "export", help="print or back up the store as JSON"
+    )
+    export.add_argument("--output", type=Path)
+
+    importer = vocabulary_commands.add_parser(
+        "import", help="merge or replace the store from a JSON backup"
+    )
+    importer.add_argument("path", type=Path)
+    importer.add_argument("--replace", action="store_true")
+
+
+def _dispatch_vocabulary(args: argparse.Namespace) -> None:
+    if args.vocabulary_command == "list":
+        list_entries(args.kind)
+    elif args.vocabulary_command == "add" and args.vocabulary_kind == "replacement":
+        add_replacement(args.spoken, args.written, force=args.force)
+    elif args.vocabulary_command == "add":
+        add_alias(args.phrase, args.target, force=args.force)
+    elif args.vocabulary_command == "remove" and args.vocabulary_kind == "replacement":
+        remove_replacement(args.spoken)
+    elif args.vocabulary_command == "remove":
+        remove_alias(args.phrase)
+    elif args.vocabulary_command == "export":
+        export_entries(args.output)
+    else:
+        import_entries(args.path, replace=args.replace)
 
 
 def dispatch(args: argparse.Namespace) -> None:
@@ -90,6 +165,8 @@ def dispatch(args: argparse.Namespace) -> None:
         respond(" ".join(args.text))
     elif args.command == "status":
         status()
+    elif args.command == "vocabulary":
+        _dispatch_vocabulary(args)
     elif args.service_command == "install":
         install_services(force=args.force, replace_dictation=args.replace_dictation)
     elif args.service_command == "start":
