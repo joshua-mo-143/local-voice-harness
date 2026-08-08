@@ -11,6 +11,8 @@ from typing import cast
 from unittest import mock
 
 from local_voice_harness.cursor import jobs
+from local_voice_harness.cursor.model import CURRENT_SCHEMA_VERSION
+from local_voice_harness.cursor.store import JobQuarantineWarning
 from local_voice_harness.integrations.github import (
     GitHubIssue,
     GitHubRepository,
@@ -33,6 +35,34 @@ class CursorJobStateTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.jobs_patch.stop()
         self.temporary.cleanup()
+
+    def test_malformed_job_file_is_quarantined_from_collection_read(self) -> None:
+        (Path(self.temporary.name) / "123456789abc.json").write_text("{not json")
+
+        with self.assertWarnsRegex(
+            JobQuarantineWarning, "123456789abc.json: job is quarantined"
+        ):
+            self.assertEqual(jobs.active_jobs(), [])
+
+    def test_invalid_job_file_is_not_silently_skipped(self) -> None:
+        jobs.write_job(
+            {
+                "id": "aaaaaaaaaaaa",
+                "status": "queued",
+                "request": "valid",
+                "delivered": False,
+            }
+        )
+        (Path(self.temporary.name) / "bbbbbbbbbbbb.json").write_text(
+            json.dumps({"id": "bbbbbbbbbbbb", "status": "unknown"})
+        )
+
+        with self.assertWarnsRegex(
+            JobQuarantineWarning, "bbbbbbbbbbbb.json: job is quarantined"
+        ):
+            self.assertEqual(
+                [job["id"] for job in jobs.active_jobs()], ["aaaaaaaaaaaa"]
+            )
 
     def test_repository_reply_preserves_original_task(self) -> None:
         job: dict[str, object] = {
@@ -168,6 +198,8 @@ class CursorJobStateTests(unittest.TestCase):
                 "id": "123456789abc",
                 "status": "routing",
                 "worker_token": "worker",
+                "worker_pid": 42,
+                "worker_process_start": "worker-start",
                 "repository": str(repository),
                 "worktree_path": str(repository),
                 "github_pull_request": 42,
@@ -204,6 +236,8 @@ class CursorJobStateTests(unittest.TestCase):
                     "id": job_id,
                     "status": "routing",
                     "worker_token": job_id,
+                    "worker_pid": 42,
+                    "worker_process_start": f"start-{job_id}",
                     "repository": str(repository),
                     "worktree_path": str(worktree),
                     "github_pull_request": number,
@@ -441,7 +475,7 @@ class CursorJobStateTests(unittest.TestCase):
             )
 
         job = jobs.read_job(job_id)
-        self.assertEqual(job["schema_version"], 4)
+        self.assertEqual(job["schema_version"], CURRENT_SCHEMA_VERSION)
         self.assertEqual(job["trusted_utterance"], "work on this")
         self.assertEqual(job["github_issue"], 42)
         self.assertEqual(
@@ -531,6 +565,9 @@ class CursorJobStateTests(unittest.TestCase):
             {
                 "id": "aaaaaaaaaaaa",
                 "status": "running",
+                "worker_token": "first-worker",
+                "worker_pid": 41,
+                "worker_process_start": "first-start",
                 "herdr_target": "first-agent",
                 "worktree_path": "/worktree/issue-42",
             }
@@ -540,6 +577,8 @@ class CursorJobStateTests(unittest.TestCase):
                 "id": "bbbbbbbbbbbb",
                 "status": "routing",
                 "worker_token": "worker-token",
+                "worker_pid": 42,
+                "worker_process_start": "second-start",
             }
         )
         selection = AgentSelection(
@@ -1966,6 +2005,8 @@ class CursorJobStateTests(unittest.TestCase):
                 "id": "bbbbbbbbbbbb",
                 "status": "routing",
                 "worker_token": "worker",
+                "worker_pid": 42,
+                "worker_process_start": "worker-start",
             }
         )
         self.assertIsNone(
@@ -2029,14 +2070,16 @@ class CursorJobStateTests(unittest.TestCase):
         self.assertFalse(jobs.read_job("123456789abc")["target_release_pending"])
 
     def test_cancel_retires_unfenced_legacy_worker_first(self) -> None:
-        jobs.write_job(
-            {
-                "id": "123456789abc",
-                "status": "running",
-                "worker_pid": 42,
-                "created_at": 1,
-                "delivered": False,
-            }
+        (Path(self.temporary.name) / "123456789abc.json").write_text(
+            json.dumps(
+                {
+                    "id": "123456789abc",
+                    "status": "running",
+                    "worker_pid": 42,
+                    "created_at": 1,
+                    "delivered": False,
+                }
+            )
         )
         with (
             mock.patch.object(jobs, "_worker_is_alive", return_value=True),
