@@ -4,6 +4,7 @@ import argparse
 from pathlib import Path
 
 from .app import respond, status
+from .diagnostics import doctor
 from .dictation import run as run_dictation
 from .notifications import notify
 from .recording import (
@@ -45,6 +46,22 @@ def parser() -> argparse.ArgumentParser:
     text = commands.add_parser("text")
     text.add_argument("text", nargs="+")
     commands.add_parser("status")
+
+    doctor_command = commands.add_parser(
+        "doctor",
+        help="diagnose harness health and suggest safe recovery steps",
+    )
+    doctor_command.add_argument(
+        "--json",
+        action="store_true",
+        dest="json_output",
+        help="emit machine-readable diagnostics instead of the human summary",
+    )
+    doctor_command.add_argument(
+        "--fix",
+        action="store_true",
+        help="offer confirmation-gated repairs for issues that support them",
+    )
 
     services = commands.add_parser("services")
     service_commands = services.add_subparsers(dest="service_command", required=True)
@@ -90,6 +107,8 @@ def dispatch(args: argparse.Namespace) -> None:
         respond(" ".join(args.text))
     elif args.command == "status":
         status()
+    elif args.command == "doctor":
+        raise SystemExit(doctor(json_output=args.json_output, fix=args.fix))
     elif args.service_command == "install":
         install_services(force=args.force, replace_dictation=args.replace_dictation)
     elif args.service_command == "start":
