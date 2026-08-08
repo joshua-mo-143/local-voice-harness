@@ -15,11 +15,16 @@ GITHUB_ROOT = Path(
     os.environ.get("VOICE_HARNESS_GITHUB_ROOT", Path.home() / "src")
 ).resolve()
 RUNTIME = Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp"))
+RECORDING_LOCK = RUNTIME / "voice-harness-recording.lock"
 STATE_DIR = RUNTIME / "voice-harness"
 JOBS_DIR = STATE_DIR / "jobs"
 WAV_PATH = STATE_DIR / "request.wav"
 PID_PATH = STATE_DIR / "recording.pid"
 RECORDER_LOG = STATE_DIR / "pw-record.log"
+DICTATION_STATE_DIR = RUNTIME / "dictation"
+DICTATION_WAV_PATH = DICTATION_STATE_DIR / "recording.wav"
+DICTATION_PID_PATH = DICTATION_STATE_DIR / "recording.pid"
+DICTATION_RECORDER_LOG = DICTATION_STATE_DIR / "pw-record.log"
 STT_SOCKET = RUNTIME / "dictation.sock"
 TTS_SOCKET = RUNTIME / "voice-harness-tts.sock"
 LLM_HEALTH = "http://127.0.0.1:8090/health"

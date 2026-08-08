@@ -14,9 +14,21 @@ from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 
+from .. import recorder
 from ..browser_context import request_context
 from ..components import llm_ready, start_components, stop_components
-from ..config import DEFAULT_SOURCE, STATE_DIR, WAV_PATH
+from ..config import (
+    DEFAULT_SOURCE,
+    DICTATION_PID_PATH,
+    DICTATION_RECORDER_LOG,
+    DICTATION_STATE_DIR,
+    DICTATION_WAV_PATH,
+    PID_PATH,
+    RECORDER_LOG,
+    RECORDING_LOCK,
+    STATE_DIR,
+    WAV_PATH,
+)
 from ..cursor.jobs import (
     DeliveryClaims,
     acknowledge_deliveries,
@@ -34,6 +46,17 @@ from ..notifications import notify
 from ..stt.client import transcribe
 from ..tts.queue import PlaybackQueue, PlaybackRequest
 
+RECORDING_PATHS = recorder.RecorderPaths(
+    STATE_DIR, WAV_PATH, PID_PATH, RECORDER_LOG, RECORDING_LOCK
+)
+DICTATION_RECORDING_PATHS = recorder.RecorderPaths(
+    DICTATION_STATE_DIR,
+    DICTATION_WAV_PATH,
+    DICTATION_PID_PATH,
+    DICTATION_RECORDER_LOG,
+    RECORDING_LOCK,
+)
+CAPTURE_PATHS = (RECORDING_PATHS, DICTATION_RECORDING_PATHS)
 SAMPLE_RATE = 16_000
 FRAME_MS = 80
 FRAME_SAMPLES = SAMPLE_RATE * FRAME_MS // 1000
@@ -219,7 +242,7 @@ class WakeConversationDaemon:
             self.read_frame()
         self.pre_roll.clear()
 
-    def record_utterance(self, initial: list[bytes]) -> None:
+    def record_utterance(self, initial: list[bytes]) -> Path:
         frames = list(initial)
         has_speech = any(self.is_speech(frame) for frame in frames)
         silence_ms = 0
@@ -236,12 +259,33 @@ class WakeConversationDaemon:
                 break
             if duration >= MAX_UTTERANCE_SECONDS:
                 break
-        STATE_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
-        with wave.open(str(WAV_PATH), "wb") as output:
-            output.setnchannels(1)
-            output.setsampwidth(2)
-            output.setframerate(SAMPLE_RATE)
-            output.writeframes(b"".join(frames))
+
+        def write_audio(path: Path) -> None:
+            with wave.open(str(path), "wb") as output:
+                output.setnchannels(1)
+                output.setsampwidth(2)
+                output.setframerate(SAMPLE_RATE)
+                output.writeframes(b"".join(frames))
+
+        return recorder.write_audio_generation(
+            RECORDING_PATHS,
+            write_audio,
+            conflicts=(DICTATION_RECORDING_PATHS,),
+        )
+
+    def record_utterance_safely(self, initial: list[bytes]) -> Path | None:
+        try:
+            if recorder.any_recording_active(CAPTURE_PATHS):
+                message = "wake activation deferred while another recording is active"
+                log(message)
+                notify(message)
+                return None
+            return self.record_utterance(initial)
+        except HarnessError as exc:
+            message = f"wake recording suppressed: {exc}"
+            log(message)
+            notify(message)
+            return None
 
     def begin_activation(self) -> None:
         if self.activation_thread is not None and self.activation_thread.is_alive():
@@ -533,15 +577,17 @@ class WakeConversationDaemon:
 
     def continue_after_barge_in(self, interruption: BargeIn | None) -> None:
         while interruption is not None and self.running:
-            self.record_utterance(interruption.initial)
-            interruption = self.process_utterance(woke=interruption.woke)
+            audio_path = self.record_utterance_safely(interruption.initial)
+            if audio_path is None:
+                return
+            interruption = self.process_utterance(audio_path, woke=interruption.woke)
 
-    def process_utterance(self, *, woke: bool) -> BargeIn | None:
+    def process_utterance(self, audio_path: Path, *, woke: bool) -> BargeIn | None:
         had_active_conversation = bool(self.conversation_deadline)
         delivery_claims: DeliveryClaims = []
         self.pause_microphone()
         try:
-            text = transcribe()
+            text = transcribe(audio_path)
             if woke:
                 text, found_wake = strip_wake_prefix(text)
                 if not found_wake:
@@ -707,20 +753,30 @@ class WakeConversationDaemon:
                     initial = list(self.pre_roll)
                     self.pre_roll.clear()
                     speech_streak = 0
-                    self.record_utterance(initial)
-                    self.continue_after_barge_in(self.process_utterance(woke=False))
+                    audio_path = self.record_utterance_safely(initial)
+                    if audio_path is None:
+                        speech_streak = 0
+                        continue
+                    self.continue_after_barge_in(
+                        self.process_utterance(audio_path, woke=False)
+                    )
                 continue
             samples = self.np.frombuffer(frame, dtype="<i2")
             score = float(self.wake_model.predict(samples).get(self.wake_key, 0.0))
             if score >= WAKE_THRESHOLD and now - self.last_wake >= 2.0:
                 self.last_wake = now
                 log(f"wake detected: score={score:.3f}")
-                notify("Wake detected — listening…")
-                self.begin_activation()
                 initial = list(self.pre_roll)
                 self.pre_roll.clear()
-                self.record_utterance(initial)
-                self.continue_after_barge_in(self.process_utterance(woke=True))
+                audio_path = self.record_utterance_safely(initial)
+                if audio_path is None:
+                    speech_streak = 0
+                    continue
+                notify("Wake detected — listening…")
+                self.begin_activation()
+                self.continue_after_barge_in(
+                    self.process_utterance(audio_path, woke=True)
+                )
 
     def stop(self) -> None:
         self.running = False

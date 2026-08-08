@@ -115,6 +115,11 @@ class SpeechToTextClientTests(unittest.TestCase):
     def test_transcribe_reports_backend_empty_and_transport_errors(self) -> None:
         cases = [
             (b"__DICTATION_ERROR__:RuntimeError: failed", "RuntimeError: failed"),
+            (
+                b'{"ok":false,"error":{"code":"invalid_audio_path",'
+                b'"message":"not allowed"}}\n',
+                "invalid_audio_path: not allowed",
+            ),
             (b" \n", "did not recognize any speech"),
         ]
         for response, message in cases:
@@ -123,7 +128,7 @@ class SpeechToTextClientTests(unittest.TestCase):
                 mock.patch.object(stt_client, "unix_request", return_value=response),
                 self.assertRaisesRegex(HarnessError, message),
             ):
-                stt_client.transcribe()
+                stt_client.transcribe(Path("/runtime/recordings/request-test.wav"))
 
         with (
             mock.patch.object(
@@ -131,7 +136,52 @@ class SpeechToTextClientTests(unittest.TestCase):
             ),
             self.assertRaisesRegex(HarnessError, "STT request failed"),
         ):
-            stt_client.transcribe()
+            stt_client.transcribe(Path("/runtime/recordings/request-test.wav"))
+
+    def test_transcribe_retries_busy_generation_then_succeeds(self) -> None:
+        audio = Path(
+            "/runtime/voice-harness/recordings/"
+            "request-0123456789abcdef0123456789abcdef.wav"
+        )
+        busy = (
+            b'{"ok":false,"error":{"code":"server_busy",'
+            b'"message":"active transcription"}}\n'
+        )
+        with (
+            mock.patch.object(
+                stt_client, "unix_request", side_effect=[busy, b"hello"]
+            ) as request,
+            mock.patch.object(stt_client.time, "sleep") as sleep,
+        ):
+            result = stt_client.transcribe(audio)
+
+        self.assertEqual(result, "hello")
+        self.assertEqual(request.call_count, 2)
+        self.assertEqual(
+            [call.args[1] for call in request.call_args_list],
+            [f"{audio}\n".encode(), f"{audio}\n".encode()],
+        )
+        sleep.assert_called_once_with(stt_client.BUSY_BACKOFF_SECONDS)
+
+    def test_transcribe_exhausted_busy_preserves_retry_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            audio = Path(temporary) / "request-generation.wav"
+            audio.write_bytes(b"RIFF" + b"\0" * 64)
+            busy = (
+                b'{"ok":false,"error":{"code":"server_busy",'
+                b'"message":"active transcription"}}\n'
+            )
+            with (
+                mock.patch.object(stt_client, "REQUEST_DEADLINE_SECONDS", 0.0),
+                mock.patch.object(stt_client, "unix_request", return_value=busy),
+                self.assertRaisesRegex(
+                    HarnessError,
+                    rf"voice-harness transcribe --generation {audio}",
+                ),
+            ):
+                stt_client.transcribe(audio)
+
+            self.assertTrue(audio.exists())
 
 
 class TextToSpeechClientTests(unittest.TestCase):

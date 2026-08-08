@@ -77,6 +77,36 @@ its isolated local worktree. PR worktrees are reused only by recovery or continu
 of the same job. Completed and cancelled worktrees are retained for inspection, while
 an invalid or partially prepared checkout is marked quarantined and is never dispatched.
 
+### Runtime privacy and durability
+
+Microphone recordings, recorder ownership files, logs, and service sockets are
+transient session data under `$XDG_RUNTIME_DIR`. The bundled STT service accepts only
+strictly named UUID generations beneath the two harness recording directories.
+Stopping capture atomically moves the writable WAV to its immutable generation while
+the recorder lock is still held; wake-mode recording performs the same handoff. A
+later capture only replaces the writable path. After acquiring the model slot, STT
+atomically moves that generation to a unique private processing path and removes only
+the claimed file after the attempt. Cancellation removes writable audio after
+recorder termination is confirmed. Recorder ownership includes the Linux process
+start identity as well as its PID; it is not durable across login sessions.
+
+Only one in-process GPU transcription runs at a time. A second fully framed request
+receives a structured `server_busy` error immediately instead of waiting behind a
+possibly hung model call, without moving or deleting its retryable generation. The
+client retries that same immutable generation with bounded backoff for an overall
+120-second request window. If STT remains busy, the error prints a safe
+`voice-harness transcribe --generation <path>` retry command and leaves the file in
+place. The accepted call remains synchronous; Python cannot safely force-cancel a
+hung native GPU call, so service supervision must restart the dictation process to
+recover that case. Wake capture is suppressed without stopping the daemon while a
+manual or focused-dictation recorder owns the shared recording lock. Manual and
+focused-dictation starts inspect every configured recorder owner atomically under
+that lock, so different capture modes cannot run concurrently.
+
+Cursor job JSON remains under `$XDG_RUNTIME_DIR/voice-harness/jobs`. Completed job
+retention and any durable Cursor job store are intentionally not defined here and are
+deferred to issue #26. This change does not prune completed jobs.
+
 ## Compute requirements
 
 Tested configuration:
@@ -639,7 +669,9 @@ the earlier Whisper large-v3 backend; Parakeet TDT 0.6B v2 measurements are pend
   root and runs `gh pr checkout` only in a job-unique, reserved worktree. Recovery
   retries that same worktree; failed preparation quarantines it.
 - Jobs never automatically commit, push, open pull requests, or remove worktrees.
-- Runtime job metadata and audio live under `$XDG_RUNTIME_DIR/voice-harness`.
+- Runtime job metadata and conversational audio live under
+  `$XDG_RUNTIME_DIR/voice-harness`; focused dictation audio lives under
+  `$XDG_RUNTIME_DIR/dictation`.
 
 ## Troubleshooting
 

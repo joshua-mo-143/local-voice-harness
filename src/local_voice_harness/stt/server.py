@@ -1,16 +1,25 @@
 from __future__ import annotations
 
+import json
 import os
 import re
 import socket
+import stat
 import sys
 import threading
+import uuid
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Literal
 
+from .. import config, recorder
+
 RUNTIME = Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp"))
 SOCKET_PATH = RUNTIME / "dictation.sock"
+MAX_REQUEST_BYTES = 4096
+ACCEPT_TIMEOUT_SECONDS = 0.5
+READ_TIMEOUT_SECONDS = 2.0
+MAX_CONNECTIONS = 16
 WHISPER_MODELS = frozenset(
     {
         "tiny",
@@ -91,6 +100,12 @@ LANGUAGE = resolve_language(os.environ.get("DICTATION_LANGUAGE", "auto"))
 LOCK = threading.Lock()
 
 
+class ProtocolError(Exception):
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+
+
 def log(message: str) -> None:
     print(f"[dictation] {message}", file=sys.stderr, flush=True)
 
@@ -158,43 +173,223 @@ def load_transcriber() -> Transcriber:
     return WhisperTranscriber(MODEL_NAME, compute_type=COMPUTE_TYPE)
 
 
+def _read_frame(connection: socket.socket) -> bytes:
+    request = bytearray()
+    while True:
+        try:
+            chunk = connection.recv(min(4096, MAX_REQUEST_BYTES + 2 - len(request)))
+        except TimeoutError as exc:
+            raise ProtocolError(
+                "request_timeout", "request was not completed before the deadline"
+            ) from exc
+        if not chunk:
+            raise ProtocolError("incomplete_request", "request must end with a newline")
+        request.extend(chunk)
+        newline = request.find(b"\n")
+        if newline >= 0:
+            if newline > MAX_REQUEST_BYTES:
+                raise ProtocolError("request_too_large", "request exceeds size limit")
+            if newline != len(request) - 1:
+                raise ProtocolError(
+                    "unexpected_data", "only one newline-delimited request is allowed"
+                )
+            return bytes(request[:newline])
+        if len(request) > MAX_REQUEST_BYTES:
+            raise ProtocolError("request_too_large", "request exceeds size limit")
+
+
+def _parse_audio_path(frame: bytes) -> tuple[Path, recorder.RecorderPaths]:
+    try:
+        text = frame.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ProtocolError("invalid_encoding", "request must be valid UTF-8") from exc
+    if not text:
+        raise ProtocolError("invalid_request", "audio path is required")
+    requested = Path(text)
+    path_sets = tuple(
+        recorder.RecorderPaths(
+            audio.parent,
+            audio,
+            audio.parent / "recording.pid",
+            audio.parent / "pw-record.log",
+            config.RECORDING_LOCK,
+        )
+        for audio in (config.WAV_PATH, config.DICTATION_WAV_PATH)
+    )
+    for paths in path_sets:
+        if recorder.is_generation_path(paths, requested):
+            return requested, paths
+    raise ProtocolError(
+        "invalid_audio_path", "audio path is not a harness recording generation"
+    )
+
+
+def _claim_audio_path(requested: Path, paths: recorder.RecorderPaths) -> Path:
+    processing_dir = paths.state_dir / "stt-processing"
+    with recorder.recording_lock(paths.state_dir, paths.lock):
+        try:
+            generation_directory_metadata = paths.generations.lstat()
+            processing_dir.mkdir(mode=0o700, exist_ok=True)
+            directory_metadata = processing_dir.lstat()
+        except OSError as exc:
+            raise ProtocolError(
+                "invalid_audio_path", "audio processing directory is inaccessible"
+            ) from exc
+        if (
+            not stat.S_ISDIR(generation_directory_metadata.st_mode)
+            or generation_directory_metadata.st_uid != os.getuid()
+            or generation_directory_metadata.st_mode & 0o077
+        ):
+            raise ProtocolError(
+                "invalid_audio_path",
+                "audio generation directory must be private and harness-owned",
+            )
+        if (
+            not stat.S_ISDIR(directory_metadata.st_mode)
+            or directory_metadata.st_uid != os.getuid()
+        ):
+            raise ProtocolError(
+                "invalid_audio_path",
+                "audio processing directory must be harness-owned",
+            )
+        processing_dir.chmod(0o700)
+        claimed = processing_dir / f"{requested.stem}-{uuid.uuid4().hex}.wav"
+        try:
+            requested.rename(claimed)
+        except FileNotFoundError as exc:
+            raise ProtocolError("audio_not_found", "audio file does not exist") from exc
+        except OSError as exc:
+            raise ProtocolError(
+                "invalid_audio_path", "audio file could not be claimed"
+            ) from exc
+        try:
+            metadata = claimed.lstat()
+        except OSError as exc:
+            claimed.unlink(missing_ok=True)
+            raise ProtocolError(
+                "invalid_audio_path", "claimed audio file is inaccessible"
+            ) from exc
+        if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.getuid():
+            claimed.unlink(missing_ok=True)
+            raise ProtocolError(
+                "invalid_audio_path", "audio path must be a harness-owned regular file"
+            )
+        return claimed
+
+
+def _error_response(error: ProtocolError) -> bytes:
+    return (
+        json.dumps(
+            {
+                "ok": False,
+                "error": {"code": error.code, "message": str(error)},
+            },
+            separators=(",", ":"),
+        ).encode()
+        + b"\n"
+    )
+
+
+def _send(connection: socket.socket, payload: bytes) -> None:
+    try:
+        connection.sendall(payload)
+    except (BrokenPipeError, ConnectionResetError, TimeoutError):
+        pass
+
+
+def handle_connection(connection: socket.socket, transcriber: Transcriber) -> None:
+    connection.settimeout(READ_TIMEOUT_SECONDS)
+    audio_path: Path | None = None
+    try:
+        try:
+            requested, paths = _parse_audio_path(_read_frame(connection))
+            if not LOCK.acquire(blocking=False):
+                raise ProtocolError(
+                    "server_busy", "another transcription is already active"
+                )
+            try:
+                audio_path = _claim_audio_path(requested, paths)
+                text = normalize(transcriber.transcribe(str(audio_path)))
+            finally:
+                LOCK.release()
+        except ProtocolError as exc:
+            _send(connection, _error_response(exc))
+            return
+        except Exception as exc:
+            log(f"transcription failed: {exc}")
+            _send(
+                connection,
+                _error_response(
+                    ProtocolError(
+                        "transcription_failed", f"{type(exc).__name__}: {exc}"
+                    )
+                ),
+            )
+            return
+        _send(connection, text.encode())
+    finally:
+        if audio_path is not None:
+            audio_path.unlink(missing_ok=True)
+        connection.close()
+
+
+def serve(
+    transcriber: Transcriber,
+    *,
+    socket_path: Path = SOCKET_PATH,
+    stop_event: threading.Event | None = None,
+) -> None:
+    socket_path.unlink(missing_ok=True)
+    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    slots = threading.BoundedSemaphore(MAX_CONNECTIONS)
+    threads: set[threading.Thread] = set()
+
+    def run_connection(connection: socket.socket) -> None:
+        try:
+            handle_connection(connection, transcriber)
+        finally:
+            slots.release()
+
+    try:
+        server.bind(str(socket_path))
+        os.chmod(socket_path, 0o600)
+        server.listen(4)
+        server.settimeout(ACCEPT_TIMEOUT_SECONDS)
+        log(f"listening on {socket_path}")
+        while stop_event is None or not stop_event.is_set():
+            try:
+                connection, _ = server.accept()
+            except TimeoutError:
+                threads = {thread for thread in threads if thread.is_alive()}
+                continue
+            if not slots.acquire(blocking=False):
+                _send(
+                    connection,
+                    _error_response(
+                        ProtocolError(
+                            "server_busy", "too many incomplete requests are active"
+                        )
+                    ),
+                )
+                connection.close()
+                continue
+            thread = threading.Thread(
+                target=run_connection, args=(connection,), daemon=True
+            )
+            threads.add(thread)
+            thread.start()
+    finally:
+        server.close()
+        socket_path.unlink(missing_ok=True)
+
+
 def main() -> None:
     transcriber = load_transcriber()
     log(
         f"model ready (backend={BACKEND}, model={MODEL_NAME}, "
         f"language={LANGUAGE or 'auto-detect'})"
     )
-    SOCKET_PATH.unlink(missing_ok=True)
-    server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-    try:
-        server.bind(str(SOCKET_PATH))
-        os.chmod(SOCKET_PATH, 0o600)
-        server.listen(4)
-        log(f"listening on {SOCKET_PATH}")
-        while True:
-            connection, _ = server.accept()
-            try:
-                request = bytearray()
-                while not request.endswith(b"\n"):
-                    chunk = connection.recv(4096)
-                    if not chunk:
-                        break
-                    request.extend(chunk)
-                audio_path = request.decode(errors="replace").strip()
-                if not audio_path:
-                    continue
-                try:
-                    with LOCK:
-                        text = normalize(transcriber.transcribe(audio_path))
-                except Exception as exc:
-                    log(f"transcription failed: {exc}")
-                    text = f"__DICTATION_ERROR__:{type(exc).__name__}: {exc}"
-                connection.sendall(text.encode())
-            finally:
-                connection.close()
-    finally:
-        server.close()
-        SOCKET_PATH.unlink(missing_ok=True)
+    serve(transcriber)
 
 
 if __name__ == "__main__":

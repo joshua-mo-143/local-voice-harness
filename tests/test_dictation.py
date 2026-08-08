@@ -3,9 +3,10 @@ from __future__ import annotations
 import io
 import unittest
 from contextlib import redirect_stdout
+from pathlib import Path
 from unittest import mock
 
-from local_voice_harness import cli, config, dictation
+from local_voice_harness import cli, config, dictation, recording
 from local_voice_harness.errors import HarnessError
 
 
@@ -18,10 +19,63 @@ class DictationTests(unittest.TestCase):
         self.assertEqual(arguments.command, "dictate")
         self.assertEqual(arguments.dictation_command, "toggle")
 
+    def test_manual_end_passes_completed_generation_to_stt(self) -> None:
+        generation = Path("/runtime/voice-harness/recordings/request-generation.wav")
+        with (
+            mock.patch.object(cli, "stop_recording", return_value=generation),
+            mock.patch.object(cli, "transcribe", return_value="hello") as transcribe,
+            mock.patch.object(cli, "respond") as respond,
+        ):
+            cli.dispatch(cli.parser().parse_args(["end"]))
+
+        transcribe.assert_called_once_with(generation)
+        respond.assert_called_once_with("hello")
+
+    def test_manual_transcribe_retries_explicit_pending_generation(self) -> None:
+        generation = Path(
+            "/runtime/voice-harness/recordings/"
+            "request-0123456789abcdef0123456789abcdef.wav"
+        )
+        with (
+            mock.patch.object(
+                cli, "retry_generation", return_value=generation
+            ) as retry,
+            mock.patch.object(cli, "transcribe", return_value="hello") as transcribe,
+            mock.patch.object(cli, "respond"),
+        ):
+            cli.dispatch(
+                cli.parser().parse_args(["transcribe", "--generation", str(generation)])
+            )
+
+        retry.assert_called_once_with(generation)
+        transcribe.assert_called_once_with(generation)
+
     def test_begin_starts_dictation_recording(self) -> None:
         with mock.patch.object(dictation, "start_recording") as start:
             dictation.run("begin")
         start.assert_called_once_with()
+
+    def test_manual_and_dictation_start_with_cross_mode_conflicts(self) -> None:
+        with (
+            mock.patch.object(dictation, "_ensure_dictation_allowed"),
+            mock.patch.object(dictation.recorder, "start_recording") as start_dictation,
+            mock.patch.object(dictation, "notify"),
+        ):
+            dictation.start_recording()
+        self.assertEqual(
+            start_dictation.call_args.kwargs["conflicts"],
+            (dictation.MANUAL_PATHS,),
+        )
+
+        with (
+            mock.patch.object(recording.recorder, "start_recording") as start_manual,
+            mock.patch.object(recording, "notify"),
+        ):
+            recording.start_recording()
+        self.assertEqual(
+            start_manual.call_args.kwargs["conflicts"],
+            (recording.DICTATION_PATHS,),
+        )
 
     def test_toggle_starts_when_idle(self) -> None:
         with (
@@ -32,26 +86,49 @@ class DictationTests(unittest.TestCase):
         start.assert_called_once_with()
 
     def test_toggle_stops_transcribes_and_types_when_recording(self) -> None:
+        generation = Path("/runtime/dictation/recordings/recording-generation.wav")
         with (
             mock.patch.object(dictation, "recording_active", return_value=True),
-            mock.patch.object(dictation, "stop_recording") as stop,
+            mock.patch.object(
+                dictation, "stop_recording", return_value=generation
+            ) as stop,
             mock.patch.object(dictation, "_ensure_dictation_allowed"),
             mock.patch.object(dictation, "transcribe_and_type") as transcribe,
         ):
             dictation.run("toggle")
         stop.assert_called_once_with()
-        transcribe.assert_called_once_with()
+        transcribe.assert_called_once_with(generation)
 
     def test_transcribes_typed_dictation_audio(self) -> None:
+        generation = Path("/runtime/dictation/recordings/recording-generation.wav")
         with (
             mock.patch.object(
                 dictation, "transcribe", return_value="hello"
             ) as transcribe,
             mock.patch.object(dictation, "inject") as inject,
         ):
-            dictation.transcribe_and_type()
-        transcribe.assert_called_once_with(dictation.WAV_PATH)
+            dictation.transcribe_and_type(generation)
+        transcribe.assert_called_once_with(generation)
         inject.assert_called_once_with("hello")
+
+    def test_direct_transcribe_hands_off_before_stt(self) -> None:
+        generation = Path("/runtime/dictation/recordings/recording-generation.wav")
+        with (
+            mock.patch.object(dictation, "_ensure_dictation_allowed"),
+            mock.patch.object(
+                dictation.recorder,
+                "handoff_recording",
+                return_value=generation,
+            ) as handoff,
+            mock.patch.object(dictation, "transcribe_and_type") as transcribe,
+        ):
+            dictation.run("transcribe")
+
+        handoff.assert_called_once_with(
+            dictation.PATHS,
+            active_message="cannot transcribe while dictation is recording",
+        )
+        transcribe.assert_called_once_with(generation)
 
     def test_runelite_dictation_is_rejected(self) -> None:
         with (
