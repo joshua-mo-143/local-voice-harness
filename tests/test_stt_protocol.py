@@ -84,6 +84,7 @@ def _running_server(
     audio_path.parent.mkdir()
     dictation_path.parent.mkdir()
     stopped = threading.Event()
+    ready = threading.Event()
     with (
         mock.patch.object(server.config, "WAV_PATH", audio_path),
         mock.patch.object(server.config, "DICTATION_WAV_PATH", dictation_path),
@@ -92,13 +93,14 @@ def _running_server(
         thread = threading.Thread(
             target=server.serve,
             args=(transcriber,),
-            kwargs={"socket_path": socket_path, "stop_event": stopped},
+            kwargs={
+                "socket_path": socket_path,
+                "stop_event": stopped,
+                "ready_event": ready,
+            },
         )
         thread.start()
-        deadline = time.monotonic() + 2
-        while not socket_path.exists() and time.monotonic() < deadline:
-            time.sleep(0.01)
-        if not socket_path.exists():
+        if not ready.wait(2):
             raise RuntimeError("test STT server did not start")
         try:
             yield socket_path, audio_path
