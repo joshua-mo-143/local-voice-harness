@@ -405,7 +405,8 @@ def consistency_errors(project_root: Path = PROJECT_ROOT) -> list[str]:
     """Validate service paths and model defaults against package configuration/docs."""
 
     source_dir = project_root / SOURCE_RELATIVE
-    readme = (project_root / "README.md").read_text()
+    installation_docs = (project_root / "docs" / "installation.md").read_text()
+    configuration_docs = (project_root / "docs" / "configuration.md").read_text()
     metadata = tomllib.loads((project_root / "pyproject.toml").read_text())
     extras = metadata["project"]["optional-dependencies"]
     errors: list[str] = []
@@ -422,8 +423,10 @@ def consistency_errors(project_root: Path = PROJECT_ROOT) -> list[str]:
         if not model_path.startswith(expected_prefix):
             errors.append(f"LLM model path must be below {expected_prefix}")
         documented_path = model_path.replace("%h", "~", 1)
-        if documented_path not in readme:
-            errors.append(f"README does not document LLM model path {documented_path}")
+        if documented_path not in installation_docs:
+            errors.append(
+                f"installation guide does not document LLM model path {documented_path}"
+            )
     if alias_match is None or alias_match.group(1) != DEFAULT_LLM_MODEL:
         errors.append(
             f"LLM service alias must match configured default {DEFAULT_LLM_MODEL}"
@@ -436,8 +439,11 @@ def consistency_errors(project_root: Path = PROJECT_ROOT) -> list[str]:
         errors.append("dictation service default backend must be parakeet")
     if len(model) != 1:
         errors.append("dictation service has no default model")
-    elif model[0] not in readme:
-        errors.append(f"README does not document dictation model default {model[0]}")
+    elif model[0] not in configuration_docs:
+        errors.append(
+            "configuration reference does not document dictation model default "
+            f"{model[0]}"
+        )
     if not any(
         str(item).startswith("onnx-asr") for item in extras.get("dictation", [])
     ):

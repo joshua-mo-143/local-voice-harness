@@ -175,9 +175,15 @@ class ServiceUnitValidationTests(unittest.TestCase):
                 if name != "voice-harness-wake.service"
             )
         )
-        readme = (service_units.PROJECT_ROOT / "README.md").read_text()
+        configuration = (
+            service_units.PROJECT_ROOT / "docs" / "configuration.md"
+        ).read_text()
         documented_wake_variables = set(
-            re.findall(r"^\| `([A-Z0-9_]+)` .*\| Wake drop-in \|$", readme, re.M)
+            re.findall(
+                r"^\| `([A-Z0-9_]+)` .*\| Wake drop-in \|$",
+                configuration,
+                re.M,
+            )
         )
         self.assertEqual(
             documented_wake_variables,
