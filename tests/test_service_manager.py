@@ -84,15 +84,15 @@ class ServiceManagementTests(unittest.TestCase):
     def test_hardening_docs_require_dictation_replacement_and_audit(self) -> None:
         root = service_manager.PROJECT_ROOT
         hardening = (root / "docs/service-hardening.md").read_text()
-        readme = (root / "README.md").read_text()
+        installation = (root / "docs/installation.md").read_text()
 
-        for text in (hardening, readme):
+        for text in (hardening, installation):
             self.assertIn(
                 "voice-harness services install --force --replace-dictation",
                 text,
             )
             self.assertIn("voice-harness services audit", text)
-        self.assertIn("intentionally replaces the standalone unit", readme)
+        self.assertIn("intentionally replaces the standalone unit", installation)
 
     def test_packaged_systemd_resources_are_available(self) -> None:
         with mock.patch.object(
@@ -119,7 +119,7 @@ class ServiceManagementTests(unittest.TestCase):
     def test_llm_model_matches_service_and_documentation(self) -> None:
         project_root = service_manager.PROJECT_ROOT
         unit = (project_root / "systemd/user/voice-harness-llm.service").read_text()
-        readme = (project_root / "README.md").read_text()
+        installation = (project_root / "docs/installation.md").read_text()
         match = re.search(r"--model \S*/(?P<filename>\S+\.gguf)\b", unit)
 
         self.assertIsNotNone(match)
@@ -127,14 +127,14 @@ class ServiceManagementTests(unittest.TestCase):
         filename = match.group("filename")
         self.assertIn(f"--alias {config.LLM_MODEL}", unit)
         self.assertEqual(
-            set(re.findall(r"Qwen3\.5-[A-Za-z0-9_.-]+\.gguf", readme)),
+            set(re.findall(r"Qwen3\.5-[A-Za-z0-9_.-]+\.gguf", installation)),
             {filename},
         )
 
     def test_dictation_defaults_have_documented_installable_backends(self) -> None:
         project_root = service_manager.PROJECT_ROOT
         unit = (project_root / "systemd/user/dictation.service").read_text()
-        readme = (project_root / "README.md").read_text()
+        configuration = (project_root / "docs/configuration.md").read_text()
         metadata = tomllib.loads((project_root / "pyproject.toml").read_text())
         extras = metadata["project"]["optional-dependencies"]
 
@@ -143,7 +143,7 @@ class ServiceManagementTests(unittest.TestCase):
             f"Environment=DICTATION_MODEL={stt_server.PARAKEET_DEFAULT_MODEL}",
             unit,
         )
-        self.assertIn(stt_server.PARAKEET_DEFAULT_MODEL, readme)
+        self.assertIn(stt_server.PARAKEET_DEFAULT_MODEL, configuration)
         self.assertTrue(
             any(dependency.startswith("onnx-asr") for dependency in extras["dictation"])
         )
