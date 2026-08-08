@@ -232,7 +232,7 @@ class GitHubClientTests(unittest.TestCase):
             verify.assert_called_once()
             upstream.assert_not_called()
 
-    def test_provision_pull_request_checks_out_in_place(self) -> None:
+    def test_provision_pull_request_leaves_shared_clone_unchanged(self) -> None:
         client = GitHubClient()
         source = _repository("source/project")
         checkout = Path("/tmp/src/source/project")
@@ -243,18 +243,16 @@ class GitHubClientTests(unittest.TestCase):
             mock.patch.object(
                 client, "ensure_repository_clone", return_value=checkout
             ) as clone,
-            mock.patch.object(
-                client, "checkout_pull_request", return_value="feature/cache"
-            ) as checkout_pr,
+            mock.patch.object(client, "checkout_pull_request") as checkout_pr,
         ):
             provisioned = client.provision_pull_request("source/project", 42)
 
         inspect.assert_called_once_with("source/project")
         clone.assert_called_once_with(source)
-        checkout_pr.assert_called_once_with(checkout, 42)
+        checkout_pr.assert_not_called()
         self.assertEqual(provisioned.checkout, checkout)
         self.assertEqual(provisioned.number, 42)
-        self.assertEqual(provisioned.branch, "feature/cache")
+        self.assertIsNone(provisioned.branch)
 
     def test_provision_pull_request_rejects_non_positive_number(self) -> None:
         client = GitHubClient()
@@ -279,11 +277,24 @@ class GitHubClientTests(unittest.TestCase):
             return _completed("feature/cache\n")
 
         with mock.patch.object(client, "_run", side_effect=run):
-            branch = client.checkout_pull_request(checkout, 42)
+            branch = client.checkout_pull_request(
+                checkout, 42, branch="voice/github-pr-123456789abc"
+            )
 
         self.assertEqual(branch, "feature/cache")
         pr_command, pr_cwd = next(call for call in calls if "checkout" in call[0])
-        self.assertEqual(pr_command, ["gh", "pr", "checkout", "42"])
+        self.assertEqual(
+            pr_command,
+            [
+                "gh",
+                "pr",
+                "checkout",
+                "42",
+                "--branch",
+                "voice/github-pr-123456789abc",
+                "--force",
+            ],
+        )
         self.assertEqual(pr_cwd, checkout)
 
     def test_remote_repository_supports_https_and_ssh(self) -> None:
