@@ -193,7 +193,7 @@ class ServiceUnitValidationTests(unittest.TestCase):
         )
         self.assertEqual(
             policy["voice-harness-tts.service"]["RestrictAddressFamilies"],
-            "AF_UNIX AF_NETLINK",
+            "AF_UNIX AF_INET AF_INET6 AF_NETLINK",
         )
         self.assertEqual(
             policy["dictation.service"]["ReadWritePaths"],

@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import math
 import os
 import re
+import tomllib
 from collections.abc import Mapping
+from dataclasses import dataclass
 from pathlib import Path
 
 PACKAGE_ROOT = Path(__file__).resolve().parent
@@ -52,6 +55,194 @@ def vocabulary_path(
     home: Path | None = None,
 ) -> Path:
     return xdg_config_home(environment, home=home) / "voice-harness" / "vocabulary.json"
+
+
+class BackendConfigurationError(ValueError):
+    """A backend selector, model, endpoint, or timeout is invalid."""
+
+
+@dataclass(frozen=True)
+class BackendSettings:
+    llm_provider: str
+    llm_model: str
+    llm_endpoint: str
+    llm_timeout: float
+    tts_provider: str
+    tts_model: str
+    tts_voice: str
+    tts_speed: float
+    tts_endpoint: str
+    tts_timeout: float
+
+
+def backend_config_path(
+    environment: Mapping[str, str] = os.environ,
+    *,
+    home: Path | None = None,
+) -> Path:
+    return xdg_config_home(environment, home=home) / "voice-harness" / "backends.toml"
+
+
+def _backend_value(
+    section: object,
+    key: str,
+    default: object,
+    environment: Mapping[str, str],
+    environment_key: str,
+) -> object:
+    if environment_key in environment:
+        return environment[environment_key]
+    if isinstance(section, dict):
+        return section.get(key, default)
+    return default
+
+
+def _provider(value: object, *, label: str) -> str:
+    provider = str(value).strip().casefold()
+    if provider not in {"local", "venice"}:
+        raise BackendConfigurationError(f"{label} provider must be local or venice")
+    return provider
+
+
+def _nonempty(value: object, *, label: str) -> str:
+    text = str(value).strip()
+    if not text:
+        raise BackendConfigurationError(f"{label} must not be empty")
+    return text
+
+
+def _positive_float(value: object, *, label: str) -> float:
+    try:
+        number = float(str(value))
+    except (TypeError, ValueError) as exc:
+        raise BackendConfigurationError(f"{label} must be a positive number") from exc
+    if not math.isfinite(number) or number <= 0:
+        raise BackendConfigurationError(f"{label} must be a positive number")
+    return number
+
+
+def _tts_speed(value: object) -> float:
+    speed = _positive_float(value, label="TTS speed")
+    if speed > 4:
+        raise BackendConfigurationError("TTS speed must be between 0.25 and 4")
+    if speed < 0.25:
+        raise BackendConfigurationError("TTS speed must be between 0.25 and 4")
+    return speed
+
+
+def load_backend_settings(
+    environment: Mapping[str, str] = os.environ,
+    *,
+    path: Path | None = None,
+    home: Path | None = None,
+) -> BackendSettings:
+    config_path = path or backend_config_path(environment, home=home)
+    try:
+        raw = tomllib.loads(config_path.read_text()) if config_path.exists() else {}
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
+        raise BackendConfigurationError(
+            f"could not read backend configuration {config_path}: {exc}"
+        ) from exc
+    if not isinstance(raw, dict):
+        raise BackendConfigurationError("backend configuration must be a TOML table")
+    llm = raw.get("llm", {})
+    tts = raw.get("tts", {})
+    venice = raw.get("venice", {})
+    if not all(isinstance(section, dict) for section in (llm, tts, venice)):
+        raise BackendConfigurationError(
+            "llm, tts, and venice configuration entries must be TOML tables"
+        )
+    if "api_key_file" in venice or "VOICE_HARNESS_VENICE_API_KEY_FILE" in environment:
+        raise BackendConfigurationError(
+            "file-based Venice credentials are unsupported; run "
+            "`voice-harness credentials set`"
+        )
+
+    llm_provider = _provider(
+        _backend_value(
+            llm, "provider", "local", environment, "VOICE_HARNESS_LLM_PROVIDER"
+        ),
+        label="LLM",
+    )
+    tts_provider = _provider(
+        _backend_value(
+            tts, "provider", "local", environment, "VOICE_HARNESS_TTS_PROVIDER"
+        ),
+        label="TTS",
+    )
+    return BackendSettings(
+        llm_provider=llm_provider,
+        llm_model=_nonempty(
+            _backend_value(
+                llm,
+                "model",
+                "qwen3.5-4b" if llm_provider == "local" else "venice-uncensored",
+                environment,
+                "VOICE_HARNESS_LLM_MODEL",
+            ),
+            label="LLM model",
+        ),
+        llm_endpoint=_nonempty(
+            _backend_value(
+                llm,
+                "endpoint",
+                (
+                    "http://127.0.0.1:8090/v1/chat/completions"
+                    if llm_provider == "local"
+                    else "https://api.venice.ai/api/v1/chat/completions"
+                ),
+                environment,
+                "VOICE_HARNESS_LLM_ENDPOINT",
+            ),
+            label="LLM endpoint",
+        ),
+        llm_timeout=_positive_float(
+            _backend_value(
+                llm, "timeout", 60, environment, "VOICE_HARNESS_LLM_TIMEOUT"
+            ),
+            label="LLM timeout",
+        ),
+        tts_provider=tts_provider,
+        tts_model=_nonempty(
+            _backend_value(
+                tts,
+                "model",
+                "chatterbox-turbo" if tts_provider == "local" else "tts-kokoro",
+                environment,
+                "VOICE_HARNESS_TTS_MODEL",
+            ),
+            label="TTS model",
+        ),
+        tts_voice=_nonempty(
+            _backend_value(
+                tts,
+                "voice",
+                "default" if tts_provider == "local" else "af_sky",
+                environment,
+                "VOICE_HARNESS_TTS_VOICE",
+            ),
+            label="TTS voice",
+        ),
+        tts_speed=_tts_speed(
+            _backend_value(tts, "speed", 1, environment, "VOICE_HARNESS_TTS_SPEED")
+        ),
+        tts_endpoint=_nonempty(
+            _backend_value(
+                tts,
+                "endpoint",
+                "https://api.venice.ai/api/v1/audio/speech",
+                environment,
+                "VOICE_HARNESS_TTS_ENDPOINT",
+            ),
+            label="TTS endpoint",
+        ),
+        tts_timeout=_positive_float(
+            _backend_value(
+                tts, "timeout", 120, environment, "VOICE_HARNESS_TTS_TIMEOUT"
+            ),
+            label="TTS timeout",
+        ),
+    )
 
 
 def systemd_state_directory(

@@ -97,7 +97,7 @@ SERVICE_SECURITY_POLICY = {
         "ProtectHome": "read-only",
         "ReadWritePaths": "%t",
         "RestrictRealtime": "true",
-        "RestrictAddressFamilies": "AF_UNIX AF_NETLINK",
+        "RestrictAddressFamilies": "AF_UNIX AF_INET AF_INET6 AF_NETLINK",
         "RuntimeDirectory": "voice-harness voice-harness-tts",
         "RuntimeDirectoryPreserve": "yes",
         "TasksMax": "512",

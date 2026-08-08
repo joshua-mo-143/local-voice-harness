@@ -52,17 +52,17 @@ def synthesize_and_play(text: str) -> dict[str, object]:
         try:
             response = unix_request(TTS_SOCKET, request, timeout=120)
         except OSError as exc:
-            raise HarnessError(f"Chatterbox request failed: {exc}") from exc
+            raise HarnessError(f"TTS request failed: {exc}") from exc
         try:
             decoded = json.loads(response)
         except (json.JSONDecodeError, UnicodeDecodeError) as exc:
-            raise HarnessError("Chatterbox returned an invalid response") from exc
+            raise HarnessError("TTS backend returned an invalid response") from exc
         if not isinstance(decoded, dict):
-            raise HarnessError("Chatterbox returned an invalid response")
+            raise HarnessError("TTS backend returned an invalid response")
         result: dict[str, object] = decoded
         if not result.get("ok"):
             raise HarnessError(
-                f"Chatterbox failed: {result.get('error', 'unknown error')}"
+                f"TTS backend failed: {result.get('error', 'unknown error')}"
             )
         result.update(
             {
@@ -264,7 +264,7 @@ class StreamingPlayback:
                 if done:
                     if worker is None:
                         raise HarnessError(
-                            "Chatterbox stream completed before playback started"
+                            "TTS stream completed before playback started"
                         )
                     if not sentinel_sent:
                         chunks.put(None)
@@ -287,15 +287,15 @@ class StreamingPlayback:
                     if self.cancelled.is_set():
                         break
                     if buffer:
-                        raise HarnessError("Chatterbox returned an incomplete event")
+                        raise HarnessError("TTS backend returned an incomplete event")
                     if not done:
-                        raise HarnessError("Chatterbox stream ended before completion")
+                        raise HarnessError("TTS stream ended before completion")
                     break
                 buffer.extend(data)
                 for event in self._events_from_buffer(buffer):
                     if not event.get("ok"):
                         raise HarnessError(
-                            f"Chatterbox failed: {event.get('error', 'unknown error')}"
+                            f"TTS backend failed: {event.get('error', 'unknown error')}"
                         )
                     kind = event.get("event")
                     if kind == "start":
@@ -314,7 +314,7 @@ class StreamingPlayback:
                     elif kind == "done":
                         done = event
                     else:
-                        raise HarnessError(f"unknown Chatterbox stream event: {kind}")
+                        raise HarnessError(f"unknown TTS stream event: {kind}")
             if not sentinel_sent:
                 chunks.put(None)
             if worker is not None:

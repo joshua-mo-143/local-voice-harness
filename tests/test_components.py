@@ -5,11 +5,13 @@ import threading
 import time
 import unittest
 import urllib.error
+from dataclasses import replace
 from pathlib import Path
 from types import TracebackType
 from unittest import mock
 
 from local_voice_harness import components
+from local_voice_harness.config import load_backend_settings
 from local_voice_harness.errors import HarnessError
 
 
@@ -78,6 +80,30 @@ class ComponentReadinessTests(unittest.TestCase):
             self.assertRaisesRegex(HarnessError, "within 0.25 seconds"),
         ):
             components.start_components(timeout=0.25)
+
+    def test_venice_starts_only_tts_service_and_uses_key_readiness(self) -> None:
+        settings = replace(
+            load_backend_settings({}),
+            llm_provider="venice",
+        )
+        with (
+            mock.patch.object(
+                components, "load_backend_settings", return_value=settings
+            ),
+            mock.patch.object(
+                components, "get_venice_api_key", return_value="secret"
+            ) as get_key,
+            mock.patch.object(components.subprocess, "run") as run,
+            mock.patch.object(components, "socket_ready", return_value=True),
+        ):
+            self.assertTrue(components.llm_ready())
+            components.start_components()
+
+        get_key.assert_called_with()
+        run.assert_called_once_with(
+            ["systemctl", "--user", "start", "voice-harness-tts.service"],
+            check=True,
+        )
 
     def test_stop_is_best_effort(self) -> None:
         with mock.patch.object(components.subprocess, "run") as run:

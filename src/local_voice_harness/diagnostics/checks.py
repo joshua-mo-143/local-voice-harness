@@ -21,7 +21,10 @@ from ..config import (
     STT_SOCKET,
     SYSTEMD_USER_DIR,
     TTS_SOCKET,
+    BackendConfigurationError,
+    load_backend_settings,
 )
+from ..credentials import CredentialError, get_venice_api_key
 from ..errors import HarnessError
 from ..integrations.herdr import HERDR_BIN, HerdrClient, HerdrError
 from ..ipc import socket_ready
@@ -139,8 +142,15 @@ def _remove_stale_socket_repair(path: Path) -> Repair:
 
 
 def check_required_executables() -> list[CheckResult]:
+    try:
+        settings = load_backend_settings()
+    except BackendConfigurationError:
+        settings = None
     results: list[CheckResult] = []
     for name, purpose in REQUIRED_EXECUTABLES:
+        if name == "llama-server" and settings is not None:
+            if settings.llm_provider == "venice":
+                continue
         location = _which(name)
         if location is not None:
             results.append(
@@ -162,6 +172,34 @@ def check_required_executables() -> list[CheckResult]:
                 )
             )
     return results
+
+
+def check_backend_configuration() -> list[CheckResult]:
+    try:
+        settings = load_backend_settings()
+        if "venice" in {settings.llm_provider, settings.tts_provider}:
+            get_venice_api_key()
+    except (BackendConfigurationError, CredentialError) as exc:
+        return [
+            CheckResult(
+                name="configuration:backends",
+                category="configuration",
+                severity=Severity.FATAL,
+                detail=str(exc),
+                suggestion="see README backend configuration",
+            )
+        ]
+    return [
+        CheckResult(
+            name="configuration:backends",
+            category="configuration",
+            severity=Severity.OK,
+            detail=(
+                f"LLM provider={settings.llm_provider} model={settings.llm_model}; "
+                f"TTS provider={settings.tts_provider} model={settings.tts_model}"
+            ),
+        )
+    ]
 
 
 def check_optional_executables() -> list[CheckResult]:
@@ -298,6 +336,18 @@ def check_python_environments() -> list[CheckResult]:
 
 
 def check_model_file() -> list[CheckResult]:
+    try:
+        if load_backend_settings().llm_provider == "venice":
+            return [
+                CheckResult(
+                    name="model:qwen",
+                    category="models",
+                    severity=Severity.OK,
+                    detail="local Qwen model is not required by the Venice LLM backend",
+                )
+            ]
+    except BackendConfigurationError:
+        pass
     if MODEL_FILE.is_file():
         try:
             size_gb = MODEL_FILE.stat().st_size / 1024**3
@@ -335,21 +385,37 @@ def check_model_caches() -> list[CheckResult]:
                 detail=f"Hugging Face cache present at {HUGGINGFACE_CACHE}",
             )
         ]
+    try:
+        local_tts = load_backend_settings().tts_provider == "local"
+    except BackendConfigurationError:
+        local_tts = True
+    cache_users = (
+        "Chatterbox runs offline and Parakeet downloads on first use"
+        if local_tts
+        else "Parakeet downloads on first use"
+    )
     return [
         CheckResult(
             name="cache:huggingface",
             category="models",
             severity=Severity.WARNING,
-            detail=(
-                f"Hugging Face cache {HUGGINGFACE_CACHE} is absent; Chatterbox runs "
-                "offline (HF_HUB_OFFLINE=1) and Parakeet downloads on first use"
-            ),
+            detail=(f"Hugging Face cache {HUGGINGFACE_CACHE} is absent; {cache_users}"),
             suggestion="see README steps 2 and 3 to pre-download the model caches",
         )
     ]
 
 
 def check_cuda() -> list[CheckResult]:
+    try:
+        settings = load_backend_settings()
+    except BackendConfigurationError:
+        settings = None
+    selected_models = ["STT"]
+    if settings is None or settings.llm_provider == "local":
+        selected_models.append("LLM")
+    if settings is None or settings.tts_provider == "local":
+        selected_models.append("TTS")
+    model_label = "/".join(selected_models)
     if _which("nvidia-smi") is None:
         return [
             CheckResult(
@@ -357,7 +423,7 @@ def check_cuda() -> list[CheckResult]:
                 category="gpu",
                 severity=Severity.WARNING,
                 detail=(
-                    "nvidia-smi not found; GPU acceleration for STT/LLM/TTS is "
+                    f"nvidia-smi not found; GPU acceleration for {model_label} is "
                     "unavailable and CPU fallback is substantially slower"
                 ),
                 suggestion=INSTALL_HINTS.get("nvidia-smi"),
@@ -383,8 +449,8 @@ def check_cuda() -> list[CheckResult]:
             category="gpu",
             severity=Severity.OK,
             detail=(
-                "nvidia-smi reports a working GPU; the LLM service is configured "
-                "for device CUDA0 (llama-server --list-devices to confirm)"
+                f"nvidia-smi reports a working GPU for {model_label}; "
+                "the local LLM service uses CUDA0 when selected"
             ),
         )
     ]
@@ -578,6 +644,10 @@ def _socket_result(
 
 
 def check_runtime_sockets() -> list[CheckResult]:
+    try:
+        settings = load_backend_settings()
+    except BackendConfigurationError:
+        settings = None
     results = [
         _socket_result(
             name="socket:stt",
@@ -588,7 +658,7 @@ def check_runtime_sockets() -> list[CheckResult]:
         ),
         _socket_result(
             name="socket:tts",
-            label="TTS (Chatterbox)",
+            label=(f"TTS ({settings.tts_provider})" if settings is not None else "TTS"),
             socket_path=TTS_SOCKET,
             unit="voice-harness-tts.service",
             always_on=False,
@@ -596,13 +666,17 @@ def check_runtime_sockets() -> list[CheckResult]:
     ]
 
     llm_unit = "voice-harness-llm.service"
-    if llm_ready():
+    if settings is not None and llm_ready():
         results.append(
             CheckResult(
                 name="socket:llm",
                 category="runtime",
                 severity=Severity.OK,
-                detail="LLM health endpoint is responding on 127.0.0.1:8090",
+                detail=(
+                    "Venice LLM credentials are available"
+                    if settings is not None and settings.llm_provider == "venice"
+                    else "LLM health endpoint is responding on 127.0.0.1:8090"
+                ),
             )
         )
     else:
@@ -954,6 +1028,7 @@ def check_mcp_linear() -> list[CheckResult]:
 
 
 ALL_CHECKS: tuple[Check, ...] = (
+    check_backend_configuration,
     check_required_executables,
     check_optional_executables,
     check_focus_automation,

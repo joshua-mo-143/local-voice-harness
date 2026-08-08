@@ -69,5 +69,31 @@ class JobsCliTests(unittest.TestCase):
         )
 
 
+class CredentialsCliTests(unittest.TestCase):
+    def test_set_prompts_without_accepting_key_as_argument(self) -> None:
+        args = cli.parser().parse_args(["credentials", "set"])
+        with (
+            mock.patch.object(cli.getpass, "getpass", return_value="venice-secret"),
+            mock.patch.object(cli, "store_venice_api_key") as store,
+            mock.patch("builtins.print"),
+        ):
+            cli.dispatch(args)
+
+        store.assert_called_once_with("venice-secret")
+
+    def test_status_and_delete_dispatch_to_secret_service(self) -> None:
+        for action, function_name in (
+            ("status", "get_venice_api_key"),
+            ("delete", "delete_venice_api_key"),
+        ):
+            with (
+                self.subTest(action=action),
+                mock.patch.object(cli, function_name) as function,
+                mock.patch("builtins.print"),
+            ):
+                cli.dispatch(cli.parser().parse_args(["credentials", action]))
+                function.assert_called_once_with()
+
+
 if __name__ == "__main__":
     unittest.main()

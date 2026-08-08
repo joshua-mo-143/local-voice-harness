@@ -16,7 +16,7 @@ from pathlib import Path
 
 from .. import recorder
 from ..browser_context import request_context
-from ..components import llm_ready, start_components, stop_components
+from ..components import start_components, stop_components
 from ..config import (
     DEFAULT_SOURCE,
     DICTATION_PID_PATH,
@@ -30,6 +30,7 @@ from ..config import (
     RECORDING_LOCK,
     STATE_DIR,
     WAV_PATH,
+    load_backend_settings,
 )
 from ..cursor import service as cursor_service
 from ..cursor.delivery import (
@@ -330,26 +331,10 @@ class WakeConversationDaemon:
         def activate() -> None:
             try:
                 with self.component_lock:
-                    subprocess.run(
-                        [
-                            "systemctl",
-                            "--user",
-                            "start",
-                            "voice-harness-llm.service",
-                            "voice-harness-tts.service",
-                        ],
-                        check=True,
-                    )
-                    deadline = time.monotonic() + 30
-                    while time.monotonic() < deadline and not llm_ready():
-                        time.sleep(0.1)
-                    if not llm_ready():
-                        raise HarnessError(
-                            "Qwen did not become ready within 30 seconds"
-                        )
-                    qwen_turn("Reply with only OK. Do not call a tool.")
                     start_components()
-                    log("Qwen tool graph and Chatterbox are warm")
+                    if load_backend_settings().llm_provider == "local":
+                        qwen_turn("Reply with only OK. Do not call a tool.")
+                    log("LLM tool graph and TTS backend are warm")
             except Exception as exc:
                 self.activation_error = exc
 
@@ -486,6 +471,94 @@ class WakeConversationDaemon:
         if not batch:
             return {}, interruption
         return batch[-1][0], interruption
+
+    def play_streamed_response(
+        self,
+        generate: Callable[
+            [Callable[[str], None]],
+            tuple[str, str | None],
+        ],
+    ) -> tuple[str, str | None, dict[str, object], BargeIn | None]:
+        condition = threading.Condition()
+        finished = False
+        stopped = False
+        chunks: list[str] = []
+        played: list[dict[str, object]] = []
+        playback_errors: list[BaseException] = []
+        interruption: BargeIn | None = None
+
+        def on_text_chunk(text: str) -> None:
+            nonlocal stopped
+            text = text.strip()
+            if not text:
+                return
+            with condition:
+                if stopped:
+                    return
+                chunks.append(text)
+                self.playback_queue.enqueue(PlaybackRequest(text=text))
+                condition.notify()
+
+        def player() -> None:
+            nonlocal stopped, interruption
+            try:
+                while True:
+                    with condition:
+                        condition.wait_for(
+                            lambda: len(self.playback_queue) > 0 or finished
+                        )
+                        if len(self.playback_queue) == 0 and finished:
+                            return
+                        response_so_far = " ".join(chunks)
+                    batch, current_interruption = self._drain_playback_queue(
+                        response_so_far
+                    )
+                    played.extend(result for result, _interrupted, _request in batch)
+                    if current_interruption is not None:
+                        interruption = current_interruption
+                        with condition:
+                            stopped = True
+                            self.playback_queue.clear()
+                        return
+            except BaseException as exc:
+                playback_errors.append(exc)
+                with condition:
+                    stopped = True
+                    self.playback_queue.clear()
+
+        playback_thread = threading.Thread(
+            target=player,
+            name="voice-streamed-playback",
+            daemon=True,
+        )
+        playback_thread.start()
+        try:
+            response, next_cursor_session = generate(on_text_chunk)
+        finally:
+            with condition:
+                finished = True
+                condition.notify_all()
+            playback_thread.join()
+        if playback_errors:
+            raise playback_errors[0]
+        if not chunks and interruption is None:
+            playback, interruption = self.play_response(response)
+            return (
+                response,
+                next_cursor_session,
+                playback,
+                interruption,
+            )
+        played_text = " ".join(
+            str(result.get("played_text") or "").strip() for result in played
+        ).strip()
+        playback = {
+            "ok": True,
+            "stage": "tts",
+            "interrupted": interruption is not None,
+            "played_text": played_text,
+        }
+        return response, next_cursor_session, playback, interruption
 
     def _job_response_text(self, job: CursorJob) -> str:
         if job.status == JobStatus.COMPLETED:
@@ -653,6 +726,9 @@ class WakeConversationDaemon:
             next_cursor_session = self.cursor_session
             next_history = list(self.history)
             remember_response = False
+            streamed_playback = False
+            playback: dict[str, object] = {}
+            interruption: BargeIn | None = None
             context = request_context(text)
             route = route_intent(text, context, cursor_session=self.cursor_session)
             fork_requested = decide_fork_intent(text) == ForkIntent.AFFIRMATIVE
@@ -745,18 +821,38 @@ class WakeConversationDaemon:
                     delivery_claims=delivery_claims,
                 )
             else:
-                response, next_cursor_session = qwen_turn(
-                    context.text,
-                    self.history,
-                    self.cursor_session,
-                    **github_arguments,
-                    trusted_utterance=text,
-                    delivery_claims=delivery_claims,
-                )
+                if load_backend_settings().llm_provider == "venice":
+                    (
+                        response,
+                        next_cursor_session,
+                        playback,
+                        interruption,
+                    ) = self.play_streamed_response(
+                        lambda on_text_chunk: qwen_turn(
+                            context.text,
+                            self.history,
+                            self.cursor_session,
+                            **github_arguments,
+                            trusted_utterance=text,
+                            delivery_claims=delivery_claims,
+                            on_text_chunk=on_text_chunk,
+                        )
+                    )
+                    streamed_playback = True
+                else:
+                    response, next_cursor_session = qwen_turn(
+                        context.text,
+                        self.history,
+                        self.cursor_session,
+                        **github_arguments,
+                        trusted_utterance=text,
+                        delivery_claims=delivery_claims,
+                    )
                 remember_response = True
             print(f"Assistant: {response}", flush=True)
             cursor_session_before_playback = self.cursor_session
-            playback, interruption = self.play_response(response)
+            if not streamed_playback:
+                playback, interruption = self.play_response(response)
             if remember_response:
                 played_text = (
                     str(playback.get("played_text") or "").strip()

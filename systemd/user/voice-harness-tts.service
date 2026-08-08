@@ -1,5 +1,5 @@
 [Unit]
-Description=Local voice harness Chatterbox Turbo server
+Description=Local voice harness TTS server
 After=graphical-session.target
 StartLimitIntervalSec=60
 StartLimitBurst=5
@@ -43,7 +43,7 @@ LockPersonality=true
 RestrictNamespaces=true
 RestrictRealtime=true
 RestrictSUIDSGID=true
-RestrictAddressFamilies=AF_UNIX AF_NETLINK
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
 SystemCallArchitectures=native
 
 [Install]

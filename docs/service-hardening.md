@@ -11,7 +11,7 @@ external tools safe to run on a hostile multi-user machine.
 | --- | --- | --- | --- | --- |
 | `dictation` | Reads its project, virtual environment, optional backend config, and request WAVs. Home is read-only except the managed Hugging Face cache. `%t` remains writable to preserve the standalone-compatible `%t/dictation.sock`. | Unix sockets, IPv4/IPv6 for Hugging Face downloads, and netlink for CUDA discovery. | CUDA devices stay visible. The application does not intentionally use PipeWire or desktop APIs, but AF_UNIX and `%t` mean those same-user session endpoints are not an isolation boundary. | The launcher replaces itself with the server. Temporary and CUDA cache files use `%t/dictation`; the compatibility socket remains mode 0600 at `%t/dictation.sock`. |
 | `voice-harness-llm` | Reads `llama-server` and the GGUF under the project. Home is read-only. Its writable CUDA cache is `%t/voice-harness-llm/cuda-cache`. | Unix, IPv4, and netlink only. `llama-server` is required to bind `127.0.0.1:8090`. AF_UNIX still permits connections to accessible same-user session sockets. | NVIDIA devices remain visible; the service does not intentionally use audio or desktop APIs. | No application subprocesses. Its only managed writable runtime directory is mode 0700. |
-| `voice-harness-tts` | Reads both project environments, the offline Hugging Face cache, and an optional reference WAV. Home is read-only; generated audio uses `%t/voice-harness`, the fixed compatibility socket is `%t/voice-harness-tts.sock`, and the CUDA cache is `%t/voice-harness-tts/cuda-cache`. | Unix sockets and netlink for CUDA discovery; Hugging Face is explicitly offline. AF_UNIX and writable `%t` remain part of the trusted same-user session boundary. | NVIDIA devices remain visible. PipeWire playback is performed by clients, not this server. | Uses request threads but no application subprocesses. Separate mode-0700 `voice-harness` and `voice-harness-tts` runtime directories are preserved across on-demand stops. |
+| `voice-harness-tts` | Reads both project environments, backend configuration, the offline Hugging Face cache, and an optional reference WAV. Home is read-only; generated audio uses `%t/voice-harness`, the fixed compatibility socket is `%t/voice-harness-tts.sock`, and the CUDA cache is `%t/voice-harness-tts/cuda-cache`. | Unix sockets include the desktop Secret Service for Venice credentials; IPv4/IPv6 permit the optional Venice backend, and netlink permits CUDA discovery. Local Chatterbox keeps Hugging Face explicitly offline. | NVIDIA devices remain visible. PipeWire playback is performed by clients, not this server. | Uses request threads and invokes an installed Secret Service client for Venice credential lookup. Separate mode-0700 `voice-harness` and `voice-harness-tts` runtime directories are preserved across on-demand stops. |
 | `voice-harness-wake` | Reads and writes repositories, worktrees, durable job state in the mode-0700 `StateDirectory=voice-harness`, GitHub/Cursor/Herdr configuration, and user-selected clone destinations. Broad home access is therefore intentional. System paths remain read-only. | Unix sockets, IPv4/IPv6, and netlink support local model services, GitHub/Git/Herdr, DNS, and network inspection by child tools. | PipeWire and desktop/compositor sockets remain usable. Direct devices are hidden because `pw-record`/`pw-play` use PipeWire rather than ALSA. A private `/tmp` is not used because X11 may rely on `/tmp/.X11-unix`. | Starts audio tools, desktop helpers, `gh`, Git, Herdr/systemd commands, and detached job workers. It receives the largest task allowance and shares the mode-0700 voice runtime directory; worker logs remain transient there. |
 
 All services use a `0077` umask, an empty capability set, no-new-privileges,
@@ -39,6 +39,13 @@ absolute paths, and GitHub-root containment are validated. Unknown keys and proc
 injection or service-boundary overrides such as `LD_PRELOAD`, socket/cache/runtime
 paths, and LLM host/bind controls fail the audit.
 
+Venice credentials are stored in the desktop Secret Service through `oo7-cli` or
+libsecret's `secret-tool`, not in an application file, environment variable, command
+argument, or unit. Storage sends the key over standard input; status and diagnostic output never
+print it. Secret Service protects the key at rest and can lock it with the desktop
+session, but retrieval necessarily places it briefly in process memory and does not
+isolate it from a process already controlling the same unlocked user session.
+
 The memory high/max pairs are 4/6 GB for dictation, 6/8 GB for llama.cpp, 8/10 GB for
 TTS, and 3/4 GB for wake and its workers. The 28 GB aggregate maxima leave room on
 the tested 32 GB host for the desktop, PipeWire, Herdr, and the kernel. `TasksMax` is
@@ -61,8 +68,9 @@ use a Unix-socket credential-checking proxy or another per-user transport there.
 
 ## Residual risks and host verification
 
-- CUDA, ONNX Runtime, Chatterbox, llama.cpp, and NVIDIA driver behavior cannot be
-  exercised in CI. All CUDA cold-start claims remain pending human host verification.
+- CUDA, ONNX Runtime, Chatterbox, llama.cpp, NVIDIA driver behavior, and live Venice
+  API behavior cannot be exercised in CI. CUDA cold starts and remote LLM/TTS latency
+  remain pending human host verification.
 - The dictation cache is writable because a clean installation downloads its model.
   Pre-provisioning a read-only cache would permit a narrower policy.
 - The wake service retains broad same-user authority by design. Its filesystem,
@@ -130,9 +138,6 @@ systemd-run --user --wait --collect --pipe --unit=voice-harness-write-probe \
   --property=ProtectSystem=strict --property=ProtectHome=read-only \
   /usr/bin/python -c 'open("/etc/voice-harness-probe", "w")'
 
-systemd-run --user --wait --collect --pipe --unit=voice-harness-tts-af-probe \
-  --property='RestrictAddressFamilies=AF_UNIX AF_NETLINK' \
-  /usr/bin/python -c 'import socket; socket.socket(socket.AF_INET)'
 ```
 
 For CUDA cold starts, stop the model services, remove only their disposable runtime
