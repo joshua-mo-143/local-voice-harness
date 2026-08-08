@@ -230,6 +230,11 @@ should I use?
             mock.patch.object(client, "find_agent", return_value=None),
             mock.patch.object(client, "workspace_for", return_value=None),
             mock.patch.object(
+                client,
+                "planned_worktree_path",
+                return_value=Path("/tmp/worktree"),
+            ),
+            mock.patch.object(
                 client, "start_agent", return_value=selection
             ) as start_agent,
         ):
@@ -244,7 +249,7 @@ should I use?
 
         self.assertEqual(result, selection)
         self.assertEqual(
-            run_json.call_args_list[1].args[:7],
+            run_json.call_args_list[1].args[:9],
             (
                 "worktree",
                 "create",
@@ -252,12 +257,173 @@ should I use?
                 "/tmp/repository",
                 "--branch",
                 "voice/github-123456",
+                "--path",
+                "/tmp/worktree",
                 "--label",
             ),
         )
         start_agent.assert_called_once_with(
-            Path("/tmp/worktree"), "github-123456", "pane", "workspace"
+            Path("/tmp/worktree"),
+            "github-123456",
+            "pane",
+            "workspace",
+            name=mock.ANY,
+            checkpoint=None,
         )
+
+    def test_worktree_and_agent_are_reserved_before_dispatch(self) -> None:
+        client = herdr.HerdrClient("herdr")
+        checkout = Path("/tmp/worktree")
+        selection = herdr.AgentSelection(
+            "planned-agent",
+            "pane",
+            "workspace",
+            str(checkout),
+            "planned-agent",
+            str(checkout),
+        )
+        events: list[str] = []
+
+        def reserve_worktree(
+            _repository: Path, _branch: str, _checkout: Path, state: str
+        ) -> None:
+            events.append(f"worktree:{state}")
+
+        def settle_worktree(
+            _checkout: Path, _workspace: str | None, _pane: str | None
+        ) -> None:
+            events.append("worktree:settled")
+
+        def reserve_agent(_selection: herdr.AgentSelection, dispatching: bool) -> None:
+            events.append(f"agent:reserved:{dispatching}")
+
+        def start_agent(*_args: object, **_kwargs: object) -> herdr.AgentSelection:
+            events.append("agent:started")
+            return selection
+
+        with (
+            mock.patch.object(
+                client,
+                "run_json",
+                side_effect=[
+                    {"worktrees": []},
+                    {
+                        "worktree": {"path": str(checkout)},
+                        "workspace": {"workspace_id": "workspace"},
+                        "root_pane": {"pane_id": "pane"},
+                    },
+                ],
+            ),
+            mock.patch.object(client, "find_agent", return_value=None),
+            mock.patch.object(client, "workspace_for", return_value=None),
+            mock.patch.object(client, "planned_worktree_path", return_value=checkout),
+            mock.patch.object(client, "start_agent", side_effect=start_agent),
+        ):
+            client.ensure_agent(
+                Path("/tmp/repository"),
+                issue_key=None,
+                agent_hint=None,
+                reserved=set(),
+                worktree_branch="voice/task",
+                reserve=reserve_agent,
+                settle=lambda _selection: events.append("agent:settled"),
+                reserve_worktree=reserve_worktree,
+                settle_worktree=settle_worktree,
+            )
+
+        self.assertEqual(
+            events,
+            [
+                "worktree:planned",
+                "worktree:dispatching",
+                "worktree:settled",
+                "agent:reserved:True",
+                "agent:started",
+                "agent:settled",
+            ],
+        )
+
+    def test_worktree_post_checkpoint_prevents_pane_and_agent_creation(self) -> None:
+        client = herdr.HerdrClient("herdr")
+        checkpoints = 0
+
+        def checkpoint() -> None:
+            nonlocal checkpoints
+            checkpoints += 1
+            if checkpoints == 4:
+                raise RuntimeError("cancelled after worktree creation")
+
+        with (
+            mock.patch.object(
+                client,
+                "run_json",
+                side_effect=[
+                    {"worktrees": []},
+                    {
+                        "worktree": {"path": "/tmp/worktree"},
+                        "workspace": {"workspace_id": "workspace"},
+                        "root_pane": {"pane_id": "pane"},
+                    },
+                ],
+            ),
+            mock.patch.object(client, "find_agent") as find_agent,
+            mock.patch.object(client, "new_pane") as new_pane,
+            mock.patch.object(client, "start_agent") as start_agent,
+            mock.patch.object(
+                client,
+                "planned_worktree_path",
+                return_value=Path("/tmp/worktree"),
+            ),
+            self.assertRaisesRegex(RuntimeError, "after worktree creation"),
+        ):
+            client.ensure_agent(
+                Path("/tmp/repository"),
+                issue_key=None,
+                agent_hint=None,
+                reserved=set(),
+                worktree_branch="voice/github-123456",
+                checkpoint=checkpoint,
+            )
+
+        find_agent.assert_not_called()
+        new_pane.assert_not_called()
+        start_agent.assert_not_called()
+
+    def test_cancel_agent_waits_until_agent_is_settled(self) -> None:
+        client = herdr.HerdrClient("herdr")
+        with mock.patch.object(
+            client,
+            "run_json",
+            side_effect=[{}, {"agent": {"agent_status": "idle"}}],
+        ) as run_json:
+            client.cancel_agent("agent")
+
+        self.assertEqual(
+            run_json.call_args_list,
+            [
+                mock.call("agent", "send-keys", "agent", "ctrl-c"),
+                mock.call(
+                    "agent",
+                    "wait",
+                    "agent",
+                    "--timeout",
+                    "5000",
+                    timeout=10,
+                ),
+            ],
+        )
+
+    def test_cancel_agent_rejects_still_working_agent(self) -> None:
+        client = herdr.HerdrClient("herdr")
+        with (
+            mock.patch.object(
+                client,
+                "run_json",
+                side_effect=[{}, {"agent": {"agent_status": "working"}}],
+            ),
+            self.assertRaisesRegex(herdr.HerdrError, "did not stop"),
+        ):
+            client.cancel_agent("agent")
 
 
 if __name__ == "__main__":

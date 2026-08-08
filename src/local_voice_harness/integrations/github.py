@@ -19,9 +19,14 @@ REPOSITORY = re.compile(
     r"^(?P<owner>[A-Za-z0-9](?:[A-Za-z0-9-]{0,38}))/"
     r"(?P<repo>[A-Za-z0-9_.-]+)$"
 )
+Checkpoint = Callable[[], None]
 
 
 class GitHubError(RuntimeError):
+    pass
+
+
+class GitHubOperationAmbiguous(GitHubError):
     pass
 
 
@@ -114,8 +119,10 @@ class GitHubClient:
                 check=False,
                 cwd=str(cwd) if cwd is not None else None,
             )
-        except (OSError, subprocess.TimeoutExpired) as exc:
+        except OSError as exc:
             raise GitHubError(f"GitHub command failed: {exc}") from exc
+        except subprocess.TimeoutExpired as exc:
+            raise GitHubOperationAmbiguous(f"GitHub command timed out: {exc}") from exc
         if check and process.returncode:
             detail = process.stderr.strip() or process.stdout.strip()
             raise GitHubError(
@@ -137,10 +144,23 @@ class GitHubClient:
             check=False,
         )
         if process.returncode:
+            detail = process.stderr.strip() or process.stdout.strip()
             if required:
-                detail = process.stderr.strip() or process.stdout.strip()
                 raise GitHubError(detail or f"could not inspect {repository}")
-            return None
+            normalized = detail.casefold()
+            if any(
+                marker in normalized
+                for marker in (
+                    "could not resolve to a repository",
+                    "repository not found",
+                    "http 404",
+                    "status 404",
+                )
+            ):
+                return None
+            raise GitHubError(
+                detail or f"could not determine whether {repository} exists"
+            )
         try:
             value = json.loads(process.stdout)
         except json.JSONDecodeError as exc:
@@ -213,7 +233,42 @@ class GitHubClient:
             raise GitHubError("GitHub CLI did not return an authenticated user")
         return login
 
-    def ensure_fork(self, source: GitHubRepository, login: str) -> GitHubRepository:
+    def prepare_public_fork(self, repository: str) -> tuple[GitHubRepository, str, str]:
+        source = self.inspect_public_repository(repository)
+        login = self.authenticated_login()
+        _owner, repository_name = source.name_with_owner.split("/", 1)
+        target = (
+            source.name_with_owner
+            if source.name_with_owner.split("/", 1)[0].casefold() == login.casefold()
+            else f"{login}/{repository_name}"
+        )
+        return source, login, target
+
+    def reconcile_fork(
+        self, source: GitHubRepository, target_name: str
+    ) -> GitHubRepository | None:
+        fork = self._repo_view(self.validate_repository(target_name), required=False)
+        if fork is None:
+            return None
+        if source.name_with_owner.casefold() == fork.name_with_owner.casefold():
+            return fork
+        accepted_parents = {
+            name.casefold() for name in (source.name_with_owner, source.parent) if name
+        }
+        if fork.parent is None or fork.parent.casefold() not in accepted_parents:
+            raise GitHubError(
+                f"{target_name} exists but is not a fork of {source.name_with_owner}"
+            )
+        return fork
+
+    def ensure_fork(
+        self,
+        source: GitHubRepository,
+        login: str,
+        *,
+        checkpoint: Checkpoint | None = None,
+        before_submit: Callable[[], None] | None = None,
+    ) -> GitHubRepository:
         source_owner, repository_name = source.name_with_owner.split("/", 1)
         if source_owner.casefold() == login.casefold():
             return source
@@ -232,6 +287,10 @@ class GitHubClient:
                     f"{source.name_with_owner}"
                 )
             return existing
+        if checkpoint is not None:
+            checkpoint()
+        if before_submit is not None:
+            before_submit()
         self._run(
             [
                 self.gh_executable,
@@ -300,18 +359,30 @@ class GitHubClient:
         self._git(checkout, "remote", action, "upstream", source.url)
 
     @contextmanager
-    def _provisioning_lock(self) -> Iterator[None]:
+    def _provisioning_lock(
+        self, checkpoint: Checkpoint | None = None
+    ) -> Iterator[None]:
         try:
             self.clone_root.relative_to(self.allowed_root)
         except ValueError as exc:
             raise GitHubError(
                 "VOICE_HARNESS_GITHUB_ROOT must be inside VOICE_HARNESS_PROJECT_ROOT"
             ) from exc
+        if checkpoint is not None:
+            checkpoint()
         self.clone_root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if checkpoint is not None:
+            checkpoint()
         lock_path = self.clone_root / ".voice-harness-github.lock"
+        if checkpoint is not None:
+            checkpoint()
         with lock_path.open("a+b") as lock:
+            if checkpoint is not None:
+                checkpoint()
             fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
             try:
+                if checkpoint is not None:
+                    checkpoint()
                 yield
             finally:
                 fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
@@ -324,10 +395,15 @@ class GitHubClient:
         clone_source: str,
         verify: GitHubRepository,
         finalize: Callable[[Path], None] | None = None,
+        checkpoint: Checkpoint | None = None,
     ) -> Path:
         destination = self.clone_root / owner / repository_name
-        with self._provisioning_lock():
+        with self._provisioning_lock(checkpoint):
+            if checkpoint is not None:
+                checkpoint()
             destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            if checkpoint is not None:
+                checkpoint()
             resolved_parent = destination.parent.resolve()
             try:
                 resolved_parent.relative_to(self.clone_root)
@@ -336,12 +412,18 @@ class GitHubClient:
             if destination.exists():
                 self._verify_checkout(destination, verify)
                 if finalize is not None:
+                    if checkpoint is not None:
+                        checkpoint()
                     finalize(destination)
+                    if checkpoint is not None:
+                        checkpoint()
                 return destination.resolve()
             temporary = destination.parent / (
                 f".{repository_name}.clone-{uuid.uuid4().hex}"
             )
             try:
+                if checkpoint is not None:
+                    checkpoint()
                 self._run(
                     [
                         self.gh_executable,
@@ -352,32 +434,74 @@ class GitHubClient:
                     ],
                     timeout=300,
                 )
+                if checkpoint is not None:
+                    checkpoint()
                 self._verify_checkout(temporary, verify)
                 if finalize is not None:
+                    if checkpoint is not None:
+                        checkpoint()
                     finalize(temporary)
+                    if checkpoint is not None:
+                        checkpoint()
+                if checkpoint is not None:
+                    checkpoint()
                 os.replace(temporary, destination)
+                if checkpoint is not None:
+                    checkpoint()
             finally:
                 if temporary.exists():
                     shutil.rmtree(temporary)
             return destination.resolve()
 
-    def ensure_clone(self, source: GitHubRepository, fork: GitHubRepository) -> Path:
+    def ensure_clone(
+        self,
+        source: GitHubRepository,
+        fork: GitHubRepository,
+        *,
+        checkpoint: Checkpoint | None = None,
+    ) -> Path:
         source_owner, repository_name = source.name_with_owner.split("/", 1)
+
+        def finalize(checkout: Path) -> None:
+            self._ensure_upstream(checkout, source, fork)
+
+        if checkpoint is None:
+            return self._materialize_clone(
+                owner=source_owner,
+                repository_name=repository_name,
+                clone_source=fork.name_with_owner,
+                verify=fork,
+                finalize=finalize,
+            )
         return self._materialize_clone(
             owner=source_owner,
             repository_name=repository_name,
             clone_source=fork.name_with_owner,
             verify=fork,
-            finalize=lambda checkout: self._ensure_upstream(checkout, source, fork),
+            finalize=finalize,
+            checkpoint=checkpoint,
         )
 
-    def ensure_repository_clone(self, source: GitHubRepository) -> Path:
+    def ensure_repository_clone(
+        self,
+        source: GitHubRepository,
+        *,
+        checkpoint: Checkpoint | None = None,
+    ) -> Path:
         source_owner, repository_name = source.name_with_owner.split("/", 1)
+        if checkpoint is None:
+            return self._materialize_clone(
+                owner=source_owner,
+                repository_name=repository_name,
+                clone_source=source.name_with_owner,
+                verify=source,
+            )
         return self._materialize_clone(
             owner=source_owner,
             repository_name=repository_name,
             clone_source=source.name_with_owner,
             verify=source,
+            checkpoint=checkpoint,
         )
 
     def find_repository_checkout(
@@ -396,13 +520,21 @@ class GitHubClient:
         issue: GitHubIssue,
         *,
         candidates: list[Path] | None = None,
+        checkpoint: Checkpoint | None = None,
     ) -> ProvisionedIssue:
         if issue.number <= 0:
             raise GitHubError("GitHub issue number must be positive")
+        if checkpoint is not None:
+            checkpoint()
         source = self.inspect_repository(issue.name_with_owner)
+        if checkpoint is not None:
+            checkpoint()
         checkout = self.find_repository_checkout(source, candidates or [])
         if checkout is None:
-            checkout = self.ensure_repository_clone(source)
+            if checkpoint is None:
+                checkout = self.ensure_repository_clone(source)
+            else:
+                checkout = self.ensure_repository_clone(source, checkpoint=checkpoint)
         canonical_owner, canonical_repository = source.name_with_owner.split("/", 1)
         canonical_issue = GitHubIssue(
             canonical_owner, canonical_repository, issue.number
@@ -414,12 +546,19 @@ class GitHubClient:
         )
 
     def checkout_pull_request(
-        self, checkout: Path, number: int, *, branch: str
+        self,
+        checkout: Path,
+        number: int,
+        *,
+        branch: str,
+        checkpoint: Checkpoint | None = None,
     ) -> str | None:
         if number <= 0:
             raise GitHubError("GitHub pull request number must be positive")
         if not re.fullmatch(r"voice/[a-z0-9][a-z0-9._/-]{0,100}", branch):
             raise GitHubError("invalid voice pull-request branch")
+        if checkpoint is not None:
+            checkpoint()
         self._run(
             [
                 self.gh_executable,
@@ -433,24 +572,60 @@ class GitHubClient:
             timeout=180,
             cwd=checkout,
         )
+        if checkpoint is not None:
+            checkpoint()
         head = self._git(checkout, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
         return head or None
 
     def provision_public_fork(
-        self, repository: str, *, confirmed: bool
+        self,
+        repository: str,
+        *,
+        confirmed: bool,
+        checkpoint: Checkpoint | None = None,
     ) -> ProvisionedRepository:
         if not confirmed:
             raise GitHubError("GitHub fork creation requires explicit confirmation")
+        if checkpoint is not None:
+            checkpoint()
         source = self.inspect_public_repository(repository)
-        fork = self.ensure_fork(source, self.authenticated_login())
-        checkout = self.ensure_clone(source, fork)
+        if checkpoint is not None:
+            checkpoint()
+        login = self.authenticated_login()
+        if checkpoint is not None:
+            checkpoint()
+        if checkpoint is None:
+            fork = self.ensure_fork(source, login)
+        else:
+            fork = self.ensure_fork(source, login, checkpoint=checkpoint)
+        if checkpoint is not None:
+            checkpoint()
+        if checkpoint is None:
+            checkout = self.ensure_clone(source, fork)
+        else:
+            checkout = self.ensure_clone(source, fork, checkpoint=checkpoint)
+        if checkpoint is not None:
+            checkpoint()
         return ProvisionedRepository(source=source, fork=fork, checkout=checkout)
 
     def provision_pull_request(
-        self, repository: str, number: int
+        self,
+        repository: str,
+        number: int,
+        *,
+        checkpoint: Checkpoint | None = None,
     ) -> ProvisionedPullRequest:
         if number <= 0:
             raise GitHubError("GitHub pull request number must be positive")
+        if checkpoint is not None:
+            checkpoint()
         source = self.inspect_repository(repository)
-        checkout = self.ensure_repository_clone(source)
+        if checkpoint is not None:
+            checkpoint()
+        if checkpoint is None:
+            checkout = self.ensure_repository_clone(source)
+        else:
+            checkout = self.ensure_repository_clone(source, checkpoint=checkpoint)
+        if checkpoint is not None:
+            checkpoint()
         return ProvisionedPullRequest(source=source, checkout=checkout, number=number)

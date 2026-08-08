@@ -46,6 +46,32 @@ class GitHubClientTests(unittest.TestCase):
             with self.subTest(invalid=invalid), self.assertRaises(GitHubError):
                 GitHubClient.validate_repository(invalid)
 
+    def test_optional_repository_lookup_only_counts_not_found_as_absent(
+        self,
+    ) -> None:
+        client = GitHubClient()
+        with mock.patch.object(
+            client,
+            "_run",
+            return_value=_completed(
+                stderr="GraphQL: Could not resolve to a Repository",
+                returncode=1,
+            ),
+        ):
+            self.assertIsNone(client._repo_view("me/project", required=False))
+
+        with (
+            mock.patch.object(
+                client,
+                "_run",
+                return_value=_completed(
+                    stderr="HTTP 503: service unavailable", returncode=1
+                ),
+            ),
+            self.assertRaisesRegex(GitHubError, "service unavailable"),
+        ):
+            client._repo_view("me/project", required=False)
+
     def test_inspection_canonicalizes_and_rejects_private_repository(self) -> None:
         client = GitHubClient()
         public = {
@@ -132,12 +158,29 @@ class GitHubClientTests(unittest.TestCase):
         client = GitHubClient()
         source = _repository("source/project")
         fork = _repository("me/project", parent="source/project")
+        events: list[str] = []
+
+        def submit(
+            command: list[str], *, timeout: float = 30
+        ) -> subprocess.CompletedProcess[str]:
+            events.append("submit")
+            return _completed()
+
         with (
             mock.patch.object(client, "_repo_view", side_effect=[None, fork]) as view,
-            mock.patch.object(client, "_run", return_value=_completed()) as run,
+            mock.patch.object(client, "_run", side_effect=submit) as run,
         ):
-            self.assertEqual(client.ensure_fork(source, "me"), fork)
+            self.assertEqual(
+                client.ensure_fork(
+                    source,
+                    "me",
+                    checkpoint=lambda: events.append("checkpoint"),
+                    before_submit=lambda: events.append("dispatching"),
+                ),
+                fork,
+            )
         self.assertEqual(view.call_count, 2)
+        self.assertEqual(events, ["checkpoint", "dispatching", "submit"])
         run.assert_called_once_with(
             ["gh", "repo", "fork", "source/project", "--clone=false"],
             timeout=120,
