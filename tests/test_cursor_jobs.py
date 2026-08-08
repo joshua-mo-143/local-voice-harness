@@ -5,7 +5,9 @@ import subprocess
 import tempfile
 import threading
 import unittest
+from collections.abc import Callable
 from pathlib import Path
+from typing import cast
 from unittest import mock
 
 from local_voice_harness.cursor import jobs
@@ -14,9 +16,12 @@ from local_voice_harness.integrations.github import (
     GitHubRepository,
     ProvisionedIssue,
     ProvisionedPullRequest,
-    ProvisionedRepository,
 )
-from local_voice_harness.integrations.herdr import AgentSelection, PromptOutcome
+from local_voice_harness.integrations.herdr import (
+    AgentSelection,
+    HerdrError,
+    PromptOutcome,
+)
 
 
 class CursorJobStateTests(unittest.TestCase):
@@ -125,7 +130,9 @@ class CursorJobStateTests(unittest.TestCase):
         ):
             jobs.run_worker("123456789abc")
 
-        github.provision_pull_request.assert_called_once_with("source/project", 42)
+        github.provision_pull_request.assert_called_once_with(
+            "source/project", 42, checkpoint=mock.ANY
+        )
         client.ensure_agent.assert_called_once_with(
             repository,
             issue_key=None,
@@ -133,9 +140,19 @@ class CursorJobStateTests(unittest.TestCase):
             reserved=set(),
             worktree_branch="voice/github-pr-123456789abc",
             worktree_label="pr-42",
+            checkpoint=mock.ANY,
+            reserve=mock.ANY,
+            settle=mock.ANY,
+            fail_agent=mock.ANY,
+            reserve_worktree=mock.ANY,
+            settle_worktree=mock.ANY,
+            fail_worktree=mock.ANY,
         )
         github.checkout_pull_request.assert_called_once_with(
-            worktree, 42, branch="voice/github-pr-123456789abc"
+            worktree,
+            42,
+            branch="voice/github-pr-123456789abc",
+            checkpoint=mock.ANY,
         )
         updated = jobs.read_job("123456789abc")
         self.assertEqual(updated["status"], "completed")
@@ -244,7 +261,6 @@ class CursorJobStateTests(unittest.TestCase):
             "main",
             "source/project",
         )
-        provisioned = ProvisionedRepository(source, fork, repository)
         jobs.write_job(
             {
                 "id": "123456789abc",
@@ -260,7 +276,16 @@ class CursorJobStateTests(unittest.TestCase):
             }
         )
         github = mock.Mock()
-        github.provision_public_fork.return_value = provisioned
+        github.prepare_public_fork.return_value = (source, "me", "me/project")
+
+        def ensure_fork(
+            *_args: object, before_submit: Callable[[], None], **_kwargs: object
+        ) -> GitHubRepository:
+            before_submit()
+            return fork
+
+        github.ensure_fork.side_effect = ensure_fork
+        github.ensure_clone.return_value = repository
         client = mock.Mock()
         client.ensure_agent.return_value = AgentSelection(
             "agent",
@@ -282,9 +307,14 @@ class CursorJobStateTests(unittest.TestCase):
         ):
             jobs.run_worker("123456789abc")
 
-        github.provision_public_fork.assert_called_once_with(
-            "source/project", confirmed=True
+        github.prepare_public_fork.assert_called_once_with("source/project")
+        github.ensure_fork.assert_called_once_with(
+            source,
+            "me",
+            checkpoint=mock.ANY,
+            before_submit=mock.ANY,
         )
+        github.ensure_clone.assert_called_once_with(source, fork, checkpoint=mock.ANY)
         client.ensure_agent.assert_called_once_with(
             repository,
             issue_key=None,
@@ -292,6 +322,13 @@ class CursorJobStateTests(unittest.TestCase):
             reserved=set(),
             worktree_branch="voice/github-123456789abc",
             worktree_label="github-123456",
+            checkpoint=mock.ANY,
+            reserve=mock.ANY,
+            settle=mock.ANY,
+            fail_agent=mock.ANY,
+            reserve_worktree=mock.ANY,
+            settle_worktree=mock.ANY,
+            fail_worktree=mock.ANY,
         )
         updated = jobs.read_job("123456789abc")
         self.assertEqual(updated["status"], "completed")
@@ -319,7 +356,7 @@ class CursorJobStateTests(unittest.TestCase):
         ):
             jobs.run_worker("123456789abc")
 
-        github.provision_public_fork.assert_not_called()
+        github.prepare_public_fork.assert_not_called()
         updated = jobs.read_job("123456789abc")
         self.assertEqual(updated["status"], "awaiting_user")
         self.assertEqual(updated["clarification_kind"], "fork_confirmation")
@@ -465,7 +502,9 @@ class CursorJobStateTests(unittest.TestCase):
         ):
             jobs.run_worker("123456789abc")
 
-        github.provision_issue.assert_called_once_with(issue, candidates=[repository])
+        github.provision_issue.assert_called_once_with(
+            issue, candidates=[repository], checkpoint=mock.ANY
+        )
         client.ensure_agent.assert_called_once_with(
             repository,
             issue_key=None,
@@ -473,6 +512,13 @@ class CursorJobStateTests(unittest.TestCase):
             reserved=set(),
             worktree_branch="voice/github-issue-42",
             worktree_label="issue-42",
+            checkpoint=mock.ANY,
+            reserve=mock.ANY,
+            settle=mock.ANY,
+            fail_agent=mock.ANY,
+            reserve_worktree=mock.ANY,
+            settle_worktree=mock.ANY,
+            fail_worktree=mock.ANY,
         )
         prompt = client.prompt_and_wait.call_args.args[1]
         self.assertIn("Title: Fix it", prompt)
@@ -674,7 +720,9 @@ class CursorJobStateTests(unittest.TestCase):
         updated = jobs.read_job("123456789abc")
         self.assertEqual(updated["status"], "completed")
         self.assertEqual(updated["repository"], str(repository))
-        client.choose_or_clone_repository.assert_called_once_with([])
+        client.choose_or_clone_repository.assert_called_once_with(
+            [], checkpoint=mock.ANY
+        )
 
     def test_dead_worker_reconciles_existing_agent(self) -> None:
         jobs.write_job(
@@ -701,6 +749,87 @@ class CursorJobStateTests(unittest.TestCase):
         self.assertTrue(updated["reconcile"])
         launch.assert_called_once_with("123456789abc")
 
+    def test_dispatch_crash_retries_same_reserved_agent_identity(self) -> None:
+        repository = Path(self.temporary.name) / "project"
+        worktree = Path(self.temporary.name) / "worktree"
+        selection = AgentSelection(
+            "planned-agent",
+            "pane",
+            "workspace",
+            str(worktree),
+            "planned-agent",
+            str(worktree),
+        )
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "fix it",
+                "status": "queued",
+                "repository": str(repository),
+                "worktree_path": str(worktree),
+                "herdr_target": "planned-agent",
+                "herdr_pane_id": "pane",
+                "herdr_workspace_id": "workspace",
+                "agent_name": "planned-agent",
+                "agent_dispatch_state": "dispatching",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        client = mock.Mock()
+        client.get_agent.side_effect = HerdrError("not found", code="agent_not_found")
+        client.start_agent.return_value = selection
+        client.prompt_and_wait.return_value = PromptOutcome(
+            "idle",
+            "done",
+            None,
+            "VOICE_SUMMARY[123456789abc-1]: done",
+        )
+
+        with mock.patch.object(jobs, "HerdrClient", return_value=client):
+            jobs.run_worker("123456789abc")
+
+        client.start_agent.assert_called_once_with(
+            worktree,
+            "project",
+            "pane",
+            "workspace",
+            name="planned-agent",
+            checkpoint=mock.ANY,
+        )
+        client.ensure_agent.assert_not_called()
+        self.assertEqual(jobs.read_job("123456789abc")["status"], "completed")
+
+    def test_dispatch_reconciliation_defers_on_transient_lookup_failure(self) -> None:
+        repository = Path(self.temporary.name) / "project"
+        worktree = Path(self.temporary.name) / "worktree"
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "fix it",
+                "status": "queued",
+                "repository": str(repository),
+                "worktree_path": str(worktree),
+                "herdr_target": "planned-agent",
+                "herdr_pane_id": "pane",
+                "herdr_workspace_id": "workspace",
+                "agent_dispatch_state": "dispatching",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        client = mock.Mock()
+        client.get_agent.side_effect = HerdrError("server unavailable")
+
+        with mock.patch.object(jobs, "HerdrClient", return_value=client):
+            jobs.run_worker("123456789abc")
+
+        client.start_agent.assert_not_called()
+        client.prompt_and_wait.assert_not_called()
+        updated = jobs.read_job("123456789abc")
+        self.assertEqual(updated["status"], "queued")
+        self.assertEqual(updated["agent_dispatch_state"], "dispatching")
+
     def test_stale_worker_cannot_overwrite_cancellation(self) -> None:
         jobs.write_job(
             {
@@ -725,6 +854,609 @@ class CursorJobStateTests(unittest.TestCase):
         updated = jobs.read_job("123456789abc")
         self.assertEqual(updated["status"], "cancelled")
         self.assertNotEqual(updated["result"], "stale success")
+
+    def test_cancellation_during_repository_resolution_stops_routing(self) -> None:
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "fix the bug",
+                "status": "queued",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        entered = threading.Event()
+        release = threading.Event()
+        client = mock.Mock()
+
+        def repository_roots() -> list[Path]:
+            entered.set()
+            self.assertTrue(release.wait(2))
+            return []
+
+        client.repository_roots.side_effect = repository_roots
+        worker = threading.Thread(target=jobs.run_worker, args=("123456789abc",))
+        with mock.patch.object(jobs, "HerdrClient", return_value=client):
+            worker.start()
+            self.assertTrue(entered.wait(2))
+            jobs.cancel_job("123456789abc")
+            release.set()
+            worker.join(2)
+
+        self.assertFalse(worker.is_alive())
+        client.resolve_repository.assert_not_called()
+        client.choose_or_clone_repository.assert_not_called()
+        client.ensure_agent.assert_not_called()
+
+    def test_fork_commit_wins_before_cancellation(self) -> None:
+        source = GitHubRepository(
+            "source/project",
+            "https://github.com/source/project",
+            False,
+            "main",
+        )
+        fork = GitHubRepository(
+            "me/project",
+            "https://github.com/me/project",
+            False,
+            "main",
+            "source/project",
+        )
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "fork it",
+                "github_repository": "source/project",
+                "fork_requested": True,
+                "fork_confirmed": True,
+                "status": "queued",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        entered = threading.Event()
+        release = threading.Event()
+        settled = threading.Event()
+        continue_after_settle = threading.Event()
+        github = mock.Mock()
+
+        github.prepare_public_fork.return_value = (source, "me", "me/project")
+
+        def ensure_fork(
+            *_args: object, before_submit: Callable[[], None], **_kwargs: object
+        ) -> GitHubRepository:
+            before_submit()
+            entered.set()
+            self.assertTrue(release.wait(2))
+            return fork
+
+        github.ensure_fork.side_effect = ensure_fork
+        original_settle = jobs._settle_fork_operation
+
+        def settle_fork(
+            job_id: str,
+            token: str,
+            value: GitHubRepository | None,
+            *,
+            ambiguous: bool = False,
+            failed_observing: bool = False,
+        ) -> dict[str, object] | None:
+            result = original_settle(
+                job_id,
+                token,
+                value,
+                ambiguous=ambiguous,
+                failed_observing=failed_observing,
+            )
+            if value is fork:
+                settled.set()
+                self.assertTrue(continue_after_settle.wait(2))
+            return result
+
+        client = mock.Mock()
+        worker = threading.Thread(target=jobs.run_worker, args=("123456789abc",))
+        with (
+            mock.patch.object(jobs, "GitHubClient", return_value=github),
+            mock.patch.object(jobs, "HerdrClient", return_value=client),
+            mock.patch.object(jobs, "_settle_fork_operation", side_effect=settle_fork),
+            mock.patch.object(jobs, "_stop_worker", return_value=False),
+        ):
+            worker.start()
+            self.assertTrue(entered.wait(2))
+            with self.assertRaisesRegex(jobs.HarnessError, "committed fork submission"):
+                jobs.cancel_job("123456789abc")
+            committed = jobs.read_job("123456789abc")
+            self.assertEqual(committed["status"], "routing")
+            self.assertEqual(committed["fork_operation_state"], "submitted")
+            release.set()
+            self.assertTrue(settled.wait(2))
+            self.assertEqual(
+                jobs.read_job("123456789abc")["fork_operation_state"], "exists"
+            )
+            jobs.cancel_job("123456789abc")
+            continue_after_settle.set()
+            worker.join(2)
+            with mock.patch.object(jobs, "_worker_is_alive", return_value=False):
+                jobs.recover_jobs()
+
+        self.assertFalse(worker.is_alive())
+        updated = jobs.read_job("123456789abc")
+        self.assertEqual(updated["fork_operation_state"], "exists")
+        self.assertEqual(updated["fork_repository"], "me/project")
+        self.assertEqual(updated["status"], "cancelled")
+        self.assertFalse(updated["target_release_pending"])
+        github.ensure_clone.assert_not_called()
+        client.ensure_agent.assert_not_called()
+
+    def test_cancellation_wins_before_fork_commit(self) -> None:
+        source = GitHubRepository(
+            "source/project",
+            "https://github.com/source/project",
+            False,
+            "main",
+        )
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "fork it",
+                "github_repository": "source/project",
+                "fork_requested": True,
+                "fork_confirmed": True,
+                "status": "queued",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        entered = threading.Event()
+        release = threading.Event()
+        submitted = threading.Event()
+        github = mock.Mock()
+        client = mock.Mock()
+        github.prepare_public_fork.return_value = (source, "me", "me/project")
+
+        def ensure_fork(
+            *_args: object, before_submit: Callable[[], None], **_kwargs: object
+        ) -> GitHubRepository:
+            entered.set()
+            self.assertTrue(release.wait(2))
+            before_submit()
+            submitted.set()
+            raise AssertionError("fork submission should not run")
+
+        github.ensure_fork.side_effect = ensure_fork
+        worker = threading.Thread(target=jobs.run_worker, args=("123456789abc",))
+        with (
+            mock.patch.object(jobs, "GitHubClient", return_value=github),
+            mock.patch.object(jobs, "HerdrClient", return_value=client),
+            mock.patch.object(jobs, "_stop_worker", return_value=False),
+            mock.patch(
+                "local_voice_harness.integrations.herdr.subprocess.run",
+                side_effect=AssertionError("real service operation attempted"),
+            ) as service_operation,
+        ):
+            worker.start()
+            try:
+                self.assertTrue(
+                    entered.wait(2),
+                    f"worker stopped before fork routing: {jobs.read_job('123456789abc')}",
+                )
+                client.ensure_server.assert_called_once_with()
+                jobs.cancel_job("123456789abc")
+                self.assertEqual(jobs.read_job("123456789abc")["status"], "cancelled")
+            finally:
+                release.set()
+                worker.join(2)
+
+        self.assertFalse(worker.is_alive())
+        self.assertFalse(submitted.is_set())
+        self.assertEqual(jobs.read_job("123456789abc")["status"], "cancelled")
+        github.ensure_clone.assert_not_called()
+        client.ensure_agent.assert_not_called()
+        service_operation.assert_not_called()
+
+    def test_worker_persists_herdr_failure_before_fork_routing(self) -> None:
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "fork it",
+                "github_repository": "source/project",
+                "fork_requested": True,
+                "fork_confirmed": True,
+                "status": "queued",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        client = mock.Mock()
+        client.ensure_server.side_effect = HerdrError(
+            "Herdr command failed: executable not found",
+            code="operation_spawn_failed",
+        )
+        with (
+            mock.patch.object(jobs, "HerdrClient", return_value=client),
+            mock.patch.object(jobs, "GitHubClient") as github_client,
+        ):
+            jobs.run_worker("123456789abc")
+
+        failed = jobs.read_job("123456789abc")
+        self.assertEqual(failed["status"], "failed")
+        self.assertEqual(failed["error"], "Herdr command failed: executable not found")
+        self.assertNotIn("fork_operation_state", failed)
+        github_client.assert_not_called()
+
+    def test_post_create_cancellation_retains_reserved_worktree(self) -> None:
+        repository = Path(self.temporary.name) / "project"
+        checkout = Path(self.temporary.name) / "worktrees" / "task"
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "fix it",
+                "repository_hint": str(repository),
+                "worktree_branch": "voice/task",
+                "worktree_label": "task",
+                "status": "queued",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        entered = threading.Event()
+        release = threading.Event()
+        client = mock.Mock()
+        client.repository_roots.return_value = [repository]
+        client.resolve_repository.return_value = (repository, [repository])
+
+        def ensure_agent(*_args: object, **kwargs: object) -> AgentSelection:
+            reserve_worktree = cast(
+                Callable[[Path, str, Path, str], None],
+                kwargs["reserve_worktree"],
+            )
+            settle_worktree = cast(
+                Callable[[Path, str | None, str | None], None],
+                kwargs["settle_worktree"],
+            )
+            checkpoint = cast(Callable[[], None], kwargs["checkpoint"])
+            reserve_worktree(repository, "voice/task", checkout, "planned")
+            checkpoint()
+            reserve_worktree(repository, "voice/task", checkout, "dispatching")
+            entered.set()
+            self.assertTrue(release.wait(2))
+            settle_worktree(checkout, "workspace", "pane")
+            checkpoint()
+            raise AssertionError("cancelled worker continued after worktree settle")
+
+        client.ensure_agent.side_effect = ensure_agent
+        worker = threading.Thread(target=jobs.run_worker, args=("123456789abc",))
+        with (
+            mock.patch.object(jobs, "HerdrClient", return_value=client),
+            mock.patch.object(jobs, "_stop_worker", return_value=False),
+        ):
+            worker.start()
+            self.assertTrue(entered.wait(2))
+            dispatching = jobs.read_job("123456789abc")
+            self.assertEqual(dispatching["worktree_path"], str(checkout))
+            self.assertEqual(dispatching["worktree_provision_state"], "dispatching")
+            jobs.cancel_job("123456789abc")
+            release.set()
+            worker.join(2)
+
+        self.assertFalse(worker.is_alive())
+        retained = jobs.read_job("123456789abc")
+        self.assertEqual(retained["worktree_provision_state"], "retained")
+        self.assertTrue(retained["target_release_pending"])
+        client.prompt_and_wait.assert_not_called()
+        with mock.patch.object(jobs, "_worker_is_alive", return_value=False):
+            jobs.recover_jobs()
+        self.assertFalse(jobs.read_job("123456789abc")["target_release_pending"])
+
+    def test_cancellation_before_agent_dispatch_uses_planned_reservation(self) -> None:
+        repository = Path(self.temporary.name) / "project"
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "fix it",
+                "repository_hint": str(repository),
+                "status": "queued",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        entered = threading.Event()
+        release = threading.Event()
+        dispatched = threading.Event()
+        selection = AgentSelection(
+            "planned-agent",
+            "pane",
+            "workspace",
+            str(repository),
+            "planned-agent",
+            str(repository),
+        )
+        client = mock.Mock()
+        client.repository_roots.return_value = [repository]
+        client.resolve_repository.return_value = (repository, [repository])
+
+        def ensure_agent(*_args: object, **kwargs: object) -> AgentSelection:
+            reserve = cast(Callable[[AgentSelection, bool], None], kwargs["reserve"])
+            checkpoint = cast(Callable[[], None], kwargs["checkpoint"])
+            reserve(selection, True)
+            entered.set()
+            self.assertTrue(release.wait(2))
+            checkpoint()
+            dispatched.set()
+            return selection
+
+        client.ensure_agent.side_effect = ensure_agent
+        worker = threading.Thread(target=jobs.run_worker, args=("123456789abc",))
+        with mock.patch.object(jobs, "HerdrClient", return_value=client):
+            worker.start()
+            self.assertTrue(entered.wait(2))
+            self.assertEqual(
+                jobs.read_job("123456789abc")["agent_dispatch_state"],
+                "dispatching",
+            )
+            jobs.cancel_job("123456789abc")
+            release.set()
+            worker.join(2)
+
+        self.assertFalse(worker.is_alive())
+        self.assertFalse(dispatched.is_set())
+        client.cancel_agent.assert_called_once_with("planned-agent")
+        client.prompt_and_wait.assert_not_called()
+
+    def test_late_agent_visibility_after_cancelled_startup(self) -> None:
+        repository = Path(self.temporary.name) / "project"
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "fix it",
+                "repository_hint": str(repository),
+                "status": "queued",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        entered = threading.Event()
+        release = threading.Event()
+        selection = AgentSelection(
+            "planned-agent",
+            "pane",
+            "workspace",
+            str(repository),
+            "planned-agent",
+            str(repository),
+        )
+        client = mock.Mock()
+        client.repository_roots.return_value = [repository]
+        client.resolve_repository.return_value = (repository, [repository])
+        client.cancel_agent.side_effect = [
+            HerdrError("not found", code="agent_not_found"),
+            None,
+        ]
+        client.get_agent.side_effect = [
+            HerdrError("not found", code="agent_not_found"),
+            {
+                "name": "planned-agent",
+                "pane_id": "pane",
+                "workspace_id": "workspace",
+            },
+        ]
+
+        def ensure_agent(*_args: object, **kwargs: object) -> AgentSelection:
+            reserve = cast(Callable[[AgentSelection, bool], None], kwargs["reserve"])
+            fail_agent = cast(Callable[[HerdrError], None], kwargs["fail_agent"])
+            reserve(selection, True)
+            entered.set()
+            self.assertTrue(release.wait(2))
+            error = HerdrError("startup timed out", code="operation_timeout")
+            fail_agent(error)
+            raise error
+
+        client.ensure_agent.side_effect = ensure_agent
+        worker = threading.Thread(target=jobs.run_worker, args=("123456789abc",))
+        with (
+            mock.patch.object(jobs, "HerdrClient", return_value=client),
+            mock.patch.object(jobs, "_stop_worker", return_value=False),
+            mock.patch("time.time", return_value=90),
+        ):
+            worker.start()
+            self.assertTrue(entered.wait(2))
+            jobs.cancel_job("123456789abc")
+            release.set()
+            worker.join(2)
+
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(
+            jobs.read_job("123456789abc")["agent_dispatch_state"], "ambiguous"
+        )
+        with (
+            mock.patch.object(jobs, "HerdrClient", return_value=client),
+            mock.patch.object(jobs, "_worker_is_alive", return_value=False),
+        ):
+            with mock.patch("time.time", return_value=100):
+                jobs.recover_jobs()
+            with mock.patch("time.time", return_value=105):
+                jobs.recover_jobs()
+
+        updated = jobs.read_job("123456789abc")
+        self.assertEqual(updated["agent_dispatch_state"], "ready")
+        self.assertFalse(updated["target_release_pending"])
+        self.assertEqual(client.cancel_agent.call_count, 2)
+
+    def test_cancellation_during_pr_checkout_prevents_prompt_submission(self) -> None:
+        repository = Path(self.temporary.name) / "source" / "project"
+        worktree = Path(self.temporary.name) / "worktrees" / "pr-42"
+        worktree.mkdir(parents=True)
+        (worktree / ".git").write_text("gitdir: shared\n")
+        source = GitHubRepository(
+            "source/project",
+            "https://github.com/source/project",
+            False,
+            "main",
+        )
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "review pull request 42",
+                "github_repository": "source/project",
+                "github_pull_request": 42,
+                "worktree_branch": "voice/github-pr-123456789abc",
+                "pull_request_worktree_state": "pending",
+                "status": "queued",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        entered = threading.Event()
+        release = threading.Event()
+        github = mock.Mock()
+        github.provision_pull_request.return_value = ProvisionedPullRequest(
+            source, repository, 42
+        )
+
+        def checkout(*_args: object, **_kwargs: object) -> str:
+            entered.set()
+            self.assertTrue(release.wait(2))
+            return "voice/github-pr-123456789abc"
+
+        github.checkout_pull_request.side_effect = checkout
+        selection = AgentSelection(
+            "agent",
+            "pane",
+            "workspace",
+            str(worktree),
+            "agent",
+            str(worktree),
+        )
+        client = mock.Mock()
+
+        def ensure_agent(*_args: object, **kwargs: object) -> AgentSelection:
+            reserve = cast(Callable[[AgentSelection, bool], None], kwargs["reserve"])
+            reserve(selection, False)
+            return selection
+
+        client.ensure_agent.side_effect = ensure_agent
+        worker = threading.Thread(target=jobs.run_worker, args=("123456789abc",))
+        with (
+            mock.patch.object(jobs, "GitHubClient", return_value=github),
+            mock.patch.object(jobs, "HerdrClient", return_value=client),
+        ):
+            worker.start()
+            self.assertTrue(entered.wait(2))
+            jobs.cancel_job("123456789abc")
+            release.set()
+            worker.join(2)
+
+        self.assertFalse(worker.is_alive())
+        client.prompt_and_wait.assert_not_called()
+        self.assertEqual(
+            jobs.read_job("123456789abc")["pull_request_worktree_state"],
+            "retained",
+        )
+
+    def test_cancellation_before_prompt_submission_stops_submission(self) -> None:
+        repository = Path(self.temporary.name) / "project"
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "fix it",
+                "repository_hint": str(repository),
+                "status": "queued",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        entered = threading.Event()
+        release = threading.Event()
+        submitted = threading.Event()
+        selection = AgentSelection(
+            "agent",
+            "pane",
+            "workspace",
+            str(repository),
+            "agent",
+            str(repository),
+        )
+        client = mock.Mock()
+        client.repository_roots.return_value = [repository]
+        client.resolve_repository.return_value = (repository, [repository])
+
+        def ensure_agent(*_args: object, **kwargs: object) -> AgentSelection:
+            reserve = cast(Callable[[AgentSelection, bool], None], kwargs["reserve"])
+            reserve(selection, False)
+            return selection
+
+        def prompt(*_args: object, **kwargs: object) -> PromptOutcome:
+            entered.set()
+            self.assertTrue(release.wait(2))
+            checkpoint = cast(Callable[[], None], kwargs["checkpoint"])
+            checkpoint()
+            submitted.set()
+            return PromptOutcome("idle", "done", None, "")
+
+        client.ensure_agent.side_effect = ensure_agent
+        client.prompt_and_wait.side_effect = prompt
+        worker = threading.Thread(target=jobs.run_worker, args=("123456789abc",))
+        with mock.patch.object(jobs, "HerdrClient", return_value=client):
+            worker.start()
+            self.assertTrue(entered.wait(2))
+            jobs.cancel_job("123456789abc")
+            release.set()
+            worker.join(2)
+
+        self.assertFalse(worker.is_alive())
+        self.assertFalse(submitted.is_set())
+        client.cancel_agent.assert_called_once_with("agent")
+
+    def test_worker_signal_requires_full_process_identity(self) -> None:
+        job = {
+            "id": "123456789abc",
+            "worker_pid": 42,
+            "worker_process_start": "start",
+            "worker_token": "claim",
+        }
+        wrong_command = b"\0".join(
+            (
+                b"/usr/bin/python",
+                b"-m",
+                b"local_voice_harness.cursor.worker",
+                b"123456789abc",
+                b"--claim",
+                b"different",
+                b"",
+            )
+        )
+        with (
+            mock.patch.object(jobs, "_process_identity", return_value="start"),
+            mock.patch.object(Path, "read_bytes", return_value=wrong_command),
+            mock.patch("os.killpg") as kill_group,
+            mock.patch("os.kill") as kill_process,
+        ):
+            self.assertFalse(jobs._signal_worker(job, jobs.signal.SIGTERM))
+
+        kill_group.assert_not_called()
+        kill_process.assert_not_called()
+
+    def test_critical_operation_never_escalates_to_process_group_kill(self) -> None:
+        job = {
+            "id": "123456789abc",
+            "worker_pid": 42,
+            "worker_process_start": "start",
+            "worker_token": "claim",
+            "worker_operation": "fork_create",
+        }
+        with (
+            mock.patch.object(jobs, "_worker_is_alive", side_effect=[True, True, True]),
+            mock.patch.object(
+                jobs, "_signal_worker", return_value=True
+            ) as signal_worker,
+        ):
+            self.assertFalse(jobs._stop_worker(job, timeout=0))
+
+        signal_worker.assert_called_once_with(
+            job,
+            jobs.signal.SIGTERM,
+            include_process_group=False,
+        )
 
     def test_only_one_concurrent_reply_transitions_job(self) -> None:
         jobs.write_job(
@@ -896,13 +1628,453 @@ class CursorJobStateTests(unittest.TestCase):
         client.cancel_agent.side_effect = inspect_reservation
         with mock.patch.object(jobs, "HerdrClient", return_value=client):
             jobs.cancel_job("123456789abc")
+            jobs.cancel_job("123456789abc")
 
         self.assertIn("cursor-agent", reserved_during_cancel)
         self.assertNotIn("cursor-agent", jobs.reserved_targets())
+        client.cancel_agent.assert_called_once_with("cursor-agent")
         self.assertEqual(
             jobs.read_job("123456789abc")["pull_request_worktree_state"],
             "retained",
         )
+
+    def test_failed_agent_interrupt_keeps_reservation_for_recovery(self) -> None:
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "status": "running",
+                "herdr_target": "cursor-agent",
+                "worktree_path": "/worktree/task",
+                "worker_token": "worker",
+                "worker_pid": 42,
+                "worker_process_start": "old-worker",
+                "delivered": False,
+            }
+        )
+        failing = mock.Mock()
+        failing.cancel_agent.side_effect = HerdrError("still working")
+        recovered = mock.Mock()
+        with (
+            mock.patch.object(jobs, "_stop_worker", return_value=True),
+            mock.patch.object(jobs, "HerdrClient", side_effect=[failing, recovered]),
+        ):
+            jobs.cancel_job("123456789abc")
+            cancelled = jobs.read_job("123456789abc")
+            self.assertTrue(cancelled["target_release_pending"])
+            self.assertIn("cursor-agent", jobs.reserved_targets())
+            jobs.recover_jobs()
+
+        recovered.cancel_agent.assert_called_once_with("cursor-agent")
+        self.assertFalse(jobs.read_job("123456789abc")["target_release_pending"])
+
+    def test_provisional_agent_fence_survives_first_not_found(self) -> None:
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "status": "routing",
+                "herdr_target": "planned-agent",
+                "worktree_path": "/worktree/task",
+                "agent_dispatch_state": "dispatching",
+                "worker_token": "worker",
+                "worker_pid": 42,
+                "worker_process_start": "old-worker",
+                "delivered": False,
+            }
+        )
+        client = mock.Mock()
+        client.cancel_agent.side_effect = [
+            HerdrError("not found", code="agent_not_found"),
+            None,
+        ]
+        client.get_agent.side_effect = [
+            HerdrError("not found", code="agent_not_found"),
+            {
+                "name": "planned-agent",
+                "pane_id": "pane",
+                "workspace_id": "workspace",
+            },
+        ]
+        with (
+            mock.patch.object(jobs, "_stop_worker", return_value=True),
+            mock.patch.object(jobs, "HerdrClient", return_value=client),
+        ):
+            jobs.cancel_job("123456789abc")
+            self.assertTrue(jobs.read_job("123456789abc")["target_release_pending"])
+            with mock.patch("time.time", return_value=100):
+                jobs.recover_jobs()
+            self.assertTrue(jobs.read_job("123456789abc")["target_release_pending"])
+            with mock.patch("time.time", return_value=104):
+                jobs.recover_jobs()
+            self.assertEqual(client.get_agent.call_count, 1)
+            with mock.patch("time.time", return_value=105):
+                jobs.recover_jobs()
+
+        self.assertFalse(jobs.read_job("123456789abc")["target_release_pending"])
+        self.assertEqual(client.get_agent.call_count, 2)
+        self.assertEqual(client.cancel_agent.call_count, 2)
+
+    def test_truly_absent_agent_releases_after_bounded_backoff(self) -> None:
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "status": "cancelled",
+                "herdr_target": "missing-agent",
+                "agent_dispatch_state": "failed_observing",
+                "agent_dispatch_exited": True,
+                "target_release_pending": True,
+                "delivered": True,
+            }
+        )
+        client = mock.Mock()
+        client.get_agent.side_effect = HerdrError("not found", code="agent_not_found")
+        client.cancel_agent.side_effect = HerdrError(
+            "not found", code="agent_not_found"
+        )
+        with mock.patch.object(jobs, "HerdrClient", return_value=client):
+            for now in (100, 104, 105, 114):
+                with mock.patch("time.time", return_value=now):
+                    jobs.recover_jobs()
+            pending = jobs.read_job("123456789abc")
+            self.assertEqual(pending["agent_reconcile_attempts"], 2)
+            self.assertEqual(pending["agent_next_reconcile_at"], 115)
+            with mock.patch("time.time", return_value=115):
+                jobs.recover_jobs()
+
+        updated = jobs.read_job("123456789abc")
+        self.assertEqual(updated["agent_dispatch_state"], "confirmed_absent")
+        self.assertEqual(updated["agent_reconcile_attempts"], 3)
+        self.assertFalse(updated["target_release_pending"])
+
+    def test_truly_absent_fork_releases_after_bounded_backoff(self) -> None:
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "status": "cancelled",
+                "fork_operation_state": "failed_observing",
+                "fork_dispatch_exited": True,
+                "fork_operation_source": "source/project",
+                "fork_operation_source_url": "https://github.com/source/project",
+                "fork_operation_source_default_branch": "main",
+                "fork_operation_source_private": False,
+                "fork_operation_target": "me/project",
+                "target_release_pending": True,
+                "delivered": True,
+            }
+        )
+        github = mock.Mock()
+        github.reconcile_fork.return_value = None
+        with mock.patch.object(jobs, "GitHubClient", return_value=github):
+            for now in (100, 105, 115):
+                with mock.patch("time.time", return_value=now):
+                    jobs.recover_jobs()
+
+        updated = jobs.read_job("123456789abc")
+        self.assertEqual(updated["fork_operation_state"], "confirmed_absent")
+        self.assertEqual(updated["fork_reconcile_attempts"], 3)
+        self.assertFalse(updated["target_release_pending"])
+
+    def test_failed_fork_becomes_visible_after_first_observation(self) -> None:
+        source = GitHubRepository(
+            "source/project",
+            "https://github.com/source/project",
+            False,
+            "main",
+        )
+        fork = GitHubRepository(
+            "me/project",
+            "https://github.com/me/project",
+            False,
+            "main",
+            "source/project",
+        )
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "status": "failed",
+                "fork_operation_state": "failed_observing",
+                "fork_dispatch_exited": True,
+                "fork_operation_source": source.name_with_owner,
+                "fork_operation_source_url": source.url,
+                "fork_operation_source_default_branch": source.default_branch,
+                "fork_operation_source_private": False,
+                "fork_operation_target": fork.name_with_owner,
+                "target_release_pending": True,
+                "delivered": True,
+            }
+        )
+        github = mock.Mock()
+        github.reconcile_fork.side_effect = [None, fork]
+        with mock.patch.object(jobs, "GitHubClient", return_value=github):
+            with mock.patch("time.time", return_value=100):
+                jobs.recover_jobs()
+            self.assertTrue(jobs.read_job("123456789abc")["target_release_pending"])
+            with mock.patch("time.time", return_value=105):
+                jobs.recover_jobs()
+
+        updated = jobs.read_job("123456789abc")
+        self.assertEqual(updated["fork_operation_state"], "exists")
+        self.assertEqual(updated["fork_repository"], "me/project")
+        self.assertFalse(updated["target_release_pending"])
+
+    def test_truly_absent_worktree_releases_after_bounded_backoff(self) -> None:
+        checkout = Path(self.temporary.name) / "missing-worktree"
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "status": "cancelled",
+                "repository": str(Path(self.temporary.name) / "repository"),
+                "worktree_branch": "voice/task",
+                "worktree_path": str(checkout),
+                "worktree_provision_state": "failed_observing",
+                "worktree_dispatch_exited": True,
+                "target_release_pending": True,
+                "delivered": True,
+            }
+        )
+        client = mock.Mock()
+        client.run_json.return_value = {"worktrees": []}
+        with mock.patch.object(jobs, "HerdrClient", return_value=client):
+            for now in (100, 105, 115):
+                with mock.patch("time.time", return_value=now):
+                    jobs.recover_jobs()
+
+        updated = jobs.read_job("123456789abc")
+        self.assertEqual(updated["worktree_provision_state"], "confirmed_absent")
+        self.assertEqual(updated["worktree_reconcile_attempts"], 3)
+        self.assertFalse(updated["target_release_pending"])
+
+    def test_dispatching_agent_backoff_is_capped_then_requires_manual_review(
+        self,
+    ) -> None:
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "status": "failed",
+                "error": "agent startup failed; external operation reconciliation is pending",
+                "result": "agent startup failed; external operation reconciliation is pending",
+                "herdr_target": "late-agent",
+                "agent_dispatch_state": "dispatching",
+                "agent_reconcile_attempts": 4,
+                "target_release_pending": True,
+                "delivered": True,
+            }
+        )
+        client = mock.Mock()
+        client.get_agent.side_effect = HerdrError("not found", code="agent_not_found")
+        with (
+            mock.patch.object(jobs, "HerdrClient", return_value=client),
+            mock.patch.object(jobs, "_worker_is_alive", return_value=False),
+        ):
+            with mock.patch("time.time", return_value=100):
+                jobs.recover_jobs()
+            capped = jobs.read_job("123456789abc")
+            self.assertEqual(capped["agent_reconcile_attempts"], 5)
+            self.assertEqual(capped["agent_next_reconcile_at"], 160)
+
+            with mock.patch("time.time", return_value=160):
+                jobs.recover_jobs()
+            manual = jobs.read_job("123456789abc")
+            self.assertEqual(manual["agent_dispatch_state"], "manual_required")
+            self.assertEqual(manual["agent_reconcile_attempts"], 6)
+            self.assertTrue(manual["target_release_pending"])
+            self.assertIn(
+                "manual reconciliation required for Herdr agent late-agent",
+                str(manual["error"]),
+            )
+            self.assertNotIn("reconciliation is pending", str(manual["result"]))
+
+            with mock.patch("time.time", return_value=10_000):
+                jobs.recover_jobs()
+
+        self.assertEqual(client.get_agent.call_count, 2)
+        client.cancel_agent.assert_not_called()
+
+    def test_ambiguous_fork_requires_manual_review_and_can_confirm_absence(
+        self,
+    ) -> None:
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "status": "failed",
+                "error": "fork outcome unknown; external operation reconciliation is pending",
+                "result": "fork outcome unknown; external operation reconciliation is pending",
+                "fork_operation_state": "ambiguous",
+                "fork_operation_source": "source/project",
+                "fork_operation_source_url": "https://github.com/source/project",
+                "fork_operation_source_default_branch": "main",
+                "fork_operation_source_private": False,
+                "fork_operation_target": "me/project",
+                "fork_reconcile_attempts": 5,
+                "herdr_target": "unrelated-agent",
+                "target_release_pending": True,
+                "delivered": True,
+            }
+        )
+        github = mock.Mock()
+        github.reconcile_fork.return_value = None
+        client = mock.Mock()
+        with (
+            mock.patch.object(jobs, "GitHubClient", return_value=github),
+            mock.patch.object(jobs, "HerdrClient", return_value=client),
+            mock.patch.object(jobs, "_worker_is_alive", return_value=False),
+            mock.patch("time.time", return_value=100),
+        ):
+            jobs.recover_jobs()
+
+        manual = jobs.read_job("123456789abc")
+        self.assertEqual(manual["fork_operation_state"], "manual_required")
+        self.assertFalse(manual["target_release_pending"])
+        client.cancel_agent.assert_called_once_with("unrelated-agent")
+        token = str(manual["manual_reconcile_token"])
+        with self.assertRaisesRegex(jobs.HarnessError, "fence is stale"):
+            jobs.resolve_manual_reconciliation(
+                "123456789abc", "fork", "stale-token", "confirmed_absent"
+            )
+        with self.assertRaisesRegex(jobs.HarnessError, "fence is stale"):
+            jobs.resolve_manual_reconciliation(
+                "123456789abc", "worktree", token, "confirmed_absent"
+            )
+        resolved = jobs.resolve_manual_reconciliation(
+            "123456789abc", "fork", token, "confirmed_absent"
+        )
+        self.assertEqual(resolved["fork_operation_state"], "confirmed_absent")
+        self.assertEqual(resolved["error"], "fork outcome unknown")
+        self.assertEqual(github.reconcile_fork.call_count, 1)
+
+    def test_manual_materialized_agent_is_retained_without_external_action(
+        self,
+    ) -> None:
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "status": "failed",
+                "error": (
+                    "agent startup failed; manual reconciliation required for "
+                    "Herdr agent retained-agent"
+                ),
+                "result": (
+                    "agent startup failed; manual reconciliation required for "
+                    "Herdr agent retained-agent"
+                ),
+                "reconciliation_base_error": "agent startup failed",
+                "herdr_target": "retained-agent",
+                "agent_dispatch_state": "manual_required",
+                "manual_reconcile_operation": "agent",
+                "manual_reconcile_token": "manual-token",
+                "target_release_pending": True,
+                "cancellation_reconciliation_pending": True,
+                "delivered": True,
+            }
+        )
+
+        resolved = jobs.resolve_manual_reconciliation(
+            "123456789abc", "agent", "manual-token", "materialized"
+        )
+
+        self.assertEqual(resolved["agent_dispatch_state"], "retained")
+        self.assertEqual(resolved["herdr_target"], "retained-agent")
+        self.assertFalse(resolved["target_release_pending"])
+        self.assertFalse(resolved["cancellation_reconciliation_pending"])
+        self.assertEqual(resolved["error"], "agent startup failed")
+        self.assertEqual(resolved["result"], "agent startup failed")
+
+    def test_quarantined_worktree_releases_target_but_blocks_path(self) -> None:
+        repository = Path(self.temporary.name) / "repository"
+        checkout = Path(self.temporary.name) / "unexpected-worktree"
+        checkout.mkdir()
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "status": "cancelled",
+                "repository": str(repository),
+                "herdr_target": "agent",
+                "worktree_branch": "voice/task",
+                "worktree_path": str(checkout),
+                "worktree_provision_state": "ambiguous",
+                "target_release_pending": True,
+                "delivered": True,
+            }
+        )
+        client = mock.Mock()
+        client.run_json.return_value = {"worktrees": []}
+        with (
+            mock.patch.object(jobs, "HerdrClient", return_value=client),
+            mock.patch("time.time", return_value=100),
+        ):
+            jobs.recover_jobs()
+
+        quarantined = jobs.read_job("123456789abc")
+        self.assertEqual(quarantined["worktree_provision_state"], "quarantined")
+        self.assertTrue(quarantined["worktree_manual_inspection_required"])
+        self.assertFalse(quarantined["target_release_pending"])
+        client.cancel_agent.assert_called_once_with("agent")
+
+        jobs.write_job(
+            {
+                "id": "bbbbbbbbbbbb",
+                "status": "routing",
+                "worker_token": "worker",
+            }
+        )
+        self.assertIsNone(
+            jobs._reserve_worker_worktree(
+                "bbbbbbbbbbbb",
+                "worker",
+                repository,
+                "voice/task",
+                checkout,
+                state="planned",
+            )
+        )
+
+        jobs.acknowledge_worktree_quarantine("123456789abc")
+        self.assertEqual(
+            jobs.read_job("123456789abc")["worktree_provision_state"],
+            "retained",
+        )
+        self.assertIsNotNone(
+            jobs._reserve_worker_worktree(
+                "bbbbbbbbbbbb",
+                "worker",
+                repository,
+                "voice/task",
+                checkout,
+                state="planned",
+            )
+        )
+
+    def test_recovery_retries_worker_stop_without_target_reservation(self) -> None:
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "status": "routing",
+                "worker_token": "worker",
+                "worker_pid": 42,
+                "worker_process_start": "worker-start",
+                "delivered": False,
+            }
+        )
+        alive = True
+        stops = 0
+
+        def stop_worker(_job: dict[str, object]) -> bool:
+            nonlocal alive, stops
+            stops += 1
+            if stops == 2:
+                alive = False
+                return True
+            return False
+
+        with (
+            mock.patch.object(jobs, "_worker_is_alive", side_effect=lambda _job: alive),
+            mock.patch.object(jobs, "_stop_worker", side_effect=stop_worker),
+        ):
+            jobs.cancel_job("123456789abc")
+            self.assertTrue(jobs.read_job("123456789abc")["target_release_pending"])
+            jobs.recover_jobs()
+
+        self.assertEqual(stops, 2)
+        self.assertFalse(jobs.read_job("123456789abc")["target_release_pending"])
 
     def test_cancel_retires_unfenced_legacy_worker_first(self) -> None:
         jobs.write_job(
@@ -938,11 +2110,16 @@ class CursorJobStateTests(unittest.TestCase):
                 "delivered": True,
             }
         )
-        with mock.patch.object(jobs, "_process_identity", return_value=None):
+        client = mock.Mock()
+        with (
+            mock.patch.object(jobs, "_process_identity", return_value=None),
+            mock.patch.object(jobs, "HerdrClient", return_value=client),
+        ):
             jobs.recover_jobs()
 
         updated = jobs.read_job("123456789abc")
         self.assertFalse(updated["target_release_pending"])
+        client.cancel_agent.assert_called_once_with("cursor-agent")
 
     def test_foreground_delivery_is_acknowledged_explicitly(self) -> None:
         jobs.write_job(

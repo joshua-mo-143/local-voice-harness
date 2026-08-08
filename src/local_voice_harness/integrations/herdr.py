@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
@@ -7,6 +8,7 @@ import subprocess
 import tempfile
 import time
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -19,8 +21,20 @@ HERDR_BIN = os.environ.get(
     "VOICE_HARNESS_HERDR_BIN", str(Path.home() / ".local/bin/herdr")
 )
 HERDR_UNIT = "voice-harness-herdr.service"
+HERDR_WORKTREE_ROOT = Path(
+    os.environ.get(
+        "VOICE_HARNESS_HERDR_WORKTREE_ROOT",
+        str(Path.home() / ".herdr/worktrees"),
+    )
+).expanduser()
 HOME_ROOT = REPOSITORY_ROOT
 SETTLED = {"idle", "done"}
+Checkpoint = Callable[[], None]
+ReserveAgent = Callable[["AgentSelection", bool], None]
+SettleAgent = Callable[["AgentSelection"], None]
+ReserveWorktree = Callable[[Path, str, Path, str], None]
+SettleWorktree = Callable[[Path, str | None, str | None], None]
+FailOperation = Callable[["HerdrError"], None]
 LINEAR_ISSUE = re.compile(r"\b([A-Z][A-Z0-9]+)(?:\s*-\s*|\s+)(\d+)\b", re.IGNORECASE)
 SCP_GIT_URL = re.compile(
     r"^(?P<user>[A-Za-z0-9._-]+)@(?P<host>[A-Za-z0-9.-]+):(?P<path>[^:\s]+)$"
@@ -144,8 +158,14 @@ class HerdrClient:
                 timeout=timeout,
                 check=False,
             )
-        except (OSError, subprocess.TimeoutExpired) as exc:
-            raise HerdrError(f"Herdr command failed: {exc}") from exc
+        except OSError as exc:
+            raise HerdrError(
+                f"Herdr command failed: {exc}", code="operation_spawn_failed"
+            ) from exc
+        except subprocess.TimeoutExpired as exc:
+            raise HerdrError(
+                f"Herdr command failed: {exc}", code="operation_timeout"
+            ) from exc
         if check and process.returncode:
             text = process.stdout.strip() or process.stderr.strip()
             try:
@@ -275,7 +295,9 @@ class HerdrClient:
         ]
         return (matches[0], matches) if len(matches) == 1 else (None, matches)
 
-    def clone_repository(self, url: str) -> Path:
+    def clone_repository(
+        self, url: str, *, checkpoint: Checkpoint | None = None
+    ) -> Path:
         name = repository_name_from_url(url)
         if name is None:
             raise HerdrError("Only Git HTTPS and SSH repository URLs are supported")
@@ -291,10 +313,16 @@ class HerdrClient:
                 f"{destination} already exists and is not a Git repository"
             )
         try:
+            if checkpoint is not None:
+                checkpoint()
             with tempfile.TemporaryDirectory(
                 dir=HOME_ROOT, prefix=f".{name}-clone-"
             ) as temporary:
+                if checkpoint is not None:
+                    checkpoint()
                 staging = Path(temporary) / name
+                if checkpoint is not None:
+                    checkpoint()
                 process = subprocess.run(
                     ["git", "clone", "--", url, str(staging)],
                     capture_output=True,
@@ -302,6 +330,8 @@ class HerdrClient:
                     timeout=300,
                     check=False,
                 )
+                if checkpoint is not None:
+                    checkpoint()
                 if process.returncode:
                     message = process.stderr.strip() or process.stdout.strip()
                     raise HerdrError(message or "Could not clone repository")
@@ -309,7 +339,11 @@ class HerdrClient:
                     raise HerdrError(
                         "Cloned destination is not an allowed Git repository"
                     )
+                if checkpoint is not None:
+                    checkpoint()
                 staging.rename(destination)
+                if checkpoint is not None:
+                    checkpoint()
         except HerdrError:
             raise
         except (OSError, subprocess.TimeoutExpired) as exc:
@@ -317,9 +351,16 @@ class HerdrClient:
         return destination
 
     def choose_or_clone_repository(
-        self, repositories: list[Path]
+        self,
+        repositories: list[Path],
+        *,
+        checkpoint: Checkpoint | None = None,
     ) -> tuple[Path | None, str]:
+        if checkpoint is not None:
+            checkpoint()
         selected = choose_repository([path.name for path in repositories])
+        if checkpoint is not None:
+            checkpoint()
         if selected is None:
             return None, ""
         repository, _matches = self.resolve_repository(selected, "", repositories)
@@ -327,10 +368,15 @@ class HerdrClient:
             return repository, ""
         if repository_name_from_url(selected) is None:
             return None, "The Rofi selection was not a local repository or Git URL."
-        if not confirm_clone(selected):
+        if checkpoint is not None:
+            checkpoint()
+        confirmed = confirm_clone(selected)
+        if checkpoint is not None:
+            checkpoint()
+        if not confirmed:
             return None, "Repository cloning was cancelled."
         try:
-            return self.clone_repository(selected), ""
+            return self.clone_repository(selected, checkpoint=checkpoint), ""
         except HerdrError as exc:
             return None, f"Repository cloning failed: {exc}."
 
@@ -399,9 +445,26 @@ class HerdrClient:
                 return workspace
         return None
 
+    @staticmethod
+    def planned_worktree_path(repository: Path, branch: str) -> Path:
+        repository = repository.resolve()
+        repository_key = hashlib.sha256(str(repository).encode()).hexdigest()[:8]
+        repository_directory = (
+            f"{normalize_name(repository.name) or 'repository'}-{repository_key}"
+        )
+        branch_directory = normalize_name(branch) or "worktree"
+        return (HERDR_WORKTREE_ROOT / repository_directory / branch_directory).resolve()
+
     def new_pane(
-        self, checkout: Path, label: str, workspace_id: str | None = None
+        self,
+        checkout: Path,
+        label: str,
+        workspace_id: str | None = None,
+        *,
+        checkpoint: Checkpoint | None = None,
     ) -> tuple[str, str]:
+        if checkpoint is not None:
+            checkpoint()
         if workspace_id:
             result = self.run_json(
                 "tab",
@@ -424,6 +487,8 @@ class HerdrClient:
                 label,
                 "--no-focus",
             )
+        if checkpoint is not None:
+            checkpoint()
         pane = str((result.get("root_pane") or {}).get("pane_id") or "")
         workspace = str(
             (result.get("workspace") or {}).get("workspace_id") or workspace_id or ""
@@ -433,13 +498,23 @@ class HerdrClient:
         return pane, workspace
 
     def start_agent(
-        self, checkout: Path, label: str, pane: str, workspace: str
+        self,
+        checkout: Path,
+        label: str,
+        pane: str,
+        workspace: str,
+        *,
+        name: str | None = None,
+        checkpoint: Checkpoint | None = None,
     ) -> AgentSelection:
-        suffix = uuid.uuid4().hex[:10]
-        name = f"voice-{normalize_name(label)[:15] or 'task'}-{suffix}"
+        if name is None:
+            suffix = uuid.uuid4().hex[:10]
+            name = f"voice-{normalize_name(label)[:15] or 'task'}-{suffix}"
         deadline = time.monotonic() + 15
         while True:
             try:
+                if checkpoint is not None:
+                    checkpoint()
                 result = self.run_json(
                     "agent",
                     "start",
@@ -454,7 +529,10 @@ class HerdrClient:
                     "--trust",
                     timeout=70,
                 )
-                return self.selection(dict(result.get("agent") or {}), str(checkout))
+                selection = self.selection(
+                    dict(result.get("agent") or {}), str(checkout)
+                )
+                return selection
             except HerdrError as exc:
                 if exc.code != "agent_pane_busy" or time.monotonic() >= deadline:
                     raise
@@ -469,6 +547,13 @@ class HerdrClient:
         reserved: set[str],
         worktree_branch: str | None = None,
         worktree_label: str | None = None,
+        checkpoint: Checkpoint | None = None,
+        reserve: ReserveAgent | None = None,
+        settle: SettleAgent | None = None,
+        fail_agent: FailOperation | None = None,
+        reserve_worktree: ReserveWorktree | None = None,
+        settle_worktree: SettleWorktree | None = None,
+        fail_worktree: FailOperation | None = None,
     ) -> AgentSelection:
         repository = repository.resolve()
         checkout = repository
@@ -482,9 +567,13 @@ class HerdrClient:
         if branch:
             if not re.fullmatch(r"voice/[a-z0-9][a-z0-9._/-]{0,100}", branch):
                 raise HerdrError("invalid voice worktree branch")
+            if checkpoint is not None:
+                checkpoint()
             listing = self.run_json(
                 "worktree", "list", "--cwd", str(repository), "--json"
             )
+            if checkpoint is not None:
+                checkpoint()
             existing = next(
                 (
                     item
@@ -495,8 +584,12 @@ class HerdrClient:
             )
             if existing:
                 checkout = Path(str(existing["path"])).resolve()
+                if reserve_worktree is not None:
+                    reserve_worktree(repository, branch, checkout, "ready")
                 workspace_id = str(existing.get("open_workspace_id") or "") or None
                 if not workspace_id:
+                    if checkpoint is not None:
+                        checkpoint()
                     opened = self.run_json(
                         "worktree",
                         "open",
@@ -509,33 +602,60 @@ class HerdrClient:
                         "--no-focus",
                         "--json",
                     )
+                    if checkpoint is not None:
+                        checkpoint()
                     workspace_id = str(
                         (opened.get("workspace") or {}).get("workspace_id") or ""
                     )
                     root_pane = str(
                         (opened.get("root_pane") or {}).get("pane_id") or ""
                     )
+                if settle_worktree is not None:
+                    settle_worktree(checkout, workspace_id, root_pane)
             else:
-                created = self.run_json(
-                    "worktree",
-                    "create",
-                    "--cwd",
-                    str(repository),
-                    "--branch",
-                    branch,
-                    "--label",
-                    label,
-                    "--no-focus",
-                    "--json",
-                    timeout=120,
-                )
-                checkout = Path(
-                    str((created.get("worktree") or {}).get("path") or "")
-                ).resolve()
+                checkout = self.planned_worktree_path(repository, branch)
+                if reserve_worktree is not None:
+                    reserve_worktree(repository, branch, checkout, "planned")
+                if checkpoint is not None:
+                    checkpoint()
+                if reserve_worktree is not None:
+                    reserve_worktree(repository, branch, checkout, "dispatching")
+                try:
+                    created = self.run_json(
+                        "worktree",
+                        "create",
+                        "--cwd",
+                        str(repository),
+                        "--branch",
+                        branch,
+                        "--path",
+                        str(checkout),
+                        "--label",
+                        label,
+                        "--no-focus",
+                        "--json",
+                        timeout=120,
+                    )
+                    created_checkout = Path(
+                        str((created.get("worktree") or {}).get("path") or "")
+                    ).resolve()
+                    if created_checkout != checkout:
+                        raise HerdrError(
+                            "Herdr created a worktree outside its reserved path",
+                            code="operation_ambiguous",
+                        )
+                except HerdrError as exc:
+                    if fail_worktree is not None:
+                        fail_worktree(exc)
+                    raise
                 workspace_id = str(
                     (created.get("workspace") or {}).get("workspace_id") or ""
                 )
                 root_pane = str((created.get("root_pane") or {}).get("pane_id") or "")
+                if settle_worktree is not None:
+                    settle_worktree(checkout, workspace_id, root_pane)
+                if checkpoint is not None:
+                    checkpoint()
         existing_agent = self.find_agent(
             repository=repository,
             checkout=checkout,
@@ -543,16 +663,51 @@ class HerdrClient:
             reserved=reserved,
         )
         if existing_agent:
+            if reserve is not None:
+                reserve(existing_agent, False)
             return existing_agent
         workspace = self.workspace_for(checkout)
         workspace_id = workspace_id or (
             str(workspace.get("workspace_id") or "") if workspace else None
         )
         if not root_pane:
-            root_pane, workspace_id = self.new_pane(checkout, label, workspace_id)
-        return self.start_agent(checkout, label, root_pane, str(workspace_id))
+            root_pane, workspace_id = self.new_pane(
+                checkout, label, workspace_id, checkpoint=checkpoint
+            )
+        suffix = uuid.uuid4().hex[:10]
+        name = f"voice-{normalize_name(label)[:15] or 'task'}-{suffix}"
+        provisional = AgentSelection(
+            target=name,
+            pane_id=root_pane,
+            workspace_id=str(workspace_id),
+            cwd=str(checkout),
+            name=name,
+            worktree_path=str(checkout),
+        )
+        if reserve is not None:
+            reserve(provisional, True)
+        try:
+            selection = self.start_agent(
+                checkout,
+                label,
+                root_pane,
+                str(workspace_id),
+                name=name,
+                checkpoint=checkpoint,
+            )
+        except HerdrError as exc:
+            if fail_agent is not None:
+                fail_agent(exc)
+            raise
+        if settle is not None:
+            settle(selection)
+        if checkpoint is not None:
+            checkpoint()
+        return selection
 
-    def ensure_router(self, reserved: set[str]) -> AgentSelection:
+    def ensure_router(
+        self, reserved: set[str], *, checkpoint: Checkpoint | None = None
+    ) -> AgentSelection:
         existing = self.find_agent(agent_hint="voice-router", reserved=reserved)
         if existing:
             return existing
@@ -566,14 +721,34 @@ class HerdrClient:
         )
         workspace_id = str(workspace.get("workspace_id") or "") if workspace else None
         pane, workspace_id = self.new_pane(
-            HOME_ROOT, "voice-router", workspace_id or None
+            HOME_ROOT,
+            "voice-router",
+            workspace_id or None,
+            checkpoint=checkpoint,
         )
-        return self.start_agent(HOME_ROOT, "router", pane, workspace_id)
+        return self.start_agent(
+            HOME_ROOT,
+            "router",
+            pane,
+            workspace_id,
+            checkpoint=checkpoint,
+        )
 
     def prompt_and_wait(
-        self, target: str, text: str, *, token: str, timeout: float = 900
+        self,
+        target: str,
+        text: str,
+        *,
+        token: str,
+        timeout: float = 900,
+        checkpoint: Checkpoint | None = None,
     ) -> PromptOutcome:
+        if checkpoint is not None:
+            checkpoint()
         before = self.get_agent(target)
+        if checkpoint is not None:
+            checkpoint()
+            checkpoint()
         process = subprocess.Popen(
             self.command(
                 "agent",
@@ -589,14 +764,26 @@ class HerdrClient:
             text=True,
         )
         try:
+            if checkpoint is not None:
+                checkpoint()
             time.sleep(0.35)
+            if checkpoint is not None:
+                checkpoint()
             current = self.get_agent(target)
+            if checkpoint is not None:
+                checkpoint()
             if (
                 current.get("state_change_seq") == before.get("state_change_seq")
                 and current.get("agent_status") in SETTLED
             ):
+                if checkpoint is not None:
+                    checkpoint()
                 self.run_json("agent", "send-keys", target, "enter")
+                if checkpoint is not None:
+                    checkpoint()
             stdout, stderr = process.communicate(timeout=timeout + 10)
+            if checkpoint is not None:
+                checkpoint()
         except Exception:
             process.kill()
             process.wait()
@@ -622,8 +809,13 @@ class HerdrClient:
         *,
         token: str,
         reserved: set[str],
+        checkpoint: Checkpoint | None = None,
     ) -> tuple[Path | None, str, str]:
-        router = self.ensure_router(reserved)
+        if checkpoint is not None:
+            checkpoint()
+        router = self.ensure_router(reserved, checkpoint=checkpoint)
+        if checkpoint is not None:
+            checkpoint()
         known = "\n".join(f"- {path.name}: {path}" for path in repositories)
         prompt = (
             f"Route Linear issue {issue_key} to a local repository. Use Linear MCP only "
@@ -632,7 +824,13 @@ class HerdrClient:
             f"ROUTE_CONFIDENCE[{token}]: high, medium, or low\n"
             f"ROUTE_REASON[{token}]: <brief reason>"
         )
-        outcome = self.prompt_and_wait(router.target, prompt, token=token, timeout=180)
+        outcome = self.prompt_and_wait(
+            router.target,
+            prompt,
+            token=token,
+            timeout=180,
+            checkpoint=checkpoint,
+        )
         name = extract_marker(outcome.output, "ROUTE_REPO", token) or ""
         confidence = (
             extract_marker(outcome.output, "ROUTE_CONFIDENCE", token) or "low"
@@ -646,3 +844,7 @@ class HerdrClient:
 
     def cancel_agent(self, target: str) -> None:
         self.run_json("agent", "send-keys", target, "ctrl-c")
+        result = self.run_json("agent", "wait", target, "--timeout", "5000", timeout=10)
+        agent = dict(result.get("agent") or {})
+        if agent.get("agent_status") == "working":
+            raise HerdrError(f"Herdr agent {target} did not stop")
