@@ -670,30 +670,52 @@ class WakeConversationDaemon:
                 or context.github_pull_request
                 else {}
             )
-            if (
-                route.actionable
-                and route.intent == Intent.CURSOR_CANCEL
-                and self.cursor_session is not None
-            ):
-                response, next_cursor_session = cursor_turn(
-                    CursorTurnRequest(
-                        "",
-                        action="cancel",
-                        job_id=self.cursor_session,
-                    ),
-                    delivery_claims=delivery_claims,
-                )
-            elif (
-                route.actionable
-                and route.intent == Intent.CURSOR_STATUS
-                and self.cursor_session is not None
-            ):
+            if route.actionable and route.intent == Intent.CURSOR_LIST:
                 response, next_cursor_session = cursor_turn(
                     CursorTurnRequest(
                         "",
                         self.cursor_session,
+                        action="list",
+                    ),
+                    delivery_claims=delivery_claims,
+                )
+            elif route.actionable and route.intent == Intent.CURSOR_CANCEL:
+                response, next_cursor_session = cursor_turn(
+                    CursorTurnRequest(
+                        text,
+                        self.cursor_session,
+                        action="cancel",
+                        job_id=self.cursor_session,
+                        reference=text,
+                    ),
+                    delivery_claims=delivery_claims,
+                )
+            elif route.actionable and route.intent == Intent.CURSOR_STATUS:
+                response, next_cursor_session = cursor_turn(
+                    CursorTurnRequest(
+                        text,
+                        self.cursor_session,
                         action="status",
                         job_id=self.cursor_session,
+                        reference=text,
+                    ),
+                    delivery_claims=delivery_claims,
+                )
+            elif route.actionable and route.intent in {
+                Intent.CURSOR_DISMISS,
+                Intent.CURSOR_REPEAT,
+            }:
+                response, next_cursor_session = cursor_turn(
+                    CursorTurnRequest(
+                        text,
+                        self.cursor_session,
+                        action=(
+                            "dismiss"
+                            if route.intent == Intent.CURSOR_DISMISS
+                            else "repeat"
+                        ),
+                        job_id=self.cursor_session,
+                        reference=text,
                     ),
                     delivery_claims=delivery_claims,
                 )

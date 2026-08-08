@@ -537,6 +537,87 @@ class ProcessUtteranceTests(unittest.TestCase):
         self.assertEqual(daemon.history, [])
 
 
+class InboxIntentRoutingTests(unittest.TestCase):
+    def test_list_intent_routes_to_inbox(self) -> None:
+        daemon = _bare_daemon()
+        with (
+            mock.patch.object(
+                wake_daemon, "transcribe", return_value="what jobs are running"
+            ),
+            mock.patch.object(wake_daemon, "start_components"),
+            mock.patch.object(
+                wake_daemon,
+                "request_context",
+                side_effect=lambda text: RequestContext(text),
+            ),
+            mock.patch.object(
+                wake_daemon,
+                "route_intent",
+                return_value=IntentRoute(Intent.CURSOR_LIST, "high"),
+            ),
+            mock.patch.object(
+                wake_daemon, "cursor_turn", return_value=("you have 2 jobs", None)
+            ) as cursor_turn,
+            mock.patch.object(wake_daemon, "qwen_turn") as qwen_turn,
+            mock.patch.object(
+                daemon,
+                "_drain_playback_queue",
+                return_value=(_playback_batch("ok"), None),
+            ),
+            mock.patch.object(wake_daemon, "notify"),
+        ):
+            daemon.process_utterance(AUDIO_GENERATION, woke=False)
+
+        cursor_turn.assert_called_once_with(
+            CursorTurnRequest("", None, action="list"),
+            delivery_claims=mock.ANY,
+        )
+        qwen_turn.assert_not_called()
+
+    def test_dismiss_intent_passes_reference_and_session(self) -> None:
+        daemon = _bare_daemon()
+        daemon.cursor_session = "oldjob123456"
+        with (
+            mock.patch.object(
+                wake_daemon, "transcribe", return_value="dismiss the bug fix"
+            ),
+            mock.patch.object(wake_daemon, "start_components"),
+            mock.patch.object(
+                wake_daemon,
+                "request_context",
+                side_effect=lambda text: RequestContext(text),
+            ),
+            mock.patch.object(
+                wake_daemon,
+                "route_intent",
+                return_value=IntentRoute(Intent.CURSOR_DISMISS, "high"),
+            ),
+            mock.patch.object(
+                wake_daemon, "cursor_turn", return_value=("Dismissed the update.", None)
+            ) as cursor_turn,
+            mock.patch.object(wake_daemon, "qwen_turn") as qwen_turn,
+            mock.patch.object(
+                daemon,
+                "_drain_playback_queue",
+                return_value=(_playback_batch("ok"), None),
+            ),
+            mock.patch.object(wake_daemon, "notify"),
+        ):
+            daemon.process_utterance(AUDIO_GENERATION, woke=False)
+
+        cursor_turn.assert_called_once_with(
+            CursorTurnRequest(
+                "dismiss the bug fix",
+                "oldjob123456",
+                action="dismiss",
+                job_id="oldjob123456",
+                reference="dismiss the bug fix",
+            ),
+            delivery_claims=mock.ANY,
+        )
+        qwen_turn.assert_not_called()
+
+
 class AnnounceJobTests(unittest.TestCase):
     def test_play_response_finalizes_queued_job_announcements(self) -> None:
         daemon = _bare_daemon()

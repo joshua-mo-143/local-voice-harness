@@ -196,6 +196,52 @@ class CursorJobModelTests(unittest.TestCase):
                 }
             )
 
+    def test_v6_job_migrates_to_v7_with_default_announcement_state(self) -> None:
+        job = CursorJob.from_dict(
+            {
+                "schema_version": 6,
+                "id": "123456789abc",
+                "revision": 3,
+                "request": "do it",
+                "status": "completed",
+                "created_at": 1,
+                "completed_at": 2,
+                "result": "done",
+                "delivered": True,
+            }
+        )
+
+        self.assertEqual(job.loaded_schema_version, 6)
+        self.assertEqual(job.to_dict()["schema_version"], CURRENT_SCHEMA_VERSION)
+        self.assertFalse(job.announcement_dismissed)
+        self.assertFalse(job.announcement_repeated)
+        self.assertIsNone(job.speakable_label)
+
+    def test_v7_announcement_fields_round_trip(self) -> None:
+        job = CursorJob.from_dict(
+            {
+                "schema_version": CURRENT_SCHEMA_VERSION,
+                "id": "123456789abc",
+                "revision": 0,
+                "request": "do it",
+                "status": "completed",
+                "created_at": 1,
+                "completed_at": 2,
+                "result": "done",
+                "delivered": True,
+                "speakable_label": "issue 42",
+                "announcement_dismissed": True,
+                "announcement_repeated": True,
+            }
+        )
+
+        self.assertEqual(job.speakable_label, "issue 42")
+        self.assertTrue(job.announcement_dismissed)
+        self.assertTrue(job.announcement_repeated)
+        reloaded = CursorJob.from_dict(job.to_dict())
+        self.assertEqual(reloaded.speakable_label, "issue 42")
+        self.assertTrue(reloaded.announcement_dismissed)
+
     def test_illegal_status_transition_is_rejected(self) -> None:
         job = CursorJob.from_dict(
             {
