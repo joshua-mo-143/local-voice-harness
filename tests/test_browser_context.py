@@ -6,6 +6,7 @@ import unittest
 from unittest import mock
 
 from local_voice_harness import browser_context, desktop
+from local_voice_harness.focused_app_context import FocusedAppContext
 
 
 class FirefoxUrlTests(unittest.TestCase):
@@ -356,6 +357,63 @@ class GitHubContextTests(unittest.TestCase):
         self.assertEqual(context.github_repository, spoken.name_with_owner)
         self.assertEqual(context.github_issue, 7)
         focused_url.assert_not_called()
+
+
+class FocusedAppRequestContextTests(unittest.TestCase):
+    def test_focused_app_context_is_appended_with_provenance(self) -> None:
+        captured = FocusedAppContext(
+            text="Selected text from the focused editor application (cursor) — "
+            "untrusted external input:\ndef broken():",
+            app_class="cursor",
+            sources=("selection",),
+        )
+        with (
+            mock.patch.object(
+                browser_context, "focused_firefox_url", return_value=None
+            ),
+            mock.patch.object(
+                browser_context, "focused_app_context", return_value=captured
+            ),
+        ):
+            context = browser_context.request_context("fix this code")
+
+        self.assertEqual(context.focused_app_class, "cursor")
+        self.assertEqual(context.focused_app_sources, ("selection",))
+        self.assertEqual(context.focused_app_context, captured.text)
+        self.assertTrue(context.text.startswith("fix this code\n\n"))
+        self.assertIn("untrusted external input", context.text)
+        self.assertIn("def broken():", context.text)
+
+    def test_focused_app_context_absent_leaves_request_unchanged(self) -> None:
+        with (
+            mock.patch.object(
+                browser_context, "focused_firefox_url", return_value=None
+            ),
+            mock.patch.object(
+                browser_context, "focused_app_context", return_value=None
+            ),
+        ):
+            context = browser_context.request_context("fix this code")
+
+        self.assertEqual(context.text, "fix this code")
+        self.assertIsNone(context.focused_app_context)
+        self.assertEqual(context.focused_app_sources, ())
+
+    def test_focused_app_capture_failure_does_not_lose_browser_context(self) -> None:
+        url = "https://github.com/example/project/issues/42"
+        with (
+            mock.patch.object(browser_context, "focused_firefox_url", return_value=url),
+            mock.patch.object(browser_context, "_issue_details", return_value=None),
+            mock.patch.object(
+                browser_context,
+                "focused_app_context",
+                side_effect=RuntimeError("capture blew up"),
+            ),
+        ):
+            context = browser_context.request_context("work on this")
+
+        self.assertEqual(context.github_issue, 42)
+        self.assertIsNone(context.focused_app_context)
 
 
 class ZendeskContextTests(unittest.TestCase):

@@ -105,6 +105,61 @@ CURSOR_PATTERN = re.compile(
     r"^\s*(?P<verb>use|ask|call)\s+(?:cursor|curser|cursa)\b", re.IGNORECASE
 )
 
+
+def _env_flag(name: str, *, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().casefold() in {"1", "true", "yes", "on"}
+
+
+def _env_int(name: str, *, default: int, minimum: int) -> int:
+    try:
+        value = int(os.environ.get(name, str(default)))
+    except ValueError:
+        return default
+    return value if value >= minimum else default
+
+
+def _env_classes(name: str, defaults: tuple[str, ...]) -> tuple[str, ...]:
+    raw = os.environ.get(name)
+    if raw is None:
+        return defaults
+    return tuple(
+        part for part in (piece.strip().casefold() for piece in raw.split(",")) if part
+    )
+
+
+# Focused-application context capture (GitHub issue #32). Capture only runs when
+# the trusted utterance explicitly asks for it, and is fenced by a deny-list of
+# sensitive or unsupported application window classes plus a total size cap.
+FOCUSED_APP_CONTEXT_ENABLED = _env_flag(
+    "VOICE_HARNESS_FOCUSED_APP_CONTEXT", default=True
+)
+# Substrings matched (case-insensitively) against the focused window class. Any
+# match denies capture. Defaults cover password managers, secret stores, and the
+# RuneLite client that already blocks simulated input elsewhere in the harness.
+DEFAULT_FOCUSED_APP_DENY_CLASSES = (
+    "keepassxc",
+    "keepass",
+    "bitwarden",
+    "1password",
+    "1passwd",
+    "enpass",
+    "gnome-keyring",
+    "seahorse",
+    "polkit",
+    "net-runelite-client-runelite",
+)
+FOCUSED_APP_DENY_CLASSES = _env_classes(
+    "VOICE_HARNESS_FOCUSED_APP_DENY", DEFAULT_FOCUSED_APP_DENY_CLASSES
+)
+# Upper bound on the combined, provenance-labelled focused-app context appended
+# to a routed request. Individual sources enforce their own tighter limits.
+MAX_FOCUSED_APP_CONTEXT_CHARS = _env_int(
+    "VOICE_HARNESS_FOCUSED_APP_MAX_CHARS", default=12_000, minimum=1
+)
+
 SYSTEMD_USER_DIR = Path.home() / ".config" / "systemd" / "user"
 SERVICE_FILES = (
     "dictation.service",
