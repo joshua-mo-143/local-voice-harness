@@ -17,11 +17,10 @@ def _completed(
 
 class VeniceCredentialTests(unittest.TestCase):
     def test_store_sends_key_only_over_stdin(self) -> None:
-        def executable(name: str) -> str | None:
-            return "/usr/bin/oo7-cli" if name == "oo7-cli" else "/usr/bin/secret-tool"
-
         with (
-            mock.patch.object(credentials.shutil, "which", side_effect=executable),
+            mock.patch.object(
+                credentials.shutil, "which", return_value="/usr/bin/secret-tool"
+            ),
             mock.patch.object(
                 credentials.subprocess, "run", return_value=_completed()
             ) as run,
@@ -31,15 +30,14 @@ class VeniceCredentialTests(unittest.TestCase):
         command = run.call_args.args[0]
         self.assertNotIn("venice-secret", command)
         self.assertEqual(run.call_args.kwargs["input"], "venice-secret")
-        self.assertEqual(command[:2], ["/usr/bin/oo7-cli", "store"])
-        self.assertEqual(command[-2:], list(credentials.OO7_ATTRIBUTES))
+        self.assertEqual(command[:2], ["/usr/bin/secret-tool", "store"])
+        self.assertEqual(command[-4:], list(credentials.SECRET_ATTRIBUTES))
 
     def test_lookup_returns_secret_service_value(self) -> None:
-        def executable(name: str) -> str | None:
-            return None if name == "oo7-cli" else "/usr/bin/secret-tool"
-
         with (
-            mock.patch.object(credentials.shutil, "which", side_effect=executable),
+            mock.patch.object(
+                credentials.shutil, "which", return_value="/usr/bin/secret-tool"
+            ),
             mock.patch.object(
                 credentials.subprocess,
                 "run",
@@ -65,9 +63,7 @@ class VeniceCredentialTests(unittest.TestCase):
             mock.patch.object(
                 credentials.shutil,
                 "which",
-                side_effect=lambda name: (
-                    None if name == "oo7-cli" else "/usr/bin/secret-tool"
-                ),
+                return_value="/usr/bin/secret-tool",
             ),
             mock.patch.object(credentials.subprocess, "run", return_value=_completed()),
             self.assertRaisesRegex(credentials.CredentialError, "credentials set"),
@@ -79,9 +75,7 @@ class VeniceCredentialTests(unittest.TestCase):
             mock.patch.object(
                 credentials.shutil,
                 "which",
-                side_effect=lambda name: (
-                    None if name == "oo7-cli" else "/usr/bin/secret-tool"
-                ),
+                return_value="/usr/bin/secret-tool",
             ),
             mock.patch.object(
                 credentials.subprocess,
@@ -98,7 +92,7 @@ class VeniceCredentialTests(unittest.TestCase):
     def test_delete_clears_only_the_harness_venice_item(self) -> None:
         with (
             mock.patch.object(
-                credentials.shutil, "which", return_value="/usr/bin/oo7-cli"
+                credentials.shutil, "which", return_value="/usr/bin/secret-tool"
             ),
             mock.patch.object(
                 credentials.subprocess, "run", return_value=_completed()
@@ -108,7 +102,7 @@ class VeniceCredentialTests(unittest.TestCase):
 
         self.assertEqual(
             run.call_args.args[0],
-            ["/usr/bin/oo7-cli", "delete", *credentials.OO7_ATTRIBUTES],
+            ["/usr/bin/secret-tool", "clear", *credentials.SECRET_ATTRIBUTES],
         )
 
 

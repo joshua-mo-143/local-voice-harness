@@ -6,9 +6,7 @@ import subprocess
 from .errors import HarnessError
 
 SECRET_TOOL = "secret-tool"
-OO7_CLI = "oo7-cli"
 SECRET_ATTRIBUTES = ("application", "local-voice-harness", "provider", "venice")
-OO7_ATTRIBUTES = ("application=local-voice-harness", "provider=venice")
 SECRET_LABEL = "Local Voice Harness Venice API key"
 MAX_API_KEY_CHARS = 4096
 
@@ -25,10 +23,6 @@ def _secret_tool() -> str:
             "`paru -S --needed libsecret`"
         )
     return executable
-
-
-def _oo7_cli() -> str | None:
-    return shutil.which(OO7_CLI)
 
 
 def _valid_api_key(value: str) -> str:
@@ -53,15 +47,9 @@ def _operation_error(action: str, process: subprocess.CompletedProcess[str]) -> 
 
 
 def get_venice_api_key() -> str:
-    oo7_cli = _oo7_cli()
-    command = (
-        [oo7_cli, "lookup", "--secret-only", *OO7_ATTRIBUTES]
-        if oo7_cli is not None
-        else [_secret_tool(), "lookup", *SECRET_ATTRIBUTES]
-    )
     try:
         process = subprocess.run(
-            command,
+            [_secret_tool(), "lookup", *SECRET_ATTRIBUTES],
             capture_output=True,
             text=True,
             timeout=10,
@@ -82,20 +70,14 @@ def get_venice_api_key() -> str:
 
 def store_venice_api_key(value: str) -> None:
     key = _valid_api_key(value)
-    oo7_cli = _oo7_cli()
-    command = (
-        [oo7_cli, "store", SECRET_LABEL, *OO7_ATTRIBUTES]
-        if oo7_cli is not None
-        else [
-            _secret_tool(),
-            "store",
-            f"--label={SECRET_LABEL}",
-            *SECRET_ATTRIBUTES,
-        ]
-    )
     try:
         process = subprocess.run(
-            command,
+            [
+                _secret_tool(),
+                "store",
+                f"--label={SECRET_LABEL}",
+                *SECRET_ATTRIBUTES,
+            ],
             input=key,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
@@ -112,15 +94,9 @@ def store_venice_api_key(value: str) -> None:
 
 
 def delete_venice_api_key() -> None:
-    oo7_cli = _oo7_cli()
-    command = (
-        [oo7_cli, "delete", *OO7_ATTRIBUTES]
-        if oo7_cli is not None
-        else [_secret_tool(), "clear", *SECRET_ATTRIBUTES]
-    )
     try:
         process = subprocess.run(
-            command,
+            [_secret_tool(), "clear", *SECRET_ATTRIBUTES],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
             text=True,

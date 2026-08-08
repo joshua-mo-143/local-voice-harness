@@ -193,8 +193,8 @@ printf '%s\n' \
   >"$HOME/.config/voice-harness/backends.toml"
 ```
 
-`credentials set` prompts without echo and sends the key to a Secret Service client
-over standard input (`oo7-cli` when available, otherwise `secret-tool`). Use
+`credentials set` prompts without echo and sends the key to libsecret's
+`secret-tool` over standard input. Use
 `voice-harness credentials status` to check it without printing the key, or
 `voice-harness credentials delete` to remove it. The desktop keyring may prompt to
 unlock when the session collection is locked.
