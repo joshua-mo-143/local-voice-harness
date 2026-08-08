@@ -390,6 +390,11 @@ def _worker_complete(
     def finish(job: dict[str, object]) -> None:
         previous_delivery = {key: job.get(key) for key in delivery_keys}
         complete_from_output(job, output=output, agent_status=agent_status)
+        if (
+            job.get("status") in TERMINAL_STATUSES
+            and job.get("pull_request_worktree_state") == "ready"
+        ):
+            job["pull_request_worktree_state"] = "retained"
         if preserve_blocked_delivery and job.get("status") == "blocked":
             job.update(previous_delivery)
             job["next_reconcile_at"] = time.time() + DELIVERY_RETRY_SECONDS
@@ -423,6 +428,66 @@ def _worker_fail(job_id: str, token: str, exc: Exception) -> None:
         _prepare_delivery(job)
 
     _worker_change(job_id, token, WORKER_STATUSES, fail)
+
+
+def _pull_request_branch(job: dict[str, object]) -> str:
+    configured = str(job.get("worktree_branch") or "")
+    if configured:
+        return configured
+    job_id = str(job.get("id") or "")
+    if not re.fullmatch(r"[0-9a-f]{12}", job_id):
+        raise HarnessError("Cursor pull-request job has an invalid ID")
+    return f"voice/github-pr-{job_id}"
+
+
+def _prepare_pull_request_checkout(
+    job_id: str,
+    token: str,
+    job: dict[str, object],
+) -> dict[str, object] | None:
+    if not job.get("github_pull_request"):
+        return job
+    if job.get("pull_request_worktree_state") in {"ready", "retained"}:
+        return job
+    repository = Path(str(job.get("repository") or "")).resolve()
+    checkout_value = str(job.get("worktree_path") or "")
+    checkout = Path(checkout_value).resolve() if checkout_value else repository
+    branch = _pull_request_branch(job)
+    number = int(str(job.get("github_pull_request") or 0))
+    try:
+        if checkout == repository:
+            raise HarnessError(
+                "refusing to check out a pull request in the shared repository clone"
+            )
+        if not checkout.is_dir() or not (checkout / ".git").exists():
+            raise HarnessError("pull-request worktree is missing or invalid")
+        checked_out_branch = GitHubClient().checkout_pull_request(
+            checkout, number, branch=branch
+        )
+    except Exception as exc:
+        message = (str(exc) or type(exc).__name__)[:500]
+
+        def quarantine(current: dict[str, object]) -> None:
+            current.update(
+                {
+                    "pull_request_worktree_state": "quarantined",
+                    "pull_request_worktree_error": message,
+                }
+            )
+
+        _worker_change(job_id, token, {"routing"}, quarantine)
+        raise
+
+    def ready(current: dict[str, object]) -> None:
+        current.update(
+            {
+                "pull_request_branch": checked_out_branch or branch,
+                "pull_request_worktree_state": "ready",
+                "pull_request_worktree_error": None,
+            }
+        )
+
+    return _worker_change(job_id, token, {"routing"}, ready)
 
 
 def _reserve_worker_target(
@@ -540,7 +605,7 @@ def run_worker(job_id: str, claim_token: str | None = None) -> None:
                                 provisioned_pr.source.name_with_owner
                             ),
                             "repository": str(provisioned_pr.checkout),
-                            "pull_request_branch": provisioned_pr.branch,
+                            "pull_request_worktree_state": "provisioning",
                         }
                     )
 
@@ -689,6 +754,11 @@ def run_worker(job_id: str, claim_token: str | None = None) -> None:
             else:
                 raise HarnessError("could not reserve a Cursor agent")
 
+        prepared = _prepare_pull_request_checkout(job_id, worker_token, job)
+        if prepared is None:
+            return
+        job = prepared
+
         def mark_running(current: dict[str, object]) -> None:
             current["status"] = "running"
             current.pop("continuation", None)
@@ -815,13 +885,22 @@ def start_job(
             "worktree_branch": (
                 f"voice/github-{job_id}"
                 if fork_requested
-                else (f"voice/github-issue-{github_issue}" if github_issue else None)
+                else (
+                    f"voice/github-issue-{github_issue}"
+                    if github_issue
+                    else (f"voice/github-pr-{job_id}" if github_pull_request else None)
+                )
             ),
             "worktree_label": (
                 f"github-{job_id[:6]}"
                 if fork_requested
-                else (f"issue-{github_issue}" if github_issue else None)
+                else (
+                    f"issue-{github_issue}"
+                    if github_issue
+                    else (f"pr-{github_pull_request}" if github_pull_request else None)
+                )
             ),
+            "pull_request_worktree_state": ("pending" if github_pull_request else None),
             "agent_hint": agent,
             "issue_key": extract_linear_issue(spoken_text),
             "status": "queued",
@@ -949,6 +1028,12 @@ def cancel_job(job_id: str) -> str:
                 ),
             }
         )
+        if (
+            job.get("github_pull_request")
+            and job.get("worktree_path")
+            and job.get("pull_request_worktree_state") != "quarantined"
+        ):
+            job["pull_request_worktree_state"] = "retained"
         job.pop("reconcile", None)
         _clear_worker(job)
         _prepare_delivery(job)

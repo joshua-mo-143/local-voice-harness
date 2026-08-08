@@ -413,9 +413,23 @@ class GitHubClient:
             issue=canonical_issue,
         )
 
-    def checkout_pull_request(self, checkout: Path, number: int) -> str | None:
+    def checkout_pull_request(
+        self, checkout: Path, number: int, *, branch: str
+    ) -> str | None:
+        if number <= 0:
+            raise GitHubError("GitHub pull request number must be positive")
+        if not re.fullmatch(r"voice/[a-z0-9][a-z0-9._/-]{0,100}", branch):
+            raise GitHubError("invalid voice pull-request branch")
         self._run(
-            [self.gh_executable, "pr", "checkout", str(number)],
+            [
+                self.gh_executable,
+                "pr",
+                "checkout",
+                str(number),
+                "--branch",
+                branch,
+                "--force",
+            ],
             timeout=180,
             cwd=checkout,
         )
@@ -439,7 +453,4 @@ class GitHubClient:
             raise GitHubError("GitHub pull request number must be positive")
         source = self.inspect_repository(repository)
         checkout = self.ensure_repository_clone(source)
-        branch = self.checkout_pull_request(checkout, number)
-        return ProvisionedPullRequest(
-            source=source, checkout=checkout, number=number, branch=branch
-        )
+        return ProvisionedPullRequest(source=source, checkout=checkout, number=number)

@@ -60,13 +60,12 @@ Cursor routing works as follows:
 6. When the user unambiguously asks to fork, ask for a yes-or-no confirmation, then
    validate the focused public GitHub repository, create or reuse the authenticated
    user's fork, and clone it below the configured GitHub root.
-7. When a GitHub pull request is focused, clone its repository below the configured
-   GitHub root and check the pull request out in place with `gh pr checkout`, then run
-   the request against that checkout so Cursor can verify or extend the branch.
+7. When a GitHub pull request is focused, clone or reuse its repository below the
+   configured GitHub root, create a job-unique `voice/github-pr-<job-id>` worktree,
+   and run `gh pr checkout` only inside that reserved worktree.
 8. Create or reuse a `voice/<issue-key>` worktree for Linear work, a stable
    `voice/github-issue-<number>` worktree for GitHub issue work, or a unique
-   `voice/github-<job-id>` worktree for a GitHub fork task. A checked-out pull request
-   runs directly on its branch without a generated worktree.
+   `voice/github-<job-id>` worktree for a GitHub fork task.
 9. Start a new Cursor agent through Herdr when no suitable agent exists.
 10. Reserve that agent and checkout until it finishes, is blocked, or is cancelled.
 
@@ -74,7 +73,9 @@ The harness never automatically commits, pushes, opens pull requests, modifies L
 or deletes generated worktrees. Fork creation is the only supported GitHub write and
 is performed only after an unambiguous spoken request and a separate affirmative
 confirmation. Checking out a focused pull request only reads from GitHub and writes to
-the local checkout.
+its isolated local worktree. PR worktrees are reused only by recovery or continuation
+of the same job. Completed and cancelled worktrees are retained for inspection, while
+an invalid or partially prepared checkout is marked quarantined and is never dispatched.
 
 ## Compute requirements
 
@@ -615,8 +616,9 @@ the earlier Whisper large-v3 backend; Parakeet TDT 0.6B v2 measurements are pend
 - Merely focusing a GitHub page cannot create a fork. The original spoken request must
   unambiguously ask for one, and the user must separately confirm before the validated
   public repository is forked.
-- Checking out a focused pull request clones its repository below the GitHub root and
-  runs `gh pr checkout`; it reads from GitHub and writes only to the local checkout.
+- Checking out a focused pull request clones or reuses its repository below the GitHub
+  root and runs `gh pr checkout` only in a job-unique, reserved worktree. Recovery
+  retries that same worktree; failed preparation quarantines it.
 - Jobs never automatically commit, push, open pull requests, or remove worktrees.
 - Runtime job metadata and audio live under `$XDG_RUNTIME_DIR/voice-harness`.
 

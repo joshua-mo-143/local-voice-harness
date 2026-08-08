@@ -13,6 +13,7 @@ from local_voice_harness.integrations.github import (
     GitHubIssue,
     GitHubRepository,
     ProvisionedIssue,
+    ProvisionedPullRequest,
     ProvisionedRepository,
 )
 from local_voice_harness.integrations.herdr import AgentSelection, PromptOutcome
@@ -58,6 +59,175 @@ class CursorJobStateTests(unittest.TestCase):
         self.assertEqual(updated["github_repository"], "example/project")
         self.assertTrue(updated["fork_requested"])
         self.assertEqual(updated["request"], "Fork this repo and add a feature")
+
+    def test_pull_request_job_gets_unique_worktree_identity(self) -> None:
+        with mock.patch.object(jobs, "launch_worker"):
+            job_id = jobs.start_job(
+                "review this pull request",
+                github_repository="source/project",
+                github_pull_request=42,
+            )
+
+        job = jobs.read_job(job_id)
+        self.assertEqual(job["worktree_branch"], f"voice/github-pr-{job_id}")
+        self.assertEqual(job["worktree_label"], "pr-42")
+        self.assertEqual(job["pull_request_worktree_state"], "pending")
+
+    def test_worker_checks_out_pull_request_only_in_reserved_worktree(self) -> None:
+        repository = Path(self.temporary.name) / "source" / "project"
+        worktree = Path(self.temporary.name) / "worktrees" / "pr-42"
+        worktree.mkdir(parents=True)
+        (worktree / ".git").write_text("gitdir: shared/worktrees/pr-42\n")
+        source = GitHubRepository(
+            "source/project",
+            "https://github.com/source/project",
+            False,
+            "main",
+        )
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "review pull request 42",
+                "github_repository": "source/project",
+                "github_pull_request": 42,
+                "worktree_branch": "voice/github-pr-123456789abc",
+                "worktree_label": "pr-42",
+                "pull_request_worktree_state": "pending",
+                "status": "queued",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        github = mock.Mock()
+        github.provision_pull_request.return_value = ProvisionedPullRequest(
+            source, repository, 42
+        )
+        github.checkout_pull_request.return_value = "voice/github-pr-123456789abc"
+        client = mock.Mock()
+        client.ensure_agent.return_value = AgentSelection(
+            "agent",
+            "pane",
+            "workspace",
+            str(worktree),
+            "agent",
+            str(worktree),
+        )
+        client.prompt_and_wait.return_value = PromptOutcome(
+            "idle",
+            "done",
+            None,
+            "VOICE_SUMMARY[123456789abc-1]: done",
+        )
+
+        with (
+            mock.patch.object(jobs, "GitHubClient", return_value=github),
+            mock.patch.object(jobs, "HerdrClient", return_value=client),
+        ):
+            jobs.run_worker("123456789abc")
+
+        github.provision_pull_request.assert_called_once_with("source/project", 42)
+        client.ensure_agent.assert_called_once_with(
+            repository,
+            issue_key=None,
+            agent_hint=None,
+            reserved=set(),
+            worktree_branch="voice/github-pr-123456789abc",
+            worktree_label="pr-42",
+        )
+        github.checkout_pull_request.assert_called_once_with(
+            worktree, 42, branch="voice/github-pr-123456789abc"
+        )
+        updated = jobs.read_job("123456789abc")
+        self.assertEqual(updated["status"], "completed")
+        self.assertEqual(updated["worktree_path"], str(worktree))
+        self.assertEqual(updated["pull_request_worktree_state"], "retained")
+
+    def test_pull_request_shared_clone_is_quarantined_without_checkout(self) -> None:
+        repository = Path(self.temporary.name) / "source" / "project"
+        repository.mkdir(parents=True)
+        (repository / ".git").mkdir()
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "status": "routing",
+                "worker_token": "worker",
+                "repository": str(repository),
+                "worktree_path": str(repository),
+                "github_pull_request": 42,
+                "worktree_branch": "voice/github-pr-123456789abc",
+                "pull_request_worktree_state": "provisioning",
+            }
+        )
+        github = mock.Mock()
+
+        with (
+            mock.patch.object(jobs, "GitHubClient", return_value=github),
+            self.assertRaisesRegex(jobs.HarnessError, "shared repository clone"),
+        ):
+            jobs._prepare_pull_request_checkout(
+                "123456789abc",
+                "worker",
+                jobs.read_job("123456789abc"),
+            )
+
+        github.checkout_pull_request.assert_not_called()
+        updated = jobs.read_job("123456789abc")
+        self.assertEqual(updated["pull_request_worktree_state"], "quarantined")
+
+    def test_concurrent_pull_requests_prepare_distinct_worktrees(self) -> None:
+        repository = Path(self.temporary.name) / "source" / "project"
+        barrier = threading.Barrier(2)
+        calls: list[tuple[Path, int, str]] = []
+        for job_id, number in (("aaaaaaaaaaaa", 41), ("bbbbbbbbbbbb", 42)):
+            worktree = Path(self.temporary.name) / "worktrees" / job_id
+            worktree.mkdir(parents=True)
+            (worktree / ".git").write_text("gitdir: shared\n")
+            jobs.write_job(
+                {
+                    "id": job_id,
+                    "status": "routing",
+                    "worker_token": job_id,
+                    "repository": str(repository),
+                    "worktree_path": str(worktree),
+                    "github_pull_request": number,
+                    "worktree_branch": f"voice/github-pr-{job_id}",
+                    "pull_request_worktree_state": "provisioning",
+                }
+            )
+        github = mock.Mock()
+
+        def checkout(path: Path, number: int, *, branch: str) -> str:
+            calls.append((path, number, branch))
+            barrier.wait()
+            return branch
+
+        github.checkout_pull_request.side_effect = checkout
+
+        def prepare(job_id: str) -> None:
+            jobs._prepare_pull_request_checkout(
+                job_id,
+                job_id,
+                jobs.read_job(job_id),
+            )
+
+        with mock.patch.object(jobs, "GitHubClient", return_value=github):
+            threads = [
+                threading.Thread(target=prepare, args=(job_id,))
+                for job_id in ("aaaaaaaaaaaa", "bbbbbbbbbbbb")
+            ]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+
+        self.assertEqual(len({path for path, _number, _branch in calls}), 2)
+        self.assertEqual(len({branch for _path, _number, branch in calls}), 2)
+        self.assertTrue(
+            all(
+                jobs.read_job(job_id)["pull_request_worktree_state"] == "ready"
+                for job_id in ("aaaaaaaaaaaa", "bbbbbbbbbbbb")
+            )
+        )
 
     def test_worker_provisions_fork_and_uses_dedicated_worktree(self) -> None:
         repository = Path(self.temporary.name) / "source" / "project"
@@ -711,6 +881,9 @@ class CursorJobStateTests(unittest.TestCase):
                 "worker_token": "worker",
                 "worker_pid": 42,
                 "worker_process_start": "old-worker",
+                "github_pull_request": 42,
+                "worktree_path": "/worktree/pr-42",
+                "pull_request_worktree_state": "provisioning",
                 "delivered": False,
             }
         )
@@ -726,6 +899,10 @@ class CursorJobStateTests(unittest.TestCase):
 
         self.assertIn("cursor-agent", reserved_during_cancel)
         self.assertNotIn("cursor-agent", jobs.reserved_targets())
+        self.assertEqual(
+            jobs.read_job("123456789abc")["pull_request_worktree_state"],
+            "retained",
+        )
 
     def test_cancel_retires_unfenced_legacy_worker_first(self) -> None:
         jobs.write_job(
