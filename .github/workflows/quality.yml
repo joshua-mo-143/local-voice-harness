@@ -15,6 +15,8 @@ jobs:
   checks:
     name: Python ${{ matrix.python-version }}
     runs-on: ubuntu-latest
+    env:
+      UV_PYTHON: ${{ matrix.python-version }}
     strategy:
       fail-fast: false
       matrix:
@@ -28,12 +30,24 @@ jobs:
           python-version: ${{ matrix.python-version }}
           enable-cache: true
       - name: Install development dependencies
-        run: uv sync --locked
+        run: uv sync --locked --python "$UV_PYTHON"
+      - name: Verify matrix interpreter
+        run: |
+          uv run --locked python -c \
+            'import os, sys; expected = tuple(map(int, os.environ["UV_PYTHON"].split("."))); assert sys.version_info[:2] == expected, sys.version'
       - name: Check formatting
         run: uv run --locked ruff format --check .
       - name: Lint
         run: uv run --locked ruff check .
       - name: Type check
-        run: uv run --locked pyright
+        run: uv run --locked pyright --pythonversion "$UV_PYTHON"
+      - name: Verify systemd units
+        run: |
+          uv run --locked python -m local_voice_harness.service_units \
+            --require-systemd-analyze
       - name: Test
         run: uv run --locked pytest
+      - name: Check risk-specific coverage
+        run: |
+          uv run --locked coverage json -o coverage.json
+          uv run --locked python -m local_voice_harness.coverage_gate coverage.json

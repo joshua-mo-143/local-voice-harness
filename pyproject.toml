@@ -71,7 +71,6 @@ select = ["B", "E4", "E7", "E9", "F", "I", "UP"]
 
 [tool.pyright]
 include = ["src", "tests"]
-pythonVersion = "3.11"
 typeCheckingMode = "standard"
 reportMissingImports = false
 reportMissingTypeStubs = false
@@ -95,3 +94,12 @@ source = ["local_voice_harness"]
 precision = 1
 show_missing = true
 skip_covered = true
+
+[tool.voice-harness.coverage.module-minimums]
+"src/local_voice_harness/cursor/jobs.py" = 70
+"src/local_voice_harness/integrations/github.py" = 65
+"src/local_voice_harness/integrations/herdr.py" = 50
+"src/local_voice_harness/llm.py" = 85
+"src/local_voice_harness/service_manager.py" = 35
+"src/local_voice_harness/tts/client.py" = 75
+"src/local_voice_harness/wake/daemon.py" = 60
