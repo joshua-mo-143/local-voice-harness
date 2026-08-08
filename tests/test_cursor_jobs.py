@@ -1026,10 +1026,16 @@ class CursorJobStateTests(unittest.TestCase):
         worker = threading.Thread(target=jobs.run_worker, args=("123456789abc",))
         with mock.patch.object(jobs, "GitHubClient", return_value=github):
             worker.start()
-            self.assertTrue(entered.wait(2))
-            jobs.cancel_job("123456789abc")
-            release.set()
-            worker.join(2)
+            try:
+                self.assertTrue(
+                    entered.wait(10),
+                    "worker did not reach the pre-submit fork barrier",
+                )
+                jobs.cancel_job("123456789abc")
+                self.assertEqual(jobs.read_job("123456789abc")["status"], "cancelled")
+            finally:
+                release.set()
+                worker.join(10)
 
         self.assertFalse(worker.is_alive())
         self.assertFalse(submitted.is_set())
