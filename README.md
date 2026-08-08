@@ -42,6 +42,10 @@ git clone https://www.github.com/joshua-mo-143/local-voice-harness "$HOME/local-
 Do not pipe the script over stdin (`... | bash`); it locates the repository from
 its own path and the logins need the terminal. Run it as a file.
 
+The installer asks whether the LLM and TTS should run locally or use Venice AI.
+They can be selected independently. For an unattended install, set
+`LLM_PROVIDER` and `TTS_PROVIDER` to `local` or `venice`.
+
 ### Install with a coding agent
 
 Prefer to let an agent drive it? Clone the repository, open it in your agent

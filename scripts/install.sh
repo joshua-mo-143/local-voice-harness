@@ -8,6 +8,8 @@
 # Overridable via environment:
 #   PYTHON_VERSION      Python for the harness envs (default 3.11)
 #   CHATTERBOX_DIR      TTS env location (default $HOME/chatterbox-audition)
+#   LLM_PROVIDER        LLM backend: local or venice (prompts when unset)
+#   TTS_PROVIDER        TTS backend: local or venice (prompts when unset)
 #   SKIP_SYSTEM_PACKAGES=1   Skip the paru package steps
 #   SKIP_MODELS=1            Skip Qwen/Chatterbox downloads
 #   SKIP_AUTH=1              Skip the interactive gh/cursor/linear logins
@@ -33,6 +35,32 @@ info() { printf '    %s\n' "$*"; }
 warn() { printf '\033[1;33m warn:\033[0m %s\n' "$*" >&2; }
 have() { command -v "$1" >/dev/null 2>&1; }
 
+select_provider() {
+  local label="$1" selected="$2"
+  while true; do
+    if [[ -z "$selected" ]]; then
+      if [[ -t 0 ]]; then
+        read -r -p "$label provider (local/venice) [local]: " selected
+      fi
+      selected="${selected:-local}"
+    fi
+    selected="${selected,,}"
+    case "$selected" in
+      local|venice)
+        printf '%s\n' "$selected"
+        return
+        ;;
+      *)
+        warn "$label provider must be 'local' or 'venice'."
+        if [[ ! -t 0 ]]; then
+          return 1
+        fi
+        selected=""
+        ;;
+    esac
+  done
+}
+
 require() {
   local missing=0 c
   for c in "$@"; do
@@ -53,6 +81,12 @@ if [[ "$PROJECT_DIR" != "$HOME/local-voice-harness" ]]; then
   warn "Running from $PROJECT_DIR; adjust units or clone there if services fail."
 fi
 
+step "Selecting AI providers"
+LLM_PROVIDER="$(select_provider "LLM" "${LLM_PROVIDER:-}")"
+TTS_PROVIDER="$(select_provider "TTS" "${TTS_PROVIDER:-}")"
+info "LLM provider: $LLM_PROVIDER"
+info "TTS provider: $TTS_PROVIDER"
+
 # --- 1. System packages -----------------------------------------------------
 if [[ "${SKIP_SYSTEM_PACKAGES:-0}" == 1 ]]; then
   step "Skipping system packages (SKIP_SYSTEM_PACKAGES=1)"
@@ -60,6 +94,10 @@ elif have paru; then
   step "Installing base system packages"
   paru -S --needed pipewire libnotify git curl github-cli xdotool xclip \
     wl-clipboard wtype uv libsndfile
+  if [[ "$LLM_PROVIDER" == venice || "$TTS_PROVIDER" == venice ]]; then
+    step "Installing Venice credential support"
+    paru -S --needed libsecret oo7
+  fi
 
   step "Installing CUDA and CUDA-enabled llama.cpp"
   paru -S --needed cuda llama.cpp-cuda
@@ -84,37 +122,69 @@ case ":$PATH:" in
   *) warn "Add \$HOME/.local/bin to your PATH to use the voice-harness command." ;;
 esac
 
+step "Writing backend configuration"
+mkdir -p "$HOME/.config/voice-harness"
+cat >"$HOME/.config/voice-harness/backends.toml" <<EOF
+[llm]
+provider = "$LLM_PROVIDER"
+
+[tts]
+provider = "$TTS_PROVIDER"
+EOF
+
+if [[ "$LLM_PROVIDER" == venice || "$TTS_PROVIDER" == venice ]]; then
+  step "Configuring Venice credentials"
+  if voice-harness credentials status >/dev/null 2>&1; then
+    info "Venice API key is already stored"
+  else
+    voice-harness credentials set
+  fi
+fi
+
 # --- 3. Dictation environment (Parakeet by default) -------------------------
 step "Syncing bundled dictation environment (.venv-dictation)"
 UV_PROJECT_ENVIRONMENT=.venv-dictation \
   uv sync --python "$PYTHON_VERSION" --extra dictation --no-dev
 
-# --- 4. Chatterbox / TTS environment ----------------------------------------
-step "Syncing Chatterbox TTS environment"
+# --- 4. TTS environment ------------------------------------------------------
+step "Syncing TTS environment"
 mkdir -p "$CHATTERBOX_DIR"
-UV_PROJECT_ENVIRONMENT="$CHATTERBOX_DIR/.venv" \
-  uv sync --python "$PYTHON_VERSION" --extra tts --no-dev
+if [[ "$TTS_PROVIDER" == local ]]; then
+  UV_PROJECT_ENVIRONMENT="$CHATTERBOX_DIR/.venv" \
+    uv sync --python "$PYTHON_VERSION" --extra tts --no-dev
+else
+  UV_PROJECT_ENVIRONMENT="$CHATTERBOX_DIR/.venv" \
+    uv sync --python "$PYTHON_VERSION" --no-dev
+fi
 
 # --- 5. Models --------------------------------------------------------------
 if [[ "${SKIP_MODELS:-0}" == 1 ]]; then
   step "Skipping model downloads (SKIP_MODELS=1)"
 else
-  step "Caching Chatterbox Turbo weights"
-  HF_HUB_OFFLINE=0 "$CHATTERBOX_DIR/.venv/bin/python" - <<'PY'
+  if [[ "$TTS_PROVIDER" == local ]]; then
+    step "Caching Chatterbox Turbo weights"
+    HF_HUB_OFFLINE=0 "$CHATTERBOX_DIR/.venv/bin/python" - <<'PY'
 from chatterbox.tts_turbo import ChatterboxTurboTTS
 ChatterboxTurboTTS.from_pretrained(device="cuda")
 print("Chatterbox Turbo cached")
 PY
-
-  step "Downloading Qwen GGUF"
-  mkdir -p "$PROJECT_DIR/models"
-  if [[ -f "$PROJECT_DIR/models/$QWEN_FILE" ]]; then
-    info "Already present: models/$QWEN_FILE"
   else
-    if ! have hf; then
-      uv tool install huggingface_hub
+    info "Skipping Chatterbox weights (Venice TTS selected)"
+  fi
+
+  if [[ "$LLM_PROVIDER" == local ]]; then
+    step "Downloading Qwen GGUF"
+    mkdir -p "$PROJECT_DIR/models"
+    if [[ -f "$PROJECT_DIR/models/$QWEN_FILE" ]]; then
+      info "Already present: models/$QWEN_FILE"
+    else
+      if ! have hf; then
+        uv tool install huggingface_hub
+      fi
+      hf download "$QWEN_REPO" "$QWEN_FILE" --local-dir "$PROJECT_DIR/models"
     fi
-    hf download "$QWEN_REPO" "$QWEN_FILE" --local-dir "$PROJECT_DIR/models"
+  else
+    info "Skipping Qwen download (Venice LLM selected)"
   fi
 fi
 

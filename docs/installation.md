@@ -166,6 +166,46 @@ print("Chatterbox Turbo cached")
 PY
 ```
 
+## Optional Venice LLM and TTS backends
+
+The LLM and TTS providers can be selected independently. The installer prompts for
+each provider and skips the corresponding local environment or model download when
+Venice is selected. Its choices can also be supplied non-interactively:
+
+```fish
+env LLM_PROVIDER=venice TTS_PROVIDER=venice ./scripts/install.sh
+```
+
+Venice credentials are stored through libsecret in the desktop Secret Service, not
+in a file, command argument, environment variable, or systemd unit. For a manual
+installation:
+
+```fish
+paru -S --needed libsecret oo7
+voice-harness credentials set
+mkdir -p "$HOME/.config/voice-harness"
+printf '%s\n' \
+  '[llm]' \
+  'provider = "venice"' \
+  '' \
+  '[tts]' \
+  'provider = "venice"' \
+  >"$HOME/.config/voice-harness/backends.toml"
+```
+
+`credentials set` prompts without echo and sends the key to a Secret Service client
+over standard input (`oo7-cli` when available, otherwise `secret-tool`). Use
+`voice-harness credentials status` to check it without printing the key, or
+`voice-harness credentials delete` to remove it. The desktop keyring may prompt to
+unlock when the session collection is locked.
+
+Venice chat uses its OpenAI-compatible function-calling API. Select an LLM model
+whose Models API entry reports `supportsFunctionCalling`. Venice TTS voice IDs are
+case-sensitive and model-specific; confirm the pair in the
+[Venice TTS model catalog](https://docs.venice.ai/models/text-to-speech).
+See [Configuration](configuration.md#ai-backends) for model, voice, endpoint, timeout,
+and speed options.
+
 ## 4. Download Qwen
 
 Install the Hugging Face CLI and download the expected filename:
