@@ -38,6 +38,13 @@ class ServiceUnitValidationTests(unittest.TestCase):
         self.assertEqual(service_units.consistency_errors(), [])
         self.assertEqual(service_units.security_errors(), [])
 
+    def test_state_directory_is_service_owned_not_user_configurable(self) -> None:
+        wake = "voice-harness-wake.service"
+        self.assertIn("STATE_DIRECTORY", service_units.SERVICE_OWNED_ENVIRONMENT[wake])
+        self.assertNotIn(
+            "STATE_DIRECTORY", service_units.OPTIONAL_ENVIRONMENT_POLICY[wake]
+        )
+
     def test_parity_checks_the_complete_inventory_and_contents(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             project_root = Path(temporary)
@@ -189,6 +196,14 @@ class ServiceUnitValidationTests(unittest.TestCase):
         self.assertEqual(
             policy["voice-harness-wake.service"]["ProtectHome"],
             "false",
+        )
+        self.assertEqual(
+            policy["voice-harness-wake.service"]["StateDirectory"],
+            "voice-harness",
+        )
+        self.assertEqual(
+            policy["voice-harness-wake.service"]["StateDirectoryMode"],
+            "0700",
         )
         for name in service_units.GPU_SERVICES:
             self.assertNotIn("PrivateDevices", policy[name])

@@ -103,9 +103,24 @@ manual or focused-dictation recorder owns the shared recording lock. Manual and
 focused-dictation starts inspect every configured recorder owner atomically under
 that lock, so different capture modes cannot run concurrently.
 
-Cursor job JSON remains under `$XDG_RUNTIME_DIR/voice-harness/jobs`. Completed job
-retention and any durable Cursor job store are intentionally not defined here and are
-deferred to issue #26. This change does not prune completed jobs.
+Cursor job JSON, its lock, and quarantine evidence are durable under the absolute
+`$STATE_DIRECTORY/jobs` supplied by systemd. Outside the service they use
+`$XDG_STATE_HOME/voice-harness/jobs`, falling back to
+`~/.local/state/voice-harness/jobs`. `STATE_DIRECTORY` is service-owned and must
+not be set in user environment overrides. Detached worker logs remain private,
+session-only files under `$XDG_RUNTIME_DIR/voice-harness/jobs`. On first recovery,
+legacy runtime job JSON is imported under both legacy and durable locks; conflicting
+same-revision imports are preserved in the durable quarantine instead of replacing
+state. Linux boot identity is part of worker and target-release ownership, so a
+reused PID after reboot cannot inherit a stale claim. Recovery retains active,
+undelivered, uncertain, fenced, manual-review, and quarantined records. It prunes
+only delivered terminal jobs whose completion is more than seven days old and never
+automatically deletes quarantine evidence.
+Unresolved quarantine evidence conservatively fences conflicting target and
+worktree reservations. Operators may explicitly release that fence through the
+typed `JobStore.acknowledge_quarantine_reservations()` API, which writes a
+hash-bound resolution tombstone while preserving the quarantined payload and
+metadata.
 
 ## Compute requirements
 

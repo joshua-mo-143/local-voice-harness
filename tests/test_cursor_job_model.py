@@ -35,6 +35,7 @@ class CursorJobModelTests(unittest.TestCase):
                 {
                     "worker_token": "claim",
                     "worker_pid": 42,
+                    "worker_boot_id": "boot",
                     "worker_process_start": "start",
                 }
             )
@@ -63,6 +64,7 @@ class CursorJobModelTests(unittest.TestCase):
                 {
                     "worker_token": "next-claim",
                     "worker_pid": 43,
+                    "worker_boot_id": "next-boot",
                     "worker_process_start": "next-start",
                 }
             )
@@ -130,6 +132,31 @@ class CursorJobModelTests(unittest.TestCase):
                 }
             )
 
+    def test_v5_worker_ownership_is_migrated_with_stale_boot_fence(self) -> None:
+        job = CursorJob.from_dict(
+            {
+                "schema_version": 5,
+                "id": "123456789abc",
+                "revision": 4,
+                "request": "do it",
+                "status": "running",
+                "created_at": 1,
+                "delivered": False,
+                "worker_token": "claim",
+                "worker_pid": 42,
+                "worker_process_start": "start",
+                "target_release_pending": True,
+                "target_release_owner_pid": 43,
+                "target_release_owner_start": "release-start",
+            }
+        )
+
+        self.assertEqual(job.worker_boot_id, "legacy-unknown")
+        self.assertEqual(
+            job.to_dict()["target_release_owner_boot_id"], "legacy-unknown"
+        )
+        self.assertEqual(job.to_dict()["schema_version"], CURRENT_SCHEMA_VERSION)
+
     def test_operation_fence_requires_reserved_identity(self) -> None:
         with self.assertRaisesRegex(
             JobValidationError, "dispatching agent operation requires herdr_target"
@@ -188,6 +215,7 @@ class CursorJobModelTests(unittest.TestCase):
                 JobStatus.RUNNING,
                 worker_token="claim",
                 worker_pid=12,
+                worker_boot_id="boot",
                 worker_process_start="start",
             )
 
@@ -232,6 +260,7 @@ class CursorJobModelTests(unittest.TestCase):
                 "herdr_target": "agent",
                 "worker_token": "one",
                 "worker_pid": 1,
+                "worker_boot_id": "boot",
                 "worker_process_start": "start-one",
             }
         )
@@ -242,6 +271,7 @@ class CursorJobModelTests(unittest.TestCase):
                 "herdr_target": "agent",
                 "worker_token": "two",
                 "worker_pid": 2,
+                "worker_boot_id": "boot",
                 "worker_process_start": "start-two",
             }
         )

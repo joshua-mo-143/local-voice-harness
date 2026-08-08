@@ -2,12 +2,15 @@ from __future__ import annotations
 
 import math
 import re
+import uuid
+from collections.abc import Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any
 
-CURRENT_SCHEMA_VERSION = 5
+CURRENT_SCHEMA_VERSION = 6
 LEGACY_SCHEMA_VERSIONS = frozenset(range(CURRENT_SCHEMA_VERSION))
+LEGACY_BOOT_ID = "legacy-unknown"
 
 
 class JobValidationError(ValueError):
@@ -196,6 +199,7 @@ _STRING_FIELDS = frozenset(
         "clarification_kind",
         "turn_token",
         "worker_token",
+        "worker_boot_id",
         "worker_process_start",
         "worker_operation",
         "herdr_target",
@@ -203,6 +207,7 @@ _STRING_FIELDS = frozenset(
         "herdr_workspace_id",
         "delivery_claim_token",
         "target_release_token",
+        "target_release_owner_boot_id",
         "target_release_owner_start",
         "agent_dispatch_state",
         "fork_operation_state",
@@ -260,6 +265,29 @@ _WORKTREE_OPERATION_STATES = frozenset(
 _UNCERTAIN_OPERATION_STATES = frozenset(
     {"dispatching", "submitted", "ambiguous", "failed_observing"}
 )
+
+
+@dataclass(frozen=True, slots=True)
+class NewCursorJob:
+    id: str
+    request: str
+    created_at: float
+    foreground_until: float
+    utterance: str | None = None
+    trusted_utterance: str | None = None
+    repository_hint: str | None = None
+    context_repository: str | None = None
+    github_repository: str | None = None
+    github_issue: int | None = None
+    github_issue_url: str | None = None
+    github_issue_context: str | None = None
+    fork_requested: bool = False
+    github_pull_request: int | None = None
+    worktree_branch: str | None = None
+    worktree_label: str | None = None
+    pull_request_worktree_state: str | None = None
+    agent_hint: str | None = None
+    issue_key: str | None = None
 
 
 def _integer(value: object, field: str) -> int:
@@ -328,6 +356,19 @@ def _legacy_defaults(values: dict[str, object]) -> None:
         values.get("queued_at") or values.get("completed_at") or 0,
     )
     values.setdefault("delivered", False)
+    if any(
+        values.get(field) is not None
+        for field in ("worker_token", "worker_pid", "worker_process_start")
+    ):
+        # A pre-v6 PID/start-time claim has no boot fence. Never attach the
+        # current boot ID while loading it: after a reboot that could bless a
+        # reused PID as the old owner.
+        values.setdefault("worker_boot_id", LEGACY_BOOT_ID)
+    if any(
+        values.get(field) is not None
+        for field in ("target_release_owner_pid", "target_release_owner_start")
+    ):
+        values.setdefault("target_release_owner_boot_id", LEGACY_BOOT_ID)
     if status == JobStatus.QUEUED:
         values.setdefault("queued_at", values["created_at"])
     elif status == JobStatus.AWAITING_USER:
@@ -370,6 +411,7 @@ class CursorJob:
     delivered: bool
     worker_token: str | None
     worker_pid: int | None
+    worker_boot_id: str | None
     worker_process_start: str | None
     worker_operation: str | None
     delivery_claim_token: str | None
@@ -481,6 +523,11 @@ class CursorJob:
                 if values.get("worker_pid") is not None
                 else None
             ),
+            worker_boot_id=(
+                str(values["worker_boot_id"])
+                if values.get("worker_boot_id") is not None
+                else None
+            ),
             worker_process_start=(
                 str(values["worker_process_start"])
                 if values.get("worker_process_start") is not None
@@ -547,6 +594,37 @@ class CursorJob:
         )
         return job
 
+    @classmethod
+    def new(cls, spec: NewCursorJob) -> CursorJob:
+        return cls.from_dict(
+            {
+                "id": spec.id,
+                "schema_version": CURRENT_SCHEMA_VERSION,
+                "revision": 0,
+                "request": spec.request,
+                "utterance": spec.utterance,
+                "trusted_utterance": spec.trusted_utterance,
+                "repository_hint": spec.repository_hint,
+                "context_repository": spec.context_repository,
+                "github_repository": spec.github_repository,
+                "github_issue": spec.github_issue,
+                "github_issue_url": spec.github_issue_url,
+                "github_issue_context": spec.github_issue_context,
+                "fork_requested": spec.fork_requested,
+                "github_pull_request": spec.github_pull_request,
+                "worktree_branch": spec.worktree_branch,
+                "worktree_label": spec.worktree_label,
+                "pull_request_worktree_state": spec.pull_request_worktree_state,
+                "agent_hint": spec.agent_hint,
+                "issue_key": spec.issue_key,
+                "status": JobStatus.QUEUED.value,
+                "delivered": False,
+                "created_at": spec.created_at,
+                "queued_at": spec.created_at,
+                "foreground_until": spec.foreground_until,
+            }
+        )
+
     def to_dict(self, *, preserve_loaded_version: bool = False) -> dict[str, object]:
         values = dict(self._values)
         if (
@@ -559,6 +637,576 @@ class CursorJob:
                 values["schema_version"] = self.loaded_schema_version
         return values
 
+    def evolve(
+        self,
+        *,
+        status: JobStatus | None = None,
+        remove: frozenset[str] = frozenset(),
+        **changes: object,
+    ) -> CursorJob:
+        values = self.to_dict()
+        for field in remove:
+            values.pop(field, None)
+        values.update(changes)
+        values["status"] = (status or self.status).value
+        values["schema_version"] = CURRENT_SCHEMA_VERSION
+        values["revision"] = self.revision + 1
+        updated = CursorJob.from_dict(values)
+        validate_transition(self, updated)
+        return updated
+
+    def clear_worker(self) -> CursorJob:
+        return self.evolve(
+            worker_pid=None,
+            worker_boot_id=None,
+            worker_process_start=None,
+            worker_token=None,
+        )
+
+    def prepare_delivery(self, *, now: float) -> CursorJob:
+        return self.evolve_for_delivery(now=now)
+
+    def evolve_for_delivery(
+        self,
+        *,
+        now: float,
+        status: JobStatus | None = None,
+        remove: frozenset[str] = frozenset(),
+        **changes: object,
+    ) -> CursorJob:
+        return self.evolve(
+            status=status,
+            remove=remove,
+            delivered=False,
+            delivery_generation=self.delivery_generation + 1,
+            delivery_claim_token=None,
+            delivery_claimed_at=None,
+            delivery_retry_at=0,
+            delivery_attempts=0,
+            updated_at=now,
+            **changes,
+        )
+
+    def evolve_recovery(
+        self,
+        dynamic_changes: Mapping[str, object] | None = None,
+        *,
+        now: float,
+        status: JobStatus | None = None,
+        remove: frozenset[str] = frozenset(),
+        prepare_delivery: bool = False,
+        **changes: object,
+    ) -> CursorJob:
+        values = self.to_dict()
+        for field in remove:
+            values.pop(field, None)
+        if dynamic_changes is not None:
+            values.update(dynamic_changes)
+        values.update(changes)
+        final_status = status or self.status
+        values["status"] = final_status.value
+        operation = str(values.get("manual_reconcile_operation") or "")
+        if final_status in TERMINAL_STATUSES and operation:
+            base = str(
+                values.get("reconciliation_base_error")
+                or (
+                    values.get("error")
+                    if final_status == JobStatus.FAILED
+                    else values.get("result")
+                )
+                or "Cursor job failed"
+            )
+            base = base.split("; external operation reconciliation", 1)[0]
+            base = base.split("; manual reconciliation required", 1)[0]
+            if operation == "agent":
+                resource = f"Herdr agent {values.get('herdr_target') or 'unknown'}"
+            elif operation == "fork":
+                resource = (
+                    f"GitHub fork {values.get('fork_operation_target') or 'unknown'}"
+                )
+            else:
+                resource = f"worktree {values.get('worktree_path') or 'unknown'}"
+            message = (f"{base}; manual reconciliation required for {resource}")[:500]
+            prepare_delivery = prepare_delivery or (
+                values.get("result") != message
+                or (final_status == JobStatus.FAILED and values.get("error") != message)
+            )
+            values.update(
+                reconciliation_base_error=base,
+                result=message,
+            )
+            if final_status == JobStatus.FAILED:
+                values["error"] = message
+        elif final_status == JobStatus.FAILED:
+            base = str(
+                values.get("reconciliation_base_error")
+                or values.get("error")
+                or "Cursor job failed"
+            )
+            base = base.split("; external operation reconciliation", 1)[0]
+            if any(
+                values.get(field)
+                in {"dispatching", "submitted", "ambiguous", "failed_observing"}
+                for field in (
+                    "agent_dispatch_state",
+                    "fork_operation_state",
+                    "worktree_provision_state",
+                )
+            ):
+                message = (f"{base}; external operation reconciliation is pending")[
+                    :500
+                ]
+            else:
+                message = base[:500]
+            prepare_delivery = prepare_delivery or (
+                values.get("error") != message or values.get("result") != message
+            )
+            values.update(
+                reconciliation_base_error=base,
+                error=message,
+                result=message,
+            )
+        if prepare_delivery:
+            values.update(
+                delivered=False,
+                delivery_generation=self.delivery_generation + 1,
+                delivery_claim_token=None,
+                delivery_claimed_at=None,
+                delivery_retry_at=0,
+                delivery_attempts=0,
+                updated_at=now,
+            )
+        values["schema_version"] = CURRENT_SCHEMA_VERSION
+        values["revision"] = self.revision + 1
+        updated = CursorJob.from_dict(values)
+        validate_transition(self, updated)
+        return updated
+
+    def record_operation_observation(
+        self,
+        operation: str,
+        state_key: str,
+        expected_states: frozenset[str],
+        *,
+        now: float,
+        observed_absent: bool,
+        failed_max_attempts: int,
+        uncertain_max_attempts: int,
+        base_seconds: float,
+        max_seconds: float,
+    ) -> CursorJob | None:
+        values = self.to_dict()
+        state = str(values.get(state_key) or "")
+        if state not in expected_states:
+            return None
+        attempts_key = f"{operation}_reconcile_attempts"
+        absent_key = f"{operation}_absent_observations"
+        attempts = _integer(values.get(attempts_key) or 0, attempts_key) + 1
+        absent = _integer(values.get(absent_key) or 0, absent_key)
+        changes: dict[str, object] = {
+            attempts_key: attempts,
+            f"{operation}_last_reconciled_at": now,
+        }
+        if observed_absent:
+            absent += 1
+            changes[absent_key] = absent
+        can_confirm_absent = not (operation == "fork" and self.fork_committed)
+        if (
+            state == "failed_observing"
+            and absent >= failed_max_attempts
+            and can_confirm_absent
+        ):
+            changes.update(
+                {
+                    state_key: "confirmed_absent",
+                    f"{operation}_confirmed_absent_at": now,
+                    f"{operation}_next_reconcile_at": None,
+                    "worker_operation": None,
+                    "cancellation_reconciliation_pending": False,
+                }
+            )
+            if operation == "agent":
+                changes.update(
+                    herdr_target=None,
+                    herdr_pane_id=None,
+                    herdr_workspace_id=None,
+                    agent_name=None,
+                    agent_dispatch_exited=None,
+                )
+            elif operation == "worktree":
+                changes.update(
+                    worktree_path=None,
+                    worktree_workspace_id=None,
+                    worktree_root_pane_id=None,
+                )
+        elif attempts >= uncertain_max_attempts:
+            changes.update(
+                {
+                    state_key: "manual_required",
+                    f"{operation}_next_reconcile_at": None,
+                    f"{operation}_automatic_reconcile_stopped_at": now,
+                    "manual_reconcile_operation": operation,
+                    "manual_reconcile_token": uuid.uuid4().hex,
+                    "manual_reconcile_required_at": now,
+                    "worker_operation": None,
+                    "cancellation_reconciliation_pending": False,
+                }
+            )
+        else:
+            changes[f"{operation}_next_reconcile_at"] = now + min(
+                max_seconds, base_seconds * (2 ** (attempts - 1))
+            )
+        return self.evolve_recovery(
+            changes,
+            now=now,
+            prepare_delivery=changes.get(state_key) == "manual_required",
+        )
+
+    def _optional_string(self, field: str) -> str | None:
+        value = self._values.get(field)
+        return str(value) if value is not None else None
+
+    def _optional_int(self, field: str) -> int | None:
+        value = self._values.get(field)
+        return _integer(value, field) if value is not None else None
+
+    def _optional_float(self, field: str) -> float | None:
+        value = self._values.get(field)
+        return _number(value, field) if value is not None else None
+
+    def _boolean_field(self, field: str) -> bool:
+        return bool(self._values.get(field, False))
+
+    @property
+    def result(self) -> str | None:
+        value = self._values.get("result")
+        return str(value) if value is not None else None
+
+    @property
+    def error(self) -> str | None:
+        value = self._values.get("error")
+        return str(value) if value is not None else None
+
+    @property
+    def question(self) -> str | None:
+        value = self._values.get("question")
+        return str(value) if value is not None else None
+
+    @property
+    def utterance(self) -> str | None:
+        return self._optional_string("utterance")
+
+    @property
+    def trusted_utterance(self) -> str | None:
+        return self._optional_string("trusted_utterance")
+
+    @property
+    def repository_hint(self) -> str | None:
+        return self._optional_string("repository_hint")
+
+    @property
+    def context_repository(self) -> str | None:
+        return self._optional_string("context_repository")
+
+    @property
+    def repository(self) -> str | None:
+        return self._optional_string("repository")
+
+    @property
+    def github_repository(self) -> str | None:
+        return self._optional_string("github_repository")
+
+    @property
+    def github_issue(self) -> int | None:
+        return self._optional_int("github_issue")
+
+    @property
+    def github_issue_url(self) -> str | None:
+        return self._optional_string("github_issue_url")
+
+    @property
+    def github_issue_context(self) -> str | None:
+        return self._optional_string("github_issue_context")
+
+    @property
+    def github_pull_request(self) -> int | None:
+        return self._optional_int("github_pull_request")
+
+    @property
+    def fork_requested(self) -> bool:
+        return self._boolean_field("fork_requested")
+
+    @property
+    def fork_confirmed(self) -> bool:
+        return self._boolean_field("fork_confirmed")
+
+    @property
+    def fork_committed(self) -> bool:
+        return self._boolean_field("fork_committed")
+
+    @property
+    def fork_exists(self) -> bool | None:
+        value = self._values.get("fork_exists")
+        return bool(value) if value is not None else None
+
+    @property
+    def worktree_branch(self) -> str | None:
+        return self._optional_string("worktree_branch")
+
+    @property
+    def worktree_label(self) -> str | None:
+        return self._optional_string("worktree_label")
+
+    @property
+    def worktree_workspace_id(self) -> str | None:
+        return self._optional_string("worktree_workspace_id")
+
+    @property
+    def worktree_root_pane_id(self) -> str | None:
+        return self._optional_string("worktree_root_pane_id")
+
+    @property
+    def worktree_provision_error(self) -> str | None:
+        return self._optional_string("worktree_provision_error")
+
+    @property
+    def worktree_manual_inspection_required(self) -> bool:
+        return self._boolean_field("worktree_manual_inspection_required")
+
+    @property
+    def pull_request_worktree_state(self) -> str | None:
+        return self._optional_string("pull_request_worktree_state")
+
+    @property
+    def pull_request_branch(self) -> str | None:
+        return self._optional_string("pull_request_branch")
+
+    @property
+    def pull_request_worktree_error(self) -> str | None:
+        return self._optional_string("pull_request_worktree_error")
+
+    @property
+    def agent_hint(self) -> str | None:
+        return self._optional_string("agent_hint")
+
+    @property
+    def agent_name(self) -> str | None:
+        return self._optional_string("agent_name")
+
+    @property
+    def issue_key(self) -> str | None:
+        return self._optional_string("issue_key")
+
+    @property
+    def clarification_kind(self) -> str | None:
+        return self._optional_string("clarification_kind")
+
+    @property
+    def turn(self) -> int:
+        return _integer(self._values.get("turn") or 0, "turn")
+
+    @property
+    def turn_token(self) -> str | None:
+        return self._optional_string("turn_token")
+
+    @property
+    def continuation(self) -> bool:
+        return self._boolean_field("continuation")
+
+    @property
+    def reconcile(self) -> bool:
+        return self._boolean_field("reconcile")
+
+    @property
+    def herdr_pane_id(self) -> str | None:
+        return self._optional_string("herdr_pane_id")
+
+    @property
+    def herdr_workspace_id(self) -> str | None:
+        return self._optional_string("herdr_workspace_id")
+
+    @property
+    def delivery_generation(self) -> int:
+        return _integer(
+            self._values.get("delivery_generation") or 0, "delivery_generation"
+        )
+
+    @property
+    def target_release_token(self) -> str | None:
+        return self._optional_string("target_release_token")
+
+    @property
+    def target_release_owner_pid(self) -> int | None:
+        return self._optional_int("target_release_owner_pid")
+
+    @property
+    def target_release_owner_boot_id(self) -> str | None:
+        return self._optional_string("target_release_owner_boot_id")
+
+    @property
+    def target_release_owner_start(self) -> str | None:
+        return self._optional_string("target_release_owner_start")
+
+    @property
+    def reconciliation_base_error(self) -> str | None:
+        return self._optional_string("reconciliation_base_error")
+
+    @property
+    def fork_operation_source(self) -> str | None:
+        return self._optional_string("fork_operation_source")
+
+    @property
+    def fork_operation_source_url(self) -> str | None:
+        return self._optional_string("fork_operation_source_url")
+
+    @property
+    def fork_operation_source_parent(self) -> str | None:
+        return self._optional_string("fork_operation_source_parent")
+
+    @property
+    def fork_operation_source_default_branch(self) -> str | None:
+        return self._optional_string("fork_operation_source_default_branch")
+
+    @property
+    def fork_operation_source_private(self) -> bool:
+        return self._boolean_field("fork_operation_source_private")
+
+    @property
+    def fork_operation_target(self) -> str | None:
+        return self._optional_string("fork_operation_target")
+
+    @property
+    def fork_repository(self) -> str | None:
+        return self._optional_string("fork_repository")
+
+    @property
+    def next_reconcile_at(self) -> float:
+        return _number(self._values.get("next_reconcile_at") or 0, "next_reconcile_at")
+
+    def operation_reconcile_at(self, operation: str) -> float:
+        field = f"{operation}_next_reconcile_at"
+        return _number(self._values.get(field) or 0, field)
+
+    def operation_reconcile_attempts(self, operation: str) -> int:
+        field = f"{operation}_reconcile_attempts"
+        return _integer(self._values.get(field) or 0, field)
+
+    def operation_absent_observations(self, operation: str) -> int:
+        field = f"{operation}_absent_observations"
+        return _integer(self._values.get(field) or 0, field)
+
+    def operation_state(self, operation: str) -> str | None:
+        states = {
+            "agent": self.agent_dispatch_state,
+            "fork": self.fork_operation_state,
+            "worktree": self.worktree_provision_state,
+        }
+        return states.get(operation)
+
+    def resolve_manual_operation(
+        self, operation: str, outcome: str, *, resolved_at: float
+    ) -> CursorJob | None:
+        state_key = {
+            "agent": "agent_dispatch_state",
+            "fork": "fork_operation_state",
+            "worktree": "worktree_provision_state",
+        }[operation]
+        changes: dict[str, object] = {
+            state_key: "confirmed_absent"
+            if outcome == "confirmed_absent"
+            else "retained",
+            f"{operation}_{'confirmed_absent' if outcome == 'confirmed_absent' else 'retained'}_at": resolved_at,
+            "manual_reconcile_operation": None,
+            "manual_reconcile_token": None,
+            "manual_reconcile_resolved_at": resolved_at,
+            "manual_reconcile_outcome": outcome,
+            "cancellation_reconciliation_pending": False,
+            "target_release_pending": False,
+            "target_release_token": None,
+            "target_release_owner_pid": None,
+            "target_release_owner_boot_id": None,
+            "target_release_owner_start": None,
+            "worker_operation": None,
+            "worker_pid": None,
+            "worker_boot_id": None,
+            "worker_process_start": None,
+            "worker_token": None,
+        }
+        if outcome == "materialized":
+            if operation == "fork":
+                if not self.fork_operation_target:
+                    return None
+                changes.update(
+                    fork_exists=True,
+                    fork_repository=self.fork_operation_target,
+                )
+            elif operation == "agent" and not self.herdr_target:
+                return None
+            elif operation == "worktree" and not self.worktree_path:
+                return None
+        elif operation == "agent":
+            changes.update(
+                herdr_target=None,
+                herdr_pane_id=None,
+                herdr_workspace_id=None,
+                agent_name=None,
+                agent_dispatch_exited=None,
+                agent_next_reconcile_at=None,
+            )
+        return self.evolve_recovery(
+            changes,
+            now=resolved_at,
+            prepare_delivery=True,
+        )
+
+    @property
+    def foreground_until(self) -> float:
+        return _number(self._values.get("foreground_until") or 0, "foreground_until")
+
+    @property
+    def updated_at(self) -> float | None:
+        return self._optional_float("updated_at")
+
+    @property
+    def delivery_retry_at(self) -> float:
+        return _number(self._values.get("delivery_retry_at") or 0, "delivery_retry_at")
+
+    @property
+    def delivery_attempts(self) -> int:
+        return _integer(self._values.get("delivery_attempts") or 0, "delivery_attempts")
+
+    def claim_delivery(self, token: str, *, claimed_at: float) -> CursorJob:
+        return self._updated(
+            delivery_claim_token=token,
+            delivery_claimed_at=claimed_at,
+            delivery_attempts=self.delivery_attempts + 1,
+        )
+
+    def acknowledge_delivery(self, *, delivered_at: float) -> CursorJob:
+        return self._updated(
+            delivered=True,
+            delivery_claim_token=None,
+            delivery_claimed_at=None,
+            delivery_retry_at=0,
+            delivered_at=delivered_at,
+        )
+
+    def release_delivery(self, *, retry_at: float) -> CursorJob:
+        return self._updated(
+            delivery_claim_token=None,
+            delivery_claimed_at=None,
+            delivery_retry_at=retry_at,
+        )
+
+    def _updated(self, **changes: object) -> CursorJob:
+        values = dict(self._values)
+        values.update(changes)
+        values["schema_version"] = CURRENT_SCHEMA_VERSION
+        values["revision"] = self.revision + 1
+        updated = CursorJob.from_dict(values)
+        validate_transition(self, updated)
+        return updated
+
     def validate_invariants(self, *, require_worker_owner: bool = False) -> None:
         if self.revision < 0:
             raise JobValidationError("revision must not be negative")
@@ -567,6 +1215,7 @@ class CursorJob:
         worker_claim = (
             self.worker_token,
             self.worker_pid,
+            self.worker_boot_id,
             self.worker_process_start,
         )
         if (
@@ -669,7 +1318,7 @@ class CursorJob:
             )
         if (
             self.cancellation_reconciliation_pending
-            and not self.has_uncertain_operation
+            and not self.has_uncertain_operation()
             and not self.target_release_pending
         ):
             raise JobValidationError(
@@ -684,17 +1333,21 @@ class CursorJob:
             )
         release_owner = (
             self._values.get("target_release_owner_pid"),
+            self._values.get("target_release_owner_boot_id"),
             self._values.get("target_release_owner_start"),
         )
-        if bool(release_owner[0]) != bool(release_owner[1]):
+        if any(item is not None for item in release_owner) and not all(
+            item is not None for item in release_owner
+        ):
             raise JobValidationError(
-                "target release owner PID and process start must be paired"
+                "target release owner PID, boot ID, and process start must be paired"
             )
         if not self.target_release_pending and any(
             self._values.get(field)
             for field in (
                 "target_release_token",
                 "target_release_owner_pid",
+                "target_release_owner_boot_id",
                 "target_release_owner_start",
             )
         ):
@@ -702,7 +1355,6 @@ class CursorJob:
                 "released target cannot retain release ownership fields"
             )
 
-    @property
     def has_uncertain_operation(self) -> bool:
         return (
             self.agent_dispatch_state in _UNCERTAIN_OPERATION_STATES

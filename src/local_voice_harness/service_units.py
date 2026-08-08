@@ -113,6 +113,8 @@ SERVICE_SECURITY_POLICY = {
         "RestrictAddressFamilies": "AF_UNIX AF_INET AF_INET6 AF_NETLINK",
         "RuntimeDirectory": "voice-harness",
         "RuntimeDirectoryPreserve": "yes",
+        "StateDirectory": "voice-harness",
+        "StateDirectoryMode": "0700",
         "TasksMax": "1024",
         "MemoryHigh": "3G",
         "MemoryMax": "4G",
@@ -200,6 +202,12 @@ OPTIONAL_ENVIRONMENT_POLICY: dict[str, dict[str, str]] = {
         "DICTATION_REPLACEMENTS": "text",
     },
 }
+SERVICE_OWNED_ENVIRONMENT: dict[str, set[str]] = {
+    "dictation.service": set(),
+    "voice-harness-llm.service": set(),
+    "voice-harness-tts.service": set(),
+    "voice-harness-wake.service": {"STATE_DIRECTORY"},
+}
 CUDA_RUNTIME_DIRECTORIES = {
     "dictation.service": "dictation",
     "voice-harness-llm.service": "voice-harness-llm",
@@ -252,6 +260,8 @@ AUDIT_SHOW_PROPERTIES = (
     "RuntimeDirectory",
     "RuntimeDirectoryMode",
     "RuntimeDirectoryPreserve",
+    "StateDirectory",
+    "StateDirectoryMode",
     "CacheDirectory",
     "CacheDirectoryMode",
     "ReadWritePaths",
@@ -735,6 +745,8 @@ def _audit_expected_properties(name: str) -> dict[str, str]:
         "RuntimeDirectoryPreserve": (
             "yes" if service_policy.get("RuntimeDirectoryPreserve") == "yes" else "no"
         ),
+        "StateDirectory": service_policy.get("StateDirectory", ""),
+        "StateDirectoryMode": service_policy.get("StateDirectoryMode", "0755"),
         "CacheDirectory": service_policy.get("CacheDirectory", ""),
         "CacheDirectoryMode": service_policy.get("CacheDirectoryMode", "0755"),
         "ReadWritePaths": _expanded_unit_value(
@@ -940,8 +952,10 @@ def audit_installed(
             for key, separator, value in [assignment.partition("=")]
             if separator
         }
-        allowed_environment = set(REQUIRED_ENVIRONMENT[name]) | set(
-            OPTIONAL_ENVIRONMENT_POLICY[name]
+        allowed_environment = (
+            set(REQUIRED_ENVIRONMENT[name])
+            | set(OPTIONAL_ENVIRONMENT_POLICY[name])
+            | SERVICE_OWNED_ENVIRONMENT[name]
         )
         unknown_environment = set(actual_environment) - allowed_environment
         missing_environment = set(REQUIRED_ENVIRONMENT[name]) - set(actual_environment)
@@ -962,6 +976,16 @@ def audit_installed(
             }:
                 errors.append(
                     f"{name}: effective environment lacks {variable}={expected}"
+                )
+        if state_directory := actual_environment.get("STATE_DIRECTORY"):
+            expected_state = (
+                Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state"))
+                / "voice-harness"
+            )
+            if state_directory != str(expected_state):
+                errors.append(
+                    f"{name}: STATE_DIRECTORY is service-owned and must be "
+                    f"{str(expected_state)!r}, got {state_directory!r}"
                 )
         errors.extend(_optional_environment_errors(name, actual_environment))
         active = properties.get("ActiveState", "unknown")

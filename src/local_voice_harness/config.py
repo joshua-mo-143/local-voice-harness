@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import re
+from collections.abc import Mapping
 from pathlib import Path
 
 PACKAGE_ROOT = Path(__file__).resolve().parent
@@ -17,7 +18,51 @@ GITHUB_ROOT = Path(
 RUNTIME = Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp"))
 RECORDING_LOCK = RUNTIME / "voice-harness-recording.lock"
 STATE_DIR = RUNTIME / "voice-harness"
-JOBS_DIR = STATE_DIR / "jobs"
+LEGACY_JOBS_DIR = STATE_DIR / "jobs"
+JOB_LOGS_DIR = STATE_DIR / "jobs"
+
+
+def xdg_state_home(
+    environment: Mapping[str, str] = os.environ,
+    *,
+    home: Path | None = None,
+) -> Path:
+    configured = environment.get("XDG_STATE_HOME")
+    path = Path(configured) if configured else None
+    if path is not None and path.is_absolute():
+        return path
+    return (home or Path.home()) / ".local/state"
+
+
+def systemd_state_directory(
+    environment: Mapping[str, str] = os.environ,
+) -> Path | None:
+    configured = environment.get("STATE_DIRECTORY", "")
+    candidates = [
+        Path(value)
+        for value in configured.split(":")
+        if value and Path(value).is_absolute()
+    ]
+    named = [path for path in candidates if path.name == "voice-harness"]
+    if len(named) == 1:
+        return named[0]
+    if len(candidates) == 1:
+        return candidates[0]
+    return None
+
+
+def durable_state_dir(
+    environment: Mapping[str, str] = os.environ,
+    *,
+    home: Path | None = None,
+) -> Path:
+    return systemd_state_directory(environment) or (
+        xdg_state_home(environment, home=home) / "voice-harness"
+    )
+
+
+DURABLE_STATE_DIR = durable_state_dir()
+JOBS_DIR = DURABLE_STATE_DIR / "jobs"
 WAV_PATH = STATE_DIR / "request.wav"
 PID_PATH = STATE_DIR / "recording.pid"
 RECORDER_LOG = STATE_DIR / "pw-record.log"

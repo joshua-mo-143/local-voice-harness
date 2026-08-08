@@ -23,22 +23,34 @@ from ..config import (
     DICTATION_RECORDER_LOG,
     DICTATION_STATE_DIR,
     DICTATION_WAV_PATH,
+    JOBS_DIR,
+    LEGACY_JOBS_DIR,
     PID_PATH,
     RECORDER_LOG,
     RECORDING_LOCK,
     STATE_DIR,
     WAV_PATH,
 )
-from ..cursor.jobs import (
+from ..cursor import service as cursor_service
+from ..cursor.delivery import (
+    DeliveryClaim,
     DeliveryClaims,
-    acknowledge_deliveries,
-    acknowledge_delivery,
-    cursor_turn,
-    pending_results,
-    recover_jobs,
-    release_deliveries,
-    release_delivery,
 )
+from ..cursor.delivery import (
+    acknowledge_deliveries as acknowledge_claims,
+)
+from ..cursor.delivery import (
+    acknowledge_delivery as acknowledge_claim,
+)
+from ..cursor.delivery import (
+    release_deliveries as release_claims,
+)
+from ..cursor.delivery import (
+    release_delivery as release_claim,
+)
+from ..cursor.model import CursorJob, JobStatus
+from ..cursor.service import CursorTurnRequest, cursor_turn, recover_jobs
+from ..cursor.store import JobStore
 from ..errors import HarnessError
 from ..intent import ForkIntent, Intent, decide_fork_intent, route_intent
 from ..llm import qwen_turn
@@ -57,6 +69,7 @@ DICTATION_RECORDING_PATHS = recorder.RecorderPaths(
     RECORDING_LOCK,
 )
 CAPTURE_PATHS = (RECORDING_PATHS, DICTATION_RECORDING_PATHS)
+CURSOR_STORE = JobStore(JOBS_DIR, LEGACY_JOBS_DIR)
 SAMPLE_RATE = 16_000
 FRAME_MS = 80
 FRAME_SAMPLES = SAMPLE_RATE * FRAME_MS // 1000
@@ -81,6 +94,28 @@ PLAYBACK_QUIET_FRAMES = max(
 PLAYBACK_QUIET_TIMEOUT_SECONDS = max(
     0.0, float(os.environ.get("VOICE_HARNESS_PLAYBACK_QUIET_TIMEOUT_SECONDS", "2"))
 )
+
+
+def acknowledge_delivery(job_id: str, token: str) -> bool:
+    return acknowledge_claim(CURSOR_STORE, job_id, token)
+
+
+def release_delivery(job_id: str, token: str) -> bool:
+    return release_claim(CURSOR_STORE, job_id, token)
+
+
+def acknowledge_deliveries(claims: DeliveryClaims) -> None:
+    acknowledge_claims(CURSOR_STORE, claims)
+
+
+def release_deliveries(claims: DeliveryClaims) -> None:
+    release_claims(CURSOR_STORE, claims)
+
+
+def pending_results() -> list[DeliveryClaim]:
+    return cursor_service.pending_results()
+
+
 WAKE_NAME = r"(?:jarvis|travis|service|jarvus|jervis)"
 WAKE_PREFIX = re.compile(rf"^\s*hey[,\s]+{WAKE_NAME}\b[\s,;:!?.-]*", re.IGNORECASE)
 WAKE_ANYWHERE = re.compile(rf"\bhey[,\s]+{WAKE_NAME}\b[\s,;:!?.-]*", re.IGNORECASE)
@@ -452,25 +487,25 @@ class WakeConversationDaemon:
             return {}, interruption
         return batch[-1][0], interruption
 
-    def _job_response_text(self, job: dict[str, object]) -> str:
-        if job.get("status") == "completed":
-            return f"Cursor finished. {str(job.get('result') or '').strip()}"
-        if job.get("status") == "awaiting_user":
+    def _job_response_text(self, job: CursorJob) -> str:
+        if job.status == JobStatus.COMPLETED:
+            return f"Cursor finished. {str(job.result or '').strip()}"
+        if job.status == JobStatus.AWAITING_USER:
             return (
                 "Cursor needs clarification. "
-                + str(job.get("question") or job.get("result") or "").strip()
+                + str(job.question or job.result or "").strip()
             )
-        if job.get("status") == "blocked":
+        if job.status == JobStatus.BLOCKED:
             return str(
-                job.get("result")
-                or f"Cursor agent {job.get('herdr_target') or ''} needs attention."
+                job.result or f"Cursor agent {job.herdr_target or ''} needs attention."
             ).strip()
-        if job.get("status") == "cancelled":
-            return str(job.get("result") or "Cursor job was cancelled.").strip()
-        return f"Cursor job failed. {str(job.get('error') or 'Unknown error').strip()}"
+        if job.status == JobStatus.CANCELLED:
+            return str(job.result or "Cursor job was cancelled.").strip()
+        return f"Cursor job failed. {str(job.error or 'Unknown error').strip()}"
 
-    def _enqueue_job_announcement(self, job: dict[str, object]) -> None:
-        job_id = str(job.get("id") or "")
+    def _enqueue_job_announcement(self, claim: DeliveryClaim) -> None:
+        job = claim.job
+        job_id = job.id
         response = self._job_response_text(job)
         log(f"job {job_id} completion queued: {response}")
         print(f"Assistant: {response}", flush=True)
@@ -478,8 +513,8 @@ class WakeConversationDaemon:
             PlaybackRequest(
                 text=response,
                 job_id=job_id,
-                delivery_token=str(job.get("_delivery_token") or "") or None,
-                job_status=str(job.get("status") or ""),
+                delivery_token=claim.token,
+                job_status=job.status.value,
             )
         )
 
@@ -641,9 +676,11 @@ class WakeConversationDaemon:
                 and self.cursor_session is not None
             ):
                 response, next_cursor_session = cursor_turn(
-                    "",
-                    action="cancel",
-                    job_id=self.cursor_session,
+                    CursorTurnRequest(
+                        "",
+                        action="cancel",
+                        job_id=self.cursor_session,
+                    ),
                     delivery_claims=delivery_claims,
                 )
             elif (
@@ -652,18 +689,22 @@ class WakeConversationDaemon:
                 and self.cursor_session is not None
             ):
                 response, next_cursor_session = cursor_turn(
-                    "",
-                    self.cursor_session,
-                    action="status",
-                    job_id=self.cursor_session,
+                    CursorTurnRequest(
+                        "",
+                        self.cursor_session,
+                        action="status",
+                        job_id=self.cursor_session,
+                    ),
                     delivery_claims=delivery_claims,
                 )
             elif route.actionable and route.intent == Intent.CURSOR_SUBMIT:
                 response, next_cursor_session = cursor_turn(
-                    context.text,
-                    utterance=text,
-                    context_repository=context.focused_repository,
-                    **github_arguments,
+                    CursorTurnRequest(
+                        context.text,
+                        utterance=text,
+                        context_repository=context.focused_repository,
+                        **github_arguments,
+                    ),
                     delivery_claims=delivery_claims,
                 )
             elif (
@@ -672,11 +713,13 @@ class WakeConversationDaemon:
                 and self.cursor_session is not None
             ):
                 response, next_cursor_session = cursor_turn(
-                    context.text,
-                    self.cursor_session,
-                    utterance=text,
-                    action="reply",
-                    job_id=self.cursor_session,
+                    CursorTurnRequest(
+                        context.text,
+                        self.cursor_session,
+                        utterance=text,
+                        action="reply",
+                        job_id=self.cursor_session,
+                    ),
                     delivery_claims=delivery_claims,
                 )
             else:
