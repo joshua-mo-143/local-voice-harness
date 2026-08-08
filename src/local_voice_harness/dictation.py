@@ -3,12 +3,20 @@ from __future__ import annotations
 import json
 import os
 import shutil
-import signal
 import subprocess
 import time
 from pathlib import Path
 
-from .config import DEFAULT_SOURCE, RUNTIME, STT_SOCKET
+from . import config, recorder
+from .config import (
+    DEFAULT_SOURCE,
+    DICTATION_PID_PATH,
+    DICTATION_RECORDER_LOG,
+    DICTATION_STATE_DIR,
+    DICTATION_WAV_PATH,
+    RECORDING_LOCK,
+    STT_SOCKET,
+)
 from .desktop import DesktopError, get_desktop
 from .errors import HarnessError
 from .ipc import socket_ready
@@ -32,93 +40,50 @@ TERMINAL_CLASSES = (
 )
 BLOCKED_WINDOW_CLASSES = ("net-runelite-client-runelite",)
 INJECT_MODES = {"auto", "paste", "type", "stdout"}
-STATE_DIR = RUNTIME / "dictation"
-WAV_PATH = STATE_DIR / "recording.wav"
-PID_PATH = STATE_DIR / "recording.pid"
-RECORDER_LOG = STATE_DIR / "pw-record.log"
+STATE_DIR = DICTATION_STATE_DIR
+WAV_PATH = DICTATION_WAV_PATH
+PID_PATH = DICTATION_PID_PATH
+RECORDER_LOG = DICTATION_RECORDER_LOG
+PATHS = recorder.RecorderPaths(
+    STATE_DIR, WAV_PATH, PID_PATH, RECORDER_LOG, RECORDING_LOCK
+)
+MANUAL_PATHS = recorder.RecorderPaths(
+    config.STATE_DIR,
+    config.WAV_PATH,
+    config.PID_PATH,
+    config.RECORDER_LOG,
+    RECORDING_LOCK,
+)
 
 
 def recording_active() -> bool:
-    if not PID_PATH.exists():
-        return False
-    try:
-        os.kill(int(PID_PATH.read_text()), 0)
-    except (OSError, ValueError):
-        PID_PATH.unlink(missing_ok=True)
-        return False
-    return True
+    return recorder.recording_active(PATHS)
 
 
 def start_recording() -> None:
     _ensure_dictation_allowed()
-    STATE_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
-    if recording_active():
-        print("already recording")
-        return
-    if not socket_ready(STT_SOCKET):
-        raise HarnessError("STT is stopped or still loading")
     source = os.environ.get(
         "DICTATION_SOURCE",
         os.environ.get("VOICE_HARNESS_SOURCE", DEFAULT_SOURCE),
     )
-    command = ["pw-record"]
-    if source:
-        command.extend(("--target", source))
-    command.extend(("--channels=1", "--rate=16000", "--format=s16", str(WAV_PATH)))
-    log_handle = RECORDER_LOG.open("wb")
-    process = subprocess.Popen(
-        command,
-        stdin=subprocess.DEVNULL,
-        stdout=log_handle,
-        stderr=subprocess.STDOUT,
-        start_new_session=True,
+    recorder.start_recording(
+        PATHS,
+        source=source,
+        ready=lambda: socket_ready(STT_SOCKET),
+        conflicts=(MANUAL_PATHS,),
     )
-    log_handle.close()
-    PID_PATH.write_text(str(process.pid))
-    time.sleep(0.2)
-    if process.poll() is not None:
-        PID_PATH.unlink(missing_ok=True)
-        detail = RECORDER_LOG.read_text(errors="replace").strip()
-        raise HarnessError(f"pw-record failed: {detail or process.returncode}")
     notify("Listening…")
     print("recording")
 
 
-def stop_recording() -> None:
-    if not PID_PATH.exists():
-        raise HarnessError("dictation is not currently recording")
-    try:
-        pid = int(PID_PATH.read_text())
-    except ValueError as exc:
-        raise HarnessError("invalid dictation recorder PID") from exc
-    finally:
-        PID_PATH.unlink(missing_ok=True)
-    try:
-        os.kill(pid, signal.SIGINT)
-    except ProcessLookupError as exc:
-        raise HarnessError("dictation recorder exited unexpectedly") from exc
-    deadline = time.monotonic() + 2
-    while time.monotonic() < deadline:
-        try:
-            os.kill(pid, 0)
-        except ProcessLookupError:
-            break
-        time.sleep(0.05)
-    else:
-        os.kill(pid, signal.SIGTERM)
-        raise HarnessError("dictation recorder did not stop cleanly")
-    if not WAV_PATH.is_file() or WAV_PATH.stat().st_size <= 44:
-        raise HarnessError("no microphone audio was captured")
+def stop_recording() -> Path:
+    return recorder.stop_recording(
+        PATHS, missing_message="dictation is not currently recording"
+    )
 
 
 def cancel_recording() -> None:
-    if PID_PATH.exists():
-        try:
-            os.kill(int(PID_PATH.read_text()), signal.SIGTERM)
-        except (ProcessLookupError, ValueError):
-            pass
-        PID_PATH.unlink(missing_ok=True)
-    WAV_PATH.unlink(missing_ok=True)
+    recorder.cancel_recording(PATHS)
     print("cancelled")
 
 
@@ -274,27 +239,30 @@ def inject(text: str) -> None:
     _send_key(shortcut)
 
 
-def transcribe_and_type() -> None:
-    inject(transcribe(WAV_PATH))
+def transcribe_and_type(audio_path: Path) -> None:
+    inject(transcribe(audio_path))
 
 
 def run(command: str) -> None:
     if command == "begin":
         start_recording()
     elif command == "end":
-        stop_recording()
+        audio_path = stop_recording()
         _ensure_dictation_allowed()
-        transcribe_and_type()
+        transcribe_and_type(audio_path)
     elif command == "toggle":
         if recording_active():
-            stop_recording()
+            audio_path = stop_recording()
             _ensure_dictation_allowed()
-            transcribe_and_type()
+            transcribe_and_type(audio_path)
         else:
             start_recording()
     elif command == "transcribe":
         _ensure_dictation_allowed()
-        transcribe_and_type()
+        audio_path = recorder.handoff_recording(
+            PATHS, active_message="cannot transcribe while dictation is recording"
+        )
+        transcribe_and_type(audio_path)
     elif command == "cancel":
         cancel_recording()
     else:

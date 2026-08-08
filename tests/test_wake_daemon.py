@@ -2,16 +2,26 @@ from __future__ import annotations
 
 import collections
 import io
+import json
+import os
+import tempfile
 import threading
 import time
 import unittest
+from pathlib import Path
 from unittest import mock
 
+from local_voice_harness import recorder
 from local_voice_harness.browser_context import RequestContext
+from local_voice_harness.errors import HarnessError
 from local_voice_harness.intent import Intent, IntentRoute
 from local_voice_harness.tts.queue import PlaybackQueue, PlaybackRequest
 from local_voice_harness.wake import daemon as wake_daemon
 from local_voice_harness.wake.daemon import WakeConversationDaemon
+
+AUDIO_GENERATION = Path(
+    "/runtime/voice-harness/recordings/request-0123456789abcdef0123456789abcdef.wav"
+)
 
 
 def _playback_batch(
@@ -127,7 +137,7 @@ class ProcessUtteranceTests(unittest.TestCase):
         with (
             mock.patch.object(
                 wake_daemon, "transcribe", return_value="what time is it"
-            ),
+            ) as transcribe,
             mock.patch.object(wake_daemon, "start_components"),
             mock.patch.object(
                 wake_daemon, "qwen_turn", return_value=("it is noon", None)
@@ -149,7 +159,7 @@ class ProcessUtteranceTests(unittest.TestCase):
             ),
             mock.patch.object(wake_daemon, "notify"),
         ):
-            daemon.process_utterance(woke=False)
+            daemon.process_utterance(AUDIO_GENERATION, woke=False)
 
         qwen_turn.assert_called_once_with(
             "what time is it\n\nGitHub context",
@@ -158,6 +168,7 @@ class ProcessUtteranceTests(unittest.TestCase):
             trusted_utterance="what time is it",
             delivery_claims=mock.ANY,
         )
+        transcribe.assert_called_once_with(AUDIO_GENERATION)
         self.assertTrue(
             daemon.awaiting_followup,
             "a completed turn must re-arm follow-up listening",
@@ -205,7 +216,7 @@ class ProcessUtteranceTests(unittest.TestCase):
             mock.patch.object(wake_daemon, "acknowledge_delivery"),
             mock.patch.object(wake_daemon, "notify"),
         ):
-            daemon.process_utterance(woke=False)
+            daemon.process_utterance(AUDIO_GENERATION, woke=False)
 
         self.assertEqual(daemon.cursor_session, "job1")
 
@@ -218,7 +229,7 @@ class ProcessUtteranceTests(unittest.TestCase):
             mock.patch.object(daemon, "_drain_playback_queue") as play,
             mock.patch.object(wake_daemon, "notify"),
         ):
-            daemon.process_utterance(woke=True)
+            daemon.process_utterance(AUDIO_GENERATION, woke=True)
 
         qwen_turn.assert_not_called()
         play.assert_not_called()
@@ -252,7 +263,7 @@ class ProcessUtteranceTests(unittest.TestCase):
             ),
             mock.patch.object(wake_daemon, "notify"),
         ):
-            daemon.process_utterance(woke=True)
+            daemon.process_utterance(AUDIO_GENERATION, woke=True)
 
         qwen_turn.assert_called_once()
 
@@ -285,7 +296,7 @@ class ProcessUtteranceTests(unittest.TestCase):
             ),
             mock.patch.object(wake_daemon, "notify"),
         ):
-            daemon.process_utterance(woke=False)
+            daemon.process_utterance(AUDIO_GENERATION, woke=False)
 
         cursor_turn.assert_called_once_with(
             "work on APP-43 instead",
@@ -324,7 +335,7 @@ class ProcessUtteranceTests(unittest.TestCase):
             ),
             mock.patch.object(wake_daemon, "notify"),
         ):
-            daemon.process_utterance(woke=False)
+            daemon.process_utterance(AUDIO_GENERATION, woke=False)
 
         cursor_turn.assert_called_once_with(
             "use the api repository",
@@ -367,7 +378,7 @@ class ProcessUtteranceTests(unittest.TestCase):
             ),
             mock.patch.object(wake_daemon, "notify"),
         ):
-            daemon.process_utterance(woke=False)
+            daemon.process_utterance(AUDIO_GENERATION, woke=False)
 
         cursor_turn.assert_called_once_with(
             "ask Cursor to work on APP-43\n\nGitHub context",
@@ -400,7 +411,7 @@ class ProcessUtteranceTests(unittest.TestCase):
             mock.patch.object(wake_daemon, "stop_components") as stop_components,
             mock.patch.object(wake_daemon, "notify"),
         ):
-            daemon.process_utterance(woke=False)
+            daemon.process_utterance(AUDIO_GENERATION, woke=False)
 
         stop_components.assert_called_once()
         self.assertEqual(daemon.conversation_deadline, 0.0)
@@ -430,7 +441,7 @@ class ProcessUtteranceTests(unittest.TestCase):
             mock.patch.object(wake_daemon, "stop_components") as stop_components,
             mock.patch.object(wake_daemon, "notify"),
         ):
-            daemon.process_utterance(woke=False)
+            daemon.process_utterance(AUDIO_GENERATION, woke=False)
 
         stop_components.assert_not_called()
         self.assertGreater(daemon.conversation_deadline, time.monotonic())
@@ -474,7 +485,7 @@ class ProcessUtteranceTests(unittest.TestCase):
             mock.patch.object(wake_daemon, "stop_components"),
             mock.patch.object(wake_daemon, "notify"),
         ):
-            daemon.process_utterance(woke=False)
+            daemon.process_utterance(AUDIO_GENERATION, woke=False)
 
         release.assert_called_once_with([("123456789abc", "claim")])
         self.assertEqual(daemon.history, [])
@@ -980,7 +991,7 @@ class InterruptedTurnTests(unittest.TestCase):
             ),
             mock.patch.object(wake_daemon, "notify"),
         ):
-            result = daemon.process_utterance(woke=False)
+            result = daemon.process_utterance(AUDIO_GENERATION, woke=False)
 
         self.assertIs(result, interruption)
         self.assertEqual(
@@ -1031,6 +1042,136 @@ class InterruptedTurnTests(unittest.TestCase):
         stop_components.assert_not_called()
 
 
+class WakeRecordingHandoffTests(unittest.TestCase):
+    def test_recorded_utterance_returns_explicit_generation(self) -> None:
+        daemon = _bare_daemon()
+        daemon.running = False
+        daemon.is_speech = lambda _frame: True  # type: ignore[method-assign]
+
+        with mock.patch.object(
+            wake_daemon.recorder,
+            "write_audio_generation",
+            return_value=AUDIO_GENERATION,
+        ) as handoff:
+            result = daemon.record_utterance([b"\x01\x00"])
+
+        self.assertEqual(result, AUDIO_GENERATION)
+        handoff.assert_called_once_with(
+            wake_daemon.RECORDING_PATHS,
+            mock.ANY,
+            conflicts=(wake_daemon.DICTATION_RECORDING_PATHS,),
+        )
+
+    def test_handoff_conflict_is_suppressed_without_terminating_daemon(self) -> None:
+        daemon = _bare_daemon()
+        with (
+            mock.patch.object(
+                wake_daemon.recorder, "any_recording_active", return_value=False
+            ),
+            mock.patch.object(
+                daemon,
+                "record_utterance",
+                side_effect=HarnessError("another recording is active"),
+            ),
+            mock.patch.object(wake_daemon, "log") as log,
+            mock.patch.object(wake_daemon, "notify"),
+        ):
+            result = daemon.record_utterance_safely([b"\x01\x00"])
+
+        self.assertIsNone(result)
+        self.assertTrue(daemon.running)
+        self.assertIn("suppressed", log.call_args.args[0])
+
+    def test_run_suppresses_wake_during_manual_capture_without_touching_it(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            shared_lock = root / "recording.lock"
+            manual = recorder.RecorderPaths(
+                root / "manual",
+                root / "manual" / "request.wav",
+                root / "manual" / "recording.pid",
+                root / "manual" / "pw-record.log",
+                shared_lock,
+            )
+            dictation = recorder.RecorderPaths(
+                root / "dictation",
+                root / "dictation" / "recording.wav",
+                root / "dictation" / "recording.pid",
+                root / "dictation" / "pw-record.log",
+                shared_lock,
+            )
+            manual.state_dir.mkdir()
+            identity = recorder.process_identity(os.getpid())
+            assert identity is not None
+            state = json.dumps({"pid": os.getpid(), "process_start": identity})
+            manual.process.write_text(state)
+            audio = b"manual capture in progress"
+            manual.audio.write_bytes(audio)
+
+            daemon = _bare_daemon()
+            daemon.np = mock.Mock()  # type: ignore[assignment]
+            daemon.wake_key = "wake"
+            daemon.wake_model.predict.side_effect = [
+                {"wake": wake_daemon.WAKE_THRESHOLD + 0.1},
+                {"wake": 0.0},
+            ]
+            reads = 0
+
+            def read_frame() -> bytes:
+                nonlocal reads
+                reads += 1
+                if reads == 2:
+                    daemon.running = False
+                return b"\x00\x00"
+
+            daemon.start_microphone = lambda: None  # type: ignore[method-assign]
+            daemon.read_frame = read_frame  # type: ignore[method-assign]
+            with (
+                mock.patch.object(wake_daemon, "CAPTURE_PATHS", (manual, dictation)),
+                mock.patch.object(daemon, "record_utterance") as record,
+                mock.patch.object(daemon, "begin_activation") as activate,
+                mock.patch.object(wake_daemon, "recover_jobs"),
+                mock.patch.object(wake_daemon, "pending_results", return_value=[]),
+                mock.patch.object(wake_daemon, "log") as log,
+                mock.patch.object(wake_daemon, "notify"),
+            ):
+                daemon.run()
+
+            self.assertEqual(reads, 2, "daemon must continue after suppression")
+            record.assert_not_called()
+            activate.assert_not_called()
+            self.assertEqual(manual.audio.read_bytes(), audio)
+            self.assertEqual(manual.process.read_text(), state)
+            self.assertTrue(
+                any("deferred" in call.args[0] for call in log.call_args_list)
+            )
+
+    def test_wake_busy_exhaustion_logs_preserved_generation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            generation = Path(temporary) / "request-generation.wav"
+            generation.write_bytes(b"RIFF" + b"\0" * 64)
+            daemon = _bare_daemon()
+            daemon.pause_microphone = lambda: None  # type: ignore[method-assign]
+            daemon.resume_microphone = lambda: None  # type: ignore[method-assign]
+            daemon.stop_components_when_idle = lambda: None  # type: ignore[method-assign]
+            error = HarnessError(
+                "STT remained busy; audio was preserved. Retry with "
+                f"`voice-harness transcribe --generation {generation}`"
+            )
+            with (
+                mock.patch.object(wake_daemon, "transcribe", side_effect=error),
+                mock.patch.object(wake_daemon, "release_deliveries"),
+                mock.patch.object(wake_daemon, "log") as log,
+                mock.patch.object(wake_daemon, "notify"),
+            ):
+                daemon.process_utterance(generation, woke=True)
+
+            self.assertTrue(generation.exists())
+            self.assertIn(str(generation), log.call_args.args[0])
+
+
 class RunLoopFollowupTests(unittest.TestCase):
     def test_followup_speech_is_recorded_without_wake_word(self) -> None:
         daemon = _bare_daemon()
@@ -1038,13 +1179,14 @@ class RunLoopFollowupTests(unittest.TestCase):
         daemon.conversation_deadline = time.monotonic() + 100
 
         recorded: list[list[bytes]] = []
-        processed: list[bool] = []
+        processed: list[tuple[Path, bool]] = []
 
-        def fake_record(initial: list[bytes]) -> None:
+        def fake_record(initial: list[bytes]) -> Path:
             recorded.append(list(initial))
+            return AUDIO_GENERATION
 
-        def fake_process(*, woke: bool) -> None:
-            processed.append(woke)
+        def fake_process(audio_path: Path, *, woke: bool) -> None:
+            processed.append((audio_path, woke))
             daemon.running = False
 
         daemon.start_microphone = lambda: None  # type: ignore[method-assign]
@@ -1060,7 +1202,11 @@ class RunLoopFollowupTests(unittest.TestCase):
             daemon.run()
 
         recover.assert_called_once()
-        self.assertEqual(processed, [False], "follow-up must be handled as woke=False")
+        self.assertEqual(
+            processed,
+            [(AUDIO_GENERATION, False)],
+            "follow-up must pass its generation and be handled as woke=False",
+        )
         self.assertEqual(len(recorded), 1)
 
 
