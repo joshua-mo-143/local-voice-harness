@@ -363,6 +363,7 @@ def serve(
     *,
     socket_path: Path = SOCKET_PATH,
     stop_event: threading.Event | None = None,
+    ready_event: threading.Event | None = None,
 ) -> None:
     socket_path.unlink(missing_ok=True)
     server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -379,6 +380,8 @@ def serve(
         server.bind(str(socket_path))
         os.chmod(socket_path, 0o600)
         server.listen(4)
+        if ready_event is not None:
+            ready_event.set()
         server.settimeout(ACCEPT_TIMEOUT_SECONDS)
         log(f"listening on {socket_path}")
         while stop_event is None or not stop_event.is_set():
