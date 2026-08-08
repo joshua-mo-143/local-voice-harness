@@ -34,6 +34,26 @@ def xdg_state_home(
     return (home or Path.home()) / ".local/state"
 
 
+def xdg_config_home(
+    environment: Mapping[str, str] = os.environ,
+    *,
+    home: Path | None = None,
+) -> Path:
+    configured = environment.get("XDG_CONFIG_HOME")
+    path = Path(configured) if configured else None
+    if path is not None and path.is_absolute():
+        return path
+    return (home or Path.home()) / ".config"
+
+
+def vocabulary_path(
+    environment: Mapping[str, str] = os.environ,
+    *,
+    home: Path | None = None,
+) -> Path:
+    return xdg_config_home(environment, home=home) / "voice-harness" / "vocabulary.json"
+
+
 def systemd_state_directory(
     environment: Mapping[str, str] = os.environ,
 ) -> Path | None:
@@ -63,6 +83,7 @@ def durable_state_dir(
 
 DURABLE_STATE_DIR = durable_state_dir()
 JOBS_DIR = DURABLE_STATE_DIR / "jobs"
+VOCABULARY_PATH = vocabulary_path()
 WAV_PATH = STATE_DIR / "request.wav"
 PID_PATH = STATE_DIR / "recording.pid"
 RECORDER_LOG = STATE_DIR / "pw-record.log"

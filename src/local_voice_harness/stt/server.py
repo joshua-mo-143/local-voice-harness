@@ -12,7 +12,7 @@ from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Literal
 
-from .. import config, recorder
+from .. import config, recorder, vocabulary
 
 SOCKET_PATH = config.STT_SOCKET
 MAX_REQUEST_BYTES = 4096
@@ -109,8 +109,34 @@ def log(message: str) -> None:
     print(f"[dictation] {message}", file=sys.stderr, flush=True)
 
 
+def _user_replacements() -> tuple[vocabulary.Replacement, ...]:
+    """Load user vocabulary corrections, tolerating a missing or broken store.
+
+    The store is read on each transcription so that ``voice-harness vocabulary``
+    edits take effect without restarting the dictation service.
+    """
+
+    try:
+        return vocabulary.load(config.VOCABULARY_PATH).replacements
+    except (vocabulary.VocabularyError, OSError):
+        return ()
+
+
 def normalize(text: str) -> str:
+    """Apply text corrections with user vocabulary taking precedence.
+
+    Precedence is user vocabulary first, then ``DICTATION_REPLACEMENTS`` and the
+    built-in defaults; a user correction overrides any static entry with the same
+    spoken source.
+    """
+
+    user = _user_replacements()
+    overridden = {replacement.spoken.casefold() for replacement in user}
+    for replacement in user:
+        text = replacement.apply(text)
     for source, target in REPLACEMENTS.items():
+        if source.casefold() in overridden:
+            continue
         text = re.sub(
             rf"(?<!\w){re.escape(source)}(?!\w)",
             lambda _match, replacement=target: replacement,
