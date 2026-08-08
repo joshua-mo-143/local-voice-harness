@@ -30,6 +30,7 @@ from ..integrations.herdr import (
     extract_linear_issue,
     extract_marker,
 )
+from .model import CURRENT_SCHEMA_VERSION
 from .prompts import cursor_prompt
 from .store import locked, read_all_unlocked, read_unlocked, write_unlocked
 
@@ -1586,7 +1587,7 @@ def start_job(
     write_job(
         {
             "id": job_id,
-            "schema_version": 4,
+            "schema_version": CURRENT_SCHEMA_VERSION,
             "revision": 0,
             "request": text,
             "utterance": utterance,
@@ -2092,6 +2093,9 @@ def cancel_job(job_id: str) -> str:
             )
         target = str(job.get("herdr_target") or "")
         worker = dict(job)
+        if status in WORKER_STATUSES and not job.get("worker_token"):
+            # The pre-schema worker was stopped before entering this mutation.
+            _clear_worker(job)
         release_pending = bool(
             target
             or job.get("worktree_path")
@@ -2099,6 +2103,9 @@ def cancel_job(job_id: str) -> str:
             or _has_uncertain_operation(job)
         )
         reconciliation_pending = _has_uncertain_operation(job)
+        release_owner_start = (
+            _process_identity(os.getpid()) if release_pending else None
+        )
         job.update(
             {
                 "status": "cancelled",
@@ -2114,10 +2121,10 @@ def cancel_job(job_id: str) -> str:
                 + FOREGROUND_GRACE_SECONDS,
                 "target_release_pending": release_pending,
                 "target_release_token": release_token if release_pending else None,
-                "target_release_owner_pid": (os.getpid() if release_pending else None),
-                "target_release_owner_start": (
-                    _process_identity(os.getpid()) if release_pending else None
+                "target_release_owner_pid": (
+                    os.getpid() if release_owner_start else None
                 ),
+                "target_release_owner_start": release_owner_start,
                 "cancellation_reconciliation_pending": reconciliation_pending,
             }
         )
@@ -2432,11 +2439,14 @@ def recover_jobs() -> None:
                 and not _manual_target_fence(job)
             ):
                 release_token = uuid.uuid4().hex
+                release_owner_start = _process_identity(os.getpid())
                 job.update(
                     {
                         "target_release_token": release_token,
-                        "target_release_owner_pid": os.getpid(),
-                        "target_release_owner_start": _process_identity(os.getpid()),
+                        "target_release_owner_pid": (
+                            os.getpid() if release_owner_start else None
+                        ),
+                        "target_release_owner_start": release_owner_start,
                     }
                 )
                 _clear_worker(job)
