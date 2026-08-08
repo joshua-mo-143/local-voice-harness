@@ -37,6 +37,41 @@ def _repository(
 
 
 class GitHubClientTests(unittest.TestCase):
+    def test_command_runner_translates_process_failures(self) -> None:
+        client = GitHubClient()
+        with (
+            mock.patch(
+                "local_voice_harness.integrations.github.subprocess.run",
+                side_effect=OSError("missing"),
+            ),
+            self.assertRaisesRegex(GitHubError, "missing"),
+        ):
+            client._run(["gh", "status"])
+
+        with (
+            mock.patch(
+                "local_voice_harness.integrations.github.subprocess.run",
+                side_effect=subprocess.TimeoutExpired(["gh"], 1),
+            ),
+            self.assertRaisesRegex(GitHubError, "timed out"),
+        ):
+            client._run(["gh", "status"])
+
+        failed = _completed(stdout="fallback error", returncode=2)
+        with (
+            mock.patch(
+                "local_voice_harness.integrations.github.subprocess.run",
+                return_value=failed,
+            ),
+            self.assertRaisesRegex(GitHubError, "fallback error"),
+        ):
+            client._run(["gh", "status"])
+        with mock.patch(
+            "local_voice_harness.integrations.github.subprocess.run",
+            return_value=failed,
+        ):
+            self.assertIs(client._run(["gh", "status"], check=False), failed)
+
     def test_repository_identity_validation_rejects_paths(self) -> None:
         self.assertEqual(
             GitHubClient.validate_repository("Example/project.git"),
@@ -99,6 +134,67 @@ class GitHubClientTests(unittest.TestCase):
             self.assertRaisesRegex(GitHubError, "private"),
         ):
             client.inspect_public_repository("example/project")
+
+    def test_repository_and_issue_metadata_validation(self) -> None:
+        client = GitHubClient()
+        for payload in ("not-json", "[]"):
+            with (
+                self.subTest(repository_payload=payload),
+                mock.patch.object(client, "_run", return_value=_completed(payload)),
+                self.assertRaisesRegex(GitHubError, "malformed repository"),
+            ):
+                client.inspect_repository("example/project")
+
+        with (
+            mock.patch.object(
+                client,
+                "_run",
+                return_value=_completed(stderr="permission denied", returncode=1),
+            ),
+            self.assertRaisesRegex(GitHubError, "permission denied"),
+        ):
+            client.inspect_repository("example/project")
+
+        with self.assertRaisesRegex(GitHubError, "positive"):
+            client.issue_details(GitHubIssue("example", "project", 0))
+        for payload in ("not-json", "[]"):
+            with (
+                self.subTest(issue_payload=payload),
+                mock.patch.object(client, "_run", return_value=_completed(payload)),
+                self.assertRaisesRegex(GitHubError, "malformed issue"),
+            ):
+                client.issue_details(GitHubIssue("example", "project", 1))
+
+    def test_login_preparation_and_fork_reconciliation(self) -> None:
+        client = GitHubClient()
+        with mock.patch.object(client, "_run", return_value=_completed("valid-user\n")):
+            self.assertEqual(client.authenticated_login(), "valid-user")
+        with (
+            mock.patch.object(client, "_run", return_value=_completed("invalid/user")),
+            self.assertRaisesRegex(GitHubError, "authenticated user"),
+        ):
+            client.authenticated_login()
+
+        source = _repository("Source/Project")
+        with (
+            mock.patch.object(client, "inspect_public_repository", return_value=source),
+            mock.patch.object(client, "authenticated_login", return_value="me"),
+        ):
+            self.assertEqual(
+                client.prepare_public_fork("source/project"),
+                (source, "me", "me/Project"),
+            )
+
+        with mock.patch.object(client, "_repo_view", return_value=None):
+            self.assertIsNone(client.reconcile_fork(source, "me/Project"))
+        with mock.patch.object(client, "_repo_view", return_value=source):
+            self.assertIs(client.reconcile_fork(source, "Source/Project"), source)
+        unrelated = _repository("me/Project", parent="other/project")
+        with (
+            mock.patch.object(client, "_repo_view", return_value=unrelated),
+            self.assertRaisesRegex(GitHubError, "not a fork"),
+        ):
+            client.reconcile_fork(source, "me/Project")
 
     def test_issue_details_are_read_through_gh(self) -> None:
         client = GitHubClient()
@@ -352,6 +448,49 @@ class GitHubClientTests(unittest.TestCase):
         self.assertIsNone(
             GitHubClient._remote_repository("https://example.com/example/project")
         )
+
+    def test_checkout_verification_and_upstream_configuration(self) -> None:
+        client = GitHubClient()
+        repository = _repository("source/project")
+        fork = _repository("me/project", parent="source/project")
+        with tempfile.TemporaryDirectory() as temporary:
+            checkout = Path(temporary)
+            with self.assertRaisesRegex(GitHubError, "not a Git repository"):
+                client._verify_checkout(checkout, repository)
+            (checkout / ".git").mkdir()
+
+            with mock.patch.object(
+                client,
+                "_git",
+                return_value=_completed("git@github.com:source/project.git\n"),
+            ):
+                client._verify_checkout(checkout, repository)
+            with (
+                mock.patch.object(
+                    client,
+                    "_git",
+                    return_value=_completed("https://github.com/other/project.git\n"),
+                ),
+                self.assertRaisesRegex(GitHubError, "origin is not"),
+            ):
+                client._verify_checkout(checkout, repository)
+
+            with mock.patch.object(client, "_run") as run:
+                client._ensure_upstream(checkout, repository, repository)
+            run.assert_not_called()
+
+            for returncode, action in ((1, "add"), (0, "set-url")):
+                with (
+                    self.subTest(action=action),
+                    mock.patch.object(
+                        client, "_run", return_value=_completed(returncode=returncode)
+                    ),
+                    mock.patch.object(client, "_git") as git,
+                ):
+                    client._ensure_upstream(checkout, repository, fork)
+                git.assert_called_once_with(
+                    checkout, "remote", action, "upstream", repository.url
+                )
 
 
 if __name__ == "__main__":

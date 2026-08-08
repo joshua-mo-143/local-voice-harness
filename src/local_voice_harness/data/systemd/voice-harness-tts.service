@@ -1,15 +1,50 @@
 [Unit]
 Description=Local voice harness Chatterbox Turbo server
 After=graphical-session.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
 
 [Service]
 Type=simple
 WorkingDirectory=%h/local-voice-harness
 ExecStart=%h/chatterbox-audition/.venv/bin/voice-harness-tts
 Environment=HF_HUB_OFFLINE=1
+Environment=CUDA_CACHE_PATH=%t/voice-harness-tts/cuda-cache
+RuntimeDirectory=voice-harness voice-harness-tts
+RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=yes
+UMask=0077
 Restart=on-failure
-RestartSec=2
+RestartSec=5
 TimeoutStopSec=15
+TasksMax=512
+LimitNOFILE=4096
+LimitCORE=0
+MemoryHigh=8G
+MemoryMax=10G
+MemorySwapMax=infinity
+OOMPolicy=stop
+OOMScoreAdjust=200
+NoNewPrivileges=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%t
+ProtectControlGroups=true
+ProtectKernelModules=true
+ProtectKernelTunables=true
+ProtectKernelLogs=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+LockPersonality=true
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+RestrictAddressFamilies=AF_UNIX AF_NETLINK
+SystemCallArchitectures=native
 
 [Install]
 WantedBy=default.target

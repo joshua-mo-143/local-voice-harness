@@ -10,7 +10,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from local_voice_harness import config, service_manager
+from local_voice_harness import cli, config, service_manager
 from local_voice_harness.config import START_SERVICES
 from local_voice_harness.stt import server as stt_server
 
@@ -29,6 +29,7 @@ class ServiceManagementTests(unittest.TestCase):
             with (
                 mock.patch.object(service_manager, "SYSTEMD_USER_DIR", systemd),
                 mock.patch.object(service_manager, "systemctl"),
+                mock.patch("builtins.print") as output,
             ):
                 service_manager.install_services(force=True)
             self.assertEqual(dictation.read_text(), "external dictation\n")
@@ -36,6 +37,62 @@ class ServiceManagementTests(unittest.TestCase):
                 "voice-harness-wake",
                 (systemd / "voice-harness-wake.service").read_text(),
             )
+            self.assertTrue(
+                any(
+                    "--force --replace-dictation" in str(call)
+                    for call in output.call_args_list
+                )
+            )
+
+    def test_install_replaces_dictation_only_with_explicit_migration_flag(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            systemd = Path(temporary)
+            dictation = systemd / "dictation.service"
+            dictation.write_text("external dictation\n")
+            with (
+                mock.patch.object(service_manager, "SYSTEMD_USER_DIR", systemd),
+                mock.patch.object(service_manager, "systemctl"),
+            ):
+                service_manager.install_services(force=True, replace_dictation=True)
+
+            self.assertEqual(
+                dictation.read_text(),
+                service_manager.unit_text("dictation.service"),
+            )
+
+    def test_services_audit_is_read_only_and_exposed_by_cli(self) -> None:
+        parsed = cli.parser().parse_args(["services", "audit"])
+        install = cli.parser().parse_args(
+            ["services", "install", "--force", "--replace-dictation"]
+        )
+        self.assertEqual(parsed.service_command, "audit")
+        self.assertTrue(install.force)
+        self.assertTrue(install.replace_dictation)
+
+        with mock.patch.object(service_manager, "audit_installed", return_value=0):
+            self.assertEqual(service_manager.audit_services(), 0)
+        with (
+            mock.patch.object(cli, "audit_services", return_value=0) as audit,
+            self.assertRaises(SystemExit) as exited,
+        ):
+            cli.dispatch(parsed)
+        audit.assert_called_once_with()
+        self.assertEqual(exited.exception.code, 0)
+
+    def test_hardening_docs_require_dictation_replacement_and_audit(self) -> None:
+        root = service_manager.PROJECT_ROOT
+        hardening = (root / "docs/service-hardening.md").read_text()
+        readme = (root / "README.md").read_text()
+
+        for text in (hardening, readme):
+            self.assertIn(
+                "voice-harness services install --force --replace-dictation",
+                text,
+            )
+            self.assertIn("voice-harness services audit", text)
+        self.assertIn("intentionally replaces the standalone unit", readme)
 
     def test_packaged_systemd_resources_are_available(self) -> None:
         with mock.patch.object(

@@ -14,8 +14,7 @@ from typing import Literal
 
 from .. import config, recorder
 
-RUNTIME = Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp"))
-SOCKET_PATH = RUNTIME / "dictation.sock"
+SOCKET_PATH = config.STT_SOCKET
 MAX_REQUEST_BYTES = 4096
 ACCEPT_TIMEOUT_SECONDS = 0.5
 READ_TIMEOUT_SECONDS = 2.0

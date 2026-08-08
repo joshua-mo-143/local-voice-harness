@@ -14,6 +14,7 @@ from .recording import (
     stop_recording,
 )
 from .service_manager import (
+    audit_services,
     install_services,
     logs,
     restart_services,
@@ -56,6 +57,9 @@ def parser() -> argparse.ArgumentParser:
     restart = service_commands.add_parser("restart")
     restart.add_argument("--include-herdr", action="store_true")
     service_commands.add_parser("status")
+    service_commands.add_parser(
+        "audit", help="read and validate effective installed units and drop-ins"
+    )
     service_logs = service_commands.add_parser("logs")
     service_logs.add_argument("-f", "--follow", action="store_true")
     service_logs.add_argument("-n", "--lines", type=int, default=100)
@@ -96,6 +100,8 @@ def dispatch(args: argparse.Namespace) -> None:
         restart_services(include_herdr=args.include_herdr)
     elif args.service_command == "status":
         service_status()
+    elif args.service_command == "audit":
+        raise SystemExit(audit_services())
     elif args.service_command == "logs":
         logs(follow=args.follow, lines=max(args.lines, 1))
     else:

@@ -239,6 +239,11 @@ Install either `dictation` for Parakeet or `dictation-whisper` for faster-whispe
 the two extras are alternative backend environments, not a requirement to install
 both.
 
+The launcher reads `backend.env` itself and accepts only backend, model, language,
+compute, and quantization selectors. Socket, CUDA/Hugging Face cache, temporary,
+home, and XDG path variables are service-owned and cannot be overridden by that
+file.
+
 ### 3. Create the Chatterbox environment
 
 The existing service uses `$HOME/chatterbox-audition/.venv`:
@@ -383,13 +388,23 @@ always-on services:
 
 ```bash
 voice-harness services install
+voice-harness services audit
 voice-harness services start
 ```
 
 Use `services install --force` only when intentionally replacing conflicting files
 from an older installation. An existing, separately managed `dictation.service` is
-preserved by default; pass `--replace-dictation` only when intentionally migrating
-to the bundled backend.
+preserved by default and is not covered by the shipped hardening policy. After
+reviewing and migrating its customizations, adopt the hardened unit with:
+
+```fish
+voice-harness services install --force --replace-dictation
+voice-harness services audit
+```
+
+`--replace-dictation` intentionally replaces the standalone unit. A failed audit
+means the effective installed unit or a drop-in still differs from the shipped
+policy; do not treat installation as complete.
 
 Qwen and Chatterbox are intentionally not enabled at login. The wake daemon starts
 them on demand and stops them when a conversation closes. It also stops them after a
@@ -402,7 +417,9 @@ The package includes a dictation backend for fresh installs, but cleanup does no
 replace an active standalone service such as `~/.local/share/dictation`. The service
 installer reports that it preserved the existing unit. The wake daemon continues to
 use the same `$XDG_RUNTIME_DIR/dictation.sock`, so both backends are protocol
-compatible.
+compatible. Preservation also means the standalone unit may retain unrestricted
+environment-file or sandbox behavior. It is not hardened merely because the other
+voice-harness units were updated.
 
 ## Repository layout
 
@@ -425,8 +442,14 @@ models/             Ignored local model weights
 ```bash
 voice-harness status
 voice-harness services status
+voice-harness services audit
 voice-harness services logs -f
 ```
+
+The installed-unit audit is read-only: it uses `systemctl --user cat/show` to inspect
+effective units and drop-ins, resource values, runtime state, and restart counts. It
+does not reload, start, stop, or install services. Developers can invoke the same
+check as `python -m local_voice_harness.service_units --audit-installed`.
 
 Test without a microphone:
 
@@ -446,7 +469,7 @@ uv sync --python $python_version
 uv run ruff format --check .
 uv run ruff check .
 uv run pyright --pythonversion $python_version
-uv run python -m local_voice_harness.service_units
+uv run python -m local_voice_harness.service_units --require-systemd-analyze
 uv run pytest
 uv run coverage json -o coverage.json
 uv run python -m local_voice_harness.coverage_gate coverage.json
@@ -461,7 +484,13 @@ service-unit check requires source/package parity and model-default consistency.
 only allowlisted external dependencies and safe stubs for configured executables, so
 clean CI runners do not need model environments installed. CI selects, asserts, and
 type-checks against each supported Python interpreter (3.11 and 3.12) without starting
-services or downloading models.
+services or downloading models. This checks shipped templates only; CI does not prove
+the effective policy of deployed units or local drop-ins. Run `services audit` after
+installation.
+
+The [service hardening and local trust policy](docs/service-hardening.md) records each
+unit's retained capabilities, resource-limit rationale, unauthenticated loopback LLM
+policy, residual risks, and the required real-host smoke checklist.
 
 GPU, audio, Herdr, and complete voice-turn checks are opt-in only. See the
 [hardware smoke checklist](docs/hardware-smoke.md) for their entry points and cleanup
@@ -586,6 +615,7 @@ voice-harness services start
 voice-harness services stop
 voice-harness services restart
 voice-harness services status
+voice-harness services audit
 voice-harness services logs
 voice-harness services logs --follow
 voice-harness services uninstall
@@ -607,37 +637,42 @@ systemd units rather than implementing a second process supervisor.
 
 ## Configuration
 
-Environment variables can be added to systemd drop-ins:
+Only the variables marked “wake drop-in” may be added to
+`voice-harness-wake.service` with `systemctl --user edit`. The installed-unit audit
+rejects other extra variables and every `EnvironmentFile` on every shipped service.
+Dictation backend selectors belong in `~/.config/dictation/backend.env`, which the
+launcher parses through its separate allowlist.
 
-| Variable | Purpose | Default |
-| --- | --- | --- |
-| `VOICE_HARNESS_SOURCE` | PipeWire microphone source | Development-machine source |
-| `VOICE_HARNESS_VOICE` | Chatterbox reference WAV | Built-in voice |
-| `VOICE_HARNESS_WAKE_THRESHOLD` | OpenWakeWord activation threshold | `0.55` |
-| `VOICE_HARNESS_MIN_SPEECH_RMS` | Speech energy gate | `1100` |
-| `VOICE_HARNESS_BARGE_IN_MODE` | Playback interruption (`wake`, `vad`, or `off`) | `wake` |
-| `VOICE_HARNESS_BARGE_IN_SPEECH_FRAMES` | Consecutive 80 ms speech frames for VAD barge-in | `5` |
-| `VOICE_HARNESS_PLAYBACK_QUIET_FRAMES` | Quiet 80 ms frames required after playback | `4` |
-| `VOICE_HARNESS_PLAYBACK_QUIET_TIMEOUT_SECONDS` | Maximum post-playback echo drain | `2` |
-| `VOICE_HARNESS_PLAYBACK_LATENCY` | `pw-play` raw-stream target latency | `100ms` |
-| `VOICE_HARNESS_CURSOR_FOREGROUND_SECONDS` | Time before a Cursor job backgrounds | `5` |
-| `VOICE_HARNESS_HERDR_BIN` | Herdr executable | `~/.local/bin/herdr` |
-| `VOICE_HARNESS_PROJECT_ROOT` | Allowed root for inferred repositories | Home directory |
-| `VOICE_HARNESS_GITHUB_ROOT` | Owner-qualified clones of explicitly requested GitHub forks | `~/src` |
-| `VOICE_HARNESS_LLM_MODEL` | llama.cpp model alias | `qwen3.5-4b` |
-| `DICTATION_BACKEND` | Dictation engine (`parakeet` or `whisper`) | `parakeet` |
-| `DICTATION_MODEL` | Backend model | `nemo-parakeet-tdt-0.6b-v2` |
-| `DICTATION_QUANTIZATION` | Parakeet ONNX quantization (`none` disables it) | `int8` |
-| `DICTATION_COMPUTE` | faster-whisper compute type | `float16` |
-| `DICTATION_LANGUAGE` | Spoken language to transcribe (`en`, `zh`, `english`, `chinese`, or `auto`) | `auto` |
-| `DICTATION_INJECT` | Focused-window insertion mode (`auto`, `paste`, `type`, or `stdout`) | `auto` |
-| `DICTATION_REPLACEMENTS` | Semicolon-separated STT corrections | Cursor/Herdr defaults |
+| Variable | Purpose | Default | Configuration channel |
+| --- | --- | --- | --- |
+| `VOICE_HARNESS_SOURCE` | PipeWire microphone source | Development-machine source | Wake drop-in |
+| `VOICE_HARNESS_VOICE` | Absolute Chatterbox reference WAV path | Built-in voice | Wake drop-in |
+| `VOICE_HARNESS_WAKE_THRESHOLD` | OpenWakeWord activation threshold (`0`–`1`) | `0.55` | Wake drop-in |
+| `VOICE_HARNESS_MIN_SPEECH_RMS` | Non-negative speech energy gate | `1100` | Wake drop-in |
+| `VOICE_HARNESS_BARGE_IN_MODE` | Playback interruption (`wake`, `vad`, or `off`) | `wake` | Wake drop-in |
+| `VOICE_HARNESS_BARGE_IN_SPEECH_FRAMES` | Positive count of consecutive 80 ms speech frames | `5` | Wake drop-in |
+| `VOICE_HARNESS_PLAYBACK_QUIET_FRAMES` | Positive count of quiet 80 ms frames after playback | `4` | Wake drop-in |
+| `VOICE_HARNESS_PLAYBACK_QUIET_TIMEOUT_SECONDS` | Non-negative post-playback echo-drain timeout | `2` | Wake drop-in |
+| `VOICE_HARNESS_PLAYBACK_LATENCY` | Non-negative `pw-play` duration ending in `us`, `ms`, or `s` | `100ms` | Wake drop-in |
+| `VOICE_HARNESS_CURSOR_FOREGROUND_SECONDS` | Non-negative time before a Cursor job backgrounds | `5` | Wake drop-in |
+| `VOICE_HARNESS_HERDR_BIN` | Absolute Herdr executable path | `~/.local/bin/herdr` | Wake drop-in |
+| `VOICE_HARNESS_PROJECT_ROOT` | Absolute allowed root for inferred repositories | Home directory | Wake drop-in |
+| `VOICE_HARNESS_GITHUB_ROOT` | Absolute fork-clone root inside the project root | `~/src` | Wake drop-in |
+| `DICTATION_INJECT` | Focused-window insertion mode (`auto`, `paste`, `type`, or `stdout`) | `auto` | Wake drop-in |
+| `DICTATION_REPLACEMENTS` | Semicolon-separated STT corrections | Cursor/Herdr defaults | Wake drop-in |
+| `DICTATION_BACKEND` | Dictation engine (`parakeet` or `whisper`) | `parakeet` | `backend.env` |
+| `DICTATION_MODEL` | Backend model | `nemo-parakeet-tdt-0.6b-v2` | `backend.env` |
+| `DICTATION_QUANTIZATION` | Parakeet ONNX quantization (`none` disables it) | `int8` | `backend.env` |
+| `DICTATION_COMPUTE` | faster-whisper compute type | `float16` | `backend.env` |
+| `DICTATION_LANGUAGE` | Spoken language to transcribe (`en`, `zh`, `english`, `chinese`, or `auto`) | `auto` | `backend.env` |
 
 `VOICE_HARNESS_PROJECT_ROOT` can narrow repository discovery to another directory.
 `VOICE_HARNESS_GITHUB_ROOT` must resolve inside it. Forks are cloned to
 `<github-root>/<source-owner>/<repository>`; an existing checkout is reused only when
 its `origin` identifies the expected fork. The source repository is configured as the
-`upstream` remote.
+`upstream` remote. Herdr and repository path overrides grant the wake process access
+to the selected executable and trees; review those trusted local paths before
+restarting and auditing the service.
 
 ## Performance observed
 
@@ -672,6 +707,12 @@ the earlier Whisper large-v3 backend; Parakeet TDT 0.6B v2 measurements are pend
 - Runtime job metadata and conversational audio live under
   `$XDG_RUNTIME_DIR/voice-harness`; focused dictation audio lives under
   `$XDG_RUNTIME_DIR/dictation`.
+- The unauthenticated llama.cpp API is bound to `127.0.0.1` for this trusted
+  single-user workstation. Same-account processes are trusted; loopback is not a
+  per-UID boundary on a mutually untrusted multi-user host.
+- Shipped services use service-specific systemd hardening and bounded resources; see
+  the [hardening policy](docs/service-hardening.md) for deliberate exceptions and
+  host checks.
 
 ## Troubleshooting
 
@@ -710,9 +751,10 @@ llama-server --list-devices
 systemctl --user edit voice-harness-llm.service
 ```
 
-After changing a unit:
+After changing shipped units and intentionally adopting the bundled dictation unit:
 
-```bash
-voice-harness services install --force
+```fish
+voice-harness services install --force --replace-dictation
+voice-harness services audit
 voice-harness services restart
 ```
