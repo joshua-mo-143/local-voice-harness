@@ -1062,8 +1062,12 @@ class CursorJobStateTests(unittest.TestCase):
             raise AssertionError("fork submission should not run")
 
         github.ensure_fork.side_effect = ensure_fork
+        client = mock.Mock()
         worker = threading.Thread(target=jobs.run_worker, args=("123456789abc",))
-        with mock.patch.object(jobs, "GitHubClient", return_value=github):
+        with (
+            mock.patch.object(jobs, "GitHubClient", return_value=github),
+            mock.patch.object(jobs, "HerdrClient", return_value=client),
+        ):
             worker.start()
             self.assertTrue(entered.wait(2))
             jobs.cancel_job("123456789abc")
