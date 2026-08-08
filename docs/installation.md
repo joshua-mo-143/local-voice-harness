@@ -1,0 +1,318 @@
+# Manual installation
+
+The [Quick install](../README.md#installation) path runs `scripts/install.sh`,
+which performs every deterministic step here and pauses only for the interactive
+logins you have not already completed. This document is the manual, step-by-step
+breakdown for partial setups, troubleshooting, or non-Arch systems.
+
+The supplied systemd units assume the repository is cloned to
+`$HOME/local-voice-harness`.
+
+## Compute requirements
+
+Tested configuration:
+
+- Linux x86-64 with systemd user services and PipeWire.
+- NVIDIA GeForce RTX 5070 Ti Laptop GPU with 12 GB VRAM.
+- 32 GB system RAM and swap.
+- CUDA-capable NVIDIA driver plus a CUDA-enabled llama.cpp build.
+- Python 3.11 for the management, wake, TTS, and bundled dictation environments.
+
+Practical requirements for the included model choices:
+
+| Resource | Minimum | Recommended |
+| --- | ---: | ---: |
+| GPU VRAM | 10 GB | 12 GB |
+| System RAM | 16 GB | 32 GB |
+| Free disk | 20 GB | 25+ GB |
+| CPU | Modern 4-core x86-64 | 8+ cores |
+
+With all models warm, expect roughly 8-10 GB of GPU memory. The main disk consumers
+are:
+
+- Qwen3.5-4B Q4_K_M GGUF: approximately 2.5 GB.
+- Chatterbox Turbo cache: 3.8 GB.
+- Parakeet TDT 0.6B v2 ONNX cache: less than 1 GB.
+- Current Python environments: approximately 13 GB combined.
+
+The tested configuration uses CUDA for Parakeet and Chatterbox. Parakeet can fall
+back to ONNX Runtime's CPU provider, but CPU dictation has substantially higher
+latency. The optional faster-whisper backend and Chatterbox are configured for CUDA.
+
+## External prerequisites
+
+Install these before setting up Python environments:
+
+- PipeWire tools (`pw-record` and `pw-play`).
+- `libnotify`/`notify-send`.
+- Git, curl, the GitHub CLI (`gh`), and systemd user services.
+- `xdotool` and `xclip` for X11 focused-window automation, or `wtype` and
+  `wl-clipboard` for Hyprland/Sway focused-window automation.
+- Rofi for repository selection and pasteable clone-URL prompts.
+- [uv](https://docs.astral.sh/uv/) for reproducible Python versions/environments.
+- A recent [llama.cpp](https://github.com/ggml-org/llama.cpp) build with CUDA and
+  `llama-server`. The server runs with `--jinja` so it uses the model's native chat
+  template, which llama.cpp requires for Qwen3.5 tool calling.
+- The [Cursor CLI](https://cursor.com/docs/cli/installation).
+- [Herdr](https://herdr.dev).
+- A working NVIDIA driver.
+
+On Arch/CachyOS, the base packages are approximately:
+
+```bash
+paru -S --needed pipewire libnotify git curl github-cli xdotool xclip \
+  wl-clipboard wtype uv libsndfile
+```
+
+On Arch/CachyOS, install the CUDA-enabled llama.cpp AUR package (it conflicts with
+`llama.cpp-vulkan` and other non-CUDA variants):
+
+```bash
+paru -S --needed cuda llama.cpp-cuda
+```
+
+Verify the required commands:
+
+```bash
+pw-record --version
+pw-play --version
+llama-server --version
+llama-server --list-devices   # expect CUDA0: NVIDIA GeForce ...
+nvidia-smi
+```
+
+Authenticate the GitHub CLI to let focused issue pages include repository details and
+to create forks explicitly requested through the harness:
+
+```bash
+gh auth login
+gh auth status
+```
+
+## 1. Clone and install the management/wake package
+
+```bash
+git clone <YOUR_GITHUB_REPOSITORY_URL> "$HOME/local-voice-harness"
+cd "$HOME/local-voice-harness"
+uv sync --python 3.11 --extra wake --no-dev
+mkdir -p "$HOME/.local/bin"
+ln -sfn "$HOME/local-voice-harness/.venv/bin/voice-harness" \
+  "$HOME/.local/bin/voice-harness"
+```
+
+This installs the package, OpenWakeWord dependencies, and all console entry points
+in `.venv`. Ensure `$HOME/.local/bin` is on `PATH`.
+The `wake`, `dictation`, and `tts` extras are intentionally installed into separate
+environments because their CUDA and NumPy constraints are not all compatible.
+
+OpenWakeWord includes the `hey_jarvis_v0.1.onnx` model used by the daemon.
+
+## 2. Create the bundled dictation environment
+
+```fish
+env UV_PROJECT_ENVIRONMENT=.venv-dictation \
+  uv sync --python 3.11 --extra dictation --no-dev
+```
+
+The default backend is Parakeet TDT 0.6B v2. Its first start downloads
+`nemo-parakeet-tdt-0.6b-v2` from Hugging Face.
+
+To use the supported faster-whisper backend instead, install its separate extra and
+select it in the service environment file:
+
+```fish
+env UV_PROJECT_ENVIRONMENT=.venv-dictation \
+  uv sync --python 3.11 --extra dictation-whisper --no-dev
+mkdir -p "$HOME/.config/dictation"
+printf '%s\n' \
+  'DICTATION_BACKEND=whisper' \
+  'DICTATION_MODEL=large-v3-turbo' \
+  'DICTATION_COMPUTE=float16' \
+  >"$HOME/.config/dictation/backend.env"
+```
+
+Install either `dictation` for Parakeet or `dictation-whisper` for faster-whisper;
+the two extras are alternative backend environments, not a requirement to install
+both.
+
+The launcher reads `backend.env` itself and accepts only backend, model, language,
+compute, and quantization selectors. Socket, CUDA/Hugging Face cache, temporary,
+home, and XDG path variables are service-owned and cannot be overridden by that
+file.
+
+## 3. Create the Chatterbox environment
+
+The existing service uses `$HOME/chatterbox-audition/.venv`:
+
+```bash
+mkdir -p "$HOME/chatterbox-audition"
+UV_PROJECT_ENVIRONMENT="$HOME/chatterbox-audition/.venv" \
+  uv sync --python 3.11 --extra tts --no-dev
+```
+
+The tested TTS environment used `chatterbox-tts 0.1.7` and CUDA-enabled
+`torch 2.10.0`. The project-level uv overrides preserve those `torch` and
+`torchaudio` versions despite Chatterbox's older metadata. If those wheels do not
+support a future GPU/driver combination, update `[tool.uv].override-dependencies`
+using the [PyTorch selector](https://pytorch.org/get-started/locally/).
+
+Download Chatterbox before enabling its offline systemd service:
+
+```bash
+HF_HUB_OFFLINE=0 "$HOME/chatterbox-audition/.venv/bin/python" - <<'PY'
+from chatterbox.tts_turbo import ChatterboxTurboTTS
+ChatterboxTurboTTS.from_pretrained(device="cuda")
+print("Chatterbox Turbo cached")
+PY
+```
+
+## 4. Download Qwen
+
+Install the Hugging Face CLI and download the expected filename:
+
+```bash
+uv tool install huggingface_hub
+mkdir -p models
+hf download \
+  unsloth/Qwen3.5-4B-GGUF \
+  Qwen3.5-4B-Q4_K_M.gguf \
+  --local-dir models
+```
+
+Confirm the model exists at:
+
+```text
+~/local-voice-harness/models/Qwen3.5-4B-Q4_K_M.gguf
+```
+
+List llama.cpp devices:
+
+```bash
+llama-server --list-devices
+```
+
+Edit `systemd/user/voice-harness-llm.service` if the NVIDIA device is not `CUDA0`, or if
+`llama-server` is installed somewhere other than `/usr/sbin/llama-server`.
+
+## 5. Install Cursor and Herdr
+
+```bash
+curl https://cursor.com/install -fsS | bash
+agent login
+
+curl -fsSL https://herdr.dev/install.sh | sh
+
+agent --version
+herdr --version
+```
+
+The harness starts `herdr server` automatically as the transient user service
+`voice-harness-herdr.service`. Running the Herdr TUI later attaches to that server.
+
+For Linear support, configure the server in `~/.cursor/mcp.json`, then authenticate
+and approve it:
+
+```bash
+agent mcp login linear
+agent mcp enable linear
+agent mcp list
+agent mcp list-tools linear
+```
+
+OAuth is reused from the same local Cursor user profile. If Linear is unavailable,
+ordinary repository tasks still work.
+
+## 6. Configure audio
+
+Find the PipeWire microphone:
+
+```bash
+wpctl status
+```
+
+The source currently defaults to the microphone from the original development
+machine. Override it with a systemd drop-in:
+
+```bash
+systemctl --user edit voice-harness-wake.service
+```
+
+```ini
+[Service]
+Environment=VOICE_HARNESS_SOURCE=<PIPEWIRE_SOURCE_NAME>
+```
+
+Optional Chatterbox voice cloning accepts a reference WAV:
+
+```ini
+[Service]
+Environment=VOICE_HARNESS_VOICE=/absolute/path/to/reference.wav
+```
+
+The default playback interruption mode is `wake`: saying “Hey Jarvis” while the
+assistant is speaking stops queued audio and starts a new wake-prefixed request. The
+wake detector is reset at playback boundaries, the microphone must become quiet
+before ordinary follow-up VAD is re-armed, and wake interruption is temporarily
+suppressed if the assistant's own response contains the wake phrase.
+
+Natural speech barge-in is available with
+`VOICE_HARNESS_BARGE_IN_MODE=vad`, but it should only be used with a PipeWire
+echo-cancelled source. A physical microphone will usually classify speaker output as
+speech and interrupt every response. PipeWire's PulseAudio compatibility layer can
+create a session-scoped WebRTC echo-cancel source for testing:
+
+```bash
+pactl load-module module-echo-cancel \
+  aec_method=webrtc \
+  source_name=voice_harness_aec \
+  sink_name=voice_harness_aec_sink
+wpctl status
+```
+
+Set `VOICE_HARNESS_SOURCE=voice_harness_aec` and
+`VOICE_HARNESS_BARGE_IN_MODE=vad` in the wake service drop-in. The virtual source
+must use the same physical capture/playback devices as the harness; make this module
+persistent through the machine's PipeWire/WirePlumber configuration after validating
+it interactively. Use `VOICE_HARNESS_BARGE_IN_MODE=off` if no acoustic interruption
+is wanted. The streaming client also exposes `StreamingPlayback.cancel()` for an
+explicit stop control in local integrations.
+
+## 7. Install and enable services
+
+Use the packaged CLI to install the units, reload systemd, and enable the two
+always-on services:
+
+```bash
+voice-harness services install
+voice-harness services audit
+voice-harness services start
+```
+
+Use `services install --force` only when intentionally replacing conflicting files
+from an older installation. An existing, separately managed `dictation.service` is
+preserved by default and is not covered by the shipped hardening policy. After
+reviewing and migrating its customizations, adopt the hardened unit with:
+
+```fish
+voice-harness services install --force --replace-dictation
+voice-harness services audit
+```
+
+`--replace-dictation` intentionally replaces the standalone unit. A failed audit
+means the effective installed unit or a drop-in still differs from the shipped
+policy; do not treat installation as complete.
+
+Qwen and Chatterbox are intentionally not enabled at login. The wake daemon starts
+them on demand and stops them when a conversation closes. It also stops them after a
+failed turn when no earlier conversation remains active. Manual text turns hold a
+cross-process usage lease so daemon cleanup cannot stop their models mid-response.
+
+## Existing standalone dictation installations
+
+The package includes a dictation backend for fresh installs, but cleanup does not
+replace an active standalone service such as `~/.local/share/dictation`. The service
+installer reports that it preserved the existing unit. The wake daemon continues to
+use the same `$XDG_RUNTIME_DIR/dictation.sock`, so both backends are protocol
+compatible. Preservation also means the standalone unit may retain unrestricted
+environment-file or sandbox behavior. It is not hardened merely because the other
+voice-harness units were updated.
