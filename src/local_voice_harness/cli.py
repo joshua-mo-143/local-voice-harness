@@ -1,11 +1,18 @@
 from __future__ import annotations
 
 import argparse
+from pathlib import Path
 
 from .app import respond, status
 from .dictation import run as run_dictation
 from .notifications import notify
-from .recording import cancel_recording, start_recording, stop_recording
+from .recording import (
+    cancel_recording,
+    handoff_recording,
+    retry_generation,
+    start_recording,
+    stop_recording,
+)
 from .service_manager import (
     install_services,
     logs,
@@ -26,7 +33,8 @@ def parser() -> argparse.ArgumentParser:
     commands.add_parser("begin")
     commands.add_parser("end")
     commands.add_parser("cancel")
-    commands.add_parser("transcribe")
+    transcribe_audio = commands.add_parser("transcribe")
+    transcribe_audio.add_argument("--generation", type=Path)
     dictate = commands.add_parser(
         "dictate", help="record and type transcription into the focused window"
     )
@@ -61,12 +69,17 @@ def dispatch(args: argparse.Namespace) -> None:
     if args.command == "begin":
         start_recording()
     elif args.command == "end":
-        stop_recording()
-        respond(transcribe())
+        audio_path = stop_recording()
+        respond(transcribe(audio_path))
     elif args.command == "cancel":
         cancel_recording()
     elif args.command == "transcribe":
-        respond(transcribe())
+        audio_path = (
+            retry_generation(args.generation)
+            if args.generation is not None
+            else handoff_recording()
+        )
+        respond(transcribe(audio_path))
     elif args.command == "dictate":
         run_dictation(args.dictation_command)
     elif args.command == "text":
