@@ -410,18 +410,37 @@ voice-harness text "Use Cursor to summarize the api-docs repository."
 The default development environment contains only the package and quality tools;
 it does not install the CUDA, audio, wake-word, or model extras:
 
-```bash
-uv sync --python 3.12
+```fish
+set python_version 3.12
+uv sync --python $python_version
 uv run ruff format --check .
 uv run ruff check .
-uv run pyright
+uv run pyright --pythonversion $python_version
+uv run python -m local_voice_harness.service_units
 uv run pytest
+uv run coverage json -o coverage.json
+uv run python -m local_voice_harness.coverage_gate coverage.json
 ```
 
 Use `uv run ruff format .` to apply formatting. Pytest includes branch coverage and
-enforces the initial 40% project threshold. CI runs the same checks on every
-supported Python version (3.11 and 3.12) without starting services or downloading
-models.
+enforces the initial 40% project threshold. The global threshold remains a baseline;
+rounded, coarse floors for risk-critical orchestration modules catch substantial
+coverage regressions without implying that measured coverage can never decrease. The
+service-unit check requires source/package parity and model-default consistency. When
+`systemd-analyze` is installed, it verifies the units in an isolated root containing
+only allowlisted external dependencies and safe stubs for configured executables, so
+clean CI runners do not need model environments installed. CI selects, asserts, and
+type-checks against each supported Python interpreter (3.11 and 3.12) without starting
+services or downloading models.
+
+GPU, audio, Herdr, and complete voice-turn checks are opt-in only. See the
+[hardware smoke checklist](docs/hardware-smoke.md) for their entry points and cleanup
+steps; CI never runs them.
+
+The [issue #28 test plan](docs/issue-28-test-plan.md) records the protocol,
+process-lifecycle, cancellation, delivery, and recovery regressions that must be
+integrated after the active #24/#25 runtime changes merge. This foundation does not
+claim those production paths are covered.
 
 ## Usage
 
