@@ -1050,6 +1050,7 @@ class CursorJobStateTests(unittest.TestCase):
         release = threading.Event()
         submitted = threading.Event()
         github = mock.Mock()
+        client = mock.Mock()
         github.prepare_public_fork.return_value = (source, "me", "me/project")
 
         def ensure_fork(
@@ -1062,22 +1063,65 @@ class CursorJobStateTests(unittest.TestCase):
             raise AssertionError("fork submission should not run")
 
         github.ensure_fork.side_effect = ensure_fork
-        client = mock.Mock()
         worker = threading.Thread(target=jobs.run_worker, args=("123456789abc",))
         with (
             mock.patch.object(jobs, "GitHubClient", return_value=github),
             mock.patch.object(jobs, "HerdrClient", return_value=client),
+            mock.patch.object(jobs, "_stop_worker", return_value=False),
+            mock.patch(
+                "local_voice_harness.integrations.herdr.subprocess.run",
+                side_effect=AssertionError("real service operation attempted"),
+            ) as service_operation,
         ):
             worker.start()
-            self.assertTrue(entered.wait(2))
-            jobs.cancel_job("123456789abc")
-            release.set()
-            worker.join(2)
+            try:
+                self.assertTrue(
+                    entered.wait(2),
+                    f"worker stopped before fork routing: {jobs.read_job('123456789abc')}",
+                )
+                client.ensure_server.assert_called_once_with()
+                jobs.cancel_job("123456789abc")
+                self.assertEqual(jobs.read_job("123456789abc")["status"], "cancelled")
+            finally:
+                release.set()
+                worker.join(2)
 
         self.assertFalse(worker.is_alive())
         self.assertFalse(submitted.is_set())
         self.assertEqual(jobs.read_job("123456789abc")["status"], "cancelled")
         github.ensure_clone.assert_not_called()
+        client.ensure_agent.assert_not_called()
+        service_operation.assert_not_called()
+
+    def test_worker_persists_herdr_failure_before_fork_routing(self) -> None:
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "fork it",
+                "github_repository": "source/project",
+                "fork_requested": True,
+                "fork_confirmed": True,
+                "status": "queued",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        client = mock.Mock()
+        client.ensure_server.side_effect = HerdrError(
+            "Herdr command failed: executable not found",
+            code="operation_spawn_failed",
+        )
+        with (
+            mock.patch.object(jobs, "HerdrClient", return_value=client),
+            mock.patch.object(jobs, "GitHubClient") as github_client,
+        ):
+            jobs.run_worker("123456789abc")
+
+        failed = jobs.read_job("123456789abc")
+        self.assertEqual(failed["status"], "failed")
+        self.assertEqual(failed["error"], "Herdr command failed: executable not found")
+        self.assertNotIn("fork_operation_state", failed)
+        github_client.assert_not_called()
 
     def test_post_create_cancellation_retains_reserved_worktree(self) -> None:
         repository = Path(self.temporary.name) / "project"
