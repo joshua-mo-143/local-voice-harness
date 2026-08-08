@@ -8,6 +8,7 @@ from contextlib import redirect_stdout
 from unittest import mock
 
 from local_voice_harness import llm
+from local_voice_harness.cursor.service import CursorTurnRequest
 from local_voice_harness.errors import HarnessError
 
 
@@ -98,13 +99,15 @@ class QwenClientTests(unittest.TestCase):
         self.assertEqual((answer, session), ("job started", "job-123"))
         notify.assert_called_once_with("Cursor is working…")
         cursor_turn.assert_called_once_with(
-            "fix it",
-            None,
-            repository="example",
-            agent=None,
-            utterance=None,
-            action="submit",
-            job_id=None,
+            CursorTurnRequest(
+                "fix it",
+                None,
+                repository="example",
+                agent=None,
+                utterance=None,
+                action="submit",
+                job_id=None,
+            ),
             delivery_claims=None,
         )
         second_request = urlopen.call_args_list[1].args[0]
@@ -154,18 +157,20 @@ class QwenClientTests(unittest.TestCase):
             )
 
         cursor_turn.assert_called_once_with(
-            "add Venice",
-            None,
-            repository=None,
-            github_repository="source/project",
-            github_issue=None,
-            github_issue_context=None,
-            fork_requested=True,
-            github_pull_request=None,
-            agent=None,
-            utterance=None,
-            action="submit",
-            job_id=None,
+            CursorTurnRequest(
+                "add Venice",
+                None,
+                repository=None,
+                github_repository="source/project",
+                github_issue=None,
+                github_issue_context=None,
+                fork_requested=True,
+                github_pull_request=None,
+                agent=None,
+                utterance=None,
+                action="submit",
+                job_id=None,
+            ),
             delivery_claims=None,
         )
 

@@ -5,6 +5,7 @@ from unittest import mock
 
 from local_voice_harness import app
 from local_voice_harness.browser_context import RequestContext
+from local_voice_harness.cursor.service import CursorTurnRequest
 from local_voice_harness.intent import Intent, IntentRoute
 
 
@@ -13,14 +14,12 @@ class ForegroundDeliveryTests(unittest.TestCase):
         events: list[str] = []
 
         def cursor_turn(
-            _text: str,
+            request: CursorTurnRequest,
             *,
-            utterance: str,
-            context_repository: str | None,
             delivery_claims: list[tuple[str, str]],
         ) -> tuple[str, None]:
-            self.assertEqual(utterance, "Use Cursor to inspect this repository")
-            self.assertIsNone(context_repository)
+            self.assertEqual(request.utterance, "Use Cursor to inspect this repository")
+            self.assertIsNone(request.context_repository)
             delivery_claims.append(("123456789abc", "claim"))
             return "done", None
 
@@ -50,14 +49,12 @@ class ForegroundDeliveryTests(unittest.TestCase):
 
     def test_playback_failure_releases_cursor_result(self) -> None:
         def cursor_turn(
-            _text: str,
+            request: CursorTurnRequest,
             *,
-            utterance: str,
-            context_repository: str | None,
             delivery_claims: list[tuple[str, str]],
         ) -> tuple[str, None]:
-            self.assertEqual(utterance, "Use Cursor to inspect this repository")
-            self.assertIsNone(context_repository)
+            self.assertEqual(request.utterance, "Use Cursor to inspect this repository")
+            self.assertIsNone(request.context_repository)
             delivery_claims.append(("123456789abc", "claim"))
             return "done", None
 
@@ -107,9 +104,11 @@ class AppContextTests(unittest.TestCase):
         route_intent.assert_not_called()
         enrich.assert_called_once_with("ask Cursor to fix this")
         cursor_turn.assert_called_once_with(
-            "ask Cursor to fix this\n\ncontext",
-            utterance="ask Cursor to fix this",
-            context_repository="example/project",
+            CursorTurnRequest(
+                "ask Cursor to fix this\n\ncontext",
+                utterance="ask Cursor to fix this",
+                context_repository="example/project",
+            ),
             delivery_claims=mock.ANY,
         )
 
@@ -215,14 +214,16 @@ class AppContextTests(unittest.TestCase):
             app.respond("work on this")
 
         cursor.assert_called_once_with(
-            context.text,
-            utterance="work on this",
-            context_repository="source/project",
-            github_repository="source/project",
-            github_issue=42,
-            github_issue_context="Issue: #42",
-            fork_requested=False,
-            github_pull_request=None,
+            CursorTurnRequest(
+                context.text,
+                utterance="work on this",
+                context_repository="source/project",
+                github_repository="source/project",
+                github_issue=42,
+                github_issue_context="Issue: #42",
+                fork_requested=False,
+                github_pull_request=None,
+            ),
             delivery_claims=mock.ANY,
         )
 
@@ -244,9 +245,11 @@ class CursorFastPathTests(unittest.TestCase):
 
         route_intent.assert_not_called()
         cursor_turn.assert_called_once_with(
-            "use cursor to refactor auth",
-            utterance="use cursor to refactor auth",
-            context_repository=None,
+            CursorTurnRequest(
+                "use cursor to refactor auth",
+                utterance="use cursor to refactor auth",
+                context_repository=None,
+            ),
             delivery_claims=mock.ANY,
         )
 

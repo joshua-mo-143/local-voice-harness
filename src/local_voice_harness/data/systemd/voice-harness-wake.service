@@ -13,6 +13,8 @@ Environment=PYTHONUNBUFFERED=1
 RuntimeDirectory=voice-harness
 RuntimeDirectoryMode=0700
 RuntimeDirectoryPreserve=yes
+StateDirectory=voice-harness
+StateDirectoryMode=0700
 UMask=0077
 Restart=on-failure
 RestartSec=5

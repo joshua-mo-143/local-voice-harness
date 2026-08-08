@@ -13,6 +13,11 @@ from unittest import mock
 
 from local_voice_harness import recorder
 from local_voice_harness.browser_context import RequestContext
+from local_voice_harness.cursor import service as cursor_service
+from local_voice_harness.cursor.delivery import DeliveryClaim
+from local_voice_harness.cursor.model import CursorJob, JobStatus
+from local_voice_harness.cursor.service import CursorTurnRequest
+from local_voice_harness.cursor.store import JobStore
 from local_voice_harness.errors import HarnessError
 from local_voice_harness.intent import Intent, IntentRoute
 from local_voice_harness.tts.queue import PlaybackQueue, PlaybackRequest
@@ -50,6 +55,37 @@ def _playback_batch(
             request,
         )
     ]
+
+
+def _delivery_claim(
+    job_id: str,
+    status: str,
+    *,
+    result: str | None = None,
+    question: str | None = None,
+    token: str = "claim",
+) -> DeliveryClaim:
+    job_id = {
+        "job1": "aaaaaaaaaaaa",
+        "job2": "bbbbbbbbbbbb",
+        "job3": "cccccccccccc",
+    }.get(job_id, job_id)
+    values: dict[str, object] = {
+        "id": job_id,
+        "status": status,
+        "request": "test",
+        "created_at": 1,
+        "delivered": False,
+    }
+    if result is not None:
+        values["result"] = result
+    if question is not None:
+        values["question"] = question
+    if status in {"completed", "failed", "cancelled", "blocked"}:
+        values["completed_at"] = 1
+    if status == "failed":
+        values["error"] = result or "failed"
+    return DeliveryClaim(CursorJob.from_dict(values), token)
 
 
 def _bare_daemon() -> WakeConversationDaemon:
@@ -299,9 +335,11 @@ class ProcessUtteranceTests(unittest.TestCase):
             daemon.process_utterance(AUDIO_GENERATION, woke=False)
 
         cursor_turn.assert_called_once_with(
-            "work on APP-43 instead",
-            utterance="work on APP-43 instead",
-            context_repository=None,
+            CursorTurnRequest(
+                "work on APP-43 instead",
+                utterance="work on APP-43 instead",
+                context_repository=None,
+            ),
             delivery_claims=mock.ANY,
         )
         qwen_turn.assert_not_called()
@@ -338,11 +376,13 @@ class ProcessUtteranceTests(unittest.TestCase):
             daemon.process_utterance(AUDIO_GENERATION, woke=False)
 
         cursor_turn.assert_called_once_with(
-            "use the api repository",
-            "oldjob123456",
-            utterance="use the api repository",
-            action="reply",
-            job_id="oldjob123456",
+            CursorTurnRequest(
+                "use the api repository",
+                "oldjob123456",
+                utterance="use the api repository",
+                action="reply",
+                job_id="oldjob123456",
+            ),
             delivery_claims=mock.ANY,
         )
         qwen_turn.assert_not_called()
@@ -381,9 +421,11 @@ class ProcessUtteranceTests(unittest.TestCase):
             daemon.process_utterance(AUDIO_GENERATION, woke=False)
 
         cursor_turn.assert_called_once_with(
-            "ask Cursor to work on APP-43\n\nGitHub context",
-            utterance="ask Cursor to work on APP-43",
-            context_repository=None,
+            CursorTurnRequest(
+                "ask Cursor to work on APP-43\n\nGitHub context",
+                utterance="ask Cursor to work on APP-43",
+                context_repository=None,
+            ),
             delivery_claims=mock.ANY,
         )
         qwen_turn.assert_not_called()
@@ -456,10 +498,12 @@ class ProcessUtteranceTests(unittest.TestCase):
             _session: object,
             *,
             trusted_utterance: str,
-            delivery_claims: list[tuple[str, str]],
+            delivery_claims: list[DeliveryClaim],
         ) -> tuple[str, None]:
             self.assertEqual(trusted_utterance, "question")
-            delivery_claims.append(("123456789abc", "claim"))
+            delivery_claims.append(
+                _delivery_claim("123456789abc", "completed", result="answer")
+            )
             return "answer", None
 
         with (
@@ -487,7 +531,9 @@ class ProcessUtteranceTests(unittest.TestCase):
         ):
             daemon.process_utterance(AUDIO_GENERATION, woke=False)
 
-        release.assert_called_once_with([("123456789abc", "claim")])
+        release.assert_called_once_with(
+            [_delivery_claim("123456789abc", "completed", result="answer")]
+        )
         self.assertEqual(daemon.history, [])
 
 
@@ -517,12 +563,7 @@ class AnnounceJobTests(unittest.TestCase):
 
     def test_awaiting_user_job_enables_followup(self) -> None:
         daemon = _bare_daemon()
-        job: dict[str, object] = {
-            "id": "job1",
-            "status": "awaiting_user",
-            "question": "which repo?",
-            "_delivery_token": "claim",
-        }
+        claim = _delivery_claim("job1", "awaiting_user", question="which repo?")
         with (
             mock.patch.object(wake_daemon, "acknowledge_delivery") as acknowledge,
             mock.patch.object(wake_daemon, "release_delivery"),
@@ -543,7 +584,7 @@ class AnnounceJobTests(unittest.TestCase):
             ),
             mock.patch.object(wake_daemon, "notify"),
         ):
-            daemon._enqueue_job_announcement(job)
+            daemon._enqueue_job_announcement(claim)
             daemon._play_pending_announcements()
 
         acknowledge.assert_called_once_with("job1", "claim")
@@ -574,7 +615,7 @@ class AnnounceJobTests(unittest.TestCase):
             mock.patch.object(wake_daemon, "notify"),
         ):
             daemon._enqueue_job_announcement(
-                {"id": "job2", "status": "completed", "result": "done"}
+                _delivery_claim("job2", "completed", result="done")
             )
             daemon._play_pending_announcements()
 
@@ -600,17 +641,12 @@ class AnnounceJobTests(unittest.TestCase):
             mock.patch.object(wake_daemon, "notify"),
         ):
             daemon._enqueue_job_announcement(
-                {
-                    "id": "job2",
-                    "status": "completed",
-                    "result": "done",
-                    "_delivery_token": "claim",
-                }
+                _delivery_claim("job2", "completed", result="done")
             )
             daemon._play_pending_announcements()
 
         acknowledge.assert_not_called()
-        release.assert_called_once_with("job2", "claim")
+        release.assert_called_once_with("bbbbbbbbbbbb", "claim")
         self.assertEqual(len(daemon.playback_queue), 0)
 
     def test_announcement_prefetch_starts_only_after_components_are_ready(
@@ -641,12 +677,7 @@ class AnnounceJobTests(unittest.TestCase):
             mock.patch.object(wake_daemon, "notify"),
         ):
             daemon._enqueue_job_announcement(
-                {
-                    "id": "job2",
-                    "status": "completed",
-                    "result": "done",
-                    "_delivery_token": "claim",
-                }
+                _delivery_claim("job2", "completed", result="done")
             )
             self.assertEqual(events, [])
             daemon._play_pending_announcements()
@@ -654,7 +685,7 @@ class AnnounceJobTests(unittest.TestCase):
         self.assertEqual(events, ["components-ready", "prefetch"])
         handle.discard.assert_called_once()
         acknowledge.assert_not_called()
-        release.assert_called_once_with("job2", "claim")
+        release.assert_called_once_with("bbbbbbbbbbbb", "claim")
         self.assertEqual(len(daemon.playback_queue), 0)
 
     def test_acknowledgement_happens_after_playback(self) -> None:
@@ -686,12 +717,7 @@ class AnnounceJobTests(unittest.TestCase):
             mock.patch.object(wake_daemon, "notify"),
         ):
             daemon._enqueue_job_announcement(
-                {
-                    "id": "job2",
-                    "status": "completed",
-                    "result": "done",
-                    "_delivery_token": "claim",
-                }
+                _delivery_claim("job2", "completed", result="done")
             )
             daemon._play_pending_announcements()
 
@@ -700,10 +726,10 @@ class AnnounceJobTests(unittest.TestCase):
     def test_later_completed_job_does_not_clear_awaiting_session(self) -> None:
         daemon = _bare_daemon()
         daemon._enqueue_job_announcement(
-            {"id": "job1", "status": "awaiting_user", "question": "which repo?"}
+            _delivery_claim("job1", "awaiting_user", question="which repo?")
         )
         daemon._enqueue_job_announcement(
-            {"id": "job2", "status": "completed", "result": "done"}
+            _delivery_claim("job2", "completed", result="done")
         )
         batch = _playback_batch(
             "Cursor needs clarification. which repo?",
@@ -728,20 +754,10 @@ class AnnounceJobTests(unittest.TestCase):
     def test_failure_releases_only_unplayed_deliveries(self) -> None:
         daemon = _bare_daemon()
         daemon._enqueue_job_announcement(
-            {
-                "id": "job1",
-                "status": "completed",
-                "result": "first",
-                "_delivery_token": "claim1",
-            }
+            _delivery_claim("job1", "completed", result="first", token="claim1")
         )
         daemon._enqueue_job_announcement(
-            {
-                "id": "job2",
-                "status": "completed",
-                "result": "second",
-                "_delivery_token": "claim2",
-            }
+            _delivery_claim("job2", "completed", result="second", token="claim2")
         )
         with daemon.playback_queue._lock:
             first_request = daemon.playback_queue._items[0][0]
@@ -770,8 +786,8 @@ class AnnounceJobTests(unittest.TestCase):
         ):
             daemon._play_pending_announcements()
 
-        acknowledge.assert_called_once_with("job1", "claim1")
-        release.assert_called_once_with("job2", "claim2")
+        acknowledge.assert_called_once_with("aaaaaaaaaaaa", "claim1")
+        release.assert_called_once_with("bbbbbbbbbbbb", "claim2")
 
 
 class ComponentSynchronizationTests(unittest.TestCase):
@@ -1027,12 +1043,7 @@ class InterruptedTurnTests(unittest.TestCase):
             mock.patch.object(wake_daemon, "notify"),
         ):
             daemon._enqueue_job_announcement(
-                {
-                    "id": "job3",
-                    "status": "completed",
-                    "result": "done",
-                    "_delivery_token": "claim",
-                }
+                _delivery_claim("job3", "completed", result="done")
             )
             result = daemon._play_pending_announcements()
 
@@ -1170,6 +1181,52 @@ class WakeRecordingHandoffTests(unittest.TestCase):
 
             self.assertTrue(generation.exists())
             self.assertIn(str(generation), log.call_args.args[0])
+
+
+class PeriodicCursorRecoveryTests(unittest.TestCase):
+    def test_next_delivery_poll_recovers_worker_that_died_after_startup(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            jobs_dir = root / "jobs"
+            legacy_dir = root / "legacy"
+            store = JobStore(jobs_dir, legacy_dir)
+            store.create(
+                CursorJob.from_dict(
+                    {
+                        "id": "123456789abc",
+                        "status": "running",
+                        "request": "test",
+                        "created_at": 1,
+                        "delivered": False,
+                        "herdr_target": "agent",
+                        "worker_token": "claim",
+                        "worker_pid": 42,
+                        "worker_boot_id": "boot",
+                        "worker_process_start": "start",
+                    }
+                )
+            )
+            alive = True
+            launch = mock.Mock()
+
+            with (
+                mock.patch.object(cursor_service, "JOBS_DIR", jobs_dir),
+                mock.patch.object(cursor_service, "LEGACY_JOBS_DIR", legacy_dir),
+                mock.patch.object(
+                    cursor_service, "_worker_is_alive", side_effect=lambda _job: alive
+                ),
+                mock.patch.object(cursor_service, "launch_worker", launch),
+            ):
+                cursor_service.recover_jobs()
+                launch.assert_not_called()
+                alive = False
+                self.assertEqual(wake_daemon.pending_results(), [])
+
+            launch.assert_called_once_with("123456789abc")
+            self.assertEqual(
+                store.get("123456789abc").status,
+                JobStatus.QUEUED,
+            )
 
 
 class RunLoopFollowupTests(unittest.TestCase):

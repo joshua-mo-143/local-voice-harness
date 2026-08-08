@@ -92,6 +92,41 @@ agent are intentionally left running for inspection:
 voice-harness services stop
 ```
 
+## Durable job recovery across reboot
+
+Use a harmless Cursor request that remains active beyond the foreground timeout.
+Record its ID, then reboot the workstation rather than manually copying state:
+
+```fish
+set state_home "$HOME/.local/state/voice-harness"
+if set -q STATE_DIRECTORY
+    for candidate in (string split : "$STATE_DIRECTORY")
+        if string match -q '*/voice-harness' "$candidate"; and string match -q '/*' "$candidate"
+            set state_home "$candidate"
+            break
+        end
+    end
+else if set -q XDG_STATE_HOME
+    set state_home "$XDG_STATE_HOME/voice-harness"
+end
+voice-harness text "Use Cursor to inspect this repository and wait for my next instruction without changing files."
+ls "$state_home/jobs"
+# Reboot, sign back in, and start the wake service before continuing.
+systemctl --user start voice-harness-wake.service
+voice-harness status
+ls "$XDG_RUNTIME_DIR/voice-harness/jobs"
+```
+
+Checklist:
+
+- The job JSON survives under the state directory and no JSON is recreated in the
+  runtime jobs directory.
+- Recovery does not accept the pre-reboot PID/start-time ownership; it safely resumes
+  or reconciles the job.
+- Old worker logs do not survive the reboot or migrate into durable storage.
+- A delivered terminal fixture older than seven days is pruned, while undelivered,
+  uncertain, manual-review, and quarantine evidence remains.
+
 ## End-to-end voice turn
 
 Start from stopped on-demand models so this check includes service activation:

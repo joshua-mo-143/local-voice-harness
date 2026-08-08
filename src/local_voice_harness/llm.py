@@ -7,7 +7,8 @@ import urllib.request
 from collections.abc import Mapping, Sequence
 
 from .config import LLM_CHAT, LLM_MODEL
-from .cursor.jobs import DeliveryClaims, cursor_turn
+from .cursor.delivery import DeliveryClaims
+from .cursor.service import CursorTurnRequest, cursor_turn
 from .errors import HarnessError
 from .notifications import notify
 
@@ -205,29 +206,33 @@ def qwen_turn(
                             or github_pull_request
                         ):
                             tool_result, cursor_session = cursor_turn(
-                                task,
-                                job_id if action == "reply" else None,
-                                repository=repository,
-                                github_repository=selected_github_repository,
-                                github_issue=github_issue,
-                                github_issue_context=github_issue_context,
-                                fork_requested=fork_requested,
-                                github_pull_request=github_pull_request,
-                                agent=agent,
-                                utterance=trusted_utterance,
-                                action=action,
-                                job_id=job_id,
+                                CursorTurnRequest(
+                                    task,
+                                    job_id if action == "reply" else None,
+                                    repository=repository,
+                                    github_repository=selected_github_repository,
+                                    github_issue=github_issue,
+                                    github_issue_context=github_issue_context,
+                                    fork_requested=fork_requested,
+                                    github_pull_request=github_pull_request,
+                                    agent=agent,
+                                    utterance=trusted_utterance,
+                                    action=action,
+                                    job_id=job_id,
+                                ),
                                 delivery_claims=delivery_claims,
                             )
                         else:
                             tool_result, cursor_session = cursor_turn(
-                                task,
-                                job_id if action == "reply" else None,
-                                repository=repository,
-                                agent=agent,
-                                utterance=trusted_utterance,
-                                action=action,
-                                job_id=job_id,
+                                CursorTurnRequest(
+                                    task,
+                                    job_id if action == "reply" else None,
+                                    repository=repository,
+                                    agent=agent,
+                                    utterance=trusted_utterance,
+                                    action=action,
+                                    job_id=job_id,
+                                ),
                                 delivery_claims=delivery_claims,
                             )
                     except Exception as exc:

@@ -1,18 +1,25 @@
 from __future__ import annotations
 
 import json
+import signal
 import subprocess
 import tempfile
 import threading
 import unittest
 from collections.abc import Callable
 from pathlib import Path
-from typing import cast
+from typing import Any, cast
 from unittest import mock
 
-from local_voice_harness.cursor import jobs
-from local_voice_harness.cursor.model import CURRENT_SCHEMA_VERSION
-from local_voice_harness.cursor.store import JobQuarantineWarning
+from local_voice_harness.cursor import provisioning as production_jobs
+from local_voice_harness.cursor import service, worker_lifecycle
+from local_voice_harness.cursor.delivery import DeliveryClaim, DeliveryClaims
+from local_voice_harness.cursor.model import (
+    CURRENT_SCHEMA_VERSION,
+    CursorJob,
+    JobStatus,
+)
+from local_voice_harness.cursor.store import JobQuarantineWarning, JobStore
 from local_voice_harness.integrations.github import (
     GitHubIssue,
     GitHubRepository,
@@ -26,13 +33,230 @@ from local_voice_harness.integrations.herdr import (
 )
 
 
+class _ProvisioningTestAdapter:
+    """Legacy-shaped helpers kept only in tests while exercising typed production APIs."""
+
+    JOBS_DIR = Path()
+    LEGACY_JOBS_DIR = Path()
+
+    def __init__(self) -> None:
+        object.__setattr__(self, "signal", signal)
+        object.__setattr__(self, "HerdrClient", production_jobs.HerdrClient)
+        object.__setattr__(self, "GitHubClient", production_jobs.GitHubClient)
+        object.__setattr__(self, "HarnessError", production_jobs.HarnessError)
+        object.__setattr__(self, "_process_identity", worker_lifecycle.process_identity)
+        object.__setattr__(self, "_boot_identity", worker_lifecycle.boot_identity)
+        worker_alive = service._worker_is_alive
+        object.__setattr__(
+            self,
+            "_worker_is_alive",
+            lambda job: worker_alive(self._coerce(job)),
+        )
+        object.__setattr__(
+            self,
+            "_stop_worker",
+            lambda job, timeout=2.0: worker_lifecycle.stop_worker(
+                self._coerce(job),
+                timeout,
+                is_alive=lambda _current: self._worker_is_alive(job),
+                send_signal=lambda _current, sent_signal, **kwargs: self._signal_worker(
+                    job, sent_signal, **kwargs
+                ),
+            ),
+        )
+        object.__setattr__(self, "_stop_legacy_worker", service._stop_legacy_worker)
+        object.__setattr__(
+            self,
+            "_settle_fork_operation",
+            production_jobs._settle_fork_operation,
+        )
+
+    def __getattr__(self, name: str) -> Any:
+        if name in {"_worker_is_alive", "_stop_worker", "_stop_legacy_worker"}:
+            return getattr(service, name)
+        if name == "_process_identity":
+            return worker_lifecycle.process_identity
+        if name == "_boot_identity":
+            return worker_lifecycle.boot_identity
+        return getattr(production_jobs, name)
+
+    def __setattr__(self, name: str, value: object) -> None:
+        if name in {"JOBS_DIR", "LEGACY_JOBS_DIR"}:
+            object.__setattr__(self, name, value)
+        elif name in {"_worker_is_alive", "_stop_worker", "_stop_legacy_worker"}:
+            object.__setattr__(self, name, value)
+            setattr(service, name, value)
+        elif name == "_process_identity":
+            object.__setattr__(self, name, value)
+            worker_lifecycle.process_identity = value
+        elif name == "_boot_identity":
+            object.__setattr__(self, name, value)
+            worker_lifecycle.boot_identity = value
+        else:
+            object.__setattr__(self, name, value)
+            setattr(production_jobs, name, value)
+
+    def _store(self) -> JobStore:
+        return JobStore(self.JOBS_DIR, self.LEGACY_JOBS_DIR)
+
+    @staticmethod
+    def _typed(raw: dict[str, object]) -> CursorJob:
+        values = dict(raw)
+        values.setdefault("id", "000000000000")
+        values.setdefault("revision", 0)
+        values.setdefault("request", "")
+        values.setdefault("status", JobStatus.QUEUED.value)
+        values.setdefault("delivered", False)
+        values.setdefault("created_at", 0.0)
+        values.setdefault("queued_at", values["created_at"])
+        if any(
+            values.get(field) is not None
+            for field in ("worker_token", "worker_pid", "worker_process_start")
+        ):
+            values.setdefault("worker_boot_id", "test-boot")
+        status = str(values["status"])
+        if status == JobStatus.AWAITING_USER.value:
+            values.setdefault("question", "question")
+            values.setdefault("result", values["question"])
+        if status in {
+            JobStatus.BLOCKED.value,
+            JobStatus.COMPLETED.value,
+            JobStatus.FAILED.value,
+            JobStatus.CANCELLED.value,
+        }:
+            values.setdefault("completed_at", values["created_at"])
+        return CursorJob.from_dict(values)
+
+    def _coerce(self, job: CursorJob | dict[str, object]) -> CursorJob:
+        return job if isinstance(job, CursorJob) else self._typed(job)
+
+    def write_job(self, raw: dict[str, object]) -> None:
+        self._store().create(self._typed(raw))
+
+    def read_job(self, job_id: str) -> dict[str, object]:
+        return self._store().get(job_id).to_dict()
+
+    def active_jobs(self) -> list[dict[str, object]]:
+        return [
+            job.to_dict()
+            for job in self._store().list()
+            if job.status in production_jobs.MODEL_ACTIVE_STATUSES
+        ]
+
+    def reserved_targets(self, exclude_job_id: str | None = None) -> set[str]:
+        return production_jobs.reserved_targets(self._store(), exclude_job_id)
+
+    def resolve_job_repository(
+        self, client: object, raw: dict[str, object], repositories: list[Path]
+    ) -> tuple[Path | None, list[Path]]:
+        return production_jobs.resolve_job_repository(
+            cast(Any, client), self._typed(raw), repositories
+        )
+
+    def complete_from_output(
+        self, raw: dict[str, object], *, output: str, agent_status: str
+    ) -> None:
+        values = dict(raw)
+        values.setdefault("status", JobStatus.RUNNING.value)
+        completed = production_jobs.complete_from_output(
+            self._typed(values), output=output, agent_status=agent_status
+        )
+        raw.clear()
+        raw.update(completed.to_dict())
+
+    def read_agent_completion(
+        self, client: object, raw: dict[str, object], **kwargs: object
+    ) -> tuple[str, str]:
+        return production_jobs.read_agent_completion(
+            cast(Any, client), self._typed(raw), **cast(Any, kwargs)
+        )
+
+    def _worker_complete(self, *args: object, **kwargs: object) -> None:
+        production_jobs._worker_complete(
+            self._store(), *cast(Any, args), **cast(Any, kwargs)
+        )
+
+    def _prepare_pull_request_checkout(
+        self,
+        job_id: str,
+        token: str,
+        raw: dict[str, object],
+        *args: object,
+        **kwargs: object,
+    ) -> dict[str, object] | None:
+        result = production_jobs._prepare_pull_request_checkout(
+            self._store(),
+            job_id,
+            token,
+            self._typed(raw),
+            *cast(Any, args),
+            **cast(Any, kwargs),
+        )
+        return result.to_dict() if result is not None else None
+
+    def _reserve_worker_target(self, *args: object, **kwargs: object) -> Any:
+        return production_jobs._reserve_worker_target(
+            self._store(), *cast(Any, args), **cast(Any, kwargs)
+        )
+
+    def _reserve_worker_worktree(self, *args: object, **kwargs: object) -> Any:
+        return production_jobs._reserve_worker_worktree(
+            self._store(), *cast(Any, args), **cast(Any, kwargs)
+        )
+
+    def _settle_worker_worktree(self, *args: object, **kwargs: object) -> Any:
+        return production_jobs._settle_worker_worktree(
+            self._store(), *cast(Any, args), **cast(Any, kwargs)
+        )
+
+    def _worker_command_matches(self, raw: dict[str, object]) -> bool:
+        return worker_lifecycle.worker_command_matches(self._typed(raw))
+
+    def _signal_worker(
+        self,
+        raw: CursorJob | dict[str, object],
+        sent_signal: signal.Signals,
+        *,
+        include_process_group: bool = True,
+    ) -> bool:
+        return worker_lifecycle.signal_worker(
+            self._coerce(raw),
+            sent_signal,
+            include_process_group=include_process_group,
+            is_alive=lambda current: service._worker_is_alive(current),
+        )
+
+
+jobs: Any = _ProvisioningTestAdapter()
+
+
 class CursorJobStateTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
         self.jobs_patch = mock.patch.object(jobs, "JOBS_DIR", Path(self.temporary.name))
+        self.legacy_jobs_patch = mock.patch.object(
+            jobs, "LEGACY_JOBS_DIR", Path(self.temporary.name) / "legacy"
+        )
+        self.job_logs_patch = mock.patch.object(
+            service, "JOB_LOGS_DIR", Path(self.temporary.name) / "logs"
+        )
+        self.service_jobs_patch = mock.patch.object(
+            service, "JOBS_DIR", Path(self.temporary.name)
+        )
+        self.service_legacy_patch = mock.patch.object(
+            service, "LEGACY_JOBS_DIR", Path(self.temporary.name) / "legacy"
+        )
         self.jobs_patch.start()
+        self.legacy_jobs_patch.start()
+        self.service_jobs_patch.start()
+        self.service_legacy_patch.start()
+        self.job_logs_patch.start()
 
     def tearDown(self) -> None:
+        self.job_logs_patch.stop()
+        self.service_legacy_patch.stop()
+        self.service_jobs_patch.stop()
+        self.legacy_jobs_patch.stop()
         self.jobs_patch.stop()
         self.temporary.cleanup()
 
@@ -72,8 +296,8 @@ class CursorJobStateTests(unittest.TestCase):
             "clarification_kind": "repository",
         }
         jobs.write_job(job)
-        with mock.patch.object(jobs, "launch_worker") as launch:
-            jobs.reply_job("123456789abc", "example-repo")
+        with mock.patch.object(service, "launch_worker") as launch:
+            service.reply_job("123456789abc", "example-repo")
         updated = jobs.read_job("123456789abc")
         self.assertEqual(updated["request"], "Fix APP-42")
         self.assertEqual(updated["repository_hint"], "example-repo")
@@ -88,16 +312,16 @@ class CursorJobStateTests(unittest.TestCase):
             "clarification_kind": "github_repository",
         }
         jobs.write_job(job)
-        with mock.patch.object(jobs, "launch_worker"):
-            jobs.reply_job("123456789abc", "example/project")
+        with mock.patch.object(service, "launch_worker"):
+            service.reply_job("123456789abc", "example/project")
         updated = jobs.read_job("123456789abc")
         self.assertEqual(updated["github_repository"], "example/project")
         self.assertTrue(updated["fork_requested"])
         self.assertEqual(updated["request"], "Fork this repo and add a feature")
 
     def test_pull_request_job_gets_unique_worktree_identity(self) -> None:
-        with mock.patch.object(jobs, "launch_worker"):
-            job_id = jobs.start_job(
+        with mock.patch.object(service, "launch_worker"):
+            job_id = service.start_job(
                 "review this pull request",
                 github_repository="source/project",
                 github_pull_request=42,
@@ -158,7 +382,7 @@ class CursorJobStateTests(unittest.TestCase):
             mock.patch.object(jobs, "GitHubClient", return_value=github),
             mock.patch.object(jobs, "HerdrClient", return_value=client),
         ):
-            jobs.run_worker("123456789abc")
+            service.run_worker("123456789abc")
 
         github.provision_pull_request.assert_called_once_with(
             "source/project", 42, checkpoint=mock.ANY
@@ -339,7 +563,7 @@ class CursorJobStateTests(unittest.TestCase):
             mock.patch.object(jobs, "GitHubClient", return_value=github),
             mock.patch.object(jobs, "HerdrClient", return_value=client),
         ):
-            jobs.run_worker("123456789abc")
+            service.run_worker("123456789abc")
 
         github.prepare_public_fork.assert_called_once_with("source/project")
         github.ensure_fork.assert_called_once_with(
@@ -369,6 +593,71 @@ class CursorJobStateTests(unittest.TestCase):
         self.assertEqual(updated["fork_repository"], "me/project")
         self.assertEqual(updated["repository"], str(repository))
 
+    def test_reconciled_fork_is_never_resubmitted(self) -> None:
+        repository = Path(self.temporary.name) / "source" / "project"
+        source = GitHubRepository(
+            "source/project",
+            "https://github.com/source/project",
+            False,
+            "main",
+        )
+        fork = GitHubRepository(
+            "me/project",
+            "https://github.com/me/project",
+            False,
+            "main",
+            "source/project",
+        )
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "continue after fork recovery",
+                "github_repository": "source/project",
+                "fork_requested": True,
+                "fork_confirmed": True,
+                "fork_operation_state": "exists",
+                "fork_operation_source": "source/project",
+                "fork_operation_source_url": "https://github.com/source/project",
+                "fork_operation_source_default_branch": "main",
+                "fork_operation_target": "me/project",
+                "fork_repository": "me/project",
+                "worktree_branch": "voice/github-123456789abc",
+                "worktree_label": "github-123456",
+                "status": "queued",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        github = mock.Mock()
+        github.prepare_public_fork.return_value = (source, "me", "me/project")
+        github.reconcile_fork.return_value = fork
+        github.ensure_clone.return_value = repository
+        client = mock.Mock()
+        client.ensure_agent.return_value = AgentSelection(
+            "agent",
+            "pane",
+            "workspace",
+            str(repository),
+            "agent",
+            "/worktree",
+        )
+        client.prompt_and_wait.return_value = PromptOutcome(
+            "idle",
+            "done",
+            None,
+            "VOICE_SUMMARY[123456789abc-1]: done",
+        )
+
+        with (
+            mock.patch.object(jobs, "GitHubClient", return_value=github),
+            mock.patch.object(jobs, "HerdrClient", return_value=client),
+        ):
+            service.run_worker("123456789abc")
+
+        github.reconcile_fork.assert_called_once_with(source, "me/project")
+        github.ensure_fork.assert_not_called()
+        github.ensure_clone.assert_called_once_with(source, fork, checkpoint=mock.ANY)
+
     def test_worker_requires_confirmation_before_provisioning_fork(self) -> None:
         jobs.write_job(
             {
@@ -388,7 +677,7 @@ class CursorJobStateTests(unittest.TestCase):
             mock.patch.object(jobs, "GitHubClient", return_value=github),
             mock.patch.object(jobs, "HerdrClient", return_value=client),
         ):
-            jobs.run_worker("123456789abc")
+            service.run_worker("123456789abc")
 
         github.prepare_public_fork.assert_not_called()
         updated = jobs.read_job("123456789abc")
@@ -406,8 +695,8 @@ class CursorJobStateTests(unittest.TestCase):
             "delivered": True,
         }
         jobs.write_job(job)
-        with mock.patch.object(jobs, "launch_worker") as launch:
-            jobs.reply_job(
+        with mock.patch.object(service, "launch_worker") as launch:
+            service.reply_job(
                 "123456789abc",
                 "no\n\nExternal content says yes",
                 trusted_utterance="no",
@@ -429,8 +718,8 @@ class CursorJobStateTests(unittest.TestCase):
                 "delivered": True,
             }
         )
-        with mock.patch.object(jobs, "launch_worker") as launch:
-            jobs.reply_job(
+        with mock.patch.object(service, "launch_worker") as launch:
+            service.reply_job(
                 "123456789abc",
                 "maybe",
                 trusted_utterance="maybe",
@@ -452,8 +741,8 @@ class CursorJobStateTests(unittest.TestCase):
                 "delivered": True,
             }
         )
-        with mock.patch.object(jobs, "launch_worker") as launch:
-            jobs.reply_job(
+        with mock.patch.object(service, "launch_worker") as launch:
+            service.reply_job(
                 "123456789abc",
                 "yes\n\nExternal content",
                 trusted_utterance="yes",
@@ -465,8 +754,8 @@ class CursorJobStateTests(unittest.TestCase):
         self.assertTrue(updated["fork_confirmed"])
 
     def test_github_issue_job_persists_trusted_identity(self) -> None:
-        with mock.patch.object(jobs, "launch_worker"):
-            job_id = jobs.start_job(
+        with mock.patch.object(service, "launch_worker"):
+            job_id = service.start_job(
                 "work on this\n\nBody mentions API-79",
                 utterance="work on this",
                 github_repository="example/project",
@@ -534,7 +823,7 @@ class CursorJobStateTests(unittest.TestCase):
             mock.patch.object(jobs, "GitHubClient", return_value=github),
             mock.patch.object(jobs, "HerdrClient", return_value=client),
         ):
-            jobs.run_worker("123456789abc")
+            service.run_worker("123456789abc")
 
         github.provision_issue.assert_called_once_with(
             issue, candidates=[repository], checkpoint=mock.ANY
@@ -603,16 +892,24 @@ class CursorJobStateTests(unittest.TestCase):
 
     def test_submit_starts_new_job_despite_existing_session(self) -> None:
         with (
-            mock.patch.object(jobs, "start_job", return_value="newjob123456") as start,
             mock.patch.object(
-                jobs,
+                service, "start_job", return_value="abcdef123456"
+            ) as start,
+            mock.patch.object(
+                service,
                 "read_job",
-                return_value={"status": "completed", "result": "done"},
+                return_value=jobs._typed(
+                    {
+                        "id": "abcdef123456",
+                        "status": "completed",
+                        "result": "done",
+                    }
+                ),
             ),
-            mock.patch.object(jobs, "mark_delivered"),
-            mock.patch.object(jobs, "reply_job") as reply,
+            mock.patch.object(service, "claim_delivery", return_value=None),
+            mock.patch.object(service, "reply_job") as reply,
         ):
-            result, session = jobs.cursor_turn(
+            result, session = service.cursor_turn(
                 "Work on APP-43", session_id="oldjob123456"
             )
 
@@ -718,7 +1015,7 @@ class CursorJobStateTests(unittest.TestCase):
             mock.patch("threading.Thread") as thread,
             mock.patch.object(jobs, "_process_identity", return_value="worker-start"),
         ):
-            jobs.launch_worker("123456789abc")
+            service.launch_worker("123456789abc")
         command = popen.call_args.args[0]
         self.assertEqual(command[1:3], ["-m", "local_voice_harness.cursor.worker"])
         thread.assert_called_once()
@@ -754,7 +1051,7 @@ class CursorJobStateTests(unittest.TestCase):
         )
 
         with mock.patch.object(jobs, "HerdrClient", return_value=client):
-            jobs.run_worker("123456789abc")
+            service.run_worker("123456789abc")
 
         updated = jobs.read_job("123456789abc")
         self.assertEqual(updated["status"], "completed")
@@ -779,9 +1076,9 @@ class CursorJobStateTests(unittest.TestCase):
         with (
             mock.patch("time.time", return_value=100),
             mock.patch.object(jobs, "_process_identity", return_value=None),
-            mock.patch.object(jobs, "launch_worker") as launch,
+            mock.patch.object(service, "launch_worker") as launch,
         ):
-            self.assertEqual(jobs.pending_results(), [])
+            self.assertEqual(service.pending_results(), [])
         updated = json.loads(
             (Path(self.temporary.name) / "123456789abc.json").read_text()
         )
@@ -826,7 +1123,7 @@ class CursorJobStateTests(unittest.TestCase):
         )
 
         with mock.patch.object(jobs, "HerdrClient", return_value=client):
-            jobs.run_worker("123456789abc")
+            service.run_worker("123456789abc")
 
         client.start_agent.assert_called_once_with(
             worktree,
@@ -861,7 +1158,7 @@ class CursorJobStateTests(unittest.TestCase):
         client.get_agent.side_effect = HerdrError("server unavailable")
 
         with mock.patch.object(jobs, "HerdrClient", return_value=client):
-            jobs.run_worker("123456789abc")
+            service.run_worker("123456789abc")
 
         client.start_agent.assert_not_called()
         client.prompt_and_wait.assert_not_called()
@@ -882,7 +1179,7 @@ class CursorJobStateTests(unittest.TestCase):
             }
         )
 
-        jobs.cancel_job("123456789abc")
+        service.cancel_job("123456789abc")
         jobs._worker_complete(
             "123456789abc",
             "worker-claim",
@@ -914,11 +1211,11 @@ class CursorJobStateTests(unittest.TestCase):
             return []
 
         client.repository_roots.side_effect = repository_roots
-        worker = threading.Thread(target=jobs.run_worker, args=("123456789abc",))
+        worker = threading.Thread(target=service.run_worker, args=("123456789abc",))
         with mock.patch.object(jobs, "HerdrClient", return_value=client):
             worker.start()
             self.assertTrue(entered.wait(2))
-            jobs.cancel_job("123456789abc")
+            service.cancel_job("123456789abc")
             release.set()
             worker.join(2)
 
@@ -973,6 +1270,7 @@ class CursorJobStateTests(unittest.TestCase):
         original_settle = jobs._settle_fork_operation
 
         def settle_fork(
+            store: JobStore,
             job_id: str,
             token: str,
             value: GitHubRepository | None,
@@ -981,6 +1279,7 @@ class CursorJobStateTests(unittest.TestCase):
             failed_observing: bool = False,
         ) -> dict[str, object] | None:
             result = original_settle(
+                store,
                 job_id,
                 token,
                 value,
@@ -993,7 +1292,7 @@ class CursorJobStateTests(unittest.TestCase):
             return result
 
         client = mock.Mock()
-        worker = threading.Thread(target=jobs.run_worker, args=("123456789abc",))
+        worker = threading.Thread(target=service.run_worker, args=("123456789abc",))
         with (
             mock.patch.object(jobs, "GitHubClient", return_value=github),
             mock.patch.object(jobs, "HerdrClient", return_value=client),
@@ -1003,7 +1302,7 @@ class CursorJobStateTests(unittest.TestCase):
             worker.start()
             self.assertTrue(entered.wait(2))
             with self.assertRaisesRegex(jobs.HarnessError, "committed fork submission"):
-                jobs.cancel_job("123456789abc")
+                service.cancel_job("123456789abc")
             committed = jobs.read_job("123456789abc")
             self.assertEqual(committed["status"], "routing")
             self.assertEqual(committed["fork_operation_state"], "submitted")
@@ -1012,11 +1311,11 @@ class CursorJobStateTests(unittest.TestCase):
             self.assertEqual(
                 jobs.read_job("123456789abc")["fork_operation_state"], "exists"
             )
-            jobs.cancel_job("123456789abc")
+            service.cancel_job("123456789abc")
             continue_after_settle.set()
             worker.join(2)
             with mock.patch.object(jobs, "_worker_is_alive", return_value=False):
-                jobs.recover_jobs()
+                service.recover_jobs()
 
         self.assertFalse(worker.is_alive())
         updated = jobs.read_job("123456789abc")
@@ -1063,7 +1362,7 @@ class CursorJobStateTests(unittest.TestCase):
             raise AssertionError("fork submission should not run")
 
         github.ensure_fork.side_effect = ensure_fork
-        worker = threading.Thread(target=jobs.run_worker, args=("123456789abc",))
+        worker = threading.Thread(target=service.run_worker, args=("123456789abc",))
         with (
             mock.patch.object(jobs, "GitHubClient", return_value=github),
             mock.patch.object(jobs, "HerdrClient", return_value=client),
@@ -1080,7 +1379,7 @@ class CursorJobStateTests(unittest.TestCase):
                     f"worker stopped before fork routing: {jobs.read_job('123456789abc')}",
                 )
                 client.ensure_server.assert_called_once_with()
-                jobs.cancel_job("123456789abc")
+                service.cancel_job("123456789abc")
                 self.assertEqual(jobs.read_job("123456789abc")["status"], "cancelled")
             finally:
                 release.set()
@@ -1115,7 +1414,7 @@ class CursorJobStateTests(unittest.TestCase):
             mock.patch.object(jobs, "HerdrClient", return_value=client),
             mock.patch.object(jobs, "GitHubClient") as github_client,
         ):
-            jobs.run_worker("123456789abc")
+            service.run_worker("123456789abc")
 
         failed = jobs.read_job("123456789abc")
         self.assertEqual(failed["status"], "failed")
@@ -1164,7 +1463,7 @@ class CursorJobStateTests(unittest.TestCase):
             raise AssertionError("cancelled worker continued after worktree settle")
 
         client.ensure_agent.side_effect = ensure_agent
-        worker = threading.Thread(target=jobs.run_worker, args=("123456789abc",))
+        worker = threading.Thread(target=service.run_worker, args=("123456789abc",))
         with (
             mock.patch.object(jobs, "HerdrClient", return_value=client),
             mock.patch.object(jobs, "_stop_worker", return_value=False),
@@ -1174,7 +1473,7 @@ class CursorJobStateTests(unittest.TestCase):
             dispatching = jobs.read_job("123456789abc")
             self.assertEqual(dispatching["worktree_path"], str(checkout))
             self.assertEqual(dispatching["worktree_provision_state"], "dispatching")
-            jobs.cancel_job("123456789abc")
+            service.cancel_job("123456789abc")
             release.set()
             worker.join(2)
 
@@ -1184,7 +1483,7 @@ class CursorJobStateTests(unittest.TestCase):
         self.assertTrue(retained["target_release_pending"])
         client.prompt_and_wait.assert_not_called()
         with mock.patch.object(jobs, "_worker_is_alive", return_value=False):
-            jobs.recover_jobs()
+            service.recover_jobs()
         self.assertFalse(jobs.read_job("123456789abc")["target_release_pending"])
 
     def test_cancellation_before_agent_dispatch_uses_planned_reservation(self) -> None:
@@ -1225,7 +1524,7 @@ class CursorJobStateTests(unittest.TestCase):
             return selection
 
         client.ensure_agent.side_effect = ensure_agent
-        worker = threading.Thread(target=jobs.run_worker, args=("123456789abc",))
+        worker = threading.Thread(target=service.run_worker, args=("123456789abc",))
         with mock.patch.object(jobs, "HerdrClient", return_value=client):
             worker.start()
             self.assertTrue(entered.wait(2))
@@ -1233,7 +1532,7 @@ class CursorJobStateTests(unittest.TestCase):
                 jobs.read_job("123456789abc")["agent_dispatch_state"],
                 "dispatching",
             )
-            jobs.cancel_job("123456789abc")
+            service.cancel_job("123456789abc")
             release.set()
             worker.join(2)
 
@@ -1291,7 +1590,7 @@ class CursorJobStateTests(unittest.TestCase):
             raise error
 
         client.ensure_agent.side_effect = ensure_agent
-        worker = threading.Thread(target=jobs.run_worker, args=("123456789abc",))
+        worker = threading.Thread(target=service.run_worker, args=("123456789abc",))
         with (
             mock.patch.object(jobs, "HerdrClient", return_value=client),
             mock.patch.object(jobs, "_stop_worker", return_value=False),
@@ -1299,7 +1598,7 @@ class CursorJobStateTests(unittest.TestCase):
         ):
             worker.start()
             self.assertTrue(entered.wait(2))
-            jobs.cancel_job("123456789abc")
+            service.cancel_job("123456789abc")
             release.set()
             worker.join(2)
 
@@ -1312,9 +1611,9 @@ class CursorJobStateTests(unittest.TestCase):
             mock.patch.object(jobs, "_worker_is_alive", return_value=False),
         ):
             with mock.patch("time.time", return_value=100):
-                jobs.recover_jobs()
+                service.recover_jobs()
             with mock.patch("time.time", return_value=105):
-                jobs.recover_jobs()
+                service.recover_jobs()
 
         updated = jobs.read_job("123456789abc")
         self.assertEqual(updated["agent_dispatch_state"], "ready")
@@ -1374,14 +1673,14 @@ class CursorJobStateTests(unittest.TestCase):
             return selection
 
         client.ensure_agent.side_effect = ensure_agent
-        worker = threading.Thread(target=jobs.run_worker, args=("123456789abc",))
+        worker = threading.Thread(target=service.run_worker, args=("123456789abc",))
         with (
             mock.patch.object(jobs, "GitHubClient", return_value=github),
             mock.patch.object(jobs, "HerdrClient", return_value=client),
         ):
             worker.start()
             self.assertTrue(entered.wait(2))
-            jobs.cancel_job("123456789abc")
+            service.cancel_job("123456789abc")
             release.set()
             worker.join(2)
 
@@ -1434,11 +1733,11 @@ class CursorJobStateTests(unittest.TestCase):
 
         client.ensure_agent.side_effect = ensure_agent
         client.prompt_and_wait.side_effect = prompt
-        worker = threading.Thread(target=jobs.run_worker, args=("123456789abc",))
+        worker = threading.Thread(target=service.run_worker, args=("123456789abc",))
         with mock.patch.object(jobs, "HerdrClient", return_value=client):
             worker.start()
             self.assertTrue(entered.wait(2))
-            jobs.cancel_job("123456789abc")
+            service.cancel_job("123456789abc")
             release.set()
             worker.join(2)
 
@@ -1514,12 +1813,12 @@ class CursorJobStateTests(unittest.TestCase):
         def reply(text: str) -> None:
             barrier.wait()
             try:
-                jobs.reply_job("123456789abc", text)
+                service.reply_job("123456789abc", text)
                 successes.append(text)
             except Exception as exc:
                 errors.append(exc)
 
-        with mock.patch.object(jobs, "launch_worker"):
+        with mock.patch.object(service, "launch_worker"):
             threads = [
                 threading.Thread(target=reply, args=("first",)),
                 threading.Thread(target=reply, args=("second",)),
@@ -1544,11 +1843,11 @@ class CursorJobStateTests(unittest.TestCase):
             }
         )
         barrier = threading.Barrier(2)
-        claims: list[dict[str, object] | None] = []
+        claims: list[DeliveryClaim | None] = []
 
         def claim() -> None:
             barrier.wait()
-            claims.append(jobs.claim_delivery())
+            claims.append(service.claim_delivery())
 
         with mock.patch("time.time", return_value=100):
             threads = [threading.Thread(target=claim) for _ in range(2)]
@@ -1572,7 +1871,7 @@ class CursorJobStateTests(unittest.TestCase):
             mock.patch("subprocess.Popen", side_effect=OSError("spawn failed")),
             self.assertRaisesRegex(OSError, "spawn failed"),
         ):
-            jobs.launch_worker("123456789abc")
+            service.launch_worker("123456789abc")
 
         updated = jobs.read_job("123456789abc")
         self.assertEqual(updated["status"], "failed")
@@ -1596,8 +1895,8 @@ class CursorJobStateTests(unittest.TestCase):
             mock.patch("threading.Thread"),
             mock.patch.object(jobs, "_process_identity", return_value="worker-start"),
         ):
-            jobs.recover_jobs()
-            jobs.recover_jobs()
+            service.recover_jobs()
+            service.recover_jobs()
 
         popen.assert_called_once()
         updated = jobs.read_job("123456789abc")
@@ -1617,16 +1916,16 @@ class CursorJobStateTests(unittest.TestCase):
         )
         with (
             mock.patch.object(jobs, "_process_identity", return_value=None),
-            mock.patch.object(jobs, "launch_worker") as launch,
+            mock.patch.object(service, "launch_worker") as launch,
         ):
-            jobs.recover_jobs()
+            service.recover_jobs()
 
         updated = jobs.read_job("123456789abc")
         self.assertEqual(updated["status"], "queued")
         self.assertNotIn("reconcile", updated)
         launch.assert_called_once_with("123456789abc")
 
-    def test_legacy_worker_pid_is_verified_by_command_line(self) -> None:
+    def test_legacy_worker_pid_without_boot_identity_is_never_alive(self) -> None:
         job = {
             "id": "123456789abc",
             "worker_pid": 42,
@@ -1641,6 +1940,24 @@ class CursorJobStateTests(unittest.TestCase):
             )
         )
         with mock.patch.object(Path, "read_bytes", return_value=command):
+            self.assertFalse(jobs._worker_is_alive(job))
+
+    def test_worker_liveness_requires_matching_linux_boot_identity(self) -> None:
+        job = {
+            "id": "123456789abc",
+            "worker_pid": 42,
+            "worker_boot_id": "old-boot",
+            "worker_process_start": "start",
+        }
+        with (
+            mock.patch.object(jobs, "_boot_identity", return_value="new-boot"),
+            mock.patch.object(jobs, "_process_identity", return_value="start"),
+        ):
+            self.assertFalse(jobs._worker_is_alive(job))
+        with (
+            mock.patch.object(jobs, "_boot_identity", return_value="old-boot"),
+            mock.patch.object(jobs, "_process_identity", return_value="start"),
+        ):
             self.assertTrue(jobs._worker_is_alive(job))
 
     def test_cancel_keeps_target_reserved_until_interrupt_finishes(self) -> None:
@@ -1666,8 +1983,8 @@ class CursorJobStateTests(unittest.TestCase):
 
         client.cancel_agent.side_effect = inspect_reservation
         with mock.patch.object(jobs, "HerdrClient", return_value=client):
-            jobs.cancel_job("123456789abc")
-            jobs.cancel_job("123456789abc")
+            service.cancel_job("123456789abc")
+            service.cancel_job("123456789abc")
 
         self.assertIn("cursor-agent", reserved_during_cancel)
         self.assertNotIn("cursor-agent", jobs.reserved_targets())
@@ -1697,11 +2014,11 @@ class CursorJobStateTests(unittest.TestCase):
             mock.patch.object(jobs, "_stop_worker", return_value=True),
             mock.patch.object(jobs, "HerdrClient", side_effect=[failing, recovered]),
         ):
-            jobs.cancel_job("123456789abc")
+            service.cancel_job("123456789abc")
             cancelled = jobs.read_job("123456789abc")
             self.assertTrue(cancelled["target_release_pending"])
             self.assertIn("cursor-agent", jobs.reserved_targets())
-            jobs.recover_jobs()
+            service.recover_jobs()
 
         recovered.cancel_agent.assert_called_once_with("cursor-agent")
         self.assertFalse(jobs.read_job("123456789abc")["target_release_pending"])
@@ -1737,16 +2054,16 @@ class CursorJobStateTests(unittest.TestCase):
             mock.patch.object(jobs, "_stop_worker", return_value=True),
             mock.patch.object(jobs, "HerdrClient", return_value=client),
         ):
-            jobs.cancel_job("123456789abc")
+            service.cancel_job("123456789abc")
             self.assertTrue(jobs.read_job("123456789abc")["target_release_pending"])
             with mock.patch("time.time", return_value=100):
-                jobs.recover_jobs()
+                service.recover_jobs()
             self.assertTrue(jobs.read_job("123456789abc")["target_release_pending"])
             with mock.patch("time.time", return_value=104):
-                jobs.recover_jobs()
+                service.recover_jobs()
             self.assertEqual(client.get_agent.call_count, 1)
             with mock.patch("time.time", return_value=105):
-                jobs.recover_jobs()
+                service.recover_jobs()
 
         self.assertFalse(jobs.read_job("123456789abc")["target_release_pending"])
         self.assertEqual(client.get_agent.call_count, 2)
@@ -1772,12 +2089,12 @@ class CursorJobStateTests(unittest.TestCase):
         with mock.patch.object(jobs, "HerdrClient", return_value=client):
             for now in (100, 104, 105, 114):
                 with mock.patch("time.time", return_value=now):
-                    jobs.recover_jobs()
+                    service.recover_jobs()
             pending = jobs.read_job("123456789abc")
             self.assertEqual(pending["agent_reconcile_attempts"], 2)
             self.assertEqual(pending["agent_next_reconcile_at"], 115)
             with mock.patch("time.time", return_value=115):
-                jobs.recover_jobs()
+                service.recover_jobs()
 
         updated = jobs.read_job("123456789abc")
         self.assertEqual(updated["agent_dispatch_state"], "confirmed_absent")
@@ -1805,7 +2122,7 @@ class CursorJobStateTests(unittest.TestCase):
         with mock.patch.object(jobs, "GitHubClient", return_value=github):
             for now in (100, 105, 115):
                 with mock.patch("time.time", return_value=now):
-                    jobs.recover_jobs()
+                    service.recover_jobs()
 
         updated = jobs.read_job("123456789abc")
         self.assertEqual(updated["fork_operation_state"], "confirmed_absent")
@@ -1845,10 +2162,10 @@ class CursorJobStateTests(unittest.TestCase):
         github.reconcile_fork.side_effect = [None, fork]
         with mock.patch.object(jobs, "GitHubClient", return_value=github):
             with mock.patch("time.time", return_value=100):
-                jobs.recover_jobs()
+                service.recover_jobs()
             self.assertTrue(jobs.read_job("123456789abc")["target_release_pending"])
             with mock.patch("time.time", return_value=105):
-                jobs.recover_jobs()
+                service.recover_jobs()
 
         updated = jobs.read_job("123456789abc")
         self.assertEqual(updated["fork_operation_state"], "exists")
@@ -1875,7 +2192,7 @@ class CursorJobStateTests(unittest.TestCase):
         with mock.patch.object(jobs, "HerdrClient", return_value=client):
             for now in (100, 105, 115):
                 with mock.patch("time.time", return_value=now):
-                    jobs.recover_jobs()
+                    service.recover_jobs()
 
         updated = jobs.read_job("123456789abc")
         self.assertEqual(updated["worktree_provision_state"], "confirmed_absent")
@@ -1905,13 +2222,13 @@ class CursorJobStateTests(unittest.TestCase):
             mock.patch.object(jobs, "_worker_is_alive", return_value=False),
         ):
             with mock.patch("time.time", return_value=100):
-                jobs.recover_jobs()
+                service.recover_jobs()
             capped = jobs.read_job("123456789abc")
             self.assertEqual(capped["agent_reconcile_attempts"], 5)
             self.assertEqual(capped["agent_next_reconcile_at"], 160)
 
             with mock.patch("time.time", return_value=160):
-                jobs.recover_jobs()
+                service.recover_jobs()
             manual = jobs.read_job("123456789abc")
             self.assertEqual(manual["agent_dispatch_state"], "manual_required")
             self.assertEqual(manual["agent_reconcile_attempts"], 6)
@@ -1923,7 +2240,7 @@ class CursorJobStateTests(unittest.TestCase):
             self.assertNotIn("reconciliation is pending", str(manual["result"]))
 
             with mock.patch("time.time", return_value=10_000):
-                jobs.recover_jobs()
+                service.recover_jobs()
 
         self.assertEqual(client.get_agent.call_count, 2)
         client.cancel_agent.assert_not_called()
@@ -1958,7 +2275,7 @@ class CursorJobStateTests(unittest.TestCase):
             mock.patch.object(jobs, "_worker_is_alive", return_value=False),
             mock.patch("time.time", return_value=100),
         ):
-            jobs.recover_jobs()
+            service.recover_jobs()
 
         manual = jobs.read_job("123456789abc")
         self.assertEqual(manual["fork_operation_state"], "manual_required")
@@ -1966,18 +2283,18 @@ class CursorJobStateTests(unittest.TestCase):
         client.cancel_agent.assert_called_once_with("unrelated-agent")
         token = str(manual["manual_reconcile_token"])
         with self.assertRaisesRegex(jobs.HarnessError, "fence is stale"):
-            jobs.resolve_manual_reconciliation(
+            service.resolve_manual_reconciliation(
                 "123456789abc", "fork", "stale-token", "confirmed_absent"
             )
         with self.assertRaisesRegex(jobs.HarnessError, "fence is stale"):
-            jobs.resolve_manual_reconciliation(
+            service.resolve_manual_reconciliation(
                 "123456789abc", "worktree", token, "confirmed_absent"
             )
-        resolved = jobs.resolve_manual_reconciliation(
+        resolved = service.resolve_manual_reconciliation(
             "123456789abc", "fork", token, "confirmed_absent"
         )
-        self.assertEqual(resolved["fork_operation_state"], "confirmed_absent")
-        self.assertEqual(resolved["error"], "fork outcome unknown")
+        self.assertEqual(resolved.fork_operation_state, "confirmed_absent")
+        self.assertEqual(resolved.error, "fork outcome unknown")
         self.assertEqual(github.reconcile_fork.call_count, 1)
 
     def test_manual_materialized_agent_is_retained_without_external_action(
@@ -2006,16 +2323,16 @@ class CursorJobStateTests(unittest.TestCase):
             }
         )
 
-        resolved = jobs.resolve_manual_reconciliation(
+        resolved = service.resolve_manual_reconciliation(
             "123456789abc", "agent", "manual-token", "materialized"
         )
 
-        self.assertEqual(resolved["agent_dispatch_state"], "retained")
-        self.assertEqual(resolved["herdr_target"], "retained-agent")
-        self.assertFalse(resolved["target_release_pending"])
-        self.assertFalse(resolved["cancellation_reconciliation_pending"])
-        self.assertEqual(resolved["error"], "agent startup failed")
-        self.assertEqual(resolved["result"], "agent startup failed")
+        self.assertEqual(resolved.agent_dispatch_state, "retained")
+        self.assertEqual(resolved.herdr_target, "retained-agent")
+        self.assertFalse(resolved.target_release_pending)
+        self.assertFalse(resolved.cancellation_reconciliation_pending)
+        self.assertEqual(resolved.error, "agent startup failed")
+        self.assertEqual(resolved.result, "agent startup failed")
 
     def test_quarantined_worktree_releases_target_but_blocks_path(self) -> None:
         repository = Path(self.temporary.name) / "repository"
@@ -2040,7 +2357,7 @@ class CursorJobStateTests(unittest.TestCase):
             mock.patch.object(jobs, "HerdrClient", return_value=client),
             mock.patch("time.time", return_value=100),
         ):
-            jobs.recover_jobs()
+            service.recover_jobs()
 
         quarantined = jobs.read_job("123456789abc")
         self.assertEqual(quarantined["worktree_provision_state"], "quarantined")
@@ -2068,7 +2385,7 @@ class CursorJobStateTests(unittest.TestCase):
             )
         )
 
-        jobs.acknowledge_worktree_quarantine("123456789abc")
+        service.acknowledge_worktree_quarantine("123456789abc")
         self.assertEqual(
             jobs.read_job("123456789abc")["worktree_provision_state"],
             "retained",
@@ -2110,9 +2427,9 @@ class CursorJobStateTests(unittest.TestCase):
             mock.patch.object(jobs, "_worker_is_alive", side_effect=lambda _job: alive),
             mock.patch.object(jobs, "_stop_worker", side_effect=stop_worker),
         ):
-            jobs.cancel_job("123456789abc")
+            service.cancel_job("123456789abc")
             self.assertTrue(jobs.read_job("123456789abc")["target_release_pending"])
-            jobs.recover_jobs()
+            service.recover_jobs()
 
         self.assertEqual(stops, 2)
         self.assertFalse(jobs.read_job("123456789abc")["target_release_pending"])
@@ -2135,7 +2452,7 @@ class CursorJobStateTests(unittest.TestCase):
                 jobs, "_stop_legacy_worker", return_value=True
             ) as stop_legacy,
         ):
-            jobs.cancel_job("123456789abc")
+            service.cancel_job("123456789abc")
 
         stop_legacy.assert_called_once_with("123456789abc")
         self.assertEqual(jobs.read_job("123456789abc")["status"], "cancelled")
@@ -2158,7 +2475,7 @@ class CursorJobStateTests(unittest.TestCase):
             mock.patch.object(jobs, "_process_identity", return_value=None),
             mock.patch.object(jobs, "HerdrClient", return_value=client),
         ):
-            jobs.recover_jobs()
+            service.recover_jobs()
 
         updated = jobs.read_job("123456789abc")
         self.assertFalse(updated["target_release_pending"])
@@ -2174,15 +2491,15 @@ class CursorJobStateTests(unittest.TestCase):
                 "delivered": False,
             }
         )
-        claims: jobs.DeliveryClaims = []
-        with mock.patch.object(jobs, "start_job", return_value="123456789abc"):
-            result, session = jobs.cursor_turn("do it", delivery_claims=claims)
+        claims: DeliveryClaims = []
+        with mock.patch.object(service, "start_job", return_value="123456789abc"):
+            result, session = service.cursor_turn("do it", delivery_claims=claims)
 
         self.assertEqual(result, "done")
         self.assertIsNone(session)
         self.assertFalse(jobs.read_job("123456789abc")["delivered"])
         self.assertEqual(len(claims), 1)
-        jobs.acknowledge_deliveries(claims)
+        service.acknowledge_deliveries(claims)
         self.assertTrue(jobs.read_job("123456789abc")["delivered"])
 
 

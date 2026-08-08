@@ -96,7 +96,8 @@ show_missing = true
 skip_covered = true
 
 [tool.voice-harness.coverage.module-minimums]
-"src/local_voice_harness/cursor/jobs.py" = 70
+"src/local_voice_harness/cursor/provisioning.py" = 70
+"src/local_voice_harness/cursor/service.py" = 70
 "src/local_voice_harness/integrations/github.py" = 65
 "src/local_voice_harness/integrations/herdr.py" = 50
 "src/local_voice_harness/llm.py" = 85

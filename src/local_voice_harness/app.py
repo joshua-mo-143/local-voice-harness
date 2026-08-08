@@ -4,18 +4,40 @@ import json
 
 from .browser_context import request_context
 from .components import component_usage, llm_ready, start_components
-from .config import CURSOR_PATTERN, PID_PATH, STT_SOCKET, TTS_SOCKET
-from .cursor.jobs import (
-    DeliveryClaims,
-    acknowledge_deliveries,
-    cursor_turn,
-    release_deliveries,
+from .config import (
+    CURSOR_PATTERN,
+    JOBS_DIR,
+    LEGACY_JOBS_DIR,
+    PID_PATH,
+    STT_SOCKET,
+    TTS_SOCKET,
 )
+from .cursor.delivery import (
+    DeliveryClaims,
+)
+from .cursor.delivery import (
+    acknowledge_deliveries as acknowledge_claims,
+)
+from .cursor.delivery import (
+    release_deliveries as release_claims,
+)
+from .cursor.service import CursorTurnRequest, cursor_turn
+from .cursor.store import JobStore
 from .errors import HarnessError
 from .intent import ForkIntent, Intent, IntentRoute, decide_fork_intent, route_intent
 from .ipc import socket_ready
 from .llm import qwen_response
 from .tts.client import stream_and_play
+
+CURSOR_STORE = JobStore(JOBS_DIR, LEGACY_JOBS_DIR)
+
+
+def acknowledge_deliveries(claims: DeliveryClaims) -> None:
+    acknowledge_claims(CURSOR_STORE, claims)
+
+
+def release_deliveries(claims: DeliveryClaims) -> None:
+    release_claims(CURSOR_STORE, claims)
 
 
 def respond(text: str) -> None:
@@ -49,10 +71,12 @@ def respond(text: str) -> None:
             )
             if route.actionable and route.intent == Intent.CURSOR_SUBMIT:
                 response = cursor_turn(
-                    context.text,
-                    utterance=text,
-                    context_repository=context.focused_repository,
-                    **github_arguments,
+                    CursorTurnRequest(
+                        context.text,
+                        utterance=text,
+                        context_repository=context.focused_repository,
+                        **github_arguments,
+                    ),
                     delivery_claims=delivery_claims,
                 )[0]
             else:
