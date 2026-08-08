@@ -11,10 +11,11 @@ from typing import NamedTuple
 from ..config import CURSOR_FOREGROUND_SECONDS, JOB_LOGS_DIR, JOBS_DIR, LEGACY_JOBS_DIR
 from ..errors import HarnessError
 from ..integrations.herdr import extract_linear_issue
-from . import delivery, provisioning, recovery, worker_lifecycle
+from . import delivery, inbox, provisioning, recovery, worker_lifecycle
 from .delivery import DeliveryClaim, DeliveryClaims
 from .model import (
     ACTIVE_STATUSES,
+    TERMINAL_STATUSES,
     WORKER_STATUSES,
     CursorJob,
     JobStatus,
@@ -68,6 +69,7 @@ class CursorTurnRequest:
     context_repository: str | None = None
     action: str = "submit"
     job_id: str | None = None
+    reference: str | None = None
 
 
 class CursorTurnResult(NamedTuple):
@@ -233,6 +235,13 @@ def start_job(
             pull_request_worktree_state=("pending" if github_pull_request else None),
             agent_hint=agent,
             issue_key=extract_linear_issue(spoken_text),
+            speakable_label=inbox.build_speakable_label(
+                text,
+                issue_key=extract_linear_issue(spoken_text),
+                github_repository=github_repository,
+                github_issue=github_issue,
+                github_pull_request=github_pull_request,
+            ),
         )
     )
     _job_store().create(job)
@@ -555,6 +564,104 @@ def pending_results() -> list[DeliveryClaim]:
     return delivery.pending_deliveries(_job_store())
 
 
+ANNOUNCEABLE_STATUSES = delivery.DELIVERABLE_STATUSES
+
+
+@dataclass(frozen=True, slots=True)
+class ResolvedReference:
+    job_id: str | None
+    clarification: str | None
+
+
+def _resolve_reference(
+    reference: str,
+    *,
+    statuses: frozenset[JobStatus],
+    action: str,
+    empty_message: str,
+    job_id: str | None = None,
+    session_id: str | None = None,
+) -> ResolvedReference:
+    """Map a spoken reference (with context fallbacks) onto a single job.
+
+    Explicit textual matches win. When the reference is ambiguous we ask for
+    clarification rather than guessing. With no textual match we fall back to an
+    explicit id, the active session, or the sole candidate before giving up and
+    listing the options.
+    """
+
+    jobs = [job for job in _job_store().list() if job.status in statuses]
+    resolution = inbox.resolve_reference(jobs, reference or "")
+    if resolution.unique is not None:
+        return ResolvedReference(resolution.unique.id, None)
+    if resolution.ambiguous:
+        return ResolvedReference(None, inbox.clarify(list(resolution.matches), action))
+    for candidate in (job_id, session_id):
+        if candidate and any(job.id == candidate for job in jobs):
+            return ResolvedReference(candidate, None)
+    if len(jobs) == 1:
+        return ResolvedReference(jobs[0].id, None)
+    if not jobs:
+        return ResolvedReference(None, empty_message)
+    return ResolvedReference(None, inbox.clarify(inbox.summarize_all(jobs), action))
+
+
+def list_jobs() -> str:
+    return inbox.describe_inbox(_job_store().list())
+
+
+def _status_message(job_id: str) -> str:
+    summary = inbox.summarize(read_job(job_id))
+    state = summary.status.value.replace("_", " ")
+    message = f"{summary.label} is {state}"
+    if summary.detail and summary.status not in {
+        JobStatus.QUEUED,
+        JobStatus.ROUTING,
+        JobStatus.RUNNING,
+        JobStatus.RECONCILING,
+    }:
+        message += f". {summary.detail}"
+    return message + "."
+
+
+def dismiss_announcement(job_id: str) -> str:
+    now = time.time()
+
+    def dismiss(job: CursorJob) -> CursorJob | None:
+        if job.announcement_dismissed and job.delivered:
+            return None
+        return job.evolve(
+            announcement_dismissed=True,
+            delivered=True,
+            delivery_claim_token=None,
+            delivery_claimed_at=None,
+            delivery_retry_at=0,
+            delivered_at=now,
+        )
+
+    updated = _job_store().update(job_id, dismiss)
+    label = inbox.speakable_label_for(updated or read_job(job_id))
+    return f"Dismissed the update for {label}."
+
+
+def repeat_announcement(job_id: str) -> str:
+    now = time.time()
+
+    def repeat(job: CursorJob) -> CursorJob | None:
+        if job.status not in ANNOUNCEABLE_STATUSES:
+            return None
+        return job.evolve_for_delivery(
+            now=now,
+            announcement_repeated=True,
+            announcement_dismissed=False,
+        )
+
+    updated = _job_store().update(job_id, repeat)
+    if updated is None:
+        raise HarnessError(f"Cursor job {job_id} has no update to repeat")
+    return f"I'll repeat the update for {inbox.speakable_label_for(updated)}."
+
+
 def cursor_turn(
     request: CursorTurnRequest | str,
     session_id: str | None = None,
@@ -570,6 +677,7 @@ def cursor_turn(
     context_repository: str | None = None,
     action: str = "submit",
     job_id: str | None = None,
+    reference: str | None = None,
     delivery_claims: DeliveryClaims | None = None,
 ) -> CursorTurnResult:
     if isinstance(request, CursorTurnRequest):
@@ -586,20 +694,70 @@ def cursor_turn(
         context_repository = request.context_repository
         action = request.action
         job_id = request.job_id
+        reference = request.reference
     else:
         text = request
+    if action == "list":
+        return CursorTurnResult(list_jobs(), session_id)
     if action == "status":
-        return CursorTurnResult(job_status(job_id), session_id)
+        resolved = _resolve_reference(
+            reference or text,
+            statuses=ACTIVE_STATUSES | TERMINAL_STATUSES,
+            action="check",
+            empty_message="There are no Cursor jobs.",
+            job_id=job_id,
+            session_id=session_id,
+        )
+        if resolved.clarification is not None:
+            return CursorTurnResult(resolved.clarification, session_id)
+        assert resolved.job_id is not None
+        return CursorTurnResult(_status_message(resolved.job_id), session_id)
     if action == "cancel":
-        if not job_id:
-            raise HarnessError("a Cursor job ID is required to cancel")
-        result = cancel_job(job_id)
-        _defer_or_acknowledge(job_id, delivery_claims)
+        resolved = _resolve_reference(
+            reference or text,
+            statuses=ACTIVE_STATUSES,
+            action="cancel",
+            empty_message="There are no active Cursor jobs to cancel.",
+            job_id=job_id,
+            session_id=session_id,
+        )
+        if resolved.clarification is not None:
+            return CursorTurnResult(resolved.clarification, session_id)
+        assert resolved.job_id is not None
+        result = cancel_job(resolved.job_id)
+        _defer_or_acknowledge(resolved.job_id, delivery_claims)
         return CursorTurnResult(result, None)
+    if action in {"dismiss", "repeat"}:
+        resolved = _resolve_reference(
+            reference or text,
+            statuses=ANNOUNCEABLE_STATUSES,
+            action=action,
+            empty_message=f"There are no updates to {action}.",
+            job_id=job_id,
+            session_id=session_id,
+        )
+        if resolved.clarification is not None:
+            return CursorTurnResult(resolved.clarification, session_id)
+        assert resolved.job_id is not None
+        message = (
+            dismiss_announcement(resolved.job_id)
+            if action == "dismiss"
+            else repeat_announcement(resolved.job_id)
+        )
+        return CursorTurnResult(message, session_id)
     if action == "reply":
         reply_id = job_id or session_id
         if not reply_id:
-            raise HarnessError("a Cursor job ID is required for a reply")
+            resolved = _resolve_reference(
+                reference or text,
+                statuses=frozenset({JobStatus.AWAITING_USER}),
+                action="answer",
+                empty_message="No Cursor job is waiting for a reply.",
+            )
+            if resolved.clarification is not None:
+                return CursorTurnResult(resolved.clarification, session_id)
+            reply_id = resolved.job_id
+        assert reply_id is not None
         reply_job(reply_id, text, trusted_utterance=utterance)
         job_id = reply_id
     else:

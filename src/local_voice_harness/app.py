@@ -31,6 +31,14 @@ from .tts.client import stream_and_play
 
 CURSOR_STORE = JobStore(JOBS_DIR, LEGACY_JOBS_DIR)
 
+CURSOR_MANAGEMENT_ACTIONS = {
+    Intent.CURSOR_LIST: "list",
+    Intent.CURSOR_STATUS: "status",
+    Intent.CURSOR_CANCEL: "cancel",
+    Intent.CURSOR_DISMISS: "dismiss",
+    Intent.CURSOR_REPEAT: "repeat",
+}
+
 
 def acknowledge_deliveries(claims: DeliveryClaims) -> None:
     acknowledge_claims(CURSOR_STORE, claims)
@@ -76,6 +84,25 @@ def respond(text: str) -> None:
                         utterance=text,
                         context_repository=context.focused_repository,
                         **github_arguments,
+                    ),
+                    delivery_claims=delivery_claims,
+                )[0]
+            elif route.actionable and route.intent in CURSOR_MANAGEMENT_ACTIONS:
+                response = cursor_turn(
+                    CursorTurnRequest(
+                        context.text,
+                        action=CURSOR_MANAGEMENT_ACTIONS[route.intent],
+                        reference=text,
+                    ),
+                    delivery_claims=delivery_claims,
+                )[0]
+            elif route.actionable and route.intent == Intent.CURSOR_REPLY:
+                response = cursor_turn(
+                    CursorTurnRequest(
+                        context.text,
+                        action="reply",
+                        reference=text,
+                        utterance=text,
                     ),
                     delivery_claims=delivery_claims,
                 )[0]

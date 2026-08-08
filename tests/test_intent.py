@@ -108,6 +108,30 @@ class IntentRouterTests(unittest.TestCase):
                 self.assertEqual(route, intent.FALLBACK_ROUTE)
 
 
+class InboxIntentTests(unittest.TestCase):
+    def test_route_tool_exposes_inbox_intents(self) -> None:
+        enum = intent.ROUTE_TOOL["function"]["parameters"]["properties"]["intent"][
+            "enum"
+        ]
+        self.assertIn("cursor_list", enum)
+        self.assertIn("cursor_dismiss", enum)
+        self.assertIn("cursor_repeat", enum)
+
+    def test_inbox_intents_are_actionable_at_high_confidence(self) -> None:
+        for name in ("cursor_list", "cursor_dismiss", "cursor_repeat"):
+            with (
+                self.subTest(intent=name),
+                mock.patch.object(
+                    intent.urllib.request,
+                    "urlopen",
+                    return_value=_response(name),
+                ),
+            ):
+                route = intent.route_intent("request", RequestContext("request"))
+                self.assertTrue(route.actionable)
+                self.assertEqual(route.intent, intent.Intent(name))
+
+
 class ForkIntentTests(unittest.TestCase):
     def test_accepts_only_unambiguous_fork_requests(self) -> None:
         for utterance in (

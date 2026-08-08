@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any
 
-CURRENT_SCHEMA_VERSION = 6
+CURRENT_SCHEMA_VERSION = 7
 LEGACY_SCHEMA_VERSIONS = frozenset(range(CURRENT_SCHEMA_VERSION))
 LEGACY_BOOT_ID = "legacy-unknown"
 
@@ -113,6 +113,8 @@ _BOOL_FIELDS = frozenset(
         "target_release_pending",
         "cancellation_reconciliation_pending",
         "worktree_manual_inspection_required",
+        "announcement_dismissed",
+        "announcement_repeated",
     }
 )
 _INT_FIELDS = frozenset(
@@ -192,6 +194,7 @@ _STRING_FIELDS = frozenset(
         "agent_hint",
         "agent_name",
         "issue_key",
+        "speakable_label",
         "status",
         "result",
         "error",
@@ -288,6 +291,7 @@ class NewCursorJob:
     pull_request_worktree_state: str | None = None
     agent_hint: str | None = None
     issue_key: str | None = None
+    speakable_label: str | None = None
 
 
 def _integer(value: object, field: str) -> int:
@@ -617,6 +621,7 @@ class CursorJob:
                 "pull_request_worktree_state": spec.pull_request_worktree_state,
                 "agent_hint": spec.agent_hint,
                 "issue_key": spec.issue_key,
+                "speakable_label": spec.speakable_label,
                 "status": JobStatus.QUEUED.value,
                 "delivered": False,
                 "created_at": spec.created_at,
@@ -996,6 +1001,22 @@ class CursorJob:
     @property
     def issue_key(self) -> str | None:
         return self._optional_string("issue_key")
+
+    @property
+    def speakable_label(self) -> str | None:
+        return self._optional_string("speakable_label")
+
+    @property
+    def announcement_dismissed(self) -> bool:
+        return self._boolean_field("announcement_dismissed")
+
+    @property
+    def announcement_repeated(self) -> bool:
+        return self._boolean_field("announcement_repeated")
+
+    @property
+    def delivered_at(self) -> float | None:
+        return self._optional_float("delivered_at")
 
     @property
     def clarification_kind(self) -> str | None:

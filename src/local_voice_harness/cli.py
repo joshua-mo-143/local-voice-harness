@@ -4,6 +4,7 @@ import argparse
 from pathlib import Path
 
 from .app import respond, status
+from .cursor.service import CursorTurnRequest, cursor_turn
 from .dictation import run as run_dictation
 from .notifications import notify
 from .recording import (
@@ -46,6 +47,22 @@ def parser() -> argparse.ArgumentParser:
     text.add_argument("text", nargs="+")
     commands.add_parser("status")
 
+    jobs = commands.add_parser("jobs", help="manage background Cursor jobs")
+    job_commands = jobs.add_subparsers(dest="jobs_command", required=True)
+    job_commands.add_parser("list", help="summarize the Cursor job inbox")
+    job_status = job_commands.add_parser("status", help="report a job's status")
+    job_status.add_argument("reference", nargs="*")
+    for name, help_text in (
+        ("cancel", "cancel a job"),
+        ("dismiss", "dismiss a job announcement"),
+        ("repeat", "repeat a job announcement"),
+    ):
+        job_action = job_commands.add_parser(name, help=help_text)
+        job_action.add_argument("reference", nargs="+")
+    job_reply = job_commands.add_parser("reply", help="answer a job clarification")
+    job_reply.add_argument("--job", "-j", help="target job id")
+    job_reply.add_argument("message", nargs="+")
+
     services = commands.add_parser("services")
     service_commands = services.add_subparsers(dest="service_command", required=True)
     install = service_commands.add_parser("install")
@@ -69,6 +86,27 @@ def parser() -> argparse.ArgumentParser:
     return root
 
 
+def run_job_command(args: argparse.Namespace) -> None:
+    if args.jobs_command == "list":
+        request = CursorTurnRequest("", action="list")
+    elif args.jobs_command == "reply":
+        message = " ".join(args.message)
+        request = CursorTurnRequest(
+            message,
+            action="reply",
+            job_id=args.job,
+            reference=message,
+        )
+    else:
+        reference = " ".join(args.reference)
+        request = CursorTurnRequest(
+            reference,
+            action=args.jobs_command,
+            reference=reference,
+        )
+    print(cursor_turn(request).text)
+
+
 def dispatch(args: argparse.Namespace) -> None:
     if args.command == "begin":
         start_recording()
@@ -90,6 +128,8 @@ def dispatch(args: argparse.Namespace) -> None:
         respond(" ".join(args.text))
     elif args.command == "status":
         status()
+    elif args.command == "jobs":
+        run_job_command(args)
     elif args.service_command == "install":
         install_services(force=args.force, replace_dictation=args.replace_dictation)
     elif args.service_command == "start":
