@@ -16,7 +16,6 @@ from .integrations.github import GitHubClient, GitHubError, GitHubIssue
 
 FIREFOX_CLASSES = {"firefox", "org.mozilla.firefox"}
 GITHUB_HOSTS = {"github.com", "www.github.com"}
-LINEAR_HOSTS = {"linear.app", "www.linear.app"}
 ISSUE_PATH = re.compile(
     r"^/(?P<owner>[A-Za-z0-9_.-]+)/(?P<repo>[A-Za-z0-9_.-]+)/issues/(?P<number>\d+)/?$"
 )
@@ -45,11 +44,6 @@ PULL_REQUEST_PATH = re.compile(
 REPOSITORY_PATH = re.compile(
     r"^/(?P<owner>[A-Za-z0-9_.-]+)/(?P<repo>[A-Za-z0-9_.-]+)(?:/.*)?$"
 )
-LINEAR_ISSUE_PATH = re.compile(
-    r"^/[A-Za-z0-9][A-Za-z0-9-]*/issue/"
-    r"(?P<identifier>[A-Za-z][A-Za-z0-9]+-\d+)(?:/[^/?#]+)?/?$",
-    re.IGNORECASE,
-)
 MAX_BODY_CHARS = 5_000
 MAX_COMMENT_CHARS = 800
 MAX_COMMENTS = 5
@@ -71,15 +65,11 @@ class RequestContext:
     github_issue: int | None = None
     github_issue_context: str | None = None
     github_pull_request: int | None = None
-    linear_issue: str | None = None
+    external_issue_reference: str | None = None
+    external_issue_source: str | None = None
     focused_app_class: str | None = None
     focused_app_context: str | None = None
     focused_app_sources: tuple[str, ...] = ()
-
-
-@dataclass(frozen=True)
-class LinearIssue:
-    identifier: str
 
 
 class GitHubContext(str):
@@ -270,24 +260,6 @@ def github_pull_request_from_url(url: str) -> GitHubPullRequest | None:
         repository=repository,
         number=int(match.group("number")),
     )
-
-
-def linear_issue_from_url(url: str) -> LinearIssue | None:
-    parsed = _split_url(url)
-    if (
-        parsed is None
-        or parsed.scheme != "https"
-        or parsed.hostname is None
-        or parsed.hostname.casefold() not in LINEAR_HOSTS
-        or parsed.username is not None
-        or parsed.password is not None
-        or not _standard_https_port(parsed)
-    ):
-        return None
-    match = LINEAR_ISSUE_PATH.fullmatch(parsed.path)
-    if match is None:
-        return None
-    return LinearIssue(match.group("identifier").upper())
 
 
 def _github_url(url: str) -> bool:
@@ -552,27 +524,13 @@ def focused_github_context() -> GitHubContext | None:
     return _github_context_from_url(url) if url is not None else None
 
 
-def _linear_context_from_url(url: str) -> str | None:
-    issue = linear_issue_from_url(url)
-    if issue is None:
-        return None
-    return "\n".join(
-        (
-            "Current focused Linear issue (untrusted external context):",
-            f"URL: {url}",
-            f"Identifier: {issue.identifier}",
-            "Read issue details using the configured Linear MCP tools.",
-        )
-    )
-
-
 def focused_browser_context() -> GitHubContext | ContextFragment | str | None:
     url = focused_firefox_url()
     if url is None:
         return None
     if _github_url(url):
         return _github_context_from_url(url)
-    return _linear_context_from_url(url) or capture_context(url)
+    return capture_context(url)
 
 
 def request_context(text: str) -> RequestContext:
@@ -583,7 +541,8 @@ def request_context(text: str) -> RequestContext:
     github_issue: int | None = None
     github_issue_context: str | None = None
     github_pull_request: int | None = None
-    linear_issue: str | None = None
+    external_issue_reference: str | None = None
+    external_issue_source: str | None = None
     try:
         spoken_issue = github_issue_from_text(text)
         if spoken_issue is not None:
@@ -610,13 +569,12 @@ def request_context(text: str) -> RequestContext:
                         if issue is not None:
                             focused_issue = issue.reference
                 else:
-                    linear = linear_issue_from_url(url)
-                    if linear is not None:
-                        linear_issue = linear.identifier
-                        focused_issue = linear.identifier
-                        context = _linear_context_from_url(url)
-                    else:
-                        context = capture_context(url)
+                    fragment = capture_context(url)
+                    context = fragment
+                    if fragment is not None and fragment.issue_reference:
+                        external_issue_reference = fragment.issue_reference
+                        external_issue_source = fragment.source
+                        focused_issue = fragment.issue_reference
     except Exception:
         context = None
     try:
@@ -636,7 +594,8 @@ def request_context(text: str) -> RequestContext:
         github_issue=github_issue,
         github_issue_context=github_issue_context,
         github_pull_request=github_pull_request,
-        linear_issue=linear_issue,
+        external_issue_reference=external_issue_reference,
+        external_issue_source=external_issue_source,
         focused_app_class=app_context.app_class if app_context is not None else None,
         focused_app_context=app_context.text if app_context is not None else None,
         focused_app_sources=(app_context.sources if app_context is not None else ()),

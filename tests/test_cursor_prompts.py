@@ -60,6 +60,20 @@ class CursorPromptTests(unittest.TestCase):
         )
         self.assertIn("a plain-text summary of at most 20 words", prompt)
 
+    def test_linear_instructions_are_only_added_as_a_contribution(self) -> None:
+        without = cursor_prompt("fix API-98", "token", issue_reference="API-98")
+        with_linear = cursor_prompt(
+            "fix API-98",
+            "token",
+            issue_reference="API-98",
+            integration_instructions=(
+                "Use configured Linear MCP tools only to read it.",
+            ),
+        )
+
+        self.assertNotIn("Linear MCP", without)
+        self.assertIn("Linear MCP", with_linear)
+
 
 if __name__ == "__main__":
     unittest.main()

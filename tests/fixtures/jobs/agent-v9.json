@@ -1,0 +1,44 @@
+{
+  "schema_version": 9,
+  "harness_kind": "cursor",
+  "session_id": "cursor-agent-61",
+  "harness_state": {
+    "pane_id": "pane-1",
+    "workspace_id": "workspace-1",
+    "agent_name": "Cursor Agent",
+    "agent_dispatch_state": "ready",
+    "agent_hint": "default",
+    "turn": 2,
+    "turn_token": "turn-2",
+    "continuation": true
+  },
+  "checkout_state": {
+    "repository": "/repo",
+    "branch": "voice/issue-61",
+    "label": "issue-61",
+    "path": "/repo-worktree",
+    "workspace_id": "workspace-1",
+    "root_pane_id": "pane-root",
+    "worktree_provision_state": "ready"
+  },
+  "provider_state": {
+    "github": {
+      "github_repository": "owner/project",
+      "github_issue": 61,
+      "fork_requested": false
+    },
+    "linear": {
+      "issue_key": "VOICE-61"
+    }
+  },
+  "id": "123456789abc",
+  "revision": 4,
+  "request": "repair issue 61",
+  "status": "running",
+  "created_at": 1,
+  "delivered": false,
+  "worker_token": "claim",
+  "worker_pid": 42,
+  "worker_boot_id": "boot",
+  "worker_process_start": "start"
+}

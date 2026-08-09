@@ -3,8 +3,8 @@ from __future__ import annotations
 import unittest
 from unittest import mock
 
-from local_voice_harness import context_providers
 from local_voice_harness.context_fragment import ContextFragment, ContextProvider
+from local_voice_harness.integrations import registry as context_providers
 from local_voice_harness.user_config import IntegrationSettings, UserConfigurationError
 
 URL = "https://example.test/thing/42"
@@ -37,7 +37,7 @@ class RegistryTests(unittest.TestCase):
         factory = mock.Mock(return_value=_StubProvider(fragment))
         with mock.patch.object(
             context_providers,
-            "_PROVIDER_FACTORIES",
+            "_INTEGRATION_FACTORIES",
             (("zendesk_enabled", factory),),
         ):
             disabled = context_providers.available_context_providers(
@@ -60,7 +60,7 @@ class RegistryTests(unittest.TestCase):
         with (
             mock.patch.object(
                 context_providers,
-                "_PROVIDER_FACTORIES",
+                "_INTEGRATION_FACTORIES",
                 (("zendesk_enabled", factory),),
             ),
             mock.patch.object(

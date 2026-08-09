@@ -155,6 +155,14 @@ class QwenClientTests(unittest.TestCase):
                 ),
             },
         }
+
+        def start_cursor(
+            request: CursorTurnRequest, **_kwargs: object
+        ) -> tuple[str, str]:
+            assert request.on_job_started is not None
+            request.on_job_started()
+            return "accepted", "job-123"
+
         with (
             mock.patch.object(
                 llm.urllib.request,
@@ -165,7 +173,7 @@ class QwenClientTests(unittest.TestCase):
                 ],
             ) as urlopen,
             mock.patch.object(
-                llm, "cursor_turn", return_value=("accepted", "job-123")
+                llm, "cursor_turn", side_effect=start_cursor
             ) as cursor_turn,
             mock.patch.object(llm, "notify") as notify,
             redirect_stdout(io.StringIO()),
@@ -183,6 +191,7 @@ class QwenClientTests(unittest.TestCase):
                 utterance=None,
                 action="submit",
                 job_id=None,
+                on_job_started=llm._notify_cursor_started,
             ),
             delivery_claims=None,
         )
@@ -306,6 +315,7 @@ class QwenClientTests(unittest.TestCase):
                 utterance=None,
                 action="submit",
                 job_id=None,
+                on_job_started=llm._notify_cursor_started,
             ),
             delivery_claims=None,
         )

@@ -19,9 +19,14 @@ from ..integrations.herdr import (
     AgentSelection,
     HerdrClient,
     HerdrError,
-    extract_linear_issue,
     extract_marker,
     normalize_name,
+)
+from ..integrations.registry import (
+    prompt_instructions,
+    require_issue_capabilities,
+    resolve_issue_reference,
+    route_issue_repository,
 )
 from . import worker_lifecycle
 from .model import (
@@ -883,6 +888,9 @@ def run_claimed_worker(
         context.checkpoint()
 
     try:
+        active_issue_key = resolve_issue_reference(job.issue_key)
+        if active_issue_key:
+            require_issue_capabilities(active_issue_key)
         client = clients.herdr()
         checkpoint()
         client.ensure_server()
@@ -1076,9 +1084,7 @@ def run_claimed_worker(
             repositories: list[Path] = []
             candidates: list[Path] = []
             hint = (job.repository_hint or "").strip() or None
-            task = job.request
-            utterance = job.utterance or task
-            issue_key = job.issue_key or extract_linear_issue(utterance)
+            issue_key = active_issue_key
             reason = ""
             if job.github_pull_request:
                 github_repository = (job.github_repository or "").strip()
@@ -1280,13 +1286,16 @@ def run_claimed_worker(
                 and not job.github_issue
             ):
                 checkpoint()
-                repository, _confidence, reason = client.infer_repository(
+                routed = route_issue_repository(
+                    client,
                     issue_key,
                     repositories,
                     token=f"{job_id}-route",
                     reserved=reserved_targets(store, job_id),
                     checkpoint=checkpoint,
                 )
+                if routed is not None:
+                    repository, _confidence, reason = routed
                 checkpoint()
             if repository is None:
                 checkpoint()
@@ -1458,9 +1467,10 @@ def run_claimed_worker(
                 continuation=continuation,
                 github_issue_context=job.github_issue_context,
                 issue_reference=(
-                    job.issue_key
+                    active_issue_key
                     or (f"issue {job.github_issue}" if job.github_issue else None)
                 ),
+                integration_instructions=prompt_instructions(active_issue_key),
             ),
             token=turn_token,
             checkpoint=checkpoint,

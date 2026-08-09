@@ -11,7 +11,11 @@ from typing import NamedTuple
 
 from ..config import CURSOR_FOREGROUND_SECONDS, JOB_LOGS_DIR, JOBS_DIR, LEGACY_JOBS_DIR
 from ..errors import HarnessError
-from ..integrations.herdr import extract_linear_issue
+from ..integrations.registry import (
+    extract_issue_reference,
+    require_issue_capabilities,
+    resolve_issue_reference,
+)
 from . import delivery, inbox, provisioning, recovery, worker_lifecycle
 from .delivery import DeliveryClaim, DeliveryClaims
 from .model import (
@@ -75,6 +79,7 @@ class CursorTurnRequest:
     reference: str | None = None
     expected_completed_at: float | None = None
     on_follow_up_started: Callable[[], None] | None = None
+    on_job_started: Callable[[], None] | None = None
 
 
 class CursorTurnResult(NamedTuple):
@@ -197,6 +202,13 @@ def start_job(
     job_id = uuid.uuid4().hex[:12]
     now = time.time()
     spoken_text = utterance if utterance is not None else text
+    resolved_issue_key = (
+        resolve_issue_reference(issue_key)
+        if issue_key is not None
+        else extract_issue_reference(spoken_text)
+    )
+    if resolved_issue_key:
+        require_issue_capabilities(resolved_issue_key)
     issue_repository = (github_repository or "").strip()
     github_issue_url = (
         f"https://github.com/{issue_repository}/issues/{github_issue}"
@@ -241,10 +253,10 @@ def start_job(
             ),
             pull_request_worktree_state=("pending" if github_pull_request else None),
             agent_hint=agent,
-            issue_key=issue_key or extract_linear_issue(spoken_text),
+            issue_key=resolved_issue_key,
             speakable_label=inbox.build_speakable_label(
                 text,
-                issue_key=issue_key or extract_linear_issue(spoken_text),
+                issue_key=resolved_issue_key,
                 github_repository=github_repository,
                 github_issue=github_issue,
                 github_pull_request=github_pull_request,
@@ -256,7 +268,13 @@ def start_job(
     return job_id
 
 
-def reply_job(job_id: str, text: str, *, trusted_utterance: str | None = None) -> None:
+def reply_job(
+    job_id: str,
+    text: str,
+    *,
+    trusted_utterance: str | None = None,
+    on_started: Callable[[], None] | None = None,
+) -> None:
     now = time.time()
     should_launch = True
 
@@ -343,6 +361,8 @@ def reply_job(job_id: str, text: str, *, trusted_utterance: str | None = None) -
         raise HarnessError(f"Cursor job {job_id} is not waiting for a reply")
     if should_launch:
         launch_worker(job_id)
+        if on_started is not None:
+            on_started()
 
 
 def start_follow_up(
@@ -357,8 +377,12 @@ def start_follow_up(
     now = time.time()
     child_id = uuid.uuid4().hex[:12]
     spoken = utterance if utterance is not None else text
+    store = _job_store()
 
     def build(parent: CursorJob) -> CursorJob:
+        active_issue_key = resolve_issue_reference(parent.issue_key)
+        if active_issue_key:
+            require_issue_capabilities(active_issue_key)
         return CursorJob.new(
             NewCursorJob(
                 id=child_id,
@@ -383,7 +407,7 @@ def start_follow_up(
             )
         )
 
-    created = _job_store().create_follow_up(
+    created = store.create_follow_up(
         parent_job_id, build, expected_completed_at=expected_completed_at
     )
     if on_created is not None:
@@ -762,6 +786,7 @@ def cursor_turn(
     delivery_claims: DeliveryClaims | None = None,
 ) -> CursorTurnResult:
     on_follow_up_started: Callable[[], None] | None = None
+    on_job_started: Callable[[], None] | None = None
     if isinstance(request, CursorTurnRequest):
         text = request.text
         session_id = request.session_id
@@ -780,6 +805,7 @@ def cursor_turn(
         reference = request.reference
         expected_completed_at = request.expected_completed_at
         on_follow_up_started = request.on_follow_up_started
+        on_job_started = request.on_job_started
     else:
         text = request
         expected_completed_at = None
@@ -844,7 +870,12 @@ def cursor_turn(
                 return CursorTurnResult(resolved.clarification, session_id)
             reply_id = resolved.job_id
         assert reply_id is not None
-        reply_job(reply_id, text, trusted_utterance=utterance)
+        reply_job(
+            reply_id,
+            text,
+            trusted_utterance=utterance,
+            on_started=on_job_started,
+        )
         job_id = reply_id
     elif action == "follow_up":
         if not job_id:
@@ -859,6 +890,8 @@ def cursor_turn(
                 utterance=utterance,
                 on_created=on_follow_up_started,
             )
+            if on_job_started is not None:
+                on_job_started()
         except FollowUpCheckoutBusy:
             return CursorTurnResult(
                 "That checkout is busy with another Cursor job right now.", None
@@ -881,6 +914,8 @@ def cursor_turn(
             context_repository=context_repository,
             issue_key=issue_key,
         )
+        if on_job_started is not None:
+            on_job_started()
     return _await_foreground(job_id, delivery_claims)
 
 
@@ -946,3 +981,10 @@ def _await_foreground(
         f"Cursor is still working on job {job_id}. I will report back when it finishes.",
         None,
     )
+
+
+# Compatibility aliases for callers migrating to the agent-neutral service API.
+StartAgentJobRequest = StartJobRequest
+AgentTurnRequest = CursorTurnRequest
+AgentTurnResult = CursorTurnResult
+agent_turn = cursor_turn

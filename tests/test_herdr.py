@@ -6,14 +6,14 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from local_voice_harness.integrations import herdr
+from local_voice_harness.integrations import herdr, linear
 
 
 class HerdrIntegrationTests(unittest.TestCase):
     def test_normalizes_spoken_linear_issue_key(self) -> None:
-        self.assertEqual(herdr.extract_linear_issue("work on API 77"), "API-77")
-        self.assertEqual(herdr.extract_linear_issue("work on api - 78"), "API-78")
-        self.assertEqual(herdr.extract_linear_issue("work on API-79"), "API-79")
+        self.assertEqual(linear.extract_linear_issue("work on API 77"), "API-77")
+        self.assertEqual(linear.extract_linear_issue("work on api - 78"), "API-78")
+        self.assertEqual(linear.extract_linear_issue("work on API-79"), "API-79")
 
     def test_extracts_latest_multiline_marker(self) -> None:
         output = """
