@@ -28,6 +28,7 @@ class RofiIntegrationTests(unittest.TestCase):
 
         self.assertEqual(selected, "https://github.com/example/project.git")
         self.assertEqual(run.call_args.kwargs["input"], "local-project")
+        self.assertIn("-no-click-to-exit", run.call_args.args[0])
         self.assertNotIn("-no-custom", run.call_args.args[0])
 
     def test_empty_repository_list_hides_results_view(self) -> None:

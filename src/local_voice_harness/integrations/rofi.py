@@ -21,6 +21,7 @@ def _dmenu(
         executable,
         "-dmenu",
         "-i",
+        "-no-click-to-exit",
         "-p",
         prompt,
         "-mesg",
