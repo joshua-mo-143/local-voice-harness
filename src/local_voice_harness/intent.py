@@ -16,7 +16,7 @@ ROUTER_SYSTEM_PROMPT = (
     "You are an intent router for a local voice assistant. Classify the user's next "
     "action; do not answer or perform it. Use cursor_submit for software-engineering "
     "work that requires inspecting or changing code, files, repositories, running "
-    "commands, or working on a GitHub or Linear issue. Phrases such as 'work on the "
+    "commands, or working on a GitHub or focused external issue. Phrases such as 'work on the "
     "task' or 'handle this' mean cursor_submit when focused_repository or focused_issue "
     "is present. Use cursor_reply only when a Cursor job is awaiting a clarification "
     "and the utterance answers that clarification; a new task is cursor_submit. Use "

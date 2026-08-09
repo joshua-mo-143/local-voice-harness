@@ -86,7 +86,7 @@ def respond(text: str) -> None:
                 context.github_repository
                 or context.github_issue
                 or context.github_pull_request
-                or context.linear_issue
+                or context.external_issue_reference
             )
             submit_requested = route.intent == Intent.CURSOR_SUBMIT and (
                 route.actionable or focused_submit_target
@@ -97,7 +97,7 @@ def respond(text: str) -> None:
                         context.text,
                         utterance=text,
                         context_repository=context.focused_repository,
-                        issue_key=context.linear_issue,
+                        issue_key=context.external_issue_reference,
                         **github_arguments,
                     ),
                     delivery_claims=delivery_claims,
