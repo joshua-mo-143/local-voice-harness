@@ -29,6 +29,44 @@ def test_service_request_and_result_types_are_explicit() -> None:
     assert tuple(result) == ("done", None)
 
 
+def test_submit_notifies_only_after_job_starts() -> None:
+    events: list[str] = []
+
+    def start(*_args: object, **_kwargs: object) -> str:
+        events.append("started")
+        return "123456789abc"
+
+    with (
+        mock.patch.object(service, "start_job", side_effect=start),
+        mock.patch.object(
+            service,
+            "_await_foreground",
+            return_value=CursorTurnResult("working", None),
+        ),
+    ):
+        result = service.cursor_turn(
+            CursorTurnRequest(
+                "fix it",
+                on_job_started=lambda: events.append("notified"),
+            )
+        )
+
+    assert result == CursorTurnResult("working", None)
+    assert events == ["started", "notified"]
+
+
+def test_submit_failure_does_not_notify() -> None:
+    notified = mock.Mock()
+
+    with (
+        mock.patch.object(service, "start_job", side_effect=HarnessError("failed")),
+        pytest.raises(HarnessError, match="failed"),
+    ):
+        service.cursor_turn(CursorTurnRequest("fix it", on_job_started=notified))
+
+    notified.assert_not_called()
+
+
 def test_production_modules_do_not_import_jobs_facade() -> None:
     source_root = Path(__file__).parents[1] / "src" / "local_voice_harness"
     offenders: list[str] = []

@@ -75,6 +75,7 @@ class CursorTurnRequest:
     reference: str | None = None
     expected_completed_at: float | None = None
     on_follow_up_started: Callable[[], None] | None = None
+    on_job_started: Callable[[], None] | None = None
 
 
 class CursorTurnResult(NamedTuple):
@@ -256,7 +257,13 @@ def start_job(
     return job_id
 
 
-def reply_job(job_id: str, text: str, *, trusted_utterance: str | None = None) -> None:
+def reply_job(
+    job_id: str,
+    text: str,
+    *,
+    trusted_utterance: str | None = None,
+    on_started: Callable[[], None] | None = None,
+) -> None:
     now = time.time()
     should_launch = True
 
@@ -343,6 +350,8 @@ def reply_job(job_id: str, text: str, *, trusted_utterance: str | None = None) -
         raise HarnessError(f"Cursor job {job_id} is not waiting for a reply")
     if should_launch:
         launch_worker(job_id)
+        if on_started is not None:
+            on_started()
 
 
 def start_follow_up(
@@ -762,6 +771,7 @@ def cursor_turn(
     delivery_claims: DeliveryClaims | None = None,
 ) -> CursorTurnResult:
     on_follow_up_started: Callable[[], None] | None = None
+    on_job_started: Callable[[], None] | None = None
     if isinstance(request, CursorTurnRequest):
         text = request.text
         session_id = request.session_id
@@ -780,6 +790,7 @@ def cursor_turn(
         reference = request.reference
         expected_completed_at = request.expected_completed_at
         on_follow_up_started = request.on_follow_up_started
+        on_job_started = request.on_job_started
     else:
         text = request
         expected_completed_at = None
@@ -844,7 +855,12 @@ def cursor_turn(
                 return CursorTurnResult(resolved.clarification, session_id)
             reply_id = resolved.job_id
         assert reply_id is not None
-        reply_job(reply_id, text, trusted_utterance=utterance)
+        reply_job(
+            reply_id,
+            text,
+            trusted_utterance=utterance,
+            on_started=on_job_started,
+        )
         job_id = reply_id
     elif action == "follow_up":
         if not job_id:
@@ -859,6 +875,8 @@ def cursor_turn(
                 utterance=utterance,
                 on_created=on_follow_up_started,
             )
+            if on_job_started is not None:
+                on_job_started()
         except FollowUpCheckoutBusy:
             return CursorTurnResult(
                 "That checkout is busy with another Cursor job right now.", None
@@ -881,6 +899,8 @@ def cursor_turn(
             context_repository=context_repository,
             issue_key=issue_key,
         )
+        if on_job_started is not None:
+            on_job_started()
     return _await_foreground(job_id, delivery_claims)
 
 
