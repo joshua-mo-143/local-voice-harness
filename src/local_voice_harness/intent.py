@@ -8,7 +8,8 @@ from dataclasses import dataclass
 from enum import StrEnum
 
 from .browser_context import RequestContext
-from .config import LLM_CHAT, LLM_MODEL
+from .config import BackendConfigurationError, load_backend_settings
+from .credentials import CredentialError, get_venice_api_key
 
 ROUTER_SYSTEM_PROMPT = (
     "You are an intent router for a local voice assistant. Classify the user's next "
@@ -184,9 +185,16 @@ def route_intent(
     *,
     cursor_session: str | None = None,
 ) -> IntentRoute:
+    try:
+        settings = load_backend_settings()
+        venice_api_key = (
+            get_venice_api_key() if settings.llm_provider == "venice" else None
+        )
+    except (BackendConfigurationError, CredentialError):
+        return FALLBACK_ROUTE
     payload = json.dumps(
         {
-            "model": LLM_MODEL,
+            "model": settings.llm_model,
             "messages": [
                 {"role": "system", "content": ROUTER_SYSTEM_PROMPT},
                 {
@@ -212,11 +220,16 @@ def route_intent(
             "stream": False,
         }
     ).encode()
+    headers = {"Content-Type": "application/json"}
+    if venice_api_key is not None:
+        headers["Authorization"] = f"Bearer {venice_api_key}"
     request = urllib.request.Request(
-        LLM_CHAT, data=payload, headers={"Content-Type": "application/json"}
+        settings.llm_endpoint,
+        data=payload,
+        headers=headers,
     )
     try:
-        with urllib.request.urlopen(request, timeout=30) as response:
+        with urllib.request.urlopen(request, timeout=settings.llm_timeout) as response:
             return _parse_route(json.load(response))
     except (OSError, urllib.error.URLError, json.JSONDecodeError):
         return FALLBACK_ROUTE

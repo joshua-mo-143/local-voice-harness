@@ -3,11 +3,12 @@ from __future__ import annotations
 import io
 import json
 import unittest
+from dataclasses import replace
 from unittest import mock
 
 from local_voice_harness import intent
 from local_voice_harness.browser_context import RequestContext
-from local_voice_harness.config import CURSOR_PATTERN
+from local_voice_harness.config import CURSOR_PATTERN, load_backend_settings
 
 
 def _response(route: str, confidence: str = "high") -> io.BytesIO:
@@ -66,6 +67,66 @@ class IntentRouterTests(unittest.TestCase):
         )
         self.assertEqual(payload["temperature"], 0)
 
+    def test_local_uses_configured_endpoint_model_and_timeout(self) -> None:
+        settings = replace(
+            load_backend_settings({}),
+            llm_provider="local",
+            llm_model="local-router",
+            llm_endpoint="http://localhost:9000/v1/chat/completions",
+            llm_timeout=11,
+        )
+        with (
+            mock.patch.object(intent, "load_backend_settings", return_value=settings),
+            mock.patch.object(intent, "get_venice_api_key") as get_key,
+            mock.patch.object(
+                intent.urllib.request,
+                "urlopen",
+                return_value=_response("conversation"),
+            ) as urlopen,
+        ):
+            route = intent.route_intent("hello", RequestContext("hello"))
+
+        request = urlopen.call_args.args[0]
+        payload = json.loads(request.data)
+        self.assertEqual(route.intent, intent.Intent.CONVERSATION)
+        self.assertEqual(request.full_url, settings.llm_endpoint)
+        self.assertEqual(payload["model"], settings.llm_model)
+        self.assertEqual(urlopen.call_args.kwargs["timeout"], settings.llm_timeout)
+        self.assertIsNone(request.get_header("Authorization"))
+        get_key.assert_not_called()
+
+    def test_venice_uses_configured_endpoint_model_timeout_and_credentials(
+        self,
+    ) -> None:
+        settings = replace(
+            load_backend_settings({}),
+            llm_provider="venice",
+            llm_model="venice-router",
+            llm_endpoint="https://example.test/v1/chat/completions",
+            llm_timeout=17,
+        )
+        with (
+            mock.patch.object(intent, "load_backend_settings", return_value=settings),
+            mock.patch.object(
+                intent, "get_venice_api_key", return_value="venice-secret"
+            ) as get_key,
+            mock.patch.object(
+                intent.urllib.request,
+                "urlopen",
+                return_value=_response("cursor_submit"),
+            ) as urlopen,
+        ):
+            route = intent.route_intent("work on this", RequestContext("work on this"))
+
+        request = urlopen.call_args.args[0]
+        payload = json.loads(request.data)
+        self.assertEqual(route.intent, intent.Intent.CURSOR_SUBMIT)
+        self.assertEqual(request.full_url, settings.llm_endpoint)
+        self.assertEqual(payload["model"], settings.llm_model)
+        self.assertEqual(urlopen.call_args.kwargs["timeout"], settings.llm_timeout)
+        self.assertEqual(request.get_header("Authorization"), "Bearer venice-secret")
+        get_key.assert_called_once_with()
+
     def test_only_high_confidence_non_conversation_routes_are_actionable(self) -> None:
         context = RequestContext("hello")
         cases = [
@@ -106,6 +167,22 @@ class IntentRouterTests(unittest.TestCase):
             ):
                 route = intent.route_intent("request", RequestContext("request"))
                 self.assertEqual(route, intent.FALLBACK_ROUTE)
+
+    def test_missing_venice_credentials_fall_back_safely(self) -> None:
+        settings = replace(load_backend_settings({}), llm_provider="venice")
+        with (
+            mock.patch.object(intent, "load_backend_settings", return_value=settings),
+            mock.patch.object(
+                intent,
+                "get_venice_api_key",
+                side_effect=intent.CredentialError("missing"),
+            ),
+            mock.patch.object(intent.urllib.request, "urlopen") as urlopen,
+        ):
+            route = intent.route_intent("request", RequestContext("request"))
+
+        self.assertEqual(route, intent.FALLBACK_ROUTE)
+        urlopen.assert_not_called()
 
 
 class InboxIntentTests(unittest.TestCase):
