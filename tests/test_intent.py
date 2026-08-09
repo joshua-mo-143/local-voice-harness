@@ -67,6 +67,9 @@ class IntentRouterTests(unittest.TestCase):
             "route_intent",
         )
         self.assertEqual(payload["temperature"], 0)
+        # Reasoning models drop the required ``confidence`` field when the
+        # completion budget is too small to finish the forced tool call.
+        self.assertGreaterEqual(payload["max_tokens"], 128)
 
     def test_local_uses_configured_endpoint_model_and_timeout(self) -> None:
         settings = replace(

@@ -79,7 +79,19 @@ def respond(text: str) -> None:
                 or context.github_pull_request
                 else {}
             )
-            if route.actionable and route.intent == Intent.CURSOR_SUBMIT:
+            # A focused ticket/repository/PR is a strong, validated signal, so a
+            # submit classification acts on it even when the router omits or lowers
+            # its confidence (some models do not populate the field reliably).
+            focused_submit_target = bool(
+                context.github_repository
+                or context.github_issue
+                or context.github_pull_request
+                or context.linear_issue
+            )
+            submit_requested = route.intent == Intent.CURSOR_SUBMIT and (
+                route.actionable or focused_submit_target
+            )
+            if submit_requested:
                 response = cursor_turn(
                     CursorTurnRequest(
                         context.text,

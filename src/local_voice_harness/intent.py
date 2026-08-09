@@ -236,7 +236,11 @@ def route_intent(
             },
             "parallel_tool_calls": False,
             "temperature": 0,
-            "max_tokens": 64,
+            # Reasoning models spend part of the completion budget before the
+            # forced tool call; too small a cap truncates the arguments after
+            # ``intent`` and silently drops ``confidence``, which the parser then
+            # treats as low confidence. Keep enough headroom for the full object.
+            "max_tokens": 128,
             "stream": False,
         }
         if settings.llm_provider == "venice":
