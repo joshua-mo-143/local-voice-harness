@@ -79,6 +79,16 @@ ROUTE_TOOL = {
 
 class Intent(StrEnum):
     CONVERSATION = "conversation"
+    AGENT_SUBMIT = "cursor_submit"
+    AGENT_REPLY = "cursor_reply"
+    AGENT_FOLLOWUP = "cursor_followup"
+    AGENT_PR_UNSUPPORTED = "cursor_pr_unsupported"
+    AGENT_STATUS = "cursor_status"
+    AGENT_CANCEL = "cursor_cancel"
+    AGENT_LIST = "cursor_list"
+    AGENT_DISMISS = "cursor_dismiss"
+    AGENT_REPEAT = "cursor_repeat"
+    # Compatibility aliases for the original Cursor-specific intent names.
     CURSOR_SUBMIT = "cursor_submit"
     CURSOR_REPLY = "cursor_reply"
     CURSOR_FOLLOWUP = "cursor_followup"

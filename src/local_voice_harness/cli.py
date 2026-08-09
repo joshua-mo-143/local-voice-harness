@@ -4,13 +4,15 @@ import argparse
 import getpass
 from pathlib import Path
 
+from .agents.service import AgentTurnRequest as CursorTurnRequest
+from .agents.service import agent_turn as cursor_turn
+from .agents.service import count_jobs, nuke_jobs
 from .app import respond, status
 from .credentials import (
     delete_venice_api_key,
     get_venice_api_key,
     store_venice_api_key,
 )
-from .cursor.service import CursorTurnRequest, count_jobs, cursor_turn, nuke_jobs
 from .diagnostics import doctor
 from .dictation import run as run_dictation
 from .notifications import notify

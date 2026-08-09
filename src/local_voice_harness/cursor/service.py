@@ -981,3 +981,10 @@ def _await_foreground(
         f"Cursor is still working on job {job_id}. I will report back when it finishes.",
         None,
     )
+
+
+# Compatibility aliases for callers migrating to the agent-neutral service API.
+StartAgentJobRequest = StartJobRequest
+AgentTurnRequest = CursorTurnRequest
+AgentTurnResult = CursorTurnResult
+agent_turn = cursor_turn
