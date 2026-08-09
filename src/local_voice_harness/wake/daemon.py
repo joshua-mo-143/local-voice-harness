@@ -136,6 +136,7 @@ def strip_wake_prefix(text: str) -> tuple[str, bool]:
 CLOSE_PATTERN = re.compile(
     r"\b(?:goodbye|stop listening|go to sleep|end conversation)\b", re.IGNORECASE
 )
+END_CONVERSATION_RESPONSE = "Okay, I'll be here if you need me."
 
 
 @dataclass
@@ -373,6 +374,15 @@ class WakeConversationDaemon:
         finally:
             self.resume_microphone()
         notify("Conversation closed")
+
+    def end_conversation(self) -> BargeIn | None:
+        """Speak a brief farewell, then close unless the user barges in."""
+        print(f"Assistant: {END_CONVERSATION_RESPONSE}", flush=True)
+        _playback, interruption = self.play_response(END_CONVERSATION_RESPONSE)
+        if interruption is not None:
+            return interruption
+        self.close_conversation("assistant ended the conversation")
+        return None
 
     def wait_for_playback_quiet(self) -> None:
         if self.microphone is None or self.microphone.poll() is not None:
@@ -813,6 +823,8 @@ class WakeConversationDaemon:
                 clarification_kind=clarification_kind,
                 recent_completion=active_completed is not None,
             )
+            if route.actionable and route.intent == Intent.END_CONVERSATION:
+                return self.end_conversation()
             fork_requested = decide_fork_intent(text) == ForkIntent.AFFIRMATIVE
             github_arguments = (
                 {

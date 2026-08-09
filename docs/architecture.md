@@ -46,10 +46,14 @@ handoffs.
 Cursor routing works as follows:
 
 1. Ask the configured LLM backend for one focused, forced-tool classification of
-   conversation, new work, follow-ups, clarification replies, status, and cancellation
-   without rewriting the user's request. Non-actionable routes fall through to
-   tool-free conversation, so only a high-confidence router result can mutate a
-   workspace.
+   conversation, new work, follow-ups, clarification replies, status, cancellation,
+   and ending the conversation without rewriting the user's request. Non-actionable
+   routes fall through to tool-free conversation, so only a high-confidence router
+   result can mutate a workspace. A high-confidence `end_conversation` result lets the
+   assistant voluntarily wind down when nothing further is needed: it speaks a brief
+   farewell and closes the conversation, releasing the microphone and models without
+   waiting for the inactivity timeout. A spoken close phrase such as "goodbye" or "stop
+   listening" remains a fast path that closes immediately.
 2. Prefer an idle Cursor agent already running in the requested checkout.
 3. For a Linear issue without a repository name, ask a dedicated routing agent to
    inspect the ticket through Linear MCP and infer the repository.

@@ -310,6 +310,35 @@ class FollowUpIntentTests(unittest.TestCase):
         self.assertEqual(route.intent, intent.Intent.CURSOR_PR_UNSUPPORTED)
 
 
+class EndConversationIntentTests(unittest.TestCase):
+    def test_route_tool_exposes_end_conversation(self) -> None:
+        enum = intent.ROUTE_TOOL["function"]["parameters"]["properties"]["intent"][
+            "enum"
+        ]
+        self.assertIn("end_conversation", enum)
+
+    def test_end_conversation_is_actionable_at_high_confidence(self) -> None:
+        with mock.patch.object(
+            intent.urllib.request,
+            "urlopen",
+            return_value=_response("end_conversation"),
+        ):
+            route = intent.route_intent("thanks, that's all", RequestContext("thanks"))
+
+        self.assertEqual(route.intent, intent.Intent.END_CONVERSATION)
+        self.assertTrue(route.actionable)
+
+    def test_end_conversation_needs_high_confidence(self) -> None:
+        with mock.patch.object(
+            intent.urllib.request,
+            "urlopen",
+            return_value=_response("end_conversation", "medium"),
+        ):
+            route = intent.route_intent("maybe done", RequestContext("maybe done"))
+
+        self.assertFalse(route.actionable)
+
+
 class ForkIntentTests(unittest.TestCase):
     def test_accepts_only_unambiguous_fork_requests(self) -> None:
         for utterance in (

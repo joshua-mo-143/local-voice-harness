@@ -220,6 +220,78 @@ class ProcessUtteranceTests(unittest.TestCase):
             ],
         )
 
+    def test_end_conversation_route_closes_and_skips_tools(self) -> None:
+        daemon = _bare_daemon()
+        daemon.awaiting_followup = True
+        daemon.conversation_deadline = time.monotonic() + 30
+        daemon.history = [{"role": "user", "content": "earlier"}]
+        with (
+            mock.patch.object(
+                wake_daemon, "transcribe", return_value="thanks, that's all"
+            ),
+            mock.patch.object(wake_daemon, "start_components"),
+            mock.patch.object(wake_daemon, "stop_components"),
+            mock.patch.object(wake_daemon, "qwen_turn") as qwen_turn,
+            mock.patch.object(wake_daemon, "cursor_turn") as cursor_turn,
+            mock.patch.object(
+                daemon,
+                "_drain_playback_queue",
+                return_value=(_playback_batch("bye"), None),
+            ),
+            mock.patch.object(
+                wake_daemon,
+                "request_context",
+                side_effect=lambda text: RequestContext(text),
+            ),
+            mock.patch.object(
+                wake_daemon,
+                "route_intent",
+                return_value=IntentRoute(Intent.END_CONVERSATION, "high"),
+            ),
+            mock.patch.object(wake_daemon, "notify"),
+        ):
+            result = daemon.process_utterance(AUDIO_GENERATION, woke=False)
+
+        self.assertIsNone(result)
+        qwen_turn.assert_not_called()
+        cursor_turn.assert_not_called()
+        self.assertFalse(daemon.awaiting_followup)
+        self.assertEqual(daemon.conversation_deadline, 0.0)
+        self.assertEqual(daemon.history, [])
+
+    def test_end_conversation_barge_in_keeps_conversation_open(self) -> None:
+        daemon = _bare_daemon()
+        daemon.awaiting_followup = True
+        daemon.conversation_deadline = time.monotonic() + 30
+        interruption = wake_daemon.BargeIn(initial=[b"user"], woke=False)
+        with (
+            mock.patch.object(
+                wake_daemon, "transcribe", return_value="that's everything then"
+            ),
+            mock.patch.object(wake_daemon, "start_components"),
+            mock.patch.object(wake_daemon, "stop_components") as stop_components,
+            mock.patch.object(
+                wake_daemon,
+                "request_context",
+                side_effect=lambda text: RequestContext(text),
+            ),
+            mock.patch.object(
+                wake_daemon,
+                "route_intent",
+                return_value=IntentRoute(Intent.END_CONVERSATION, "high"),
+            ),
+            mock.patch.object(
+                daemon,
+                "play_response",
+                return_value=({"interrupted": True}, interruption),
+            ),
+            mock.patch.object(wake_daemon, "notify"),
+        ):
+            result = daemon.process_utterance(AUDIO_GENERATION, woke=False)
+
+        self.assertIs(result, interruption)
+        stop_components.assert_not_called()
+
     def test_venice_turn_streams_sentence_chunks_to_playback(self) -> None:
         daemon = _bare_daemon()
         played_requests: list[str] = []
