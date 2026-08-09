@@ -14,7 +14,11 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
-from ..config import REPOSITORY_ROOT
+from ..config import (
+    CURSOR_AGENT_INACTIVITY_SECONDS,
+    CURSOR_AGENT_MAX_RUNTIME_SECONDS,
+    REPOSITORY_ROOT,
+)
 from .rofi import choose_repository, confirm_clone
 
 HERDR_BIN = os.environ.get(
@@ -29,6 +33,10 @@ HERDR_WORKTREE_ROOT = Path(
 ).expanduser()
 HOME_ROOT = REPOSITORY_ROOT
 SETTLED = {"idle", "done"}
+OBSERVABLE_AGENT_STATES = SETTLED | {"blocked", "unknown"}
+AGENT_COMPLETION_POLL_SECONDS = 1.0
+AGENT_COMPLETION_QUIET_SECONDS = 5.0
+AGENT_PROMPT_WAIT_SECONDS = 5.0
 Checkpoint = Callable[[], None]
 ReserveAgent = Callable[["AgentSelection", bool], None]
 SettleAgent = Callable[["AgentSelection"], None]
@@ -744,9 +752,11 @@ class HerdrClient:
         text: str,
         *,
         token: str,
-        timeout: float = 900,
+        timeout: float = CURSOR_AGENT_INACTIVITY_SECONDS,
+        max_runtime: float = CURSOR_AGENT_MAX_RUNTIME_SECONDS,
         checkpoint: Checkpoint | None = None,
     ) -> PromptOutcome:
+        started_at = time.monotonic()
         if checkpoint is not None:
             checkpoint()
         before = self.get_agent(target)
@@ -761,7 +771,7 @@ class HerdrClient:
                 text,
                 "--wait",
                 "--timeout",
-                str(int(timeout * 1000)),
+                str(int(AGENT_PROMPT_WAIT_SECONDS * 1000)),
             ),
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -785,7 +795,7 @@ class HerdrClient:
                 self.run_json("agent", "send-keys", target, "enter")
                 if checkpoint is not None:
                     checkpoint()
-            stdout, stderr = process.communicate(timeout=timeout + 10)
+            stdout, stderr = process.communicate(timeout=AGENT_PROMPT_WAIT_SECONDS + 5)
             if checkpoint is not None:
                 checkpoint()
         except Exception:
@@ -793,18 +803,121 @@ class HerdrClient:
             process.wait()
             raise
         if process.returncode:
-            self.decode(stdout or stderr)
-        result = self.decode(stdout)
-        agent = dict(result.get("agent") or {})
-        output = self.run_text(
-            "agent", "read", target, "--source", "recent-unwrapped", "--lines", "160"
+            try:
+                self.decode(stdout or stderr)
+            except HerdrError as exc:
+                if exc.code != "operation_timeout":
+                    raise
+        else:
+            self.decode(stdout)
+        return self.wait_for_stable_completion(
+            target,
+            token=token,
+            inactivity_timeout=timeout,
+            max_runtime=max_runtime,
+            started_at=started_at,
+            checkpoint=checkpoint,
         )
-        return PromptOutcome(
-            status=str(agent.get("agent_status") or "unknown"),
-            summary=extract_marker(output, "VOICE_SUMMARY", token),
-            question=extract_marker(output, "VOICE_QUESTION", token),
-            output=output,
-        )
+
+    def wait_for_stable_completion(
+        self,
+        target: str,
+        *,
+        token: str,
+        inactivity_timeout: float = CURSOR_AGENT_INACTIVITY_SECONDS,
+        max_runtime: float = CURSOR_AGENT_MAX_RUNTIME_SECONDS,
+        quiet_period: float = AGENT_COMPLETION_QUIET_SECONDS,
+        started_at: float | None = None,
+        checkpoint: Checkpoint | None = None,
+    ) -> PromptOutcome:
+        """Wait for a token marker and a stable, non-working agent state."""
+
+        started = time.monotonic() if started_at is None else started_at
+        last_activity = started
+        last_signature: tuple[object, str, str] | None = None
+        initial_session: str | None = None
+        settled_since: float | None = None
+        marker_output: str | None = None
+
+        while True:
+            if checkpoint is not None:
+                checkpoint()
+            agent = self.get_agent(target)
+            if checkpoint is not None:
+                checkpoint()
+            output = self.run_text(
+                "agent",
+                "read",
+                target,
+                "--source",
+                "recent-unwrapped",
+                "--lines",
+                "160",
+            )
+            if checkpoint is not None:
+                checkpoint()
+
+            now = time.monotonic()
+            status = str(agent.get("agent_status") or "unknown")
+            session = str(agent.get("agent_session") or "") or None
+            if initial_session is None:
+                initial_session = session
+            elif session is not None and session != initial_session:
+                raise HerdrError(
+                    f"Herdr agent {target} changed sessions while work was active",
+                    code="agent_session_changed",
+                )
+
+            signature = (
+                agent.get("state_change_seq"),
+                status,
+                hashlib.sha256(output.encode()).hexdigest(),
+            )
+            if signature != last_signature:
+                last_signature = signature
+                last_activity = now
+                settled_since = now if status in OBSERVABLE_AGENT_STATES else None
+
+            summary = extract_marker(output, "VOICE_SUMMARY", token)
+            question = extract_marker(output, "VOICE_QUESTION", token)
+            if summary or question:
+                marker_output = output
+
+            if status in OBSERVABLE_AGENT_STATES:
+                if settled_since is None:
+                    settled_since = now
+                if now - settled_since >= quiet_period:
+                    selected_output = marker_output or output
+                    return PromptOutcome(
+                        status=status,
+                        summary=extract_marker(selected_output, "VOICE_SUMMARY", token),
+                        question=extract_marker(
+                            selected_output, "VOICE_QUESTION", token
+                        ),
+                        output=selected_output,
+                    )
+            else:
+                settled_since = None
+
+            inactivity_expired = now - last_activity >= inactivity_timeout
+            runtime_expired = now - started >= max_runtime
+            if inactivity_expired or runtime_expired:
+                reason = (
+                    "inactivity timeout" if inactivity_expired else "maximum runtime"
+                )
+                raise HerdrError(
+                    f"Herdr agent {target} exceeded its {reason}",
+                    code="agent_stalled",
+                )
+
+            remaining = min(
+                inactivity_timeout - (now - last_activity),
+                max_runtime - (now - started),
+                AGENT_COMPLETION_POLL_SECONDS,
+            )
+            time.sleep(max(0.0, remaining))
+            if checkpoint is not None:
+                checkpoint()
 
     def infer_repository(
         self,

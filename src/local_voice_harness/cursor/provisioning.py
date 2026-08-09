@@ -15,6 +15,7 @@ from ..integrations.github import (
     GitHubRepository,
 )
 from ..integrations.herdr import (
+    SETTLED,
     AgentSelection,
     HerdrClient,
     HerdrError,
@@ -107,6 +108,9 @@ def complete_from_output(
     token = job.turn_token or ""
     summary = extract_marker(output, "VOICE_SUMMARY", token)
     question = extract_marker(output, "VOICE_QUESTION", token)
+    if agent_status not in SETTLED:
+        summary = None
+        question = None
     summary_position = output.rfind(f"VOICE_SUMMARY[{token}]")
     question_position = output.rfind(f"VOICE_QUESTION[{token}]")
     if question and question_position > summary_position:
@@ -145,28 +149,24 @@ def read_agent_completion(
     target = job.herdr_target or ""
     if not target:
         raise HarnessError("Cursor job has no Herdr agent")
-    if checkpoint is not None:
-        checkpoint()
-    agent = client.get_agent(target)
-    if checkpoint is not None:
-        checkpoint()
-    if wait and agent.get("agent_status") == "working":
+    if not wait:
         if checkpoint is not None:
             checkpoint()
-        result = client.run_json(
-            "agent", "wait", target, "--timeout", "900000", timeout=910
+        agent = client.get_agent(target)
+        if checkpoint is not None:
+            checkpoint()
+        output = client.run_text(
+            "agent", "read", target, "--source", "recent-unwrapped", "--lines", "160"
         )
         if checkpoint is not None:
             checkpoint()
-        agent = dict(result.get("agent") or {})
-    if checkpoint is not None:
-        checkpoint()
-    output = client.run_text(
-        "agent", "read", target, "--source", "recent-unwrapped", "--lines", "160"
+        return output, str(agent.get("agent_status") or "unknown")
+    outcome = client.wait_for_stable_completion(
+        target,
+        token=job.turn_token or "",
+        checkpoint=checkpoint,
     )
-    if checkpoint is not None:
-        checkpoint()
-    return output, str(agent.get("agent_status") or "unknown")
+    return outcome.output, outcome.status
 
 
 def _worker_change(
@@ -312,6 +312,66 @@ def _worker_fail(
         )
 
     _worker_change(store, job_id, token, MODEL_WORKER_STATUSES, fail)
+
+
+def _worker_block(
+    store: JobStore,
+    job_id: str,
+    token: str,
+    message: str,
+) -> None:
+    blocked_at = time.time()
+
+    def block(job: CursorJob) -> CursorJob:
+        return job.evolve_for_delivery(
+            now=blocked_at,
+            status=JobStatus.BLOCKED,
+            result=message[:500],
+            completed_at=blocked_at,
+        )
+
+    _worker_change(store, job_id, token, MODEL_WORKER_STATUSES, block)
+
+
+def _worker_exception(
+    client: HerdrClient | None,
+    store: JobStore,
+    job_id: str,
+    token: str,
+    target: str,
+    exc: Exception,
+    *,
+    target_may_be_active: bool,
+    checkpoint: Callable[[], None],
+) -> None:
+    if (
+        isinstance(exc, HerdrError)
+        and exc.code == "agent_stalled"
+        and target_may_be_active
+        and client is not None
+    ):
+        try:
+            checkpoint()
+            client.cancel_agent(target)
+            checkpoint()
+        except Exception as cancel_exc:
+            _worker_fail(
+                store,
+                job_id,
+                token,
+                cancel_exc,
+                target_may_be_active=True,
+            )
+            return
+        _worker_block(store, job_id, token, str(exc))
+        return
+    _worker_fail(
+        store,
+        job_id,
+        token,
+        exc,
+        target_may_be_active=target_may_be_active,
+    )
 
 
 def _pull_request_branch(job: CursorJob) -> str:
@@ -816,6 +876,8 @@ def run_claimed_worker(
     job = context.job
     worker_token = context.token
     prompt_may_be_active = False
+    client: HerdrClient | None = None
+    target = ""
 
     def checkpoint() -> None:
         context.checkpoint()
@@ -1415,10 +1477,13 @@ def run_claimed_worker(
     except WorkerCancelled:
         return
     except Exception as exc:
-        _worker_fail(
+        _worker_exception(
+            client,
             store,
             job_id,
             worker_token,
+            target,
             exc,
             target_may_be_active=prompt_may_be_active,
+            checkpoint=checkpoint,
         )

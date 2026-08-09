@@ -1016,6 +1016,21 @@ class CursorJobStateTests(unittest.TestCase):
         self.assertEqual(job["status"], "blocked")
         self.assertIn("needs attention", str(job["result"]))
 
+    def test_working_agent_cannot_complete_from_stale_summary(self) -> None:
+        job: dict[str, object] = {
+            "id": "123456789abc",
+            "turn_token": "token",
+            "herdr_target": "agent",
+        }
+        jobs.complete_from_output(
+            job,
+            output="VOICE_SUMMARY[token]: stale result",
+            agent_status="working",
+        )
+
+        self.assertEqual(job["status"], "blocked")
+        self.assertNotEqual(job["result"], "stale result")
+
     def test_worker_spawns_package_module(self) -> None:
         process = mock.Mock(spec=subprocess.Popen)
         process.pid = 1234
@@ -1111,6 +1126,74 @@ class CursorJobStateTests(unittest.TestCase):
         self.assertTrue(failed["target_release_pending"])
         self.assertTrue(failed["cancellation_reconciliation_pending"])
         self.assertIn("cursor-agent", jobs.reserved_targets())
+
+    def test_stalled_agent_is_cancelled_and_blocked(self) -> None:
+        repository = Path(self.temporary.name) / "project"
+        checkout = Path(self.temporary.name) / "worktree"
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "fix it",
+                "status": "queued",
+                "repository": str(repository),
+                "worktree_path": str(checkout),
+                "herdr_target": "cursor-agent",
+                "herdr_pane_id": "pane",
+                "herdr_workspace_id": "workspace",
+                "agent_name": "cursor-agent",
+                "agent_dispatch_state": "ready",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        client = mock.Mock()
+        client.prompt_and_wait.side_effect = HerdrError(
+            "Herdr agent cursor-agent exceeded its inactivity timeout",
+            code="agent_stalled",
+        )
+
+        with mock.patch.object(jobs, "HerdrClient", return_value=client):
+            service.run_worker("123456789abc")
+
+        blocked = jobs.read_job("123456789abc")
+        self.assertEqual(blocked["status"], "blocked")
+        self.assertIn("inactivity timeout", str(blocked["result"]))
+        self.assertFalse(blocked.get("target_release_pending", False))
+        client.cancel_agent.assert_called_once_with("cursor-agent")
+
+    def test_uncertain_stalled_agent_cancellation_is_reconciled(self) -> None:
+        repository = Path(self.temporary.name) / "project"
+        checkout = Path(self.temporary.name) / "worktree"
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "fix it",
+                "status": "queued",
+                "repository": str(repository),
+                "worktree_path": str(checkout),
+                "herdr_target": "cursor-agent",
+                "herdr_pane_id": "pane",
+                "herdr_workspace_id": "workspace",
+                "agent_name": "cursor-agent",
+                "agent_dispatch_state": "ready",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        client = mock.Mock()
+        client.prompt_and_wait.side_effect = HerdrError(
+            "Herdr agent cursor-agent exceeded its maximum runtime",
+            code="agent_stalled",
+        )
+        client.cancel_agent.side_effect = HerdrError("agent did not stop")
+
+        with mock.patch.object(jobs, "HerdrClient", return_value=client):
+            service.run_worker("123456789abc")
+
+        failed = jobs.read_job("123456789abc")
+        self.assertEqual(failed["status"], "failed")
+        self.assertTrue(failed["target_release_pending"])
+        self.assertTrue(failed["cancellation_reconciliation_pending"])
 
     def test_dead_worker_reconciles_existing_agent(self) -> None:
         jobs.write_job(

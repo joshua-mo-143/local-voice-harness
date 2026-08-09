@@ -67,6 +67,8 @@ _PLATFORM_KEYS = (
     "cursor_followup",
     "cursor_followup_window_seconds",
     "cursor_foreground_seconds",
+    "cursor_agent_inactivity_seconds",
+    "cursor_agent_max_runtime_seconds",
 )
 
 _TRUTHY = {"1", "true", "yes", "on"}
@@ -135,6 +137,8 @@ class PlatformSettings:
     cursor_followup_enabled: bool = True
     cursor_followup_window_seconds: float = 60.0
     cursor_foreground_seconds: float = 5.0
+    cursor_agent_inactivity_seconds: float = 15 * 60
+    cursor_agent_max_runtime_seconds: float = 60 * 60
 
 
 @dataclass(frozen=True)
@@ -246,6 +250,13 @@ def _as_nonnegative_float(value: object, *, label: str) -> float:
         ) from exc
     if not math.isfinite(number) or number < 0:
         raise UserConfigurationError(f"{label} must be a finite non-negative number")
+    return number
+
+
+def _as_positive_float(value: object, *, label: str) -> float:
+    number = _as_nonnegative_float(value, label=label)
+    if number <= 0:
+        raise UserConfigurationError(f"{label} must be a finite positive number")
     return number
 
 
@@ -587,6 +598,26 @@ def _load_platform(
             ),
             label="platform.cursor_foreground_seconds",
         ),
+        cursor_agent_inactivity_seconds=_as_positive_float(
+            _resolve(
+                environment,
+                "VOICE_HARNESS_CURSOR_AGENT_INACTIVITY_SECONDS",
+                section,
+                "cursor_agent_inactivity_seconds",
+                15 * 60,
+            ),
+            label="platform.cursor_agent_inactivity_seconds",
+        ),
+        cursor_agent_max_runtime_seconds=_as_positive_float(
+            _resolve(
+                environment,
+                "VOICE_HARNESS_CURSOR_AGENT_MAX_RUNTIME_SECONDS",
+                section,
+                "cursor_agent_max_runtime_seconds",
+                60 * 60,
+            ),
+            label="platform.cursor_agent_max_runtime_seconds",
+        ),
     )
 
 
@@ -764,6 +795,10 @@ def render_user_config(user_config: UserConfig) -> str:
             "cursor_followup": platform.cursor_followup_enabled,
             "cursor_followup_window_seconds": platform.cursor_followup_window_seconds,
             "cursor_foreground_seconds": platform.cursor_foreground_seconds,
+            "cursor_agent_inactivity_seconds": (
+                platform.cursor_agent_inactivity_seconds
+            ),
+            "cursor_agent_max_runtime_seconds": platform.cursor_agent_max_runtime_seconds,
         },
     )
     return "\n".join(lines).rstrip("\n") + "\n"
