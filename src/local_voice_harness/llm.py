@@ -73,6 +73,12 @@ QWEN_TOOLS = [
     }
 ]
 MAX_TOOL_CALL_ROUNDS = 6
+MAX_COMPLETION_TOKENS = 512
+MAX_MALFORMED_TOOL_CALL_RETRIES = 1
+MALFORMED_TOOL_CALL_RECOVERY = (
+    "I couldn't complete that request because the tool call was incomplete. "
+    "Please try again."
+)
 _SENTENCE = re.compile(r'^(.+?[.!?]["\']?)(?:\s+)', re.DOTALL)
 
 
@@ -95,6 +101,27 @@ def _message_tool_calls(message: dict[str, object]) -> list[dict[str, object]]:
     if not isinstance(value, list) or not all(isinstance(call, dict) for call in value):
         raise HarnessError("LLM returned malformed tool calls")
     return value
+
+
+def _parse_tool_arguments(
+    tool_calls: Sequence[Mapping[str, object]],
+) -> list[dict[str, object]] | None:
+    parsed: list[dict[str, object]] = []
+    for call in tool_calls:
+        function = call.get("function")
+        if not isinstance(function, Mapping):
+            return None
+        raw_arguments = function.get("arguments")
+        if not isinstance(raw_arguments, str):
+            return None
+        try:
+            arguments = json.loads(raw_arguments)
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(arguments, dict):
+            return None
+        parsed.append(arguments)
+    return parsed
 
 
 class _TextChunker:
@@ -230,6 +257,7 @@ def qwen_turn(
         *(history or [])[-8:],
         {"role": "user", "content": text},
     ]
+    malformed_tool_call_count = 0
     for tool_round in range(MAX_TOOL_CALL_ROUNDS):
         request_data: dict[str, object] = {
             "model": settings.llm_model,
@@ -238,7 +266,7 @@ def qwen_turn(
             "tool_choice": "auto",
             "parallel_tool_calls": False,
             "temperature": 0.7,
-            "max_tokens": 128,
+            "max_tokens": MAX_COMPLETION_TOKENS,
             "stream": settings.llm_provider == "venice",
         }
         if settings.llm_provider == "venice":
@@ -289,6 +317,12 @@ def qwen_turn(
             if not answer:
                 raise HarnessError("LLM returned an empty response")
             return answer, cursor_session
+        parsed_arguments = _parse_tool_arguments(tool_calls)
+        if parsed_arguments is None:
+            malformed_tool_call_count += 1
+            if malformed_tool_call_count > MAX_MALFORMED_TOOL_CALL_RETRIES:
+                return MALFORMED_TOOL_CALL_RECOVERY, cursor_session
+            continue
         messages.append(
             {
                 "role": "assistant",
@@ -296,39 +330,21 @@ def qwen_turn(
                 "tool_calls": tool_calls,
             }
         )
-        for call in tool_calls:
+        for call, arguments in zip(tool_calls, parsed_arguments, strict=True):
             function_value = call.get("function")
             function = function_value if isinstance(function_value, dict) else {}
             name = str(function.get("name", ""))
             if name != "cursor":
                 tool_result = f"Unknown tool: {name}"
             else:
-                try:
-                    arguments = json.loads(str(function.get("arguments") or "{}"))
-                    task = str(arguments.get("task", "")).strip()
-                    repository = str(arguments.get("repository", "")).strip() or None
-                    requested_github_repository = (
-                        str(arguments.get("github_repository", "")).strip() or None
-                    )
-                    agent = str(arguments.get("agent", "")).strip() or None
-                    action = str(arguments.get("action", "submit")).strip() or "submit"
-                    job_id = str(arguments.get("job_id", "")).strip() or cursor_session
-                except (json.JSONDecodeError, AttributeError):
-                    (
-                        task,
-                        repository,
-                        requested_github_repository,
-                        agent,
-                        action,
-                        job_id,
-                    ) = (
-                        "",
-                        None,
-                        None,
-                        None,
-                        "submit",
-                        None,
-                    )
+                task = str(arguments.get("task", "")).strip()
+                repository = str(arguments.get("repository", "")).strip() or None
+                requested_github_repository = (
+                    str(arguments.get("github_repository", "")).strip() or None
+                )
+                agent = str(arguments.get("agent", "")).strip() or None
+                action = str(arguments.get("action", "submit")).strip() or "submit"
+                job_id = str(arguments.get("job_id", "")).strip() or cursor_session
                 if action in {"submit", "reply"} and not task:
                     tool_result = "Cursor tool error: task must not be empty"
                 else:
