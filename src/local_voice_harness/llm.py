@@ -1,20 +1,25 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 import urllib.error
 import urllib.request
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 
-from .config import LLM_CHAT, LLM_MODEL
+from .config import load_backend_settings
+from .credentials import get_venice_api_key
 from .cursor.delivery import DeliveryClaims
 from .cursor.service import CursorTurnRequest, cursor_turn
 from .errors import HarnessError
 from .notifications import notify
 
 SYSTEM_PROMPT = (
-    "You are a fast conversational voice assistant. Answer directly in one or two short "
-    "sentences, usually under 40 words. Use natural spoken language without markdown or lists. "
+    "You are a fast conversational voice assistant. Every spoken answer must be complete and "
+    "no more than 30 words. Omit detail rather than ending mid-sentence. For GitHub issues and "
+    "pull requests, state only the goal, current status, and main blocker in one or two short "
+    "sentences. Offer a follow-up when more detail would help. Use natural spoken language "
+    "without markdown or lists. "
     "You have a Cursor coding tool with access to the user's workspace. Use it for requests "
     "requiring code inspection, file edits, shell commands, or other software-engineering work. "
     "Cursor agents are managed through Herdr and can use configured MCP servers such as Linear. "
@@ -66,17 +71,18 @@ QWEN_TOOLS = [
     }
 ]
 MAX_TOOL_CALL_ROUNDS = 6
+_SENTENCE = re.compile(r'^(.+?[.!?]["\']?)(?:\s+)', re.DOTALL)
 
 
 def _response_message(result: object) -> dict[str, object]:
     if not isinstance(result, dict):
-        raise HarnessError("Qwen returned a malformed response")
+        raise HarnessError("LLM returned a malformed response")
     choices = result.get("choices")
     if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
-        raise HarnessError("Qwen returned a malformed response")
+        raise HarnessError("LLM returned a malformed response")
     message = choices[0].get("message")
     if not isinstance(message, dict):
-        raise HarnessError("Qwen returned a malformed response")
+        raise HarnessError("LLM returned a malformed response")
     return message
 
 
@@ -85,8 +91,114 @@ def _message_tool_calls(message: dict[str, object]) -> list[dict[str, object]]:
     if value is None:
         return []
     if not isinstance(value, list) or not all(isinstance(call, dict) for call in value):
-        raise HarnessError("Qwen returned malformed tool calls")
+        raise HarnessError("LLM returned malformed tool calls")
     return value
+
+
+class _TextChunker:
+    def __init__(self, callback: Callable[[str], None] | None) -> None:
+        self.callback = callback
+        self.buffer = ""
+
+    def feed(self, text: str) -> None:
+        if self.callback is None:
+            return
+        self.buffer += text
+        while match := _SENTENCE.match(self.buffer):
+            chunk = match.group(1).strip()
+            self.buffer = self.buffer[match.end() :]
+            if chunk:
+                self.callback(chunk)
+
+    def flush(self) -> None:
+        chunk = self.buffer.strip()
+        self.buffer = ""
+        if self.callback is not None and chunk:
+            self.callback(chunk)
+
+
+def _streamed_message(
+    response: Iterable[bytes | str],
+    on_text_chunk: Callable[[str], None] | None,
+) -> dict[str, object]:
+    content: list[str] = []
+    tool_calls: dict[int, dict[str, object]] = {}
+    chunker = _TextChunker(on_text_chunk)
+    received_event = False
+    for raw_line in response:
+        line = (
+            raw_line.decode("utf-8") if isinstance(raw_line, bytes) else str(raw_line)
+        ).strip()
+        if not line or not line.startswith("data:"):
+            continue
+        data = line.removeprefix("data:").strip()
+        if data == "[DONE]":
+            break
+        event = json.loads(data)
+        if not isinstance(event, dict):
+            raise HarnessError("LLM returned a malformed streaming event")
+        if event.get("error"):
+            raise HarnessError(f"LLM streaming request failed: {event['error']}")
+        choices = event.get("choices")
+        if not isinstance(choices, list) or not choices:
+            continue
+        choice = choices[0]
+        if not isinstance(choice, dict):
+            raise HarnessError("LLM returned a malformed streaming event")
+        delta = choice.get("delta")
+        if not isinstance(delta, dict):
+            continue
+        received_event = True
+        delta_content = delta.get("content")
+        if delta_content is not None:
+            content.append(str(delta_content))
+        delta_tools = delta.get("tool_calls")
+        if delta_tools is not None:
+            if not isinstance(delta_tools, list):
+                raise HarnessError("LLM returned malformed streaming tool calls")
+            for delta_call in delta_tools:
+                if not isinstance(delta_call, dict):
+                    raise HarnessError("LLM returned malformed streaming tool calls")
+                try:
+                    index = int(delta_call.get("index", 0))
+                except (TypeError, ValueError) as exc:
+                    raise HarnessError(
+                        "LLM returned malformed streaming tool calls"
+                    ) from exc
+                call = tool_calls.setdefault(
+                    index,
+                    {
+                        "id": "",
+                        "type": "function",
+                        "function": {"name": "", "arguments": ""},
+                    },
+                )
+                if delta_call.get("id") is not None:
+                    call["id"] = str(call["id"]) + str(delta_call["id"])
+                if delta_call.get("type") is not None:
+                    call["type"] = str(delta_call["type"])
+                function_delta = delta_call.get("function")
+                if function_delta is not None:
+                    if not isinstance(function_delta, dict):
+                        raise HarnessError(
+                            "LLM returned malformed streaming tool calls"
+                        )
+                    function = call["function"]
+                    assert isinstance(function, dict)
+                    for key in ("name", "arguments"):
+                        if function_delta.get(key) is not None:
+                            function[key] = str(function[key]) + str(
+                                function_delta[key]
+                            )
+    if not received_event:
+        raise HarnessError("LLM returned an empty streaming response")
+    if content and not tool_calls:
+        chunker.feed("".join(content))
+        chunker.flush()
+    message: dict[str, object] = {"content": "".join(content) or None}
+    if tool_calls:
+        message["tool_calls"] = [tool_calls[index] for index in sorted(tool_calls)]
+    return message
 
 
 def qwen_turn(
@@ -101,7 +213,10 @@ def qwen_turn(
     github_pull_request: int | None = None,
     trusted_utterance: str | None = None,
     delivery_claims: DeliveryClaims | None = None,
+    on_text_chunk: Callable[[str], None] | None = None,
 ) -> tuple[str, str | None]:
+    settings = load_backend_settings()
+    venice_api_key = get_venice_api_key() if settings.llm_provider == "venice" else None
     system_prompt = SYSTEM_PROMPT
     if cursor_session:
         system_prompt += (
@@ -114,27 +229,49 @@ def qwen_turn(
         {"role": "user", "content": text},
     ]
     for tool_round in range(MAX_TOOL_CALL_ROUNDS):
-        payload = json.dumps(
-            {
-                "model": LLM_MODEL,
-                "messages": messages,
-                "tools": QWEN_TOOLS,
-                "tool_choice": "auto",
-                "parallel_tool_calls": False,
-                "temperature": 0.7,
-                "max_tokens": 128,
-                "stream": False,
-            }
-        ).encode()
+        request_data: dict[str, object] = {
+            "model": settings.llm_model,
+            "messages": messages,
+            "tools": QWEN_TOOLS,
+            "tool_choice": "auto",
+            "parallel_tool_calls": False,
+            "temperature": 0.7,
+            "max_tokens": 128,
+            "stream": settings.llm_provider == "venice",
+        }
+        if settings.llm_provider == "venice":
+            request_data["reasoning"] = {"enabled": False}
+        payload = json.dumps(request_data).encode()
+        headers = {"Content-Type": "application/json"}
+        if venice_api_key is not None:
+            headers["Authorization"] = f"Bearer {venice_api_key}"
+            headers["Accept"] = "text/event-stream"
         request = urllib.request.Request(
-            LLM_CHAT, data=payload, headers={"Content-Type": "application/json"}
+            settings.llm_endpoint,
+            data=payload,
+            headers=headers,
         )
         started = time.perf_counter()
         try:
-            with urllib.request.urlopen(request, timeout=60) as response:
-                result = json.load(response)
+            with urllib.request.urlopen(
+                request, timeout=settings.llm_timeout
+            ) as response:
+                message = (
+                    _streamed_message(response, on_text_chunk)
+                    if settings.llm_provider == "venice"
+                    else _response_message(json.load(response))
+                )
+        except urllib.error.HTTPError as exc:
+            try:
+                detail = exc.read(4096).decode("utf-8", errors="replace").strip()
+            except OSError:
+                detail = ""
+            suffix = f": {detail}" if detail else ""
+            raise HarnessError(
+                f"LLM request failed: HTTP {exc.code} {exc.reason}{suffix}"
+            ) from exc
         except (OSError, urllib.error.URLError, json.JSONDecodeError) as exc:
-            raise HarnessError(f"Qwen request failed: {exc}") from exc
+            raise HarnessError(f"LLM request failed: {exc}") from exc
         print(
             json.dumps(
                 {
@@ -144,12 +281,11 @@ def qwen_turn(
                 }
             )
         )
-        message = _response_message(result)
         tool_calls = _message_tool_calls(message)
         if not tool_calls:
             answer = str(message.get("content") or "").strip()
             if not answer:
-                raise HarnessError("Qwen returned an empty response")
+                raise HarnessError("LLM returned an empty response")
             return answer, cursor_session
         messages.append(
             {
@@ -245,7 +381,7 @@ def qwen_turn(
                     "content": tool_result,
                 }
             )
-    raise HarnessError("Qwen exceeded the tool-call round limit")
+    raise HarnessError("LLM exceeded the tool-call round limit")
 
 
 def qwen_response(

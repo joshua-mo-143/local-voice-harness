@@ -8,9 +8,12 @@ import tempfile
 import types
 import unittest
 import wave
+from dataclasses import replace
+from email.message import Message
 from pathlib import Path
 from unittest import mock
 
+from local_voice_harness.config import load_backend_settings
 from local_voice_harness.tts import client, server
 
 
@@ -70,6 +73,57 @@ class ServerStreamingTests(unittest.TestCase):
         )
         self.assertTrue(events[-1]["cancelled"])
         self.assertNotIn("request-1", server.ACTIVE_STREAMS)
+
+    def test_venice_tts_requests_pcm_wav_with_configured_model_and_voice(self) -> None:
+        output = io.BytesIO()
+        with wave.open(output, "wb") as target:
+            target.setnchannels(1)
+            target.setsampwidth(2)
+            target.setframerate(24_000)
+            target.writeframes(b"\x00\x00" * 2_400)
+        headers = Message()
+        headers["Content-Type"] = "audio/wav"
+        response = mock.MagicMock()
+        response.__enter__.return_value = response
+        response.headers = headers
+        response.read.return_value = output.getvalue()
+        settings = replace(
+            load_backend_settings({}),
+            tts_provider="venice",
+            tts_model="tts-kokoro",
+            tts_voice="af_sky",
+            tts_speed=1.25,
+            tts_endpoint="https://api.venice.ai/api/v1/audio/speech",
+            tts_timeout=19,
+        )
+
+        with (
+            mock.patch.object(server, "SETTINGS", settings),
+            mock.patch.object(
+                server, "get_venice_api_key", return_value="venice-secret"
+            ),
+            mock.patch.object(
+                server.urllib.request, "urlopen", return_value=response
+            ) as urlopen,
+        ):
+            audio, rate, duration, _elapsed = server._venice_audio("Hello.")
+
+        request = urlopen.call_args.args[0]
+        payload = json.loads(request.data)
+        self.assertEqual(audio, output.getvalue())
+        self.assertEqual((rate, duration), (24_000, 0.1))
+        self.assertEqual(
+            payload,
+            {
+                "model": "tts-kokoro",
+                "voice": "af_sky",
+                "input": "Hello.",
+                "response_format": "wav",
+                "speed": 1.25,
+            },
+        )
+        self.assertEqual(request.get_header("Authorization"), "Bearer venice-secret")
+        self.assertEqual(urlopen.call_args.kwargs["timeout"], 19)
 
 
 class _CapturingStdin:

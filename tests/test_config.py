@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -57,6 +58,87 @@ class ConfigPathTests(unittest.TestCase):
             ),
             Path("/custom/state/voice-harness"),
         )
+
+    def test_backend_settings_default_to_local_and_support_venice_toml(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            missing = root / "missing.toml"
+            defaults = config.load_backend_settings({}, path=missing, home=root)
+            self.assertEqual(
+                (defaults.llm_provider, defaults.tts_provider), ("local", "local")
+            )
+
+            backend_file = root / "backends.toml"
+            backend_file.write_text(
+                "[llm]\n"
+                'provider = "venice"\n'
+                'model = "venice-uncensored"\n'
+                "timeout = 15\n"
+                "[tts]\n"
+                'provider = "venice"\n'
+                'model = "tts-kokoro"\n'
+                'voice = "af_sky"\n'
+                "speed = 1.25\n"
+            )
+
+            settings = config.load_backend_settings({}, path=backend_file, home=root)
+
+        self.assertEqual(settings.llm_provider, "venice")
+        self.assertEqual(settings.llm_timeout, 15)
+        self.assertEqual(settings.tts_provider, "venice")
+        self.assertEqual(settings.tts_voice, "af_sky")
+        self.assertEqual(settings.tts_speed, 1.25)
+
+    def test_backend_environment_overrides_toml_and_rejects_unknown_provider(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "backends.toml"
+            path.write_text('[llm]\nprovider = "local"\n')
+            settings = config.load_backend_settings(
+                {
+                    "VOICE_HARNESS_LLM_PROVIDER": "venice",
+                    "VOICE_HARNESS_LLM_MODEL": "custom-model",
+                },
+                path=path,
+                home=Path(temporary),
+            )
+            self.assertEqual(settings.llm_provider, "venice")
+            self.assertEqual(settings.llm_model, "custom-model")
+
+            with self.assertRaisesRegex(
+                config.BackendConfigurationError, "local or venice"
+            ):
+                config.load_backend_settings(
+                    {"VOICE_HARNESS_TTS_PROVIDER": "unknown"},
+                    path=path,
+                    home=Path(temporary),
+                )
+            with self.assertRaisesRegex(
+                config.BackendConfigurationError, "positive number"
+            ):
+                config.load_backend_settings(
+                    {"VOICE_HARNESS_LLM_TIMEOUT": "nan"},
+                    path=path,
+                    home=Path(temporary),
+                )
+            with self.assertRaisesRegex(
+                config.BackendConfigurationError, "between 0.25 and 4"
+            ):
+                config.load_backend_settings(
+                    {"VOICE_HARNESS_TTS_SPEED": "4.1"},
+                    path=path,
+                    home=Path(temporary),
+                )
+
+    def test_rejects_legacy_file_based_venice_credentials(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "backends.toml"
+            path.write_text('[venice]\napi_key_file = "/tmp/legacy"\n')
+            with self.assertRaisesRegex(
+                config.BackendConfigurationError, "credentials set"
+            ):
+                config.load_backend_settings({}, path=path)
 
 
 if __name__ == "__main__":

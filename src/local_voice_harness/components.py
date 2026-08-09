@@ -8,12 +8,25 @@ import urllib.error
 import urllib.request
 from collections.abc import Iterator
 
-from .config import LLM_HEALTH, STATE_DIR, TTS_SOCKET
+from .config import (
+    LLM_HEALTH,
+    STATE_DIR,
+    TTS_SOCKET,
+    load_backend_settings,
+)
+from .credentials import CredentialError, get_venice_api_key
 from .errors import HarnessError
 from .ipc import socket_ready
 
 
 def llm_ready() -> bool:
+    settings = load_backend_settings()
+    if settings.llm_provider == "venice":
+        try:
+            get_venice_api_key()
+        except CredentialError:
+            return False
+        return True
     try:
         with urllib.request.urlopen(LLM_HEALTH, timeout=0.5) as response:
             return response.status == 200
@@ -33,14 +46,12 @@ def component_usage() -> Iterator[None]:
 
 
 def start_components(timeout: float = 30.0) -> None:
+    settings = load_backend_settings()
+    services = ["voice-harness-tts.service"]
+    if settings.llm_provider == "local":
+        services.insert(0, "voice-harness-llm.service")
     subprocess.run(
-        [
-            "systemctl",
-            "--user",
-            "start",
-            "voice-harness-llm.service",
-            "voice-harness-tts.service",
-        ],
+        ["systemctl", "--user", "start", *services],
         check=True,
     )
     deadline = time.monotonic() + timeout
@@ -49,7 +60,7 @@ def start_components(timeout: float = 30.0) -> None:
             return
         time.sleep(0.25)
     raise HarnessError(
-        f"Qwen or Chatterbox did not become ready within {timeout:g} seconds"
+        f"LLM or TTS backend did not become ready within {timeout:g} seconds"
     )
 
 

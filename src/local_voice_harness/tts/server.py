@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import json
 import os
 import re
@@ -8,10 +9,19 @@ import socketserver
 import sys
 import threading
 import time
+import urllib.error
+import urllib.request
+import wave
 from pathlib import Path
 from typing import Any
 
-from ..config import STATE_DIR, TTS_SOCKET
+from ..config import (
+    STATE_DIR,
+    TTS_SOCKET,
+    BackendSettings,
+    load_backend_settings,
+)
+from ..credentials import get_venice_api_key
 
 SOCKET_PATH = TTS_SOCKET
 OUTPUT_ROOT = STATE_DIR
@@ -22,6 +32,9 @@ ACTIVE_STREAMS_LOCK = threading.Lock()
 MAX_CHUNK_CHARS = 160
 REQUEST_ID = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 MODEL: Any = None
+SETTINGS: BackendSettings | None = None
+VENICE_API_KEY: str | None = None
+MAX_AUDIO_BYTES = 32 * 1024 * 1024
 
 
 def log(message: str) -> None:
@@ -29,7 +42,7 @@ def log(message: str) -> None:
 
 
 def split_text(text: str, *, max_chars: int = MAX_CHUNK_CHARS) -> list[str]:
-    """Split prose into short Chatterbox requests without cutting normal words."""
+    """Split prose into short TTS requests without cutting normal words."""
     text = " ".join(text.split())
     if not text:
         return []
@@ -93,6 +106,8 @@ def _request_text(request: dict[str, object]) -> str:
 
 
 def _request_voice(request: dict[str, object]) -> Path | None:
+    if _settings().tts_provider == "venice":
+        return None
     voice_value = str(request.get("voice", "")).strip()
     voice = Path(voice_value).expanduser().resolve() if voice_value else None
     if voice is not None and not voice.is_file():
@@ -116,6 +131,82 @@ def _generate(text: str, voice: Path | None) -> tuple[Any, float]:
     )
 
 
+def _settings() -> BackendSettings:
+    return SETTINGS or load_backend_settings()
+
+
+def _venice_api_key() -> str:
+    return VENICE_API_KEY or get_venice_api_key()
+
+
+def _venice_audio(text: str) -> tuple[bytes, int, float, float]:
+    settings = _settings()
+    payload = json.dumps(
+        {
+            "model": settings.tts_model,
+            "voice": settings.tts_voice,
+            "input": text,
+            "response_format": "wav",
+            "speed": settings.tts_speed,
+        }
+    ).encode()
+    request = urllib.request.Request(
+        settings.tts_endpoint,
+        data=payload,
+        headers={
+            "Authorization": f"Bearer {_venice_api_key()}",
+            "Content-Type": "application/json",
+        },
+    )
+    started = time.perf_counter()
+    try:
+        with urllib.request.urlopen(request, timeout=settings.tts_timeout) as response:
+            content_type = response.headers.get_content_type()
+            audio = response.read(MAX_AUDIO_BYTES + 1)
+    except (OSError, urllib.error.URLError) as exc:
+        raise RuntimeError(f"Venice TTS request failed: {exc}") from exc
+    elapsed = time.perf_counter() - started
+    if content_type not in {"audio/wav", "audio/x-wav", "audio/wave"}:
+        raise RuntimeError(
+            f"Venice TTS returned unexpected content type {content_type}"
+        )
+    if len(audio) > MAX_AUDIO_BYTES:
+        raise RuntimeError("Venice TTS response exceeds the 32 MiB limit")
+    try:
+        with wave.open(io.BytesIO(audio), "rb") as source:
+            channels = source.getnchannels()
+            sample_width = source.getsampwidth()
+            sample_rate = source.getframerate()
+            frames = source.getnframes()
+            compression = source.getcomptype()
+    except (EOFError, wave.Error) as exc:
+        raise RuntimeError("Venice TTS returned an invalid WAV response") from exc
+    if channels != 1 or sample_width != 2 or compression != "NONE":
+        raise RuntimeError(
+            "Venice TTS WAV must be mono, 16-bit, uncompressed PCM audio"
+        )
+    if sample_rate <= 0 or frames <= 0:
+        raise RuntimeError("Venice TTS returned an empty WAV response")
+    return audio, sample_rate, frames / sample_rate, elapsed
+
+
+def _synthesize(
+    text: str,
+    voice: Path | None,
+    output: Path,
+) -> tuple[int, float, float]:
+    if _settings().tts_provider == "venice":
+        audio, sample_rate, duration, elapsed = _venice_audio(text)
+        output.write_bytes(audio)
+        return sample_rate, duration, elapsed
+
+    import soundfile as sf
+
+    audio, elapsed = _generate(text, voice)
+    sf.write(str(output), audio, MODEL.sr, subtype="PCM_16")
+    return MODEL.sr, len(audio) / MODEL.sr, elapsed
+
+
 def _cancel_stream(request_id: str) -> bool:
     with ACTIVE_STREAMS_LOCK:
         cancelled = ACTIVE_STREAMS.get(request_id)
@@ -129,8 +220,6 @@ def _stream_response(
     handler: socketserver.StreamRequestHandler,
     request: dict[str, object],
 ) -> None:
-    import soundfile as sf
-
     text = _request_text(request)
     voice = _request_voice(request)
     request_id = str(request.get("request_id", ""))
@@ -148,30 +237,36 @@ def _stream_response(
     generation_seconds = 0.0
     audio_seconds = 0.0
     emitted = 0
+    sample_rate: int | None = None
     try:
-        _write_json(
-            handler,
-            {
-                "ok": True,
-                "event": "start",
-                "request_id": request_id,
-                "sample_rate": MODEL.sr,
-                "chunks": len(chunks),
-            },
-        )
         # Keep one stream contiguous on the single GPU. A cancellation handler does
         # not acquire this lock, so it can still stop us between model calls.
         with LOCK:
             for index, chunk in enumerate(chunks):
                 if cancelled.is_set():
                     break
-                audio, elapsed = _generate(chunk, voice)
+                output = output_dir / f"{index:04d}.wav"
+                rate, duration, elapsed = _synthesize(chunk, voice, output)
                 generation_seconds += elapsed
                 if cancelled.is_set():
+                    output.unlink(missing_ok=True)
                     break
-                output = output_dir / f"{index:04d}.wav"
-                sf.write(str(output), audio, MODEL.sr, subtype="PCM_16")
-                duration = len(audio) / MODEL.sr
+                if sample_rate is None:
+                    sample_rate = rate
+                    _write_json(
+                        handler,
+                        {
+                            "ok": True,
+                            "event": "start",
+                            "request_id": request_id,
+                            "sample_rate": sample_rate,
+                            "chunks": len(chunks),
+                        },
+                    )
+                elif rate != sample_rate:
+                    raise RuntimeError(
+                        "TTS backend changed sample rate during one response"
+                    )
                 audio_seconds += duration
                 _write_json(
                     handler,
@@ -218,8 +313,6 @@ def _stream_response(
 class RequestHandler(socketserver.StreamRequestHandler):
     def handle(self) -> None:
         try:
-            import soundfile as sf
-
             line = self.rfile.readline(64 * 1024)
             if not line:
                 _write_json(self, {"ok": True, "ready": True})
@@ -247,13 +340,11 @@ class RequestHandler(socketserver.StreamRequestHandler):
                 )
             voice = _request_voice(request)
             with LOCK:
-                audio, elapsed = _generate(text, voice)
-            sf.write(str(output), audio, MODEL.sr)
-            duration = len(audio) / MODEL.sr
+                sample_rate, duration, elapsed = _synthesize(text, voice, output)
             response = {
                 "ok": True,
                 "output": str(output),
-                "sample_rate": MODEL.sr,
+                "sample_rate": sample_rate,
                 "audio_seconds": round(duration, 3),
                 "generation_seconds": round(elapsed, 3),
                 "realtime_factor": round(elapsed / duration, 3),
@@ -272,17 +363,22 @@ class Server(socketserver.ThreadingUnixStreamServer):
 
 
 def main() -> None:
-    global MODEL
+    global MODEL, SETTINGS, VENICE_API_KEY
     if "--check" in sys.argv[1:]:
         print("voice-harness-tts: ok")
         return
-    import torch
-    from chatterbox.tts_turbo import ChatterboxTurboTTS
+    SETTINGS = load_backend_settings()
+    if SETTINGS.tts_provider == "local":
+        import torch
+        from chatterbox.tts_turbo import ChatterboxTurboTTS
 
-    log("loading Chatterbox Turbo on CUDA")
-    MODEL = ChatterboxTurboTTS.from_pretrained(device="cuda")
-    torch.cuda.synchronize()
-    log("model ready")
+        log("loading Chatterbox Turbo on CUDA")
+        MODEL = ChatterboxTurboTTS.from_pretrained(device="cuda")
+        torch.cuda.synchronize()
+        log("model ready")
+    else:
+        VENICE_API_KEY = get_venice_api_key()
+        log(f"using Venice TTS model {SETTINGS.tts_model} ({SETTINGS.tts_voice})")
     SOCKET_PATH.unlink(missing_ok=True)
     try:
         with Server(str(SOCKET_PATH), RequestHandler) as server:

@@ -218,6 +218,88 @@ class ProcessUtteranceTests(unittest.TestCase):
             ],
         )
 
+    def test_venice_turn_streams_sentence_chunks_to_playback(self) -> None:
+        daemon = _bare_daemon()
+        played_requests: list[str] = []
+
+        def streamed_turn(
+            _text: str,
+            _history: object,
+            _session: object,
+            **kwargs: object,
+        ) -> tuple[str, None]:
+            callback = kwargs["on_text_chunk"]
+            assert callable(callback)
+            callback("First sentence.")
+            callback("Second sentence.")
+            return "First sentence. Second sentence.", None
+
+        def drain(
+            _response: str,
+            **_kwargs: object,
+        ) -> tuple[
+            list[tuple[dict[str, object], bool, PlaybackRequest]],
+            None,
+        ]:
+            with daemon.playback_queue._lock:
+                requests = [
+                    request for request, _handle in daemon.playback_queue._items
+                ]
+                daemon.playback_queue._items.clear()
+            played_requests.extend(request.text for request in requests)
+            return [
+                (
+                    {
+                        "ok": True,
+                        "played_text": request.text,
+                        "interrupted": False,
+                    },
+                    False,
+                    request,
+                )
+                for request in requests
+            ], None
+
+        with (
+            mock.patch.object(
+                wake_daemon, "transcribe", return_value="tell me something"
+            ),
+            mock.patch.object(wake_daemon, "start_components"),
+            mock.patch.object(
+                wake_daemon, "load_backend_settings"
+            ) as load_backend_settings,
+            mock.patch.object(
+                wake_daemon, "qwen_turn", side_effect=streamed_turn
+            ) as qwen_turn,
+            mock.patch.object(daemon, "_drain_playback_queue", side_effect=drain),
+            mock.patch.object(
+                wake_daemon,
+                "request_context",
+                return_value=RequestContext("tell me something"),
+            ),
+            mock.patch.object(
+                wake_daemon,
+                "route_intent",
+                return_value=IntentRoute(Intent.CONVERSATION, "high"),
+            ),
+            mock.patch.object(wake_daemon, "notify"),
+        ):
+            load_backend_settings.return_value.llm_provider = "venice"
+            daemon.process_utterance(AUDIO_GENERATION, woke=False)
+
+        self.assertEqual(played_requests, ["First sentence.", "Second sentence."])
+        self.assertEqual(
+            daemon.history,
+            [
+                {"role": "user", "content": "tell me something"},
+                {
+                    "role": "assistant",
+                    "content": "First sentence. Second sentence.",
+                },
+            ],
+        )
+        self.assertIn("on_text_chunk", qwen_turn.call_args.kwargs)
+
     def test_turn_preserves_awaiting_job_session_played_before_response(
         self,
     ) -> None:
@@ -884,8 +966,6 @@ class ComponentSynchronizationTests(unittest.TestCase):
             return "OK", None
 
         with (
-            mock.patch.object(wake_daemon.subprocess, "run"),
-            mock.patch.object(wake_daemon, "llm_ready", return_value=True),
             mock.patch.object(wake_daemon, "qwen_turn", side_effect=warm_qwen),
             mock.patch.object(
                 wake_daemon,

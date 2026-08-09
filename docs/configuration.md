@@ -6,6 +6,37 @@ rejects other extra variables and every `EnvironmentFile` on every shipped servi
 Dictation backend selectors belong in `~/.config/dictation/backend.env`, which the
 launcher parses through its separate allowlist.
 
+## AI backends
+
+LLM and TTS providers are selected independently in
+`~/.config/voice-harness/backends.toml`. Both default to `local`; use `venice` for
+either hosted backend:
+
+```toml
+[llm]
+provider = "venice"
+model = "venice-uncensored"
+
+[tts]
+provider = "venice"
+model = "tts-kokoro"
+voice = "af_sky"
+speed = 1.0
+```
+
+The optional `endpoint` and positive `timeout` keys may be set in either section.
+TTS `speed` accepts values from `0.25` to `4.0`. Environment overrides are available
+as `VOICE_HARNESS_LLM_PROVIDER`, `VOICE_HARNESS_LLM_MODEL`,
+`VOICE_HARNESS_LLM_ENDPOINT`, `VOICE_HARNESS_LLM_TIMEOUT`, and their corresponding
+`VOICE_HARNESS_TTS_*` forms, including `VOICE`, `SPEED`, `ENDPOINT`, and `TIMEOUT`.
+
+Store the shared Venice API key with `voice-harness credentials set`; file-based
+credentials are intentionally unsupported. Restart the wake and TTS services after
+changing providers, then run `voice-harness doctor` to verify the configuration and
+credential.
+
+## Runtime variables
+
 | Variable | Purpose | Default | Configuration channel |
 | --- | --- | --- | --- |
 | `VOICE_HARNESS_SOURCE` | PipeWire microphone source | Development-machine source | Wake drop-in |

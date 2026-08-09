@@ -81,11 +81,11 @@ class PrefetchHandle:
             if should_interrupt is not None and should_interrupt():
                 return None
             if time.monotonic() >= deadline:
-                raise HarnessError("Chatterbox prefetch timed out")
+                raise HarnessError("TTS prefetch timed out")
         assert self._result is not None
         if self._result.error is not None:
             raise HarnessError(
-                f"Chatterbox prefetch failed: {type(self._result.error).__name__}: "
+                f"TTS prefetch failed: {type(self._result.error).__name__}: "
                 f"{self._result.error}"
             )
         return self._result
@@ -153,7 +153,7 @@ def _prefetch_utterance(text: str) -> PrefetchedUtterance:
                 event = json.loads(line)
                 if not event.get("ok"):
                     raise HarnessError(
-                        f"Chatterbox failed: {event.get('error', 'unknown error')}"
+                        f"TTS backend failed: {event.get('error', 'unknown error')}"
                     )
                 kind = event.get("event")
                 if kind == "start":
@@ -164,7 +164,7 @@ def _prefetch_utterance(text: str) -> PrefetchedUtterance:
                 elif kind == "done":
                     done_meta = event
         if not chunks or not sample_rate:
-            raise HarnessError("Chatterbox prefetch returned no audio")
+            raise HarnessError("TTS prefetch returned no audio")
         return PrefetchedUtterance(
             sample_rate=sample_rate,
             chunks=chunks,

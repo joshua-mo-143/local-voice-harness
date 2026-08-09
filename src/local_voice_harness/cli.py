@@ -1,9 +1,15 @@
 from __future__ import annotations
 
 import argparse
+import getpass
 from pathlib import Path
 
 from .app import respond, status
+from .credentials import (
+    delete_venice_api_key,
+    get_venice_api_key,
+    store_venice_api_key,
+)
 from .cursor.service import CursorTurnRequest, cursor_turn
 from .diagnostics import doctor
 from .dictation import run as run_dictation
@@ -87,6 +93,20 @@ def parser() -> argparse.ArgumentParser:
         "--fix",
         action="store_true",
         help="offer confirmation-gated repairs for issues that support them",
+    )
+
+    credentials = commands.add_parser(
+        "credentials", help="manage credentials in the desktop Secret Service"
+    )
+    credential_commands = credentials.add_subparsers(
+        dest="credential_command", required=True
+    )
+    credential_commands.add_parser("set", help="securely store the Venice API key")
+    credential_commands.add_parser(
+        "status", help="check whether the Venice API key is stored"
+    )
+    credential_commands.add_parser(
+        "delete", help="delete the Venice API key from Secret Service"
     )
 
     services = commands.add_parser("services")
@@ -224,6 +244,20 @@ def dispatch(args: argparse.Namespace) -> None:
         run_job_command(args)
     elif args.command == "doctor":
         raise SystemExit(doctor(json_output=args.json_output, fix=args.fix))
+    elif args.command == "credentials":
+        if args.credential_command == "set":
+            key = getpass.getpass(
+                "Venice API key (input hidden; paste then press Enter): "
+            )
+            print("Storing Venice API key…", flush=True)
+            store_venice_api_key(key)
+            print("Venice API key stored in the desktop Secret Service")
+        elif args.credential_command == "status":
+            get_venice_api_key()
+            print("Venice API key is stored in the desktop Secret Service")
+        else:
+            delete_venice_api_key()
+            print("Venice API key deleted from the desktop Secret Service")
     elif args.command == "vocabulary":
         _dispatch_vocabulary(args)
     elif args.service_command == "install":

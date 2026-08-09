@@ -294,7 +294,7 @@ class TextToSpeechClientTests(unittest.TestCase):
             mock.patch.object(
                 tts_client, "unix_request", side_effect=ConnectionRefusedError()
             ),
-            self.assertRaisesRegex(HarnessError, "Chatterbox request failed"),
+            self.assertRaisesRegex(HarnessError, "TTS request failed"),
         ):
             tts_client.synthesize_and_play("hello")
 
