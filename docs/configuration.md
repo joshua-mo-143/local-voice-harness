@@ -59,6 +59,10 @@ credential.
 | `VOICE_HARNESS_FOCUSED_APP_MAX_CHARS` | Positive combined focused-app context character cap | `12000` | Wake drop-in |
 | `DICTATION_INJECT` | Focused-window insertion mode (`auto`, `paste`, `type`, or `stdout`) | `auto` | Wake drop-in |
 | `DICTATION_REPLACEMENTS` | Semicolon-separated STT corrections | Cursor/Herdr defaults | Wake drop-in |
+| `DICTATION_VAD_END_SILENCE_MS` | Positive silence duration that finishes VAD dictation | `900` | Calling environment |
+| `DICTATION_VAD_START_SPEECH_FRAMES` | Consecutive 80 ms speech frames required to start an utterance | `3` | Calling environment |
+| `DICTATION_VAD_MAX_SECONDS` | Positive maximum duration of each VAD utterance | `120` | Calling environment |
+| `DICTATION_VAD_MIN_SPEECH_RMS` | Non-negative VAD speech energy gate | `1100` | Calling environment |
 | `DICTATION_BACKEND` | Dictation engine (`parakeet` or `whisper`) | `parakeet` | `backend.env` |
 | `DICTATION_MODEL` | Backend model | `nemo-parakeet-tdt-0.6b-v2` | `backend.env` |
 | `DICTATION_QUANTIZATION` | Parakeet ONNX quantization (`none` disables it) | `int8` | `backend.env` |
@@ -72,6 +76,11 @@ its `origin` identifies the expected fork. The source repository is configured a
 `upstream` remote. Herdr and repository path overrides grant the wake process access
 to the selected executable and trees; review those trusted local paths before
 restarting and auditing the service.
+
+`voice-harness dictate vad` reads its `DICTATION_VAD_*` settings from the process
+that enables it. The listener waits indefinitely for speech, transcribes after the
+configured silence, and then rearms. Another invocation while it is active disables
+the listener. Configure any desktop keybind or wrapper outside the harness.
 
 Transcription and routing accuracy for repository names, issue references, and
 recurring speech-recognition mistakes can be improved with a local, user-owned

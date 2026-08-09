@@ -469,6 +469,37 @@ class RecorderTests(unittest.TestCase):
             self.assertTrue(paths.process.exists())
             self.assertTrue(paths.audio.exists())
 
+    def test_cancel_waits_for_vad_owner_without_holding_recording_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = _paths(Path(temporary))
+            recorder.claim_current_process(paths, mode="vad")
+            paths.audio.write_bytes(b"partial")
+
+            def confirm_unlocked(_pidfd: int, _timeout: float) -> bool:
+                acquired: list[bool] = []
+
+                def take_lock() -> None:
+                    with recorder.recording_lock(paths.state_dir, paths.lock):
+                        acquired.append(True)
+
+                thread = threading.Thread(target=take_lock)
+                thread.start()
+                thread.join(1)
+                self.assertFalse(thread.is_alive())
+                self.assertEqual(acquired, [True])
+                return True
+
+            with (
+                mock.patch.object(recorder, "_pidfd_send"),
+                mock.patch.object(
+                    recorder, "_pidfd_exited", side_effect=confirm_unlocked
+                ),
+            ):
+                recorder.cancel_recording(paths)
+
+            self.assertFalse(paths.process.exists())
+            self.assertFalse(paths.audio.exists())
+
     def test_completed_generation_survives_new_recording_start(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             paths = _paths(Path(temporary))
@@ -497,6 +528,107 @@ class RecorderTests(unittest.TestCase):
 
             self.assertEqual(generation.read_bytes(), contents)
             self.assertFalse(paths.audio.exists())
+
+    def test_vad_owner_can_be_stopped_and_complete_its_generation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = _paths(Path(temporary))
+            recorder.claim_current_process(paths, mode="vad")
+
+            self.assertEqual(recorder.recording_mode(paths), "vad")
+            state = json.loads(paths.process.read_text())
+            self.assertEqual(state["mode"], "vad")
+            with mock.patch.object(recorder, "_pidfd_send") as send:
+                self.assertTrue(recorder.request_vad_stop(paths))
+            send.assert_called_once_with(mock.ANY, signal.SIGTERM)
+
+            contents = b"RIFF-vad" + b"\0" * 64
+            paths.audio.write_bytes(contents)
+            generation = recorder.complete_current_recording(paths, mode="vad")
+
+            self.assertEqual(generation.read_bytes(), contents)
+            self.assertFalse(paths.process.exists())
+
+    def test_vad_completion_can_retain_listener_ownership(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = _paths(Path(temporary))
+            recorder.claim_current_process(paths, mode="vad")
+            paths.audio.write_bytes(b"RIFF-vad" + b"\0" * 64)
+
+            generation = recorder.complete_current_recording(
+                paths,
+                mode="vad",
+                retain_owner=True,
+            )
+
+            self.assertTrue(generation.exists())
+            self.assertEqual(recorder.recording_mode(paths), "vad")
+            recorder.abandon_current_recording(paths, mode="vad")
+
+    def test_vad_stop_rejects_manual_owner(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = _paths(Path(temporary))
+            identity = recorder.process_identity(os.getpid())
+            assert identity is not None
+            _write_state(paths, identity)
+
+            with (
+                mock.patch.object(recorder, "_pidfd_send") as send,
+                self.assertRaisesRegex(HarnessError, "manual dictation"),
+            ):
+                recorder.request_vad_stop(paths)
+
+            send.assert_not_called()
+
+    def test_abandon_vad_owner_removes_state_and_audio(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = _paths(Path(temporary))
+            recorder.claim_current_process(paths, mode="vad")
+            paths.audio.write_bytes(b"partial")
+
+            recorder.abandon_current_recording(paths, mode="vad")
+
+            self.assertFalse(paths.process.exists())
+            self.assertFalse(paths.audio.exists())
+
+    def test_vad_completion_honors_cancellation_under_lock(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = _paths(Path(temporary))
+            recorder.claim_current_process(paths, mode="vad")
+            paths.audio.write_bytes(b"RIFF-vad" + b"\0" * 64)
+
+            with self.assertRaisesRegex(HarnessError, "cancelled"):
+                recorder.complete_current_recording(
+                    paths, mode="vad", cancelled=lambda: True
+                )
+
+            self.assertFalse(paths.process.exists())
+            self.assertFalse(paths.audio.exists())
+
+    def test_concurrent_vad_claims_create_one_owner(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = _paths(Path(temporary))
+            barrier = threading.Barrier(3)
+            results: list[str] = []
+
+            def claim() -> None:
+                barrier.wait()
+                try:
+                    recorder.claim_current_process(paths, mode="vad")
+                except HarnessError:
+                    results.append("blocked")
+                else:
+                    results.append("claimed")
+
+            threads = [threading.Thread(target=claim) for _ in range(2)]
+            for thread in threads:
+                thread.start()
+            barrier.wait()
+            for thread in threads:
+                thread.join(2)
+
+            self.assertCountEqual(results, ["claimed", "blocked"])
+            self.assertEqual(recorder.recording_mode(paths), "vad")
+            recorder.abandon_current_recording(paths, mode="vad")
 
     def test_direct_handoff_rejects_active_recording_non_destructively(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

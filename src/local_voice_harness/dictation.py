@@ -3,7 +3,9 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import signal
 import subprocess
+import threading
 import time
 from pathlib import Path
 
@@ -18,10 +20,11 @@ from .config import (
     STT_SOCKET,
 )
 from .desktop import DesktopError, get_desktop
-from .errors import HarnessError
+from .errors import HarnessError, NoSpeechError
 from .ipc import socket_ready
 from .notifications import notify
 from .stt.client import transcribe
+from .vad import SpeechDetector, VadCaptureSettings, capture_vad_audio
 
 TERMINAL_CLASSES = (
     "alacritty",
@@ -243,6 +246,64 @@ def transcribe_and_type(audio_path: Path) -> None:
     inject(transcribe(audio_path))
 
 
+def run_vad() -> None:
+    if recorder.request_vad_stop(PATHS):
+        notify("Stopping always-on VAD dictation…")
+        print("stopping")
+        return
+
+    _ensure_dictation_allowed()
+    if not socket_ready(STT_SOCKET):
+        raise HarnessError("STT is stopped or still loading")
+    settings = VadCaptureSettings.from_environment()
+    detector = SpeechDetector(minimum_rms=settings.minimum_rms)
+    stop_requested = threading.Event()
+    previous_terminate = signal.getsignal(signal.SIGTERM)
+
+    def request_stop(_signum: int, _frame: object) -> None:
+        stop_requested.set()
+
+    signal.signal(signal.SIGTERM, request_stop)
+    claimed = False
+    try:
+        recorder.claim_current_process(PATHS, mode="vad", conflicts=(MANUAL_PATHS,))
+        claimed = True
+        source = os.environ.get(
+            "DICTATION_SOURCE",
+            os.environ.get("VOICE_HARNESS_SOURCE", DEFAULT_SOURCE),
+        )
+        notify("Always-on VAD dictation enabled")
+        print("listening")
+        while not stop_requested.is_set():
+            try:
+                capture_vad_audio(
+                    PATHS.audio,
+                    source=source,
+                    settings=settings,
+                    detector=detector,
+                    stop_requested=stop_requested,
+                )
+            except HarnessError:
+                if stop_requested.is_set():
+                    break
+                raise
+            generation = recorder.complete_current_recording(
+                PATHS,
+                mode="vad",
+                retain_owner=True,
+            )
+            notify("Transcribing…")
+            _ensure_dictation_allowed()
+            try:
+                transcribe_and_type(generation)
+            except NoSpeechError:
+                print("no speech detected; listening")
+    finally:
+        if claimed:
+            recorder.abandon_current_recording(PATHS, mode="vad")
+        signal.signal(signal.SIGTERM, previous_terminate)
+
+
 def run(command: str) -> None:
     if command == "begin":
         start_recording()
@@ -265,5 +326,7 @@ def run(command: str) -> None:
         transcribe_and_type(audio_path)
     elif command == "cancel":
         cancel_recording()
+    elif command == "vad":
+        run_vad()
     else:
         raise HarnessError(f"unknown dictation command: {command}")

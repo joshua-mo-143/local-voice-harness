@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 import io
+import tempfile
+import threading
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
 from unittest import mock
 
 from local_voice_harness import cli, config, dictation, recording
-from local_voice_harness.errors import HarnessError
+from local_voice_harness.errors import HarnessError, NoSpeechError
 
 
 class DictationTests(unittest.TestCase):
@@ -18,6 +20,11 @@ class DictationTests(unittest.TestCase):
         arguments = cli.parser().parse_args(["dictate", "toggle"])
         self.assertEqual(arguments.command, "dictate")
         self.assertEqual(arguments.dictation_command, "toggle")
+
+    def test_cli_accepts_vad_dictation(self) -> None:
+        arguments = cli.parser().parse_args(["dictate", "vad"])
+        self.assertEqual(arguments.command, "dictate")
+        self.assertEqual(arguments.dictation_command, "vad")
 
     def test_manual_end_passes_completed_generation_to_stt(self) -> None:
         generation = Path("/runtime/voice-harness/recordings/request-generation.wav")
@@ -98,6 +105,167 @@ class DictationTests(unittest.TestCase):
             dictation.run("toggle")
         stop.assert_called_once_with()
         transcribe.assert_called_once_with(generation)
+
+    def test_vad_second_press_stops_always_on_listener(self) -> None:
+        with (
+            mock.patch.object(
+                dictation.recorder, "request_vad_stop", return_value=True
+            ) as stop,
+            mock.patch.object(dictation, "_ensure_dictation_allowed") as allowed,
+            mock.patch.object(dictation, "notify"),
+        ):
+            dictation.run("vad")
+
+        stop.assert_called_once_with(dictation.PATHS)
+        allowed.assert_not_called()
+
+    def test_vad_listener_rearms_after_transcribing(self) -> None:
+        generation = Path("/runtime/dictation/recordings/recording-generation.wav")
+        settings = mock.Mock(minimum_rms=1100)
+
+        def capture_once(*_args: object, **kwargs: object) -> None:
+            stop_requested = kwargs["stop_requested"]
+            assert isinstance(stop_requested, threading.Event)
+            stop_requested.set()
+
+        with (
+            mock.patch.object(
+                dictation.recorder, "request_vad_stop", return_value=False
+            ),
+            mock.patch.object(dictation, "_ensure_dictation_allowed") as allowed,
+            mock.patch.object(dictation, "socket_ready", return_value=True),
+            mock.patch.object(
+                dictation.VadCaptureSettings,
+                "from_environment",
+                return_value=settings,
+            ),
+            mock.patch.object(dictation, "SpeechDetector") as detector,
+            mock.patch.object(dictation.signal, "getsignal", return_value=None),
+            mock.patch.object(dictation.signal, "signal"),
+            mock.patch.object(dictation.recorder, "claim_current_process") as claim,
+            mock.patch.object(
+                dictation, "capture_vad_audio", side_effect=capture_once
+            ) as capture,
+            mock.patch.object(
+                dictation.recorder,
+                "complete_current_recording",
+                return_value=generation,
+            ) as complete,
+            mock.patch.object(
+                dictation.recorder, "abandon_current_recording"
+            ) as abandon,
+            mock.patch.object(dictation, "transcribe_and_type") as transcribe,
+            mock.patch.object(dictation, "notify"),
+        ):
+            dictation.run("vad")
+
+        claim.assert_called_once_with(
+            dictation.PATHS, mode="vad", conflicts=(dictation.MANUAL_PATHS,)
+        )
+        self.assertEqual(capture.call_args.kwargs["detector"], detector.return_value)
+        complete.assert_called_once_with(
+            dictation.PATHS,
+            mode="vad",
+            retain_owner=True,
+        )
+        transcribe.assert_called_once_with(generation)
+        abandon.assert_called_once_with(dictation.PATHS, mode="vad")
+        self.assertEqual(allowed.call_count, 2)
+
+    def test_vad_listener_rearms_when_stt_finds_no_speech(self) -> None:
+        generation = Path("/runtime/dictation/recordings/recording-generation.wav")
+
+        def capture_false_activation(*_args: object, **kwargs: object) -> None:
+            stop_requested = kwargs["stop_requested"]
+            assert isinstance(stop_requested, threading.Event)
+            stop_requested.set()
+
+        with (
+            mock.patch.object(
+                dictation.recorder, "request_vad_stop", return_value=False
+            ),
+            mock.patch.object(dictation, "_ensure_dictation_allowed"),
+            mock.patch.object(dictation, "socket_ready", return_value=True),
+            mock.patch.object(
+                dictation.VadCaptureSettings,
+                "from_environment",
+                return_value=mock.Mock(minimum_rms=1100),
+            ),
+            mock.patch.object(dictation, "SpeechDetector"),
+            mock.patch.object(dictation.signal, "getsignal", return_value=None),
+            mock.patch.object(dictation.signal, "signal"),
+            mock.patch.object(dictation.recorder, "claim_current_process"),
+            mock.patch.object(
+                dictation,
+                "capture_vad_audio",
+                side_effect=capture_false_activation,
+            ),
+            mock.patch.object(
+                dictation.recorder,
+                "complete_current_recording",
+                return_value=generation,
+            ),
+            mock.patch.object(dictation.recorder, "abandon_current_recording"),
+            mock.patch.object(
+                dictation,
+                "transcribe_and_type",
+                side_effect=NoSpeechError("no speech"),
+            ) as transcribe,
+            mock.patch.object(dictation, "notify"),
+        ):
+            dictation.run("vad")
+
+        transcribe.assert_called_once_with(generation)
+
+    def test_stopped_vad_listener_abandons_owned_audio(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            paths = dictation.recorder.RecorderPaths(
+                root,
+                root / "recording.wav",
+                root / "recording.pid",
+                root / "recording.log",
+            )
+
+            def cancel_capture(*_args: object, **kwargs: object) -> None:
+                paths.audio.write_bytes(b"partial")
+                stop_requested = kwargs["stop_requested"]
+                assert isinstance(stop_requested, threading.Event)
+                stop_requested.set()
+                raise HarnessError("cancelled")
+
+            with (
+                mock.patch.object(dictation, "PATHS", paths),
+                mock.patch.object(
+                    dictation.recorder, "request_vad_stop", return_value=False
+                ),
+                mock.patch.object(dictation, "_ensure_dictation_allowed"),
+                mock.patch.object(dictation, "socket_ready", return_value=True),
+                mock.patch.object(
+                    dictation.VadCaptureSettings,
+                    "from_environment",
+                    return_value=mock.Mock(minimum_rms=1100),
+                ),
+                mock.patch.object(dictation, "SpeechDetector"),
+                mock.patch.object(dictation.signal, "getsignal", return_value=None),
+                mock.patch.object(dictation.signal, "signal"),
+                mock.patch.object(dictation.recorder, "claim_current_process"),
+                mock.patch.object(
+                    dictation, "capture_vad_audio", side_effect=cancel_capture
+                ),
+                mock.patch.object(
+                    dictation.recorder,
+                    "abandon_current_recording",
+                    side_effect=lambda *_args, **_kwargs: paths.audio.unlink(
+                        missing_ok=True
+                    ),
+                ) as abandon,
+                mock.patch.object(dictation, "notify"),
+            ):
+                dictation.run("vad")
+
+            abandon.assert_called_once_with(paths, mode="vad")
+            self.assertFalse(paths.audio.exists())
 
     def test_transcribes_typed_dictation_audio(self) -> None:
         generation = Path("/runtime/dictation/recordings/recording-generation.wav")

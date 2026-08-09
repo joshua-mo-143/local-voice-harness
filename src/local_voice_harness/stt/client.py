@@ -5,7 +5,7 @@ import time
 from pathlib import Path
 
 from ..config import STT_SOCKET
-from ..errors import HarnessError
+from ..errors import HarnessError, NoSpeechError
 from ..ipc import unix_request
 
 REQUEST_DEADLINE_SECONDS = 120.0
@@ -64,7 +64,7 @@ def transcribe(audio_path: Path) -> str:
     if text.startswith("__DICTATION_ERROR__:"):
         raise HarnessError(text.removeprefix("__DICTATION_ERROR__:"))
     if not text:
-        raise HarnessError("STT did not recognize any speech")
+        raise NoSpeechError("STT did not recognize any speech")
     print(
         json.dumps({"stage": "stt", "seconds": round(time.perf_counter() - started, 3)})
     )

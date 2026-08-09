@@ -35,6 +35,13 @@ class RecorderPaths:
         return self.state_dir / "recordings"
 
 
+@dataclass(frozen=True)
+class RecorderState:
+    pid: int
+    identity: str | None
+    mode: str
+
+
 def process_identity(pid: int) -> str | None:
     """Return the Linux process start tick, which remains stable for its lifetime."""
 
@@ -70,7 +77,7 @@ def _locked(paths: RecorderPaths) -> Iterator[None]:
         yield
 
 
-def _read_state(paths: RecorderPaths) -> tuple[int, str | None] | None:
+def _read_state(paths: RecorderPaths) -> RecorderState | None:
     try:
         raw = paths.process.read_text()
         try:
@@ -78,21 +85,23 @@ def _read_state(paths: RecorderPaths) -> tuple[int, str | None] | None:
         except ValueError:
             pass
         else:
-            return legacy_pid, None
+            return RecorderState(legacy_pid, None, "manual")
         value = json.loads(raw)
         if not isinstance(value, dict):
             return None
         pid = value.get("pid")
         identity = value.get("process_start")
+        mode = value.get("mode", "manual")
         if (
             isinstance(pid, bool)
             or not isinstance(pid, int)
             or pid <= 0
             or not isinstance(identity, str)
             or not identity
+            or mode not in {"manual", "vad"}
         ):
             return None
-        return pid, identity
+        return RecorderState(pid, identity, mode)
     except (OSError, json.JSONDecodeError):
         return None
 
@@ -113,10 +122,17 @@ def _legacy_command_matches(pid: int, audio_path: Path) -> bool | None:
     )
 
 
-def _write_state(paths: RecorderPaths, pid: int, identity: str) -> None:
+def _write_state(
+    paths: RecorderPaths, pid: int, identity: str, *, mode: str = "manual"
+) -> None:
+    if mode not in {"manual", "vad"}:
+        raise ValueError(f"unsupported recorder mode: {mode}")
     temporary = paths.process.with_suffix(".tmp")
     temporary.write_text(
-        json.dumps({"pid": pid, "process_start": identity}, separators=(",", ":"))
+        json.dumps(
+            {"pid": pid, "process_start": identity, "mode": mode},
+            separators=(",", ":"),
+        )
         + "\n"
     )
     temporary.chmod(0o600)
@@ -232,7 +248,7 @@ def _owned_pidfd(paths: RecorderPaths) -> tuple[int, int] | None:
                 "recorder ownership state is invalid; refusing to replace it"
             )
         return None
-    pid, expected_identity = state
+    pid, expected_identity = state.pid, state.identity
     if pid <= 0:
         raise HarnessError(
             "recorder ownership state is invalid; refusing to replace it"
@@ -262,7 +278,7 @@ def _owned_pidfd(paths: RecorderPaths) -> tuple[int, int] | None:
             os.close(pidfd)
             paths.process.unlink(missing_ok=True)
             return None
-        _write_state(paths, pid, identity)
+        _write_state(paths, pid, identity, mode=state.mode)
         return pid, pidfd
     identity = process_identity(pid)
     if identity is None:
@@ -291,6 +307,96 @@ def recording_active(paths: RecorderPaths) -> bool:
             return False
         os.close(owned[1])
         return True
+
+
+def recording_mode(paths: RecorderPaths) -> str | None:
+    with _locked(paths):
+        owned = _owned_pidfd(paths)
+        if owned is None:
+            return None
+        os.close(owned[1])
+        state = _read_state(paths)
+        if state is None:
+            raise HarnessError("recorder ownership state became invalid")
+        return state.mode
+
+
+def request_vad_stop(paths: RecorderPaths) -> bool:
+    """Ask an active VAD owner to stop; return false when the listener is idle."""
+
+    with _locked(paths):
+        owned = _owned_pidfd(paths)
+        if owned is None:
+            return False
+        _pid, pidfd = owned
+        try:
+            state = _read_state(paths)
+            if state is None:
+                raise HarnessError("recorder ownership state became invalid")
+            if state.mode != "vad":
+                raise HarnessError("manual dictation is already active")
+            _pidfd_send(pidfd, signal.SIGTERM)
+            return True
+        finally:
+            os.close(pidfd)
+
+
+def claim_current_process(
+    paths: RecorderPaths,
+    *,
+    mode: str,
+    conflicts: tuple[RecorderPaths, ...] = (),
+) -> None:
+    if any(candidate.lock != paths.lock for candidate in conflicts):
+        raise ValueError("conflicting recorders do not share an ownership lock")
+    with _locked(paths):
+        for candidate in (paths, *conflicts):
+            owned = _owned_pidfd(candidate)
+            if owned is not None:
+                os.close(owned[1])
+                raise HarnessError("another recording mode is already active")
+        identity = process_identity(os.getpid())
+        if identity is None:
+            raise HarnessError("could not establish recorder process identity")
+        paths.audio.unlink(missing_ok=True)
+        _write_state(paths, os.getpid(), identity, mode=mode)
+
+
+def complete_current_recording(
+    paths: RecorderPaths,
+    *,
+    mode: str,
+    cancelled: Callable[[], bool] | None = None,
+    retain_owner: bool = False,
+) -> Path:
+    with _locked(paths):
+        owned = _owned_pidfd(paths)
+        if owned is None:
+            raise HarnessError("recording ownership was lost before completion")
+        pid, pidfd = owned
+        os.close(pidfd)
+        state = _read_state(paths)
+        if pid != os.getpid() or state is None or state.mode != mode:
+            raise HarnessError("recording is owned by another process")
+        if cancelled is not None and cancelled():
+            paths.process.unlink(missing_ok=True)
+            paths.audio.unlink(missing_ok=True)
+            raise HarnessError("recording was cancelled before completion")
+        if not retain_owner:
+            paths.process.unlink(missing_ok=True)
+        return _handoff_audio_locked(paths)
+
+
+def abandon_current_recording(paths: RecorderPaths, *, mode: str) -> None:
+    with _locked(paths):
+        owned = _owned_pidfd(paths)
+        if owned is not None:
+            pid, pidfd = owned
+            os.close(pidfd)
+            state = _read_state(paths)
+            if pid == os.getpid() and state is not None and state.mode == mode:
+                paths.process.unlink(missing_ok=True)
+        paths.audio.unlink(missing_ok=True)
 
 
 def any_recording_active(paths: tuple[RecorderPaths, ...]) -> bool:
@@ -406,18 +512,40 @@ def stop_recording(paths: RecorderPaths, *, missing_message: str) -> Path:
 def cancel_recording(paths: RecorderPaths) -> None:
     with _locked(paths):
         owned = _owned_pidfd(paths)
-        if owned is not None:
-            _pid, pidfd = owned
-            try:
-                _pidfd_send(pidfd, signal.SIGTERM)
-                if not _pidfd_exited(pidfd, 2):
-                    raise HarnessError(
-                        "recorder did not stop after SIGTERM; ownership was preserved"
-                    )
-            except ProcessLookupError as exc:
-                if not _pidfd_exited(pidfd, 0):
-                    raise HarnessError("recorder exit could not be confirmed") from exc
-            finally:
+        if owned is None:
+            paths.audio.unlink(missing_ok=True)
+            return
+        pid, pidfd = owned
+        state = _read_state(paths)
+        if state is None:
+            os.close(pidfd)
+            raise HarnessError("recorder ownership state became invalid")
+        try:
+            _pidfd_send(pidfd, signal.SIGTERM)
+        except ProcessLookupError as exc:
+            if not _pidfd_exited(pidfd, 0):
                 os.close(pidfd)
-            paths.process.unlink(missing_ok=True)
+                raise HarnessError("recorder exit could not be confirmed") from exc
+
+    try:
+        if not _pidfd_exited(pidfd, 2):
+            raise HarnessError(
+                "recorder did not stop after SIGTERM; ownership was preserved"
+            )
+    finally:
+        os.close(pidfd)
+
+    with _locked(paths):
+        current = _read_state(paths)
+        if current is None and paths.process.exists():
+            raise HarnessError(
+                "recorder ownership changed during cancellation; state was preserved"
+            )
+        if current is not None and (
+            current.pid,
+            current.identity,
+            current.mode,
+        ) != (pid, state.identity, state.mode):
+            return
+        paths.process.unlink(missing_ok=True)
         paths.audio.unlink(missing_ok=True)

@@ -57,7 +57,7 @@ def parser() -> argparse.ArgumentParser:
         "dictate", help="record and type transcription into the focused window"
     )
     dictate_commands = dictate.add_subparsers(dest="dictation_command", required=True)
-    for command in ("begin", "end", "toggle", "transcribe", "cancel"):
+    for command in ("begin", "end", "toggle", "vad", "transcribe", "cancel"):
         dictate_commands.add_parser(command)
     text = commands.add_parser("text")
     text.add_argument("text", nargs="+")
