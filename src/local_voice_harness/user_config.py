@@ -1,0 +1,818 @@
+"""Unified, validated user configuration.
+
+This module introduces a single typed model for user-facing defaults instead of
+spreading settings across ``backends.toml``, environment variables, backend
+environment files, and systemd drop-ins. It is additive: existing installations
+that rely on ``backends.toml`` and environment overrides keep working unchanged,
+and no runtime consumer is rewired here.
+
+Precedence, from lowest to highest, is::
+
+    built-in defaults < config.toml < backends.toml < environment
+
+Credentials are intentionally never read from configuration files; the Venice
+API key stays in the desktop credential store (``voice-harness credentials``).
+"""
+
+from __future__ import annotations
+
+import math
+import os
+import re
+import tempfile
+from collections.abc import Iterable, Mapping
+from dataclasses import dataclass
+from pathlib import Path
+
+from . import config
+from .config import (
+    BackendSettings,
+    backend_settings_from_tables,
+    read_toml_table,
+    reject_file_based_credentials,
+    xdg_config_home,
+)
+
+_TOP_LEVEL_SECTIONS = ("providers", "integrations", "compute", "audio", "platform")
+_PROVIDER_TABLES = ("llm", "tts", "venice")
+_LLM_KEYS = ("provider", "model", "endpoint", "timeout")
+_TTS_KEYS = ("provider", "model", "voice", "speed", "endpoint", "timeout")
+_INTEGRATION_KEYS = ("github", "zendesk", "linear")
+_COMPUTE_KEYS = (
+    "cuda_device",
+    "dictation_backend",
+    "dictation_model",
+    "dictation_quantization",
+    "dictation_compute",
+    "dictation_language",
+)
+_AUDIO_KEYS = (
+    "source",
+    "voice",
+    "wake_threshold",
+    "min_speech_rms",
+    "barge_in_mode",
+    "barge_in_speech_frames",
+    "playback_quiet_frames",
+    "playback_quiet_timeout_seconds",
+    "playback_latency",
+)
+_PLATFORM_KEYS = (
+    "project_root",
+    "github_root",
+    "herdr_bin",
+    "focused_app_context",
+    "focused_app_deny_classes",
+    "focused_app_max_chars",
+    "cursor_followup",
+    "cursor_followup_window_seconds",
+    "cursor_foreground_seconds",
+)
+
+_TRUTHY = {"1", "true", "yes", "on"}
+_FALSY = {"0", "false", "no", "off"}
+_BARGE_IN_MODES = {"wake", "vad", "off"}
+_DICTATION_BACKENDS = {"parakeet", "whisper"}
+_DICTATION_LANGUAGES = {"en", "zh", "english", "chinese", "auto"}
+_PLAYBACK_LATENCY = re.compile(r"^\d+(?:\.\d+)?(?:us|ms|s)$")
+_CREDENTIAL_KEYS = {"api_key", "api_key_file"}
+
+
+class UserConfigurationError(ValueError):
+    """A unified configuration value is missing, malformed, or out of range."""
+
+
+@dataclass(frozen=True)
+class IntegrationSettings:
+    """Optional context and routing integrations.
+
+    Optional integrations default to disabled on fresh installations. Nothing in
+    this module enforces the flags at runtime yet; consumers are wired in later.
+    """
+
+    github_enabled: bool = True
+    zendesk_enabled: bool = False
+    linear_enabled: bool = False
+
+
+@dataclass(frozen=True)
+class ComputeSettings:
+    """GPU device and dictation compute selectors."""
+
+    cuda_device: str = "CUDA0"
+    dictation_backend: str = "parakeet"
+    dictation_model: str = "nemo-parakeet-tdt-0.6b-v2"
+    dictation_quantization: str = "int8"
+    dictation_compute: str = "float16"
+    dictation_language: str = "auto"
+
+
+@dataclass(frozen=True)
+class AudioSettings:
+    """Microphone, wake, barge-in, and playback tuning."""
+
+    source: str = config.DEFAULT_SOURCE
+    voice: str = ""
+    wake_threshold: float = 0.55
+    min_speech_rms: float = 1100.0
+    barge_in_mode: str = "wake"
+    barge_in_speech_frames: int = 5
+    playback_quiet_frames: int = 4
+    playback_quiet_timeout_seconds: float = 2.0
+    playback_latency: str = "100ms"
+
+
+@dataclass(frozen=True)
+class PlatformSettings:
+    """Local trust boundaries and desktop capability toggles."""
+
+    project_root: Path
+    github_root: Path
+    herdr_bin: Path
+    focused_app_context_enabled: bool = True
+    focused_app_deny_classes: tuple[str, ...] = config.DEFAULT_FOCUSED_APP_DENY_CLASSES
+    focused_app_max_chars: int = 12_000
+    cursor_followup_enabled: bool = True
+    cursor_followup_window_seconds: float = 60.0
+    cursor_foreground_seconds: float = 5.0
+
+
+@dataclass(frozen=True)
+class UserConfig:
+    """The complete, validated user configuration."""
+
+    providers: BackendSettings
+    integrations: IntegrationSettings
+    compute: ComputeSettings
+    audio: AudioSettings
+    platform: PlatformSettings
+
+
+def user_config_path(
+    environment: Mapping[str, str] = os.environ,
+    *,
+    home: Path | None = None,
+) -> Path:
+    """Return the path to the unified ``config.toml``."""
+
+    return xdg_config_home(environment, home=home) / "voice-harness" / "config.toml"
+
+
+def _home(home: Path | None) -> Path:
+    return home if home is not None else Path.home()
+
+
+def _section(raw: Mapping[str, object], name: str) -> Mapping[str, object]:
+    value = raw.get(name, {})
+    if not isinstance(value, Mapping):
+        raise UserConfigurationError(f"[{name}] must be a TOML table")
+    return value
+
+
+def _table(section: Mapping[str, object], key: str, *, label: str) -> dict[str, object]:
+    value = section.get(key, {})
+    if not isinstance(value, Mapping):
+        raise UserConfigurationError(f"[{label}] must be a TOML table")
+    return {str(name): item for name, item in value.items()}
+
+
+def _reject_unknown(
+    section: Mapping[str, object], allowed: Iterable[str], *, label: str
+) -> None:
+    permitted = set(allowed)
+    unknown = sorted(key for key in section if key not in permitted)
+    if unknown:
+        raise UserConfigurationError(f"unknown {label} key(s): {', '.join(unknown)}")
+
+
+def _reject_file_credentials(value: object) -> None:
+    if isinstance(value, Mapping):
+        for key, nested in value.items():
+            if key in _CREDENTIAL_KEYS:
+                raise UserConfigurationError(
+                    "credentials must not be stored in configuration files; run "
+                    "`voice-harness credentials set`"
+                )
+            _reject_file_credentials(nested)
+
+
+def _resolve(
+    environment: Mapping[str, str],
+    env_key: str,
+    section: Mapping[str, object],
+    key: str,
+    default: object,
+) -> object:
+    if env_key in environment:
+        return environment[env_key]
+    if key in section:
+        return section[key]
+    return default
+
+
+def _as_bool(value: object, *, label: str) -> bool:
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().casefold()
+    if text in _TRUTHY:
+        return True
+    if text in _FALSY:
+        return False
+    raise UserConfigurationError(f"{label} must be a boolean")
+
+
+def _as_positive_int(value: object, *, label: str) -> int:
+    number = _as_int(value, label=label)
+    if number < 1:
+        raise UserConfigurationError(f"{label} must be a positive integer")
+    return number
+
+
+def _as_int(value: object, *, label: str) -> int:
+    if isinstance(value, bool):
+        raise UserConfigurationError(f"{label} must be an integer")
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError) as exc:
+        raise UserConfigurationError(f"{label} must be an integer") from exc
+
+
+def _as_nonnegative_float(value: object, *, label: str) -> float:
+    try:
+        number = float(str(value))
+    except (TypeError, ValueError) as exc:
+        raise UserConfigurationError(
+            f"{label} must be a finite non-negative number"
+        ) from exc
+    if not math.isfinite(number) or number < 0:
+        raise UserConfigurationError(f"{label} must be a finite non-negative number")
+    return number
+
+
+def _as_float_in_range(value: object, *, label: str, low: float, high: float) -> float:
+    try:
+        number = float(str(value))
+    except (TypeError, ValueError) as exc:
+        raise UserConfigurationError(
+            f"{label} must be a number between {low} and {high}"
+        ) from exc
+    if not math.isfinite(number) or number < low or number > high:
+        raise UserConfigurationError(
+            f"{label} must be a number between {low} and {high}"
+        )
+    return number
+
+
+def _as_nonempty(value: object, *, label: str) -> str:
+    text = str(value).strip()
+    if not text:
+        raise UserConfigurationError(f"{label} must not be empty")
+    return text
+
+
+def _as_choice(value: object, choices: set[str], *, label: str) -> str:
+    text = str(value).strip().casefold()
+    if text not in choices:
+        options = ", ".join(sorted(choices))
+        raise UserConfigurationError(f"{label} must be one of: {options}")
+    return text
+
+
+def _as_path(value: object, *, label: str) -> Path:
+    return Path(_as_nonempty(value, label=label)).expanduser()
+
+
+def _as_classes(value: object, *, label: str) -> tuple[str, ...]:
+    if isinstance(value, (list, tuple)):
+        parts: Iterable[str] = (str(item) for item in value)
+    else:
+        parts = str(value).split(",")
+    return tuple(part for part in (piece.strip().casefold() for piece in parts) if part)
+
+
+def _load_integrations(
+    section: Mapping[str, object], environment: Mapping[str, str]
+) -> IntegrationSettings:
+    _reject_unknown(section, _INTEGRATION_KEYS, label="[integrations]")
+    return IntegrationSettings(
+        github_enabled=_as_bool(
+            _resolve(
+                environment,
+                "VOICE_HARNESS_INTEGRATION_GITHUB",
+                section,
+                "github",
+                True,
+            ),
+            label="integrations.github",
+        ),
+        zendesk_enabled=_as_bool(
+            _resolve(
+                environment,
+                "VOICE_HARNESS_INTEGRATION_ZENDESK",
+                section,
+                "zendesk",
+                False,
+            ),
+            label="integrations.zendesk",
+        ),
+        linear_enabled=_as_bool(
+            _resolve(
+                environment,
+                "VOICE_HARNESS_INTEGRATION_LINEAR",
+                section,
+                "linear",
+                False,
+            ),
+            label="integrations.linear",
+        ),
+    )
+
+
+def _load_compute(
+    section: Mapping[str, object], environment: Mapping[str, str]
+) -> ComputeSettings:
+    _reject_unknown(section, _COMPUTE_KEYS, label="[compute]")
+    return ComputeSettings(
+        cuda_device=_as_nonempty(
+            _resolve(
+                environment,
+                "VOICE_HARNESS_CUDA_DEVICE",
+                section,
+                "cuda_device",
+                "CUDA0",
+            ),
+            label="compute.cuda_device",
+        ),
+        dictation_backend=_as_choice(
+            _resolve(
+                environment,
+                "DICTATION_BACKEND",
+                section,
+                "dictation_backend",
+                "parakeet",
+            ),
+            _DICTATION_BACKENDS,
+            label="compute.dictation_backend",
+        ),
+        dictation_model=_as_nonempty(
+            _resolve(
+                environment,
+                "DICTATION_MODEL",
+                section,
+                "dictation_model",
+                "nemo-parakeet-tdt-0.6b-v2",
+            ),
+            label="compute.dictation_model",
+        ),
+        dictation_quantization=_as_nonempty(
+            _resolve(
+                environment,
+                "DICTATION_QUANTIZATION",
+                section,
+                "dictation_quantization",
+                "int8",
+            ),
+            label="compute.dictation_quantization",
+        ),
+        dictation_compute=_as_nonempty(
+            _resolve(
+                environment,
+                "DICTATION_COMPUTE",
+                section,
+                "dictation_compute",
+                "float16",
+            ),
+            label="compute.dictation_compute",
+        ),
+        dictation_language=_as_choice(
+            _resolve(
+                environment, "DICTATION_LANGUAGE", section, "dictation_language", "auto"
+            ),
+            _DICTATION_LANGUAGES,
+            label="compute.dictation_language",
+        ),
+    )
+
+
+def _load_audio(
+    section: Mapping[str, object], environment: Mapping[str, str]
+) -> AudioSettings:
+    _reject_unknown(section, _AUDIO_KEYS, label="[audio]")
+    playback_latency = str(
+        _resolve(
+            environment,
+            "VOICE_HARNESS_PLAYBACK_LATENCY",
+            section,
+            "playback_latency",
+            "100ms",
+        )
+    ).strip()
+    if not _PLAYBACK_LATENCY.fullmatch(playback_latency):
+        raise UserConfigurationError(
+            "audio.playback_latency must be a non-negative duration ending in "
+            "us, ms, or s"
+        )
+    return AudioSettings(
+        source=_as_nonempty(
+            _resolve(
+                environment,
+                "VOICE_HARNESS_SOURCE",
+                section,
+                "source",
+                config.DEFAULT_SOURCE,
+            ),
+            label="audio.source",
+        ),
+        voice=str(
+            _resolve(environment, "VOICE_HARNESS_VOICE", section, "voice", "")
+        ).strip(),
+        wake_threshold=_as_float_in_range(
+            _resolve(
+                environment,
+                "VOICE_HARNESS_WAKE_THRESHOLD",
+                section,
+                "wake_threshold",
+                0.55,
+            ),
+            label="audio.wake_threshold",
+            low=0.0,
+            high=1.0,
+        ),
+        min_speech_rms=_as_nonnegative_float(
+            _resolve(
+                environment,
+                "VOICE_HARNESS_MIN_SPEECH_RMS",
+                section,
+                "min_speech_rms",
+                1100,
+            ),
+            label="audio.min_speech_rms",
+        ),
+        barge_in_mode=_as_choice(
+            _resolve(
+                environment,
+                "VOICE_HARNESS_BARGE_IN_MODE",
+                section,
+                "barge_in_mode",
+                "wake",
+            ),
+            _BARGE_IN_MODES,
+            label="audio.barge_in_mode",
+        ),
+        barge_in_speech_frames=_as_positive_int(
+            _resolve(
+                environment,
+                "VOICE_HARNESS_BARGE_IN_SPEECH_FRAMES",
+                section,
+                "barge_in_speech_frames",
+                5,
+            ),
+            label="audio.barge_in_speech_frames",
+        ),
+        playback_quiet_frames=_as_positive_int(
+            _resolve(
+                environment,
+                "VOICE_HARNESS_PLAYBACK_QUIET_FRAMES",
+                section,
+                "playback_quiet_frames",
+                4,
+            ),
+            label="audio.playback_quiet_frames",
+        ),
+        playback_quiet_timeout_seconds=_as_nonnegative_float(
+            _resolve(
+                environment,
+                "VOICE_HARNESS_PLAYBACK_QUIET_TIMEOUT_SECONDS",
+                section,
+                "playback_quiet_timeout_seconds",
+                2,
+            ),
+            label="audio.playback_quiet_timeout_seconds",
+        ),
+        playback_latency=playback_latency,
+    )
+
+
+def _load_platform(
+    section: Mapping[str, object],
+    environment: Mapping[str, str],
+    *,
+    home: Path,
+) -> PlatformSettings:
+    _reject_unknown(section, _PLATFORM_KEYS, label="[platform]")
+    return PlatformSettings(
+        project_root=_as_path(
+            _resolve(
+                environment, "VOICE_HARNESS_PROJECT_ROOT", section, "project_root", home
+            ),
+            label="platform.project_root",
+        ),
+        github_root=_as_path(
+            _resolve(
+                environment,
+                "VOICE_HARNESS_GITHUB_ROOT",
+                section,
+                "github_root",
+                home / "src",
+            ),
+            label="platform.github_root",
+        ),
+        herdr_bin=_as_path(
+            _resolve(
+                environment,
+                "VOICE_HARNESS_HERDR_BIN",
+                section,
+                "herdr_bin",
+                home / ".local" / "bin" / "herdr",
+            ),
+            label="platform.herdr_bin",
+        ),
+        focused_app_context_enabled=_as_bool(
+            _resolve(
+                environment,
+                "VOICE_HARNESS_FOCUSED_APP_CONTEXT",
+                section,
+                "focused_app_context",
+                True,
+            ),
+            label="platform.focused_app_context",
+        ),
+        focused_app_deny_classes=_as_classes(
+            _resolve(
+                environment,
+                "VOICE_HARNESS_FOCUSED_APP_DENY",
+                section,
+                "focused_app_deny_classes",
+                list(config.DEFAULT_FOCUSED_APP_DENY_CLASSES),
+            ),
+            label="platform.focused_app_deny_classes",
+        ),
+        focused_app_max_chars=_as_positive_int(
+            _resolve(
+                environment,
+                "VOICE_HARNESS_FOCUSED_APP_MAX_CHARS",
+                section,
+                "focused_app_max_chars",
+                12_000,
+            ),
+            label="platform.focused_app_max_chars",
+        ),
+        cursor_followup_enabled=_as_bool(
+            _resolve(
+                environment,
+                "VOICE_HARNESS_CURSOR_FOLLOWUP",
+                section,
+                "cursor_followup",
+                True,
+            ),
+            label="platform.cursor_followup",
+        ),
+        cursor_followup_window_seconds=_as_nonnegative_float(
+            _resolve(
+                environment,
+                "VOICE_HARNESS_CURSOR_FOLLOWUP_WINDOW_SECONDS",
+                section,
+                "cursor_followup_window_seconds",
+                60,
+            ),
+            label="platform.cursor_followup_window_seconds",
+        ),
+        cursor_foreground_seconds=_as_nonnegative_float(
+            _resolve(
+                environment,
+                "VOICE_HARNESS_CURSOR_FOREGROUND_SECONDS",
+                section,
+                "cursor_foreground_seconds",
+                5,
+            ),
+            label="platform.cursor_foreground_seconds",
+        ),
+    )
+
+
+def _load_providers(
+    section: Mapping[str, object],
+    environment: Mapping[str, str],
+    *,
+    backends_path: Path,
+) -> BackendSettings:
+    _reject_unknown(section, _PROVIDER_TABLES, label="[providers]")
+    config_llm = _table(section, "llm", label="providers.llm")
+    config_tts = _table(section, "tts", label="providers.tts")
+    _reject_unknown(config_llm, _LLM_KEYS, label="[providers.llm]")
+    _reject_unknown(config_tts, _TTS_KEYS, label="[providers.tts]")
+
+    backends = read_toml_table(
+        backends_path,
+        error=UserConfigurationError,
+        label="backend configuration",
+    )
+    backends_llm = _table(backends, "llm", label="backends llm")
+    backends_tts = _table(backends, "tts", label="backends tts")
+    backends_venice = _table(backends, "venice", label="backends venice")
+
+    merged_llm = {**config_llm, **backends_llm}
+    merged_tts = {**config_tts, **backends_tts}
+    try:
+        reject_file_based_credentials(backends_venice, environment)
+        return backend_settings_from_tables(merged_llm, merged_tts, environment)
+    except config.BackendConfigurationError as exc:
+        raise UserConfigurationError(str(exc)) from exc
+
+
+def load_user_config(
+    environment: Mapping[str, str] = os.environ,
+    *,
+    path: Path | None = None,
+    backends_path: Path | None = None,
+    home: Path | None = None,
+) -> UserConfig:
+    """Load and validate the unified configuration.
+
+    Precedence is built-in defaults, then ``config.toml``, then ``backends.toml``
+    (providers only, for backward compatibility), then environment overrides.
+    """
+
+    resolved_home = _home(home)
+    config_path = path or user_config_path(environment, home=resolved_home)
+    backends = backends_path or config.backend_config_path(
+        environment, home=resolved_home
+    )
+
+    raw = read_toml_table(
+        config_path, error=UserConfigurationError, label="user configuration"
+    )
+    _reject_unknown(raw, _TOP_LEVEL_SECTIONS, label="configuration section")
+    _reject_file_credentials(raw)
+
+    return UserConfig(
+        providers=_load_providers(
+            _section(raw, "providers"), environment, backends_path=backends
+        ),
+        integrations=_load_integrations(_section(raw, "integrations"), environment),
+        compute=_load_compute(_section(raw, "compute"), environment),
+        audio=_load_audio(_section(raw, "audio"), environment),
+        platform=_load_platform(
+            _section(raw, "platform"), environment, home=resolved_home
+        ),
+    )
+
+
+def default_user_config(home: Path | None = None) -> UserConfig:
+    """Return the built-in configuration with no files or environment applied."""
+
+    empty = Path(os.devnull)
+    return load_user_config({}, path=empty, backends_path=empty, home=home)
+
+
+def _toml_scalar(value: object) -> str:
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return repr(value)
+    text = str(value).replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{text}"'
+
+
+def _toml_array(values: Iterable[object]) -> str:
+    return "[" + ", ".join(_toml_scalar(value) for value in values) + "]"
+
+
+def _render_table(name: str, entries: Mapping[str, object]) -> list[str]:
+    lines = [f"[{name}]"]
+    for key, value in entries.items():
+        if isinstance(value, (list, tuple)):
+            lines.append(f"{key} = {_toml_array(value)}")
+        else:
+            lines.append(f"{key} = {_toml_scalar(value)}")
+    lines.append("")
+    return lines
+
+
+def render_user_config(user_config: UserConfig) -> str:
+    """Serialize a :class:`UserConfig` to deterministic TOML text."""
+
+    providers = user_config.providers
+    audio = user_config.audio
+    compute = user_config.compute
+    platform = user_config.platform
+    integrations = user_config.integrations
+
+    lines: list[str] = []
+    lines += _render_table(
+        "providers.llm",
+        {
+            "provider": providers.llm_provider,
+            "model": providers.llm_model,
+            "endpoint": providers.llm_endpoint,
+            "timeout": providers.llm_timeout,
+        },
+    )
+    lines += _render_table(
+        "providers.tts",
+        {
+            "provider": providers.tts_provider,
+            "model": providers.tts_model,
+            "voice": providers.tts_voice,
+            "speed": providers.tts_speed,
+            "endpoint": providers.tts_endpoint,
+            "timeout": providers.tts_timeout,
+        },
+    )
+    lines += _render_table(
+        "integrations",
+        {
+            "github": integrations.github_enabled,
+            "zendesk": integrations.zendesk_enabled,
+            "linear": integrations.linear_enabled,
+        },
+    )
+    lines += _render_table(
+        "compute",
+        {
+            "cuda_device": compute.cuda_device,
+            "dictation_backend": compute.dictation_backend,
+            "dictation_model": compute.dictation_model,
+            "dictation_quantization": compute.dictation_quantization,
+            "dictation_compute": compute.dictation_compute,
+            "dictation_language": compute.dictation_language,
+        },
+    )
+    lines += _render_table(
+        "audio",
+        {
+            "source": audio.source,
+            "voice": audio.voice,
+            "wake_threshold": audio.wake_threshold,
+            "min_speech_rms": audio.min_speech_rms,
+            "barge_in_mode": audio.barge_in_mode,
+            "barge_in_speech_frames": audio.barge_in_speech_frames,
+            "playback_quiet_frames": audio.playback_quiet_frames,
+            "playback_quiet_timeout_seconds": audio.playback_quiet_timeout_seconds,
+            "playback_latency": audio.playback_latency,
+        },
+    )
+    lines += _render_table(
+        "platform",
+        {
+            "project_root": str(platform.project_root),
+            "github_root": str(platform.github_root),
+            "herdr_bin": str(platform.herdr_bin),
+            "focused_app_context": platform.focused_app_context_enabled,
+            "focused_app_deny_classes": list(platform.focused_app_deny_classes),
+            "focused_app_max_chars": platform.focused_app_max_chars,
+            "cursor_followup": platform.cursor_followup_enabled,
+            "cursor_followup_window_seconds": platform.cursor_followup_window_seconds,
+            "cursor_foreground_seconds": platform.cursor_foreground_seconds,
+        },
+    )
+    return "\n".join(lines).rstrip("\n") + "\n"
+
+
+def write_user_config(
+    user_config: UserConfig,
+    path: Path,
+) -> None:
+    """Atomically write ``user_config`` to ``path`` with owner-only permissions.
+
+    Providers are serialized into the ``[providers.*]`` tables of the unified
+    file, so credentials are never written; the Venice key stays in the store.
+    """
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = render_user_config(user_config)
+    handle = tempfile.NamedTemporaryFile(
+        "w",
+        encoding="utf-8",
+        dir=path.parent,
+        prefix=f".{path.name}.",
+        suffix=".tmp",
+        delete=False,
+    )
+    temporary = Path(handle.name)
+    try:
+        with handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, path)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
+    _fsync_directory(path.parent)
+
+
+def _fsync_directory(directory: Path) -> None:
+    """Flush a directory entry so a rename survives a crash (best effort)."""
+
+    try:
+        fd = os.open(directory, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)

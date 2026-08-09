@@ -6,6 +6,72 @@ rejects other extra variables and every `EnvironmentFile` on every shipped servi
 Dictation backend selectors belong in `~/.config/dictation/backend.env`, which the
 launcher parses through its separate allowlist.
 
+## Unified configuration (`config.toml`)
+
+`~/.config/voice-harness/config.toml` provides one validated, typed model for
+user-facing defaults across five sections: `providers`, `integrations`,
+`compute`, `audio`, and `platform`. The file is optional. When it is absent, or a
+key is omitted, built-in defaults apply, so existing installations that rely only
+on `backends.toml` and environment variables keep working unchanged.
+
+Values are resolved with a fixed precedence, from lowest to highest:
+
+1. built-in defaults
+2. `config.toml`
+3. `backends.toml` (providers only, for backward compatibility)
+4. environment variables
+
+In other words, an environment override always wins, and a legacy `backends.toml`
+provider setting still takes precedence over the same value in `config.toml`.
+Most fields reuse the `VOICE_HARNESS_*` and `DICTATION_*` names documented in the
+tables below (for example `VOICE_HARNESS_WAKE_THRESHOLD` overrides
+`[audio] wake_threshold`). The sections that previously had no environment knob
+add these overrides: `VOICE_HARNESS_INTEGRATION_GITHUB`,
+`VOICE_HARNESS_INTEGRATION_ZENDESK`, and `VOICE_HARNESS_INTEGRATION_LINEAR` for
+`[integrations]`, and `VOICE_HARNESS_CUDA_DEVICE` for `[compute] cuda_device`.
+
+```toml
+[providers.llm]
+provider = "local"
+
+[providers.tts]
+provider = "local"
+
+[integrations]
+github = true
+zendesk = false
+linear = false
+
+[compute]
+cuda_device = "CUDA0"
+dictation_backend = "parakeet"
+dictation_language = "auto"
+
+[audio]
+wake_threshold = 0.55
+barge_in_mode = "wake"
+playback_latency = "100ms"
+
+[platform]
+focused_app_context = true
+cursor_followup = true
+```
+
+Fresh installations default the optional `zendesk` and `linear` integrations to
+disabled. Invalid values (an unknown provider, an out-of-range TTS speed or wake
+threshold, an unknown section or key, a malformed playback latency, and so on)
+raise an actionable error rather than being silently ignored. Writes are atomic:
+the file is written to a temporary sibling and renamed into place with
+owner-only (`0600`) permissions.
+
+Credentials are never read from or written to `config.toml`; a Venice API key in
+any section is rejected. Store it with `voice-harness credentials set` instead, as
+described under [AI backends](#ai-backends).
+
+This section is the foundation for later configuration and integration
+management; runtime services continue to read the environment variables and files
+described below until they are migrated.
+
 ## AI backends
 
 LLM and TTS providers are selected independently in
