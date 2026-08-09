@@ -21,12 +21,14 @@ model = "venice-uncensored"
 provider = "venice"
 model = "tts-kokoro"
 voice = "af_sky"
-speed = 1.0
+speed = 1.25
 ```
 
 The optional `endpoint` and positive `timeout` keys may be set in either section.
-TTS `speed` accepts values from `0.25` to `4.0`. Environment overrides are available
-as `VOICE_HARNESS_LLM_PROVIDER`, `VOICE_HARNESS_LLM_MODEL`,
+Venice TTS defaults to pitch-preserving `1.25` speed, applied locally through
+FFmpeg so the result is consistent across models. Local TTS defaults to `1.0`.
+TTS `speed` accepts values from `0.25` to `4.0`. Environment overrides are
+available as `VOICE_HARNESS_LLM_PROVIDER`, `VOICE_HARNESS_LLM_MODEL`,
 `VOICE_HARNESS_LLM_ENDPOINT`, `VOICE_HARNESS_LLM_TIMEOUT`, and their corresponding
 `VOICE_HARNESS_TTS_*` forms, including `VOICE`, `SPEED`, `ENDPOINT`, and `TIMEOUT`.
 

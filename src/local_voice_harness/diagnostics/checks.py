@@ -50,6 +50,7 @@ REQUIRED_EXECUTABLES: tuple[tuple[str, str], ...] = (
     ("pw-record", "record microphone audio through PipeWire"),
     ("pw-play", "play synthesized speech through PipeWire"),
     ("llama-server", "serve the Qwen conversational model with llama.cpp"),
+    ("ffmpeg", "adjust Venice speech speed without changing pitch"),
     ("uv", "manage reproducible Python environments"),
     ("herdr", "manage Cursor agents"),
     ("agent", "run delegated work through the Cursor CLI"),
@@ -62,6 +63,7 @@ INSTALL_HINTS: dict[str, str] = {
     "pw-record": "paru -S --needed pipewire",
     "pw-play": "paru -S --needed pipewire",
     "llama-server": "paru -S --needed cuda llama.cpp-cuda",
+    "ffmpeg": "paru -S --needed ffmpeg",
     "uv": "paru -S --needed uv",
     "herdr": "curl -fsSL https://herdr.dev/install.sh | sh",
     "agent": "curl https://cursor.com/install -fsS | bash",
@@ -150,6 +152,9 @@ def check_required_executables() -> list[CheckResult]:
     for name, purpose in REQUIRED_EXECUTABLES:
         if name == "llama-server" and settings is not None:
             if settings.llm_provider == "venice":
+                continue
+        if name == "ffmpeg" and settings is not None:
+            if settings.tts_provider != "venice":
                 continue
         location = _which(name)
         if location is not None:
