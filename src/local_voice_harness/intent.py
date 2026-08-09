@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 
 from .browser_context import RequestContext
-from .config import load_backend_settings
+from .config import BackendConfigurationError, load_backend_settings
 from .credentials import get_venice_api_key
 from .errors import HarnessError
 
@@ -244,6 +244,7 @@ def route_intent(
         with urllib.request.urlopen(request, timeout=settings.llm_timeout) as response:
             return _parse_route(json.load(response))
     except (
+        BackendConfigurationError,
         HarnessError,
         OSError,
         urllib.error.URLError,
