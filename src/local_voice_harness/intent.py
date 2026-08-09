@@ -208,39 +208,40 @@ def route_intent(
 ) -> IntentRoute:
     try:
         settings = load_backend_settings()
-        payload = json.dumps(
-            {
-                "model": settings.llm_model,
-                "messages": [
-                    {"role": "system", "content": ROUTER_SYSTEM_PROMPT},
-                    {
-                        "role": "user",
-                        "content": json.dumps(
-                            {
-                                "utterance": text,
-                                "cursor_job_awaiting_reply": cursor_session is not None,
-                                "pending_cursor_question": pending_question,
-                                "clarification_kind": clarification_kind,
-                                "recent_completed_job": (
-                                    recent_completion and cursor_session is None
-                                ),
-                                "focused_repository": context.focused_repository,
-                                "focused_issue": context.focused_issue,
-                            }
-                        ),
-                    },
-                ],
-                "tools": [ROUTE_TOOL],
-                "tool_choice": {
-                    "type": "function",
-                    "function": {"name": "route_intent"},
+        request_data: dict[str, object] = {
+            "model": settings.llm_model,
+            "messages": [
+                {"role": "system", "content": ROUTER_SYSTEM_PROMPT},
+                {
+                    "role": "user",
+                    "content": json.dumps(
+                        {
+                            "utterance": text,
+                            "cursor_job_awaiting_reply": cursor_session is not None,
+                            "pending_cursor_question": pending_question,
+                            "clarification_kind": clarification_kind,
+                            "recent_completed_job": (
+                                recent_completion and cursor_session is None
+                            ),
+                            "focused_repository": context.focused_repository,
+                            "focused_issue": context.focused_issue,
+                        }
+                    ),
                 },
-                "parallel_tool_calls": False,
-                "temperature": 0,
-                "max_tokens": 64,
-                "stream": False,
-            }
-        ).encode()
+            ],
+            "tools": [ROUTE_TOOL],
+            "tool_choice": {
+                "type": "function",
+                "function": {"name": "route_intent"},
+            },
+            "parallel_tool_calls": False,
+            "temperature": 0,
+            "max_tokens": 64,
+            "stream": False,
+        }
+        if settings.llm_provider == "venice":
+            request_data["reasoning"] = {"enabled": False}
+        payload = json.dumps(request_data).encode()
         headers = {"Content-Type": "application/json"}
         if settings.llm_provider == "venice":
             headers["Authorization"] = f"Bearer {get_venice_api_key()}"
