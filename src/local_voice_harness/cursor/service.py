@@ -5,6 +5,7 @@ import os
 import re
 import time
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import NamedTuple
 
@@ -22,7 +23,7 @@ from .model import (
     NewCursorJob,
 )
 from .provisioning import run_claimed_worker
-from .store import JobStore
+from .store import FollowUpCheckoutBusy, FollowUpUnavailable, JobStore
 
 DELIVERY_RETRY_SECONDS = 5.0
 FOREGROUND_GRACE_SECONDS = 2.0
@@ -72,6 +73,8 @@ class CursorTurnRequest:
     action: str = "submit"
     job_id: str | None = None
     reference: str | None = None
+    expected_completed_at: float | None = None
+    on_follow_up_started: Callable[[], None] | None = None
 
 
 class CursorTurnResult(NamedTuple):
@@ -342,6 +345,53 @@ def reply_job(job_id: str, text: str, *, trusted_utterance: str | None = None) -
         launch_worker(job_id)
 
 
+def start_follow_up(
+    parent_job_id: str,
+    text: str,
+    *,
+    expected_completed_at: float | None = None,
+    utterance: str | None = None,
+    on_created: Callable[[], None] | None = None,
+) -> str:
+    """Create and launch a child job that reuses a completed parent's checkout."""
+    now = time.time()
+    child_id = uuid.uuid4().hex[:12]
+    spoken = utterance if utterance is not None else text
+
+    def build(parent: CursorJob) -> CursorJob:
+        return CursorJob.new(
+            NewCursorJob(
+                id=child_id,
+                parent_job_id=parent.id,
+                request=text,
+                created_at=now,
+                foreground_until=(
+                    now + CURSOR_FOREGROUND_SECONDS + FOREGROUND_GRACE_SECONDS
+                ),
+                utterance=utterance,
+                trusted_utterance=spoken,
+                repository=parent.repository,
+                context_repository=parent.repository,
+                worktree_branch=parent.worktree_branch,
+                worktree_path=parent.worktree_path,
+                worktree_label=parent.worktree_label,
+                worktree_workspace_id=parent.worktree_workspace_id,
+                worktree_root_pane_id=parent.worktree_root_pane_id,
+                worktree_provision_state="ready",
+                issue_key=parent.issue_key,
+                speakable_label=parent.speakable_label,
+            )
+        )
+
+    created = _job_store().create_follow_up(
+        parent_job_id, build, expected_completed_at=expected_completed_at
+    )
+    if on_created is not None:
+        on_created()
+    launch_worker(created.id)
+    return created.id
+
+
 def _cancel_target_and_release(
     job_id: str,
     target: str,
@@ -521,8 +571,8 @@ def release_delivery(job_id: str, token: str, *, retry: bool = True) -> bool:
     return delivery.release_delivery(_job_store(), job_id, token, retry=retry)
 
 
-def acknowledge_deliveries(claims: DeliveryClaims) -> None:
-    delivery.acknowledge_deliveries(_job_store(), claims)
+def acknowledge_deliveries(claims: DeliveryClaims) -> list[DeliveryClaim]:
+    return delivery.acknowledge_deliveries(_job_store(), claims)
 
 
 def release_deliveries(claims: DeliveryClaims) -> None:
@@ -685,6 +735,7 @@ def cursor_turn(
     reference: str | None = None,
     delivery_claims: DeliveryClaims | None = None,
 ) -> CursorTurnResult:
+    on_follow_up_started: Callable[[], None] | None = None
     if isinstance(request, CursorTurnRequest):
         text = request.text
         session_id = request.session_id
@@ -701,8 +752,11 @@ def cursor_turn(
         action = request.action
         job_id = request.job_id
         reference = request.reference
+        expected_completed_at = request.expected_completed_at
+        on_follow_up_started = request.on_follow_up_started
     else:
         text = request
+        expected_completed_at = None
     if action == "list":
         return CursorTurnResult(list_jobs(), session_id)
     if action == "status":
@@ -766,6 +820,27 @@ def cursor_turn(
         assert reply_id is not None
         reply_job(reply_id, text, trusted_utterance=utterance)
         job_id = reply_id
+    elif action == "follow_up":
+        if not job_id:
+            return CursorTurnResult(
+                "I don't have a recent completed Cursor job to follow up on.", None
+            )
+        try:
+            job_id = start_follow_up(
+                job_id,
+                text,
+                expected_completed_at=expected_completed_at,
+                utterance=utterance,
+                on_created=on_follow_up_started,
+            )
+        except FollowUpCheckoutBusy:
+            return CursorTurnResult(
+                "That checkout is busy with another Cursor job right now.", None
+            )
+        except FollowUpUnavailable:
+            return CursorTurnResult(
+                "I can no longer follow up on that Cursor job.", None
+            )
     else:
         job_id = start_job(
             text,
@@ -780,6 +855,12 @@ def cursor_turn(
             context_repository=context_repository,
             issue_key=issue_key,
         )
+    return _await_foreground(job_id, delivery_claims)
+
+
+def _await_foreground(
+    job_id: str, delivery_claims: DeliveryClaims | None
+) -> CursorTurnResult:
     started = time.perf_counter()
     deadline = time.monotonic() + CURSOR_FOREGROUND_SECONDS
     while time.monotonic() < deadline:

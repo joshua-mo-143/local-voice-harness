@@ -13,6 +13,69 @@ from local_voice_harness.cursor.model import (
 )
 
 
+class FollowUpLineageTests(unittest.TestCase):
+    def _child(self, **fields: object) -> CursorJob:
+        value: dict[str, object] = {
+            "schema_version": CURRENT_SCHEMA_VERSION,
+            "id": "123456789abc",
+            "parent_job_id": "aaaaaaaaaaaa",
+            "revision": 0,
+            "request": "review",
+            "status": JobStatus.QUEUED.value,
+            "created_at": 1,
+            "queued_at": 1,
+            "delivered": False,
+            "repository": "/repo",
+            "worktree_branch": "voice/feature",
+            "worktree_path": "/repo-wt",
+            "worktree_provision_state": "ready",
+        }
+        value.update(fields)
+        return CursorJob.from_dict(value)
+
+    def test_parent_job_id_round_trips(self) -> None:
+        child = self._child()
+        self.assertEqual(child.parent_job_id, "aaaaaaaaaaaa")
+        self.assertEqual(child.to_dict()["parent_job_id"], "aaaaaaaaaaaa")
+
+    def test_transition_cannot_change_parent_job_id(self) -> None:
+        child = self._child()
+        with self.assertRaises(JobValidationError):
+            transition(child, JobStatus.QUEUED, parent_job_id="dddddddddddd")
+
+    def test_child_cannot_substitute_inherited_checkout(self) -> None:
+        child = self._child()
+        with self.assertRaises(JobValidationError):
+            transition(child, JobStatus.QUEUED, worktree_path="/somewhere-else")
+
+    def test_child_cannot_remove_inherited_worktree(self) -> None:
+        child = self._child()
+        with self.assertRaises(JobValidationError):
+            transition(child, JobStatus.QUEUED, worktree_path=None)
+
+    def test_child_recovery_keeps_confirmed_absent_worktree_identity(self) -> None:
+        child = self._child(
+            worktree_provision_state="failed_observing",
+            worktree_dispatch_exited=True,
+        )
+
+        updated = child.record_operation_observation(
+            "worktree",
+            "worktree_provision_state",
+            frozenset({"failed_observing"}),
+            now=10,
+            observed_absent=True,
+            failed_max_attempts=1,
+            uncertain_max_attempts=6,
+            base_seconds=5,
+            max_seconds=60,
+        )
+
+        assert updated is not None
+        self.assertEqual(updated.worktree_provision_state, "confirmed_absent")
+        self.assertEqual(updated.worktree_path, "/repo-wt")
+
+
 class CursorJobModelTests(unittest.TestCase):
     def job_for_status(self, status: JobStatus) -> CursorJob:
         value: dict[str, object] = {

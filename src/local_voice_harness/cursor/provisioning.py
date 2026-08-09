@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+import uuid
 from collections.abc import Callable, Set
 from dataclasses import dataclass
 from pathlib import Path
@@ -19,6 +20,7 @@ from ..integrations.herdr import (
     HerdrError,
     extract_linear_issue,
     extract_marker,
+    normalize_name,
 )
 from . import worker_lifecycle
 from .model import (
@@ -269,11 +271,20 @@ def _worker_complete(
     )
 
 
-def _worker_fail(store: JobStore, job_id: str, token: str, exc: Exception) -> None:
+def _worker_fail(
+    store: JobStore,
+    job_id: str,
+    token: str,
+    exc: Exception,
+    *,
+    target_may_be_active: bool = False,
+) -> None:
     message = (str(exc) or type(exc).__name__)[:500]
 
     def fail(job: CursorJob) -> CursorJob:
-        uncertain = job.has_uncertain_operation()
+        uncertain = job.has_uncertain_operation() or (
+            target_may_be_active and bool(job.herdr_target)
+        )
         if uncertain:
             message_with_fence = (
                 f"{message}; external operation reconciliation is pending"
@@ -385,15 +396,19 @@ def _reserve_worker_target(
     def reserve(job: CursorJob) -> CursorJob | None:
         if job.worker_token != token or job.status.value != "routing":
             return None
+        repository_value = job.repository if job.parent_job_id else str(repository)
+        worktree_value = (
+            job.worktree_path if job.parent_job_id else selection.worktree_path
+        )
         return transition(
             job,
             job.status,
-            repository=str(repository),
+            repository=repository_value,
             issue_key=issue_key,
             herdr_target=target,
             herdr_pane_id=selection.pane_id,
             herdr_workspace_id=selection.workspace_id,
-            worktree_path=selection.worktree_path,
+            worktree_path=worktree_value,
             agent_name=selection.name,
             agent_dispatch_state="dispatching" if dispatching else "ready",
             worker_operation="agent_start" if dispatching else None,
@@ -636,6 +651,161 @@ def _settle_fork_operation(
     return store.update(job_id, settle)
 
 
+def _validate_followup_checkout(
+    client: HerdrClient, job: CursorJob
+) -> tuple[Path, Path, str, dict[str, object]]:
+    """Confirm a follow-up child's inherited checkout still exists in Herdr."""
+    repository = Path(job.repository or "").resolve()
+    checkout = Path(job.worktree_path or "").resolve()
+    branch = job.worktree_branch or ""
+    if not client.allowed_repository(repository):
+        raise HarnessError("follow-up parent repository is not allowed")
+    if checkout == repository:
+        raise HarnessError("refusing to follow up in the shared repository clone")
+    if not checkout.is_dir() or not (checkout / ".git").exists():
+        raise HarnessError("follow-up worktree is missing")
+    listing = client.run_json("worktree", "list", "--cwd", str(repository), "--json")
+    match = next(
+        (
+            item
+            for item in listing.get("worktrees") or []
+            if item.get("branch") == branch
+            and Path(str(item.get("path") or "")).resolve() == checkout
+        ),
+        None,
+    )
+    if match is None:
+        raise HarnessError("follow-up worktree no longer matches Herdr")
+    return repository, checkout, branch, match
+
+
+def _validate_followup_agent_cwd(checkout: Path, cwd: object) -> None:
+    """Require a follow-up agent to run in the retained checkout."""
+    value = str(cwd or "").strip()
+    if not value:
+        raise HarnessError(
+            "follow-up Cursor agent did not report its working directory"
+        )
+    try:
+        agent_checkout = Path(value).resolve()
+    except OSError as exc:
+        raise HarnessError(
+            "follow-up Cursor agent working directory is invalid"
+        ) from exc
+    if agent_checkout != checkout:
+        raise HarnessError("follow-up Cursor agent is attached to a different checkout")
+
+
+def _validate_followup_agent_binding(
+    checkout: Path,
+    *,
+    cwd: object,
+    pane_id: object,
+    workspace_id: object,
+    expected_pane_id: str | None,
+    expected_workspace_id: str | None,
+) -> None:
+    _validate_followup_agent_cwd(checkout, cwd)
+    if expected_pane_id and str(pane_id or "") != expected_pane_id:
+        raise HarnessError("follow-up Cursor agent pane does not match its reservation")
+    if expected_workspace_id and str(workspace_id or "") != expected_workspace_id:
+        raise HarnessError(
+            "follow-up Cursor agent workspace does not match its reservation"
+        )
+
+
+def _provision_followup_agent(
+    store: JobStore,
+    job_id: str,
+    token: str,
+    job: CursorJob,
+    client: HerdrClient,
+    reserved: set[str],
+    checkpoint: Callable[[], None],
+) -> tuple[CursorJob, str]:
+    """Reserve a settled agent at the child's exact retained checkout."""
+    repository, checkout, _branch, match = _validate_followup_checkout(client, job)
+    checkpoint()
+    existing = client.find_agent(checkout=checkout, reserved=reserved)
+    if existing is not None:
+        _validate_followup_agent_cwd(checkout, existing.cwd)
+        selection = existing
+        reserved_job = _reserve_worker_target(
+            store,
+            job_id,
+            token,
+            selection,
+            repository,
+            job.issue_key,
+            dispatching=False,
+        )
+    else:
+        label = job.worktree_label or repository.name
+        workspace_id = job.worktree_workspace_id or ""
+        pane = job.worktree_root_pane_id or ""
+        if not workspace_id or not pane:
+            raise HarnessError(
+                "follow-up worktree has no retained Herdr pane for safe agent startup"
+            )
+        open_workspace_id = str(match.get("open_workspace_id") or "")
+        if open_workspace_id and open_workspace_id != workspace_id:
+            raise HarnessError(
+                "follow-up worktree is open in a different Herdr workspace"
+            )
+        name = f"voice-{normalize_name(label)[:15] or 'task'}-{uuid.uuid4().hex[:10]}"
+        provisional = AgentSelection(
+            target=name,
+            pane_id=pane,
+            workspace_id=workspace_id,
+            cwd=str(checkout),
+            name=name,
+            worktree_path=job.worktree_path,
+        )
+        reserved_job = _reserve_worker_target(
+            store,
+            job_id,
+            token,
+            provisional,
+            repository,
+            job.issue_key,
+            dispatching=True,
+        )
+        if reserved_job is None:
+            raise HarnessError("could not reserve a Cursor agent for the follow-up")
+        checkpoint()
+        try:
+            selection = client.start_agent(
+                checkout,
+                label,
+                pane,
+                workspace_id,
+                name=name,
+                checkpoint=checkpoint,
+            )
+        except HerdrError as exc:
+            _fail_worker_agent_dispatch(store, job_id, token, exc)
+            raise
+        if selection.target != name:
+            error = HerdrError(
+                "Herdr started a different follow-up agent than the reserved target",
+                code="operation_ambiguous",
+            )
+            _fail_worker_agent_dispatch(store, job_id, token, error)
+            raise error
+        _validate_followup_agent_binding(
+            checkout,
+            cwd=selection.cwd,
+            pane_id=selection.pane_id,
+            workspace_id=selection.workspace_id,
+            expected_pane_id=pane,
+            expected_workspace_id=workspace_id,
+        )
+        reserved_job = _settle_worker_agent(store, job_id, token, selection)
+    if reserved_job is None:
+        raise HarnessError("could not reserve a Cursor agent for the follow-up")
+    return reserved_job, selection.target
+
+
 def run_claimed_worker(
     context: worker_lifecycle.WorkerContext,
     factories: ClientFactories | None = None,
@@ -645,6 +815,7 @@ def run_claimed_worker(
     job_id = context.job.id
     job = context.job
     worker_token = context.token
+    prompt_may_be_active = False
 
     def checkpoint() -> None:
         context.checkpoint()
@@ -654,7 +825,27 @@ def run_claimed_worker(
         checkpoint()
         client.ensure_server()
         checkpoint()
+        followup_checkout: Path | None = None
+        followup_target_verified = False
+        if job.parent_job_id:
+            _repository, followup_checkout, _branch, _match = (
+                _validate_followup_checkout(client, job)
+            )
+            checkpoint()
         if job.reconcile:
+            if followup_checkout is not None and job.herdr_target:
+                agent = client.get_agent(job.herdr_target)
+                if not agent:
+                    raise HarnessError("follow-up Cursor agent is no longer available")
+                _validate_followup_agent_binding(
+                    followup_checkout,
+                    cwd=agent.get("cwd"),
+                    pane_id=agent.get("pane_id"),
+                    workspace_id=agent.get("workspace_id"),
+                    expected_pane_id=job.herdr_pane_id,
+                    expected_workspace_id=job.herdr_workspace_id,
+                )
+                checkpoint()
             output, agent_status = read_agent_completion(
                 client, job, wait=True, checkpoint=checkpoint
             )
@@ -683,6 +874,11 @@ def run_claimed_worker(
         checkpoint()
         continuation = job.continuation
         target = job.herdr_target or ""
+        if job.parent_job_id:
+            _repository, followup_checkout, _branch, _match = (
+                _validate_followup_checkout(client, job)
+            )
+            checkpoint()
         if target and job.agent_dispatch_state == "dispatching":
             checkout_value = job.worktree_path or ""
             pane = job.herdr_pane_id or ""
@@ -716,6 +912,15 @@ def run_claimed_worker(
                     agent = {}
                 checkpoint()
                 if agent:
+                    if followup_checkout is not None:
+                        _validate_followup_agent_binding(
+                            followup_checkout,
+                            cwd=agent.get("cwd"),
+                            pane_id=agent.get("pane_id"),
+                            workspace_id=agent.get("workspace_id"),
+                            expected_pane_id=pane or None,
+                            expected_workspace_id=workspace or None,
+                        )
                     selection = AgentSelection(
                         target=target,
                         pane_id=str(agent.get("pane_id") or pane),
@@ -733,11 +938,21 @@ def run_claimed_worker(
                         name=target,
                         checkpoint=checkpoint,
                     )
+                    if followup_checkout is not None:
+                        _validate_followup_agent_binding(
+                            followup_checkout,
+                            cwd=selection.cwd,
+                            pane_id=selection.pane_id,
+                            workspace_id=selection.workspace_id,
+                            expected_pane_id=pane or None,
+                            expected_workspace_id=workspace or None,
+                        )
                 updated = _settle_worker_agent(store, job_id, worker_token, selection)
                 if updated is None:
                     return
                 job = updated
                 target = selection.target
+                followup_target_verified = followup_checkout is not None
                 checkpoint()
             else:
 
@@ -761,6 +976,39 @@ def run_claimed_worker(
                     return
                 job = updated
                 target = ""
+        if (
+            not target
+            and job.parent_job_id
+            and job.worktree_path
+            and job.repository
+            and job.worktree_branch
+        ):
+            checkpoint()
+            job, target = _provision_followup_agent(
+                store,
+                job_id,
+                worker_token,
+                job,
+                client,
+                reserved_targets(store, job_id),
+                checkpoint,
+            )
+            followup_target_verified = True
+            checkpoint()
+        if target and followup_checkout is not None and not followup_target_verified:
+            checkpoint()
+            agent = client.get_agent(target)
+            if not agent:
+                raise HarnessError("follow-up Cursor agent is no longer available")
+            _validate_followup_agent_binding(
+                followup_checkout,
+                cwd=agent.get("cwd"),
+                pane_id=agent.get("pane_id"),
+                workspace_id=agent.get("workspace_id"),
+                expected_pane_id=job.herdr_pane_id,
+                expected_workspace_id=job.herdr_workspace_id,
+            )
+            checkpoint()
         if not target:
             repository: Path | None = None
             repositories: list[Path] = []
@@ -1139,6 +1387,7 @@ def run_claimed_worker(
         ):
             return
         checkpoint()
+        prompt_may_be_active = True
         outcome = client.prompt_and_wait(
             target,
             cursor_prompt(
@@ -1162,7 +1411,14 @@ def run_claimed_worker(
             output=outcome.output,
             agent_status=outcome.status,
         )
+        prompt_may_be_active = False
     except WorkerCancelled:
         return
     except Exception as exc:
-        _worker_fail(store, job_id, worker_token, exc)
+        _worker_fail(
+            store,
+            job_id,
+            worker_token,
+            exc,
+            target_may_be_active=prompt_may_be_active,
+        )

@@ -93,6 +93,7 @@ def _bare_daemon() -> WakeConversationDaemon:
     instance = WakeConversationDaemon.__new__(WakeConversationDaemon)
     instance.history = []
     instance.cursor_session = None
+    instance.completed_followup = None
     instance.conversation_deadline = 0.0
     instance.awaiting_followup = False
     instance.last_wake = 0.0
@@ -203,6 +204,7 @@ class ProcessUtteranceTests(unittest.TestCase):
             None,
             trusted_utterance="what time is it",
             delivery_claims=mock.ANY,
+            allow_tools=False,
         )
         transcribe.assert_called_once_with(AUDIO_GENERATION)
         self.assertTrue(
@@ -581,6 +583,7 @@ class ProcessUtteranceTests(unittest.TestCase):
             *,
             trusted_utterance: str,
             delivery_claims: list[DeliveryClaim],
+            allow_tools: bool = True,
         ) -> tuple[str, None]:
             self.assertEqual(trusted_utterance, "question")
             delivery_claims.append(
@@ -1194,7 +1197,7 @@ class InterruptedTurnTests(unittest.TestCase):
                     _playback_batch(
                         "Cursor finished. done",
                         interrupted=True,
-                        job_id="job3",
+                        job_id="cccccccccccc",
                         delivery_token="claim",
                         job_status="completed",
                     ),
@@ -1210,8 +1213,61 @@ class InterruptedTurnTests(unittest.TestCase):
 
         self.assertIs(result, interruption)
         acknowledge.assert_not_called()
-        release.assert_called_once_with("job3", "claim")
+        release.assert_called_once_with("cccccccccccc", "claim")
         stop_components.assert_not_called()
+
+    def test_barge_in_releases_later_announcements_before_user_response(self) -> None:
+        daemon = _bare_daemon()
+        interruption = wake_daemon.BargeIn(initial=[b"user"], woke=True)
+        daemon._enqueue_job_announcement(
+            _delivery_claim("job1", "completed", result="first", token="claim1")
+        )
+        daemon._enqueue_job_announcement(
+            _delivery_claim(
+                "job2",
+                "completed",
+                result="Hey Jarvis, second",
+                token="claim2",
+            )
+        )
+        with daemon.playback_queue._lock:
+            first_request = daemon.playback_queue._items[0][0]
+        batch = [
+            (
+                {
+                    "played_text": "",
+                    "interrupted": True,
+                },
+                True,
+                first_request,
+            )
+        ]
+
+        with (
+            mock.patch.object(wake_daemon, "acknowledge_delivery") as acknowledge,
+            mock.patch.object(wake_daemon, "release_delivery") as release,
+            mock.patch.object(wake_daemon, "start_components"),
+            mock.patch.object(wake_daemon, "stop_components"),
+            mock.patch.object(
+                daemon,
+                "_drain_playback_queue",
+                return_value=(batch, interruption),
+            ) as drain,
+            mock.patch.object(wake_daemon, "notify"),
+        ):
+            result = daemon._play_pending_announcements()
+
+        self.assertIs(result, interruption)
+        acknowledge.assert_not_called()
+        self.assertEqual(
+            release.call_args_list,
+            [
+                mock.call("aaaaaaaaaaaa", "claim1"),
+                mock.call("bbbbbbbbbbbb", "claim2"),
+            ],
+        )
+        self.assertEqual(len(daemon.playback_queue), 0)
+        self.assertIn("Hey Jarvis, second", drain.call_args.args[0])
 
 
 class WakeRecordingHandoffTests(unittest.TestCase):
@@ -1426,6 +1482,310 @@ class RunLoopFollowupTests(unittest.TestCase):
             "follow-up must pass its generation and be handled as woke=False",
         )
         self.assertEqual(len(recorded), 1)
+
+
+class CompletedFollowupContextTests(unittest.TestCase):
+    def test_completed_announcement_installs_context(self) -> None:
+        daemon = _bare_daemon()
+        with (
+            mock.patch.object(wake_daemon, "CURSOR_FOLLOWUP_ENABLED", True),
+            mock.patch.object(
+                wake_daemon.CURSOR_STORE,
+                "get",
+                return_value=mock.Mock(completed_at=123.0),
+            ),
+            mock.patch.object(wake_daemon, "notify"),
+        ):
+            daemon._enable_post_job_conversation(
+                job_id="bbbbbbbbbbbb", job_status="completed", played_text="done"
+            )
+
+        assert daemon.completed_followup is not None
+        self.assertEqual(daemon.completed_followup.job_id, "bbbbbbbbbbbb")
+        self.assertEqual(daemon.completed_followup.completed_at, 123.0)
+        self.assertGreater(daemon.completed_followup.expires_at, time.monotonic())
+
+    def test_foreground_completion_installs_context_after_playback(self) -> None:
+        daemon = _bare_daemon()
+        claim = _delivery_claim("job2", "completed", result="done")
+
+        def finish_in_foreground(
+            _request: CursorTurnRequest,
+            *,
+            delivery_claims: list[DeliveryClaim],
+        ) -> tuple[str, None]:
+            delivery_claims.append(claim)
+            return "done", None
+
+        def acknowledge(
+            claims: list[DeliveryClaim],
+        ) -> list[DeliveryClaim]:
+            acknowledged = list(claims)
+            claims.clear()
+            return acknowledged
+
+        with (
+            mock.patch.object(wake_daemon, "CURSOR_FOLLOWUP_ENABLED", True),
+            mock.patch.object(wake_daemon.CURSOR_STORE, "get", return_value=claim.job),
+            mock.patch.object(wake_daemon, "transcribe", return_value="do the task"),
+            mock.patch.object(wake_daemon, "start_components"),
+            mock.patch.object(
+                wake_daemon,
+                "request_context",
+                side_effect=lambda text: RequestContext(text),
+            ),
+            mock.patch.object(
+                wake_daemon,
+                "route_intent",
+                return_value=IntentRoute(Intent.CURSOR_SUBMIT, "high"),
+            ),
+            mock.patch.object(
+                wake_daemon, "cursor_turn", side_effect=finish_in_foreground
+            ),
+            mock.patch.object(
+                wake_daemon, "acknowledge_deliveries", side_effect=acknowledge
+            ),
+            mock.patch.object(
+                daemon,
+                "_drain_playback_queue",
+                return_value=(_playback_batch("done"), None),
+            ),
+            mock.patch.object(wake_daemon, "notify"),
+        ):
+            daemon.process_utterance(AUDIO_GENERATION, woke=False)
+
+        assert daemon.completed_followup is not None
+        self.assertEqual(daemon.completed_followup.job_id, "bbbbbbbbbbbb")
+        self.assertEqual(daemon.completed_followup.completed_at, 1)
+
+    def test_kill_switch_disables_context(self) -> None:
+        daemon = _bare_daemon()
+        with (
+            mock.patch.object(wake_daemon, "CURSOR_FOLLOWUP_ENABLED", False),
+            mock.patch.object(wake_daemon.CURSOR_STORE, "get") as get,
+            mock.patch.object(wake_daemon, "notify"),
+        ):
+            daemon._enable_post_job_conversation(
+                job_id="bbbbbbbbbbbb", job_status="completed", played_text="done"
+            )
+
+        self.assertIsNone(daemon.completed_followup)
+        get.assert_not_called()
+
+    def test_awaiting_job_completion_swaps_slots(self) -> None:
+        daemon = _bare_daemon()
+        daemon.cursor_session = "bbbbbbbbbbbb"
+        with (
+            mock.patch.object(wake_daemon, "CURSOR_FOLLOWUP_ENABLED", True),
+            mock.patch.object(
+                wake_daemon.CURSOR_STORE,
+                "get",
+                return_value=mock.Mock(completed_at=5.0),
+            ),
+            mock.patch.object(wake_daemon, "notify"),
+        ):
+            daemon._enable_post_job_conversation(
+                job_id="bbbbbbbbbbbb", job_status="completed", played_text="done"
+            )
+
+        self.assertIsNone(daemon.cursor_session)
+        assert daemon.completed_followup is not None
+        self.assertEqual(daemon.completed_followup.job_id, "bbbbbbbbbbbb")
+
+    def test_active_context_expires(self) -> None:
+        daemon = _bare_daemon()
+        daemon.completed_followup = wake_daemon.CompletedFollowup(
+            job_id="bbbbbbbbbbbb",
+            completed_at=1.0,
+            expires_at=time.monotonic() - 1,
+        )
+        self.assertIsNone(daemon._active_completed_followup())
+        self.assertIsNone(daemon.completed_followup)
+
+    def _run_route(
+        self,
+        daemon: WakeConversationDaemon,
+        route: IntentRoute,
+        *,
+        transcript: str,
+        follow_up_started: bool = True,
+        expire_during_routing: bool = False,
+    ) -> mock.Mock:
+        def run_cursor(request: CursorTurnRequest, **_kwargs: object):
+            if follow_up_started and request.on_follow_up_started is not None:
+                request.on_follow_up_started()
+            return "ok", None
+
+        cursor_turn = mock.Mock(side_effect=run_cursor)
+
+        def routed(*_args: object, **_kwargs: object) -> IntentRoute:
+            if expire_during_routing and daemon.completed_followup is not None:
+                daemon.completed_followup.expires_at = time.monotonic() - 1
+            return route
+
+        with (
+            mock.patch.object(wake_daemon, "transcribe", return_value=transcript),
+            mock.patch.object(wake_daemon, "start_components"),
+            mock.patch.object(
+                wake_daemon,
+                "request_context",
+                side_effect=lambda text: RequestContext(text),
+            ),
+            mock.patch.object(wake_daemon, "route_intent", side_effect=routed),
+            mock.patch.object(wake_daemon, "cursor_turn", cursor_turn),
+            mock.patch.object(wake_daemon, "qwen_turn") as qwen_turn,
+            mock.patch.object(
+                daemon,
+                "_drain_playback_queue",
+                return_value=(_playback_batch("ok"), None),
+            ),
+            mock.patch.object(wake_daemon, "notify"),
+        ):
+            daemon.process_utterance(AUDIO_GENERATION, woke=False)
+        self._last_qwen = qwen_turn
+        return cursor_turn
+
+    def test_followup_route_dispatches_and_consumes_slot(self) -> None:
+        daemon = _bare_daemon()
+        daemon.completed_followup = wake_daemon.CompletedFollowup(
+            job_id="bbbbbbbbbbbb",
+            completed_at=9.0,
+            expires_at=time.monotonic() + 60,
+        )
+        cursor_turn = self._run_route(
+            daemon,
+            IntentRoute(Intent.CURSOR_FOLLOWUP, "high"),
+            transcript="review the changes",
+        )
+
+        cursor_turn.assert_called_once()
+        request = cursor_turn.call_args.args[0]
+        self.assertEqual(request.action, "follow_up")
+        self.assertEqual(request.job_id, "bbbbbbbbbbbb")
+        self.assertEqual(request.expected_completed_at, 9.0)
+        self.assertIsNone(daemon.completed_followup)
+
+    def test_followup_route_without_context_declines_without_tools(self) -> None:
+        daemon = _bare_daemon()
+        cursor_turn = self._run_route(
+            daemon,
+            IntentRoute(Intent.CURSOR_FOLLOWUP, "high"),
+            transcript="review the changes",
+        )
+        cursor_turn.assert_not_called()
+        self._last_qwen.assert_not_called()
+
+    def test_busy_followup_preserves_context_until_expiry(self) -> None:
+        daemon = _bare_daemon()
+        retained = wake_daemon.CompletedFollowup(
+            job_id="bbbbbbbbbbbb",
+            completed_at=9.0,
+            expires_at=time.monotonic() + 60,
+        )
+        daemon.completed_followup = retained
+
+        cursor_turn = self._run_route(
+            daemon,
+            IntentRoute(Intent.CURSOR_FOLLOWUP, "high"),
+            transcript="review the changes",
+            follow_up_started=False,
+        )
+
+        cursor_turn.assert_called_once()
+        self.assertIs(daemon.completed_followup, retained)
+        retained.expires_at = time.monotonic() - 1
+        self.assertIsNone(daemon._active_completed_followup())
+
+    def test_followup_expiring_during_routing_is_not_dispatched(self) -> None:
+        daemon = _bare_daemon()
+        daemon.completed_followup = wake_daemon.CompletedFollowup(
+            job_id="bbbbbbbbbbbb",
+            completed_at=9.0,
+            expires_at=time.monotonic() + 60,
+        )
+
+        cursor_turn = self._run_route(
+            daemon,
+            IntentRoute(Intent.CURSOR_FOLLOWUP, "high"),
+            transcript="review the changes",
+            expire_during_routing=True,
+        )
+
+        cursor_turn.assert_not_called()
+        self.assertIsNone(daemon.completed_followup)
+        self._last_qwen.assert_not_called()
+
+    def test_pending_clarification_takes_precedence_over_completed_context(
+        self,
+    ) -> None:
+        daemon = _bare_daemon()
+        daemon.cursor_session = "aaaaaaaaaaaa"
+        retained = wake_daemon.CompletedFollowup(
+            job_id="bbbbbbbbbbbb",
+            completed_at=9.0,
+            expires_at=time.monotonic() + 60,
+        )
+        daemon.completed_followup = retained
+
+        cursor_turn = self._run_route(
+            daemon,
+            IntentRoute(Intent.CURSOR_REPLY, "high"),
+            transcript="use the api repository",
+        )
+
+        request = cursor_turn.call_args.args[0]
+        self.assertEqual(request.action, "reply")
+        self.assertEqual(request.job_id, "aaaaaaaaaaaa")
+        self.assertIs(daemon.completed_followup, retained)
+
+    def test_non_actionable_cursor_route_cannot_reach_tools(self) -> None:
+        daemon = _bare_daemon()
+        cursor_turn = self._run_route(
+            daemon,
+            IntentRoute(Intent.CURSOR_SUBMIT, "medium"),
+            transcript="maybe change the code",
+        )
+
+        cursor_turn.assert_not_called()
+        self._last_qwen.assert_called_once()
+        self.assertFalse(self._last_qwen.call_args.kwargs["allow_tools"])
+
+    def test_explicit_submit_clears_context(self) -> None:
+        daemon = _bare_daemon()
+        daemon.completed_followup = wake_daemon.CompletedFollowup(
+            job_id="bbbbbbbbbbbb",
+            completed_at=9.0,
+            expires_at=time.monotonic() + 60,
+        )
+        cursor_turn = self._run_route(
+            daemon,
+            IntentRoute(Intent.CURSOR_SUBMIT, "high"),
+            transcript="work on a new ticket",
+        )
+        cursor_turn.assert_called_once()
+        self.assertEqual(cursor_turn.call_args.args[0].action, "submit")
+        self.assertIsNone(daemon.completed_followup)
+
+    def test_pr_unsupported_declines_without_starting_a_job(self) -> None:
+        daemon = _bare_daemon()
+        cursor_turn = self._run_route(
+            daemon,
+            IntentRoute(Intent.CURSOR_PR_UNSUPPORTED, "high"),
+            transcript="open a pull request",
+        )
+        cursor_turn.assert_not_called()
+        self._last_qwen.assert_not_called()
+        self.assertTrue(daemon.awaiting_followup)
+
+    def test_medium_confidence_pr_is_still_declined_without_tools(self) -> None:
+        daemon = _bare_daemon()
+        cursor_turn = self._run_route(
+            daemon,
+            IntentRoute(Intent.CURSOR_PR_UNSUPPORTED, "medium"),
+            transcript="open a pull request",
+        )
+        cursor_turn.assert_not_called()
+        self._last_qwen.assert_not_called()
 
 
 if __name__ == "__main__":

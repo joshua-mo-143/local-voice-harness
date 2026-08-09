@@ -246,6 +246,35 @@ class CursorStoreIntegrationTests(unittest.TestCase):
             list((durable / ".quarantine").glob("bbbbbbbbbbbb-legacy-import-*.json"))
         )
 
+    def test_legacy_import_respects_new_durable_quarantine_evidence(self) -> None:
+        legacy = self.jobs_dir / "runtime"
+        durable = self.jobs_dir / "state"
+        legacy.mkdir()
+        durable.mkdir()
+        malformed = self.job(
+            "aaaaaaaaaaaa",
+            status="running",
+            worktree_path="/worktrees/shared",
+        )
+        malformed["parent_job_id"] = "invalid"
+        (durable / "aaaaaaaaaaaa.json").write_text(json.dumps(malformed))
+        (legacy / "bbbbbbbbbbbb.json").write_text(
+            json.dumps(
+                self.job(
+                    "bbbbbbbbbbbb",
+                    worktree_path="/worktrees/shared",
+                )
+            )
+        )
+
+        with self.assertWarns(JobQuarantineWarning):
+            migrate_legacy_jobs(legacy, durable)
+
+        self.assertFalse((durable / "bbbbbbbbbbbb.json").exists())
+        self.assertTrue(
+            list((durable / ".quarantine").glob("bbbbbbbbbbbb-legacy-import-*.json"))
+        )
+
     def test_lower_revision_collision_requires_matching_created_at_lineage(
         self,
     ) -> None:
@@ -465,6 +494,98 @@ class CursorStoreIntegrationTests(unittest.TestCase):
         self.assertTrue(
             list((self.jobs_dir / ".quarantine").glob("aaaaaaaaaaaa-*.json"))
         )
+
+    def test_newly_quarantined_peer_blocks_plain_create_reservation(self) -> None:
+        store = JobStore(self.jobs_dir, self.jobs_dir / "legacy")
+        malformed = self.job(
+            "aaaaaaaaaaaa",
+            status="running",
+            herdr_target="shared-agent",
+        )
+        malformed["parent_job_id"] = "invalid"
+        (self.jobs_dir / "aaaaaaaaaaaa.json").write_text(json.dumps(malformed))
+        candidate = CursorJob.from_dict(
+            self.job("bbbbbbbbbbbb", herdr_target="shared-agent")
+        )
+
+        with (
+            self.assertWarns(JobQuarantineWarning),
+            self.assertRaisesRegex(
+                JobValidationError,
+                "blocked by unresolved quarantine evidence",
+            ),
+        ):
+            store.create(candidate)
+
+        self.assertFalse((self.jobs_dir / "bbbbbbbbbbbb.json").exists())
+
+    def test_terminal_uncertain_operation_keeps_live_target_reservation(self) -> None:
+        self.write(
+            self.job(
+                "aaaaaaaaaaaa",
+                status="failed",
+                completed_at=2,
+                error="timed out",
+                result="timed out",
+                herdr_target="shared-agent",
+                agent_dispatch_state="ambiguous",
+                cancellation_reconciliation_pending=True,
+            )
+        )
+
+        with self.assertRaisesRegex(JobValidationError, "reserved by both"):
+            self.write(
+                self.job(
+                    "bbbbbbbbbbbb",
+                    herdr_target="shared-agent",
+                )
+            )
+
+    def test_terminal_quarantined_pull_request_keeps_worktree_reservation(
+        self,
+    ) -> None:
+        self.write(
+            self.job(
+                "aaaaaaaaaaaa",
+                status="failed",
+                completed_at=2,
+                error="checkout failed",
+                result="checkout failed",
+                worktree_path="/worktrees/quarantined",
+                worktree_branch="voice/github-pr-aaaaaaaaaaaa",
+                pull_request_worktree_state="quarantined",
+            )
+        )
+
+        with self.assertRaisesRegex(JobValidationError, "reserved by both"):
+            self.write(
+                self.job(
+                    "bbbbbbbbbbbb",
+                    worktree_path="/worktrees/quarantined",
+                )
+            )
+
+    def test_quarantine_evidence_does_not_block_existing_owner_release(self) -> None:
+        store = JobStore(self.jobs_dir, self.jobs_dir / "legacy")
+        store.create(
+            CursorJob.from_dict(self.job("aaaaaaaaaaaa", herdr_target="owned-agent"))
+        )
+        (self.jobs_dir / "bbbbbbbbbbbb.json").write_text("{unknown")
+
+        with self.assertWarns(JobQuarantineWarning):
+            updated = store.update(
+                "aaaaaaaaaaaa",
+                lambda current: transition(
+                    current,
+                    JobStatus.CANCELLED,
+                    result="cancelled",
+                    completed_at=2,
+                    target_release_pending=True,
+                ),
+            )
+
+        assert updated is not None
+        self.assertTrue(updated.target_release_pending)
 
     def test_unknown_quarantine_blocks_any_new_reservation(self) -> None:
         store = JobStore(self.jobs_dir, self.jobs_dir / "legacy")

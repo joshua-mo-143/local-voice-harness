@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any
 
-CURRENT_SCHEMA_VERSION = 7
+CURRENT_SCHEMA_VERSION = 8
 LEGACY_SCHEMA_VERSIONS = frozenset(range(CURRENT_SCHEMA_VERSION))
 LEGACY_BOOT_ID = "legacy-unknown"
 
@@ -173,6 +173,7 @@ _FLOAT_FIELDS = frozenset(
 _STRING_FIELDS = frozenset(
     {
         "id",
+        "parent_job_id",
         "request",
         "utterance",
         "trusted_utterance",
@@ -292,6 +293,12 @@ class NewCursorJob:
     agent_hint: str | None = None
     issue_key: str | None = None
     speakable_label: str | None = None
+    parent_job_id: str | None = None
+    repository: str | None = None
+    worktree_path: str | None = None
+    worktree_workspace_id: str | None = None
+    worktree_root_pane_id: str | None = None
+    worktree_provision_state: str | None = None
 
 
 def _integer(value: object, field: str) -> int:
@@ -466,6 +473,14 @@ class CursorJob:
         job_id = str(values.get("id") or "")
         if not re.fullmatch(r"[0-9a-f]{12}", job_id):
             raise JobValidationError("id must be 12 lowercase hexadecimal characters")
+        parent_job_id = values.get("parent_job_id")
+        if parent_job_id is not None:
+            if not re.fullmatch(r"[0-9a-f]{12}", str(parent_job_id)):
+                raise JobValidationError(
+                    "parent_job_id must be 12 lowercase hexadecimal characters"
+                )
+            if parent_job_id == job_id:
+                raise JobValidationError("parent_job_id must not reference the child")
         try:
             status = JobStatus(str(values.get("status") or ""))
         except ValueError as exc:
@@ -603,6 +618,7 @@ class CursorJob:
         return cls.from_dict(
             {
                 "id": spec.id,
+                "parent_job_id": spec.parent_job_id,
                 "schema_version": CURRENT_SCHEMA_VERSION,
                 "revision": 0,
                 "request": spec.request,
@@ -610,6 +626,7 @@ class CursorJob:
                 "trusted_utterance": spec.trusted_utterance,
                 "repository_hint": spec.repository_hint,
                 "context_repository": spec.context_repository,
+                "repository": spec.repository,
                 "github_repository": spec.github_repository,
                 "github_issue": spec.github_issue,
                 "github_issue_url": spec.github_issue_url,
@@ -618,6 +635,10 @@ class CursorJob:
                 "github_pull_request": spec.github_pull_request,
                 "worktree_branch": spec.worktree_branch,
                 "worktree_label": spec.worktree_label,
+                "worktree_path": spec.worktree_path,
+                "worktree_workspace_id": spec.worktree_workspace_id,
+                "worktree_root_pane_id": spec.worktree_root_pane_id,
+                "worktree_provision_state": spec.worktree_provision_state,
                 "pull_request_worktree_state": spec.pull_request_worktree_state,
                 "agent_hint": spec.agent_hint,
                 "issue_key": spec.issue_key,
@@ -839,11 +860,12 @@ class CursorJob:
                     agent_dispatch_exited=None,
                 )
             elif operation == "worktree":
-                changes.update(
-                    worktree_path=None,
-                    worktree_workspace_id=None,
-                    worktree_root_pane_id=None,
-                )
+                if self.parent_job_id is None:
+                    changes.update(
+                        worktree_path=None,
+                        worktree_workspace_id=None,
+                        worktree_root_pane_id=None,
+                    )
         elif attempts >= uncertain_max_attempts:
             changes.update(
                 {
@@ -912,6 +934,10 @@ class CursorJob:
     @property
     def context_repository(self) -> str | None:
         return self._optional_string("context_repository")
+
+    @property
+    def parent_job_id(self) -> str | None:
+        return self._optional_string("parent_job_id")
 
     @property
     def repository(self) -> str | None:
@@ -1396,6 +1422,24 @@ def validate_transition(before: CursorJob, after: CursorJob) -> None:
         raise JobValidationError("Cursor job transition cannot change id")
     if before.created_at != after.created_at:
         raise JobValidationError("Cursor job transition cannot change created_at")
+    if before.parent_job_id != after.parent_job_id:
+        raise JobValidationError("Cursor job transition cannot change parent_job_id")
+    if after.parent_job_id is not None:
+        # A follow-up child inherits its parent's exact checkout. That identity
+        # must never be substituted, removed, or reconstructed by recovery.
+        for field in (
+            "repository",
+            "worktree_branch",
+            "worktree_path",
+            "worktree_workspace_id",
+            "worktree_root_pane_id",
+        ):
+            old = before._values.get(field)
+            new = after._values.get(field)
+            if old != new:
+                raise JobValidationError(
+                    f"follow-up child cannot change inherited {field}"
+                )
     if after.revision != before.revision + 1:
         raise JobValidationError(
             "Cursor job revision must increase by exactly one "
@@ -1437,7 +1481,16 @@ def validate_reservations(jobs: list[CursorJob]) -> None:
     targets: dict[str, str] = {}
     worktrees: dict[str, str] = {}
     for job in jobs:
-        reserves = job.status in ACTIVE_STATUSES or job.target_release_pending
+        reserves = (
+            job.status in ACTIVE_STATUSES
+            or job.target_release_pending
+            or job.cancellation_reconciliation_pending
+            or job.has_uncertain_operation()
+            or job.manual_reconcile_operation is not None
+            or job.worktree_manual_inspection_required
+            or job.worktree_provision_state in {"quarantined", "manual_required"}
+            or job.pull_request_worktree_state == "quarantined"
+        )
         if reserves and job.herdr_target:
             owner = targets.setdefault(job.herdr_target, job.id)
             if owner != job.id:

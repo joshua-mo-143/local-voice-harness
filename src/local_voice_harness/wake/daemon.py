@@ -18,6 +18,8 @@ from .. import recorder
 from ..browser_context import request_context
 from ..components import start_components, stop_components
 from ..config import (
+    CURSOR_FOLLOWUP_ENABLED,
+    CURSOR_FOLLOWUP_WINDOW_SECONDS,
     DEFAULT_SOURCE,
     DICTATION_PID_PATH,
     DICTATION_RECORDER_LOG,
@@ -101,8 +103,8 @@ def release_delivery(job_id: str, token: str) -> bool:
     return release_claim(CURSOR_STORE, job_id, token)
 
 
-def acknowledge_deliveries(claims: DeliveryClaims) -> None:
-    acknowledge_claims(CURSOR_STORE, claims)
+def acknowledge_deliveries(claims: DeliveryClaims) -> list[DeliveryClaim]:
+    return acknowledge_claims(CURSOR_STORE, claims)
 
 
 def release_deliveries(claims: DeliveryClaims) -> None:
@@ -142,6 +144,19 @@ class BargeIn:
     woke: bool
 
 
+@dataclass
+class CompletedFollowup:
+    """A bounded, one-shot reference to the last announced completed job.
+
+    ``expires_at`` is a ``time.monotonic()`` deadline, so it is intentionally
+    volatile and cannot survive a restart.
+    """
+
+    job_id: str
+    completed_at: float | None
+    expires_at: float
+
+
 def log(message: str) -> None:
     print(f"[voice-harness-wake] {message}", file=sys.stderr, flush=True)
 
@@ -175,6 +190,7 @@ class WakeConversationDaemon:
         )
         self.history: list[dict[str, str]] = []
         self.cursor_session: str | None = None
+        self.completed_followup: CompletedFollowup | None = None
         self.conversation_deadline = 0.0
         self.awaiting_followup = False
         self.last_wake = 0.0
@@ -348,6 +364,7 @@ class WakeConversationDaemon:
         log(f"conversation closed: {reason}")
         self.history.clear()
         self.cursor_session = None
+        self.completed_followup = None
         self.conversation_deadline = 0.0
         self.awaiting_followup = False
         self.pause_microphone()
@@ -589,11 +606,64 @@ class WakeConversationDaemon:
             self.history = self.history[-8:]
         if job_status == "awaiting_user":
             self.cursor_session = job_id
-        elif job_status == "completed" and self.cursor_session == job_id:
-            self.cursor_session = None
+        elif job_status == "completed":
+            # A job that was awaiting clarification and then completes must give
+            # up the clarification slot and take the completed slot atomically.
+            if self.cursor_session == job_id:
+                self.cursor_session = None
+            self._remember_completed_job(job_id)
         self.conversation_deadline = time.monotonic() + CONVERSATION_TIMEOUT_SECONDS
         self.awaiting_followup = True
         notify("Listening for a follow-up…")
+
+    def _remember_completed_job(self, job_id: str) -> None:
+        """Install the most recently played completed job as follow-up context.
+
+        Called only after a successful, uninterrupted announcement was
+        acknowledged, so the reference reflects work the user just heard about.
+        The last successfully announced completion wins.
+        """
+        if not CURSOR_FOLLOWUP_ENABLED:
+            return
+        try:
+            job = CURSOR_STORE.get(job_id)
+        except HarnessError:
+            return
+        except Exception as exc:  # noqa: BLE001 - never let context tracking crash a turn
+            log(f"follow-up context skipped for {job_id}: {type(exc).__name__}: {exc}")
+            return
+        self.completed_followup = CompletedFollowup(
+            job_id=job_id,
+            completed_at=job.completed_at,
+            expires_at=time.monotonic() + CURSOR_FOLLOWUP_WINDOW_SECONDS,
+        )
+        log(f"follow-up context retained for completed job {job_id}")
+
+    def _active_completed_followup(self) -> CompletedFollowup | None:
+        """Return the live completed reference, clearing it once it has expired."""
+        followup = self.completed_followup
+        if followup is None:
+            return None
+        if time.monotonic() >= followup.expires_at:
+            self.completed_followup = None
+            return None
+        return followup
+
+    def _pending_cursor_clarification(self) -> tuple[str | None, str | None]:
+        """Return trusted clarification context for the active Cursor session."""
+        if self.cursor_session is None:
+            return None, None
+        try:
+            job = CURSOR_STORE.get(self.cursor_session)
+        except Exception as exc:  # noqa: BLE001 - routing must fail closed
+            log(
+                "clarification context unavailable for "
+                f"{self.cursor_session}: {type(exc).__name__}: {exc}"
+            )
+            return None, None
+        if job.status != JobStatus.AWAITING_USER:
+            return None, None
+        return job.question, job.clarification_kind
 
     def _finish_job_playback(
         self,
@@ -626,9 +696,14 @@ class WakeConversationDaemon:
         self.pause_microphone()
         batch: list[tuple[dict[str, object], bool, PlaybackRequest]] = []
         interruption: BargeIn | None = None
-        finished: set[int] = set()
+        finished: set[tuple[str, str] | int] = set()
         with self.playback_queue._lock:
             pending_requests = [request for request, _ in self.playback_queue._items]
+
+        def request_key(request: PlaybackRequest) -> tuple[str, str] | int:
+            if request.job_id and request.delivery_token:
+                return request.job_id, request.delivery_token
+            return id(request)
 
         def finish_job(
             playback: dict[str, object],
@@ -637,25 +712,37 @@ class WakeConversationDaemon:
         ) -> None:
             if request.job_id:
                 self._finish_job_playback(request, playback, interrupted=interrupted)
-            finished.add(id(request))
+            finished.add(request_key(request))
 
         try:
             with self.component_lock:
                 start_components()
                 self.playback_queue.start_prefetch()
             batch, interruption = self._drain_playback_queue(
-                self.playback_queue.peek_text(),
+                self.playback_queue.queued_text(),
                 on_played=finish_job,
             )
             for playback, interrupted, request in batch:
-                if id(request) not in finished:
+                if request_key(request) not in finished:
                     finish_job(playback, interrupted, request)
+            if interruption is not None:
+                # Barge-in must not leave later announcements ahead of the
+                # user's response. Release their durable claims so they can be
+                # announced again only after the interrupted turn completes.
+                self.playback_queue.clear()
+                for request in pending_requests:
+                    if (
+                        request_key(request) not in finished
+                        and request.delivery_token
+                        and request.job_id
+                    ):
+                        release_delivery(request.job_id, request.delivery_token)
             return interruption
         except Exception as exc:
             self.playback_queue.clear()
             for request in pending_requests:
                 if (
-                    id(request) not in finished
+                    request_key(request) not in finished
                     and request.delivery_token
                     and request.job_id
                 ):
@@ -716,7 +803,16 @@ class WakeConversationDaemon:
             playback: dict[str, object] = {}
             interruption: BargeIn | None = None
             context = request_context(text)
-            route = route_intent(text, context, cursor_session=self.cursor_session)
+            active_completed = self._active_completed_followup()
+            pending_question, clarification_kind = self._pending_cursor_clarification()
+            route = route_intent(
+                text,
+                context,
+                cursor_session=self.cursor_session,
+                pending_question=pending_question,
+                clarification_kind=clarification_kind,
+                recent_completion=active_completed is not None,
+            )
             fork_requested = decide_fork_intent(text) == ForkIntent.AFFIRMATIVE
             github_arguments = (
                 {
@@ -781,16 +877,6 @@ class WakeConversationDaemon:
                     ),
                     delivery_claims=delivery_claims,
                 )
-            elif route.actionable and route.intent == Intent.CURSOR_SUBMIT:
-                response, next_cursor_session = cursor_turn(
-                    CursorTurnRequest(
-                        context.text,
-                        utterance=text,
-                        context_repository=context.focused_repository,
-                        **github_arguments,
-                    ),
-                    delivery_claims=delivery_claims,
-                )
             elif (
                 route.actionable
                 and route.intent == Intent.CURSOR_REPLY
@@ -806,7 +892,59 @@ class WakeConversationDaemon:
                     ),
                     delivery_claims=delivery_claims,
                 )
+            elif route.actionable and route.intent == Intent.CURSOR_SUBMIT:
+                # Explicit new work invalidates any retained completed-job slot.
+                self.completed_followup = None
+                response, next_cursor_session = cursor_turn(
+                    CursorTurnRequest(
+                        context.text,
+                        utterance=text,
+                        context_repository=context.focused_repository,
+                        **github_arguments,
+                    ),
+                    delivery_claims=delivery_claims,
+                )
+            elif route.intent == Intent.CURSOR_PR_UNSUPPORTED:
+                response = (
+                    "I can't open pull requests. I can review the changes or run "
+                    "the tests in that checkout instead."
+                )
+            elif route.actionable and route.intent == Intent.CURSOR_FOLLOWUP:
+                current_completed = self._active_completed_followup()
+                if (
+                    self.cursor_session is not None
+                    or current_completed is None
+                    or current_completed is not active_completed
+                ):
+                    response = (
+                        "I don't have a recent completed Cursor job to follow up on."
+                    )
+                else:
+                    log(
+                        "follow-up dispatched for completed job "
+                        f"{current_completed.job_id}"
+                    )
+
+                    def consume_completed_followup() -> None:
+                        # Consume only after the child is durably created. A busy
+                        # checkout is retryable while this context remains live.
+                        if self.completed_followup is current_completed:
+                            self.completed_followup = None
+
+                    response, next_cursor_session = cursor_turn(
+                        CursorTurnRequest(
+                            context.text,
+                            utterance=text,
+                            action="follow_up",
+                            job_id=current_completed.job_id,
+                            expected_completed_at=current_completed.completed_at,
+                            on_follow_up_started=consume_completed_followup,
+                        ),
+                        delivery_claims=delivery_claims,
+                    )
             else:
+                # The authoritative router handles every mutating action above.
+                # Conversation fallback is always tool-free.
                 if load_backend_settings().llm_provider == "venice":
                     (
                         response,
@@ -822,6 +960,7 @@ class WakeConversationDaemon:
                             trusted_utterance=text,
                             delivery_claims=delivery_claims,
                             on_text_chunk=on_text_chunk,
+                            allow_tools=False,
                         )
                     )
                     streamed_playback = True
@@ -833,6 +972,7 @@ class WakeConversationDaemon:
                         **github_arguments,
                         trusted_utterance=text,
                         delivery_claims=delivery_claims,
+                        allow_tools=False,
                     )
                 remember_response = True
             print(f"Assistant: {response}", flush=True)
@@ -853,7 +993,10 @@ class WakeConversationDaemon:
                 release_deliveries(delivery_claims)
                 self.history = next_history
                 return interruption
-            acknowledge_deliveries(delivery_claims)
+            acknowledged = acknowledge_deliveries(delivery_claims)
+            for claim in acknowledged:
+                if claim.job.status == JobStatus.COMPLETED:
+                    self._remember_completed_job(claim.job.id)
             if self.cursor_session == cursor_session_before_playback:
                 self.cursor_session = next_cursor_session
             self.history = next_history

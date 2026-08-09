@@ -107,6 +107,32 @@ class IntentRouterTests(unittest.TestCase):
                 route = intent.route_intent("request", RequestContext("request"))
                 self.assertEqual(route, intent.FALLBACK_ROUTE)
 
+    def test_venice_router_uses_configured_endpoint_and_authorization(self) -> None:
+        settings = mock.Mock(
+            llm_provider="venice",
+            llm_model="venice-model",
+            llm_endpoint="https://api.venice.example/chat",
+            llm_timeout=17,
+        )
+        with (
+            mock.patch.object(intent, "load_backend_settings", return_value=settings),
+            mock.patch.object(
+                intent, "get_venice_api_key", return_value="secret-token"
+            ),
+            mock.patch.object(
+                intent.urllib.request,
+                "urlopen",
+                return_value=_response("conversation"),
+            ) as urlopen,
+        ):
+            intent.route_intent("hello", RequestContext("hello"))
+
+        request = urlopen.call_args.args[0]
+        self.assertEqual(request.full_url, settings.llm_endpoint)
+        self.assertEqual(request.get_header("Authorization"), "Bearer secret-token")
+        self.assertEqual(urlopen.call_args.kwargs["timeout"], 17)
+        self.assertEqual(json.loads(request.data)["model"], "venice-model")
+
 
 class InboxIntentTests(unittest.TestCase):
     def test_route_tool_exposes_inbox_intents(self) -> None:
@@ -130,6 +156,80 @@ class InboxIntentTests(unittest.TestCase):
                 route = intent.route_intent("request", RequestContext("request"))
                 self.assertTrue(route.actionable)
                 self.assertEqual(route.intent, intent.Intent(name))
+
+
+class FollowUpIntentTests(unittest.TestCase):
+    def test_route_tool_exposes_follow_up_intents(self) -> None:
+        enum = intent.ROUTE_TOOL["function"]["parameters"]["properties"]["intent"][
+            "enum"
+        ]
+        self.assertIn("cursor_followup", enum)
+        self.assertIn("cursor_pr_unsupported", enum)
+
+    def test_recent_completion_flag_is_forwarded(self) -> None:
+        with mock.patch.object(
+            intent.urllib.request,
+            "urlopen",
+            return_value=_response("cursor_followup"),
+        ) as urlopen:
+            route = intent.route_intent(
+                "review the changes",
+                RequestContext("review the changes"),
+                recent_completion=True,
+            )
+
+        self.assertEqual(route.intent, intent.Intent.CURSOR_FOLLOWUP)
+        self.assertTrue(route.actionable)
+        payload = json.loads(urlopen.call_args.args[0].data)
+        router_input = json.loads(payload["messages"][1]["content"])
+        self.assertTrue(router_input["recent_completed_job"])
+
+    def test_recent_completion_defaults_to_false(self) -> None:
+        with mock.patch.object(
+            intent.urllib.request,
+            "urlopen",
+            return_value=_response("conversation"),
+        ) as urlopen:
+            intent.route_intent("hello", RequestContext("hello"))
+
+        payload = json.loads(urlopen.call_args.args[0].data)
+        router_input = json.loads(payload["messages"][1]["content"])
+        self.assertFalse(router_input["recent_completed_job"])
+
+    def test_pending_clarification_suppresses_completed_context(self) -> None:
+        with mock.patch.object(
+            intent.urllib.request,
+            "urlopen",
+            return_value=_response("cursor_reply"),
+        ) as urlopen:
+            route = intent.route_intent(
+                "use the api repository",
+                RequestContext("use the api repository"),
+                cursor_session="aaaaaaaaaaaa",
+                pending_question="Which repository should I use?",
+                clarification_kind="repository",
+                recent_completion=True,
+            )
+
+        self.assertEqual(route.intent, intent.Intent.CURSOR_REPLY)
+        payload = json.loads(urlopen.call_args.args[0].data)
+        router_input = json.loads(payload["messages"][1]["content"])
+        self.assertFalse(router_input["recent_completed_job"])
+        self.assertEqual(
+            router_input["pending_cursor_question"],
+            "Which repository should I use?",
+        )
+        self.assertEqual(router_input["clarification_kind"], "repository")
+
+    def test_pr_unsupported_is_actionable(self) -> None:
+        with mock.patch.object(
+            intent.urllib.request,
+            "urlopen",
+            return_value=_response("cursor_pr_unsupported"),
+        ):
+            route = intent.route_intent("open a pull request", RequestContext("open"))
+        self.assertTrue(route.actionable)
+        self.assertEqual(route.intent, intent.Intent.CURSOR_PR_UNSUPPORTED)
 
 
 class ForkIntentTests(unittest.TestCase):
