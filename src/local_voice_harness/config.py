@@ -224,7 +224,13 @@ def load_backend_settings(
             label="TTS voice",
         ),
         tts_speed=_tts_speed(
-            _backend_value(tts, "speed", 1, environment, "VOICE_HARNESS_TTS_SPEED")
+            _backend_value(
+                tts,
+                "speed",
+                1.25 if tts_provider == "venice" else 1,
+                environment,
+                "VOICE_HARNESS_TTS_SPEED",
+            )
         ),
         tts_endpoint=_nonempty(
             _backend_value(

@@ -93,7 +93,7 @@ if [[ "${SKIP_SYSTEM_PACKAGES:-0}" == 1 ]]; then
 elif have paru; then
   step "Installing base system packages"
   paru -S --needed pipewire libnotify git curl github-cli xdotool xclip \
-    wl-clipboard wtype uv libsndfile
+    wl-clipboard wtype uv libsndfile ffmpeg
   if [[ "$LLM_PROVIDER" == venice || "$TTS_PROVIDER" == venice ]]; then
     step "Installing Venice credential support"
     paru -S --needed libsecret oo7
