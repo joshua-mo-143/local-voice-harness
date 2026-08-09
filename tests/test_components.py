@@ -12,6 +12,7 @@ from unittest import mock
 
 from local_voice_harness import components
 from local_voice_harness.config import load_backend_settings
+from local_voice_harness.credentials import CredentialError
 from local_voice_harness.errors import HarnessError
 
 
@@ -32,6 +33,16 @@ class _HTTPResponse:
 
 
 class ComponentReadinessTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.settings = load_backend_settings(
+            {}, path=Path("/nonexistent/backends.toml")
+        )
+        patcher = mock.patch.object(
+            components, "load_backend_settings", return_value=self.settings
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
     def test_llm_ready_requires_successful_health_response(self) -> None:
         with mock.patch.object(
             components.urllib.request, "urlopen", return_value=_HTTPResponse(200)
@@ -81,9 +92,45 @@ class ComponentReadinessTests(unittest.TestCase):
         ):
             components.start_components(timeout=0.25)
 
+    def test_start_reports_the_component_that_is_not_ready(self) -> None:
+        with (
+            mock.patch.object(components.subprocess, "run"),
+            mock.patch.object(components, "llm_ready", return_value=True),
+            mock.patch.object(components, "socket_ready", return_value=False),
+            mock.patch.object(
+                components.time, "monotonic", side_effect=[10.0, 10.0, 10.5]
+            ),
+            mock.patch.object(components.time, "sleep"),
+            self.assertRaisesRegex(
+                HarnessError, "TTS backend did not become ready within 0.25 seconds"
+            ),
+        ):
+            components.start_components(timeout=0.25)
+
+    def test_start_checks_venice_credential_before_starting_services(self) -> None:
+        settings = replace(
+            self.settings,
+            tts_provider="venice",
+        )
+        with (
+            mock.patch.object(
+                components, "load_backend_settings", return_value=settings
+            ),
+            mock.patch.object(
+                components,
+                "get_venice_api_key",
+                side_effect=CredentialError("Venice API key is not stored"),
+            ),
+            mock.patch.object(components.subprocess, "run") as run,
+            self.assertRaisesRegex(CredentialError, "API key is not stored"),
+        ):
+            components.start_components()
+
+        run.assert_not_called()
+
     def test_venice_starts_only_tts_service_and_uses_key_readiness(self) -> None:
         settings = replace(
-            load_backend_settings({}),
+            self.settings,
             llm_provider="venice",
         )
         with (

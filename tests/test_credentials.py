@@ -65,6 +65,21 @@ class VeniceCredentialTests(unittest.TestCase):
                 "which",
                 return_value="/usr/bin/secret-tool",
             ),
+            mock.patch.object(
+                credentials.subprocess,
+                "run",
+                return_value=_completed(returncode=1),
+            ),
+            self.assertRaisesRegex(credentials.CredentialError, "credentials set"),
+        ):
+            credentials.get_venice_api_key()
+
+        with (
+            mock.patch.object(
+                credentials.shutil,
+                "which",
+                return_value="/usr/bin/secret-tool",
+            ),
             mock.patch.object(credentials.subprocess, "run", return_value=_completed()),
             self.assertRaisesRegex(credentials.CredentialError, "credentials set"),
         ):

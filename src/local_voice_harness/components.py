@@ -47,6 +47,8 @@ def component_usage() -> Iterator[None]:
 
 def start_components(timeout: float = 30.0) -> None:
     settings = load_backend_settings()
+    if "venice" in (settings.llm_provider, settings.tts_provider):
+        get_venice_api_key()
     services = ["voice-harness-tts.service"]
     if settings.llm_provider == "local":
         services.insert(0, "voice-harness-llm.service")
@@ -55,13 +57,23 @@ def start_components(timeout: float = 30.0) -> None:
         check=True,
     )
     deadline = time.monotonic() + timeout
+    llm_is_ready = False
+    tts_is_ready = False
     while time.monotonic() < deadline:
-        if llm_ready() and socket_ready(TTS_SOCKET):
+        llm_is_ready = settings.llm_provider == "venice" or llm_ready()
+        tts_is_ready = socket_ready(TTS_SOCKET) if llm_is_ready else False
+        if llm_is_ready and tts_is_ready:
             return
         time.sleep(0.25)
-    raise HarnessError(
-        f"LLM or TTS backend did not become ready within {timeout:g} seconds"
-    )
+    unready = [
+        name
+        for name, ready in (("LLM", llm_is_ready), ("TTS", tts_is_ready))
+        if not ready
+    ]
+    subject = f"{' and '.join(unready)} backend"
+    if len(unready) > 1:
+        subject += "s"
+    raise HarnessError(f"{subject} did not become ready within {timeout:g} seconds")
 
 
 def stop_components() -> None:
