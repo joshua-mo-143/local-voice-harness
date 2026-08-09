@@ -12,6 +12,17 @@ class DesktopError(RuntimeError):
     pass
 
 
+DESKTOP_ENVIRONMENT = (
+    "DISPLAY",
+    "XAUTHORITY",
+    "XDG_SESSION_TYPE",
+    "WAYLAND_DISPLAY",
+    "XDG_CURRENT_DESKTOP",
+    "HYPRLAND_INSTANCE_SIGNATURE",
+    "SWAYSOCK",
+)
+
+
 @dataclass(frozen=True)
 class Window:
     token: str
@@ -58,6 +69,20 @@ def _integer(value: object) -> int | None:
         return int(value)  # type: ignore[arg-type]
     except (TypeError, ValueError):
         return None
+
+
+def _refresh_desktop_environment() -> None:
+    """Recover graphical-session variables imported after this service started."""
+    if os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"):
+        return
+    process = _run(["systemctl", "--user", "show-environment"])
+    if process is None or process.returncode:
+        return
+    allowed = set(DESKTOP_ENVIRONMENT)
+    for line in process.stdout.splitlines():
+        name, separator, value = line.partition("=")
+        if separator and name in allowed and value:
+            os.environ.setdefault(name, value)
 
 
 class Desktop(Protocol):
@@ -254,6 +279,7 @@ class SwayDesktop(WaylandDesktop):
 
 
 def get_desktop() -> Desktop | None:
+    _refresh_desktop_environment()
     session_type = os.environ.get("XDG_SESSION_TYPE", "").casefold()
     if session_type != "wayland" and not os.environ.get("WAYLAND_DISPLAY"):
         return X11Desktop()

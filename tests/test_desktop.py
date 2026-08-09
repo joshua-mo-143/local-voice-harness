@@ -18,12 +18,51 @@ def completed(
 
 class DesktopSelectionTests(unittest.TestCase):
     def test_defaults_to_x11_without_wayland_environment(self) -> None:
-        with mock.patch.dict("os.environ", {}, clear=True):
+        with (
+            mock.patch.dict("os.environ", {}, clear=True),
+            mock.patch.object(desktop, "_run", return_value=None),
+        ):
             self.assertIsInstance(desktop.get_desktop(), desktop.X11Desktop)
+
+    def test_recovers_x11_environment_imported_after_service_start(self) -> None:
+        manager_environment = "\n".join(
+            (
+                "DISPLAY=:0",
+                "XAUTHORITY=/run/user/1000/xauth",
+                "UNRELATED_SECRET=do-not-import",
+            )
+        )
+        with (
+            mock.patch.dict("os.environ", {}, clear=True),
+            mock.patch.object(
+                desktop, "_run", return_value=completed(manager_environment)
+            ) as run,
+        ):
+            self.assertIsInstance(desktop.get_desktop(), desktop.X11Desktop)
+            self.assertEqual(desktop.os.environ["DISPLAY"], ":0")
+            self.assertEqual(desktop.os.environ["XAUTHORITY"], "/run/user/1000/xauth")
+            self.assertNotIn("UNRELATED_SECRET", desktop.os.environ)
+
+        run.assert_called_once_with(["systemctl", "--user", "show-environment"])
+
+    def test_existing_graphical_environment_is_not_replaced(self) -> None:
+        with (
+            mock.patch.dict(
+                "os.environ",
+                {"DISPLAY": ":1", "XAUTHORITY": "/existing"},
+                clear=True,
+            ),
+            mock.patch.object(desktop, "_run") as run,
+        ):
+            self.assertIsInstance(desktop.get_desktop(), desktop.X11Desktop)
+            self.assertEqual(desktop.os.environ["DISPLAY"], ":1")
+
+        run.assert_not_called()
 
     def test_selects_hyprland(self) -> None:
         environment = {
             "XDG_SESSION_TYPE": "wayland",
+            "WAYLAND_DISPLAY": "wayland-1",
             "HYPRLAND_INSTANCE_SIGNATURE": "instance",
         }
         with mock.patch.dict("os.environ", environment, clear=True):
@@ -37,6 +76,7 @@ class DesktopSelectionTests(unittest.TestCase):
     def test_other_wayland_compositors_are_unsupported(self) -> None:
         environment = {
             "XDG_SESSION_TYPE": "wayland",
+            "WAYLAND_DISPLAY": "wayland-1",
             "XDG_CURRENT_DESKTOP": "GNOME",
         }
         with mock.patch.dict("os.environ", environment, clear=True):
