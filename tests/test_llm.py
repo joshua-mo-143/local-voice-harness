@@ -391,6 +391,62 @@ class QwenClientTests(unittest.TestCase):
         self.assertEqual(chunks, ["Started."])
         cursor_turn.assert_called_once()
 
+    def test_logs_payload_aggregated_response_and_tool_exchange(self) -> None:
+        settings = replace(
+            load_backend_settings({}),
+            llm_provider="venice",
+            llm_model="zai-org-glm-5-2",
+        )
+        tool_arguments = '{"task":"fix it","action":"submit"}'
+        output = io.StringIO()
+        with (
+            mock.patch.object(llm, "load_backend_settings", return_value=settings),
+            mock.patch.object(llm, "get_venice_api_key", return_value="secret"),
+            mock.patch.object(
+                llm.urllib.request,
+                "urlopen",
+                side_effect=[
+                    _stream_response(
+                        {
+                            "tool_calls": [
+                                {
+                                    "index": 0,
+                                    "id": "call-1",
+                                    "function": {
+                                        "name": "cursor",
+                                        "arguments": tool_arguments,
+                                    },
+                                }
+                            ]
+                        }
+                    ),
+                    _stream_response({"content": "Started."}),
+                ],
+            ),
+            mock.patch.object(llm, "cursor_turn", return_value=("accepted", "job-123")),
+            mock.patch.object(llm, "notify"),
+            redirect_stdout(output),
+        ):
+            llm.qwen_turn("fix it")
+
+        records = [json.loads(line) for line in output.getvalue().splitlines()]
+        requests = [record for record in records if record.get("event") == "request"]
+        responses = [
+            record for record in records if record.get("event") == "aggregated_response"
+        ]
+        calls = [record for record in records if record.get("event") == "tool_call"]
+        results = [record for record in records if record.get("event") == "tool_result"]
+
+        self.assertEqual(len(requests), 2)
+        self.assertEqual(
+            json.loads(requests[0]["payload"])["messages"][-1]["content"], "fix it"
+        )
+        self.assertNotIn("secret", requests[0]["payload"])
+        self.assertEqual(responses[0]["response"]["tool_calls"][0]["id"], "call-1")
+        self.assertEqual(responses[1]["response"], {"content": "Started."})
+        self.assertEqual(calls[0]["arguments"], tool_arguments)
+        self.assertEqual(results[0]["result"], "accepted")
+
     def test_venice_accepts_mixed_text_and_tool_stream_without_speaking(self) -> None:
         response = _stream_response(
             {"content": "Speaking already. "},
