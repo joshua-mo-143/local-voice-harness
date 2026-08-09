@@ -46,6 +46,12 @@ def _operation_error(action: str, process: subprocess.CompletedProcess[str]) -> 
     raise CredentialError(f"could not {action} Venice credential: {detail}")
 
 
+def _missing_credential_error() -> CredentialError:
+    return CredentialError(
+        "Venice API key is not stored; run `voice-harness credentials set`"
+    )
+
+
 def get_venice_api_key() -> str:
     try:
         process = subprocess.run(
@@ -59,12 +65,12 @@ def get_venice_api_key() -> str:
         raise CredentialError(
             f"could not access desktop Secret Service: {exc}"
         ) from exc
+    if process.returncode and not process.stderr.strip():
+        raise _missing_credential_error()
     if process.returncode:
         _operation_error("read", process)
     if not process.stdout.strip():
-        raise CredentialError(
-            "Venice API key is not stored; run `voice-harness credentials set`"
-        )
+        raise _missing_credential_error()
     return _valid_api_key(process.stdout)
 
 
