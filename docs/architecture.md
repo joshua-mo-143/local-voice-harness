@@ -78,6 +78,11 @@ the claimed file after the attempt. Cancellation removes writable audio after
 recorder termination is confirmed. Recorder ownership includes the Linux process
 start identity as well as its PID; it is not durable across login sessions.
 
+The wake-service journal records user and assistant text, raw LLM request payloads,
+aggregated responses, and tool-call arguments and results for diagnostics. These logs
+can contain conversation, repository, and issue content and follow the system journal's
+retention policy. Authorization headers and API keys are never included.
+
 Only one in-process GPU transcription runs at a time. A second fully framed request
 receives a structured `server_busy` error immediately instead of waiting behind a
 possibly hung model call, without moving or deleting its retryable generation. The
