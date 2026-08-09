@@ -10,8 +10,8 @@ Optional integrations are disabled by default on fresh installations, so a
 provider is only ever instantiated when its flag is explicitly enabled through
 ``config.toml`` or the matching ``VOICE_HARNESS_INTEGRATION_*`` environment
 variable. Existing installations preserve prior behaviour by enabling the flag.
-Concrete providers register themselves in ``_PROVIDER_FACTORIES``; the mapping
-starts empty and is extended as integrations are extracted into providers.
+Concrete providers register themselves in ``_PROVIDER_FACTORIES``; Zendesk is
+the first such provider and is disabled by default on fresh installations.
 
 Loading configuration fails closed: if the unified configuration cannot be read
 or is malformed, the registry falls back to the built-in defaults, which leave
@@ -23,6 +23,7 @@ from __future__ import annotations
 from collections.abc import Callable
 
 from .context_fragment import ContextFragment, ContextProvider
+from .integrations.zendesk import ZendeskProvider
 from .user_config import IntegrationSettings, load_user_config
 
 __all__ = [
@@ -35,7 +36,9 @@ __all__ = [
 # Each entry pairs the ``IntegrationSettings`` flag that enables a provider with
 # a factory that builds it. The registry stays generic: adding an integration is
 # a matter of appending its ``(flag, factory)`` pair here.
-_PROVIDER_FACTORIES: tuple[tuple[str, Callable[[], ContextProvider]], ...] = ()
+_PROVIDER_FACTORIES: tuple[tuple[str, Callable[[], ContextProvider]], ...] = (
+    ("zendesk_enabled", ZendeskProvider),
+)
 
 
 def _integration_settings() -> IntegrationSettings:

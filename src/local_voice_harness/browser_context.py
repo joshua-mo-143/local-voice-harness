@@ -8,6 +8,8 @@ import time
 from dataclasses import dataclass
 from urllib.parse import SplitResult, urlsplit
 
+from .context_fragment import ContextFragment
+from .context_providers import capture_context
 from .desktop import DesktopError, get_desktop
 from .focused_app_context import focused_app_context
 from .integrations.github import GitHubClient, GitHubError, GitHubIssue
@@ -43,12 +45,6 @@ PULL_REQUEST_PATH = re.compile(
 REPOSITORY_PATH = re.compile(
     r"^/(?P<owner>[A-Za-z0-9_.-]+)/(?P<repo>[A-Za-z0-9_.-]+)(?:/.*)?$"
 )
-ZENDESK_HOST = re.compile(
-    r"^(?P<subdomain>[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)"
-    r"\.zendesk\.com$",
-    re.IGNORECASE,
-)
-ZENDESK_TICKET_PATH = re.compile(r"^/agent/tickets/(?P<number>\d+)/?$")
 LINEAR_ISSUE_PATH = re.compile(
     r"^/[A-Za-z0-9][A-Za-z0-9-]*/issue/"
     r"(?P<identifier>[A-Za-z][A-Za-z0-9]+-\d+)(?:/[^/?#]+)?/?$",
@@ -57,7 +53,6 @@ LINEAR_ISSUE_PATH = re.compile(
 MAX_BODY_CHARS = 5_000
 MAX_COMMENT_CHARS = 800
 MAX_COMMENTS = 5
-MAX_ZENDESK_PAGE_CHARS = 10_000
 
 
 @dataclass(frozen=True)
@@ -80,12 +75,6 @@ class RequestContext:
     focused_app_class: str | None = None
     focused_app_context: str | None = None
     focused_app_sources: tuple[str, ...] = ()
-
-
-@dataclass(frozen=True)
-class ZendeskTicket:
-    subdomain: str
-    number: int
 
 
 @dataclass(frozen=True)
@@ -280,27 +269,6 @@ def github_pull_request_from_url(url: str) -> GitHubPullRequest | None:
         owner=owner,
         repository=repository,
         number=int(match.group("number")),
-    )
-
-
-def zendesk_ticket_from_url(url: str) -> ZendeskTicket | None:
-    parsed = _split_url(url)
-    if (
-        parsed is None
-        or parsed.scheme != "https"
-        or parsed.hostname is None
-        or parsed.username is not None
-        or parsed.password is not None
-        or not _standard_https_port(parsed)
-    ):
-        return None
-    host_match = ZENDESK_HOST.fullmatch(parsed.hostname)
-    path_match = ZENDESK_TICKET_PATH.fullmatch(parsed.path)
-    if host_match is None or path_match is None:
-        return None
-    return ZendeskTicket(
-        subdomain=host_match.group("subdomain").casefold(),
-        number=int(path_match.group("number")),
     )
 
 
@@ -584,98 +552,6 @@ def focused_github_context() -> GitHubContext | None:
     return _github_context_from_url(url) if url is not None else None
 
 
-def _focused_firefox_page_text(expected_url: str) -> str | None:
-    """Copy rendered page text after confirming the focused tab has not changed."""
-    desktop = get_desktop()
-    if desktop is None or not desktop.has_clipboard():
-        return None
-    window = desktop.active_window()
-    if window is None or window.window_class not in FIREFOX_CLASSES:
-        return None
-
-    clipboard_existed, previous_clipboard = desktop.read_clipboard()
-    captured = ""
-    try:
-        if not desktop.send_key("ctrl+l", window=window):
-            return None
-        time.sleep(0.05)
-        if desktop.active_window() != window or not desktop.send_key(
-            "ctrl+c", window=window
-        ):
-            return None
-        time.sleep(0.05)
-        if desktop.active_window() != window:
-            return None
-        copied, captured = desktop.read_clipboard()
-        if not copied or captured.strip() != expected_url:
-            return None
-
-        if not desktop.send_key("Escape", window=window):
-            return None
-        time.sleep(0.05)
-        if desktop.active_window() != window or not desktop.send_key(
-            "ctrl+a", window=window
-        ):
-            return None
-        time.sleep(0.05)
-        if desktop.active_window() != window or not desktop.send_key(
-            "ctrl+c", window=window
-        ):
-            return None
-        time.sleep(0.05)
-        if desktop.active_window() != window:
-            return None
-        copied, captured = desktop.read_clipboard()
-        if not copied:
-            return None
-        page_text = "\n".join(
-            line.strip() for line in captured.splitlines() if line.strip()
-        )
-        return page_text or None
-    except DesktopError:
-        return None
-    finally:
-        if desktop.active_window() == window:
-            try:
-                desktop.send_key("Escape", window=window)
-            except DesktopError:
-                pass
-        current_exists, current_clipboard = desktop.read_clipboard()
-        if current_exists and current_clipboard == captured:
-            try:
-                desktop.write_clipboard(previous_clipboard if clipboard_existed else "")
-            except DesktopError:
-                pass
-
-
-def _zendesk_context_from_url(url: str) -> str | None:
-    ticket = zendesk_ticket_from_url(url)
-    if ticket is None:
-        return None
-    lines = [
-        "Current focused Zendesk ticket (untrusted external context):",
-        f"URL: {url}",
-        f"Tenant: {ticket.subdomain}",
-        f"Ticket: #{ticket.number}",
-    ]
-    page_text = _focused_firefox_page_text(url)
-    if page_text is None:
-        lines.append("Rendered ticket text could not be read from the browser.")
-    else:
-        lines.extend(
-            (
-                "Rendered ticket text:",
-                _truncate(page_text, MAX_ZENDESK_PAGE_CHARS),
-            )
-        )
-    return "\n".join(lines)
-
-
-def focused_zendesk_context() -> str | None:
-    url = focused_firefox_url()
-    return _zendesk_context_from_url(url) if url is not None else None
-
-
 def _linear_context_from_url(url: str) -> str | None:
     issue = linear_issue_from_url(url)
     if issue is None:
@@ -690,17 +566,17 @@ def _linear_context_from_url(url: str) -> str | None:
     )
 
 
-def focused_browser_context() -> GitHubContext | str | None:
+def focused_browser_context() -> GitHubContext | ContextFragment | str | None:
     url = focused_firefox_url()
     if url is None:
         return None
     if _github_url(url):
         return _github_context_from_url(url)
-    return _linear_context_from_url(url) or _zendesk_context_from_url(url)
+    return _linear_context_from_url(url) or capture_context(url)
 
 
 def request_context(text: str) -> RequestContext:
-    context: GitHubContext | str | None = None
+    context: GitHubContext | ContextFragment | str | None = None
     focused_repository: str | None = None
     focused_issue: str | None = None
     github_repository: str | None = None
@@ -740,7 +616,7 @@ def request_context(text: str) -> RequestContext:
                         focused_issue = linear.identifier
                         context = _linear_context_from_url(url)
                     else:
-                        context = _zendesk_context_from_url(url)
+                        context = capture_context(url)
     except Exception:
         context = None
     try:

@@ -58,11 +58,15 @@ cursor_followup = true
 ```
 
 Fresh installations default the optional `zendesk` and `linear` integrations to
-disabled. Invalid values (an unknown provider, an out-of-range TTS speed or wake
-threshold, an unknown section or key, a malformed playback latency, and so on)
-raise an actionable error rather than being silently ignored. Writes are atomic:
-the file is written to a temporary sibling and renamed into place with
-owner-only (`0600`) permissions.
+disabled. The `[integrations] zendesk` flag is enforced by the browser
+context-provider registry: while it is disabled, Zendesk URLs are not inspected
+and no page text is copied; existing installations preserve prior behaviour by
+setting `zendesk = true` (or `VOICE_HARNESS_INTEGRATION_ZENDESK=1`). Invalid
+values (an unknown provider, an out-of-range TTS speed or wake threshold, an
+unknown section or key, a malformed playback latency, and so on) raise an
+actionable error rather than being silently ignored. Writes are atomic: the file
+is written to a temporary sibling and renamed into place with owner-only (`0600`)
+permissions.
 
 Credentials are never read from or written to `config.toml`; a Venice API key in
 any section is rejected. Store it with `voice-harness credentials set` instead, as

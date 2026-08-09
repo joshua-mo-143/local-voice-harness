@@ -5,8 +5,12 @@ import subprocess
 import unittest
 from unittest import mock
 
-from local_voice_harness import browser_context, desktop
+from local_voice_harness import browser_context, context_providers, desktop
 from local_voice_harness.focused_app_context import FocusedAppContext
+from local_voice_harness.integrations import zendesk
+from local_voice_harness.user_config import IntegrationSettings
+
+DISABLED = IntegrationSettings(zendesk_enabled=False)
 
 
 class FirefoxUrlTests(unittest.TestCase):
@@ -462,126 +466,22 @@ class LinearContextTests(unittest.TestCase):
         self.assertIn("Identifier: ENG-123", str(context))
 
 
-class ZendeskContextTests(unittest.TestCase):
-    def test_extracts_canonical_ticket_url(self) -> None:
-        ticket = browser_context.zendesk_ticket_from_url(
-            "https://Example-Help.zendesk.com/agent/tickets/42?foo=bar"
-        )
-        self.assertEqual(ticket, browser_context.ZendeskTicket("example-help", 42))
+class ZendeskDispatchTests(unittest.TestCase):
+    ZENDESK_URL = "https://example.zendesk.com/agent/tickets/42"
 
-        invalid_urls = [
-            "http://example.zendesk.com/agent/tickets/42",
-            "https://example.zendesk.com.evil.test/agent/tickets/42",
-            "https://user@example.zendesk.com/agent/tickets/42",
-            "https://example.zendesk.com:444/agent/tickets/42",
-            "https://example.zendesk.com/hc/en-us/requests/42",
-            "https://example.zendesk.com/agent/tickets/not-a-number",
-            "https://-example.zendesk.com/agent/tickets/42",
-        ]
-        for url in invalid_urls:
-            with self.subTest(url=url):
-                self.assertIsNone(browser_context.zendesk_ticket_from_url(url))
-
-    def test_copies_rendered_page_text_and_restores_clipboard(self) -> None:
-        url = "https://example.zendesk.com/agent/tickets/42"
-        page_text = " Ticket 42 \n\n Customer cannot sign in "
-        window = desktop.Window("42", "firefox", 10)
-        backend = mock.Mock()
-        backend.has_clipboard.return_value = True
-        backend.active_window.return_value = window
-        backend.read_clipboard.side_effect = [
-            (True, "previous"),
-            (True, url),
-            (True, page_text),
-            (True, page_text),
-        ]
-        backend.send_key.return_value = True
-        with (
-            mock.patch.object(browser_context, "get_desktop", return_value=backend),
-            mock.patch.object(browser_context.time, "sleep"),
-        ):
-            captured = browser_context._focused_firefox_page_text(url)
-
-        self.assertEqual(captured, "Ticket 42\nCustomer cannot sign in")
-        self.assertEqual(
-            backend.send_key.call_args_list,
-            [
-                mock.call("ctrl+l", window=window),
-                mock.call("ctrl+c", window=window),
-                mock.call("Escape", window=window),
-                mock.call("ctrl+a", window=window),
-                mock.call("ctrl+c", window=window),
-                mock.call("Escape", window=window),
-            ],
-        )
-        backend.write_clipboard.assert_called_once_with("previous")
-
-    def test_focus_change_aborts_page_capture(self) -> None:
-        url = "https://example.zendesk.com/agent/tickets/42"
-        window = desktop.Window("42", "firefox", 10)
-        changed = desktop.Window("99", "foot", 11)
-        backend = mock.Mock()
-        backend.has_clipboard.return_value = True
-        backend.active_window.side_effect = [window, window, window, changed, changed]
-        backend.read_clipboard.side_effect = [
-            (True, "previous"),
-            (True, url),
-            (True, url),
-        ]
-        backend.send_key.return_value = True
-        with (
-            mock.patch.object(browser_context, "get_desktop", return_value=backend),
-            mock.patch.object(browser_context.time, "sleep"),
-        ):
-            self.assertIsNone(browser_context._focused_firefox_page_text(url))
-
-        self.assertEqual(
-            backend.send_key.call_args_list,
-            [
-                mock.call("ctrl+l", window=window),
-                mock.call("ctrl+c", window=window),
-                mock.call("Escape", window=window),
-            ],
-        )
-        backend.write_clipboard.assert_called_once_with("previous")
-
-    def test_formats_and_bounds_rendered_ticket_text(self) -> None:
-        url = "https://example.zendesk.com/agent/tickets/42"
-        with mock.patch.object(
-            browser_context,
-            "_focused_firefox_page_text",
-            return_value="x" * 20_000,
-        ):
-            context = browser_context._zendesk_context_from_url(url)
-
-        self.assertIsNotNone(context)
-        self.assertIn("Tenant: example", str(context))
-        self.assertIn("Ticket: #42", str(context))
-        self.assertIn("Rendered ticket text:", str(context))
-        self.assertLess(len(str(context)), 10_500)
-        self.assertTrue(str(context).endswith("…"))
-
-    def test_page_copy_failure_keeps_validated_ticket_identity(self) -> None:
-        url = "https://example.zendesk.com/agent/tickets/42"
-        with mock.patch.object(
-            browser_context, "_focused_firefox_page_text", return_value=None
-        ):
-            context = browser_context._zendesk_context_from_url(url)
-
-        self.assertIn("Tenant: example", str(context))
-        self.assertIn("Ticket: #42", str(context))
-        self.assertIn("could not be read", str(context))
-
-    def test_browser_context_dispatches_zendesk_url_once(self) -> None:
-        url = "https://example.zendesk.com/agent/tickets/42"
+    def test_enabled_zendesk_url_is_dispatched_once_through_registry(self) -> None:
+        provider = zendesk.ZendeskProvider()
         with (
             mock.patch.object(
-                browser_context, "focused_firefox_url", return_value=url
+                browser_context, "focused_firefox_url", return_value=self.ZENDESK_URL
             ) as focused_url,
             mock.patch.object(
+                zendesk, "_focused_firefox_page_text", return_value="Ticket details"
+            ),
+            mock.patch.object(
                 browser_context,
-                "_focused_firefox_page_text",
-                return_value="Ticket details",
+                "capture_context",
+                side_effect=lambda url: provider.capture(url),
             ),
         ):
             context = browser_context.focused_browser_context()
@@ -589,6 +489,26 @@ class ZendeskContextTests(unittest.TestCase):
         focused_url.assert_called_once_with()
         self.assertIn("Current focused Zendesk ticket", str(context))
         self.assertIn("Ticket details", str(context))
+
+    def test_disabled_zendesk_url_is_never_inspected_or_copied(self) -> None:
+        with (
+            mock.patch.object(
+                browser_context, "focused_firefox_url", return_value=self.ZENDESK_URL
+            ),
+            mock.patch.object(
+                browser_context, "focused_app_context", return_value=None
+            ),
+            mock.patch.object(
+                context_providers, "_integration_settings", return_value=DISABLED
+            ),
+            mock.patch.object(zendesk, "zendesk_ticket_from_url") as ticket,
+            mock.patch.object(zendesk, "_focused_firefox_page_text") as page_text,
+        ):
+            context = browser_context.request_context("look at this ticket")
+
+        self.assertEqual(context.text, "look at this ticket")
+        ticket.assert_not_called()
+        page_text.assert_not_called()
 
 
 if __name__ == "__main__":
