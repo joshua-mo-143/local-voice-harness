@@ -7,10 +7,11 @@ import urllib.error
 import urllib.request
 from collections.abc import Callable, Iterable, Mapping, Sequence
 
+from .agents.delivery import AgentDeliveryClaims as DeliveryClaims
+from .agents.service import AgentTurnRequest as CursorTurnRequest
+from .agents.service import agent_turn as cursor_turn
 from .config import load_backend_settings
 from .credentials import get_venice_api_key
-from .cursor.delivery import DeliveryClaims
-from .cursor.service import CursorTurnRequest, cursor_turn
 from .errors import HarnessError
 from .notifications import notify
 

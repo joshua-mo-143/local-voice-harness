@@ -2,6 +2,18 @@ from __future__ import annotations
 
 import json
 
+from .agents.delivery import (
+    AgentDeliveryClaims as DeliveryClaims,
+)
+from .agents.delivery import (
+    acknowledge_deliveries as acknowledge_claims,
+)
+from .agents.delivery import (
+    release_deliveries as release_claims,
+)
+from .agents.service import AgentTurnRequest as CursorTurnRequest
+from .agents.service import agent_turn as cursor_turn
+from .agents.store import AgentJobStore as JobStore
 from .browser_context import request_context
 from .components import component_usage, llm_ready, start_components
 from .config import (
@@ -12,17 +24,6 @@ from .config import (
     STT_SOCKET,
     TTS_SOCKET,
 )
-from .cursor.delivery import (
-    DeliveryClaims,
-)
-from .cursor.delivery import (
-    acknowledge_deliveries as acknowledge_claims,
-)
-from .cursor.delivery import (
-    release_deliveries as release_claims,
-)
-from .cursor.service import CursorTurnRequest, cursor_turn
-from .cursor.store import JobStore
 from .errors import HarnessError
 from .intent import ForkIntent, Intent, IntentRoute, decide_fork_intent, route_intent
 from .ipc import socket_ready
@@ -33,11 +34,11 @@ from .vocabulary import resolve_aliases
 CURSOR_STORE = JobStore(JOBS_DIR, LEGACY_JOBS_DIR)
 
 CURSOR_MANAGEMENT_ACTIONS = {
-    Intent.CURSOR_LIST: "list",
-    Intent.CURSOR_STATUS: "status",
-    Intent.CURSOR_CANCEL: "cancel",
-    Intent.CURSOR_DISMISS: "dismiss",
-    Intent.CURSOR_REPEAT: "repeat",
+    Intent.AGENT_LIST: "list",
+    Intent.AGENT_STATUS: "status",
+    Intent.AGENT_CANCEL: "cancel",
+    Intent.AGENT_DISMISS: "dismiss",
+    Intent.AGENT_REPEAT: "repeat",
 }
 
 
@@ -61,7 +62,7 @@ def respond(text: str) -> None:
             print(f"You: {text}")
             context = request_context(text)
             if CURSOR_PATTERN.search(text):
-                route = IntentRoute(Intent.CURSOR_SUBMIT, "high")
+                route = IntentRoute(Intent.AGENT_SUBMIT, "high")
             else:
                 route = route_intent(text, context)
             fork_requested = decide_fork_intent(text) == ForkIntent.AFFIRMATIVE
@@ -88,7 +89,7 @@ def respond(text: str) -> None:
                 or context.github_pull_request
                 or context.linear_issue
             )
-            submit_requested = route.intent == Intent.CURSOR_SUBMIT and (
+            submit_requested = route.intent == Intent.AGENT_SUBMIT and (
                 route.actionable or focused_submit_target
             )
             if submit_requested:
@@ -111,12 +112,12 @@ def respond(text: str) -> None:
                     ),
                     delivery_claims=delivery_claims,
                 )[0]
-            elif route.intent == Intent.CURSOR_PR_UNSUPPORTED:
+            elif route.intent == Intent.AGENT_PR_UNSUPPORTED:
                 response = (
                     "I can't open pull requests. I can review the changes or run "
                     "the tests instead."
                 )
-            elif route.actionable and route.intent == Intent.CURSOR_REPLY:
+            elif route.actionable and route.intent == Intent.AGENT_REPLY:
                 response = cursor_turn(
                     CursorTurnRequest(
                         context.text,
