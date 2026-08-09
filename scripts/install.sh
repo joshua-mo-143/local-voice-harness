@@ -233,7 +233,8 @@ else
 
   # Linear is optional; ordinary repository tasks work without it.
   if have agent; then
-    if agent mcp list 2>/dev/null | grep -qi linear; then
+    if agent mcp list 2>/dev/null |
+      grep -Eiq '^[[:space:]]*linear:[[:space:]]*(ready|connected)[[:space:]]*$'; then
       info "Linear MCP already configured"
     else
       info "Configuring Linear MCP (interactive; optional)"

@@ -320,9 +320,10 @@ class AppContextTests(unittest.TestCase):
 
     def test_actionable_linear_issue_metadata_reaches_cursor(self) -> None:
         context = RequestContext(
-            "work on this ticket\n\nIdentifier: ENG-123",
+            "work on this ticket\n\nIdentifier (untrusted external identifier): ENG-123",
             focused_issue="ENG-123",
-            linear_issue="ENG-123",
+            external_issue_reference="ENG-123",
+            external_issue_source="linear",
         )
         with (
             mock.patch.object(app, "start_components"),
@@ -351,9 +352,10 @@ class AppContextTests(unittest.TestCase):
 
     def test_focused_linear_issue_submits_despite_low_confidence(self) -> None:
         context = RequestContext(
-            "work on this ticket\n\nIdentifier: ENG-123",
+            "work on this ticket\n\nIdentifier (untrusted external identifier): ENG-123",
             focused_issue="ENG-123",
-            linear_issue="ENG-123",
+            external_issue_reference="ENG-123",
+            external_issue_source="linear",
         )
         with (
             mock.patch.object(app, "start_components"),

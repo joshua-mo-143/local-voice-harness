@@ -5,9 +5,10 @@ import subprocess
 import unittest
 from unittest import mock
 
-from local_voice_harness import browser_context, context_providers, desktop
+from local_voice_harness import browser_context, desktop
 from local_voice_harness.focused_app_context import FocusedAppContext
-from local_voice_harness.integrations import zendesk
+from local_voice_harness.integrations import linear, zendesk
+from local_voice_harness.integrations import registry as context_providers
 from local_voice_harness.user_config import IntegrationSettings
 
 DISABLED = IntegrationSettings(zendesk_enabled=False)
@@ -422,10 +423,10 @@ class FocusedAppRequestContextTests(unittest.TestCase):
 
 class LinearContextTests(unittest.TestCase):
     def test_extracts_canonical_issue_url(self) -> None:
-        issue = browser_context.linear_issue_from_url(
+        issue = linear.linear_issue_from_url(
             "https://linear.app/acme/issue/eng-123/fix-routing?utm_source=inbox"
         )
-        self.assertEqual(issue, browser_context.LinearIssue("ENG-123"))
+        self.assertEqual(issue, linear.LinearIssue("ENG-123"))
 
         invalid_urls = [
             "http://linear.app/acme/issue/ENG-123/fix-routing",
@@ -436,7 +437,7 @@ class LinearContextTests(unittest.TestCase):
         ]
         for url in invalid_urls:
             with self.subTest(url=url):
-                self.assertIsNone(browser_context.linear_issue_from_url(url))
+                self.assertIsNone(linear.linear_issue_from_url(url))
 
     def test_request_context_preserves_focused_linear_identifier(self) -> None:
         url = "https://linear.app/acme/issue/ENG-123/fix-routing"
@@ -447,23 +448,53 @@ class LinearContextTests(unittest.TestCase):
             mock.patch.object(
                 browser_context, "focused_app_context", return_value=None
             ),
+            mock.patch.object(
+                browser_context,
+                "capture_context",
+                side_effect=linear.LinearIntegration().capture,
+            ),
         ):
             context = browser_context.request_context("work on this ticket")
 
         self.assertEqual(context.focused_issue, "ENG-123")
-        self.assertEqual(context.linear_issue, "ENG-123")
+        self.assertEqual(context.external_issue_reference, "ENG-123")
+        self.assertEqual(context.external_issue_source, "linear")
         self.assertIn("Current focused Linear issue", context.text)
-        self.assertIn("Identifier: ENG-123", context.text)
+        self.assertIn(
+            "Identifier (untrusted external identifier): ENG-123", context.text
+        )
         focused_url.assert_called_once_with()
 
     def test_browser_context_dispatches_linear_url(self) -> None:
         url = "https://linear.app/acme/issue/ENG-123/fix-routing"
-        with mock.patch.object(
-            browser_context, "focused_firefox_url", return_value=url
+        with (
+            mock.patch.object(browser_context, "focused_firefox_url", return_value=url),
+            mock.patch.object(
+                browser_context,
+                "capture_context",
+                side_effect=linear.LinearIntegration().capture,
+            ),
         ):
             context = browser_context.focused_browser_context()
 
-        self.assertIn("Identifier: ENG-123", str(context))
+        self.assertIn(
+            "Identifier (untrusted external identifier): ENG-123", str(context)
+        )
+
+    def test_disabled_linear_url_is_not_recognized(self) -> None:
+        url = "https://linear.app/acme/issue/ENG-123/fix-routing"
+        with (
+            mock.patch.object(browser_context, "focused_firefox_url", return_value=url),
+            mock.patch.object(
+                browser_context, "focused_app_context", return_value=None
+            ),
+            mock.patch.object(browser_context, "capture_context", return_value=None),
+        ):
+            context = browser_context.request_context("work on this ticket")
+
+        self.assertEqual(context.text, "work on this ticket")
+        self.assertIsNone(context.focused_issue)
+        self.assertIsNone(context.external_issue_reference)
 
 
 class ZendeskDispatchTests(unittest.TestCase):
