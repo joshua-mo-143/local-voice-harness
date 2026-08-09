@@ -69,6 +69,47 @@ class JobsCliTests(unittest.TestCase):
         )
 
 
+class JobsNukeCliTests(unittest.TestCase):
+    def _dispatch_nuke(
+        self, argv: list[str], *, total: int, answer: str = "delete"
+    ) -> tuple[mock.Mock, mock.Mock]:
+        args = cli.parser().parse_args(argv)
+        with (
+            mock.patch.object(cli, "count_jobs", return_value=total),
+            mock.patch.object(
+                cli, "nuke_jobs", return_value="Deleted all jobs."
+            ) as nuke_jobs,
+            mock.patch.object(cli, "input", return_value=answer, create=True) as prompt,
+            mock.patch("builtins.print"),
+        ):
+            cli.dispatch(args)
+        return nuke_jobs, prompt
+
+    def test_force_deletes_without_prompting(self) -> None:
+        nuke_jobs, prompt = self._dispatch_nuke(
+            ["jobs", "nuke", "--force"], total=3, answer="delete"
+        )
+        nuke_jobs.assert_called_once_with()
+        prompt.assert_not_called()
+
+    def test_confirmation_word_deletes(self) -> None:
+        nuke_jobs, prompt = self._dispatch_nuke(
+            ["jobs", "nuke"], total=2, answer="delete"
+        )
+        prompt.assert_called_once()
+        nuke_jobs.assert_called_once_with()
+
+    def test_other_answer_aborts(self) -> None:
+        nuke_jobs, prompt = self._dispatch_nuke(["jobs", "nuke"], total=2, answer="no")
+        prompt.assert_called_once()
+        nuke_jobs.assert_not_called()
+
+    def test_no_jobs_skips_prompt_and_delete(self) -> None:
+        nuke_jobs, prompt = self._dispatch_nuke(["jobs", "nuke"], total=0)
+        prompt.assert_not_called()
+        nuke_jobs.assert_not_called()
+
+
 class CredentialsCliTests(unittest.TestCase):
     def test_set_prompts_without_accepting_key_as_argument(self) -> None:
         args = cli.parser().parse_args(["credentials", "set"])

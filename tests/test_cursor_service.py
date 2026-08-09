@@ -149,6 +149,88 @@ def test_cancellation_clears_safely_absent_durable_legacy_owner(
     assert cancelled.worker_pid is None
 
 
+def _write_queued_job(jobs_dir: Path, job_id: str, **fields: object) -> None:
+    value: dict[str, object] = {
+        "schema_version": 5,
+        "id": job_id,
+        "revision": 0,
+        "request": "do it",
+        "status": "queued",
+        "created_at": 1,
+        "queued_at": 1,
+        "delivered": False,
+    }
+    value.update(fields)
+    (jobs_dir / f"{job_id}.json").write_text(json.dumps(value))
+
+
+def test_count_jobs_reports_durable_total(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    jobs_dir = tmp_path / "jobs"
+    jobs_dir.mkdir()
+    monkeypatch.setattr(service, "JOBS_DIR", jobs_dir)
+    monkeypatch.setattr(service, "LEGACY_JOBS_DIR", tmp_path / "legacy")
+
+    assert service.count_jobs() == 0
+    _write_queued_job(jobs_dir, "aaaaaaaaaaaa")
+    _write_queued_job(jobs_dir, "bbbbbbbbbbbb")
+    assert service.count_jobs() == 2
+
+
+def test_nuke_jobs_deletes_all_and_reports(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    jobs_dir = tmp_path / "jobs"
+    jobs_dir.mkdir()
+    monkeypatch.setattr(service, "JOBS_DIR", jobs_dir)
+    monkeypatch.setattr(service, "LEGACY_JOBS_DIR", tmp_path / "legacy")
+    _write_queued_job(jobs_dir, "aaaaaaaaaaaa")
+    _write_queued_job(jobs_dir, "bbbbbbbbbbbb")
+
+    message = service.nuke_jobs()
+
+    assert message == "Deleted all 2 Cursor jobs."
+    assert list(jobs_dir.glob("*.json")) == []
+    assert service.count_jobs() == 0
+
+
+def test_nuke_jobs_stops_running_worker_before_delete(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    jobs_dir = tmp_path / "jobs"
+    jobs_dir.mkdir()
+    monkeypatch.setattr(service, "JOBS_DIR", jobs_dir)
+    monkeypatch.setattr(service, "LEGACY_JOBS_DIR", tmp_path / "legacy")
+    _write_queued_job(
+        jobs_dir,
+        "aaaaaaaaaaaa",
+        status="running",
+        worker_token="claim",
+        worker_pid=42,
+        worker_boot_id="boot",
+        worker_process_start="start",
+    )
+
+    with mock.patch.object(service, "_stop_worker", return_value=True) as stop_worker:
+        message = service.nuke_jobs()
+
+    stop_worker.assert_called_once()
+    assert message == "Deleted all 1 Cursor job."
+    assert list(jobs_dir.glob("*.json")) == []
+
+
+def test_nuke_jobs_with_no_jobs_reports_nothing_to_delete(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    jobs_dir = tmp_path / "jobs"
+    jobs_dir.mkdir()
+    monkeypatch.setattr(service, "JOBS_DIR", jobs_dir)
+    monkeypatch.setattr(service, "LEGACY_JOBS_DIR", tmp_path / "legacy")
+
+    assert service.nuke_jobs() == "There were no Cursor jobs to delete."
+
+
 def test_behavior_modules_reject_low_level_store_and_job_dict_mutation() -> None:
     cursor_root = Path(__file__).parents[1] / "src" / "local_voice_harness" / "cursor"
     behavior_modules = (
