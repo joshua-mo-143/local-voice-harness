@@ -849,6 +849,37 @@ class CursorStoreIntegrationTests(unittest.TestCase):
         self.assertIsNotNone(first)
         self.assertEqual(store.get("bbbbbbbbbbbb").revision, 0)
 
+    def test_delete_all_removes_every_job_and_returns_ids(self) -> None:
+        store = JobStore(self.jobs_dir, self.jobs_dir / "legacy")
+        for job_id in ("aaaaaaaaaaaa", "bbbbbbbbbbbb", "cccccccccccc"):
+            store.create(CursorJob.from_dict(self.job(job_id)))
+
+        removed = store.delete_all()
+
+        self.assertEqual(
+            sorted(removed), ["aaaaaaaaaaaa", "bbbbbbbbbbbb", "cccccccccccc"]
+        )
+        self.assertEqual(list(self.jobs_dir.glob("*.json")), [])
+        self.assertEqual(store.list(), [])
+
+    def test_delete_all_preserves_quarantine_evidence(self) -> None:
+        store = JobStore(self.jobs_dir, self.jobs_dir / "legacy")
+        store.create(CursorJob.from_dict(self.job("aaaaaaaaaaaa")))
+        quarantine = self.jobs_dir / ".quarantine"
+        quarantine.mkdir()
+        evidence = quarantine / "bbbbbbbbbbbb-deadbeef.metadata.json"
+        evidence.write_text(json.dumps({"error": "held"}))
+
+        removed = store.delete_all()
+
+        self.assertEqual(removed, ["aaaaaaaaaaaa"])
+        self.assertTrue(evidence.exists())
+
+    def test_delete_all_on_missing_directory_returns_empty(self) -> None:
+        store = JobStore(self.jobs_dir / "absent", self.jobs_dir / "legacy")
+
+        self.assertEqual(store.delete_all(), [])
+
 
 if __name__ == "__main__":
     unittest.main()

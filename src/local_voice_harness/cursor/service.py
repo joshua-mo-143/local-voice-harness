@@ -664,6 +664,32 @@ def list_jobs() -> str:
     return inbox.describe_inbox(_job_store().list())
 
 
+def count_jobs() -> int:
+    """Return how many durable Cursor jobs currently exist."""
+    return len(_job_store().list())
+
+
+def nuke_jobs() -> str:
+    """Forcefully delete every Cursor job after stopping any live workers.
+
+    This is an irreversible bulk delete intended for the confirmation-gated
+    ``jobs nuke`` command. Any owned or legacy worker is stopped best-effort
+    first so we do not orphan running processes, then all job files are removed.
+    """
+    store = _job_store()
+    for job in store.list():
+        if job.worker_token:
+            _stop_worker(job)
+        elif worker_lifecycle.has_legacy_worker_claim(job):
+            _stop_legacy_worker(job.id)
+    removed = store.delete_all()
+    count = len(removed)
+    if not count:
+        return "There were no Cursor jobs to delete."
+    noun = "job" if count == 1 else "jobs"
+    return f"Deleted all {count} Cursor {noun}."
+
+
 def _status_message(job_id: str) -> str:
     summary = inbox.summarize(read_job(job_id))
     state = summary.status.value.replace("_", " ")

@@ -10,7 +10,7 @@ from .credentials import (
     get_venice_api_key,
     store_venice_api_key,
 )
-from .cursor.service import CursorTurnRequest, cursor_turn
+from .cursor.service import CursorTurnRequest, count_jobs, cursor_turn, nuke_jobs
 from .diagnostics import doctor
 from .dictation import run as run_dictation
 from .notifications import notify
@@ -78,6 +78,15 @@ def parser() -> argparse.ArgumentParser:
     job_reply = job_commands.add_parser("reply", help="answer a job clarification")
     job_reply.add_argument("--job", "-j", help="target job id")
     job_reply.add_argument("message", nargs="+")
+    job_nuke = job_commands.add_parser(
+        "nuke", help="permanently delete ALL Cursor jobs"
+    )
+    job_nuke.add_argument(
+        "--force",
+        "-f",
+        action="store_true",
+        help="delete without the confirmation prompt",
+    )
 
     doctor_command = commands.add_parser(
         "doctor",
@@ -135,6 +144,9 @@ def parser() -> argparse.ArgumentParser:
 
 
 def run_job_command(args: argparse.Namespace) -> None:
+    if args.jobs_command == "nuke":
+        _run_job_nuke(force=args.force)
+        return
     if args.jobs_command == "list":
         request = CursorTurnRequest("", action="list")
     elif args.jobs_command == "reply":
@@ -153,6 +165,24 @@ def run_job_command(args: argparse.Namespace) -> None:
             reference=reference,
         )
     print(cursor_turn(request).text)
+
+
+def _run_job_nuke(*, force: bool) -> None:
+    total = count_jobs()
+    if total == 0:
+        print("There are no Cursor jobs to delete.")
+        return
+    if not force:
+        noun = "job" if total == 1 else "jobs"
+        print(
+            f"WARNING: this permanently deletes all {total} Cursor {noun}, "
+            "including any that are still running. This cannot be undone."
+        )
+        confirmation = input("Type 'delete' to confirm: ").strip().casefold()
+        if confirmation != "delete":
+            print("Aborted. No Cursor jobs were deleted.")
+            return
+    print(nuke_jobs())
 
 
 def _add_vocabulary_parser(

@@ -893,3 +893,22 @@ class JobStore:
             now=now,
             retention_seconds=retention_seconds,
         )
+
+    def delete_all(self) -> list[str]:
+        """Forcefully remove every durable Cursor job file.
+
+        Unlike :meth:`prune`, this ignores retention, delivery, and reservation
+        fences: it is the bulk "nuke" primitive behind the confirmation-gated
+        CLI command. Quarantined payloads under ``.quarantine`` are left in
+        place so their evidence survives. Returns the ids of the removed jobs.
+        """
+        if not self.durable_dir.is_dir():
+            return []
+        removed: list[str] = []
+        with locked(self.durable_dir):
+            for path in sorted(self.durable_dir.glob("*.json")):
+                path.unlink()
+                removed.append(path.stem)
+            if removed:
+                _fsync_directory(self.durable_dir)
+        return removed
