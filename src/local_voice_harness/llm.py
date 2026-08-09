@@ -76,6 +76,13 @@ MAX_TOOL_CALL_ROUNDS = 6
 _SENTENCE = re.compile(r'^(.+?[.!?]["\']?)(?:\s+)', re.DOTALL)
 
 
+def _log_llm_event(event: str, **fields: object) -> None:
+    print(
+        json.dumps({"stage": "llm", "event": event, **fields}, ensure_ascii=False),
+        flush=True,
+    )
+
+
 def _response_message(result: object) -> dict[str, object]:
     if not isinstance(result, dict):
         raise HarnessError("LLM returned a malformed response")
@@ -244,6 +251,11 @@ def qwen_turn(
         if settings.llm_provider == "venice":
             request_data["reasoning"] = {"enabled": False}
         payload = json.dumps(request_data).encode()
+        _log_llm_event(
+            "request",
+            round=tool_round + 1,
+            payload=payload.decode(),
+        )
         headers = {"Content-Type": "application/json"}
         if venice_api_key is not None:
             headers["Authorization"] = f"Bearer {venice_api_key}"
@@ -262,6 +274,11 @@ def qwen_turn(
                     _streamed_message(response, on_text_chunk)
                     if settings.llm_provider == "venice"
                     else _response_message(json.load(response))
+                )
+                _log_llm_event(
+                    "aggregated_response",
+                    round=tool_round + 1,
+                    response=message,
                 )
         except urllib.error.HTTPError as exc:
             try:
@@ -300,11 +317,19 @@ def qwen_turn(
             function_value = call.get("function")
             function = function_value if isinstance(function_value, dict) else {}
             name = str(function.get("name", ""))
+            raw_arguments = str(function.get("arguments") or "{}")
+            _log_llm_event(
+                "tool_call",
+                round=tool_round + 1,
+                tool_call_id=str(call.get("id", "")),
+                name=name,
+                arguments=raw_arguments,
+            )
             if name != "cursor":
                 tool_result = f"Unknown tool: {name}"
             else:
                 try:
-                    arguments = json.loads(str(function.get("arguments") or "{}"))
+                    arguments = json.loads(raw_arguments)
                     task = str(arguments.get("task", "")).strip()
                     repository = str(arguments.get("repository", "")).strip() or None
                     requested_github_repository = (
@@ -375,6 +400,13 @@ def qwen_turn(
                             )
                     except Exception as exc:
                         tool_result = f"Cursor tool failed: {type(exc).__name__}: {exc}"
+            _log_llm_event(
+                "tool_result",
+                round=tool_round + 1,
+                tool_call_id=str(call.get("id", "")),
+                name=name,
+                result=tool_result,
+            )
             messages.append(
                 {
                     "role": "tool",
