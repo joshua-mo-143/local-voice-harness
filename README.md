@@ -80,7 +80,7 @@ Hey Jarvis, ask Cursor to summarize the api-docs repository.
 Hey Jarvis, ask Cursor to work on Linear issue API-79.
 Hey Jarvis, ask Cursor to work on owner/repository#42.
 Hey Jarvis, summarize this issue.  # with a GitHub issue focused in Firefox
-Hey Jarvis, summarize this ticket. # with a Zendesk ticket focused in Firefox
+Hey Jarvis, summarize this ticket. # with a Zendesk ticket focused (opt-in; see below)
 Hey Jarvis, fork this repo and add Venice.  # with a public GitHub repo focused
 Hey Jarvis, ask Cursor to check out this PR and make sure it works.  # with a PR focused
 Hey Jarvis, what is the status of that Cursor job?
@@ -90,9 +90,10 @@ Hey Jarvis, cancel that Cursor job.
 The assistant speaks its reply. To interrupt it and ask something else, say “Hey
 Jarvis” again while it is talking.
 
-To act on what is on your screen, focus a GitHub, pull request, or Zendesk tab, or
-select code in your editor, then refer to it in your request (for example
-“summarize this issue” or “explain this error”). See
+To act on what is on your screen, focus a GitHub or pull request tab, or select
+code in your editor, then refer to it in your request (for example “summarize this
+issue” or “explain this error”). Optional integrations such as Zendesk are disabled
+by default and are enabled per-provider in `config.toml`. See
 [Context capture](docs/context-capture.md) for the supported sources and how to
 enable them.
 
