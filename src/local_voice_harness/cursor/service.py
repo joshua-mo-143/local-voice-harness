@@ -52,6 +52,7 @@ class StartJobRequest:
     agent: str | None = None
     utterance: str | None = None
     context_repository: str | None = None
+    issue_key: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -67,6 +68,7 @@ class CursorTurnRequest:
     agent: str | None = None
     utterance: str | None = None
     context_repository: str | None = None
+    issue_key: str | None = None
     action: str = "submit"
     job_id: str | None = None
     reference: str | None = None
@@ -173,6 +175,7 @@ def start_job(
     agent: str | None = None,
     utterance: str | None = None,
     context_repository: str | None = None,
+    issue_key: str | None = None,
 ) -> str:
     if isinstance(request, StartJobRequest):
         text = request.text
@@ -185,6 +188,7 @@ def start_job(
         agent = request.agent
         utterance = request.utterance
         context_repository = request.context_repository
+        issue_key = request.issue_key
     else:
         text = request
     job_id = uuid.uuid4().hex[:12]
@@ -234,10 +238,10 @@ def start_job(
             ),
             pull_request_worktree_state=("pending" if github_pull_request else None),
             agent_hint=agent,
-            issue_key=extract_linear_issue(spoken_text),
+            issue_key=issue_key or extract_linear_issue(spoken_text),
             speakable_label=inbox.build_speakable_label(
                 text,
-                issue_key=extract_linear_issue(spoken_text),
+                issue_key=issue_key or extract_linear_issue(spoken_text),
                 github_repository=github_repository,
                 github_issue=github_issue,
                 github_pull_request=github_pull_request,
@@ -675,6 +679,7 @@ def cursor_turn(
     agent: str | None = None,
     utterance: str | None = None,
     context_repository: str | None = None,
+    issue_key: str | None = None,
     action: str = "submit",
     job_id: str | None = None,
     reference: str | None = None,
@@ -692,6 +697,7 @@ def cursor_turn(
         agent = request.agent
         utterance = request.utterance
         context_repository = request.context_repository
+        issue_key = request.issue_key
         action = request.action
         job_id = request.job_id
         reference = request.reference
@@ -772,6 +778,7 @@ def cursor_turn(
             agent=agent,
             utterance=utterance,
             context_repository=context_repository,
+            issue_key=issue_key,
         )
     started = time.perf_counter()
     deadline = time.monotonic() + CURSOR_FOREGROUND_SECONDS
