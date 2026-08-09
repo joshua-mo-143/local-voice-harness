@@ -99,6 +99,11 @@ def respond(text: str) -> None:
                     ),
                     delivery_claims=delivery_claims,
                 )[0]
+            elif route.intent == Intent.CURSOR_PR_UNSUPPORTED:
+                response = (
+                    "I can't open pull requests. I can review the changes or run "
+                    "the tests instead."
+                )
             elif route.actionable and route.intent == Intent.CURSOR_REPLY:
                 response = cursor_turn(
                     CursorTurnRequest(
@@ -115,6 +120,7 @@ def respond(text: str) -> None:
                     **github_arguments,
                     trusted_utterance=text,
                     delivery_claims=delivery_claims,
+                    allow_tools=False,
                 )
             print(f"Assistant: {response}")
             stream_and_play(response)

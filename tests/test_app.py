@@ -134,6 +134,7 @@ class AppContextTests(unittest.TestCase):
             "summarize this\n\ncontext",
             trusted_utterance="summarize this",
             delivery_claims=mock.ANY,
+            allow_tools=False,
         )
 
     def test_explicit_fork_passes_validated_focused_repository(self) -> None:
@@ -163,6 +164,7 @@ class AppContextTests(unittest.TestCase):
             github_pull_request=None,
             trusted_utterance="fork this repo and add Venice",
             delivery_claims=mock.ANY,
+            allow_tools=False,
         )
 
     def test_external_fork_language_cannot_authorize_fork(self) -> None:
@@ -188,6 +190,31 @@ class AppContextTests(unittest.TestCase):
             qwen.call_args.kwargs["trusted_utterance"],
             "summarize this issue",
         )
+        self.assertFalse(qwen.call_args.kwargs["allow_tools"])
+
+    def test_pull_request_request_is_declined_without_tools(self) -> None:
+        with (
+            mock.patch.object(app, "start_components"),
+            mock.patch.object(
+                app, "request_context", side_effect=lambda text: RequestContext(text)
+            ),
+            mock.patch.object(
+                app,
+                "route_intent",
+                return_value=IntentRoute(
+                    Intent.CURSOR_PR_UNSUPPORTED,
+                    "medium",
+                ),
+            ),
+            mock.patch.object(app, "qwen_response") as qwen,
+            mock.patch.object(app, "cursor_turn") as cursor,
+            mock.patch.object(app, "stream_and_play") as play,
+        ):
+            app.respond("open a pull request")
+
+        qwen.assert_not_called()
+        cursor.assert_not_called()
+        self.assertIn("can't open pull requests", play.call_args.args[0])
 
     def test_actionable_github_issue_metadata_reaches_cursor(self) -> None:
         context = RequestContext(

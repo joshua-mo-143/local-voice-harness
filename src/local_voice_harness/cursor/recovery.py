@@ -11,7 +11,7 @@ from typing import cast
 from ..errors import HarnessError
 from ..integrations.github import GitHubClient, GitHubError, GitHubRepository
 from ..integrations.herdr import HerdrClient, HerdrError
-from .model import CursorJob, JobStatus
+from .model import TERMINAL_STATUSES, CursorJob, JobStatus
 from .store import JobStore, LegacyWorkerInspector
 from .worker_lifecycle import (
     boot_identity,
@@ -68,6 +68,26 @@ def _record_reconciliation_observation(
     store.update(job_id, observe)
 
 
+def _followup_agent_cwd_matches(job: CursorJob, agent: dict[str, object]) -> bool:
+    if job.parent_job_id is None:
+        return True
+    expected = str(job.worktree_path or "").strip()
+    actual = str(agent.get("cwd") or "").strip()
+    if not expected or not actual:
+        return False
+    if job.herdr_pane_id and str(agent.get("pane_id") or "") != job.herdr_pane_id:
+        return False
+    if (
+        job.herdr_workspace_id
+        and str(agent.get("workspace_id") or "") != job.herdr_workspace_id
+    ):
+        return False
+    try:
+        return Path(actual).resolve() == Path(expected).resolve()
+    except OSError:
+        return False
+
+
 def reconcile_uncertain_agent(
     store: JobStore,
     job: CursorJob,
@@ -117,6 +137,53 @@ def reconcile_uncertain_agent(
             now=now,
             observed_absent=True,
         )
+        return
+    if not _followup_agent_cwd_matches(job, agent):
+        message = (
+            "follow-up Cursor agent does not match its reserved checkout and pane; "
+            "target cancellation is pending"
+        )
+
+        def reject_mismatch(current: CursorJob) -> CursorJob | None:
+            if (
+                current.agent_dispatch_state not in states
+                or current.herdr_target != target
+            ):
+                return None
+            status = (
+                current.status
+                if current.status in TERMINAL_STATUSES
+                else JobStatus.FAILED
+            )
+            changes: dict[str, object] = {
+                "agent_dispatch_state": "ready",
+                "agent_name": str(agent.get("name") or target),
+                "herdr_pane_id": str(
+                    agent.get("pane_id") or current.herdr_pane_id or ""
+                ),
+                "herdr_workspace_id": str(
+                    agent.get("workspace_id") or current.herdr_workspace_id or ""
+                ),
+                "worker_operation": None,
+                "agent_next_reconcile_at": None,
+                "target_release_pending": True,
+                "cancellation_reconciliation_pending": True,
+            }
+            if status == JobStatus.FAILED:
+                changes.update(
+                    error=message,
+                    result=message,
+                    reconciliation_base_error=message,
+                    completed_at=current.completed_at or now,
+                )
+            return current.evolve_recovery(
+                changes,
+                now=now,
+                status=status,
+                prepare_delivery=current.status not in TERMINAL_STATUSES,
+            )
+
+        store.update(job.id, reject_mismatch)
         return
 
     def visible(current: CursorJob) -> CursorJob | None:

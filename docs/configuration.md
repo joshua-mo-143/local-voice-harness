@@ -51,6 +51,8 @@ credential.
 | `VOICE_HARNESS_PLAYBACK_QUIET_TIMEOUT_SECONDS` | Non-negative post-playback echo-drain timeout | `2` | Wake drop-in |
 | `VOICE_HARNESS_PLAYBACK_LATENCY` | Non-negative `pw-play` duration ending in `us`, `ms`, or `s` | `100ms` | Wake drop-in |
 | `VOICE_HARNESS_CURSOR_FOREGROUND_SECONDS` | Non-negative time before a Cursor job backgrounds | `5` | Wake drop-in |
+| `VOICE_HARNESS_CURSOR_FOLLOWUP` | Enable completed-job follow-up context (kill switch) | `1` | Wake drop-in |
+| `VOICE_HARNESS_CURSOR_FOLLOWUP_WINDOW_SECONDS` | Finite, non-negative absolute lifetime of the retained completed-job reference | `60` | Wake drop-in |
 | `VOICE_HARNESS_HERDR_BIN` | Absolute Herdr executable path | `~/.local/bin/herdr` | Wake drop-in |
 | `VOICE_HARNESS_PROJECT_ROOT` | Absolute allowed root for inferred repositories | Home directory | Wake drop-in |
 | `VOICE_HARNESS_GITHUB_ROOT` | Absolute fork-clone root inside the project root | `~/src` | Wake drop-in |
@@ -76,6 +78,26 @@ its `origin` identifies the expected fork. The source repository is configured a
 `upstream` remote. Herdr and repository path overrides grant the wake process access
 to the selected executable and trees; review those trusted local paths before
 restarting and auditing the service.
+
+After the harness announces a completed Cursor job, it retains a one-shot reference
+to that job for `VOICE_HARNESS_CURSOR_FOLLOWUP_WINDOW_SECONDS`. Within that window a
+referential request such as "review the changes" or "run the tests" starts a child
+job that reuses the completed job's exact retained checkout instead of creating a
+fresh workspace. The reference is volatile: it is installed only after the
+completion response plays and its delivery is acknowledged, it is consumed only
+after a child job is durably created (so a busy checkout remains retryable until
+expiry), it is cleared by explicit new work or by ending the conversation, and it
+never survives a restart. Awaiting-clarification replies always take precedence,
+and opening a pull request remains unsupported. Set
+`VOICE_HARNESS_CURSOR_FOLLOWUP=0` to disable the feature entirely without affecting
+clarification replies or fresh submissions.
+
+Intent routing uses the configured LLM provider and endpoint, including Venice when
+selected. The router is authoritative for workspace mutations: conversation fallback
+does not receive Cursor tools, and invalid, unavailable, or low-confidence routing
+cannot start a job. A follow-up reuses a settled exact-checkout agent or the completed
+parent's retained Herdr workspace and root pane; if neither identity is safely
+available, the child fails closed without opening another pane.
 
 `voice-harness dictate vad` reads its `DICTATION_VAD_*` settings from the process
 that enables it. The listener waits indefinitely for speech, transcribes after the

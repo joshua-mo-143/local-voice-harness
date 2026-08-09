@@ -16,6 +16,19 @@
   root and runs `gh pr checkout` only in a job-unique, reserved worktree. Recovery
   retries that same worktree; failed preparation quarantines it.
 - Jobs never automatically commit, push, open pull requests, or remove worktrees.
+- Completed-job follow-ups reuse only the parent's exact, verified retained checkout:
+  the inherited repository, branch, worktree path, workspace, and pane are immutable;
+  the path is confirmed to be an isolated worktree (never the shared clone) that still
+  matches Herdr before dispatch; and unresolved live or quarantined evidence blocks
+  reuse. Agent startup uses a durably reserved target and retained pane, recovered
+  agents must report the exact checkout, and a prompt timeout keeps its target fenced
+  until cancellation. The completed parent is never reopened or mutated, prior agent
+  output is never injected into routing or worker prompts, opening a pull request
+  stays unsupported, and the in-memory follow-up reference is discarded on restart. Set
+  `VOICE_HARNESS_CURSOR_FOLLOWUP=0` to disable the feature.
+- Intent routing uses the configured LLM backend, but only a high-confidence
+  authoritative route can invoke Cursor. Conversation and low-confidence fallback are
+  tool-free.
 - Runtime job metadata and conversational audio live under
   `$XDG_RUNTIME_DIR/voice-harness`; focused dictation audio lives under
   `$XDG_RUNTIME_DIR/dictation`.

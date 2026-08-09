@@ -150,6 +150,28 @@ class ConfigPathTests(unittest.TestCase):
             ):
                 config.load_backend_settings({}, path=path)
 
+    def test_followup_window_rejects_non_finite_and_negative_values(self) -> None:
+        name = "VOICE_HARNESS_CURSOR_FOLLOWUP_WINDOW_SECONDS"
+        for value in ("invalid", "-1", "nan", "inf", "-inf"):
+            with (
+                self.subTest(value=value),
+                self.assertRaisesRegex(ValueError, "finite non-negative"),
+            ):
+                config._env_nonnegative_float(
+                    name,
+                    default=60,
+                    environment={name: value},
+                )
+
+        self.assertEqual(
+            config._env_nonnegative_float(
+                name,
+                default=60,
+                environment={name: "0"},
+            ),
+            0,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

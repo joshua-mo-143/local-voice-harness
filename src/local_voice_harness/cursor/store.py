@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Literal
 
 from .model import (
+    ACTIVE_STATUSES,
     CURRENT_SCHEMA_VERSION,
     TERMINAL_STATUSES,
     CursorJob,
@@ -30,6 +31,14 @@ LegacyWorkerInspector = Callable[[CursorJob], LegacyWorkerDisposition]
 
 class JobQuarantinedError(JobValidationError):
     """A malformed job was isolated from active job processing."""
+
+
+class FollowUpUnavailable(JobValidationError):
+    """A completed parent job cannot be used as a follow-up source."""
+
+
+class FollowUpCheckoutBusy(JobValidationError):
+    """The parent's retained checkout is reserved by another active job."""
 
 
 class JobQuarantineWarning(UserWarning):
@@ -98,8 +107,42 @@ def _quarantine_may_reserve(
             return True
     except (OSError, UnicodeDecodeError, json.JSONDecodeError):
         return True
-    if raw.get("status") in {status.value for status in TERMINAL_STATUSES}:
-        return False
+    status = str(raw.get("status") or "")
+    if status in {item.value for item in TERMINAL_STATUSES}:
+        uncertain = any(
+            str(raw.get(field) or "")
+            in {
+                "dispatching",
+                "submitted",
+                "ambiguous",
+                "failed_observing",
+                "manual_required",
+            }
+            for field in (
+                "agent_dispatch_state",
+                "fork_operation_state",
+                "worktree_provision_state",
+            )
+        )
+        fenced = bool(
+            raw.get("target_release_pending")
+            or raw.get("cancellation_reconciliation_pending")
+            or raw.get("manual_reconcile_operation")
+            or uncertain
+        )
+        if reservation == "worktree":
+            fenced = fenced or bool(
+                raw.get("worktree_manual_inspection_required")
+                or raw.get("worktree_provision_state")
+                in {"quarantined", "manual_required"}
+                or raw.get("pull_request_worktree_state") == "quarantined"
+            )
+        if not fenced:
+            return False
+    elif status not in {item.value for item in ACTIVE_STATUSES}:
+        # Treat an unknown status as reservation-bearing, but still compare a
+        # usable resource identity below rather than blocking unrelated jobs.
+        pass
     field = "herdr_target" if reservation == "target" else "worktree_path"
     reserved = raw.get(field)
     if reserved is None:
@@ -216,10 +259,6 @@ def _quarantine(path: Path, error: JobValidationError) -> JobQuarantinedError:
     while destination.exists():
         destination = quarantine / f"{stem}-{sequence}.json"
         sequence += 1
-    os.replace(path, destination)
-    destination.chmod(0o600)
-    _fsync_directory(path.parent)
-    _fsync_directory(quarantine)
     metadata_path = destination.with_suffix(".metadata.json")
     metadata: dict[str, object] = {
         "original_name": path.name,
@@ -228,7 +267,13 @@ def _quarantine(path: Path, error: JobValidationError) -> JobQuarantinedError:
         "sha256": digest,
         "error": str(error),
     }
+    # Publish reservation-bearing evidence before moving the malformed payload.
+    # A crash in the gap therefore fails closed; a later scan can retry the move.
     _atomic_json(metadata_path, metadata)
+    os.replace(path, destination)
+    destination.chmod(0o600)
+    _fsync_directory(path.parent)
+    _fsync_directory(quarantine)
     quarantined = JobQuarantinedError(
         f"{path.name}: job is quarantined as {destination.name}: {error}"
     )
@@ -309,6 +354,44 @@ def _peer_models_unlocked(path: Path) -> list[CursorJob]:
         except JobQuarantinedError:
             continue
     return peers
+
+
+def _validate_candidate_reservations_unlocked(
+    path: Path,
+    candidate: CursorJob,
+    previous: CursorJob | None,
+) -> None:
+    # Scan first so malformed peers become quarantine evidence before either
+    # live or quarantined reservations are evaluated.
+    peers = _peer_models_unlocked(path)
+    candidate_reserves = _job_reserves_resources(candidate)
+    previous_reserves = previous is not None and _job_reserves_resources(previous)
+    if candidate_reserves and (
+        not previous_reserves
+        or previous is None
+        or candidate.herdr_target != previous.herdr_target
+    ):
+        _validate_quarantine_reservation_unlocked(path.parent, candidate, "target")
+    if candidate_reserves and (
+        not previous_reserves
+        or previous is None
+        or candidate.worktree_path != previous.worktree_path
+    ):
+        _validate_quarantine_reservation_unlocked(path.parent, candidate, "worktree")
+    validate_reservations([*peers, candidate])
+
+
+def _job_reserves_resources(job: CursorJob) -> bool:
+    return bool(
+        job.status in ACTIVE_STATUSES
+        or job.target_release_pending
+        or job.cancellation_reconciliation_pending
+        or job.has_uncertain_operation()
+        or job.manual_reconcile_operation is not None
+        or job.worktree_manual_inspection_required
+        or job.worktree_provision_state in {"quarantined", "manual_required"}
+        or job.pull_request_worktree_state == "quarantined"
+    )
 
 
 def _has_legacy_worker_claim(job: CursorJob) -> bool:
@@ -409,7 +492,7 @@ def write_unlocked(path: Path, job: dict[str, object]) -> None:
                 raise JobValidationError("new Cursor job revision must be zero")
         else:
             validate_transition(previous, candidate)
-        validate_reservations([*_peer_models_unlocked(path), candidate])
+        _validate_candidate_reservations_unlocked(path, candidate, previous)
     except JobValidationError as exc:
         if isinstance(exc, JobQuarantinedError):
             raise
@@ -428,7 +511,7 @@ def _write_model_unlocked(path: Path, candidate: CursorJob) -> CursorJob:
                 raise JobValidationError("new Cursor job revision must be zero")
         else:
             validate_transition(previous, candidate)
-        validate_reservations([*_peer_models_unlocked(path), candidate])
+        _validate_candidate_reservations_unlocked(path, candidate, previous)
     except JobValidationError as exc:
         if isinstance(exc, JobQuarantinedError):
             raise
@@ -518,12 +601,11 @@ def migrate_legacy_jobs(
                         source.unlink()
                         _fsync_directory(legacy_dir)
                         continue
-                peers = [
-                    peer
-                    for peer in _peer_models_unlocked(destination)
-                    if peer.id != candidate.id
-                ]
-                validate_reservations([*peers, candidate])
+                _validate_candidate_reservations_unlocked(
+                    destination,
+                    candidate,
+                    existing,
+                )
                 _atomic_json(destination, candidate.to_dict())
                 source.unlink()
                 _fsync_directory(legacy_dir)
@@ -583,7 +665,51 @@ def prune_jobs(
     return removed
 
 
+def _validate_follow_up_source(
+    parent: CursorJob, expected_completed_at: float | None
+) -> None:
+    """Reject a follow-up whose parent is not a safe, isolated completed job."""
+    if parent.status != JobStatus.COMPLETED:
+        raise FollowUpUnavailable(
+            f"Cursor job {parent.id} is not completed and cannot be followed up"
+        )
+    if (
+        expected_completed_at is not None
+        and parent.completed_at != expected_completed_at
+    ):
+        raise FollowUpUnavailable(
+            f"Cursor job {parent.id} completion identity has changed"
+        )
+    if not (parent.repository and parent.worktree_branch and parent.worktree_path):
+        raise FollowUpUnavailable(
+            f"Cursor job {parent.id} has no isolated worktree to reuse"
+        )
+    if parent.worktree_provision_state not in {"ready", "retained"}:
+        raise FollowUpUnavailable(
+            f"Cursor job {parent.id} worktree is not in a reusable state"
+        )
+    if (
+        parent.has_uncertain_operation()
+        or parent.manual_reconcile_operation
+        or parent.target_release_pending
+        or parent.cancellation_reconciliation_pending
+    ):
+        raise FollowUpUnavailable(f"Cursor job {parent.id} is still being reconciled")
+    try:
+        repository = Path(parent.repository).resolve()
+        checkout = Path(parent.worktree_path).resolve()
+    except OSError as exc:
+        raise FollowUpUnavailable(
+            f"Cursor job {parent.id} checkout path is invalid"
+        ) from exc
+    if checkout == repository:
+        raise FollowUpUnavailable(
+            f"Cursor job {parent.id} used the shared repository clone"
+        )
+
+
 JobCommand = Callable[[CursorJob], CursorJob | None]
+FollowUpBuilder = Callable[[CursorJob], CursorJob]
 
 
 class JobStore:
@@ -636,6 +762,66 @@ class JobStore:
     def update(self, job_id: str, command: JobCommand) -> CursorJob | None:
         return self._transaction(job_id, command)
 
+    def create_follow_up(
+        self,
+        parent_job_id: str,
+        build: FollowUpBuilder,
+        *,
+        expected_completed_at: float | None = None,
+    ) -> CursorJob:
+        """Atomically create a child job that reuses a completed parent checkout.
+
+        The parent is re-read under the directory lock and validated as an
+        isolated, completed, reconciled job. The child is written as a fresh
+        queued job whose active worktree reservation guarantees a single winner
+        when several follow-ups race for the same checkout. The parent record is
+        never written.
+        """
+        with locked(self.durable_dir):
+            try:
+                parent = _read_model_unlocked(self.path(parent_job_id))
+            except (FileNotFoundError, JobQuarantinedError) as exc:
+                raise FollowUpUnavailable(
+                    f"Cursor job {parent_job_id} is no longer available"
+                ) from exc
+            _validate_follow_up_source(parent, expected_completed_at)
+            child = build(parent)
+            if child.parent_job_id != parent.id:
+                raise JobValidationError(
+                    "follow-up child must reference its parent job id"
+                )
+            for field in (
+                "repository",
+                "worktree_branch",
+                "worktree_path",
+                "worktree_workspace_id",
+                "worktree_root_pane_id",
+            ):
+                if getattr(child, field) != getattr(parent, field):
+                    raise JobValidationError(
+                        f"follow-up child must inherit parent {field} exactly"
+                    )
+            path = self.path(child.id)
+            if path.exists():
+                raise JobValidationError(f"{path.name}: Cursor job already exists")
+            try:
+                # Force malformed peers into quarantine before checking their
+                # evidence. The directory lock prevents a new peer appearing
+                # between this scan and the child write.
+                _peer_models_unlocked(path)
+                _validate_quarantine_reservation_unlocked(
+                    self.durable_dir, child, "worktree"
+                )
+                return _write_model_unlocked(path, child)
+            except JobValidationError as exc:
+                if "reserved by both" in str(
+                    exc
+                ) or "blocked by unresolved quarantine evidence" in str(exc):
+                    raise FollowUpCheckoutBusy(
+                        f"{parent.worktree_path} is busy with another Cursor job"
+                    ) from exc
+                raise
+
     def reserve_target(self, job_id: str, command: JobCommand) -> CursorJob | None:
         """Atomically apply a typed target-reservation transition."""
         return self._transaction(job_id, command, reservation="target")
@@ -657,12 +843,6 @@ class JobStore:
             candidate = command(current)
             if candidate is None:
                 return None
-            if reservation is not None:
-                _validate_quarantine_reservation_unlocked(
-                    self.durable_dir,
-                    candidate,
-                    reservation,
-                )
             return _write_model_unlocked(path, candidate)
 
     def acknowledge_quarantine_reservations(

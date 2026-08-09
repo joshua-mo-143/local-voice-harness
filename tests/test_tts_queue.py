@@ -3,6 +3,7 @@ from __future__ import annotations
 import tempfile
 import threading
 import unittest
+import wave
 from pathlib import Path
 from unittest import mock
 
@@ -75,6 +76,100 @@ class PlaybackQueueTests(unittest.TestCase):
 
         handle.discard.assert_called_once()
         self.assertEqual(len(queue), 0)
+
+    def test_late_pw_play_failure_does_not_run_delivery_callback(self) -> None:
+        queue = PlaybackQueue()
+        request = PlaybackRequest(
+            text="completed",
+            job_id="aaaaaaaaaaaa",
+            delivery_token="claim",
+            job_status="completed",
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            chunk = Path(temporary) / "chunk.wav"
+            with wave.open(str(chunk), "wb") as output:
+                output.setnchannels(1)
+                output.setsampwidth(2)
+                output.setframerate(16_000)
+                output.writeframes(b"\x00\x00" * 8)
+            prefetched = PrefetchedUtterance(
+                sample_rate=16_000,
+                chunks=[chunk],
+                chunk_texts=["completed"],
+            )
+            handle = mock.create_autospec(PrefetchHandle, instance=True)
+            handle.wait.return_value = prefetched
+            queue._items.append((request, handle))
+            process = mock.Mock()
+            process.stdin = mock.Mock()
+            process.stderr = mock.Mock()
+            process.stderr.read.return_value = b"sink disconnected"
+            process.wait.return_value = 1
+            process.poll.return_value = 1
+            on_played = mock.Mock()
+
+            with (
+                mock.patch(
+                    "local_voice_harness.tts.queue._open_playback",
+                    return_value=process,
+                ),
+                self.assertRaisesRegex(HarnessError, "sink disconnected"),
+            ):
+                queue.drain(on_played=on_played)
+
+        on_played.assert_not_called()
+
+    def test_later_prefetch_failure_acknowledges_successful_audio_prefix(self) -> None:
+        queue = PlaybackQueue()
+        first = PlaybackRequest(
+            text="first",
+            job_id="aaaaaaaaaaaa",
+            delivery_token="claim1",
+            job_status="completed",
+        )
+        second = PlaybackRequest(
+            text="second",
+            job_id="bbbbbbbbbbbb",
+            delivery_token="claim2",
+            job_status="completed",
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            chunk = Path(temporary) / "first.wav"
+            with wave.open(str(chunk), "wb") as output:
+                output.setnchannels(1)
+                output.setsampwidth(2)
+                output.setframerate(16_000)
+                output.writeframes(b"\x00\x00" * 8)
+            first_handle = mock.create_autospec(PrefetchHandle, instance=True)
+            first_handle.wait.return_value = PrefetchedUtterance(
+                sample_rate=16_000,
+                chunks=[chunk],
+                chunk_texts=["first"],
+            )
+            second_handle = mock.create_autospec(PrefetchHandle, instance=True)
+            second_handle.wait.side_effect = HarnessError("second prefetch failed")
+            queue._items.extend([(first, first_handle), (second, second_handle)])
+            process = mock.Mock()
+            process.stdin = mock.Mock()
+            process.wait.return_value = 0
+            process.poll.return_value = 0
+            on_played = mock.Mock()
+
+            with (
+                mock.patch(
+                    "local_voice_harness.tts.queue._open_playback",
+                    return_value=process,
+                ),
+                self.assertRaisesRegex(HarnessError, "second prefetch failed"),
+            ):
+                queue.drain(on_played=on_played)
+
+        on_played.assert_called_once()
+        result, interrupted, request = on_played.call_args.args
+        self.assertEqual(result["played_text"], "first")
+        self.assertFalse(interrupted)
+        self.assertIs(request, first)
+        second_handle.discard.assert_called_once()
 
     def test_failed_handle_discard_cleans_partial_chunks_safely(self) -> None:
         handle = PrefetchHandle.__new__(PrefetchHandle)

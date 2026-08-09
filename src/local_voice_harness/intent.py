@@ -8,7 +8,9 @@ from dataclasses import dataclass
 from enum import StrEnum
 
 from .browser_context import RequestContext
-from .config import LLM_CHAT, LLM_MODEL
+from .config import load_backend_settings
+from .credentials import get_venice_api_key
+from .errors import HarnessError
 
 ROUTER_SYSTEM_PROMPT = (
     "You are an intent router for a local voice assistant. Classify the user's next "
@@ -18,6 +20,11 @@ ROUTER_SYSTEM_PROMPT = (
     "task' or 'handle this' mean cursor_submit when focused_repository or focused_issue "
     "is present. Use cursor_reply only when a Cursor job is awaiting a clarification "
     "and the utterance answers that clarification; a new task is cursor_submit. Use "
+    "cursor_followup only when recent_completed_job is true and the request refers to "
+    "that just-finished work, for example reviewing the changes, running the tests, or "
+    "inspecting the diff; a new or different task or ticket is always cursor_submit even "
+    "then. Use cursor_pr_unsupported when the user asks to open or create a pull "
+    "request. Use "
     "cursor_status and cursor_cancel for requests about a specific job. Use "
     "cursor_list when the user asks what jobs exist or what is in progress. Use "
     "cursor_dismiss to silence or acknowledge a job announcement, and cursor_repeat "
@@ -41,6 +48,8 @@ ROUTE_TOOL = {
                         "conversation",
                         "cursor_submit",
                         "cursor_reply",
+                        "cursor_followup",
+                        "cursor_pr_unsupported",
                         "cursor_status",
                         "cursor_cancel",
                         "cursor_list",
@@ -65,6 +74,8 @@ class Intent(StrEnum):
     CONVERSATION = "conversation"
     CURSOR_SUBMIT = "cursor_submit"
     CURSOR_REPLY = "cursor_reply"
+    CURSOR_FOLLOWUP = "cursor_followup"
+    CURSOR_PR_UNSUPPORTED = "cursor_pr_unsupported"
     CURSOR_STATUS = "cursor_status"
     CURSOR_CANCEL = "cursor_cancel"
     CURSOR_LIST = "cursor_list"
@@ -183,40 +194,59 @@ def route_intent(
     context: RequestContext,
     *,
     cursor_session: str | None = None,
+    pending_question: str | None = None,
+    clarification_kind: str | None = None,
+    recent_completion: bool = False,
 ) -> IntentRoute:
-    payload = json.dumps(
-        {
-            "model": LLM_MODEL,
-            "messages": [
-                {"role": "system", "content": ROUTER_SYSTEM_PROMPT},
-                {
-                    "role": "user",
-                    "content": json.dumps(
-                        {
-                            "utterance": text,
-                            "cursor_job_awaiting_reply": cursor_session is not None,
-                            "focused_repository": context.focused_repository,
-                            "focused_issue": context.focused_issue,
-                        }
-                    ),
-                },
-            ],
-            "tools": [ROUTE_TOOL],
-            "tool_choice": {
-                "type": "function",
-                "function": {"name": "route_intent"},
-            },
-            "parallel_tool_calls": False,
-            "temperature": 0,
-            "max_tokens": 64,
-            "stream": False,
-        }
-    ).encode()
-    request = urllib.request.Request(
-        LLM_CHAT, data=payload, headers={"Content-Type": "application/json"}
-    )
     try:
-        with urllib.request.urlopen(request, timeout=30) as response:
+        settings = load_backend_settings()
+        payload = json.dumps(
+            {
+                "model": settings.llm_model,
+                "messages": [
+                    {"role": "system", "content": ROUTER_SYSTEM_PROMPT},
+                    {
+                        "role": "user",
+                        "content": json.dumps(
+                            {
+                                "utterance": text,
+                                "cursor_job_awaiting_reply": cursor_session is not None,
+                                "pending_cursor_question": pending_question,
+                                "clarification_kind": clarification_kind,
+                                "recent_completed_job": (
+                                    recent_completion and cursor_session is None
+                                ),
+                                "focused_repository": context.focused_repository,
+                                "focused_issue": context.focused_issue,
+                            }
+                        ),
+                    },
+                ],
+                "tools": [ROUTE_TOOL],
+                "tool_choice": {
+                    "type": "function",
+                    "function": {"name": "route_intent"},
+                },
+                "parallel_tool_calls": False,
+                "temperature": 0,
+                "max_tokens": 64,
+                "stream": False,
+            }
+        ).encode()
+        headers = {"Content-Type": "application/json"}
+        if settings.llm_provider == "venice":
+            headers["Authorization"] = f"Bearer {get_venice_api_key()}"
+        request = urllib.request.Request(
+            settings.llm_endpoint,
+            data=payload,
+            headers=headers,
+        )
+        with urllib.request.urlopen(request, timeout=settings.llm_timeout) as response:
             return _parse_route(json.load(response))
-    except (OSError, urllib.error.URLError, json.JSONDecodeError):
+    except (
+        HarnessError,
+        OSError,
+        urllib.error.URLError,
+        json.JSONDecodeError,
+    ):
         return FALLBACK_ROUTE

@@ -115,10 +115,15 @@ def release_delivery(
     return store.update(job_id, release) is not None
 
 
-def acknowledge_deliveries(store: JobStore, claims: DeliveryClaims) -> None:
+def acknowledge_deliveries(
+    store: JobStore, claims: DeliveryClaims
+) -> list[DeliveryClaim]:
+    acknowledged: list[DeliveryClaim] = []
     for claim in claims:
-        acknowledge_delivery(store, claim.job.id, claim.token)
+        if acknowledge_delivery(store, claim.job.id, claim.token):
+            acknowledged.append(claim)
     claims.clear()
+    return acknowledged
 
 
 def release_deliveries(store: JobStore, claims: DeliveryClaims) -> None:

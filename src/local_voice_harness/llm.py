@@ -250,6 +250,7 @@ def qwen_turn(
     trusted_utterance: str | None = None,
     delivery_claims: DeliveryClaims | None = None,
     on_text_chunk: Callable[[str], None] | None = None,
+    allow_tools: bool = True,
 ) -> tuple[str, str | None]:
     settings = load_backend_settings()
     venice_api_key = get_venice_api_key() if settings.llm_provider == "venice" else None
@@ -269,13 +270,14 @@ def qwen_turn(
         request_data: dict[str, object] = {
             "model": settings.llm_model,
             "messages": messages,
-            "tools": QWEN_TOOLS,
-            "tool_choice": "auto",
-            "parallel_tool_calls": False,
             "temperature": 0.7,
             "max_tokens": MAX_COMPLETION_TOKENS,
             "stream": settings.llm_provider == "venice",
         }
+        if allow_tools:
+            request_data["tools"] = QWEN_TOOLS
+            request_data["tool_choice"] = "auto"
+            request_data["parallel_tool_calls"] = False
         if settings.llm_provider == "venice":
             request_data["reasoning"] = {"enabled": False}
         payload = json.dumps(request_data).encode()
@@ -329,6 +331,8 @@ def qwen_turn(
             )
         )
         tool_calls = _message_tool_calls(message)
+        if tool_calls and not allow_tools:
+            raise HarnessError("LLM returned a tool call when tools are disabled")
         if not tool_calls:
             answer = str(message.get("content") or "").strip()
             if not answer:
@@ -445,6 +449,7 @@ def qwen_response(
     github_pull_request: int | None = None,
     trusted_utterance: str | None = None,
     delivery_claims: DeliveryClaims | None = None,
+    allow_tools: bool = True,
 ) -> str:
     return qwen_turn(
         text,
@@ -456,4 +461,5 @@ def qwen_response(
         github_pull_request=github_pull_request,
         trusted_utterance=trusted_utterance,
         delivery_claims=delivery_claims,
+        allow_tools=allow_tools,
     )[0]

@@ -45,8 +45,11 @@ handoffs.
 
 Cursor routing works as follows:
 
-1. Ask a focused Qwen pass to classify conversation, new work, clarification replies,
-   status, and cancellation without rewriting the user's request.
+1. Ask the configured LLM backend for one focused, forced-tool classification of
+   conversation, new work, follow-ups, clarification replies, status, and cancellation
+   without rewriting the user's request. Non-actionable routes fall through to
+   tool-free conversation, so only a high-confidence router result can mutate a
+   workspace.
 2. Prefer an idle Cursor agent already running in the requested checkout.
 3. For a Linear issue without a repository name, ask a dedicated routing agent to
    inspect the ticket through Linear MCP and infer the repository.
@@ -74,6 +77,19 @@ confirmation. Checking out a focused pull request only reads from GitHub and wri
 its isolated local worktree. PR worktrees are reused only by recovery or continuation
 of the same job. Completed and cancelled worktrees are retained for inspection, while
 an invalid or partially prepared checkout is marked quarantined and is never dispatched.
+
+After a completed job is announced, the wake conversation retains a bounded, one-shot
+reference to it. A referential follow-up within that window ("review the changes",
+"run the tests") starts a child job that reuses the completed parent's exact retained
+checkout: the child records a `parent_job_id`, inherits the parent's immutable
+repository, branch, worktree path, workspace, and root-pane identity, and provisions
+an agent only at that verified checkout. The completed parent job is terminal and is
+never reopened, mutated, or transitioned; a settled agent already at the checkout is
+reused, otherwise a new agent is started only in the retained pane. Missing pane
+identity fails closed rather than creating an unrecoverable Herdr side effect. The
+reference is volatile in-memory conversation state installed only after a successful,
+acknowledged announcement, so it never survives a restart, and
+awaiting-clarification replies always take precedence over it.
 
 ## Runtime privacy and durability
 
