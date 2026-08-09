@@ -224,7 +224,13 @@ def load_backend_settings(
             label="TTS voice",
         ),
         tts_speed=_tts_speed(
-            _backend_value(tts, "speed", 1, environment, "VOICE_HARNESS_TTS_SPEED")
+            _backend_value(
+                tts,
+                "speed",
+                1.25 if tts_provider == "venice" else 1,
+                environment,
+                "VOICE_HARNESS_TTS_SPEED",
+            )
         ),
         tts_endpoint=_nonempty(
             _backend_value(
@@ -312,6 +318,22 @@ def _env_int(name: str, *, default: int, minimum: int) -> int:
     return value if value >= minimum else default
 
 
+def _env_nonnegative_float(
+    name: str,
+    *,
+    default: float,
+    environment: Mapping[str, str] = os.environ,
+) -> float:
+    raw = environment.get(name, str(default))
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a finite non-negative number") from exc
+    if not math.isfinite(value) or value < 0:
+        raise ValueError(f"{name} must be a finite non-negative number")
+    return value
+
+
 def _env_classes(name: str, defaults: tuple[str, ...]) -> tuple[str, ...]:
     raw = os.environ.get(name)
     if raw is None:
@@ -349,6 +371,18 @@ FOCUSED_APP_DENY_CLASSES = _env_classes(
 # to a routed request. Individual sources enforce their own tighter limits.
 MAX_FOCUSED_APP_CONTEXT_CHARS = _env_int(
     "VOICE_HARNESS_FOCUSED_APP_MAX_CHARS", default=12_000, minimum=1
+)
+
+# Completed-job follow-up context (GitHub issue #follow-on-jobs). When enabled,
+# the wake daemon retains the last successfully announced completed Cursor job as
+# a bounded, one-shot follow-up target. The kill switch disables the whole
+# feature without affecting clarification replies or fresh submissions.
+CURSOR_FOLLOWUP_ENABLED = _env_flag("VOICE_HARNESS_CURSOR_FOLLOWUP", default=True)
+# Absolute lifetime of the retained completed-job reference, in seconds. It does
+# not slide when unrelated conversation extends the conversation deadline.
+CURSOR_FOLLOWUP_WINDOW_SECONDS = _env_nonnegative_float(
+    "VOICE_HARNESS_CURSOR_FOLLOWUP_WINDOW_SECONDS",
+    default=60,
 )
 
 SYSTEMD_USER_DIR = Path.home() / ".config" / "systemd" / "user"

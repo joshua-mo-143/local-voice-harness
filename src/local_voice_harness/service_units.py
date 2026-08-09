@@ -195,6 +195,8 @@ OPTIONAL_ENVIRONMENT_POLICY: dict[str, dict[str, str]] = {
         "VOICE_HARNESS_PLAYBACK_QUIET_TIMEOUT_SECONDS": "nonnegative_float",
         "VOICE_HARNESS_PLAYBACK_LATENCY": "duration",
         "VOICE_HARNESS_CURSOR_FOREGROUND_SECONDS": "nonnegative_float",
+        "VOICE_HARNESS_CURSOR_FOLLOWUP": "flag",
+        "VOICE_HARNESS_CURSOR_FOLLOWUP_WINDOW_SECONDS": "nonnegative_float",
         "VOICE_HARNESS_HERDR_BIN": "absolute_path",
         "VOICE_HARNESS_PROJECT_ROOT": "absolute_path",
         "VOICE_HARNESS_GITHUB_ROOT": "absolute_path",
@@ -835,6 +837,17 @@ def _optional_environment_errors(name: str, environment: dict[str, str]) -> list
             and re.fullmatch(r"(?:0|[1-9]\d*)(?:\.\d+)?(?:us|ms|s)", value) is None
         ):
             problem = "must be a non-negative duration ending in us, ms, or s"
+        elif validator == "flag" and value.strip().casefold() not in {
+            "0",
+            "1",
+            "true",
+            "false",
+            "yes",
+            "no",
+            "on",
+            "off",
+        }:
+            problem = "must be a boolean flag (0/1, true/false, yes/no, on/off)"
         elif validator == "barge_in_mode" and value not in {"wake", "vad", "off"}:
             problem = "must be wake, vad, or off"
         elif validator == "dictation_inject" and value not in {

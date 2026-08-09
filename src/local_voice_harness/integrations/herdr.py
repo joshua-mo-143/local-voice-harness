@@ -432,11 +432,15 @@ class HerdrClient:
             ):
                 continue
             matches.append(agent)
-        return (
-            self.selection(matches[0], str(expected) if expected else None)
-            if len(matches) == 1
-            else None
-        )
+        if len(matches) > 1:
+            targets = ", ".join(sorted(self.target(agent) for agent in matches))
+            raise HerdrError(
+                f"multiple settled Cursor agents match the requested checkout: {targets}",
+                code="agent_ambiguous",
+            )
+        if not matches:
+            return None
+        return self.selection(matches[0], str(expected) if expected else None)
 
     def workspace_for(self, checkout: Path) -> dict[str, Any] | None:
         for workspace in self.list_workspaces():

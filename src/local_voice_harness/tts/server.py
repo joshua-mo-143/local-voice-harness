@@ -6,7 +6,9 @@ import os
 import re
 import shutil
 import socketserver
+import subprocess
 import sys
+import tempfile
 import threading
 import time
 import urllib.error
@@ -139,6 +141,26 @@ def _venice_api_key() -> str:
     return VENICE_API_KEY or get_venice_api_key()
 
 
+def _wav_metadata(audio: bytes) -> tuple[int, float]:
+    try:
+        with wave.open(io.BytesIO(audio), "rb") as source:
+            channels = source.getnchannels()
+            sample_width = source.getsampwidth()
+            sample_rate = source.getframerate()
+            compression = source.getcomptype()
+            pcm = source.readframes(source.getnframes())
+    except (EOFError, wave.Error) as exc:
+        raise RuntimeError("Venice TTS returned an invalid WAV response") from exc
+    if channels != 1 or sample_width != 2 or compression != "NONE":
+        raise RuntimeError(
+            "Venice TTS WAV must be mono, 16-bit, uncompressed PCM audio"
+        )
+    frame_width = channels * sample_width
+    if sample_rate <= 0 or not pcm or len(pcm) % frame_width:
+        raise RuntimeError("Venice TTS returned an empty or truncated WAV response")
+    return sample_rate, len(pcm) / frame_width / sample_rate
+
+
 def _venice_audio(text: str) -> tuple[bytes, int, float, float]:
     settings = _settings()
     payload = json.dumps(
@@ -147,7 +169,9 @@ def _venice_audio(text: str) -> tuple[bytes, int, float, float]:
             "voice": settings.tts_voice,
             "input": text,
             "response_format": "wav",
-            "speed": settings.tts_speed,
+            # Venice models do not apply this consistently. Request the original
+            # cadence and perform one predictable, pitch-preserving transform.
+            "speed": 1,
         }
     ).encode()
     request = urllib.request.Request(
@@ -172,22 +196,88 @@ def _venice_audio(text: str) -> tuple[bytes, int, float, float]:
         )
     if len(audio) > MAX_AUDIO_BYTES:
         raise RuntimeError("Venice TTS response exceeds the 32 MiB limit")
+    sample_rate, duration = _wav_metadata(audio)
+    return audio, sample_rate, duration, elapsed
+
+
+def _atempo_filter(speed: float) -> str:
+    """Build quality-preserving FFmpeg atempo stages within the 0.5-2 range."""
+    factors: list[float] = []
+    remaining = speed
+    while remaining < 0.5:
+        factors.append(0.5)
+        remaining /= 0.5
+    while remaining > 2:
+        factors.append(2)
+        remaining /= 2
+    factors.append(remaining)
+    return ",".join(f"atempo={factor:g}" for factor in factors)
+
+
+def _apply_venice_speed(
+    audio: bytes,
+    output: Path,
+    speed: float,
+    *,
+    timeout: float,
+) -> tuple[int, float, float]:
+    started = time.perf_counter()
+    if speed == 1:
+        output.write_bytes(audio)
+    else:
+        ffmpeg = shutil.which("ffmpeg")
+        if ffmpeg is None:
+            raise RuntimeError(
+                "FFmpeg is required for pitch-preserving Venice TTS speed adjustment"
+            )
+        source_path: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                mode="wb",
+                prefix=".voice-harness-tts-",
+                suffix=".wav",
+                dir=output.parent,
+                delete=False,
+            ) as source:
+                source.write(audio)
+                source_path = Path(source.name)
+            process = subprocess.run(
+                [
+                    ffmpeg,
+                    "-nostdin",
+                    "-y",
+                    "-v",
+                    "error",
+                    "-i",
+                    str(source_path),
+                    "-filter:a",
+                    _atempo_filter(speed),
+                    "-c:a",
+                    "pcm_s16le",
+                    str(output),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=timeout,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            output.unlink(missing_ok=True)
+            raise RuntimeError(f"FFmpeg TTS speed adjustment failed: {exc}") from exc
+        finally:
+            if source_path is not None:
+                source_path.unlink(missing_ok=True)
+        if process.returncode:
+            output.unlink(missing_ok=True)
+            detail = process.stderr.strip() or "unknown FFmpeg error"
+            raise RuntimeError(f"FFmpeg TTS speed adjustment failed: {detail}")
+
     try:
-        with wave.open(io.BytesIO(audio), "rb") as source:
-            channels = source.getnchannels()
-            sample_width = source.getsampwidth()
-            sample_rate = source.getframerate()
-            frames = source.getnframes()
-            compression = source.getcomptype()
-    except (EOFError, wave.Error) as exc:
-        raise RuntimeError("Venice TTS returned an invalid WAV response") from exc
-    if channels != 1 or sample_width != 2 or compression != "NONE":
-        raise RuntimeError(
-            "Venice TTS WAV must be mono, 16-bit, uncompressed PCM audio"
-        )
-    if sample_rate <= 0 or frames <= 0:
-        raise RuntimeError("Venice TTS returned an empty WAV response")
-    return audio, sample_rate, frames / sample_rate, elapsed
+        processed = output.read_bytes()
+    except OSError as exc:
+        raise RuntimeError(f"could not read processed Venice TTS audio: {exc}") from exc
+    sample_rate, duration = _wav_metadata(processed)
+    return sample_rate, duration, time.perf_counter() - started
 
 
 def _synthesize(
@@ -196,9 +286,15 @@ def _synthesize(
     output: Path,
 ) -> tuple[int, float, float]:
     if _settings().tts_provider == "venice":
-        audio, sample_rate, duration, elapsed = _venice_audio(text)
-        output.write_bytes(audio)
-        return sample_rate, duration, elapsed
+        settings = _settings()
+        audio, _sample_rate, _duration, generation_elapsed = _venice_audio(text)
+        sample_rate, duration, processing_elapsed = _apply_venice_speed(
+            audio,
+            output,
+            settings.tts_speed,
+            timeout=settings.tts_timeout,
+        )
+        return sample_rate, duration, generation_elapsed + processing_elapsed
 
     import soundfile as sf
 

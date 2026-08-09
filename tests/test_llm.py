@@ -53,6 +53,64 @@ class QwenClientTests(unittest.TestCase):
         self.assertIn("awaiting the user's reply", system_messages[0]["content"])
         self.assertEqual((answer, session), ("Continuing now.", "123456789abc"))
 
+    def test_allow_tools_false_omits_tools_and_returns_content(self) -> None:
+        with (
+            mock.patch.object(
+                llm.urllib.request,
+                "urlopen",
+                return_value=_response({"content": "Just chatting."}),
+            ) as urlopen,
+            redirect_stdout(io.StringIO()),
+        ):
+            answer, session = llm.qwen_turn("hello", allow_tools=False)
+
+        self.assertEqual((answer, session), ("Just chatting.", None))
+        payload = json.loads(urlopen.call_args.args[0].data)
+        self.assertNotIn("tools", payload)
+        self.assertNotIn("tool_choice", payload)
+
+    def test_allow_tools_false_rejects_returned_tool_calls(self) -> None:
+        message = {
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call-1",
+                    "function": {
+                        "name": "cursor_turn",
+                        "arguments": json.dumps({"request": "change the code"}),
+                    },
+                }
+            ],
+        }
+        with (
+            mock.patch.object(
+                llm.urllib.request,
+                "urlopen",
+                return_value=_response(message),
+            ),
+            mock.patch.object(llm, "cursor_turn") as cursor,
+            redirect_stdout(io.StringIO()),
+            self.assertRaisesRegex(HarnessError, "tools are disabled"),
+        ):
+            llm.qwen_turn("hello", allow_tools=False)
+
+        cursor.assert_not_called()
+
+    def test_allow_tools_true_includes_tools(self) -> None:
+        with (
+            mock.patch.object(
+                llm.urllib.request,
+                "urlopen",
+                return_value=_response({"content": "answer"}),
+            ) as urlopen,
+            redirect_stdout(io.StringIO()),
+        ):
+            llm.qwen_turn("hello", allow_tools=True)
+
+        payload = json.loads(urlopen.call_args.args[0].data)
+        self.assertIn("tools", payload)
+        self.assertEqual(payload["tool_choice"], "auto")
+
     def test_sends_expected_chat_payload_and_limits_history(self) -> None:
         history = [
             {"role": "user", "content": f"message {index}"} for index in range(10)

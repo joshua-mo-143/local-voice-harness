@@ -67,6 +67,7 @@ class ConfigPathTests(unittest.TestCase):
             self.assertEqual(
                 (defaults.llm_provider, defaults.tts_provider), ("local", "local")
             )
+            self.assertEqual(defaults.tts_speed, 1)
 
             backend_file = root / "backends.toml"
             backend_file.write_text(
@@ -87,6 +88,15 @@ class ConfigPathTests(unittest.TestCase):
         self.assertEqual(settings.llm_timeout, 15)
         self.assertEqual(settings.tts_provider, "venice")
         self.assertEqual(settings.tts_voice, "af_sky")
+        self.assertEqual(settings.tts_speed, 1.25)
+
+    def test_venice_tts_defaults_to_quarter_faster_speed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "backends.toml"
+            path.write_text('[tts]\nprovider = "venice"\n')
+
+            settings = config.load_backend_settings({}, path=path)
+
         self.assertEqual(settings.tts_speed, 1.25)
 
     def test_backend_environment_overrides_toml_and_rejects_unknown_provider(
@@ -139,6 +149,28 @@ class ConfigPathTests(unittest.TestCase):
                 config.BackendConfigurationError, "credentials set"
             ):
                 config.load_backend_settings({}, path=path)
+
+    def test_followup_window_rejects_non_finite_and_negative_values(self) -> None:
+        name = "VOICE_HARNESS_CURSOR_FOLLOWUP_WINDOW_SECONDS"
+        for value in ("invalid", "-1", "nan", "inf", "-inf"):
+            with (
+                self.subTest(value=value),
+                self.assertRaisesRegex(ValueError, "finite non-negative"),
+            ):
+                config._env_nonnegative_float(
+                    name,
+                    default=60,
+                    environment={name: value},
+                )
+
+        self.assertEqual(
+            config._env_nonnegative_float(
+                name,
+                default=60,
+                environment={name: "0"},
+            ),
+            0,
+        )
 
 
 if __name__ == "__main__":

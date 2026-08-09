@@ -44,6 +44,7 @@ latency. The optional faster-whisper backend and Chatterbox are configured for C
 Install these before setting up Python environments:
 
 - PipeWire tools (`pw-record` and `pw-play`).
+- FFmpeg for pitch-preserving Venice TTS speed adjustment.
 - `libnotify`/`notify-send`.
 - Git, curl, the GitHub CLI (`gh`), and systemd user services.
 - `xdotool` and `xclip` for X11 focused-window automation, or `wtype` and
@@ -61,7 +62,7 @@ On Arch/CachyOS, the base packages are approximately:
 
 ```bash
 paru -S --needed pipewire libnotify git curl github-cli xdotool xclip \
-  wl-clipboard wtype uv libsndfile
+  wl-clipboard wtype uv libsndfile ffmpeg
 ```
 
 On Arch/CachyOS, install the CUDA-enabled llama.cpp AUR package (it conflicts with
@@ -76,6 +77,7 @@ Verify the required commands:
 ```bash
 pw-record --version
 pw-play --version
+ffmpeg -version
 llama-server --version
 llama-server --list-devices   # expect CUDA0: NVIDIA GeForce ...
 nvidia-smi

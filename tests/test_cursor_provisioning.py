@@ -859,7 +859,7 @@ class CursorJobStateTests(unittest.TestCase):
         prompt = client.prompt_and_wait.call_args.args[1]
         self.assertIn("Title: Fix it", prompt)
         self.assertIn(
-            'the summary must be exactly "I\'ve finished working on source/project#42"',
+            'the summary must be exactly "I\'ve finished working on issue 42"',
             prompt,
         )
         updated = jobs.read_job("123456789abc")
@@ -1077,6 +1077,40 @@ class CursorJobStateTests(unittest.TestCase):
         client.choose_or_clone_repository.assert_called_once_with(
             [], checkpoint=mock.ANY
         )
+
+    def test_prompt_timeout_retains_target_reservation_for_cancellation(self) -> None:
+        repository = Path(self.temporary.name) / "project"
+        checkout = Path(self.temporary.name) / "worktree"
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "fix it",
+                "status": "queued",
+                "repository": str(repository),
+                "worktree_path": str(checkout),
+                "herdr_target": "cursor-agent",
+                "herdr_pane_id": "pane",
+                "herdr_workspace_id": "workspace",
+                "agent_name": "cursor-agent",
+                "agent_dispatch_state": "ready",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        client = mock.Mock()
+        client.prompt_and_wait.side_effect = HerdrError(
+            "prompt timed out",
+            code="operation_timeout",
+        )
+
+        with mock.patch.object(jobs, "HerdrClient", return_value=client):
+            service.run_worker("123456789abc")
+
+        failed = jobs.read_job("123456789abc")
+        self.assertEqual(failed["status"], "failed")
+        self.assertTrue(failed["target_release_pending"])
+        self.assertTrue(failed["cancellation_reconciliation_pending"])
+        self.assertIn("cursor-agent", jobs.reserved_targets())
 
     def test_dead_worker_reconciles_existing_agent(self) -> None:
         jobs.write_job(

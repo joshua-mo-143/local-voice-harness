@@ -106,6 +106,12 @@ bindsym $mod+d exec --no-startup-id /home/joshuam/.local/bin/voice-harness dicta
 
 This toggles recording - so in this case to activate recording you press $mod+d; to stop the recording, press $mod+d again.
 
+For always-on, silence-terminated dictation, bind `voice-harness dictate vad` to a
+key. The first invocation enables the listener. Each utterance is transcribed after
+speech is followed by silence, then the listener rearms for the next utterance.
+Invoke the command again to disable the listener. Keybind configuration remains
+external to the harness.
+
 The Sway (`bindsym`) and Hyprland (`bind = SUPER, D, exec, ...`) equivalents, plus
 the compositor environment setup the wake service needs, are in
 [Context capture](docs/context-capture.md).

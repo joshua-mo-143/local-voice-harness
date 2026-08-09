@@ -296,6 +296,11 @@ class PlaybackQueue:
                 return ""
             return self._items[0][0].text
 
+    def queued_text(self) -> str:
+        """Return all queued speech for wake-echo suppression."""
+        with self._lock:
+            return " ".join(request.text for request, _handle in self._items)
+
     def drain(
         self,
         *,
@@ -306,6 +311,7 @@ class PlaybackQueue:
     ) -> list[tuple[dict[str, object], bool, PlaybackRequest]]:
         """Play every queued item through one continuous pw-play stream."""
         played: list[tuple[dict[str, object], bool, PlaybackRequest]] = []
+        deferred_error: Exception | None = None
         started = time.perf_counter()
         with playback_slot():
             process: subprocess.Popen[bytes] | None = None
@@ -322,12 +328,13 @@ class PlaybackQueue:
                             self._items[0] = (request, handle)
                     try:
                         prefetched = handle.wait(should_interrupt=should_interrupt)
-                    except Exception:
+                    except Exception as exc:
                         handle.discard()
                         with self._lock:
                             if self._items and self._items[0][0] is request:
                                 self._items.popleft()
-                        raise
+                        deferred_error = exc
+                        break
                     if prefetched is None:
                         interrupted = True
                         handle.discard()
@@ -343,8 +350,6 @@ class PlaybackQueue:
                         }
                         print(json.dumps(result))
                         played.append((result, True, request))
-                        if on_played is not None:
-                            on_played(result, True, request)
                         break
                     item_started = time.perf_counter()
                     chunk_texts: list[str] = []
@@ -381,11 +386,15 @@ class PlaybackQueue:
                             if interrupted:
                                 break
                             chunk_texts.append(prefetched.chunk_texts[index])
+                    except Exception as exc:
+                        deferred_error = exc
                     finally:
                         _cleanup_chunks(prefetched.chunks)
                         with self._lock:
                             if self._items and self._items[0][0] is request:
                                 self._items.popleft()
+                    if deferred_error is not None:
+                        break
                     result = {
                         **prefetched.done_meta,
                         "ok": True,
@@ -396,8 +405,6 @@ class PlaybackQueue:
                     }
                     print(json.dumps(result))
                     played.append((result, interrupted, request))
-                    if on_played is not None:
-                        on_played(result, interrupted, request)
                     if interrupted:
                         break
                 if process is not None:
@@ -424,6 +431,14 @@ class PlaybackQueue:
                         process.wait(timeout=1)
         if played:
             played[-1][0]["request_seconds"] = round(time.perf_counter() - started, 3)
+        # Delivery callbacks may acknowledge durable announcements. Do not run
+        # them until pw-play has exited (or an intentional interruption has
+        # terminated it), because a late sink failure invalidates the batch.
+        if on_played is not None:
+            for result, interrupted, request in played:
+                on_played(result, interrupted, request)
+        if deferred_error is not None:
+            raise deferred_error
         return played
 
     def play_next(

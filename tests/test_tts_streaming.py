@@ -119,11 +119,51 @@ class ServerStreamingTests(unittest.TestCase):
                 "voice": "af_sky",
                 "input": "Hello.",
                 "response_format": "wav",
-                "speed": 1.25,
+                "speed": 1,
             },
         )
         self.assertEqual(request.get_header("Authorization"), "Bearer venice-secret")
         self.assertEqual(urlopen.call_args.kwargs["timeout"], 19)
+
+    def test_venice_speed_is_applied_locally_without_changing_pitch(self) -> None:
+        source = io.BytesIO()
+        with wave.open(source, "wb") as target:
+            target.setnchannels(1)
+            target.setsampwidth(2)
+            target.setframerate(24_000)
+            target.writeframes(b"\x00\x00" * 2_400)
+
+        def run_ffmpeg(command: list[str], **_kwargs: object) -> mock.Mock:
+            transformed = io.BytesIO()
+            with wave.open(transformed, "wb") as target:
+                target.setnchannels(1)
+                target.setsampwidth(2)
+                target.setframerate(24_000)
+                target.writeframes(b"\x00\x00" * 1_920)
+            Path(command[-1]).write_bytes(transformed.getvalue())
+            return mock.Mock(returncode=0, stderr="")
+
+        with (
+            tempfile.TemporaryDirectory() as temporary,
+            mock.patch.object(server.shutil, "which", return_value="/usr/bin/ffmpeg"),
+            mock.patch.object(server.subprocess, "run", side_effect=run_ffmpeg) as run,
+        ):
+            output = Path(temporary) / "reply.wav"
+            rate, duration, _elapsed = server._apply_venice_speed(
+                source.getvalue(),
+                output,
+                1.25,
+                timeout=19,
+            )
+
+        command = run.call_args.args[0]
+        self.assertEqual((rate, duration), (24_000, 0.08))
+        self.assertEqual(command[command.index("-filter:a") + 1], "atempo=1.25")
+        self.assertEqual(run.call_args.kwargs["timeout"], 19)
+
+    def test_atempo_filter_chains_extreme_supported_speeds(self) -> None:
+        self.assertEqual(server._atempo_filter(0.25), "atempo=0.5,atempo=0.5")
+        self.assertEqual(server._atempo_filter(4), "atempo=2,atempo=2")
 
 
 class _CapturingStdin:
