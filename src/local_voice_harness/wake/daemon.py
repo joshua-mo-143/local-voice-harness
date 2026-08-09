@@ -58,6 +58,7 @@ from ..llm import qwen_turn
 from ..notifications import notify
 from ..stt.client import transcribe
 from ..tts.queue import PlaybackQueue, PlaybackRequest
+from ..vad import FRAME_BYTES, FRAME_MS, SAMPLE_RATE, SpeechDetector
 
 RECORDING_PATHS = recorder.RecorderPaths(
     STATE_DIR, WAV_PATH, PID_PATH, RECORDER_LOG, RECORDING_LOCK
@@ -71,11 +72,6 @@ DICTATION_RECORDING_PATHS = recorder.RecorderPaths(
 )
 CAPTURE_PATHS = (RECORDING_PATHS, DICTATION_RECORDING_PATHS)
 CURSOR_STORE = JobStore(JOBS_DIR, LEGACY_JOBS_DIR)
-SAMPLE_RATE = 16_000
-FRAME_MS = 80
-FRAME_SAMPLES = SAMPLE_RATE * FRAME_MS // 1000
-FRAME_BYTES = FRAME_SAMPLES * 2
-VAD_CHUNK_BYTES = SAMPLE_RATE * 20 // 1000 * 2
 END_SILENCE_MS = 720
 MAX_UTTERANCE_SECONDS = 15
 CONVERSATION_TIMEOUT_SECONDS = 60
@@ -154,7 +150,6 @@ class WakeConversationDaemon:
     def __init__(self) -> None:
         import numpy as np
         import openwakeword
-        import webrtcvad
         from openwakeword.model import Model
 
         if BARGE_IN_MODE not in {"wake", "vad", "off"}:
@@ -174,7 +169,7 @@ class WakeConversationDaemon:
             vad_threshold=0.0,
         )
         self.wake_key = next(iter(self.wake_model.models))
-        self.vad = webrtcvad.Vad(2)
+        self.speech_detector = SpeechDetector(minimum_rms=MIN_SPEECH_RMS)
         self.pre_roll: collections.deque[bytes] = collections.deque(
             maxlen=PRE_ROLL_FRAMES
         )
@@ -192,16 +187,7 @@ class WakeConversationDaemon:
         self.playback_queue = PlaybackQueue()
 
     def is_speech(self, frame: bytes) -> bool:
-        samples = self.np.frombuffer(frame, dtype="<i2").astype(self.np.float64)
-        rms = float(self.np.sqrt(self.np.mean(samples * samples)))
-        if rms < MIN_SPEECH_RMS:
-            return False
-        chunks = [
-            frame[offset : offset + VAD_CHUNK_BYTES]
-            for offset in range(0, len(frame), VAD_CHUNK_BYTES)
-        ]
-        valid = [chunk for chunk in chunks if len(chunk) == VAD_CHUNK_BYTES]
-        return sum(self.vad.is_speech(chunk, SAMPLE_RATE) for chunk in valid) >= 2
+        return self.speech_detector.is_speech(frame)
 
     def read_frame(self) -> bytes:
         if self.microphone is None or self.microphone.stdout is None:

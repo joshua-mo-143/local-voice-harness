@@ -31,6 +31,16 @@ response. Chatterbox cannot cancel an active `generate()` call, so a wake-word
 interruption may take up to one short chunk to take effect on the server side, while
 PipeWire playback and already-queued chunks stop immediately.
 
+Focused dictation supports both manual and VAD-controlled capture. In VAD mode the
+invoking CLI process remains active, repeatedly owns a raw PipeWire stream, frames
+it through the same RMS-gated WebRTC detector as the wake daemon, and requires
+sustained speech before starting an utterance. It transcribes each utterance after
+post-speech silence and rearms, including when STT finds no recognizable speech. A
+concurrent invocation signals that owner to stop instead of attempting
+WAV handoff itself. The owner closes the WAV and atomically creates the immutable
+generation before transcription, which prevents duplicate or partially written
+handoffs.
+
 ## Cursor routing
 
 Cursor routing works as follows:
