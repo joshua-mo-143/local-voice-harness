@@ -283,6 +283,7 @@ JOBS_DIR = DURABLE_STATE_DIR / "jobs"
 VOCABULARY_PATH = vocabulary_path()
 WAV_PATH = STATE_DIR / "request.wav"
 PID_PATH = STATE_DIR / "recording.pid"
+WAKE_PID_PATH = STATE_DIR / "wake.pid"
 RECORDER_LOG = STATE_DIR / "pw-record.log"
 DICTATION_STATE_DIR = RUNTIME / "dictation"
 DICTATION_WAV_PATH = DICTATION_STATE_DIR / "recording.wav"

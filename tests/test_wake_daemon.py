@@ -97,6 +97,7 @@ def _bare_daemon() -> WakeConversationDaemon:
     instance.conversation_deadline = 0.0
     instance.awaiting_followup = False
     instance.last_wake = 0.0
+    instance.force_listen = threading.Event()
     instance.running = True
     instance.microphone = None
     instance.microphone_paused = False
@@ -1554,6 +1555,75 @@ class RunLoopFollowupTests(unittest.TestCase):
             "follow-up must pass its generation and be handled as woke=False",
         )
         self.assertEqual(len(recorded), 1)
+
+
+class ForceListenTests(unittest.TestCase):
+    def test_force_listen_starts_a_turn_without_the_wake_word(self) -> None:
+        daemon = _bare_daemon()
+        daemon.force_listen.set()
+
+        processed: list[tuple[Path, bool]] = []
+
+        def fake_process(audio_path: Path, *, woke: bool) -> None:
+            processed.append((audio_path, woke))
+            daemon.running = False
+
+        daemon.start_microphone = lambda: None  # type: ignore[method-assign]
+        daemon.read_frame = lambda: b"\x00\x00"  # type: ignore[method-assign]
+        daemon.record_utterance = lambda _initial: AUDIO_GENERATION  # type: ignore[method-assign]
+        daemon.process_utterance = fake_process  # type: ignore[method-assign]
+        daemon.begin_activation = lambda: None  # type: ignore[method-assign]
+
+        with (
+            mock.patch.object(wake_daemon, "recover_jobs"),
+            mock.patch.object(wake_daemon, "pending_results", return_value=[]),
+            mock.patch.object(
+                wake_daemon.recorder, "any_recording_active", return_value=False
+            ),
+            mock.patch.object(wake_daemon, "log"),
+            mock.patch.object(wake_daemon, "notify"),
+        ):
+            daemon.run()
+
+        self.assertEqual(processed, [(AUDIO_GENERATION, False)])
+        self.assertFalse(
+            daemon.force_listen.is_set(),
+            "the request must be consumed exactly once",
+        )
+
+    def test_request_listen_signals_the_recorded_pid(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            pid_path = Path(temporary) / "wake.pid"
+            pid_path.write_text("4321")
+            with (
+                mock.patch.object(wake_daemon, "WAKE_PID_PATH", pid_path),
+                mock.patch.object(wake_daemon.os, "kill") as kill,
+            ):
+                wake_daemon.request_listen()
+
+        kill.assert_called_once_with(4321, wake_daemon.signal.SIGUSR1)
+
+    def test_request_listen_reports_a_stopped_daemon(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            pid_path = Path(temporary) / "missing.pid"
+            with (
+                mock.patch.object(wake_daemon, "WAKE_PID_PATH", pid_path),
+                self.assertRaisesRegex(HarnessError, "not running"),
+            ):
+                wake_daemon.request_listen()
+
+    def test_request_listen_reports_a_dead_pid(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            pid_path = Path(temporary) / "wake.pid"
+            pid_path.write_text("4321")
+            with (
+                mock.patch.object(wake_daemon, "WAKE_PID_PATH", pid_path),
+                mock.patch.object(
+                    wake_daemon.os, "kill", side_effect=ProcessLookupError
+                ),
+                self.assertRaisesRegex(HarnessError, "not running"),
+            ):
+                wake_daemon.request_listen()
 
 
 class CompletedFollowupContextTests(unittest.TestCase):

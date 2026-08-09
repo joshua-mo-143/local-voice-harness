@@ -51,6 +51,9 @@ def parser() -> argparse.ArgumentParser:
     commands.add_parser("begin")
     commands.add_parser("end")
     commands.add_parser("cancel")
+    commands.add_parser(
+        "listen", help="start a conversation now without saying the wake word"
+    )
     transcribe_audio = commands.add_parser("transcribe")
     transcribe_audio.add_argument("--generation", type=Path)
     dictate = commands.add_parser(
@@ -257,6 +260,11 @@ def dispatch(args: argparse.Namespace) -> None:
         respond(transcribe(audio_path))
     elif args.command == "cancel":
         cancel_recording()
+    elif args.command == "listen":
+        from .wake.daemon import request_listen
+
+        request_listen()
+        print("listening")
     elif args.command == "transcribe":
         audio_path = (
             retry_generation(args.generation)
