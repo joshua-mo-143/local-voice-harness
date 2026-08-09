@@ -76,6 +76,12 @@ class QwenClientTests(unittest.TestCase):
         self.assertEqual(urlopen.call_args.kwargs["timeout"], 60)
         payload = json.loads(request.data)
         self.assertEqual(payload["model"], settings.llm_model)
+        system_prompt = payload["messages"][0]["content"]
+        self.assertIn(
+            'respond only with "I\'ve finished working on <identifier>"',
+            system_prompt,
+        )
+        self.assertIn("acknowledge it in one brief sentence", system_prompt)
         self.assertEqual(payload["messages"][1], history[2])
         self.assertEqual(payload["messages"][-1], {"role": "user", "content": "hello"})
         self.assertEqual(payload["tools"], llm.QWEN_TOOLS)

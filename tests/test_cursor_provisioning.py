@@ -845,6 +845,10 @@ class CursorJobStateTests(unittest.TestCase):
         )
         prompt = client.prompt_and_wait.call_args.args[1]
         self.assertIn("Title: Fix it", prompt)
+        self.assertIn(
+            'the summary must be exactly "I\'ve finished working on source/project#42"',
+            prompt,
+        )
         updated = jobs.read_job("123456789abc")
         self.assertEqual(updated["status"], "completed")
         self.assertEqual(updated["github_issue_url"], issue.url)

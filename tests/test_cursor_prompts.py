@@ -45,6 +45,19 @@ class CursorPromptTests(unittest.TestCase):
         self.assertIn("read it with gh", prompt)
         self.assertIn("Do not comment on, edit, label, assign, close", prompt)
 
+    def test_issue_completion_summary_uses_exact_concise_wording(self) -> None:
+        prompt = cursor_prompt(
+            "fix API-98",
+            "token",
+            issue_reference="API-98",
+        )
+
+        self.assertIn(
+            'the summary must be exactly "I\'ve finished working on API-98"',
+            prompt,
+        )
+        self.assertIn("a plain-text summary of at most 20 words", prompt)
+
 
 if __name__ == "__main__":
     unittest.main()
