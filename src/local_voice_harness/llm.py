@@ -89,6 +89,10 @@ def _log_llm_event(event: str, **fields: object) -> None:
     )
 
 
+def _notify_cursor_started() -> None:
+    notify("Cursor is working…")
+
+
 def _response_message(result: object) -> dict[str, object]:
     if not isinstance(result, dict):
         raise HarnessError("LLM returned a malformed response")
@@ -377,7 +381,6 @@ def qwen_turn(
                 if action in {"submit", "reply"} and not task:
                     tool_result = "Cursor tool error: task must not be empty"
                 else:
-                    notify("Cursor is working…")
                     try:
                         selected_github_repository = (
                             github_repository or requested_github_repository
@@ -402,6 +405,7 @@ def qwen_turn(
                                     utterance=trusted_utterance,
                                     action=action,
                                     job_id=job_id,
+                                    on_job_started=_notify_cursor_started,
                                 ),
                                 delivery_claims=delivery_claims,
                             )
@@ -415,6 +419,7 @@ def qwen_turn(
                                     utterance=trusted_utterance,
                                     action=action,
                                     job_id=job_id,
+                                    on_job_started=_notify_cursor_started,
                                 ),
                                 delivery_claims=delivery_claims,
                             )
