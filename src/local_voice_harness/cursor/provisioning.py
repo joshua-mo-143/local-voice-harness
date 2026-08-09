@@ -1148,11 +1148,7 @@ def run_claimed_worker(
                 github_issue_context=job.github_issue_context,
                 issue_reference=(
                     job.issue_key
-                    or (
-                        f"{job.github_repository}#{job.github_issue}"
-                        if job.github_repository and job.github_issue
-                        else None
-                    )
+                    or (f"issue {job.github_issue}" if job.github_issue else None)
                 ),
             ),
             token=turn_token,
