@@ -94,6 +94,7 @@ class IntentRouterTests(unittest.TestCase):
         self.assertEqual(payload["model"], settings.llm_model)
         self.assertEqual(urlopen.call_args.kwargs["timeout"], settings.llm_timeout)
         self.assertIsNone(request.get_header("Authorization"))
+        self.assertNotIn("reasoning", payload)
         get_key.assert_not_called()
 
     def test_venice_uses_configured_endpoint_model_timeout_and_credentials(
@@ -126,6 +127,7 @@ class IntentRouterTests(unittest.TestCase):
         self.assertEqual(payload["model"], settings.llm_model)
         self.assertEqual(urlopen.call_args.kwargs["timeout"], settings.llm_timeout)
         self.assertEqual(request.get_header("Authorization"), "Bearer venice-secret")
+        self.assertEqual(payload["reasoning"], {"enabled": False})
         get_key.assert_called_once_with()
 
     def test_only_high_confidence_non_conversation_routes_are_actionable(self) -> None:
