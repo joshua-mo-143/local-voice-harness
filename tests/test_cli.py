@@ -110,6 +110,20 @@ class JobsNukeCliTests(unittest.TestCase):
         nuke_jobs.assert_not_called()
 
 
+class ListenCliTests(unittest.TestCase):
+    def test_listen_asks_the_wake_daemon_to_start_a_conversation(self) -> None:
+        args = cli.parser().parse_args(["listen"])
+        with (
+            mock.patch(
+                "local_voice_harness.wake.daemon.request_listen"
+            ) as request_listen,
+            mock.patch("builtins.print"),
+        ):
+            cli.dispatch(args)
+
+        request_listen.assert_called_once_with()
+
+
 class CredentialsCliTests(unittest.TestCase):
     def test_set_prompts_without_accepting_key_as_argument(self) -> None:
         args = cli.parser().parse_args(["credentials", "set"])

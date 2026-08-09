@@ -31,6 +31,7 @@ from ..config import (
     RECORDER_LOG,
     RECORDING_LOCK,
     STATE_DIR,
+    WAKE_PID_PATH,
     WAV_PATH,
     load_backend_settings,
 )
@@ -195,6 +196,7 @@ class WakeConversationDaemon:
         self.conversation_deadline = 0.0
         self.awaiting_followup = False
         self.last_wake = 0.0
+        self.force_listen = threading.Event()
         self.running = True
         self.microphone: subprocess.Popen[bytes] | None = None
         self.microphone_paused = False
@@ -1048,6 +1050,21 @@ class WakeConversationDaemon:
                 self.close_conversation("inactivity")
                 speech_streak = 0
                 continue
+            if self.force_listen.is_set():
+                self.force_listen.clear()
+                log("force-listen requested")
+                initial = list(self.pre_roll)
+                self.pre_roll.clear()
+                speech_streak = 0
+                audio_path = self.record_utterance_safely(initial)
+                if audio_path is None:
+                    continue
+                notify("Listening…")
+                self.begin_activation()
+                self.continue_after_barge_in(
+                    self.process_utterance(audio_path, woke=False)
+                )
+                continue
             if self.awaiting_followup:
                 speech_streak = speech_streak + 1 if self.is_speech(frame) else 0
                 if speech_streak >= 5:
@@ -1093,6 +1110,28 @@ class WakeConversationDaemon:
                 self.microphone.wait(timeout=2)
 
 
+def request_listen() -> None:
+    """Ask a running wake daemon to start a conversation without the wake word."""
+    try:
+        pid = int(WAKE_PID_PATH.read_text().strip())
+    except (OSError, ValueError) as exc:
+        raise HarnessError("wake daemon is not running") from exc
+    try:
+        os.kill(pid, signal.SIGUSR1)
+    except ProcessLookupError as exc:
+        raise HarnessError("wake daemon is not running") from exc
+
+
+def _write_pidfile() -> None:
+    WAKE_PID_PATH.parent.mkdir(parents=True, exist_ok=True)
+    WAKE_PID_PATH.write_text(str(os.getpid()))
+
+
+def _remove_pidfile() -> None:
+    with contextlib.suppress(OSError):
+        WAKE_PID_PATH.unlink()
+
+
 def main() -> None:
     if "--check" in sys.argv[1:]:
         print("voice-harness-wake: ok")
@@ -1102,8 +1141,13 @@ def main() -> None:
     def handle_signal(_signum: int, _frame: object) -> None:
         daemon.stop()
 
+    def handle_listen(_signum: int, _frame: object) -> None:
+        daemon.force_listen.set()
+
     signal.signal(signal.SIGTERM, handle_signal)
     signal.signal(signal.SIGINT, handle_signal)
+    signal.signal(signal.SIGUSR1, handle_listen)
+    _write_pidfile()
     try:
         daemon.run()
     except Exception as exc:
@@ -1113,6 +1157,7 @@ def main() -> None:
             raise
     finally:
         daemon.stop()
+        _remove_pidfile()
 
 
 if __name__ == "__main__":
