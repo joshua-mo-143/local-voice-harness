@@ -416,6 +416,52 @@ class FocusedAppRequestContextTests(unittest.TestCase):
         self.assertIsNone(context.focused_app_context)
 
 
+class LinearContextTests(unittest.TestCase):
+    def test_extracts_canonical_issue_url(self) -> None:
+        issue = browser_context.linear_issue_from_url(
+            "https://linear.app/acme/issue/eng-123/fix-routing?utm_source=inbox"
+        )
+        self.assertEqual(issue, browser_context.LinearIssue("ENG-123"))
+
+        invalid_urls = [
+            "http://linear.app/acme/issue/ENG-123/fix-routing",
+            "https://linear.app.evil.test/acme/issue/ENG-123/fix-routing",
+            "https://user@linear.app/acme/issue/ENG-123/fix-routing",
+            "https://linear.app:444/acme/issue/ENG-123/fix-routing",
+            "https://linear.app/acme/project/ENG-123",
+        ]
+        for url in invalid_urls:
+            with self.subTest(url=url):
+                self.assertIsNone(browser_context.linear_issue_from_url(url))
+
+    def test_request_context_preserves_focused_linear_identifier(self) -> None:
+        url = "https://linear.app/acme/issue/ENG-123/fix-routing"
+        with (
+            mock.patch.object(
+                browser_context, "focused_firefox_url", return_value=url
+            ) as focused_url,
+            mock.patch.object(
+                browser_context, "focused_app_context", return_value=None
+            ),
+        ):
+            context = browser_context.request_context("work on this ticket")
+
+        self.assertEqual(context.focused_issue, "ENG-123")
+        self.assertEqual(context.linear_issue, "ENG-123")
+        self.assertIn("Current focused Linear issue", context.text)
+        self.assertIn("Identifier: ENG-123", context.text)
+        focused_url.assert_called_once_with()
+
+    def test_browser_context_dispatches_linear_url(self) -> None:
+        url = "https://linear.app/acme/issue/ENG-123/fix-routing"
+        with mock.patch.object(
+            browser_context, "focused_firefox_url", return_value=url
+        ):
+            context = browser_context.focused_browser_context()
+
+        self.assertIn("Identifier: ENG-123", str(context))
+
+
 class ZendeskContextTests(unittest.TestCase):
     def test_extracts_canonical_ticket_url(self) -> None:
         ticket = browser_context.zendesk_ticket_from_url(

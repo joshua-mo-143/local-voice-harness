@@ -227,6 +227,37 @@ class AppContextTests(unittest.TestCase):
             delivery_claims=mock.ANY,
         )
 
+    def test_actionable_linear_issue_metadata_reaches_cursor(self) -> None:
+        context = RequestContext(
+            "work on this ticket\n\nIdentifier: ENG-123",
+            focused_issue="ENG-123",
+            linear_issue="ENG-123",
+        )
+        with (
+            mock.patch.object(app, "start_components"),
+            mock.patch.object(app, "request_context", return_value=context),
+            mock.patch.object(
+                app,
+                "route_intent",
+                return_value=IntentRoute(Intent.CURSOR_SUBMIT, "high"),
+            ),
+            mock.patch.object(
+                app, "cursor_turn", return_value=("started", None)
+            ) as cursor,
+            mock.patch.object(app, "stream_and_play"),
+        ):
+            app.respond("work on this ticket")
+
+        cursor.assert_called_once_with(
+            CursorTurnRequest(
+                context.text,
+                utterance="work on this ticket",
+                context_repository=None,
+                issue_key="ENG-123",
+            ),
+            delivery_claims=mock.ANY,
+        )
+
 
 class CursorFastPathTests(unittest.TestCase):
     def test_explicit_cursor_utterance_skips_router(self) -> None:

@@ -776,6 +776,19 @@ class CursorJobStateTests(unittest.TestCase):
         self.assertEqual(job["worktree_label"], "issue-42")
         self.assertIsNone(job["issue_key"])
 
+    def test_focused_linear_issue_persists_validated_identifier(self) -> None:
+        with mock.patch.object(service, "launch_worker"):
+            job_id = service.start_job(
+                "work on this ticket\n\nIdentifier: ENG-123",
+                utterance="work on this ticket",
+                issue_key="ENG-123",
+            )
+
+        job = jobs.read_job(job_id)
+        self.assertEqual(job["trusted_utterance"], "work on this ticket")
+        self.assertEqual(job["issue_key"], "ENG-123")
+        self.assertEqual(job["speakable_label"], "ENG-123")
+
     def test_worker_provisions_github_issue_and_uses_stable_worktree(self) -> None:
         repository = Path(self.temporary.name) / "source" / "project"
         source = GitHubRepository(
@@ -924,6 +937,7 @@ class CursorJobStateTests(unittest.TestCase):
             agent=None,
             utterance=None,
             context_repository=None,
+            issue_key=None,
         )
         reply.assert_not_called()
         self.assertEqual(result, "done")

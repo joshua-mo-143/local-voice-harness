@@ -85,6 +85,7 @@ def respond(text: str) -> None:
                         context.text,
                         utterance=text,
                         context_repository=context.focused_repository,
+                        issue_key=context.linear_issue,
                         **github_arguments,
                     ),
                     delivery_claims=delivery_claims,
