@@ -140,6 +140,66 @@ class QwenClientTests(unittest.TestCase):
             },
         )
 
+    def test_retries_without_replaying_malformed_tool_arguments(self) -> None:
+        malformed_call = {
+            "id": "call-bad",
+            "type": "function",
+            "function": {
+                "name": "cursor",
+                "arguments": '{"task":"on this issue please."',
+            },
+        }
+        with (
+            mock.patch.object(
+                llm.urllib.request,
+                "urlopen",
+                side_effect=[
+                    _response({"content": None, "tool_calls": [malformed_call]}),
+                    _response({"content": "Please try that request again."}),
+                ],
+            ) as urlopen,
+            mock.patch.object(llm, "cursor_turn") as cursor_turn,
+            redirect_stdout(io.StringIO()),
+        ):
+            answer, session = llm.qwen_turn("on this issue please.")
+
+        self.assertEqual((answer, session), ("Please try that request again.", None))
+        cursor_turn.assert_not_called()
+        second_request = urlopen.call_args_list[1].args[0]
+        second_payload = json.loads(second_request.data)
+        self.assertFalse(
+            any("tool_calls" in message for message in second_payload["messages"])
+        )
+
+    def test_returns_recovery_after_repeated_malformed_tool_arguments(self) -> None:
+        malformed_message = {
+            "content": None,
+            "tool_calls": [
+                {
+                    "id": "call-bad",
+                    "type": "function",
+                    "function": {"name": "cursor", "arguments": '{"task":'},
+                }
+            ],
+        }
+        with (
+            mock.patch.object(
+                llm.urllib.request,
+                "urlopen",
+                side_effect=[
+                    _response(malformed_message),
+                    _response(malformed_message),
+                ],
+            ) as urlopen,
+            mock.patch.object(llm, "cursor_turn") as cursor_turn,
+            redirect_stdout(io.StringIO()),
+        ):
+            answer, session = llm.qwen_turn("on this issue please.")
+
+        self.assertEqual((answer, session), (llm.MALFORMED_TOOL_CALL_RECOVERY, None))
+        self.assertEqual(urlopen.call_count, 2)
+        cursor_turn.assert_not_called()
+
     def test_focused_repository_and_explicit_fork_are_forwarded(self) -> None:
         tool_call = {
             "id": "call-1",
@@ -410,6 +470,52 @@ class QwenClientTests(unittest.TestCase):
         assert isinstance(tool_calls, list)
         self.assertEqual(len(tool_calls), 1)
         self.assertEqual(chunks, [])
+
+    def test_venice_retries_truncated_streamed_tool_arguments(self) -> None:
+        settings = replace(
+            load_backend_settings({}),
+            llm_provider="venice",
+            llm_model="zai-org-glm-5-2",
+        )
+        with (
+            mock.patch.object(llm, "load_backend_settings", return_value=settings),
+            mock.patch.object(llm, "get_venice_api_key", return_value="secret"),
+            mock.patch.object(
+                llm.urllib.request,
+                "urlopen",
+                side_effect=[
+                    _stream_response(
+                        {
+                            "tool_calls": [
+                                {
+                                    "index": 0,
+                                    "id": "call-truncated",
+                                    "type": "function",
+                                    "function": {
+                                        "name": "cursor",
+                                        "arguments": '{"task":"on this issue',
+                                    },
+                                }
+                            ]
+                        }
+                    ),
+                    _stream_response({"content": "Please try that request again."}),
+                ],
+            ) as urlopen,
+            mock.patch.object(llm, "cursor_turn") as cursor_turn,
+            redirect_stdout(io.StringIO()),
+        ):
+            answer, session = llm.qwen_turn("on this issue please.")
+
+        self.assertEqual((answer, session), ("Please try that request again.", None))
+        cursor_turn.assert_not_called()
+        first_payload = json.loads(urlopen.call_args_list[0].args[0].data)
+        second_payload = json.loads(urlopen.call_args_list[1].args[0].data)
+        self.assertEqual(first_payload["max_tokens"], llm.MAX_COMPLETION_TOKENS)
+        self.assertGreater(first_payload["max_tokens"], 128)
+        self.assertFalse(
+            any("tool_calls" in message for message in second_payload["messages"])
+        )
 
     def test_venice_surfaces_stream_errors_and_empty_streams(self) -> None:
         error = io.BytesIO(b'data: {"error": "model unavailable"}\n\n')
