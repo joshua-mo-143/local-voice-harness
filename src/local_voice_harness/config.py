@@ -130,33 +130,46 @@ def _tts_speed(value: object) -> float:
     return speed
 
 
-def load_backend_settings(
-    environment: Mapping[str, str] = os.environ,
+def read_toml_table(
+    config_path: Path,
     *,
-    path: Path | None = None,
-    home: Path | None = None,
-) -> BackendSettings:
-    config_path = path or backend_config_path(environment, home=home)
+    error: type[ValueError] = BackendConfigurationError,
+    label: str = "configuration",
+) -> dict[str, object]:
+    """Read ``config_path`` into a TOML table, tolerating a missing file."""
+
     try:
         raw = tomllib.loads(config_path.read_text()) if config_path.exists() else {}
     except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
-        raise BackendConfigurationError(
-            f"could not read backend configuration {config_path}: {exc}"
-        ) from exc
+        raise error(f"could not read {label} {config_path}: {exc}") from exc
     if not isinstance(raw, dict):
-        raise BackendConfigurationError("backend configuration must be a TOML table")
-    llm = raw.get("llm", {})
-    tts = raw.get("tts", {})
-    venice = raw.get("venice", {})
-    if not all(isinstance(section, dict) for section in (llm, tts, venice)):
-        raise BackendConfigurationError(
-            "llm, tts, and venice configuration entries must be TOML tables"
-        )
+        raise error(f"{label} must be a TOML table")
+    return raw
+
+
+def reject_file_based_credentials(
+    venice: Mapping[str, object],
+    environment: Mapping[str, str],
+) -> None:
+    """Raise if Venice credentials are supplied through a file instead of the store."""
+
     if "api_key_file" in venice or "VOICE_HARNESS_VENICE_API_KEY_FILE" in environment:
         raise BackendConfigurationError(
             "file-based Venice credentials are unsupported; run "
             "`voice-harness credentials set`"
         )
+
+
+def backend_settings_from_tables(
+    llm: Mapping[str, object],
+    tts: Mapping[str, object],
+    environment: Mapping[str, str] = os.environ,
+) -> BackendSettings:
+    """Validate already-merged ``[llm]``/``[tts]`` tables into typed settings.
+
+    Environment variables override the supplied table values, matching the
+    precedence enforced by :func:`load_backend_settings`.
+    """
 
     llm_provider = _provider(
         _backend_value(
@@ -249,6 +262,27 @@ def load_backend_settings(
             label="TTS timeout",
         ),
     )
+
+
+def load_backend_settings(
+    environment: Mapping[str, str] = os.environ,
+    *,
+    path: Path | None = None,
+    home: Path | None = None,
+) -> BackendSettings:
+    config_path = path or backend_config_path(environment, home=home)
+    raw = read_toml_table(config_path, label="backend configuration")
+    llm = raw.get("llm", {})
+    tts = raw.get("tts", {})
+    venice = raw.get("venice", {})
+    if not (
+        isinstance(llm, dict) and isinstance(tts, dict) and isinstance(venice, dict)
+    ):
+        raise BackendConfigurationError(
+            "llm, tts, and venice configuration entries must be TOML tables"
+        )
+    reject_file_based_credentials(venice, environment)
+    return backend_settings_from_tables(llm, tts, environment)
 
 
 def systemd_state_directory(

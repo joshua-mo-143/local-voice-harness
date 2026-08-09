@@ -120,8 +120,11 @@ the compositor environment setup the wake service needs, are in
 
 Runtime behaviour is set through environment variables on the wake service drop-in
 (`systemctl --user edit voice-harness-wake.service`) and dictation selectors in
-`~/.config/dictation/backend.env`. The [configuration reference](docs/configuration.md)
-lists every variable, its default, and where it may be set, plus repository-root and
+`~/.config/dictation/backend.env`. A unified, typed
+`~/.config/voice-harness/config.toml` also collects user-facing defaults for
+providers, integrations, compute, audio, and platform capabilities. The
+[configuration reference](docs/configuration.md) lists every variable, its default,
+and where it may be set, plus the unified configuration file, repository-root, and
 vocabulary options.
 
 ## Service management
