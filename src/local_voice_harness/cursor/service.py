@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import time
 import uuid
@@ -33,7 +34,13 @@ from .model import (
     NewCursorJob,
 )
 from .provisioning import run_claimed_worker
-from .store import FollowUpCheckoutBusy, FollowUpUnavailable, JobStore
+from .store import (
+    FollowUpCheckoutBusy,
+    FollowUpUnavailable,
+    JobMaintenanceError,
+    JobStore,
+    MaintenanceLease,
+)
 
 DELIVERY_RETRY_SECONDS = 5.0
 FOREGROUND_GRACE_SECONDS = 2.0
@@ -699,19 +706,201 @@ def count_jobs() -> int:
 
 
 def nuke_jobs() -> str:
-    """Forcefully delete every Cursor job after stopping any live workers.
-
-    This is an irreversible bulk delete intended for the confirmation-gated
-    ``jobs nuke`` command. Any owned or legacy worker is stopped best-effort
-    first so we do not orphan running processes, then all job files are removed.
-    """
+    """Fence claims, drain workers, and delete only fully reconciled jobs."""
     store = _job_store()
-    for job in store.list():
-        if job.worker_token:
-            _stop_worker(job)
-        elif worker_lifecycle.has_legacy_worker_claim(job):
-            _stop_legacy_worker(job.id)
-    removed = store.delete_all()
+    owner_pid = os.getpid()
+    owner_boot = worker_lifecycle.boot_identity()
+    owner_start = worker_lifecycle.process_identity(owner_pid)
+    if not owner_boot or not owner_start:
+        raise HarnessError("could not establish job deletion process identity")
+    lease = MaintenanceLease(
+        token=uuid.uuid4().hex,
+        started_at=time.time(),
+        owner_pid=owner_pid,
+        owner_boot_id=owner_boot,
+        owner_process_start=owner_start,
+    )
+    original: dict[str, CursorJob] = {}
+
+    def stage(job: CursorJob) -> CursorJob | None:
+        original[job.id] = job
+        if (
+            worker_lifecycle.has_legacy_worker_claim(job)
+            or job.status not in ACTIVE_STATUSES
+            or job.terminal_intent_status is not None
+        ):
+            return None
+        return recovery.stage_terminal_intent(
+            job,
+            JobStatus.CANCELLED,
+            now=time.time(),
+            result=f"Cursor job {job.id} was cancelled before deletion.",
+            preserve_worker_operation=True,
+        )
+
+    def maintenance_owner_alive(existing: MaintenanceLease) -> bool | None:
+        return worker_lifecycle.process_owner_alive(
+            existing.owner_pid,
+            existing.owner_boot_id,
+            existing.owner_process_start,
+        )
+
+    def abort_owned_lease() -> None:
+        try:
+            store.abort_maintenance(lease.token)
+        except JobMaintenanceError:
+            # A malformed or replaced fence is not ours to remove.
+            pass
+
+    try:
+        store.begin_maintenance(
+            lease,
+            stage,
+            owner_alive=maintenance_owner_alive,
+        )
+        stop_failures: list[str] = []
+        stopped: dict[str, bool] = {}
+        for snapshot in original.values():
+            current = store.get(snapshot.id)
+            if worker_lifecycle.has_legacy_worker_claim(current):
+                disposition = worker_lifecycle.inspect_and_stop_legacy_worker(
+                    current,
+                    get_process_identity=worker_lifecycle.process_identity,
+                    command_matches=worker_lifecycle.legacy_worker_command_matches,
+                )
+                stopped[current.id] = disposition != "unsafe"
+                if disposition == "unsafe":
+                    stop_failures.append(
+                        f"{current.id}: legacy worker identity or exit could not "
+                        "be verified"
+                    )
+                elif current.status in ACTIVE_STATUSES:
+
+                    def stage_legacy(job: CursorJob) -> CursorJob | None:
+                        if not worker_lifecycle.has_legacy_worker_claim(job):
+                            return None
+                        return recovery.stage_terminal_intent(
+                            job,
+                            JobStatus.CANCELLED,
+                            now=time.time(),
+                            result=(
+                                f"Cursor job {job.id} was cancelled before deletion."
+                            ),
+                            clear_worker=True,
+                            preserve_worker_operation=True,
+                        )
+
+                    store.update(current.id, stage_legacy)
+                else:
+
+                    def clear_legacy(job: CursorJob) -> CursorJob | None:
+                        if not worker_lifecycle.has_legacy_worker_claim(job):
+                            return None
+                        return job.evolve(
+                            worker_token=None,
+                            worker_pid=None,
+                            worker_boot_id=None,
+                            worker_process_start=None,
+                        )
+
+                    store.update(current.id, clear_legacy)
+                continue
+            if not current.worker_token:
+                stopped[current.id] = True
+                continue
+            ownership = (
+                current.worker_token,
+                current.worker_pid,
+                current.worker_boot_id,
+                current.worker_process_start,
+            )
+            worker_stopped = _stop_worker(current)
+            latest = store.get(current.id)
+            latest_ownership = (
+                latest.worker_token,
+                latest.worker_pid,
+                latest.worker_boot_id,
+                latest.worker_process_start,
+            )
+            if latest_ownership != ownership and any(
+                value is not None for value in latest_ownership
+            ):
+                worker_stopped = False
+                stop_failures.append(
+                    f"{current.id}: worker ownership changed while stopping"
+                )
+            elif (
+                latest.worker_pid is not None
+                and latest.worker_boot_id is not None
+                and latest.worker_process_start is not None
+            ):
+                owner_alive = worker_lifecycle.process_owner_alive(
+                    latest.worker_pid,
+                    latest.worker_boot_id,
+                    latest.worker_process_start,
+                )
+                worker_stopped = owner_alive is False
+                if not worker_stopped:
+                    worker_stopped = False
+                    reason = (
+                        "worker is still running"
+                        if owner_alive
+                        else "worker exit could not be verified"
+                    )
+                    stop_failures.append(f"{current.id}: {reason}")
+            elif not worker_stopped:
+                stop_failures.append(
+                    f"{current.id}: worker did not exit within the safe timeout"
+                )
+            if worker_stopped and latest_ownership == ownership:
+
+                def clear_worker(
+                    job: CursorJob,
+                    expected_ownership: tuple[str | int | None, ...] = ownership,
+                ) -> CursorJob | None:
+                    current_ownership = (
+                        job.worker_token,
+                        job.worker_pid,
+                        job.worker_boot_id,
+                        job.worker_process_start,
+                    )
+                    if current_ownership != expected_ownership:
+                        return None
+                    return job.evolve(
+                        worker_token=None,
+                        worker_pid=None,
+                        worker_boot_id=None,
+                        worker_process_start=None,
+                    )
+
+                store.update(current.id, clear_worker)
+            stopped[current.id] = worker_stopped
+
+        for current in store.list():
+            if not current.target_release_pending or not stopped.get(current.id, True):
+                continue
+            _cancel_target_and_release(
+                current.id,
+                current.herdr_target or "",
+                current.target_release_token or "",
+                worker_stopped=True,
+            )
+
+        if stop_failures:
+            raise HarnessError(
+                "Cursor jobs were preserved because workers could not be stopped "
+                "safely: "
+                + "; ".join(stop_failures)
+                + ". Resolve the worker or external operation, then retry."
+            )
+        removed = store.finalize_maintenance(lease.token)
+    except JobMaintenanceError as exc:
+        abort_owned_lease()
+        raise HarnessError(str(exc)) from exc
+    except Exception:
+        abort_owned_lease()
+        raise
+
     count = len(removed)
     if not count:
         return "There were no Cursor jobs to delete."

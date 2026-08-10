@@ -250,7 +250,7 @@ def _worker_change(
             return None
         return change(job)
 
-    return store.update(job_id, guarded)
+    return store.update_unless_maintenance(job_id, guarded)
 
 
 def _worker_question(
@@ -578,7 +578,11 @@ def _reserve_worker_target(
     target = str(selection.target)
 
     def reserve(job: CursorJob) -> CursorJob | None:
-        if job.worker_token != token or job.status not in MODEL_WORKER_STATUSES:
+        if (
+            job.worker_token != token
+            or job.status not in MODEL_WORKER_STATUSES
+            or job.terminal_intent_status is not None
+        ):
             return None
         repository_value = (
             job.repository
@@ -695,7 +699,11 @@ def _reserve_worker_worktree(
     checkout_value = str(checkout.resolve())
 
     def reserve(job: CursorJob) -> CursorJob | None:
-        if job.worker_token != token or job.status.value != "routing":
+        if (
+            job.worker_token != token
+            or job.status.value != "routing"
+            or job.terminal_intent_status is not None
+        ):
             return None
         return transition(
             job,

@@ -36,6 +36,8 @@ _ARTIFACT_REF = re.compile(
 )
 LegacyWorkerDisposition = Literal["absent", "stopped", "unsafe"]
 LegacyWorkerInspector = Callable[[CursorJob], LegacyWorkerDisposition]
+MAINTENANCE_FILENAME = ".maintenance"
+MAINTENANCE_SCHEMA_VERSION = 1
 
 
 class JobQuarantinedError(JobValidationError):
@@ -54,8 +56,35 @@ class FollowUpCheckoutBusy(JobValidationError):
     """The parent's retained checkout is reserved by another active job."""
 
 
+class JobMaintenanceError(JobValidationError):
+    """The durable job store is fenced for maintenance."""
+
+
 class JobQuarantineWarning(UserWarning):
     """A malformed job file was moved into quarantine."""
+
+
+@dataclass(frozen=True, slots=True)
+class MaintenanceLease:
+    token: str
+    started_at: float
+    owner_pid: int
+    owner_boot_id: str
+    owner_process_start: str
+
+    def to_record(self) -> dict[str, object]:
+        return {
+            "schema_version": MAINTENANCE_SCHEMA_VERSION,
+            "operation": "delete_all",
+            "token": self.token,
+            "started_at": self.started_at,
+            "owner_pid": self.owner_pid,
+            "owner_boot_id": self.owner_boot_id,
+            "owner_process_start": self.owner_process_start,
+        }
+
+
+MaintenanceOwnerAlive = Callable[[MaintenanceLease], bool | None]
 
 
 @dataclass(frozen=True, slots=True)
@@ -279,6 +308,57 @@ def _atomic_bytes(path: Path, contents: bytes) -> None:
         _fsync_directory(path.parent)
     finally:
         temporary.unlink(missing_ok=True)
+
+
+def _maintenance_path(jobs_dir: Path) -> Path:
+    return jobs_dir / MAINTENANCE_FILENAME
+
+
+def _read_maintenance_unlocked(jobs_dir: Path) -> MaintenanceLease | None:
+    path = _maintenance_path(jobs_dir)
+    if not path.exists():
+        return None
+    if path.is_symlink() or not path.is_file():
+        raise JobMaintenanceError("job maintenance fence cannot be verified safely")
+    try:
+        raw = json.loads(path.read_text())
+        if not isinstance(raw, dict):
+            raise ValueError("maintenance fence must be an object")
+        if (
+            raw.get("schema_version") != MAINTENANCE_SCHEMA_VERSION
+            or raw.get("operation") != "delete_all"
+        ):
+            raise ValueError("unsupported maintenance fence")
+        token = raw.get("token")
+        started_at = raw.get("started_at")
+        owner_pid = raw.get("owner_pid")
+        owner_boot_id = raw.get("owner_boot_id")
+        owner_process_start = raw.get("owner_process_start")
+        if (
+            not isinstance(token, str)
+            or not token
+            or not isinstance(started_at, (int, float))
+            or isinstance(started_at, bool)
+            or not isinstance(owner_pid, int)
+            or isinstance(owner_pid, bool)
+            or owner_pid <= 0
+            or not isinstance(owner_boot_id, str)
+            or not owner_boot_id
+            or not isinstance(owner_process_start, str)
+            or not owner_process_start
+        ):
+            raise ValueError("invalid maintenance fence identity")
+        return MaintenanceLease(
+            token=token,
+            started_at=float(started_at),
+            owner_pid=owner_pid,
+            owner_boot_id=owner_boot_id,
+            owner_process_start=owner_process_start,
+        )
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        raise JobMaintenanceError(
+            "job maintenance fence cannot be verified safely"
+        ) from exc
 
 
 def _exclusive_bytes(path: Path, contents: bytes) -> bool:
@@ -852,6 +932,8 @@ def migrate_legacy_jobs(
     if not legacy_dir.is_dir() or legacy_dir.resolve() == jobs_dir.resolve():
         return blocked
     with locked(legacy_dir), locked(jobs_dir):
+        if _read_maintenance_unlocked(jobs_dir) is not None:
+            return blocked
         for source in sorted(legacy_dir.glob("*.json")):
             destination = jobs_dir / source.name
             preserve_source = False
@@ -956,6 +1038,8 @@ def prune_jobs(
     cutoff = (time.time() if now is None else now) - retention_seconds
     removed: list[str] = []
     with locked(jobs_dir):
+        if _read_maintenance_unlocked(jobs_dir) is not None:
+            return removed
         for path in sorted(jobs_dir.glob("*.json")):
             try:
                 job = _read_model_unlocked(path)
@@ -1039,6 +1123,15 @@ class JobStore:
             raise JobValidationError("invalid Cursor job ID")
         return self.durable_dir / f"{job_id}.json"
 
+    @contextmanager
+    def _locked_legacy_and_durable(self) -> Iterator[None]:
+        if self.legacy_dir.resolve() == self.durable_dir.resolve():
+            with locked(self.durable_dir):
+                yield
+            return
+        with locked(self.legacy_dir), locked(self.durable_dir):
+            yield
+
     def migrate_legacy(
         self, *, inspect_worker: LegacyWorkerInspector | None = None
     ) -> set[str]:
@@ -1050,6 +1143,13 @@ class JobStore:
 
     def get(self, job_id: str) -> CursorJob:
         with locked(self.durable_dir):
+            return _read_model_unlocked(self.path(job_id))
+
+    def get_unless_maintenance(self, job_id: str) -> CursorJob | None:
+        """Read a worker snapshot only while no maintenance fence is active."""
+        with locked(self.durable_dir):
+            if _read_maintenance_unlocked(self.durable_dir) is not None:
+                return None
             return _read_model_unlocked(self.path(job_id))
 
     def list(self) -> list[CursorJob]:
@@ -1064,8 +1164,67 @@ class JobStore:
                     continue
             return jobs
 
+    def maintenance_active(self) -> bool:
+        if not self.durable_dir.is_dir():
+            return False
+        with locked(self.durable_dir):
+            return _read_maintenance_unlocked(self.durable_dir) is not None
+
+    def begin_maintenance(
+        self,
+        lease: MaintenanceLease,
+        stage: JobCommand,
+        *,
+        owner_alive: MaintenanceOwnerAlive,
+    ) -> list[CursorJob]:
+        """Install a durable deletion fence and stage every job under one lock."""
+        with locked(self.durable_dir):
+            existing = _read_maintenance_unlocked(self.durable_dir)
+            if existing is not None:
+                disposition = owner_alive(existing)
+                if disposition is True:
+                    raise JobMaintenanceError(
+                        "another Cursor job deletion is already in progress"
+                    )
+                if disposition is None:
+                    raise JobMaintenanceError(
+                        "an existing Cursor job deletion owner cannot be "
+                        "verified; retry after checking the recorded process"
+                    )
+            _atomic_json(_maintenance_path(self.durable_dir), lease.to_record())
+            staged: list[CursorJob] = []
+            for path in sorted(self.durable_dir.glob("*.json")):
+                try:
+                    current = _read_model_unlocked(path)
+                except JobQuarantinedError as exc:
+                    raise JobMaintenanceError(
+                        "Cursor jobs could not be deleted safely: quarantined "
+                        f"record {path.stem} requires manual inspection"
+                    ) from exc
+                candidate = stage(current)
+                if candidate is not None:
+                    current = _write_model_unlocked(path, candidate)
+                staged.append(current)
+            return staged
+
+    def abort_maintenance(self, token: str) -> bool:
+        """Remove only the maintenance fence owned by ``token``."""
+        if not self.durable_dir.is_dir():
+            return False
+        with locked(self.durable_dir):
+            existing = _read_maintenance_unlocked(self.durable_dir)
+            if existing is None or existing.token != token:
+                return False
+            _maintenance_path(self.durable_dir).unlink()
+            _fsync_directory(self.durable_dir)
+            return True
+
     def create(self, job: CursorJob) -> CursorJob:
         with locked(self.durable_dir):
+            if _read_maintenance_unlocked(self.durable_dir) is not None:
+                raise JobMaintenanceError(
+                    "Cursor jobs are temporarily unavailable during job deletion"
+                )
             path = self.path(job.id)
             if path.exists():
                 raise JobValidationError(f"{path.name}: Cursor job already exists")
@@ -1249,6 +1408,10 @@ class JobStore:
         never written.
         """
         with locked(self.durable_dir):
+            if _read_maintenance_unlocked(self.durable_dir) is not None:
+                raise JobMaintenanceError(
+                    "Cursor follow-ups are temporarily unavailable during job deletion"
+                )
             try:
                 parent = _read_model_unlocked(self.path(parent_job_id))
             except (FileNotFoundError, JobQuarantinedError) as exc:
@@ -1295,11 +1458,21 @@ class JobStore:
 
     def reserve_target(self, job_id: str, command: JobCommand) -> CursorJob | None:
         """Atomically apply a typed target-reservation transition."""
-        return self._transaction(job_id, command, reservation="target")
+        return self._transaction(
+            job_id, command, reservation="target", reject_maintenance=True
+        )
 
     def reserve_worktree(self, job_id: str, command: JobCommand) -> CursorJob | None:
         """Atomically apply a typed worktree-reservation transition."""
-        return self._transaction(job_id, command, reservation="worktree")
+        return self._transaction(
+            job_id, command, reservation="worktree", reject_maintenance=True
+        )
+
+    def update_unless_maintenance(
+        self, job_id: str, command: JobCommand
+    ) -> CursorJob | None:
+        """Apply an ownership or side-effect acquisition unless fenced."""
+        return self._transaction(job_id, command, reject_maintenance=True)
 
     def _transaction(
         self,
@@ -1307,8 +1480,14 @@ class JobStore:
         command: JobCommand,
         *,
         reservation: Literal["target", "worktree"] | None = None,
+        reject_maintenance: bool = False,
     ) -> CursorJob | None:
         with locked(self.durable_dir):
+            if (
+                reject_maintenance
+                and _read_maintenance_unlocked(self.durable_dir) is not None
+            ):
+                return None
             path = self.path(job_id)
             current = _read_model_unlocked(path)
             candidate = command(current)
@@ -1365,24 +1544,73 @@ class JobStore:
             retention_seconds=retention_seconds,
         )
 
-    def delete_all(self) -> list[str]:
-        """Forcefully remove every durable Cursor job file.
-
-        Unlike :meth:`prune`, this ignores retention, delivery, and reservation
-        fences: it is the bulk "nuke" primitive behind the confirmation-gated
-        CLI command. Quarantined payloads under ``.quarantine`` are left in
-        place so their evidence survives. Returns the ids of the removed jobs.
-        """
-        if not self.durable_dir.is_dir():
-            return []
+    def finalize_maintenance(self, token: str) -> list[str]:
+        """Delete all jobs only after their safety fences have fully drained."""
         removed: list[str] = []
-        with locked(self.durable_dir):
+        with self._locked_legacy_and_durable():
+            lease = _read_maintenance_unlocked(self.durable_dir)
+            if lease is None or lease.token != token:
+                raise JobMaintenanceError(
+                    "Cursor job deletion lease changed before finalization"
+                )
+            legacy_records = sorted(self.legacy_dir.glob("*.json"))
+            if (
+                self.legacy_dir.resolve() != self.durable_dir.resolve()
+                and legacy_records
+            ):
+                raise JobMaintenanceError(
+                    "Cursor jobs could not be deleted safely: legacy source records "
+                    "remain; run job recovery and retry"
+                )
+            jobs: list[CursorJob] = []
+            quarantined: list[str] = []
+            for path in sorted(self.durable_dir.glob("*.json")):
+                try:
+                    jobs.append(_read_model_unlocked(path))
+                except JobQuarantinedError:
+                    quarantined.append(path.stem)
+            blockers: list[str] = []
+            unresolved_quarantine = [
+                path.name
+                for path in sorted(
+                    (self.durable_dir / ".quarantine").glob("*.metadata.json")
+                )
+                if not _quarantine_metadata_resolved(path)
+            ]
+            if quarantined or unresolved_quarantine:
+                evidence = sorted({*quarantined, *unresolved_quarantine})
+                blockers.append(
+                    "quarantine evidence requires manual inspection: "
+                    + ", ".join(evidence)
+                )
+            for job in jobs:
+                reasons: list[str] = []
+                if job.status in ACTIVE_STATUSES:
+                    reasons.append(f"status {job.status.value}")
+                if any(
+                    value is not None
+                    for value in (
+                        job.worker_token,
+                        job.worker_pid,
+                        job.worker_boot_id,
+                        job.worker_process_start,
+                    )
+                ):
+                    reasons.append("worker ownership remains")
+                if _must_retain(job):
+                    reasons.append("recovery or reservation fence remains")
+                if reasons:
+                    blockers.append(f"{job.id}: {', '.join(reasons)}")
+            if blockers:
+                raise JobMaintenanceError(
+                    "Cursor jobs could not be deleted safely: " + "; ".join(blockers)
+                )
             for path in sorted(self.durable_dir.glob("*.json")):
                 path.unlink()
                 _delete_artifacts_unlocked(self.durable_dir, path.stem)
                 removed.append(path.stem)
-            if removed:
-                _fsync_directory(self.durable_dir)
+            _maintenance_path(self.durable_dir).unlink()
+            _fsync_directory(self.durable_dir)
         return removed
 
 

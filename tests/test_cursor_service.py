@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import ast
 import json
+import threading
 import time
 from pathlib import Path
 from unittest import mock
@@ -9,7 +10,11 @@ from unittest import mock
 import pytest
 
 from local_voice_harness.cursor import service
-from local_voice_harness.cursor.model import CursorJob, NewCursorJob
+from local_voice_harness.cursor.model import (
+    CURRENT_SCHEMA_VERSION,
+    CursorJob,
+    NewCursorJob,
+)
 from local_voice_harness.cursor.service import (
     CursorTurnRequest,
     CursorTurnResult,
@@ -189,7 +194,7 @@ def test_cancellation_clears_safely_absent_durable_legacy_owner(
 
 def _write_queued_job(jobs_dir: Path, job_id: str, **fields: object) -> None:
     value: dict[str, object] = {
-        "schema_version": 5,
+        "schema_version": CURRENT_SCHEMA_VERSION,
         "id": job_id,
         "revision": 0,
         "request": "do it",
@@ -256,6 +261,194 @@ def test_nuke_jobs_stops_running_worker_before_delete(
     stop_worker.assert_called_once()
     assert message == "Deleted all 1 Cursor job."
     assert list(jobs_dir.glob("*.json")) == []
+
+
+def test_nuke_jobs_preserves_record_reservations_and_artifacts_on_stop_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    jobs_dir = tmp_path / "jobs"
+    jobs_dir.mkdir()
+    monkeypatch.setattr(service, "JOBS_DIR", jobs_dir)
+    monkeypatch.setattr(service, "LEGACY_JOBS_DIR", tmp_path / "legacy")
+    _write_queued_job(
+        jobs_dir,
+        "aaaaaaaaaaaa",
+        status="running",
+        worker_token="claim",
+        worker_pid=42,
+        worker_boot_id="boot",
+        worker_process_start="start",
+        worker_operation="agent_start",
+        herdr_target="agent-target",
+        agent_dispatch_state="dispatching",
+    )
+    artifacts = jobs_dir / ".artifacts" / "aaaaaaaaaaaa"
+    artifacts.mkdir(parents=True)
+    evidence = artifacts / "evidence.txt"
+    evidence.write_text("keep me")
+
+    with (
+        mock.patch.object(service, "_stop_worker", return_value=False),
+        mock.patch.object(
+            service.worker_lifecycle, "process_owner_alive", return_value=True
+        ),
+        pytest.raises(HarnessError, match="preserved.*still running"),
+    ):
+        service.nuke_jobs()
+
+    retained = service.read_job("aaaaaaaaaaaa")
+    assert retained.worker_token == "claim"
+    assert retained.target_release_pending
+    assert retained.cancellation_reconciliation_pending
+    assert retained.herdr_target == "agent-target"
+    assert retained.worker_operation == "agent_start"
+    assert evidence.read_text() == "keep me"
+    assert not (jobs_dir / ".maintenance").exists()
+
+
+def test_nuke_jobs_preserves_uncertain_external_operation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    jobs_dir = tmp_path / "jobs"
+    jobs_dir.mkdir()
+    monkeypatch.setattr(service, "JOBS_DIR", jobs_dir)
+    monkeypatch.setattr(service, "LEGACY_JOBS_DIR", tmp_path / "legacy")
+    _write_queued_job(
+        jobs_dir,
+        "aaaaaaaaaaaa",
+        status="running",
+        worker_token="claim",
+        worker_pid=42,
+        worker_boot_id="boot",
+        worker_process_start="start",
+        worker_operation="agent_start",
+        herdr_target="agent-target",
+        agent_dispatch_state="dispatching",
+    )
+
+    with (
+        mock.patch.object(service, "_stop_worker", return_value=True),
+        mock.patch.object(service, "_cancel_target_and_release"),
+        pytest.raises(HarnessError, match="recovery or reservation fence remains"),
+    ):
+        service.nuke_jobs()
+
+    retained = service.read_job("aaaaaaaaaaaa")
+    assert retained.agent_dispatch_state == "dispatching"
+    assert retained.target_release_pending
+    assert not (jobs_dir / ".maintenance").exists()
+
+
+def test_nuke_jobs_refuses_unverifiable_process_exit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    jobs_dir = tmp_path / "jobs"
+    jobs_dir.mkdir()
+    monkeypatch.setattr(service, "JOBS_DIR", jobs_dir)
+    monkeypatch.setattr(service, "LEGACY_JOBS_DIR", tmp_path / "legacy")
+    _write_queued_job(
+        jobs_dir,
+        "aaaaaaaaaaaa",
+        status="running",
+        worker_token="claim",
+        worker_pid=42,
+        worker_boot_id="boot",
+        worker_process_start="start",
+    )
+
+    with (
+        mock.patch.object(service, "_stop_worker", return_value=True),
+        mock.patch.object(
+            service.worker_lifecycle, "process_owner_alive", return_value=None
+        ),
+        pytest.raises(HarnessError, match="exit could not be verified"),
+    ):
+        service.nuke_jobs()
+
+    assert service.read_job("aaaaaaaaaaaa").worker_token == "claim"
+    assert not (jobs_dir / ".maintenance").exists()
+
+
+def test_nuke_and_concurrent_cancellation_share_one_terminal_fence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    jobs_dir = tmp_path / "jobs"
+    jobs_dir.mkdir()
+    monkeypatch.setattr(service, "JOBS_DIR", jobs_dir)
+    monkeypatch.setattr(service, "LEGACY_JOBS_DIR", tmp_path / "legacy")
+    _write_queued_job(
+        jobs_dir,
+        "aaaaaaaaaaaa",
+        status="running",
+        worker_token="claim",
+        worker_pid=42,
+        worker_boot_id="boot",
+        worker_process_start="start",
+    )
+    stopping = threading.Event()
+    allow_stop = threading.Event()
+    outcomes: list[str] = []
+    failures: list[BaseException] = []
+
+    def stop(_job: CursorJob) -> bool:
+        stopping.set()
+        assert allow_stop.wait(2)
+        return True
+
+    def nuke() -> None:
+        try:
+            outcomes.append(service.nuke_jobs())
+        except BaseException as exc:
+            failures.append(exc)
+
+    with mock.patch.object(service, "_stop_worker", side_effect=stop):
+        thread = threading.Thread(target=nuke)
+        thread.start()
+        assert stopping.wait(2)
+        assert service.cancel_job("aaaaaaaaaaaa") == (
+            "Cursor job aaaaaaaaaaaa was cancelled."
+        )
+        allow_stop.set()
+        thread.join(2)
+
+    assert not thread.is_alive()
+    assert failures == []
+    assert outcomes == ["Deleted all 1 Cursor job."]
+    assert list(jobs_dir.glob("*.json")) == []
+
+
+def test_nuke_jobs_checks_legacy_claim_before_modern_token(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    jobs_dir = tmp_path / "jobs"
+    jobs_dir.mkdir()
+    monkeypatch.setattr(service, "JOBS_DIR", jobs_dir)
+    monkeypatch.setattr(service, "LEGACY_JOBS_DIR", tmp_path / "legacy")
+    _write_queued_job(
+        jobs_dir,
+        "aaaaaaaaaaaa",
+        status="running",
+        worker_token="claim",
+        worker_pid=42,
+        worker_boot_id="legacy-unknown",
+        worker_process_start="start",
+        schema_version=5,
+    )
+
+    with (
+        mock.patch.object(
+            service.worker_lifecycle,
+            "inspect_and_stop_legacy_worker",
+            return_value="unsafe",
+        ) as inspect,
+        mock.patch.object(service, "_stop_worker") as stop,
+        pytest.raises(HarnessError, match="legacy worker identity"),
+    ):
+        service.nuke_jobs()
+
+    inspect.assert_called_once()
+    stop.assert_not_called()
+    assert (jobs_dir / "aaaaaaaaaaaa.json").exists()
 
 
 def test_nuke_jobs_with_no_jobs_reports_nothing_to_delete(

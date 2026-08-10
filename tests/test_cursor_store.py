@@ -4,6 +4,7 @@ import hashlib
 import json
 import stat
 import tempfile
+import threading
 import unittest
 import warnings
 from pathlib import Path
@@ -19,9 +20,11 @@ from local_voice_harness.cursor.model import (
 from local_voice_harness.cursor.recovery import stage_terminal_intent
 from local_voice_harness.cursor.store import (
     ArtifactQuarantinedError,
+    JobMaintenanceError,
     JobQuarantinedError,
     JobQuarantineWarning,
     JobStore,
+    MaintenanceLease,
     locked,
     migrate_legacy_jobs,
     prune_jobs,
@@ -1120,36 +1123,207 @@ class CursorStoreIntegrationTests(unittest.TestCase):
         self.assertIsNotNone(first)
         self.assertEqual(store.get("bbbbbbbbbbbb").revision, 0)
 
-    def test_delete_all_removes_every_job_and_returns_ids(self) -> None:
+    def maintenance_lease(self, token: str = "maintenance-token") -> MaintenanceLease:
+        return MaintenanceLease(token, 10, 42, "boot", "start")
+
+    def test_maintenance_finalize_removes_safe_jobs_and_returns_ids(self) -> None:
         store = JobStore(self.jobs_dir, self.jobs_dir / "legacy")
         for job_id in ("aaaaaaaaaaaa", "bbbbbbbbbbbb", "cccccccccccc"):
-            store.create(CursorJob.from_dict(self.job(job_id)))
+            store.create(
+                CursorJob.from_dict(
+                    self.job(
+                        job_id,
+                        status="completed",
+                        result="done",
+                        completed_at=2,
+                    )
+                )
+            )
+        lease = self.maintenance_lease()
+        store.begin_maintenance(
+            lease, lambda _job: None, owner_alive=lambda _lease: False
+        )
 
-        removed = store.delete_all()
+        removed = store.finalize_maintenance(lease.token)
 
         self.assertEqual(
             sorted(removed), ["aaaaaaaaaaaa", "bbbbbbbbbbbb", "cccccccccccc"]
         )
         self.assertEqual(list(self.jobs_dir.glob("*.json")), [])
         self.assertEqual(store.list(), [])
+        self.assertFalse(store.maintenance_active())
 
-    def test_delete_all_preserves_quarantine_evidence(self) -> None:
+    def test_maintenance_refuses_deletion_and_preserves_quarantine_evidence(
+        self,
+    ) -> None:
         store = JobStore(self.jobs_dir, self.jobs_dir / "legacy")
-        store.create(CursorJob.from_dict(self.job("aaaaaaaaaaaa")))
+        store.create(
+            CursorJob.from_dict(
+                self.job(
+                    "aaaaaaaaaaaa",
+                    status="completed",
+                    result="done",
+                    completed_at=2,
+                )
+            )
+        )
         quarantine = self.jobs_dir / ".quarantine"
         quarantine.mkdir()
         evidence = quarantine / "bbbbbbbbbbbb-deadbeef.metadata.json"
         evidence.write_text(json.dumps({"error": "held"}))
+        lease = self.maintenance_lease()
+        store.begin_maintenance(
+            lease, lambda _job: None, owner_alive=lambda _lease: False
+        )
 
-        removed = store.delete_all()
+        with self.assertRaisesRegex(JobMaintenanceError, "quarantine evidence"):
+            store.finalize_maintenance(lease.token)
 
-        self.assertEqual(removed, ["aaaaaaaaaaaa"])
+        self.assertTrue((self.jobs_dir / "aaaaaaaaaaaa.json").exists())
         self.assertTrue(evidence.exists())
+        self.assertTrue(store.abort_maintenance(lease.token))
 
-    def test_delete_all_on_missing_directory_returns_empty(self) -> None:
+    def test_maintenance_finalize_empty_store_returns_empty(self) -> None:
         store = JobStore(self.jobs_dir / "absent", self.jobs_dir / "legacy")
+        lease = self.maintenance_lease()
+        store.begin_maintenance(
+            lease, lambda _job: None, owner_alive=lambda _lease: False
+        )
 
-        self.assertEqual(store.delete_all(), [])
+        self.assertEqual(store.finalize_maintenance(lease.token), [])
+        self.assertFalse(store.maintenance_active())
+
+    def test_maintenance_refuses_deletion_with_legacy_source_records(self) -> None:
+        legacy = self.jobs_dir / "legacy"
+        legacy.mkdir()
+        (legacy / "aaaaaaaaaaaa.json").write_text("{}")
+        store = JobStore(self.jobs_dir, legacy)
+        store.create(
+            CursorJob.from_dict(
+                self.job(
+                    "bbbbbbbbbbbb",
+                    status="completed",
+                    result="done",
+                    completed_at=2,
+                )
+            )
+        )
+        lease = self.maintenance_lease()
+        store.begin_maintenance(
+            lease, lambda _job: None, owner_alive=lambda _lease: False
+        )
+
+        with self.assertRaisesRegex(JobMaintenanceError, "legacy source records"):
+            store.finalize_maintenance(lease.token)
+
+        self.assertTrue((self.jobs_dir / "bbbbbbbbbbbb.json").exists())
+        self.assertTrue(store.abort_maintenance(lease.token))
+
+    def test_maintenance_blocks_create_and_acquisition_until_abort(self) -> None:
+        store = JobStore(self.jobs_dir, self.jobs_dir / "legacy")
+        store.create(CursorJob.from_dict(self.job("aaaaaaaaaaaa")))
+        lease = self.maintenance_lease()
+        store.begin_maintenance(
+            lease, lambda _job: None, owner_alive=lambda _lease: False
+        )
+
+        with self.assertRaisesRegex(JobMaintenanceError, "temporarily unavailable"):
+            store.create(CursorJob.from_dict(self.job("bbbbbbbbbbbb")))
+        acquired = store.update_unless_maintenance(
+            "aaaaaaaaaaaa",
+            lambda job: transition(
+                job,
+                JobStatus.ROUTING,
+                worker_token="claim",
+                worker_pid=42,
+                worker_boot_id="boot",
+                worker_process_start="start",
+            ),
+        )
+
+        self.assertIsNone(acquired)
+        self.assertTrue(store.abort_maintenance(lease.token))
+        self.assertFalse(store.abort_maintenance(lease.token))
+
+    def test_maintenance_rejects_live_owner_and_uncertain_takeover(self) -> None:
+        store = JobStore(self.jobs_dir, self.jobs_dir / "legacy")
+        first = self.maintenance_lease("first")
+        store.begin_maintenance(
+            first, lambda _job: None, owner_alive=lambda _lease: False
+        )
+
+        with self.assertRaisesRegex(JobMaintenanceError, "already in progress"):
+            store.begin_maintenance(
+                self.maintenance_lease("second"),
+                lambda _job: None,
+                owner_alive=lambda _lease: True,
+            )
+        with self.assertRaisesRegex(JobMaintenanceError, "cannot be verified"):
+            store.begin_maintenance(
+                self.maintenance_lease("third"),
+                lambda _job: None,
+                owner_alive=lambda _lease: None,
+            )
+
+        replacement = self.maintenance_lease("replacement")
+        store.begin_maintenance(
+            replacement,
+            lambda _job: None,
+            owner_alive=lambda _lease: False,
+        )
+        self.assertFalse(store.abort_maintenance(first.token))
+        self.assertTrue(store.abort_maintenance(replacement.token))
+
+    def test_maintenance_and_claim_are_serialized_by_real_lock(self) -> None:
+        store = JobStore(self.jobs_dir, self.jobs_dir / "legacy")
+        store.create(CursorJob.from_dict(self.job("aaaaaaaaaaaa")))
+        lease = self.maintenance_lease()
+        staging = threading.Event()
+        release = threading.Event()
+        claim_finished = threading.Event()
+        claimed: list[CursorJob | None] = []
+
+        def stage(_job: CursorJob) -> None:
+            staging.set()
+            self.assertTrue(release.wait(2))
+
+        def begin() -> None:
+            store.begin_maintenance(
+                lease,
+                stage,
+                owner_alive=lambda _lease: False,
+            )
+
+        def claim() -> None:
+            claimed.append(
+                store.update_unless_maintenance(
+                    "aaaaaaaaaaaa",
+                    lambda job: transition(
+                        job,
+                        JobStatus.ROUTING,
+                        worker_token="claim",
+                        worker_pid=42,
+                        worker_boot_id="boot",
+                        worker_process_start="start",
+                    ),
+                )
+            )
+            claim_finished.set()
+
+        maintenance_thread = threading.Thread(target=begin)
+        maintenance_thread.start()
+        self.assertTrue(staging.wait(2))
+        claim_thread = threading.Thread(target=claim)
+        claim_thread.start()
+        self.assertFalse(claim_finished.wait(0.05))
+        release.set()
+        maintenance_thread.join(2)
+        claim_thread.join(2)
+
+        self.assertFalse(maintenance_thread.is_alive())
+        self.assertFalse(claim_thread.is_alive())
+        self.assertEqual(claimed, [None])
+        self.assertTrue(store.abort_maintenance(lease.token))
 
 
 if __name__ == "__main__":
