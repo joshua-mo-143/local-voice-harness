@@ -457,7 +457,7 @@ WORKFLOW_PLAN[token]: <bounded multiline implementation plan>
         self.assertEqual(
             run_json.call_args_list,
             [
-                mock.call("agent", "send-keys", "agent", "ctrl-c"),
+                mock.call("agent", "send-keys", "agent", "ctrl+c"),
                 mock.call(
                     "agent",
                     "wait",
