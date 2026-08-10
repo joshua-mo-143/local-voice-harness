@@ -908,6 +908,10 @@ def claim_delivery(
     return delivery.claim_delivery(_job_store(), job_id, foreground=foreground)
 
 
+def renew_delivery(job_id: str, token: str) -> bool:
+    return delivery.renew_delivery(_job_store(), job_id, token)
+
+
 def acknowledge_delivery(job_id: str, token: str) -> bool:
     return delivery.acknowledge_delivery(_job_store(), job_id, token)
 
@@ -958,9 +962,9 @@ def recover_jobs() -> None:
     )
 
 
-def pending_results() -> list[DeliveryClaim]:
+def pending_results(*, limit: int = delivery.DELIVERY_WINDOW) -> list[DeliveryClaim]:
     recover_jobs()
-    return delivery.pending_deliveries(_job_store())
+    return delivery.pending_deliveries(_job_store(), limit=limit)
 
 
 ANNOUNCEABLE_STATUSES = delivery.DELIVERABLE_STATUSES

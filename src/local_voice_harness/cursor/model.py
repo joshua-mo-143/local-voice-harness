@@ -1974,6 +1974,9 @@ class AgentJob:
             delivery_attempts=self.delivery_attempts + 1,
         )
 
+    def renew_delivery(self, *, claimed_at: float) -> CursorJob:
+        return self._updated(delivery_claimed_at=claimed_at)
+
     def acknowledge_delivery(self, *, delivered_at: float) -> CursorJob:
         return self._updated(
             delivered=True,

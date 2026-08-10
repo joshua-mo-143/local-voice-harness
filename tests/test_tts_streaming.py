@@ -14,7 +14,9 @@ from pathlib import Path
 from unittest import mock
 
 from local_voice_harness.config import load_backend_settings
+from local_voice_harness.errors import HarnessError
 from local_voice_harness.tts import client, server
+from local_voice_harness.tts.stream import TTSStreamParser
 
 
 class TextSplittingTests(unittest.TestCase):
@@ -73,6 +75,38 @@ class ServerStreamingTests(unittest.TestCase):
         )
         self.assertTrue(events[-1]["cancelled"])
         self.assertNotIn("request-1", server.ACTIVE_STREAMS)
+
+    def test_cancellation_before_registration_prevents_synthesis(self) -> None:
+        handler = mock.Mock()
+        events: list[dict[str, object]] = []
+
+        with (
+            tempfile.TemporaryDirectory() as temporary,
+            mock.patch.object(server, "OUTPUT_ROOT", Path(temporary)),
+            mock.patch.object(server, "_generate") as generate,
+            mock.patch.object(
+                server,
+                "_write_json",
+                side_effect=lambda _handler, event: events.append(event),
+            ),
+            mock.patch.dict(server.ACTIVE_STREAMS, {}, clear=True),
+            mock.patch.dict(server.PENDING_CANCELLATIONS, {}, clear=True),
+        ):
+            self.assertTrue(server._cancel_stream("request-late"))
+            server._stream_response(
+                handler,
+                {
+                    "text": "Never synthesize this.",
+                    "request_id": "request-late",
+                },
+            )
+            self.assertFalse((Path(temporary) / "stream-request-late").exists())
+
+        generate.assert_not_called()
+        self.assertEqual([event["event"] for event in events], ["done"])
+        self.assertTrue(events[0]["cancelled"])
+        self.assertEqual(events[0]["chunks"], 0)
+        self.assertNotIn("request-late", server.PENDING_CANCELLATIONS)
 
     def test_venice_tts_requests_pcm_wav_with_configured_model_and_voice(self) -> None:
         output = io.BytesIO()
@@ -225,6 +259,123 @@ class _FakeSocket:
         self.closed = True
 
 
+class StreamParserTests(unittest.TestCase):
+    request_id = "request-1"
+
+    def _line(self, event: dict[str, object]) -> bytes:
+        return json.dumps(event).encode() + b"\n"
+
+    def _start(self, **changes: object) -> dict[str, object]:
+        return {
+            "ok": True,
+            "event": "start",
+            "request_id": self.request_id,
+            "sample_rate": 24_000,
+            "chunks": 1,
+            **changes,
+        }
+
+    def _chunk(self, **changes: object) -> dict[str, object]:
+        return {
+            "ok": True,
+            "event": "chunk",
+            "request_id": self.request_id,
+            "index": 0,
+            "output": "/tmp/chunk.wav",
+            "text": "hello",
+            **changes,
+        }
+
+    def _done(self, **changes: object) -> dict[str, object]:
+        return {
+            "ok": True,
+            "event": "done",
+            "request_id": self.request_id,
+            "cancelled": False,
+            "chunks": 1,
+            **changes,
+        }
+
+    def test_fragmented_ordered_stream_finishes_with_matching_done(self) -> None:
+        parser = TTSStreamParser(self.request_id)
+        payload = b"".join(
+            self._line(event) for event in (self._start(), self._chunk(), self._done())
+        )
+        parsed: list[dict[str, object]] = []
+
+        for byte in payload:
+            parsed.extend(parser.feed(bytes([byte])))
+
+        self.assertEqual(
+            [event["event"] for event in parsed], ["start", "chunk", "done"]
+        )
+        self.assertEqual(parser.sample_rate, 24_000)
+        self.assertEqual(parser.finish(), self._done())
+
+    def test_missing_done_and_partial_event_fail_at_eof(self) -> None:
+        parser = TTSStreamParser(self.request_id)
+        parser.feed(self._line(self._start()) + self._line(self._chunk()))
+        with self.assertRaisesRegex(HarnessError, "before completion"):
+            parser.finish()
+
+        partial = TTSStreamParser(self.request_id)
+        partial.feed(self._line(self._start()) + b'{"ok":true')
+        with self.assertRaisesRegex(HarnessError, "incomplete stream event"):
+            partial.finish()
+
+    def test_duplicate_done_and_trailing_events_fail_closed(self) -> None:
+        for trailing in (self._done(), self._chunk()):
+            with self.subTest(trailing=trailing["event"]):
+                parser = TTSStreamParser(self.request_id)
+                payload = b"".join(
+                    self._line(event)
+                    for event in (
+                        self._start(),
+                        self._chunk(),
+                        self._done(),
+                        trailing,
+                    )
+                )
+                with self.assertRaisesRegex(HarnessError, "after completion"):
+                    parser.feed(payload)
+
+    def test_malformed_or_mismatched_done_fails_closed(self) -> None:
+        invalid_done = (
+            self._done(cancelled="false"),
+            self._done(chunks=2),
+            self._done(request_id="other"),
+        )
+        for done in invalid_done:
+            with self.subTest(done=done):
+                parser = TTSStreamParser(self.request_id)
+                parser.feed(self._line(self._start()) + self._line(self._chunk()))
+                with self.assertRaises(HarnessError):
+                    parser.feed(self._line(done))
+
+    def test_start_and_chunk_ordering_is_strict(self) -> None:
+        invalid_sequences = (
+            (self._chunk(),),
+            (self._start(), self._start()),
+            (self._start(), self._chunk(index=1)),
+            (self._start(), self._chunk(), self._done(chunks=0)),
+        )
+        for events in invalid_sequences:
+            with self.subTest(events=[event["event"] for event in events]):
+                parser = TTSStreamParser(self.request_id)
+                with self.assertRaises(HarnessError):
+                    parser.feed(b"".join(self._line(event) for event in events))
+
+    def test_cancelled_completion_is_not_successful(self) -> None:
+        parser = TTSStreamParser(self.request_id)
+        parser.feed(
+            self._line(self._start())
+            + self._line(self._chunk())
+            + self._line(self._done(cancelled=True))
+        )
+        with self.assertRaisesRegex(HarnessError, "was cancelled"):
+            parser.finish()
+
+
 class ClientPlaybackTests(unittest.TestCase):
     def test_worker_uses_one_raw_pipewire_process_for_all_chunks(self) -> None:
         session = client.StreamingPlayback("hello")
@@ -260,14 +411,28 @@ class ClientPlaybackTests(unittest.TestCase):
     def test_stream_events_are_queued_and_reported(self) -> None:
         session = client.StreamingPlayback("One. Two.")
         events = [
-            {"ok": True, "event": "start", "sample_rate": 24_000},
+            {
+                "ok": True,
+                "event": "start",
+                "request_id": session.request_id,
+                "sample_rate": 24_000,
+                "chunks": 1,
+            },
             {
                 "ok": True,
                 "event": "chunk",
+                "request_id": session.request_id,
+                "index": 0,
                 "output": "/tmp/nonexistent-voice-chunk.wav",
                 "text": "One.",
             },
-            {"ok": True, "event": "done", "cancelled": False, "chunks": 1},
+            {
+                "ok": True,
+                "event": "done",
+                "request_id": session.request_id,
+                "cancelled": False,
+                "chunks": 1,
+            },
         ]
         payload = b"".join(json.dumps(event).encode() + b"\n" for event in events)
         fake_socket = _FakeSocket(payload)
@@ -295,14 +460,28 @@ class ClientPlaybackTests(unittest.TestCase):
     def test_interrupt_monitor_continues_after_server_finishes(self) -> None:
         session = client.StreamingPlayback("One.")
         events = [
-            {"ok": True, "event": "start", "sample_rate": 24_000},
+            {
+                "ok": True,
+                "event": "start",
+                "request_id": session.request_id,
+                "sample_rate": 24_000,
+                "chunks": 1,
+            },
             {
                 "ok": True,
                 "event": "chunk",
+                "request_id": session.request_id,
+                "index": 0,
                 "output": "/tmp/nonexistent-late-voice-chunk.wav",
                 "text": "One.",
             },
-            {"ok": True, "event": "done", "cancelled": False, "chunks": 1},
+            {
+                "ok": True,
+                "event": "done",
+                "request_id": session.request_id,
+                "cancelled": False,
+                "chunks": 1,
+            },
         ]
         payload = b"".join(json.dumps(event).encode() + b"\n" for event in events)
         fake_socket = _FakeSocket(payload)
@@ -369,6 +548,26 @@ class ClientPlaybackTests(unittest.TestCase):
             result = session.run()
 
         self.assertTrue(result["interrupted"])
+
+    def test_silent_stream_times_out_closes_socket_and_cancels_server(self) -> None:
+        session = client.StreamingPlayback("hello")
+        fake_socket = _FakeSocket(b"")
+
+        with (
+            mock.patch.object(client.socket, "socket", return_value=fake_socket),
+            mock.patch.object(client.select, "select", return_value=([], [], [])),
+            mock.patch.object(client, "STREAM_TIMEOUT_SECONDS", 0),
+            mock.patch.object(
+                client,
+                "unix_request",
+                return_value=b'{"ok":true}\n',
+            ) as cancel,
+            self.assertRaisesRegex(HarnessError, "timed out"),
+        ):
+            session.run()
+
+        self.assertTrue(fake_socket.closed)
+        cancel.assert_called_once()
 
     def test_legacy_api_still_uses_complete_waveform_request(self) -> None:
         response = json.dumps({"ok": True, "output": "/tmp/reply.wav"}).encode()

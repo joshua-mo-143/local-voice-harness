@@ -43,6 +43,8 @@ from ..config import (
 from ..cursor import questions as cursor_questions
 from ..cursor import service as cursor_service
 from ..cursor.delivery import (
+    DELIVERY_RENEW_SECONDS,
+    DELIVERY_WINDOW,
     DeliveryClaim,
     DeliveryClaims,
 )
@@ -57,6 +59,9 @@ from ..cursor.delivery import (
 )
 from ..cursor.delivery import (
     release_delivery as release_claim,
+)
+from ..cursor.delivery import (
+    renew_delivery as renew_claim,
 )
 from ..cursor.store import JobStore
 from ..errors import HarnessError
@@ -117,6 +122,10 @@ def release_delivery(job_id: str, token: str) -> bool:
     return release_claim(CURSOR_STORE, job_id, token)
 
 
+def renew_delivery(job_id: str, token: str) -> bool:
+    return renew_claim(CURSOR_STORE, job_id, token)
+
+
 def acknowledge_deliveries(claims: DeliveryClaims) -> list[DeliveryClaim]:
     return acknowledge_claims(CURSOR_STORE, claims)
 
@@ -126,7 +135,72 @@ def release_deliveries(claims: DeliveryClaims) -> None:
 
 
 def pending_results() -> list[DeliveryClaim]:
-    return cursor_service.pending_results()
+    return cursor_service.pending_results(limit=DELIVERY_WINDOW)
+
+
+class _DeliveryLeaseGuard:
+    def __init__(self, requests: list[PlaybackRequest]) -> None:
+        self._claims = {
+            (request.job_id, request.delivery_token)
+            for request in requests
+            if request.job_id and request.delivery_token
+        }
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._error: HarnessError | None = None
+        self._thread: threading.Thread | None = None
+
+    def start(self) -> None:
+        if not self._claims or self._thread is not None:
+            return
+        self._thread = threading.Thread(
+            target=self._run,
+            name="voice-delivery-lease",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def _run(self) -> None:
+        while not self._stop.wait(DELIVERY_RENEW_SECONDS):
+            with self._lock:
+                for job_id, token in self._claims:
+                    try:
+                        renewed = renew_delivery(job_id, token)
+                    except Exception as exc:
+                        self._error = HarnessError(
+                            "delivery lease renewal failed for "
+                            f"{job_id}: {type(exc).__name__}: {exc}"
+                        )
+                        self._stop.set()
+                        return
+                    if not renewed:
+                        self._error = HarnessError(
+                            f"delivery lease lost for job {job_id}"
+                        )
+                        self._stop.set()
+                        return
+                if not self._claims:
+                    return
+
+    def maintain(self) -> None:
+        with self._lock:
+            if self._error is not None:
+                raise self._error
+
+    def complete(self, request: PlaybackRequest) -> None:
+        if request.job_id and request.delivery_token:
+            with self._lock:
+                self._claims.discard((request.job_id, request.delivery_token))
+                if not self._claims:
+                    self._stop.set()
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread is None:
+            return
+        self._thread.join(timeout=2)
+        if self._thread.is_alive():
+            raise HarnessError("delivery lease worker did not stop")
 
 
 WAKE_NAME = r"(?:jarvis|travis|service|jarvus|jervis)"
@@ -472,15 +546,23 @@ class WakeConversationDaemon:
         self,
         response: str,
         *,
+        on_poll: Callable[[], None] | None = None,
         on_played: Callable[[dict[str, object], bool, PlaybackRequest], None]
         | None = None,
     ) -> tuple[list[tuple[dict[str, object], bool, PlaybackRequest]], BargeIn | None]:
         should_interrupt, interruption_result = self._build_interrupt_checker(response)
         try:
-            batch = self.playback_queue.drain(
-                should_interrupt=should_interrupt,
-                on_played=on_played,
-            )
+            if on_poll is None:
+                batch = self.playback_queue.drain(
+                    should_interrupt=should_interrupt,
+                    on_played=on_played,
+                )
+            else:
+                batch = self.playback_queue.drain(
+                    should_interrupt=should_interrupt,
+                    on_poll=on_poll,
+                    on_played=on_played,
+                )
         finally:
             self.wake_model.reset()
         interruption = interruption_result()
@@ -731,6 +813,8 @@ class WakeConversationDaemon:
             acknowledge_delivery(job_id, delivery_token) if delivery_token else True
         )
         if not acknowledged:
+            if delivery_token:
+                release_delivery(job_id, delivery_token)
             return
         played_text = str(playback.get("played_text") or "").strip() or request.text
         self._enable_post_job_conversation(
@@ -748,6 +832,7 @@ class WakeConversationDaemon:
         finished: set[tuple[str, str] | int] = set()
         with self.playback_queue._lock:
             pending_requests = [request for request, _ in self.playback_queue._items]
+        lease_guard = _DeliveryLeaseGuard(pending_requests)
 
         def request_key(request: PlaybackRequest) -> tuple[str, str] | int:
             if request.job_id and request.delivery_token:
@@ -759,16 +844,20 @@ class WakeConversationDaemon:
             interrupted: bool,
             request: PlaybackRequest,
         ) -> None:
+            lease_guard.complete(request)
             if request.job_id:
                 self._finish_job_playback(request, playback, interrupted=interrupted)
             finished.add(request_key(request))
 
         try:
+            lease_guard.start()
             with self.component_lock:
                 start_components()
-                self.playback_queue.start_prefetch()
+                lease_guard.maintain()
+                self.playback_queue.start_prefetch(limit=DELIVERY_WINDOW)
             batch, interruption = self._drain_playback_queue(
                 self.playback_queue.queued_text(),
+                on_poll=lease_guard.maintain,
                 on_played=finish_job,
             )
             for playback, interrupted, request in batch:
@@ -800,10 +889,13 @@ class WakeConversationDaemon:
             notify(str(exc) or type(exc).__name__, error=True)
             return None
         finally:
-            if not self.conversation_deadline and interruption is None:
-                self.stop_components_when_idle()
-            self.resume_microphone()
-            self.wake_model.reset()
+            try:
+                lease_guard.stop()
+            finally:
+                if not self.conversation_deadline and interruption is None:
+                    self.stop_components_when_idle()
+                self.resume_microphone()
+                self.wake_model.reset()
 
     def continue_after_barge_in(self, interruption: BargeIn | None) -> None:
         while interruption is not None and self.running:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import collections
+import contextlib
 import io
 import json
 import os
@@ -1072,6 +1073,226 @@ class AnnounceJobTests(unittest.TestCase):
         release.assert_called_once_with("bbbbbbbbbbbb", "claim")
         self.assertEqual(len(daemon.playback_queue), 0)
 
+    def test_truncated_queue_stream_releases_without_acknowledging(self) -> None:
+        daemon = _bare_daemon()
+        stream_socket = mock.Mock()
+        reads = 0
+
+        def recv(_size: int) -> bytes:
+            nonlocal reads
+            reads += 1
+            if reads > 1:
+                return b""
+            request = json.loads(stream_socket.sendall.call_args.args[0])
+            events = [
+                {
+                    "ok": True,
+                    "event": "start",
+                    "request_id": request["request_id"],
+                    "sample_rate": 24_000,
+                    "chunks": 1,
+                },
+                {
+                    "ok": True,
+                    "event": "chunk",
+                    "request_id": request["request_id"],
+                    "index": 0,
+                    "output": "/tmp/nonexistent-prefetch.wav",
+                    "text": "partial",
+                },
+            ]
+            return b"".join(json.dumps(event).encode() + b"\n" for event in events)
+
+        stream_socket.recv.side_effect = recv
+        with (
+            mock.patch(
+                "local_voice_harness.tts.queue.socket.socket",
+                return_value=stream_socket,
+            ),
+            mock.patch(
+                "local_voice_harness.tts.queue.select.select",
+                return_value=([stream_socket], [], []),
+            ),
+            mock.patch(
+                "local_voice_harness.tts.queue.unix_request",
+                return_value=b'{"ok":true,"cancelled":true}\n',
+            ),
+            mock.patch(
+                "local_voice_harness.tts.queue.playback_slot",
+                return_value=contextlib.nullcontext(),
+            ),
+            mock.patch.object(wake_daemon, "acknowledge_delivery") as acknowledge,
+            mock.patch.object(wake_daemon, "release_delivery") as release,
+            mock.patch.object(wake_daemon, "start_components"),
+            mock.patch.object(wake_daemon, "stop_components"),
+            mock.patch.object(wake_daemon, "notify"),
+        ):
+            daemon._enqueue_job_announcement(
+                _delivery_claim("job2", "completed", result="done")
+            )
+            daemon._play_pending_announcements()
+
+        acknowledge.assert_not_called()
+        release.assert_called_once_with("bbbbbbbbbbbb", "claim")
+        self.assertEqual(len(daemon.playback_queue), 0)
+        stream_socket.close.assert_called_once()
+
+    def test_expired_acknowledgement_releases_without_enabling_followup(self) -> None:
+        daemon = _bare_daemon()
+        request = PlaybackRequest(
+            text="Cursor finished. done",
+            job_id="bbbbbbbbbbbb",
+            delivery_token="claim",
+            job_status="completed",
+        )
+
+        with (
+            mock.patch.object(
+                wake_daemon,
+                "acknowledge_delivery",
+                return_value=False,
+            ) as acknowledge,
+            mock.patch.object(wake_daemon, "release_delivery") as release,
+        ):
+            daemon._finish_job_playback(
+                request,
+                {"played_text": request.text},
+                interrupted=False,
+            )
+
+        acknowledge.assert_called_once_with("bbbbbbbbbbbb", "claim")
+        release.assert_called_once_with("bbbbbbbbbbbb", "claim")
+        self.assertFalse(daemon.awaiting_followup)
+        self.assertIsNone(daemon.completed_followup)
+
+    def test_active_announcement_renews_its_delivery_lease(self) -> None:
+        daemon = _bare_daemon()
+        renewed = threading.Event()
+
+        def drain_with_renewal(
+            _response: str,
+            *,
+            on_poll: object,
+            on_played: object = None,
+        ) -> tuple[
+            list[tuple[dict[str, object], bool, PlaybackRequest]],
+            None,
+        ]:
+            self.assertTrue(renewed.wait(timeout=1))
+            on_poll()  # type: ignore[operator]
+            return (
+                _playback_batch(
+                    "Cursor finished. done",
+                    job_id="job2",
+                    delivery_token="claim",
+                    job_status="completed",
+                ),
+                None,
+            )
+
+        with (
+            mock.patch.object(wake_daemon, "DELIVERY_RENEW_SECONDS", 0.001),
+            mock.patch.object(
+                wake_daemon,
+                "renew_delivery",
+                side_effect=lambda _job, _token: renewed.set() or True,
+            ) as renew,
+            mock.patch.object(
+                wake_daemon,
+                "acknowledge_delivery",
+                return_value=True,
+            ),
+            mock.patch.object(wake_daemon, "release_delivery"),
+            mock.patch.object(wake_daemon, "start_components"),
+            mock.patch.object(wake_daemon, "stop_components"),
+            mock.patch.object(daemon.playback_queue, "start_prefetch"),
+            mock.patch.object(
+                daemon,
+                "_drain_playback_queue",
+                side_effect=drain_with_renewal,
+            ),
+            mock.patch.object(wake_daemon, "notify"),
+        ):
+            daemon._enqueue_job_announcement(
+                _delivery_claim("job2", "completed", result="done")
+            )
+            daemon._play_pending_announcements()
+
+        self.assertGreaterEqual(renew.call_count, 1)
+        renew.assert_called_with("bbbbbbbbbbbb", "claim")
+
+    def test_lease_loss_cancels_and_releases_without_acknowledging(self) -> None:
+        daemon = _bare_daemon()
+        renewal_failed = threading.Event()
+
+        def fail_after_lease_loss(
+            _response: str,
+            *,
+            on_poll: object,
+            on_played: object = None,
+        ) -> None:
+            self.assertTrue(renewal_failed.wait(timeout=1))
+            on_poll()  # type: ignore[operator]
+
+        with (
+            mock.patch.object(wake_daemon, "DELIVERY_RENEW_SECONDS", 0.001),
+            mock.patch.object(
+                wake_daemon,
+                "renew_delivery",
+                side_effect=lambda _job, _token: renewal_failed.set() and False,
+            ),
+            mock.patch.object(wake_daemon, "acknowledge_delivery") as acknowledge,
+            mock.patch.object(wake_daemon, "release_delivery") as release,
+            mock.patch.object(wake_daemon, "start_components"),
+            mock.patch.object(wake_daemon, "stop_components"),
+            mock.patch.object(daemon.playback_queue, "start_prefetch"),
+            mock.patch.object(
+                daemon,
+                "_drain_playback_queue",
+                side_effect=fail_after_lease_loss,
+            ),
+            mock.patch.object(wake_daemon, "notify"),
+        ):
+            daemon._enqueue_job_announcement(
+                _delivery_claim("job2", "completed", result="done")
+            )
+            daemon._play_pending_announcements()
+
+        acknowledge.assert_not_called()
+        release.assert_called_once_with("bbbbbbbbbbbb", "claim")
+        self.assertEqual(len(daemon.playback_queue), 0)
+
+    def test_lease_renewal_exception_fails_the_guard_closed(self) -> None:
+        attempted = threading.Event()
+        request = PlaybackRequest(
+            text="Cursor finished. done",
+            job_id="bbbbbbbbbbbb",
+            delivery_token="claim",
+            job_status="completed",
+        )
+
+        def fail_renewal(_job_id: str, _token: str) -> bool:
+            attempted.set()
+            raise OSError("store unavailable")
+
+        with (
+            mock.patch.object(wake_daemon, "DELIVERY_RENEW_SECONDS", 0.001),
+            mock.patch.object(
+                wake_daemon,
+                "renew_delivery",
+                side_effect=fail_renewal,
+            ),
+        ):
+            guard = wake_daemon._DeliveryLeaseGuard([request])
+            guard.start()
+            self.assertTrue(attempted.wait(timeout=1))
+            with self.assertRaisesRegex(
+                HarnessError,
+                "lease renewal failed.*store unavailable",
+            ):
+                guard.maintain()
+            guard.stop()
+
     def test_announcement_prefetch_starts_only_after_components_are_ready(
         self,
     ) -> None:
@@ -1115,7 +1336,12 @@ class AnnounceJobTests(unittest.TestCase):
         daemon = _bare_daemon()
         events: list[str] = []
 
-        def fake_drain(_response: str, *, on_played: object = None):
+        def fake_drain(
+            _response: str,
+            *,
+            on_poll: object = None,
+            on_played: object = None,
+        ):
             events.append("played")
             return (
                 _playback_batch(
@@ -1188,6 +1414,7 @@ class AnnounceJobTests(unittest.TestCase):
         def fail_after_first(
             _response: str,
             *,
+            on_poll: object = None,
             on_played: object = None,
         ) -> None:
             callback = on_played
