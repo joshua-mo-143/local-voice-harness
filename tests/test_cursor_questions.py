@@ -29,6 +29,7 @@ from local_voice_harness.questions import (
     QuestionSensitivity,
     QuestionState,
     parse_question_spec,
+    question_prompt,
     resolve_answer,
 )
 
@@ -182,6 +183,68 @@ def test_multiple_choice_never_guesses_ambiguous_answer() -> None:
     selected = resolve_answer(question, "second")
     assert selected.outcome == AnswerOutcome.ACCEPTED
     assert selected.answer == "b"
+
+
+@pytest.mark.parametrize(
+    "spoken_answer",
+    [
+        "option 2",
+        "option two",
+        "the second option",
+        "I choose choice number 2 please",
+        "Point option two",
+    ],
+)
+def test_multiple_choice_accepts_explicit_spoken_option(
+    spoken_answer: str,
+) -> None:
+    question = _question(
+        kind=QuestionKind.MULTIPLE_CHOICE,
+        choices=(Choice("a", "Use SQLite"), Choice("b", "Use PostgreSQL")),
+    )
+
+    selected = resolve_answer(question, spoken_answer)
+
+    assert selected.outcome == AnswerOutcome.ACCEPTED
+    assert selected.answer == "b"
+
+
+def test_multiple_choice_rejects_conflicting_spoken_options() -> None:
+    question = _question(
+        kind=QuestionKind.MULTIPLE_CHOICE,
+        choices=(Choice("a", "Use SQLite"), Choice("b", "Use PostgreSQL")),
+    )
+
+    resolution = resolve_answer(question, "option one or option two")
+
+    assert resolution.outcome == AnswerOutcome.AMBIGUOUS
+
+
+def test_multiple_choice_accepts_equivalent_acknowledgment_spelling() -> None:
+    question = _question(
+        kind=QuestionKind.MULTIPLE_CHOICE,
+        choices=(
+            Choice("send", "Successful server send completion"),
+            Choice("ack", "Explicit client acknowledgment"),
+        ),
+    )
+
+    selected = resolve_answer(question, "Explicit client acknowledgement")
+
+    assert selected.outcome == AnswerOutcome.ACCEPTED
+    assert selected.answer == "ack"
+
+
+def test_multiple_choice_prompt_numbers_each_spoken_option() -> None:
+    question = _question(
+        kind=QuestionKind.MULTIPLE_CHOICE,
+        choices=(Choice("a", "Use SQLite"), Choice("b", "Use PostgreSQL")),
+    )
+
+    assert question_prompt(question) == (
+        "Which approach should I use? Option 1 is Use SQLite. "
+        "Option 2 is Use PostgreSQL. Please choose one."
+    )
 
 
 @pytest.mark.parametrize(
@@ -455,6 +518,51 @@ def test_third_accepted_approval_offers_auto_after_implementation(
     assert completed.terminal_intent_status == JobStatus.COMPLETED
     assert completed.terminal_intent_result == "done"
     release.assert_called_once()
+
+
+def test_repeat_returns_numbered_multiple_choice_question(store: JobStore) -> None:
+    original = _awaiting(
+        store,
+        _question(
+            kind=QuestionKind.MULTIPLE_CHOICE,
+            choices=(Choice("a", "Use SQLite"), Choice("b", "Use PostgreSQL")),
+        ),
+    )
+
+    with mock.patch.object(service, "launch_worker") as launch:
+        result = cursor_turn(
+            CursorTurnRequest(
+                "repeat",
+                action="reply",
+                job_id=original.id,
+                expected_question_id="question-1",
+            )
+        )
+
+    launch.assert_not_called()
+    assert result.text == (
+        "Which approach should I use? Option 1 is Use SQLite. "
+        "Option 2 is Use PostgreSQL. Please choose one."
+    )
+    assert store.get(original.id).revision == original.revision
+
+
+def test_foreground_multiple_choice_delivery_numbers_options(store: JobStore) -> None:
+    original = _awaiting(
+        store,
+        _question(
+            kind=QuestionKind.MULTIPLE_CHOICE,
+            choices=(Choice("a", "Use SQLite"), Choice("b", "Use PostgreSQL")),
+        ),
+    )
+
+    result = service._await_foreground(original.id, None)
+
+    assert result.text == (
+        "Which approach should I use? Option 1 is Use SQLite. "
+        "Option 2 is Use PostgreSQL. Please choose one."
+    )
+    assert result.session_id == original.id
 
 
 def test_stale_answer_does_not_mutate_or_launch(store: JobStore) -> None:

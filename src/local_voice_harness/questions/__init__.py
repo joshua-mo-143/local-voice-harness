@@ -240,6 +240,13 @@ _ORDINALS = {
     "five": 4,
     "5": 4,
 }
+_ORDINAL_PATTERN = "|".join(
+    sorted((re.escape(value) for value in _ORDINALS), key=len, reverse=True)
+)
+_CHOICE_REFERENCE_PATTERNS = (
+    re.compile(rf"\b(?:option|choice)(?: number)? (?P<ordinal>{_ORDINAL_PATTERN})\b"),
+    re.compile(rf"\b(?P<ordinal>{_ORDINAL_PATTERN}) (?:option|choice|one)\b"),
+)
 
 
 def parse_question_spec(value: str) -> QuestionSpec:
@@ -313,11 +320,16 @@ def resolve_answer(
         for choice in question.choices
         if normalized in {_normalize(choice.id), _normalize(choice.label)}
     ]
-    ordinal = _ORDINALS.get(normalized)
-    if ordinal is not None and ordinal < len(question.choices):
+    ordinals = _choice_ordinals(normalized)
+    if len(ordinals) == 1:
+        ordinal = next(iter(ordinals))
+        if ordinal >= len(question.choices):
+            return AnswerResolution(AnswerOutcome.AMBIGUOUS)
         choice = question.choices[ordinal]
         if choice not in matches:
             matches.append(choice)
+    elif ordinals:
+        return AnswerResolution(AnswerOutcome.AMBIGUOUS)
     if len(matches) != 1:
         return AnswerResolution(AnswerOutcome.AMBIGUOUS)
     return AnswerResolution(
@@ -338,12 +350,34 @@ def question_control(value: str) -> AnswerOutcome | None:
 
 
 def choices_prompt(question: Question) -> str:
-    labels = ", ".join(choice.label for choice in question.choices)
-    return f"Please choose exactly one of: {labels}."
+    options = " ".join(
+        f"Option {index} is {choice.label}."
+        for index, choice in enumerate(question.choices, start=1)
+    )
+    return f"{options} Please choose one."
+
+
+def question_prompt(question: Question) -> str:
+    if not question.choices:
+        return question.text
+    return f"{question.text} {choices_prompt(question)}"
+
+
+def _choice_ordinals(value: str) -> set[int]:
+    direct = _ORDINALS.get(value)
+    if direct is not None:
+        return {direct}
+    return {
+        _ORDINALS[match.group("ordinal")]
+        for pattern in _CHOICE_REFERENCE_PATTERNS
+        for match in pattern.finditer(value)
+    }
 
 
 def _normalize(value: str) -> str:
-    return re.sub(r"\s+", " ", re.sub(r"[^\w\s'-]", "", value.casefold())).strip()
+    normalized = re.sub(r"[^\w\s'-]", "", value.casefold())
+    normalized = re.sub(r"\backnowledgement\b", "acknowledgment", normalized)
+    return re.sub(r"\s+", " ", normalized).strip()
 
 
 def _required_string(values: dict[str, Any], field: str) -> str:

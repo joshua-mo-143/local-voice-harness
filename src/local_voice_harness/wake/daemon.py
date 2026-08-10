@@ -70,7 +70,7 @@ from ..intent import (
 )
 from ..llm import qwen_turn
 from ..notifications import notify
-from ..questions import AnswerProvenance, question_control
+from ..questions import AnswerProvenance, question_control, question_prompt
 from ..stt.client import transcribe
 from ..ticket_targets import MISSING_ISSUE_SCOPE_RESPONSE, extract_ticket_targets
 from ..tts.queue import PlaybackQueue, PlaybackRequest
@@ -604,10 +604,13 @@ class WakeConversationDaemon:
         if job.status == JobStatus.COMPLETED:
             return f"Cursor finished. {str(job.result or '').strip()}"
         if job.status == JobStatus.AWAITING_USER:
-            return (
-                "Cursor needs clarification. "
-                + str(job.question or job.result or "").strip()
+            pending = cursor_questions.current(job)
+            text = (
+                question_prompt(pending)
+                if pending is not None
+                else str(job.question or job.result or "").strip()
             )
+            return "Cursor needs clarification. " + text
         if job.status == JobStatus.BLOCKED:
             return str(
                 job.result or f"Cursor agent {job.herdr_target or ''} needs attention."
