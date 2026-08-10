@@ -34,6 +34,7 @@ _ARTIFACT_REF = re.compile(
     r"(?P<kind>plan|review)-(?P<round>[0-2])"
     r"(?:-(?P<digest>[0-9a-f]{64}))?\.json$"
 )
+_QUARANTINE_METADATA_NAME = re.compile(r"^(?P<job_id>[0-9a-f]{12})-.+\.metadata\.json$")
 LegacyWorkerDisposition = Literal["absent", "stopped", "unsafe"]
 LegacyWorkerInspector = Callable[[CursorJob], LegacyWorkerDisposition]
 MAINTENANCE_FILENAME = ".maintenance"
@@ -94,6 +95,42 @@ class QuarantineAcknowledgement:
     acknowledged_at: float
 
 
+@dataclass(frozen=True, slots=True)
+class QuarantineEvidence:
+    job_id: str | None
+    metadata_path: Path
+    payload_path: Path | None
+    quarantined_at: float | None
+    quarantine_error: str
+    resolved: bool
+    status: str | None
+    worker_pid: int | None
+    worker_boot_id: str | None
+    worker_process_start: str | None
+    herdr_target: str | None
+    worktree_path: str | None
+    inspection_error: str | None
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "job_id": self.job_id,
+            "metadata_path": str(self.metadata_path),
+            "payload_path": (
+                str(self.payload_path) if self.payload_path is not None else None
+            ),
+            "quarantined_at": self.quarantined_at,
+            "quarantine_error": self.quarantine_error,
+            "resolved": self.resolved,
+            "status": self.status,
+            "worker_pid": self.worker_pid,
+            "worker_boot_id": self.worker_boot_id,
+            "worker_process_start": self.worker_process_start,
+            "herdr_target": self.herdr_target,
+            "worktree_path": self.worktree_path,
+            "inspection_error": self.inspection_error,
+        }
+
+
 @contextmanager
 def locked(jobs_dir: Path) -> Iterator[None]:
     jobs_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -118,6 +155,8 @@ def _quarantine_resolution_path(metadata_path: Path) -> Path:
 
 def _quarantine_metadata_resolved(metadata_path: Path) -> bool:
     resolution_path = _quarantine_resolution_path(metadata_path)
+    if metadata_path.is_symlink() or resolution_path.is_symlink():
+        return False
     try:
         resolution = json.loads(resolution_path.read_text())
         return (
@@ -127,6 +166,92 @@ def _quarantine_metadata_resolved(metadata_path: Path) -> bool:
         )
     except (OSError, json.JSONDecodeError):
         return False
+
+
+def _optional_string(value: object) -> str | None:
+    return value if isinstance(value, str) and value else None
+
+
+def _quarantine_evidence_unlocked(metadata_path: Path) -> QuarantineEvidence:
+    match = _QUARANTINE_METADATA_NAME.fullmatch(metadata_path.name)
+    job_id = match.group("job_id") if match is not None else None
+    resolved = not metadata_path.is_symlink() and _quarantine_metadata_resolved(
+        metadata_path
+    )
+    payload_path: Path | None = None
+    quarantined_at: float | None = None
+    quarantine_error = "quarantine metadata is unreadable"
+    status: str | None = None
+    worker_pid: int | None = None
+    worker_boot_id: str | None = None
+    worker_process_start: str | None = None
+    herdr_target: str | None = None
+    worktree_path: str | None = None
+    inspection_error: str | None = None
+
+    try:
+        if metadata_path.is_symlink():
+            raise OSError("quarantine metadata cannot be a symlink")
+        metadata = json.loads(metadata_path.read_text())
+        if not isinstance(metadata, dict):
+            raise ValueError("quarantine metadata is not a JSON object")
+        timestamp = metadata.get("quarantined_at")
+        if isinstance(timestamp, int | float) and not isinstance(timestamp, bool):
+            quarantined_at = float(timestamp)
+        quarantine_error = str(metadata.get("error") or "validation failed")
+        quarantined_name = metadata.get("quarantined_name")
+        if not isinstance(quarantined_name, str) or not quarantined_name:
+            raise ValueError("quarantine metadata has no payload name")
+        if Path(quarantined_name).name != quarantined_name:
+            raise ValueError("quarantine payload path is not confined")
+        payload_path = metadata_path.parent / quarantined_name
+        if payload_path.is_symlink():
+            raise OSError("quarantine payload cannot be a symlink")
+        raw = json.loads(payload_path.read_text())
+        if not isinstance(raw, dict):
+            raise ValueError("quarantine payload is not a JSON object")
+        harness_state = _mapping_field(raw, "harness_state")
+        checkout_state = _mapping_field(raw, "checkout_state")
+        status = _optional_string(raw.get("status"))
+        pid = raw.get("worker_pid")
+        if isinstance(pid, int) and not isinstance(pid, bool):
+            worker_pid = pid
+        worker_boot_id = _optional_string(raw.get("worker_boot_id"))
+        worker_process_start = _optional_string(raw.get("worker_process_start"))
+        herdr_target = _optional_string(
+            raw.get("herdr_target")
+            or raw.get("session_id")
+            or harness_state.get("session_id")
+        )
+        worktree_path = _optional_string(
+            raw.get("worktree_path") or checkout_state.get("path")
+        )
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as exc:
+        inspection_error = str(exc) or type(exc).__name__
+
+    return QuarantineEvidence(
+        job_id=job_id,
+        metadata_path=metadata_path,
+        payload_path=payload_path,
+        quarantined_at=quarantined_at,
+        quarantine_error=quarantine_error,
+        resolved=resolved,
+        status=status,
+        worker_pid=worker_pid,
+        worker_boot_id=worker_boot_id,
+        worker_process_start=worker_process_start,
+        herdr_target=herdr_target,
+        worktree_path=worktree_path,
+        inspection_error=inspection_error,
+    )
+
+
+def _unresolved_quarantine_metadata(jobs_dir: Path) -> list[Path]:
+    return [
+        path
+        for path in sorted((jobs_dir / ".quarantine").glob("*.metadata.json"))
+        if not _quarantine_metadata_resolved(path)
+    ]
 
 
 def _mapping_field(value: dict[str, object], field: str) -> dict[str, object]:
@@ -1191,6 +1316,13 @@ class JobStore:
                         "an existing Cursor job deletion owner cannot be "
                         "verified; retry after checking the recorded process"
                     )
+            unresolved_quarantine = _unresolved_quarantine_metadata(self.durable_dir)
+            if unresolved_quarantine:
+                raise JobMaintenanceError(
+                    "Cursor jobs could not be deleted safely: quarantine evidence "
+                    "requires manual inspection: "
+                    + ", ".join(path.name for path in unresolved_quarantine)
+                )
             _atomic_json(_maintenance_path(self.durable_dir), lease.to_record())
             staged: list[CursorJob] = []
             for path in sorted(self.durable_dir.glob("*.json")):
@@ -1513,6 +1645,12 @@ class JobStore:
                 )
             resolved: list[str] = []
             for metadata_path in metadata_paths:
+                if _quarantine_metadata_resolved(metadata_path):
+                    continue
+                if metadata_path.is_symlink():
+                    raise JobValidationError(
+                        f"{metadata_path.name}: quarantine metadata cannot be a symlink"
+                    )
                 _atomic_json(
                     _quarantine_resolution_path(metadata_path),
                     {
@@ -1531,6 +1669,22 @@ class JobStore:
             tuple(resolved),
             acknowledged_at,
         )
+
+    def list_quarantine_evidence(
+        self, *, include_resolved: bool = False
+    ) -> list[QuarantineEvidence]:
+        if not self.durable_dir.is_dir():
+            return []
+        with locked(self.durable_dir):
+            evidence = [
+                _quarantine_evidence_unlocked(path)
+                for path in sorted(
+                    (self.durable_dir / ".quarantine").glob("*.metadata.json")
+                )
+            ]
+        return [
+            record for record in evidence if include_resolved or not record.resolved
+        ]
 
     def prune(
         self,
@@ -1571,11 +1725,7 @@ class JobStore:
                     quarantined.append(path.stem)
             blockers: list[str] = []
             unresolved_quarantine = [
-                path.name
-                for path in sorted(
-                    (self.durable_dir / ".quarantine").glob("*.metadata.json")
-                )
-                if not _quarantine_metadata_resolved(path)
+                path.name for path in _unresolved_quarantine_metadata(self.durable_dir)
             ]
             if quarantined or unresolved_quarantine:
                 evidence = sorted({*quarantined, *unresolved_quarantine})

@@ -1,10 +1,13 @@
 from __future__ import annotations
 
+import json
 import unittest
+from pathlib import Path
 from unittest import mock
 
 from local_voice_harness import cli
 from local_voice_harness.cursor.service import CursorTurnRequest, CursorTurnResult
+from local_voice_harness.cursor.store import QuarantineEvidence
 
 
 class JobsCliTests(unittest.TestCase):
@@ -79,6 +82,7 @@ class JobsNukeCliTests(unittest.TestCase):
             mock.patch.object(
                 cli, "nuke_jobs", return_value="Deleted all jobs."
             ) as nuke_jobs,
+            mock.patch.object(cli, "list_quarantine_evidence", return_value=[]),
             mock.patch.object(cli, "input", return_value=answer, create=True) as prompt,
             mock.patch("builtins.print"),
         ):
@@ -108,6 +112,132 @@ class JobsNukeCliTests(unittest.TestCase):
         nuke_jobs, prompt = self._dispatch_nuke(["jobs", "nuke"], total=0)
         prompt.assert_not_called()
         nuke_jobs.assert_not_called()
+
+    def test_no_live_jobs_reports_unresolved_quarantine(self) -> None:
+        args = cli.parser().parse_args(["jobs", "nuke", "--force"])
+        with (
+            mock.patch.object(cli, "count_jobs", return_value=0),
+            mock.patch.object(
+                cli, "list_quarantine_evidence", return_value=[mock.sentinel.evidence]
+            ),
+            mock.patch.object(cli, "nuke_jobs") as nuke_jobs,
+            mock.patch("builtins.print") as output,
+        ):
+            cli.dispatch(args)
+
+        nuke_jobs.assert_not_called()
+        self.assertIn("jobs quarantine list", output.call_args.args[0])
+
+
+class JobsQuarantineCliTests(unittest.TestCase):
+    def evidence(self, *, resolved: bool = False) -> QuarantineEvidence:
+        return QuarantineEvidence(
+            job_id="aaaaaaaaaaaa",
+            metadata_path=Path("/state/jobs/.quarantine/job.metadata.json"),
+            payload_path=Path("/state/jobs/.quarantine/job.json"),
+            quarantined_at=10,
+            quarantine_error="unsupported schema",
+            resolved=resolved,
+            status="running",
+            worker_pid=42,
+            worker_boot_id="boot",
+            worker_process_start="start",
+            herdr_target="held-agent",
+            worktree_path="/worktrees/held",
+            inspection_error=None,
+        )
+
+    def test_list_displays_unresolved_reconciliation_details(self) -> None:
+        args = cli.parser().parse_args(["jobs", "quarantine", "list"])
+        with (
+            mock.patch.object(
+                cli, "list_quarantine_evidence", return_value=[self.evidence()]
+            ) as listing,
+            mock.patch("builtins.print") as output,
+        ):
+            cli.dispatch(args)
+
+        listing.assert_called_once_with(include_resolved=False)
+        displayed = "\n".join(str(call.args[0]) for call in output.call_args_list)
+        self.assertIn("aaaaaaaaaaaa: unresolved", displayed)
+        self.assertIn("pid=42", displayed)
+        self.assertIn("held-agent", displayed)
+        self.assertIn("/worktrees/held", displayed)
+
+    def test_list_json_includes_resolved_evidence_when_requested(self) -> None:
+        args = cli.parser().parse_args(
+            ["jobs", "quarantine", "list", "--all", "--json"]
+        )
+        with (
+            mock.patch.object(
+                cli,
+                "list_quarantine_evidence",
+                return_value=[self.evidence(resolved=True)],
+            ) as listing,
+            mock.patch("builtins.print") as output,
+        ):
+            cli.dispatch(args)
+
+        listing.assert_called_once_with(include_resolved=True)
+        payload = json.loads(output.call_args.args[0])
+        self.assertEqual(payload[0]["job_id"], "aaaaaaaaaaaa")
+        self.assertTrue(payload[0]["resolved"])
+
+    def test_acknowledge_requires_exact_confirmation(self) -> None:
+        args = cli.parser().parse_args(
+            [
+                "jobs",
+                "quarantine",
+                "acknowledge",
+                "aaaaaaaaaaaa",
+                "--reason",
+                "verified absent",
+            ]
+        )
+        with (
+            mock.patch.object(
+                cli, "list_quarantine_evidence", return_value=[self.evidence()]
+            ),
+            mock.patch.object(
+                cli, "acknowledge_quarantine_reservations"
+            ) as acknowledge,
+            mock.patch.object(cli, "input", return_value="no", create=True) as prompt,
+            mock.patch("builtins.print"),
+        ):
+            cli.dispatch(args)
+
+        prompt.assert_called_once()
+        acknowledge.assert_not_called()
+
+    def test_force_acknowledges_with_reason_without_prompting(self) -> None:
+        args = cli.parser().parse_args(
+            [
+                "jobs",
+                "quarantine",
+                "acknowledge",
+                "aaaaaaaaaaaa",
+                "--reason",
+                "verified absent",
+                "--force",
+            ]
+        )
+        with (
+            mock.patch.object(
+                cli, "list_quarantine_evidence", return_value=[self.evidence()]
+            ) as listing,
+            mock.patch.object(
+                cli,
+                "acknowledge_quarantine_reservations",
+                return_value="acknowledged",
+            ) as acknowledge,
+            mock.patch.object(cli, "input", create=True) as prompt,
+            mock.patch("builtins.print"),
+        ):
+            cli.dispatch(args)
+
+        listing.assert_called_once_with(include_resolved=True)
+        acknowledge.assert_called_once_with("aaaaaaaaaaaa", reason="verified absent")
+        prompt.assert_not_called()
 
 
 class ListenCliTests(unittest.TestCase):

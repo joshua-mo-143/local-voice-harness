@@ -376,6 +376,36 @@ def _write_queued_job(jobs_dir: Path, job_id: str, **fields: object) -> None:
     (jobs_dir / f"{job_id}.json").write_text(json.dumps(value))
 
 
+def _write_quarantine_evidence(
+    jobs_dir: Path,
+    job_id: str,
+    *,
+    payload: dict[str, object] | None = None,
+) -> None:
+    quarantine = jobs_dir / ".quarantine"
+    quarantine.mkdir()
+    quarantined_name = f"{job_id}-deadbeef.json"
+    (quarantine / quarantined_name).write_text(
+        json.dumps(
+            payload
+            or {
+                "id": job_id,
+                "status": "running",
+                "herdr_target": "held-agent",
+            }
+        )
+    )
+    (quarantine / f"{job_id}-deadbeef.metadata.json").write_text(
+        json.dumps(
+            {
+                "quarantined_name": quarantined_name,
+                "quarantined_at": 10,
+                "error": "invalid record",
+            }
+        )
+    )
+
+
 def test_count_jobs_reports_durable_total(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -388,6 +418,63 @@ def test_count_jobs_reports_durable_total(
     _write_queued_job(jobs_dir, "aaaaaaaaaaaa")
     _write_queued_job(jobs_dir, "bbbbbbbbbbbb")
     assert service.count_jobs() == 2
+
+
+def test_quarantine_service_lists_and_acknowledges_preserved_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    jobs_dir = tmp_path / "jobs"
+    jobs_dir.mkdir()
+    monkeypatch.setattr(service, "JOBS_DIR", jobs_dir)
+    monkeypatch.setattr(service, "LEGACY_JOBS_DIR", tmp_path / "legacy")
+    _write_quarantine_evidence(jobs_dir, "aaaaaaaaaaaa")
+
+    evidence = service.list_quarantine_evidence()
+    message = service.acknowledge_quarantine_reservations(
+        "aaaaaaaaaaaa", reason="verified absent"
+    )
+
+    assert len(evidence) == 1
+    assert evidence[0].herdr_target == "held-agent"
+    assert message == (
+        "Acknowledged 1 quarantined record for job aaaaaaaaaaaa. "
+        "The payload and metadata were preserved."
+    )
+    assert service.list_quarantine_evidence() == []
+    assert len(service.list_quarantine_evidence(include_resolved=True)) == 1
+
+
+def test_nuke_preflights_quarantine_before_staging_or_stopping_jobs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    jobs_dir = tmp_path / "jobs"
+    jobs_dir.mkdir()
+    monkeypatch.setattr(service, "JOBS_DIR", jobs_dir)
+    monkeypatch.setattr(service, "LEGACY_JOBS_DIR", tmp_path / "legacy")
+    _write_queued_job(
+        jobs_dir,
+        "aaaaaaaaaaaa",
+        status="running",
+        worker_token="claim",
+        worker_pid=42,
+        worker_boot_id="boot",
+        worker_process_start="start",
+    )
+    _write_quarantine_evidence(jobs_dir, "bbbbbbbbbbbb")
+    before = (jobs_dir / "aaaaaaaaaaaa.json").read_bytes()
+
+    with (
+        mock.patch.object(service, "_stop_worker") as stop_worker,
+        pytest.raises(
+            HarnessError,
+            match="jobs quarantine list.*acknowledge each verified job",
+        ),
+    ):
+        service.nuke_jobs()
+
+    stop_worker.assert_not_called()
+    assert (jobs_dir / "aaaaaaaaaaaa.json").read_bytes() == before
+    assert not (jobs_dir / ".maintenance").exists()
 
 
 def test_nuke_jobs_deletes_all_and_reports(

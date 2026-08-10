@@ -28,6 +28,29 @@ agent status
 agent mcp list
 ```
 
+Job deletion reports unresolved quarantine evidence:
+
+```fish
+voice-harness jobs quarantine list
+voice-harness jobs quarantine list --all --json
+```
+
+The listing shows the quarantined payload and metadata paths plus any recorded
+worker identity, Herdr target, or worktree reservation. Verify those external
+resources no longer exist before releasing their fences. Then record what was
+checked and retry deletion:
+
+```fish
+voice-harness jobs quarantine acknowledge aaaaaaaaaaaa \
+  --reason "worker exited and no Herdr target or worktree remains"
+voice-harness jobs nuke
+```
+
+Acknowledgement requires typing `acknowledge` and writes a hash-bound resolution
+tombstone. It does not delete the quarantined payload or metadata. Do not
+acknowledge evidence merely to silence the warning: unresolved worker, agent,
+fork, or worktree operations must remain fenced until manually reconciled.
+
 Wrong llama.cpp GPU:
 
 ```bash
