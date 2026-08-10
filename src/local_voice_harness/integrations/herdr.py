@@ -855,6 +855,7 @@ class HerdrClient:
             "router",
             pane,
             workspace_id,
+            name="voice-router",
             checkpoint=checkpoint,
         )
 

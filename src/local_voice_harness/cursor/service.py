@@ -6,13 +6,27 @@ import re
 import time
 import uuid
 from collections.abc import Callable
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from typing import NamedTuple
+from typing import Literal, NamedTuple
 
-from ..config import CURSOR_FOREGROUND_SECONDS, JOB_LOGS_DIR, JOBS_DIR, LEGACY_JOBS_DIR
+from ..config import (
+    CURSOR_FOREGROUND_SECONDS,
+    JOB_LOGS_DIR,
+    JOBS_DIR,
+    LEGACY_JOBS_DIR,
+)
 from ..errors import HarnessError
+from ..integrations.github import (
+    GitHubClient,
+    GitHubError,
+    GitHubIssue,
+    format_issue_context,
+    github_issue_from_url,
+)
 from ..integrations.registry import (
     extract_issue_reference,
+    integration_enabled,
     require_issue_capabilities,
     resolve_issue_reference,
 )
@@ -23,6 +37,8 @@ from ..questions import (
     choices_prompt,
     resolve_answer,
 )
+from ..ticket_targets import TicketExtraction, TicketReference, extract_ticket_targets
+from ..user_config import load_user_config
 from . import delivery, inbox, provisioning, questions, recovery, worker_lifecycle
 from .delivery import DeliveryClaim, DeliveryClaims
 from .model import (
@@ -71,6 +87,7 @@ class StartJobRequest:
     utterance: str | None = None
     context_repository: str | None = None
     issue_key: str | None = None
+    foreground: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -87,6 +104,8 @@ class CursorTurnRequest:
     utterance: str | None = None
     context_repository: str | None = None
     issue_key: str | None = None
+    issue_scope: str | None = None
+    issue_scope_source: str | None = None
     action: str = "submit"
     job_id: str | None = None
     reference: str | None = None
@@ -101,6 +120,23 @@ class CursorTurnRequest:
 class CursorTurnResult(NamedTuple):
     text: str
     session_id: str | None
+
+
+TicketStartStatus = Literal["accepted", "rejected", "start-failed"]
+
+
+@dataclass(frozen=True, slots=True)
+class TicketJobRequest:
+    target: str
+    request: StartJobRequest
+
+
+@dataclass(frozen=True, slots=True)
+class TicketStartOutcome:
+    target: str
+    status: TicketStartStatus
+    job_id: str | None = None
+    detail: str | None = None
 
 
 def _job_store() -> JobStore:
@@ -200,6 +236,7 @@ def start_job(
     utterance: str | None = None,
     context_repository: str | None = None,
     issue_key: str | None = None,
+    foreground: bool = True,
 ) -> str:
     if isinstance(request, StartJobRequest):
         text = request.text
@@ -213,6 +250,7 @@ def start_job(
         utterance = request.utterance
         context_repository = request.context_repository
         issue_key = request.issue_key
+        foreground = request.foreground
     else:
         text = request
     job_id = uuid.uuid4().hex[:12]
@@ -238,6 +276,8 @@ def start_job(
             created_at=now,
             foreground_until=(
                 now + CURSOR_FOREGROUND_SECONDS + FOREGROUND_GRACE_SECONDS
+                if foreground
+                else 0
             ),
             utterance=utterance,
             trusted_utterance=spoken_text,
@@ -282,6 +322,241 @@ def start_job(
     _job_store().create(job)
     launch_worker(job_id)
     return job_id
+
+
+def _start_error_detail(error: BaseException) -> str:
+    detail = re.sub(r"\s+", " ", str(error) or type(error).__name__).strip()
+    return detail[:240]
+
+
+def start_jobs(
+    requests: tuple[TicketJobRequest, ...],
+    *,
+    concurrency: int | None = None,
+) -> tuple[TicketStartOutcome, ...]:
+    """Start ordinary durable jobs concurrently without foreground waiting."""
+    if not requests:
+        return ()
+    outcomes: list[TicketStartOutcome | None] = [None] * len(requests)
+
+    def start(request: TicketJobRequest) -> TicketStartOutcome:
+        try:
+            job_id = start_job(request.request)
+        except Exception as exc:  # noqa: BLE001 - every child needs an outcome
+            return TicketStartOutcome(
+                request.target,
+                "start-failed",
+                detail=_start_error_detail(exc),
+            )
+        try:
+            current = read_job(job_id)
+        except Exception:  # noqa: BLE001 - handoff succeeded; observation is optional
+            current = None
+        if current is not None and current.status == JobStatus.FAILED:
+            return TicketStartOutcome(
+                request.target,
+                "start-failed",
+                job_id=job_id,
+                detail=_start_error_detail(
+                    HarnessError(
+                        str(current.error or current.result or "worker failed")
+                    )
+                ),
+            )
+        return TicketStartOutcome(request.target, "accepted", job_id=job_id)
+
+    configured_concurrency = (
+        load_user_config().platform.agent_job_start_concurrency
+        if concurrency is None
+        else concurrency
+    )
+    with ThreadPoolExecutor(max_workers=max(1, configured_concurrency)) as executor:
+        futures = {
+            executor.submit(start, request): index
+            for index, request in enumerate(requests)
+        }
+        for future in as_completed(futures):
+            outcomes[futures[future]] = future.result()
+    return tuple(outcome for outcome in outcomes if outcome is not None)
+
+
+def _scoped_request_text(base: StartJobRequest, target: str, source: str) -> str:
+    provider = "GitHub issue" if source == "github" else "Linear issue"
+    original = (base.utterance or base.text).strip()
+    return (
+        f"Work only on {provider} {target}. Do not work on any other ticket "
+        "mentioned in the original request.\n\n"
+        f"Original user request: {original}"
+    )
+
+
+def _rejected(reference: TicketReference, detail: str) -> TicketStartOutcome:
+    return TicketStartOutcome(
+        reference.label,
+        "rejected",
+        detail=_start_error_detail(HarnessError(detail)),
+    )
+
+
+def _github_target(
+    reference: TicketReference,
+    base: StartJobRequest,
+    client: GitHubClient,
+    *,
+    foreground: bool,
+) -> TicketJobRequest | TicketStartOutcome:
+    assert reference.canonical is not None
+    repository, separator, number_text = reference.canonical.rpartition("#")
+    if not separator:
+        return _rejected(reference, "GitHub issue reference is invalid")
+    owner, repository_separator, name = repository.partition("/")
+    if not repository_separator:
+        return _rejected(reference, "GitHub issue reference is invalid")
+    issue = GitHubIssue(owner, name, int(number_text))
+    try:
+        details = client.issue_details(issue)
+    except GitHubError as exc:
+        return _rejected(reference, str(exc))
+
+    detail_number = details.get("number")
+    if isinstance(detail_number, int) and detail_number != issue.number:
+        return _rejected(reference, "GitHub returned a different issue number")
+    detail_url = str(details.get("url") or "").strip()
+    if detail_url:
+        canonical_issue = github_issue_from_url(detail_url)
+        if (
+            canonical_issue is None
+            or canonical_issue.number != issue.number
+            or canonical_issue.name_with_owner.casefold()
+            != issue.name_with_owner.casefold()
+        ):
+            return _rejected(reference, "GitHub returned a different issue identity")
+        issue = canonical_issue
+
+    target = issue.reference
+    return TicketJobRequest(
+        target,
+        StartJobRequest(
+            text=_scoped_request_text(base, target, "github"),
+            repository=base.repository,
+            github_repository=issue.name_with_owner,
+            github_issue=issue.number,
+            github_issue_context=format_issue_context(issue, details),
+            agent=base.agent,
+            utterance=f"Work only on GitHub issue {target}.",
+            context_repository=issue.name_with_owner,
+            foreground=foreground,
+        ),
+    )
+
+
+def _linear_target(
+    reference: TicketReference,
+    base: StartJobRequest,
+    *,
+    foreground: bool,
+) -> TicketJobRequest | TicketStartOutcome:
+    canonical = resolve_issue_reference(reference.canonical)
+    if canonical is None:
+        return _rejected(
+            reference,
+            "Linear integration is disabled or the issue key is invalid",
+        )
+    return TicketJobRequest(
+        canonical,
+        StartJobRequest(
+            text=_scoped_request_text(base, canonical, "linear"),
+            repository=base.repository,
+            agent=base.agent,
+            utterance=f"Work only on Linear issue {canonical}.",
+            context_repository=base.context_repository,
+            issue_key=canonical,
+            foreground=foreground,
+        ),
+    )
+
+
+def _preflight_ticket_targets(
+    extraction: TicketExtraction,
+    base: StartJobRequest,
+    *,
+    foreground: bool,
+) -> tuple[
+    list[TicketStartOutcome | None],
+    list[tuple[int, TicketJobRequest]],
+]:
+    """Validate every unique reference before returning any startable child."""
+    slots: list[TicketStartOutcome | None] = [None] * len(extraction.references)
+    prepared: list[tuple[int, TicketJobRequest]] = []
+    github_client = GitHubClient()
+    github_available = integration_enabled("github")
+    linear_capability_error: str | None = None
+    linear_capability_checked = False
+
+    for index, reference in enumerate(extraction.references):
+        if reference.error is not None:
+            slots[index] = _rejected(reference, reference.error)
+            continue
+        if reference.canonical is None or reference.source is None:
+            slots[index] = _rejected(reference, "ticket reference is invalid")
+            continue
+        if reference.source == "github":
+            candidate: TicketJobRequest | TicketStartOutcome
+            candidate = (
+                _github_target(
+                    reference,
+                    base,
+                    github_client,
+                    foreground=foreground,
+                )
+                if github_available
+                else _rejected(reference, "GitHub integration is disabled")
+            )
+        else:
+            if not linear_capability_checked:
+                try:
+                    require_issue_capabilities(reference.canonical)
+                except HarnessError as exc:
+                    linear_capability_error = str(exc)
+                linear_capability_checked = True
+            candidate = (
+                _rejected(reference, linear_capability_error)
+                if linear_capability_error is not None
+                else _linear_target(reference, base, foreground=foreground)
+            )
+        if isinstance(candidate, TicketStartOutcome):
+            slots[index] = candidate
+        else:
+            prepared.append((index, candidate))
+    return slots, prepared
+
+
+def _ticket_start_summary(outcomes: tuple[TicketStartOutcome, ...]) -> str:
+    parts: list[str] = []
+    for outcome in outcomes:
+        if outcome.status == "accepted":
+            parts.append(f"{outcome.target}: accepted as job {outcome.job_id}")
+        else:
+            detail = f" ({outcome.detail})" if outcome.detail else ""
+            parts.append(f"{outcome.target}: {outcome.status}{detail}")
+    return "Ticket starts: " + "; ".join(parts) + "."
+
+
+def _submit_extracted_targets(
+    extraction: TicketExtraction,
+    base: StartJobRequest,
+    *,
+    foreground: bool,
+) -> tuple[TicketStartOutcome, ...]:
+    slots, prepared = _preflight_ticket_targets(
+        extraction,
+        base,
+        foreground=foreground,
+    )
+    started = start_jobs(tuple(request for _index, request in prepared))
+    for (index, _request), outcome in zip(prepared, started, strict=True):
+        slots[index] = outcome
+    return tuple(outcome for outcome in slots if outcome is not None)
 
 
 def reply_job(
@@ -974,6 +1249,8 @@ def cursor_turn(
     utterance: str | None = None,
     context_repository: str | None = None,
     issue_key: str | None = None,
+    issue_scope: str | None = None,
+    issue_scope_source: str | None = None,
     action: str = "submit",
     job_id: str | None = None,
     reference: str | None = None,
@@ -997,6 +1274,8 @@ def cursor_turn(
         utterance = request.utterance
         context_repository = request.context_repository
         issue_key = request.issue_key
+        issue_scope = request.issue_scope
+        issue_scope_source = request.issue_scope_source
         action = request.action
         job_id = request.job_id
         reference = request.reference
@@ -1112,6 +1391,46 @@ def cursor_turn(
                 "I can no longer follow up on that Cursor job.", None
             )
     else:
+        extraction = extract_ticket_targets(
+            utterance or text,
+            scope_source=issue_scope_source,
+            scope=issue_scope,
+        )
+        use_extracted_targets = extraction.batch_requested or bool(
+            issue_scope
+            and extraction.requested_count == 1
+            and extraction.references
+            and extraction.references[0].scoped
+        )
+        if use_extracted_targets:
+            base = StartJobRequest(
+                text=text,
+                repository=repository,
+                github_repository=github_repository,
+                github_issue=github_issue,
+                github_issue_context=github_issue_context,
+                fork_requested=fork_requested,
+                github_pull_request=github_pull_request,
+                agent=agent,
+                utterance=utterance,
+                context_repository=context_repository,
+                issue_key=issue_key,
+                foreground=not extraction.batch_requested,
+            )
+            outcomes = _submit_extracted_targets(
+                extraction,
+                base,
+                foreground=not extraction.batch_requested,
+            )
+            accepted = tuple(
+                outcome for outcome in outcomes if outcome.status == "accepted"
+            )
+            if accepted and on_job_started is not None:
+                on_job_started()
+            if extraction.batch_requested or not accepted:
+                return CursorTurnResult(_ticket_start_summary(outcomes), None)
+            assert len(accepted) == 1 and accepted[0].job_id is not None
+            return _await_foreground(accepted[0].job_id, delivery_claims)
         job_id = start_job(
             text,
             repository=repository,

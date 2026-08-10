@@ -57,6 +57,7 @@ focused_app_context = true
 cursor_followup = true
 cursor_agent_inactivity_seconds = 900
 cursor_agent_max_runtime_seconds = 3600
+agent_job_start_concurrency = 3
 ```
 
 GitHub is enabled by default for compatibility. Setting `github = false` prevents
@@ -134,6 +135,7 @@ credential.
 | `VOICE_HARNESS_CURSOR_FOREGROUND_SECONDS` | Non-negative time before a Cursor job backgrounds | `5` | Wake drop-in |
 | `VOICE_HARNESS_CURSOR_AGENT_INACTIVITY_SECONDS` | Positive time without observable Cursor progress before cancellation | `900` | Wake drop-in |
 | `VOICE_HARNESS_CURSOR_AGENT_MAX_RUNTIME_SECONDS` | Positive absolute runtime limit for one Cursor turn | `3600` | Wake drop-in |
+| `VOICE_HARNESS_AGENT_JOB_START_CONCURRENCY` | Positive maximum number of concurrent durable job starts in a multi-ticket request | `3` | Wake drop-in |
 | `VOICE_HARNESS_CURSOR_FOLLOWUP` | Enable completed-job follow-up context (kill switch) | `1` | Wake drop-in |
 | `VOICE_HARNESS_CURSOR_FOLLOWUP_WINDOW_SECONDS` | Finite, non-negative absolute lifetime of the retained completed-job reference | `60` | Wake drop-in |
 | `VOICE_HARNESS_HERDR_BIN` | Absolute Herdr executable path | `~/.local/bin/herdr` | Wake drop-in |
@@ -174,6 +176,16 @@ never survives a restart. Awaiting-clarification replies always take precedence,
 and opening a pull request remains unsupported. Set
 `VOICE_HARNESS_CURSOR_FOLLOWUP=0` to disable the feature entirely without affecting
 clarification replies or fresh submissions.
+
+An explicit multi-ticket request starts one ordinary durable job per unique,
+validated target. Bare GitHub numbers require a focused repository issue-list page;
+bare Linear numbers require a focused Linear team page. Full GitHub references and
+full Linear keys need no browser scope. All unique targets are preflighted before
+any starts, then valid jobs start with at most
+`VOICE_HARNESS_AGENT_JOB_START_CONCURRENCY` concurrent admissions. The response
+reports each target as accepted, rejected, or start-failed in request order.
+Fan-out is best-effort and intentionally not crash-atomic: one child can fail after
+another has started, and there is no durable batch record to roll children back.
 
 Intent routing uses the configured LLM provider and endpoint, including Venice when
 selected. The router is authoritative for workspace mutations: conversation fallback

@@ -33,6 +33,7 @@ class ContextFragment:
     repository_reference: str | None = None
     issue_number: int | None = None
     pull_request_number: int | None = None
+    issue_scope: str | None = None
 
     def __str__(self) -> str:
         return self.text

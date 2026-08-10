@@ -76,6 +76,28 @@ WORKFLOW_PLAN[token]: <bounded multiline implementation plan>
             live = client.live_agents()
         self.assertEqual([agent["pane_id"] for agent in live], ["w1:p1"])
 
+    def test_router_uses_stable_single_owner_name(self) -> None:
+        client = herdr.HerdrClient("herdr")
+        selection = mock.Mock()
+        with (
+            mock.patch.object(client, "find_agent", return_value=None),
+            mock.patch.object(client, "list_workspaces", return_value=[]),
+            mock.patch.object(client, "new_pane", return_value=("pane", "workspace")),
+            mock.patch.object(
+                client, "start_agent", return_value=selection
+            ) as start_agent,
+        ):
+            self.assertIs(client.ensure_router(set()), selection)
+
+        start_agent.assert_called_once_with(
+            herdr.HOME_ROOT,
+            "router",
+            "pane",
+            "workspace",
+            name="voice-router",
+            checkpoint=None,
+        )
+
     def test_existing_detected_agent_avoids_new_tab(self) -> None:
         client = herdr.HerdrClient("herdr")
         repository = Path("/repo")

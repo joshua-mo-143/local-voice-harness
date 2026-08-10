@@ -25,6 +25,9 @@ ISSUE_PATH = re.compile(
     r"^/(?P<owner>[A-Za-z0-9_.-]+)/(?P<repo>[A-Za-z0-9_.-]+)/issues/"
     r"(?P<number>[1-9]\d*)/?$"
 )
+ISSUES_PATH = re.compile(
+    r"^/(?P<owner>[A-Za-z0-9_.-]+)/(?P<repo>[A-Za-z0-9_.-]+)/issues/?$"
+)
 ISSUE_REFERENCE = re.compile(
     r"(?<![A-Za-z0-9_.-])"
     r"(?P<owner>[A-Za-z0-9](?:[A-Za-z0-9-]{0,38}))/"
@@ -806,6 +809,17 @@ def github_repository_from_url(url: str) -> str | None:
     return _validated_repository(match.group("owner"), match.group("repo"))
 
 
+def github_issues_repository_from_url(url: str) -> str | None:
+    """Return the repository only for an exact repository issue-list page."""
+    parsed = _split_url(url)
+    if not _github_url(url) or parsed is None:
+        return None
+    match = ISSUES_PATH.fullmatch(parsed.path)
+    if match is None:
+        return None
+    return _validated_repository(match.group("owner"), match.group("repo"))
+
+
 def github_pull_request_from_url(url: str) -> GitHubPullRequest | None:
     parsed = _split_url(url)
     if not _github_url(url) or parsed is None:
@@ -900,6 +914,11 @@ def _format_issue(url: str, issue: GitHubIssue, details: dict[str, object]) -> s
         lines.extend(("Body:", body))
     lines.extend(_comment_lines(details))
     return "\n".join(lines)
+
+
+def format_issue_context(issue: GitHubIssue, details: dict[str, object]) -> str:
+    """Render validated issue details as bounded, untrusted external context."""
+    return _format_issue(issue.url, issue, details)
 
 
 def _format_pull_request(
@@ -1028,6 +1047,11 @@ class GitHubProvider:
             source=self.name,
             text=text,
             repository_reference=_canonical_repository(repository, details),
+            issue_scope=(
+                _canonical_repository(repository, details)
+                if github_issues_repository_from_url(url) is not None
+                else None
+            ),
         )
 
     def capture(self, url: str) -> ContextFragment | None:

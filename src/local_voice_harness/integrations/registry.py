@@ -37,6 +37,17 @@ def enabled_integrations(
     )
 
 
+def integration_enabled(
+    name: str,
+    integrations: IntegrationSettings | None = None,
+) -> bool:
+    expected = name.strip().casefold()
+    return any(
+        str(getattr(integration, "name", "")).casefold() == expected
+        for integration in enabled_integrations(integrations)
+    )
+
+
 def available_context_providers(
     integrations: IntegrationSettings | None = None,
 ) -> tuple[ContextProvider, ...]:

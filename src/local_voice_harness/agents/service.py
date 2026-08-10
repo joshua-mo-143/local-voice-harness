@@ -4,6 +4,8 @@ from ..cursor.service import (
     CursorTurnRequest,
     CursorTurnResult,
     StartJobRequest,
+    TicketJobRequest,
+    TicketStartOutcome,
     acknowledge_deliveries,
     acknowledge_delivery,
     cancel_job,
@@ -24,6 +26,7 @@ from ..cursor.service import (
     resolve_manual_reconciliation,
     start_follow_up,
     start_job,
+    start_jobs,
 )
 
 AgentTurnRequest = CursorTurnRequest
@@ -35,6 +38,8 @@ __all__ = [
     "AgentTurnRequest",
     "AgentTurnResult",
     "StartAgentJobRequest",
+    "TicketJobRequest",
+    "TicketStartOutcome",
     "acknowledge_deliveries",
     "acknowledge_delivery",
     "agent_turn",
@@ -55,4 +60,5 @@ __all__ = [
     "resolve_manual_reconciliation",
     "start_follow_up",
     "start_job",
+    "start_jobs",
 ]

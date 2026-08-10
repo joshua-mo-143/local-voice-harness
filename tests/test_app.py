@@ -350,6 +350,45 @@ class AppContextTests(unittest.TestCase):
             delivery_claims=mock.ANY,
         )
 
+    def test_issue_list_scope_reaches_cursor_submission(self) -> None:
+        context = RequestContext(
+            "work on issues 12 and 18\n\nRepository context",
+            focused_repository="source/project",
+            github_repository="source/project",
+            issue_scope="source/project",
+            issue_scope_source="github",
+        )
+        with (
+            mock.patch.object(app, "start_components"),
+            mock.patch.object(app, "request_context", return_value=context),
+            mock.patch.object(
+                app,
+                "route_intent",
+                return_value=IntentRoute(Intent.CURSOR_SUBMIT, "high"),
+            ),
+            mock.patch.object(
+                app, "cursor_turn", return_value=("started", None)
+            ) as cursor,
+            mock.patch.object(app, "stream_and_play"),
+        ):
+            app.respond("work on issues 12 and 18")
+
+        cursor.assert_called_once_with(
+            CursorTurnRequest(
+                context.text,
+                utterance="work on issues 12 and 18",
+                context_repository="source/project",
+                issue_scope="source/project",
+                issue_scope_source="github",
+                github_repository="source/project",
+                github_issue=None,
+                github_issue_context=None,
+                fork_requested=False,
+                github_pull_request=None,
+            ),
+            delivery_claims=mock.ANY,
+        )
+
     def test_focused_linear_issue_submits_despite_low_confidence(self) -> None:
         context = RequestContext(
             "work on this ticket\n\nIdentifier (untrusted external identifier): ENG-123",

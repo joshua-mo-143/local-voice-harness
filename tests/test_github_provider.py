@@ -62,6 +62,21 @@ class GitHubUrlTests(unittest.TestCase):
             github.github_repository_from_url("https://github.com/example/..")
         )
 
+    def test_extracts_scope_only_from_repository_issue_list(self) -> None:
+        self.assertEqual(
+            github.github_issues_repository_from_url(
+                "https://github.com/example/project/issues?q=is%3Aopen"
+            ),
+            "example/project",
+        )
+        for url in (
+            "https://github.com/example/project",
+            "https://github.com/example/project/issues/42",
+            "https://github.com/example/project/pulls",
+        ):
+            with self.subTest(url=url):
+                self.assertIsNone(github.github_issues_repository_from_url(url))
+
     def test_extracts_canonical_pull_request_url(self) -> None:
         pull_request = github.github_pull_request_from_url(
             "https://github.com/example/project/pull/42/files?diff=split"
@@ -210,6 +225,35 @@ class GitHubProviderTests(unittest.TestCase):
         assert fragment is not None
         self.assertEqual(fragment.repository_reference, "example/project")
         self.assertIn("Repository details could not be fetched", fragment.text)
+
+    def test_issue_list_capture_adds_repository_scope_without_scraping(self) -> None:
+        self.client.repository_context_details.return_value = {
+            "nameWithOwner": "Example/Project",
+            "isPrivate": False,
+        }
+
+        fragment = self.provider.capture(
+            "https://github.com/example/project/issues?q=is%3Aopen"
+        )
+
+        self.assertIsNotNone(fragment)
+        assert fragment is not None
+        self.assertEqual(fragment.repository_reference, "Example/Project")
+        self.assertEqual(fragment.issue_scope, "Example/Project")
+        self.assertIsNone(fragment.issue_number)
+        self.assertNotIn("Issue: #", fragment.text)
+
+    def test_non_issue_repository_subpage_has_no_issue_scope(self) -> None:
+        self.client.repository_context_details.return_value = {
+            "nameWithOwner": "example/project",
+            "isPrivate": False,
+        }
+
+        fragment = self.provider.capture("https://github.com/example/project/pulls")
+
+        self.assertIsNotNone(fragment)
+        assert fragment is not None
+        self.assertIsNone(fragment.issue_scope)
 
     def test_pull_request_capture_returns_structured_metadata(self) -> None:
         url = "https://github.com/example/project/pull/7"

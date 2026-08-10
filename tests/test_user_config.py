@@ -39,6 +39,7 @@ class UserConfigDefaultsTests(unittest.TestCase):
         )
         self.assertEqual(config.platform.cursor_agent_inactivity_seconds, 900)
         self.assertEqual(config.platform.cursor_agent_max_runtime_seconds, 3600)
+        self.assertEqual(config.platform.agent_job_start_concurrency, 3)
 
     def test_config_path_lives_under_xdg_config_home(self) -> None:
         path = user_config.user_config_path({"XDG_CONFIG_HOME": "/cfg"}, home=self.HOME)
@@ -149,6 +150,7 @@ class UserConfigPrecedenceTests(unittest.TestCase):
                 {
                     "VOICE_HARNESS_CURSOR_AGENT_INACTIVITY_SECONDS": "120",
                     "VOICE_HARNESS_CURSOR_AGENT_MAX_RUNTIME_SECONDS": "600",
+                    "VOICE_HARNESS_AGENT_JOB_START_CONCURRENCY": "5",
                 },
                 path=root / "config.toml",
                 backends_path=root / "backends.toml",
@@ -157,6 +159,7 @@ class UserConfigPrecedenceTests(unittest.TestCase):
 
         self.assertEqual(config.platform.cursor_agent_inactivity_seconds, 120)
         self.assertEqual(config.platform.cursor_agent_max_runtime_seconds, 600)
+        self.assertEqual(config.platform.agent_job_start_concurrency, 5)
 
 
 class UserConfigValidationTests(unittest.TestCase):
@@ -213,6 +216,10 @@ class UserConfigValidationTests(unittest.TestCase):
     def test_non_positive_cursor_watchdog_is_rejected(self) -> None:
         with self.assertRaisesRegex(UserConfigurationError, "positive number"):
             self._load("[platform]\ncursor_agent_inactivity_seconds = 0\n")
+
+    def test_non_positive_agent_job_start_concurrency_is_rejected(self) -> None:
+        with self.assertRaisesRegex(UserConfigurationError, "positive integer"):
+            self._load("[platform]\nagent_job_start_concurrency = 0\n")
 
     def test_file_based_credentials_are_rejected(self) -> None:
         with self.assertRaisesRegex(UserConfigurationError, "credentials set"):

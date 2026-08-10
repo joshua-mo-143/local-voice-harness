@@ -31,6 +31,8 @@ class RequestContext:
     github_pull_request: int | None = None
     external_issue_reference: str | None = None
     external_issue_source: str | None = None
+    issue_scope: str | None = None
+    issue_scope_source: str | None = None
     focused_app_class: str | None = None
     focused_app_context: str | None = None
     focused_app_sources: tuple[str, ...] = ()
@@ -161,6 +163,8 @@ def request_context(text: str) -> RequestContext:
     external_issue_source = (
         context.source if external_issue_reference is not None and context else None
     )
+    issue_scope = context.issue_scope if context is not None else None
+    issue_scope_source = context.source if issue_scope is not None and context else None
 
     parts = [text]
     if context is not None:
@@ -177,6 +181,8 @@ def request_context(text: str) -> RequestContext:
         github_pull_request=github_pull_request,
         external_issue_reference=external_issue_reference,
         external_issue_source=external_issue_source,
+        issue_scope=issue_scope,
+        issue_scope_source=issue_scope_source,
         focused_app_class=app_context.app_class if app_context is not None else None,
         focused_app_context=app_context.text if app_context is not None else None,
         focused_app_sources=(app_context.sources if app_context is not None else ()),
