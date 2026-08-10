@@ -43,6 +43,11 @@ from .service_manager import (
     status as service_status,
 )
 from .stt.client import transcribe
+from .user_config import (
+    PlanApprovalMode,
+    load_plan_approval_preferences,
+    set_plan_approval_mode,
+)
 from .vocabulary import (
     add_alias,
     add_replacement,
@@ -74,6 +79,15 @@ def parser() -> argparse.ArgumentParser:
     text = commands.add_parser("text")
     text.add_argument("text", nargs="+")
     commands.add_parser("status")
+    plan_approval = commands.add_parser(
+        "plan-approval",
+        help="inspect or disable automatic Cursor plan approval",
+    )
+    plan_approval.add_argument(
+        "plan_approval_command",
+        choices=("status", "ask"),
+        help="show the current mode or require explicit approval",
+    )
 
     jobs = commands.add_parser("jobs", help="manage background Cursor jobs")
     job_commands = jobs.add_subparsers(dest="jobs_command", required=True)
@@ -408,6 +422,16 @@ def dispatch(args: argparse.Namespace) -> None:
         respond(" ".join(args.text))
     elif args.command == "status":
         status()
+    elif args.command == "plan-approval":
+        preferences = (
+            set_plan_approval_mode(PlanApprovalMode.ASK)
+            if args.plan_approval_command == "ask"
+            else load_plan_approval_preferences()
+        )
+        print(
+            f"Cursor plan approval: {preferences.mode.value} "
+            f"({preferences.explicit_approval_count}/3 explicit approvals)"
+        )
     elif args.command == "jobs":
         run_job_command(args)
     elif args.command == "doctor":

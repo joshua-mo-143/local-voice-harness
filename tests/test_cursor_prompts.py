@@ -5,6 +5,7 @@ import unittest
 from local_voice_harness.cursor.prompts import (
     classification_prompt,
     cursor_prompt,
+    plan_approval_prompt,
     planning_prompt,
     review_prompt,
     revision_prompt,
@@ -91,6 +92,20 @@ class CursorPromptTests(unittest.TestCase):
         self.assertIn("WORKFLOW_REVIEW_DECISION[turn]", prompt)
         self.assertIn("Issue requires crash recovery.", prompt)
         self.assertIn("Persistence changes force high-risk.", prompt)
+
+    def test_plan_approval_prompt_approves_gate_and_binds_completion_token(
+        self,
+    ) -> None:
+        prompt = plan_approval_prompt(
+            "change storage",
+            "turn",
+            plan="Preserve atomic replacement.",
+        )
+
+        self.assertTrue(prompt.startswith("lgtm. Implement the approved plan."))
+        self.assertIn("Implement only from this approved plan", prompt)
+        self.assertIn("VOICE_SUMMARY[turn]", prompt)
+        self.assertIn("WORKFLOW_PROMOTE[turn]", prompt)
 
     def test_linear_instructions_are_only_added_as_a_contribution(self) -> None:
         without = cursor_prompt("fix API-98", "token", issue_reference="API-98")

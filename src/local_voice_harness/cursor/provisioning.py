@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import re
 import time
 import uuid
 from collections.abc import Callable, Mapping, Set
@@ -19,6 +21,7 @@ from ..integrations.herdr import (
     AgentSelection,
     HerdrClient,
     HerdrError,
+    agent_session_identity,
     extract_marker,
     normalize_name,
 )
@@ -35,6 +38,13 @@ from ..questions import (
     QuestionSpec,
     QuestionState,
     parse_question_spec,
+)
+from ..user_config import (
+    PlanApprovalMode,
+    PlanApprovalPreferences,
+    UserConfigurationError,
+    load_plan_approval_preferences,
+    record_explicit_plan_approval,
 )
 from . import questions as question_adapter
 from . import recovery, worker_lifecycle
@@ -59,6 +69,7 @@ from .model import (
 from .prompts import (
     classification_prompt,
     implementation_prompt,
+    plan_approval_prompt,
     planning_prompt,
     review_prompt,
     revision_prompt,
@@ -210,6 +221,7 @@ def read_agent_completion(
     *,
     wait: bool,
     checkpoint: Callable[[], None] | None = None,
+    active_marker: str | None = None,
 ) -> tuple[str, str]:
     target = job.herdr_target or ""
     if not target:
@@ -230,6 +242,7 @@ def read_agent_completion(
         target,
         token=job.turn_token or "",
         checkpoint=checkpoint,
+        active_marker=active_marker,
     )
     return outcome.output, outcome.status
 
@@ -260,6 +273,7 @@ def _worker_question(
     question: str,
     *,
     clarification_kind: str,
+    job_changes: Mapping[str, object] | None = None,
 ) -> None:
     def ask(job: CursorJob) -> CursorJob:
         now = time.time()
@@ -274,9 +288,83 @@ def _worker_question(
             now=now,
             clear_worker=True,
             remove_reconcile=True,
+            job_changes=job_changes,
         )
 
     _worker_change(store, job_id, token, {JobStatus.ROUTING, JobStatus.RUNNING}, ask)
+
+
+def _completion_preferences(
+    job: CursorJob,
+) -> tuple[PlanApprovalPreferences | None, bool]:
+    approval_id = job.plan_approval_id
+    if job.plan_approval_source != "explicit" or approval_id is None:
+        return None, False
+    try:
+        preferences = (
+            load_plan_approval_preferences()
+            if job.plan_approval_counted
+            else record_explicit_plan_approval(approval_id)
+        )
+    except (OSError, UserConfigurationError):
+        return None, True
+    return preferences, False
+
+
+def _finish_completed_workflow(
+    job: CursorJob,
+    *,
+    preferences: PlanApprovalPreferences | None,
+    result: str,
+    voice_question: dict[str, object] | None,
+    now: float,
+) -> CursorJob:
+    approval_id = job.plan_approval_id
+    counted = job.plan_approval_counted or bool(
+        approval_id
+        and preferences is not None
+        and approval_id in preferences.explicit_approval_ids
+    )
+    completion_changes: Mapping[str, object] = {
+        "result": result,
+        "workflow_phase": WorkflowPhase.FINISHED.value,
+        "active_participant": None,
+        "prompt_operation_state": "none",
+        "plan_approval_counted": counted,
+        "plan_approval_completion_pending": False,
+    }
+    if (
+        counted
+        and job.plan_approval_source == "explicit"
+        and preferences is not None
+        and approval_id == preferences.offer_pending_id
+    ):
+        return question_adapter.ask(
+            job,
+            QuestionSpec(
+                f"{result or 'Cursor implementation completed.'} "
+                "You've explicitly approved three reviewed Cursor plans. "
+                "Would you like me to automatically approve ordinary "
+                "reviewed plans from now on? Say yes to enable automatic "
+                "plan approval, or no to keep asking.",
+                sensitivity=QuestionSensitivity.ARCHITECTURE,
+            ),
+            owner="workflow_plan_auto_offer",
+            turn_token=job.turn_token or f"{job.id}-approval-offer",
+            now=now,
+            clear_worker=True,
+            remove_reconcile=True,
+            prompt_operation_state="none",
+            job_changes=completion_changes,
+        )
+    return recovery.stage_terminal_intent(
+        job,
+        JobStatus.COMPLETED,
+        now=now,
+        result=result,
+        voice_question=voice_question,
+        job_changes=completion_changes,
+    )
 
 
 def _worker_complete(
@@ -288,6 +376,15 @@ def _worker_complete(
     agent_status: str,
     preserve_blocked_delivery: bool = False,
 ) -> None:
+    snapshot = store.get(job_id)
+    if (
+        snapshot.worker_token != token
+        or snapshot.status not in {JobStatus.RUNNING, JobStatus.RECONCILING}
+        or snapshot.terminal_intent_status is not None
+    ):
+        return
+    preferences, preference_update_failed = _completion_preferences(snapshot)
+
     def finish(job: CursorJob) -> CursorJob:
         now = time.time()
         outcome = complete_from_output(
@@ -298,12 +395,28 @@ def _worker_complete(
             outcome.status == JobStatus.COMPLETED and job.workflow_tier is not None
         )
         if outcome.status == JobStatus.COMPLETED:
-            return recovery.stage_terminal_intent(
+            if preference_update_failed and job.plan_approval_source == "explicit":
+                return job.evolve(
+                    status=JobStatus.QUEUED,
+                    reconcile=True,
+                    queued_at=now,
+                    result=outcome.result or "Cursor implementation completed.",
+                    voice_question=outcome.voice_question,
+                    workflow_phase=WorkflowPhase.FINISHED.value,
+                    active_participant=None,
+                    prompt_operation_state="none",
+                    plan_approval_completion_pending=True,
+                    worker_pid=None,
+                    worker_boot_id=None,
+                    worker_process_start=None,
+                    worker_token=None,
+                )
+            return _finish_completed_workflow(
                 job,
-                JobStatus.COMPLETED,
-                now=now,
+                preferences=preferences,
                 result=outcome.result or "",
                 voice_question=outcome.voice_question,
+                now=now,
             )
         return job.evolve(
             status=outcome.status,
@@ -364,6 +477,55 @@ def _worker_complete(
         job_id,
         token,
         {JobStatus.RUNNING, JobStatus.RECONCILING},
+        finish,
+    )
+
+
+def _resume_plan_approval_completion(
+    store: JobStore,
+    job: CursorJob,
+    worker_token: str,
+) -> None:
+    if (
+        job.worker_token != worker_token
+        or job.status not in MODEL_WORKER_STATUSES
+        or job.terminal_intent_status is not None
+    ):
+        return
+    preferences, preference_update_failed = _completion_preferences(job)
+    if preference_update_failed:
+        _worker_change(
+            store,
+            job.id,
+            worker_token,
+            MODEL_WORKER_STATUSES,
+            lambda current: current.evolve(
+                status=JobStatus.QUEUED,
+                queued_at=time.time(),
+                worker_pid=None,
+                worker_boot_id=None,
+                worker_process_start=None,
+                worker_token=None,
+            ),
+        )
+        return
+
+    def finish(current: CursorJob) -> CursorJob:
+        if not current.plan_approval_completion_pending:
+            raise WorkerCancelled
+        return _finish_completed_workflow(
+            current,
+            preferences=preferences,
+            result=current.result or "Cursor implementation completed.",
+            voice_question=current.voice_question,
+            now=time.time(),
+        )
+
+    _worker_change(
+        store,
+        job.id,
+        worker_token,
+        MODEL_WORKER_STATUSES,
         finish,
     )
 
@@ -1070,6 +1232,14 @@ _HARD_RISK_TERMS = (
     "unclear acceptance",
 )
 _MAX_RISK_EVIDENCE_BYTES = 16 * 1024
+_NEGATED_REVIEW_RISK = re.compile(
+    r"\b(?:no|without)\s+(?:known\s+)?"
+    r"(?:[a-z-]+\s+){0,6}(?:concerns?|risks?|issues?)\b"
+    r"|\b(?:does|did)\s+not\s+(?:raise|introduce|create)\s+"
+    r"(?:[a-z-]+\s+){0,6}(?:concerns?|risks?|issues?)\b"
+    r"|\b(?:[a-z-]+\s+){1,4}(?:is|are)\s+not\s+"
+    r"(?:a\s+)?(?:concern|risk|issue)\b"
+)
 
 
 def _bounded_risk_text(value: str | None) -> str:
@@ -1082,13 +1252,20 @@ def _hard_risk_evidence(
     request: str,
     reason: str,
     github_issue_context: str | None = None,
+    *,
+    plan: str | None = None,
+    review: str | None = None,
 ) -> str | None:
     for source, value in (
         ("request", request),
         ("GitHub issue context", github_issue_context),
         ("classification or promotion reason", reason),
+        ("approved plan", plan),
+        ("review", review),
     ):
         evidence = _bounded_risk_text(value)
+        if source == "review":
+            evidence = _NEGATED_REVIEW_RISK.sub("", evidence)
         for term in _HARD_RISK_TERMS:
             if term in evidence:
                 return f"{source} contains {term!r}"
@@ -1111,6 +1288,40 @@ def _classified_tier(
     return tier
 
 
+def _auto_plan_approval_allowed(
+    job: CursorJob,
+    *,
+    plan: str,
+    review: str,
+    reviewer_approved: bool | None = None,
+) -> bool:
+    """Fail closed unless this is only the reviewed Plan Mode Build gate."""
+
+    approved = (
+        job.review_approved and job.review_decision == "approve"
+        if reviewer_approved is None
+        else reviewer_approved
+    )
+    if (
+        job.plan_approval_state != "boundary"
+        or not approved
+        or job.workflow_tier not in {WorkflowTier.SIMPLE, WorkflowTier.MEDIUM}
+    ):
+        return False
+    if _hard_risk_evidence(
+        job.request,
+        job.workflow_classification_reason or "",
+        job.github_issue_context,
+        plan=plan,
+        review=review,
+    ):
+        return False
+    try:
+        return load_plan_approval_preferences().mode == PlanApprovalMode.AUTO
+    except (OSError, UserConfigurationError):
+        return False
+
+
 def _workflow_question(
     store: JobStore,
     job_id: str,
@@ -1118,11 +1329,23 @@ def _workflow_question(
     question: str,
     *,
     clarification_kind: str = "workflow",
+    job_changes: Mapping[str, object] | None = None,
+    sensitivity: QuestionSensitivity = QuestionSensitivity.ROUTINE,
 ) -> None:
     try:
         spec = parse_question_spec(question)
     except QuestionError:
-        spec = QuestionSpec(question, sensitivity=QuestionSensitivity.ROUTINE)
+        spec = QuestionSpec(question, sensitivity=sensitivity)
+    if (
+        sensitivity != QuestionSensitivity.ROUTINE
+        and spec.sensitivity == QuestionSensitivity.UNSPECIFIED
+    ):
+        spec = QuestionSpec(
+            spec.text,
+            kind=spec.kind,
+            choices=spec.choices,
+            sensitivity=sensitivity,
+        )
 
     def ask(job: CursorJob) -> CursorJob:
         now = time.time()
@@ -1135,6 +1358,7 @@ def _workflow_question(
             clear_worker=True,
             remove_reconcile=True,
             prompt_operation_state="none",
+            job_changes=job_changes,
         )
         return asked
 
@@ -1177,6 +1401,73 @@ def _begin_phase_turn(
         )
 
     return _worker_change(store, job_id, worker_token, MODEL_WORKER_STATUSES, begin)
+
+
+def _record_plan_boundary(
+    store: JobStore,
+    job: CursorJob,
+    worker_token: str,
+    output: str,
+    *,
+    agent_status: str,
+    agent_session: str | None,
+    state_change_sequence: int | None,
+    revision: int | None,
+) -> CursorJob:
+    token = job.turn_token or ""
+    plan = extract_marker(output, "WORKFLOW_PLAN", token)
+    if not plan:
+        return job
+    if agent_status not in {"idle", "done", "working", "blocked"}:
+        raise HarnessError("Cursor Plan Mode boundary has an unsupported agent state")
+    if agent_session is None or state_change_sequence is None:
+        raise HarnessError(
+            "Cursor Plan Mode boundary is missing durable Herdr session proof"
+        )
+    gate_material = (
+        f"{job.id}\0{job.review_round}\0{token}\0{agent_session}\0"
+        f"{state_change_sequence}\0{plan}"
+    )
+    gate_id = hashlib.sha256(gate_material.encode()).hexdigest()
+
+    def record(current: CursorJob) -> CursorJob:
+        if (
+            current.workflow_phase != job.workflow_phase
+            or current.turn_token != token
+            or current.plan_approval_state not in {"none", "boundary"}
+        ):
+            raise WorkerCancelled
+        return current.evolve(
+            plan_approval_state="boundary",
+            plan_approval_id=gate_id,
+            plan_approval_source=None,
+            plan_approval_agent_session=agent_session,
+            plan_approval_state_change_sequence=state_change_sequence,
+            plan_approval_revision=revision,
+            plan_approval_counted=False,
+        )
+
+    recorded = _worker_change(
+        store,
+        job.id,
+        worker_token,
+        MODEL_WORKER_STATUSES,
+        record,
+    )
+    if recorded is None:
+        raise WorkerCancelled
+    return recorded
+
+
+def _accepted_explicit_plan_approval(job: CursorJob) -> bool:
+    approval_id = job.plan_approval_id
+    if job.plan_approval_source != "explicit" or approval_id is None:
+        return False
+    try:
+        preferences = record_explicit_plan_approval(approval_id)
+    except (OSError, UserConfigurationError):
+        return False
+    return approval_id in preferences.explicit_approval_ids
 
 
 def _advance_workflow_output(
@@ -1295,7 +1586,63 @@ def _advance_workflow_output(
             )
             return None
         if decision == "approve":
-            return store.publish_artifact(
+            planner_target = job.participant_target(WorkflowParticipant.PLANNER)
+            if not planner_target:
+                _workflow_block(
+                    store,
+                    job.id,
+                    worker_token,
+                    "The approved plan has no live Plan Mode agent.",
+                )
+                return None
+            plan = store.read_artifact(job.id, job.plan_artifact, kind="plan")
+            auto_approval = _auto_plan_approval_allowed(
+                job,
+                plan=plan,
+                review=review,
+                reviewer_approved=True,
+            )
+            now = time.time()
+
+            def approve_review(current: CursorJob, reference: str) -> CursorJob:
+                if auto_approval:
+                    return current.evolve(
+                        workflow_phase=WorkflowPhase.IMPLEMENTING.value,
+                        active_participant=WorkflowParticipant.PLANNER.value,
+                        herdr_target=planner_target,
+                        review_artifact=reference,
+                        prompt_operation_state="none",
+                        review_approved=True,
+                        review_decision="approve",
+                        review_approval_source="reviewer",
+                        plan_approval_state="approved",
+                        plan_approval_source="auto",
+                        plan_approval_counted=False,
+                    )
+                return question_adapter.ask(
+                    current,
+                    QuestionSpec(
+                        "The reviewed implementation plan is ready. Should I "
+                        "approve Cursor's Build step and start implementation? "
+                        "Say yes to implement it, or no to cancel this job.",
+                        sensitivity=QuestionSensitivity.ARCHITECTURE,
+                    ),
+                    owner="workflow_plan_approval",
+                    turn_token=current.turn_token or token,
+                    now=now,
+                    clear_worker=True,
+                    remove_reconcile=True,
+                    prompt_operation_state="none",
+                    job_changes={
+                        "review_artifact": reference,
+                        "review_approved": True,
+                        "review_decision": "approve",
+                        "review_approval_source": "reviewer",
+                        "plan_approval_state": "awaiting",
+                    },
+                )
+
+            published = store.publish_artifact(
                 job.id,
                 "review",
                 job.review_round,
@@ -1305,15 +1652,11 @@ def _advance_workflow_output(
                 expected_phase=job.workflow_phase.value,
                 expected_prior_reference=job.review_artifact,
                 expected_plan_reference=job.plan_artifact,
-                change=lambda current, reference: current.evolve(
-                    workflow_phase=WorkflowPhase.IMPLEMENTING.value,
-                    review_artifact=reference,
-                    prompt_operation_state="none",
-                    review_approved=True,
-                    review_decision="approve",
-                    review_approval_source="reviewer",
-                ),
+                change=approve_review,
             )
+            if published is None:
+                return None
+            return published if auto_approval else None
         if job.workflow_tier == WorkflowTier.MEDIUM:
             published = store.publish_artifact(
                 job.id,
@@ -1401,6 +1744,13 @@ def _advance_workflow_output(
                 review_approved=False,
                 review_decision="revise",
                 review_approval_source=None,
+                plan_approval_state="none",
+                plan_approval_id=None,
+                plan_approval_source=None,
+                plan_approval_agent_session=None,
+                plan_approval_state_change_sequence=None,
+                plan_approval_revision=None,
+                plan_approval_counted=False,
             ),
         )
 
@@ -1482,6 +1832,13 @@ def _advance_workflow_output(
                     review_approved=False,
                     review_decision=None,
                     review_approval_source=None,
+                    plan_approval_state="none",
+                    plan_approval_id=None,
+                    plan_approval_source=None,
+                    plan_approval_agent_session=None,
+                    plan_approval_state_change_sequence=None,
+                    plan_approval_revision=None,
+                    plan_approval_counted=False,
                 ),
             )
         _worker_complete(
@@ -1732,6 +2089,14 @@ def _execute_phase_prompt(
             baseline = int(raw_baseline) if isinstance(raw_baseline, int | str) else 0
         except (TypeError, ValueError) as exc:
             raise HarnessError("Herdr returned an invalid prompt sequence") from exc
+        if job.plan_approval_state == "approved" and (
+            baseline != job.plan_approval_state_change_sequence
+            or agent_session_identity(baseline_agent.get("agent_session"))
+            != job.plan_approval_agent_session
+        ):
+            raise HarnessError(
+                "Cursor Plan Mode boundary changed before approval submission"
+            )
 
         def plan_prompt(current: CursorJob) -> CursorJob:
             if (
@@ -1770,17 +2135,27 @@ def _execute_phase_prompt(
         observed = client.get_agent(target)
         checkpoint()
         sequence = int(observed.get("state_change_seq") or 0)
+        approval_session_matches = (
+            job.plan_approval_state != "approved"
+            or agent_session_identity(observed.get("agent_session"))
+            == job.plan_approval_agent_session
+        )
         if (
-            job.prompt_baseline_sequence is not None
+            approval_session_matches
+            and job.prompt_baseline_sequence is not None
             and job.prompt_baseline_sequence >= 0
             and sequence != job.prompt_baseline_sequence
         ):
+            counted = _accepted_explicit_plan_approval(job)
             submitted = _worker_change(
                 store,
                 job.id,
                 worker_token,
                 MODEL_WORKER_STATUSES,
-                lambda current: current.evolve(prompt_operation_state="submitted"),
+                lambda current: current.evolve(
+                    prompt_operation_state="submitted",
+                    plan_approval_counted=(current.plan_approval_counted or counted),
+                ),
             )
             if submitted is None:
                 return None
@@ -1809,8 +2184,64 @@ def _execute_phase_prompt(
             raise HarnessError(
                 "Cursor prompt submission requires manual reconciliation"
             )
+        if (
+            job.plan_approval_source == "explicit"
+            and not job.plan_approval_counted
+            and _accepted_explicit_plan_approval(job)
+        ):
+            counted = _worker_change(
+                store,
+                job.id,
+                worker_token,
+                MODEL_WORKER_STATUSES,
+                lambda current: current.evolve(plan_approval_counted=True),
+            )
+            if counted is None:
+                return None
+            job = counted
         try:
-            return read_agent_completion(client, job, wait=True, checkpoint=checkpoint)
+            outcome = client.wait_for_stable_completion(
+                target,
+                token=job.turn_token or "",
+                checkpoint=checkpoint,
+                expected_agent_session=(
+                    job.plan_approval_agent_session
+                    if phase == WorkflowPhase.IMPLEMENTING
+                    and job.plan_approval_source in {"auto", "explicit"}
+                    else None
+                ),
+                active_marker=(
+                    "WORKFLOW_PLAN"
+                    if phase in {WorkflowPhase.PLANNING, WorkflowPhase.REVISING}
+                    else None
+                ),
+            )
+            completion = (outcome.output, outcome.status)
+            if phase in {WorkflowPhase.PLANNING, WorkflowPhase.REVISING}:
+                job = _record_plan_boundary(
+                    store,
+                    job,
+                    worker_token,
+                    outcome.output,
+                    agent_status=outcome.status,
+                    agent_session=outcome.agent_session,
+                    state_change_sequence=outcome.state_change_sequence,
+                    revision=outcome.revision,
+                )
+            if (
+                phase == WorkflowPhase.IMPLEMENTING
+                and job.plan_approval_state == "approved"
+            ):
+                observed = _worker_change(
+                    store,
+                    job.id,
+                    worker_token,
+                    MODEL_WORKER_STATUSES,
+                    lambda current: current.evolve(plan_approval_state="observed"),
+                )
+                if observed is None:
+                    return None
+            return completion
         except HerdrError:
             _worker_change(
                 store,
@@ -1834,6 +2265,18 @@ def _execute_phase_prompt(
 
     operation_baseline = job.prompt_baseline_sequence
 
+    def before_agent(agent: dict[str, object]) -> None:
+        if job.plan_approval_state != "approved":
+            return
+        if (
+            agent_session_identity(agent.get("agent_session"))
+            != job.plan_approval_agent_session
+            or _state_change_sequence(agent) != job.plan_approval_state_change_sequence
+        ):
+            raise HarnessError(
+                "Cursor Plan Mode boundary changed before approval submission"
+            )
+
     def before_submit(observed_baseline: int) -> None:
         if observed_baseline != operation_baseline:
             raise HarnessError("Cursor prompt baseline changed before submission")
@@ -1856,10 +2299,15 @@ def _execute_phase_prompt(
             raise WorkerCancelled
 
     def accepted() -> None:
+        counted = _accepted_explicit_plan_approval(job)
+
         def mark_submitted(current: CursorJob) -> CursorJob:
             if current.prompt_operation_state != "submitting":
                 raise WorkerCancelled
-            return current.evolve(prompt_operation_state="submitted")
+            return current.evolve(
+                prompt_operation_state="submitted",
+                plan_approval_counted=(current.plan_approval_counted or counted),
+            )
 
         if (
             _worker_change(
@@ -1882,6 +2330,18 @@ def _execute_phase_prompt(
             baseline_sequence=job.prompt_baseline_sequence,
             before_submit=before_submit,
             accepted=accepted,
+            before_agent=before_agent,
+            expected_agent_session=(
+                job.plan_approval_agent_session
+                if job.plan_approval_state == "approved"
+                else None
+            ),
+            active_marker=(
+                "WORKFLOW_PLAN"
+                if phase in {WorkflowPhase.PLANNING, WorkflowPhase.REVISING}
+                else None
+            ),
+            allow_enter_fallback=job.plan_approval_state != "approved",
         )
     except HerdrError as exc:
         if exc.code == "interactive_questionnaire":
@@ -1906,6 +2366,27 @@ def _execute_phase_prompt(
         )
         raise
     checkpoint()
+    if phase in {WorkflowPhase.PLANNING, WorkflowPhase.REVISING}:
+        job = _record_plan_boundary(
+            store,
+            job,
+            worker_token,
+            outcome.output,
+            agent_status=outcome.status,
+            agent_session=outcome.agent_session,
+            state_change_sequence=outcome.state_change_sequence,
+            revision=outcome.revision,
+        )
+    if phase == WorkflowPhase.IMPLEMENTING and job.plan_approval_state == "approved":
+        observed = _worker_change(
+            store,
+            job.id,
+            worker_token,
+            MODEL_WORKER_STATUSES,
+            lambda current: current.evolve(plan_approval_state="observed"),
+        )
+        if observed is None:
+            return None
     return outcome.output, outcome.status
 
 
@@ -1923,6 +2404,9 @@ def _run_tiered_workflow(
         checkpoint()
         job = store.get(job.id)
         if job.status not in MODEL_WORKER_STATUSES:
+            return
+        if job.plan_approval_completion_pending:
+            _resume_plan_approval_completion(store, job, worker_token)
             return
         if pending_output is not None:
             output, agent_status = pending_output
@@ -1943,7 +2427,11 @@ def _run_tiered_workflow(
             WorkflowParticipant.REVIEWER
             if phase == WorkflowPhase.REVIEWING
             else (
-                WorkflowParticipant.IMPLEMENTER
+                (
+                    WorkflowParticipant.PLANNER
+                    if job.plan_approval_state in {"approved", "observed"}
+                    else WorkflowParticipant.IMPLEMENTER
+                )
                 if phase == WorkflowPhase.IMPLEMENTING
                 else WorkflowParticipant.PLANNER
             )
@@ -2010,19 +2498,32 @@ def _run_tiered_workflow(
                 if job.plan_artifact
                 else None
             )
-            prompt = implementation_prompt(
-                _prompt_request(job),
-                token,
-                plan=plan,
-                continuation=job.continuation or bool(job.continuation_answer),
-                github_issue_context=job.github_issue_context,
-                classification_reason=job.workflow_classification_reason,
-                issue_reference=(
-                    job.issue_key
-                    or (f"issue {job.github_issue}" if job.github_issue else None)
-                ),
-                integration_instructions=integration_instructions,
+            issue_reference = job.issue_key or (
+                f"issue {job.github_issue}" if job.github_issue else None
             )
+            if job.plan_approval_state in {"approved", "observed"}:
+                if plan is None:
+                    raise HarnessError("plan approval requires a durable plan")
+                prompt = plan_approval_prompt(
+                    _prompt_request(job),
+                    token,
+                    plan=plan,
+                    github_issue_context=job.github_issue_context,
+                    classification_reason=job.workflow_classification_reason,
+                    issue_reference=issue_reference,
+                    integration_instructions=integration_instructions,
+                )
+            else:
+                prompt = implementation_prompt(
+                    _prompt_request(job),
+                    token,
+                    plan=plan,
+                    continuation=job.continuation or bool(job.continuation_answer),
+                    github_issue_context=job.github_issue_context,
+                    classification_reason=job.workflow_classification_reason,
+                    issue_reference=issue_reference,
+                    integration_instructions=integration_instructions,
+                )
         else:
             raise HarnessError(f"unsupported workflow phase {phase.value}")
         pending_output = _execute_phase_prompt(
@@ -2170,6 +2671,10 @@ def run_claimed_worker(  # pyright: ignore[reportGeneralTypeIssues]
         context.checkpoint()
 
     try:
+        if job.plan_approval_completion_pending:
+            checkpoint()
+            _resume_plan_approval_completion(store, job, worker_token)
+            return
         active_issue_key = resolve_issue_reference(job.issue_key)
         if active_issue_key:
             require_issue_capabilities(active_issue_key)

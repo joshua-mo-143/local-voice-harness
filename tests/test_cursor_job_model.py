@@ -348,6 +348,8 @@ class CursorJobModelTests(unittest.TestCase):
         )
 
         self.assertEqual(job.review_approval_source, "reviewer")
+        self.assertEqual(job.plan_approval_state, "observed")
+        self.assertEqual(job.plan_approval_source, "legacy")
 
     def test_v9_exhausted_review_migrates_to_explicit_clarification(self) -> None:
         job = CursorJob.from_dict(
@@ -451,6 +453,60 @@ class CursorJobModelTests(unittest.TestCase):
                     "workflow_tier": "high-risk",
                     "workflow_classification_reason": "persistence",
                     "workflow_phase": "implementing",
+                }
+            )
+
+    def test_current_planned_workflow_cannot_implement_without_plan_approval(
+        self,
+    ) -> None:
+        with self.assertRaisesRegex(
+            JobValidationError,
+            "without plan approval",
+        ):
+            CursorJob.from_dict(
+                {
+                    "schema_version": CURRENT_SCHEMA_VERSION,
+                    "id": "123456789abc",
+                    "revision": 0,
+                    "request": "change persistence",
+                    "status": "queued",
+                    "created_at": 1,
+                    "queued_at": 1,
+                    "delivered": False,
+                    "workflow_tier": "medium",
+                    "workflow_classification_reason": "persistence",
+                    "workflow_phase": "implementing",
+                    "plan_artifact": ".artifacts/123456789abc/plan-0.json",
+                    "review_artifact": ".artifacts/123456789abc/review-0.json",
+                    "review_decision": "approve",
+                    "review_approved": True,
+                    "review_approval_source": "reviewer",
+                }
+            )
+
+    def test_plan_approval_boundary_requires_session_proof(self) -> None:
+        with self.assertRaisesRegex(
+            JobValidationError,
+            "requires gate ID, agent session, and sequence",
+        ):
+            CursorJob.from_dict(
+                {
+                    "schema_version": CURRENT_SCHEMA_VERSION,
+                    "id": "123456789abc",
+                    "revision": 0,
+                    "request": "change persistence",
+                    "status": "running",
+                    "created_at": 1,
+                    "delivered": False,
+                    "worker_token": "worker",
+                    "worker_pid": 42,
+                    "worker_boot_id": "boot",
+                    "worker_process_start": "start",
+                    "workflow_tier": "medium",
+                    "workflow_classification_reason": "persistence",
+                    "workflow_phase": "planning",
+                    "plan_approval_state": "boundary",
+                    "plan_approval_id": "gate",
                 }
             )
 
@@ -580,11 +636,47 @@ class CursorJobModelTests(unittest.TestCase):
             }
         )
 
-        self.assertEqual(job.schema_version, 10)
+        self.assertEqual(job.schema_version, CURRENT_SCHEMA_VERSION)
         self.assertEqual(job.prompt_operation_state, "ambiguous")
         self.assertEqual(job.prompt_operation_turn, 2)
         self.assertEqual(job.prompt_operation_target, "planner")
         self.assertEqual(job.prompt_baseline_sequence, -1)
+
+    def test_schema_v11_defaults_deferred_plan_completion_to_false(self) -> None:
+        job = CursorJob.from_dict(
+            {
+                "schema_version": 11,
+                "id": "123456789abc",
+                "revision": 0,
+                "request": "test",
+                "status": "queued",
+                "created_at": 1,
+                "queued_at": 1,
+                "delivered": False,
+            }
+        )
+
+        self.assertEqual(job.schema_version, CURRENT_SCHEMA_VERSION)
+        self.assertFalse(job.plan_approval_completion_pending)
+
+    def test_deferred_plan_completion_requires_durable_finished_output(self) -> None:
+        with self.assertRaisesRegex(
+            JobValidationError,
+            "requires durable finished output",
+        ):
+            CursorJob.from_dict(
+                {
+                    "schema_version": CURRENT_SCHEMA_VERSION,
+                    "id": "123456789abc",
+                    "revision": 0,
+                    "request": "test",
+                    "status": "queued",
+                    "created_at": 1,
+                    "queued_at": 1,
+                    "delivered": False,
+                    "plan_approval_completion_pending": True,
+                }
+            )
 
     def test_all_participant_targets_remain_reserved_during_cleanup(self) -> None:
         first = self.job_for_status(JobStatus.RECONCILING).evolve(

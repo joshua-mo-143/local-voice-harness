@@ -9,6 +9,7 @@ from unittest import mock
 
 import pytest
 
+from local_voice_harness import user_config
 from local_voice_harness.cursor import provisioning, questions, recovery, service
 from local_voice_harness.cursor.delivery import claim_delivery
 from local_voice_harness.cursor.model import CursorJob, JobStatus
@@ -83,6 +84,64 @@ def _awaiting(store: JobStore, question: Question | None = None) -> CursorJob:
             }
         )
     )
+
+
+def _plan_approval_awaiting(store: JobStore) -> CursorJob:
+    pending = replace(
+        _question(sensitivity=QuestionSensitivity.ARCHITECTURE),
+        text="Approve the reviewed plan?",
+        owner="workflow_plan_approval",
+    )
+    created = store.create(
+        CursorJob.from_dict(
+            {
+                "id": "aaaaaaaaaaaa",
+                "request": "build the reviewed feature",
+                "status": JobStatus.AWAITING_USER.value,
+                "created_at": 1,
+                "updated_at": 10,
+                "delivered": True,
+                "question": pending.text,
+                "result": pending.text,
+                "clarification_kind": "workflow_plan_approval",
+                "turn": 3,
+                "turn_token": pending.origin.turn_token,
+                "workflow_tier": "medium",
+                "workflow_classification_reason": "reviewed change",
+                "workflow_phase": "reviewing",
+                "review_round": 0,
+                "herdr_target": "planner",
+                "planner_target": "planner",
+                "active_participant": "planner",
+                "voice_question": pending.to_dict(),
+            }
+        )
+    )
+    plan = "Implement the reviewed feature."
+    plan_reference = store.write_artifact(created.id, "plan", 0, plan)
+    review_reference = store.write_artifact(
+        created.id,
+        "review",
+        0,
+        "The plan is safe.",
+        source_text=plan,
+    )
+    updated = store.update(
+        created.id,
+        lambda job: job.evolve(
+            plan_artifact=plan_reference,
+            review_artifact=review_reference,
+            review_decision="approve",
+            review_approved=True,
+            review_approval_source="reviewer",
+            plan_approval_state="awaiting",
+            plan_approval_id="gate-id",
+            plan_approval_agent_session="planner-session",
+            plan_approval_state_change_sequence=7,
+        ),
+    )
+    assert updated is not None
+    return updated
 
 
 def test_structured_and_legacy_question_payloads() -> None:
@@ -296,6 +355,169 @@ def test_repeat_returns_same_question_without_mutation(store: JobStore) -> None:
     assert result.text == "Which approach should I use?"
     assert result.session_id == original.id
     assert store.get(original.id).revision == original.revision
+
+
+@pytest.mark.parametrize(
+    "answer",
+    ["yes", "sure", "go ahead", "lgtm", "ok then"],
+)
+def test_natural_plan_approval_queues_fenced_planner_prompt(
+    store: JobStore,
+    answer: str,
+) -> None:
+    original = _plan_approval_awaiting(store)
+
+    with mock.patch.object(service, "launch_worker") as launch:
+        service.reply_job(original.id, answer)
+
+    updated = store.get(original.id)
+    assert updated.status == JobStatus.QUEUED
+    assert updated.plan_approval_state == "approved"
+    assert updated.plan_approval_source == "explicit"
+    assert updated.herdr_target == "planner"
+    launch.assert_called_once_with(original.id)
+
+
+def test_ambiguous_plan_approval_reprompts_without_mutation(store: JobStore) -> None:
+    original = _plan_approval_awaiting(store)
+
+    message = service.reply_job(original.id, "maybe after lunch")
+
+    assert message is not None
+    assert "answer yes" in message
+    assert store.get(original.id).revision == original.revision
+
+
+def test_automated_answer_cannot_approve_plan(store: JobStore) -> None:
+    original = _plan_approval_awaiting(store)
+
+    with mock.patch.object(service, "launch_worker") as launch:
+        message = service.reply_job(
+            original.id,
+            "yes",
+            answer_provenance=AnswerProvenance.AUTOMATION,
+        )
+
+    assert message is not None
+    assert "direct user answer" in message
+    assert store.get(original.id).revision == original.revision
+    launch.assert_not_called()
+
+
+@pytest.mark.parametrize("answer", ["no", "nah", "don't", "cancel"])
+def test_natural_plan_rejection_cancels_and_retains_artifact_reference(
+    store: JobStore,
+    answer: str,
+) -> None:
+    original = _plan_approval_awaiting(store)
+
+    with mock.patch.object(service, "_cancel_target_and_release") as release:
+        service.reply_job(original.id, answer)
+
+    rejected = store.get(original.id)
+    assert rejected.status == JobStatus.RECONCILING
+    assert rejected.terminal_intent_status == JobStatus.CANCELLED
+    assert rejected.plan_approval_state == "rejected"
+    assert rejected.plan_artifact == original.plan_artifact
+    release.assert_called_once()
+
+
+def test_third_accepted_approval_offers_auto_after_implementation(
+    store: JobStore,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    preferences_path = tmp_path / "approval.json"
+    monkeypatch.setenv(
+        "VOICE_HARNESS_PLAN_APPROVAL_FILE",
+        str(preferences_path),
+    )
+    for approval_id in ("first", "second", "gate-id"):
+        user_config.record_explicit_plan_approval(
+            approval_id,
+            path=preferences_path,
+        )
+    created = store.create(
+        CursorJob.from_dict(
+            {
+                "id": "aaaaaaaaaaaa",
+                "request": "build reviewed feature",
+                "status": "running",
+                "created_at": 1,
+                "delivered": False,
+                "worker_token": "worker",
+                "worker_pid": 42,
+                "worker_boot_id": "boot",
+                "worker_process_start": "start",
+                "workflow_tier": "medium",
+                "workflow_classification_reason": "reviewed",
+                "workflow_phase": "reviewing",
+                "review_round": 0,
+                "turn": 4,
+                "turn_token": "aaaaaaaaaaaa-4",
+                "workflow_turn_phase": "reviewing",
+                "herdr_target": "planner",
+                "planner_target": "planner",
+                "active_participant": "planner",
+                "plan_approval_state": "boundary",
+                "plan_approval_id": "gate-id",
+                "plan_approval_agent_session": "planner-session",
+                "plan_approval_state_change_sequence": 7,
+            }
+        )
+    )
+    plan = "Implement the reviewed feature."
+    plan_reference = store.write_artifact(created.id, "plan", 0, plan)
+    review_reference = store.write_artifact(
+        created.id,
+        "review",
+        0,
+        "The plan is safe.",
+        source_text=plan,
+    )
+    job = store.update(
+        created.id,
+        lambda current: current.evolve(
+            workflow_phase="implementing",
+            workflow_turn_phase="implementing",
+            plan_artifact=plan_reference,
+            review_artifact=review_reference,
+            review_decision="approve",
+            review_approved=True,
+            review_approval_source="reviewer",
+            plan_approval_state="observed",
+            plan_approval_source="explicit",
+            plan_approval_counted=True,
+        ),
+    )
+    assert job is not None
+
+    provisioning._worker_complete(
+        store,
+        job.id,
+        "worker",
+        output="VOICE_SUMMARY[aaaaaaaaaaaa-4]: done",
+        agent_status="idle",
+    )
+
+    offered = store.get(job.id)
+    assert offered.status == JobStatus.AWAITING_USER
+    assert offered.workflow_phase.value == "finished"
+    pending = questions.current(offered)
+    assert pending is not None
+    assert pending.owner == "workflow_plan_auto_offer"
+
+    with mock.patch.object(service, "_cancel_target_and_release") as release:
+        message = service.reply_job(job.id, "yes")
+
+    assert message is not None
+    assert "enabled" in message
+    preferences = user_config.load_plan_approval_preferences(preferences_path)
+    assert preferences.mode == user_config.PlanApprovalMode.AUTO
+    completed = store.get(job.id)
+    assert completed.terminal_intent_status == JobStatus.COMPLETED
+    assert completed.terminal_intent_result == "done"
+    release.assert_called_once()
 
 
 def test_repeat_returns_numbered_multiple_choice_question(store: JobStore) -> None:

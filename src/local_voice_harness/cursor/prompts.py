@@ -227,6 +227,29 @@ def implementation_prompt(
     )
 
 
+def plan_approval_prompt(
+    text: str,
+    token: str,
+    *,
+    plan: str,
+    github_issue_context: str | None = None,
+    issue_reference: str | None = None,
+    classification_reason: str | None = None,
+    integration_instructions: tuple[str, ...] = (),
+) -> str:
+    """Approve Cursor's Plan Mode gate and bind implementation output."""
+
+    return "lgtm. Implement the approved plan.\n\n" + implementation_prompt(
+        text,
+        token,
+        plan=plan,
+        github_issue_context=github_issue_context,
+        issue_reference=issue_reference,
+        classification_reason=classification_reason,
+        integration_instructions=integration_instructions,
+    )
+
+
 def cursor_prompt(
     text: str,
     token: str,

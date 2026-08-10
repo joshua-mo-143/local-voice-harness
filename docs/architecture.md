@@ -113,8 +113,32 @@ whether approval came from the reviewer or from that explicit user override.
 Persistence, migration, recovery,
 concurrency, lifecycle, worktrees, external writes, security, infrastructure,
 destructive behavior, public APIs, and ambiguous requirements force the high-risk
-tier. Implementation cannot start until the latest review approves it; newly
-discovered scope promotes the tier and returns the job to planning.
+tier. After the latest review approves, the job still pauses at the exact Cursor
+Plan Mode Build boundary. In the default `ask` mode it speaks a yes-or-no question.
+An affirmative answer queues `lgtm. Implement the approved plan.` through the Herdr
+prompt API to the retained planner; a negative answer uses normal cancellation and
+retains the plan artifact. Newly discovered scope promotes the tier and returns the
+job to planning.
+
+The boundary is not inferred from an idle status. A stable, turn-scoped
+`WORKFLOW_PLAN` marker may prove it while the planner still reports `working` or
+`blocked`. The job persists a digest-derived gate ID, canonical Herdr session,
+state-change sequence, and optional revision. Approval submission rechecks the same
+session and sequence and disables the desktop Enter-key fallback. The ordinary
+prompt operation fence supplies `planned`, `submitting`, `submitted`, and observed
+recovery; only a Herdr-accepted explicit submission enters the preference ledger.
+Ambiguous submission is never retried without positive sequence evidence. If the
+preference store is temporarily unavailable after implementation, the completed
+result is persisted and preference reconciliation retries locally without observing
+or prompting the old Herdr session again.
+
+After three distinct accepted explicit submissions, the successful third
+implementation speaks a one-time offer for automatic plan approval. Accepted
+automatic mode never applies to a high-risk workflow and bypasses only this reviewed
+Plan Mode Build gate. Deterministic security, destructive, infrastructure, migration,
+authentication, permission, and other hard-risk evidence keeps asking. Reviewer
+objections, unresolved product/architecture questions, interactive questionnaires,
+and tool permission prompts always retain their existing user decision path.
 
 The selected tier, evidence, current phase, review round, active participant, and
 participant targets live in the job record. Full plans and reviews are bounded,
@@ -135,8 +159,9 @@ advancing a workflow. Prompt delivery is a durable operation with `planned`,
 `submitting`, `submitted`, `ambiguous`, and `none` states plus the phase, turn,
 target, and observed Herdr sequence. Recovery submits only `planned`, observes only
 `submitted`, and never retries `submitting` without positive sequence evidence.
-The former schema-v10 prompt boolean is translated in place: a true value becomes
-an ambiguous fail-closed operation because it has no trustworthy sequence baseline.
+During migration to schema v11, the former schema-v10 prompt boolean is translated:
+a true value becomes an ambiguous fail-closed operation because it has no
+trustworthy sequence baseline.
 
 Fresh workflow participants persist their deterministic name, role, label, and
 workspace intent before pane creation. The returned pane and workspace are persisted

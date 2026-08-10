@@ -574,10 +574,11 @@ def reply_job(
     now = time.time()
     should_launch = False
     should_cancel = False
+    should_complete = False
     immediate: str | None = None
 
     def reply(job: CursorJob) -> CursorJob | None:
-        nonlocal immediate, should_cancel, should_launch
+        nonlocal immediate, should_cancel, should_complete, should_launch
         if job.status != JobStatus.AWAITING_USER:
             return None
         question = questions.current(job)
@@ -654,6 +655,28 @@ def reply_job(
                 now=now,
                 result=f"Cursor job {job_id} was cancelled.",
                 voice_question=questions.envelope(question, QuestionState.CANCELLED),
+                job_changes=(
+                    {"plan_approval_state": "rejected"}
+                    if question.owner == "workflow_plan_approval"
+                    else None
+                ),
+            )
+        if transition.complete:
+            should_complete = True
+            should_launch = False
+            immediate = transition.message
+            return recovery.stage_terminal_intent(
+                job,
+                JobStatus.COMPLETED,
+                now=now,
+                result=job.result or "Cursor implementation completed.",
+                voice_question=questions.envelope(
+                    question,
+                    QuestionState.RESOLVED,
+                    answer=resolution.answer,
+                    trusted_answer=resolution.trusted_answer,
+                    answered_at=now,
+                ),
             )
         should_launch = transition.launch
         immediate = transition.message
@@ -671,6 +694,15 @@ def reply_job(
                 updated.target_release_token or "",
             )
         return None
+    if should_complete:
+        assert updated is not None
+        if updated.target_release_pending:
+            _cancel_target_and_release(
+                job_id,
+                updated.herdr_target or "",
+                updated.target_release_token or "",
+            )
+        return immediate
     if should_launch:
         launch_worker(job_id)
         if on_started is not None:

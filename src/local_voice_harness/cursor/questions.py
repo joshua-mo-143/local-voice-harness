@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import re
 import uuid
+from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from typing import Any, Protocol
 
@@ -13,6 +14,12 @@ from ..questions import (
     QuestionOrigin,
     QuestionSpec,
     QuestionState,
+)
+from ..user_config import (
+    PlanApprovalMode,
+    UserConfigurationError,
+    load_plan_approval_preferences,
+    resolve_plan_approval_offer,
 )
 from .model import (
     CursorJob,
@@ -56,6 +63,7 @@ def ask(
     clear_worker: bool = False,
     remove_reconcile: bool = False,
     prompt_operation_state: str | None = None,
+    job_changes: Mapping[str, object] | None = None,
 ) -> CursorJob:
     question = Question(
         id=uuid.uuid4().hex,
@@ -71,38 +79,34 @@ def ask(
         owner=owner,
         asked_at=now,
     )
+    changes: dict[str, object] = {
+        "question": question.text,
+        "result": question.text,
+        "clarification_kind": owner,
+        "voice_question": question.to_dict(),
+        "prompt_operation_state": (
+            job.prompt_operation_state
+            if prompt_operation_state is None
+            else prompt_operation_state
+        ),
+    }
+    changes.update(job_changes or {})
     if clear_worker:
         return job.evolve_for_delivery(
             now=now,
             status=JobStatus.AWAITING_USER,
             remove=frozenset({"reconcile"}) if remove_reconcile else frozenset(),
-            question=question.text,
-            result=question.text,
-            clarification_kind=owner,
-            voice_question=question.to_dict(),
             worker_pid=None,
             worker_boot_id=None,
             worker_process_start=None,
             worker_token=None,
-            prompt_operation_state=(
-                job.prompt_operation_state
-                if prompt_operation_state is None
-                else prompt_operation_state
-            ),
+            **changes,
         )
     return job.evolve_for_delivery(
         now=now,
         status=JobStatus.AWAITING_USER,
         remove=frozenset({"reconcile"}) if remove_reconcile else frozenset(),
-        question=question.text,
-        result=question.text,
-        clarification_kind=owner,
-        voice_question=question.to_dict(),
-        prompt_operation_state=(
-            job.prompt_operation_state
-            if prompt_operation_state is None
-            else prompt_operation_state
-        ),
+        **changes,
     )
 
 
@@ -136,6 +140,7 @@ class AnswerTransition:
     launch: bool = False
     message: str | None = None
     cancel: bool = False
+    complete: bool = False
 
 
 class AnswerHandler(Protocol):
@@ -279,19 +284,71 @@ _CONFIRMATIONS = frozenset(
         "confirmed",
         "do it",
         "go ahead",
+        "lgtm",
+        "ok",
+        "okay",
+        "ok then",
+        "okay then",
+        "sure",
+        "sounds good",
+        "please do",
+        "proceed",
+        "approve",
         "create it",
         "create the fork",
         "fork it",
     }
 )
-_REJECTIONS = frozenset({"no", "no thanks", "do not", "don't", "cancel", "stop"})
+_REJECTIONS = frozenset(
+    {
+        "no",
+        "no thanks",
+        "nah",
+        "nope",
+        "do not",
+        "don't",
+        "cancel",
+        "stop",
+        "reject",
+        "not now",
+    }
+)
+_FORK_CONFIRMATIONS = frozenset(
+    {
+        "yes",
+        "yes please",
+        "confirm",
+        "confirmed",
+        "do it",
+        "go ahead",
+        "create it",
+        "create the fork",
+        "fork it",
+    }
+)
+_FORK_REJECTIONS = frozenset(
+    {
+        "no",
+        "no thanks",
+        "do not",
+        "don't",
+        "cancel",
+        "stop",
+    }
+)
 
 
-def _confirmation(value: str) -> bool | None:
-    normalized = " ".join(value.casefold().replace("’", "'").split())
-    if normalized in _CONFIRMATIONS:
+def _confirmation(
+    value: str,
+    *,
+    confirmations: frozenset[str] = _CONFIRMATIONS,
+    rejections: frozenset[str] = _REJECTIONS,
+) -> bool | None:
+    normalized = re.sub(r"[^\w\s'’]", "", value.casefold())
+    normalized = " ".join(normalized.replace("’", "'").split())
+    if normalized in confirmations:
         return True
-    if normalized in _REJECTIONS:
+    if normalized in rejections:
         return False
     return None
 
@@ -302,7 +359,11 @@ def _fork_confirmation_answer(
     resolution: AnswerResolution,
     context: AnswerContext,
 ) -> AnswerTransition:
-    confirmation = _confirmation(context.trusted_text or context.text)
+    confirmation = _confirmation(
+        context.trusted_text or context.text,
+        confirmations=_FORK_CONFIRMATIONS,
+        rejections=_FORK_REJECTIONS,
+    )
     if confirmation is None:
         return AnswerTransition(
             None,
@@ -377,6 +438,7 @@ def _workflow_queue_answer(
     review_approved: bool | None = None,
     review_approval_source: str | None = None,
     clear_target: bool = False,
+    extra_changes: Mapping[str, object] | None = None,
 ) -> CursorJob:
     changes: dict[str, Any] = {
         "question": None,
@@ -425,6 +487,7 @@ def _workflow_queue_answer(
         changes["review_approved"] = review_approved
     if review_approval_source is not None:
         changes["review_approval_source"] = review_approval_source
+    changes.update(extra_changes or {})
     return job.evolve(status=JobStatus.QUEUED, **changes)
 
 
@@ -482,6 +545,15 @@ def _workflow_review_answer(
             workflow_reason=reason,
             review_round=max(1, job.review_round),
             active_participant=WorkflowParticipant.PLANNER.value,
+            extra_changes={
+                "plan_approval_state": "none",
+                "plan_approval_id": None,
+                "plan_approval_source": None,
+                "plan_approval_agent_session": None,
+                "plan_approval_state_change_sequence": None,
+                "plan_approval_revision": None,
+                "plan_approval_counted": False,
+            },
         ),
         launch=True,
     )
@@ -504,6 +576,12 @@ def _workflow_review_exhausted_answer(
                 "to cancel the job."
             ),
         )
+    planner_target = job.participant_target(WorkflowParticipant.PLANNER)
+    if not planner_target or job.plan_approval_state != "boundary":
+        return AnswerTransition(
+            None,
+            message="The reviewed Plan Mode boundary is no longer available.",
+        )
     return AnswerTransition(
         _workflow_queue_answer(
             job,
@@ -511,11 +589,117 @@ def _workflow_review_exhausted_answer(
             resolution,
             context,
             continuation=False,
+            herdr_target=planner_target,
             workflow_phase=WorkflowPhase.IMPLEMENTING.value,
+            active_participant=WorkflowParticipant.PLANNER.value,
             review_approved=True,
             review_approval_source="user",
+            extra_changes={
+                "plan_approval_state": "approved",
+                "plan_approval_source": "explicit",
+                "plan_approval_counted": False,
+            },
         ),
         launch=True,
+    )
+
+
+def _workflow_plan_approval_answer(
+    job: CursorJob,
+    question: Question,
+    resolution: AnswerResolution,
+    context: AnswerContext,
+) -> AnswerTransition:
+    confirmation = _confirmation(context.trusted_text or context.text)
+    if confirmation is None:
+        return AnswerTransition(
+            None,
+            message=(
+                "Please answer yes to approve this reviewed plan, or no to "
+                "cancel the job."
+            ),
+        )
+    if not confirmation:
+        return AnswerTransition(None, cancel=True)
+    planner_target = job.participant_target(WorkflowParticipant.PLANNER)
+    if (
+        job.plan_approval_state != "awaiting"
+        or not job.review_approved
+        or not job.plan_artifact
+        or not planner_target
+    ):
+        return AnswerTransition(
+            None,
+            message="That reviewed Plan Mode boundary is no longer available.",
+        )
+    return AnswerTransition(
+        _workflow_queue_answer(
+            job,
+            question,
+            resolution,
+            context,
+            continuation=False,
+            herdr_target=planner_target,
+            workflow_phase=WorkflowPhase.IMPLEMENTING.value,
+            active_participant=WorkflowParticipant.PLANNER.value,
+            extra_changes={
+                "plan_approval_state": "approved",
+                "plan_approval_source": "explicit",
+                "plan_approval_counted": False,
+            },
+        ),
+        launch=True,
+    )
+
+
+def _workflow_plan_auto_offer_answer(
+    job: CursorJob,
+    question: Question,
+    resolution: AnswerResolution,
+    context: AnswerContext,
+) -> AnswerTransition:
+    confirmation = _confirmation(context.trusted_text or context.text)
+    if confirmation is None:
+        return AnswerTransition(
+            None,
+            message=(
+                "Please answer yes to enable automatic approval for ordinary "
+                "reviewed plans, or no to keep asking."
+            ),
+        )
+    approval_id = job.plan_approval_id
+    if not approval_id or job.workflow_phase != WorkflowPhase.FINISHED:
+        return AnswerTransition(
+            None,
+            message="That automatic plan-approval offer is no longer available.",
+        )
+    try:
+        preferences = resolve_plan_approval_offer(
+            approval_id,
+            approved=confirmation,
+        )
+    except (OSError, UserConfigurationError):
+        try:
+            preferences = load_plan_approval_preferences()
+        except (OSError, UserConfigurationError):
+            return AnswerTransition(
+                None,
+                message="I could not safely save that plan-approval preference.",
+            )
+        if not preferences.offer_completed:
+            return AnswerTransition(
+                None,
+                message="I could not safely save that plan-approval preference.",
+            )
+    enabled = preferences.mode == PlanApprovalMode.AUTO
+    return AnswerTransition(
+        None,
+        message=(
+            "Automatic approval is enabled for ordinary reviewed Cursor plans."
+            if enabled
+            else "Okay, I will keep asking before Cursor implements reviewed plans."
+        ),
+        complete=True,
     )
 
 
@@ -527,6 +711,8 @@ _ANSWER_HANDLERS: dict[str, AnswerHandler] = {
     "workflow": _workflow_answer,
     "workflow_review": _workflow_review_answer,
     "workflow_review_exhausted": _workflow_review_exhausted_answer,
+    "workflow_plan_approval": _workflow_plan_approval_answer,
+    "workflow_plan_auto_offer": _workflow_plan_auto_offer_answer,
 }
 
 

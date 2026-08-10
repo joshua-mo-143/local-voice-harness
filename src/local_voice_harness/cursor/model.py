@@ -10,7 +10,7 @@ from typing import Any
 
 from ..questions import Question, QuestionError
 
-CURRENT_SCHEMA_VERSION = 10
+CURRENT_SCHEMA_VERSION = 12
 LEGACY_SCHEMA_VERSIONS = frozenset(range(CURRENT_SCHEMA_VERSION))
 LEGACY_BOOT_ID = "legacy-unknown"
 
@@ -172,6 +172,8 @@ _BOOL_FIELDS = frozenset(
         "phase_prompt_active",
         "review_approved",
         "interactive_questionnaire_blocked",
+        "plan_approval_counted",
+        "plan_approval_completion_pending",
     }
 )
 _INT_FIELDS = frozenset(
@@ -194,6 +196,8 @@ _INT_FIELDS = frozenset(
         "review_round",
         "prompt_operation_turn",
         "prompt_baseline_sequence",
+        "plan_approval_state_change_sequence",
+        "plan_approval_revision",
     }
 )
 _FLOAT_FIELDS = frozenset(
@@ -300,6 +304,10 @@ _STRING_FIELDS = frozenset(
         "implementer_target",
         "review_decision",
         "review_approval_source",
+        "plan_approval_state",
+        "plan_approval_id",
+        "plan_approval_source",
+        "plan_approval_agent_session",
         "workflow_turn_phase",
         "prompt_operation_state",
         "prompt_operation_phase",
@@ -359,6 +367,9 @@ _UNCERTAIN_OPERATION_STATES = frozenset(
 )
 _PROMPT_OPERATION_STATES = frozenset(
     {"none", "planned", "submitting", "submitted", "ambiguous"}
+)
+_PLAN_APPROVAL_STATES = frozenset(
+    {"none", "boundary", "awaiting", "approved", "observed", "rejected"}
 )
 _PARTICIPANT_CREATION_STATES = frozenset(
     {"none", "planned", "submitting", "created", "ambiguous", "manual_required"}
@@ -628,6 +639,24 @@ def _advance_legacy_version(values: dict[str, object], version: int) -> None:
         values.setdefault("harness_kind", HarnessKind.CURSOR.value)
         if values.get("herdr_target") is not None:
             values.setdefault("session_id", values["herdr_target"])
+    elif version == 10:
+        values.setdefault("plan_approval_counted", False)
+        if values.get("workflow_tier") in {
+            WorkflowTier.MEDIUM.value,
+            WorkflowTier.HIGH_RISK.value,
+        } and values.get("workflow_phase") in {
+            WorkflowPhase.IMPLEMENTING.value,
+            WorkflowPhase.FINISHED.value,
+        }:
+            values.setdefault("plan_approval_state", "observed")
+            values.setdefault("plan_approval_id", f"legacy-{values.get('id') or 'job'}")
+            values.setdefault("plan_approval_source", "legacy")
+            values.setdefault("plan_approval_agent_session", LEGACY_BOOT_ID)
+            values.setdefault("plan_approval_state_change_sequence", -1)
+        else:
+            values.setdefault("plan_approval_state", "none")
+    elif version == 11:
+        values.setdefault("plan_approval_completion_pending", False)
     values["schema_version"] = version + 1
 
 
@@ -1735,6 +1764,38 @@ class AgentJob:
         return self._optional_string("review_approval_source")
 
     @property
+    def plan_approval_state(self) -> str:
+        return self._optional_string("plan_approval_state") or "none"
+
+    @property
+    def plan_approval_id(self) -> str | None:
+        return self._optional_string("plan_approval_id")
+
+    @property
+    def plan_approval_source(self) -> str | None:
+        return self._optional_string("plan_approval_source")
+
+    @property
+    def plan_approval_agent_session(self) -> str | None:
+        return self._optional_string("plan_approval_agent_session")
+
+    @property
+    def plan_approval_state_change_sequence(self) -> int | None:
+        return self._optional_int("plan_approval_state_change_sequence")
+
+    @property
+    def plan_approval_revision(self) -> int | None:
+        return self._optional_int("plan_approval_revision")
+
+    @property
+    def plan_approval_counted(self) -> bool:
+        return self._boolean_field("plan_approval_counted")
+
+    @property
+    def plan_approval_completion_pending(self) -> bool:
+        return self._boolean_field("plan_approval_completion_pending")
+
+    @property
     def workflow_turn_phase(self) -> WorkflowPhase | None:
         value = self._optional_string("workflow_turn_phase")
         if value is None:
@@ -2023,6 +2084,90 @@ class AgentJob:
             raise JobValidationError(
                 "user approval requires an exhausted high-risk rejected review"
             )
+        plan_approval_state = self.plan_approval_state
+        if plan_approval_state not in _PLAN_APPROVAL_STATES:
+            raise JobValidationError("plan_approval_state has invalid value")
+        plan_approval_source = self.plan_approval_source
+        if plan_approval_source not in {None, "explicit", "auto", "legacy"}:
+            raise JobValidationError("plan_approval_source has invalid value")
+        approval_proof = (
+            self.plan_approval_id,
+            self.plan_approval_agent_session,
+            self.plan_approval_state_change_sequence,
+        )
+        if plan_approval_state == "none":
+            if any(value is not None for value in approval_proof) or (
+                plan_approval_source is not None
+            ):
+                raise JobValidationError(
+                    "inactive plan approval cannot retain gate proof or source"
+                )
+        elif not all(value is not None for value in approval_proof):
+            raise JobValidationError(
+                "active plan approval requires gate ID, agent session, and sequence"
+            )
+        if plan_approval_state == "boundary" and (
+            self.workflow_phase
+            not in {
+                WorkflowPhase.PLANNING,
+                WorkflowPhase.REVISING,
+                WorkflowPhase.REVIEWING,
+            }
+            or plan_approval_source is not None
+        ):
+            raise JobValidationError(
+                "plan approval boundary requires a planning or review phase"
+            )
+        if plan_approval_state == "awaiting" and (
+            self.status != JobStatus.AWAITING_USER
+            or self.clarification_kind != "workflow_plan_approval"
+            or self.workflow_phase != WorkflowPhase.REVIEWING
+            or plan_approval_source is not None
+        ):
+            raise JobValidationError(
+                "awaiting plan approval requires the reviewed-plan question"
+            )
+        if plan_approval_state in {"approved", "observed"} and (
+            plan_approval_source is None
+            or self.workflow_phase
+            not in {WorkflowPhase.IMPLEMENTING, WorkflowPhase.FINISHED}
+        ):
+            raise JobValidationError(
+                "approved plan requires a source and implementation phase"
+            )
+        if plan_approval_state == "rejected" and (
+            (
+                self.status != JobStatus.CANCELLED
+                and not (
+                    self.status == JobStatus.RECONCILING
+                    and self.terminal_intent_status == JobStatus.CANCELLED
+                )
+            )
+            or plan_approval_source is not None
+        ):
+            raise JobValidationError(
+                "rejected plan approval requires a cancelled job without a source"
+            )
+        if self.plan_approval_counted and (
+            plan_approval_source != "explicit"
+            or plan_approval_state not in {"approved", "observed"}
+        ):
+            raise JobValidationError(
+                "counted plan approval requires an accepted explicit approval"
+            )
+        if self.plan_approval_completion_pending and (
+            plan_approval_source != "explicit"
+            or plan_approval_state != "observed"
+            or self.workflow_phase != WorkflowPhase.FINISHED
+            or self.status not in {JobStatus.QUEUED, JobStatus.RECONCILING}
+            or not self.reconcile
+            or not self.result
+            or self.active_participant is not None
+            or self.prompt_operation_state != "none"
+        ):
+            raise JobValidationError(
+                "pending plan approval completion requires durable finished output"
+            )
         if (
             self.workflow_tier in {WorkflowTier.MEDIUM, WorkflowTier.HIGH_RISK}
             and self.workflow_phase
@@ -2035,6 +2180,15 @@ class AgentJob:
         ):
             raise JobValidationError(
                 "planned workflow cannot implement without approved plan and review"
+            )
+        if (
+            self.workflow_tier in {WorkflowTier.MEDIUM, WorkflowTier.HIGH_RISK}
+            and self.workflow_phase
+            in {WorkflowPhase.IMPLEMENTING, WorkflowPhase.FINISHED}
+            and plan_approval_state not in {"approved", "observed"}
+        ):
+            raise JobValidationError(
+                "planned workflow cannot implement without plan approval"
             )
         turn_phase = self._optional_string("workflow_turn_phase")
         if turn_phase is not None and turn_phase not in {

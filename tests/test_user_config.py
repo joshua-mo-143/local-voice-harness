@@ -278,5 +278,74 @@ class UserConfigWriteTests(unittest.TestCase):
             self.assertEqual(reloaded.providers.tts_provider, "venice")
 
 
+class PlanApprovalPreferenceTests(unittest.TestCase):
+    def test_default_is_ask_and_environment_override_selects_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "approval.json"
+            selected = user_config.plan_approval_preferences_path(
+                {"VOICE_HARNESS_PLAN_APPROVAL_FILE": str(path)}
+            )
+
+            self.assertEqual(selected, path)
+            preferences = user_config.load_plan_approval_preferences(path)
+            self.assertEqual(
+                preferences.mode,
+                user_config.PlanApprovalMode.ASK,
+            )
+            self.assertEqual(preferences.explicit_approval_count, 0)
+
+    def test_explicit_approvals_are_idempotent_and_offer_once_at_three(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "approval.json"
+            user_config.record_explicit_plan_approval("one", path=path)
+            user_config.record_explicit_plan_approval("one", path=path)
+            user_config.record_explicit_plan_approval("two", path=path)
+            preferences = user_config.record_explicit_plan_approval(
+                "three",
+                path=path,
+            )
+
+            self.assertEqual(preferences.explicit_approval_count, 3)
+            self.assertEqual(preferences.offer_pending_id, "three")
+            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600)
+
+    def test_offer_enables_auto_and_cli_reset_state_returns_to_ask(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "approval.json"
+            for approval_id in ("one", "two", "three"):
+                user_config.record_explicit_plan_approval(approval_id, path=path)
+
+            automatic = user_config.resolve_plan_approval_offer(
+                "three",
+                approved=True,
+                path=path,
+            )
+            asking = user_config.set_plan_approval_mode(
+                user_config.PlanApprovalMode.ASK,
+                path=path,
+            )
+
+            self.assertEqual(automatic.mode, user_config.PlanApprovalMode.AUTO)
+            self.assertTrue(automatic.offer_completed)
+            self.assertEqual(asking.mode, user_config.PlanApprovalMode.ASK)
+            self.assertEqual(asking.explicit_approval_count, 3)
+
+    def test_stale_offer_identity_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "approval.json"
+            for approval_id in ("one", "two", "three"):
+                user_config.record_explicit_plan_approval(approval_id, path=path)
+
+            with self.assertRaisesRegex(
+                UserConfigurationError,
+                "no longer pending",
+            ):
+                user_config.resolve_plan_approval_offer(
+                    "stale",
+                    approved=True,
+                    path=path,
+                )
+
+
 if __name__ == "__main__":
     unittest.main()
