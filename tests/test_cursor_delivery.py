@@ -7,10 +7,13 @@ import unittest
 from pathlib import Path
 
 from local_voice_harness.cursor.delivery import (
+    DELIVERY_CLAIM_SECONDS,
     DeliveryClaim,
     acknowledge_delivery,
     claim_delivery,
+    pending_deliveries,
     release_delivery,
+    renew_delivery,
 )
 from local_voice_harness.cursor.model import CursorJob
 from local_voice_harness.cursor.store import JobStore
@@ -87,6 +90,87 @@ class CursorDeliveryTests(unittest.TestCase):
         self.assertEqual(released.revision, 2)
         self.assertIsNone(claim_delivery(self.store, now=105))
         self.assertIsNotNone(claim_delivery(self.store, now=106))
+
+    def test_pending_deliveries_claims_only_the_oldest_window(self) -> None:
+        self.store.create(
+            CursorJob.from_dict(
+                {
+                    "id": "bbbbbbbbbbbb",
+                    "status": "completed",
+                    "request": "second",
+                    "result": "second",
+                    "created_at": 2,
+                    "completed_at": 2,
+                    "delivered": False,
+                }
+            )
+        )
+
+        claims = pending_deliveries(self.store)
+
+        self.assertEqual([claim.job.id for claim in claims], ["123456789abc"])
+        self.assertIsNone(self.store.get("bbbbbbbbbbbb").delivery_claim_token)
+
+    def test_renewal_extends_the_lease_without_incrementing_attempts(self) -> None:
+        claim = claim_delivery(self.store, now=100)
+        assert claim is not None
+
+        self.assertTrue(renew_delivery(self.store, claim.job.id, claim.token, now=249))
+
+        renewed = self.store.get(claim.job.id)
+        self.assertEqual(renewed.delivery_claimed_at, 249)
+        self.assertEqual(renewed.delivery_attempts, 1)
+        self.assertEqual(renewed.revision, 2)
+        self.assertTrue(
+            acknowledge_delivery(
+                self.store,
+                claim.job.id,
+                claim.token,
+                now=249 + DELIVERY_CLAIM_SECONDS - 1,
+            )
+        )
+
+    def test_expired_lease_cannot_be_renewed_or_acknowledged(self) -> None:
+        claim = claim_delivery(self.store, now=100)
+        assert claim is not None
+        expires_at = 100 + DELIVERY_CLAIM_SECONDS
+
+        self.assertFalse(
+            renew_delivery(self.store, claim.job.id, claim.token, now=expires_at)
+        )
+        self.assertFalse(
+            acknowledge_delivery(self.store, claim.job.id, claim.token, now=expires_at)
+        )
+        self.assertEqual(self.store.get(claim.job.id).revision, 1)
+
+    def test_reclaim_replaces_token_and_fences_old_acknowledgement(self) -> None:
+        original = claim_delivery(self.store, now=100)
+        assert original is not None
+        replacement = claim_delivery(
+            self.store,
+            now=100 + DELIVERY_CLAIM_SECONDS,
+        )
+        assert replacement is not None
+
+        self.assertNotEqual(original.token, replacement.token)
+        revision = self.store.get(original.job.id).revision
+        self.assertFalse(
+            acknowledge_delivery(
+                self.store,
+                original.job.id,
+                original.token,
+                now=401,
+            )
+        )
+        self.assertEqual(self.store.get(original.job.id).revision, revision)
+        self.assertTrue(
+            acknowledge_delivery(
+                self.store,
+                replacement.job.id,
+                replacement.token,
+                now=401,
+            )
+        )
 
 
 if __name__ == "__main__":

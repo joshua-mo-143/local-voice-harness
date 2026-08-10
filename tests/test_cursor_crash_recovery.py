@@ -7,6 +7,7 @@ from typing import Any
 
 import pytest
 
+from local_voice_harness.cursor.delivery import claim_delivery, renew_delivery
 from local_voice_harness.cursor.model import (
     CURRENT_SCHEMA_VERSION,
     CursorJob,
@@ -266,3 +267,20 @@ def test_delivery_crash_is_at_least_once_without_false_acknowledgement(
     assert state["playbacks"] == [JOB_ID] * expected_playbacks
     job = JobStore(tmp_path / "jobs", tmp_path / "legacy").get(JOB_ID)
     assert job.delivered
+
+
+def test_recovery_preserves_a_renewed_delivery_lease_until_expiry(
+    tmp_path: Path,
+) -> None:
+    _seed_delivery(tmp_path)
+    store = JobStore(tmp_path / "jobs", tmp_path / "legacy")
+    claim = claim_delivery(store, now=100)
+    assert claim is not None
+    assert renew_delivery(store, claim.job.id, claim.token, now=350)
+
+    _recover(tmp_path)
+
+    assert claim_delivery(store, now=649) is None
+    replacement = claim_delivery(store, now=650)
+    assert replacement is not None
+    assert replacement.token != claim.token

@@ -30,7 +30,10 @@ OUTPUT_ROOT = STATE_DIR
 OUTPUT_ROOT.mkdir(mode=0o700, parents=True, exist_ok=True)
 LOCK = threading.Lock()
 ACTIVE_STREAMS: dict[str, threading.Event] = {}
+PENDING_CANCELLATIONS: dict[str, float] = {}
 ACTIVE_STREAMS_LOCK = threading.Lock()
+PENDING_CANCELLATION_SECONDS = 120.0
+MAX_PENDING_CANCELLATIONS = 1024
 MAX_CHUNK_CHARS = 160
 REQUEST_ID = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 MODEL: Any = None
@@ -304,11 +307,26 @@ def _synthesize(
 
 
 def _cancel_stream(request_id: str) -> bool:
+    now = time.monotonic()
     with ACTIVE_STREAMS_LOCK:
+        expired = [
+            pending_id
+            for pending_id, expires_at in PENDING_CANCELLATIONS.items()
+            if expires_at <= now
+        ]
+        for pending_id in expired:
+            PENDING_CANCELLATIONS.pop(pending_id, None)
         cancelled = ACTIVE_STREAMS.get(request_id)
-    if cancelled is None:
-        return False
-    cancelled.set()
+        if cancelled is None:
+            if len(PENDING_CANCELLATIONS) >= MAX_PENDING_CANCELLATIONS:
+                oldest = min(
+                    PENDING_CANCELLATIONS,
+                    key=PENDING_CANCELLATIONS.__getitem__,
+                )
+                PENDING_CANCELLATIONS.pop(oldest, None)
+            PENDING_CANCELLATIONS[request_id] = now + PENDING_CANCELLATION_SECONDS
+        else:
+            cancelled.set()
     return True
 
 
@@ -328,6 +346,9 @@ def _stream_response(
     with ACTIVE_STREAMS_LOCK:
         if request_id in ACTIVE_STREAMS:
             raise ValueError("request_id is already active")
+        pending_cancel = PENDING_CANCELLATIONS.pop(request_id, None)
+        if pending_cancel is not None and pending_cancel > time.monotonic():
+            cancelled.set()
         ACTIVE_STREAMS[request_id] = cancelled
 
     generation_seconds = 0.0
@@ -395,6 +416,8 @@ def _stream_response(
                 ),
             },
         )
+        if cancelled.is_set() and not emitted:
+            shutil.rmtree(output_dir, ignore_errors=True)
     except (BrokenPipeError, ConnectionResetError):
         cancelled.set()
         shutil.rmtree(output_dir, ignore_errors=True)
@@ -416,6 +439,10 @@ class RequestHandler(socketserver.StreamRequestHandler):
             request = json.loads(line)
             if request.get("op") == "cancel":
                 request_id = str(request.get("request_id", ""))
+                if not REQUEST_ID.fullmatch(request_id):
+                    raise ValueError(
+                        "request_id must contain 1-64 letters, numbers, '_' or '-'"
+                    )
                 response = {
                     "ok": True,
                     "cancelled": _cancel_stream(request_id),

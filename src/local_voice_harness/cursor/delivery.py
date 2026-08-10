@@ -8,7 +8,9 @@ from .model import CursorJob, JobStatus
 from .store import JobStore
 
 DELIVERY_CLAIM_SECONDS = 300.0
+DELIVERY_RENEW_SECONDS = DELIVERY_CLAIM_SECONDS / 2
 DELIVERY_RETRY_SECONDS = 5.0
+DELIVERY_WINDOW = 1
 DELIVERABLE_STATUSES = frozenset(
     {
         JobStatus.AWAITING_USER,
@@ -27,6 +29,14 @@ class DeliveryClaim:
 
 
 DeliveryClaims = list[DeliveryClaim]
+
+
+def _claim_is_live(job: CursorJob, now: float) -> bool:
+    return (
+        bool(job.delivery_claim_token)
+        and job.delivery_claimed_at is not None
+        and now - job.delivery_claimed_at < DELIVERY_CLAIM_SECONDS
+    )
 
 
 def claim_delivery(
@@ -52,11 +62,7 @@ def claim_delivery(
             and completed_age < 1
         ):
             return None
-        if (
-            job.delivery_claim_token
-            and job.delivery_claimed_at is not None
-            and claimed_at - job.delivery_claimed_at < DELIVERY_CLAIM_SECONDS
-        ):
+        if _claim_is_live(job, claimed_at):
             return None
         return job.claim_delivery(uuid.uuid4().hex, claimed_at=claimed_at)
 
@@ -79,6 +85,27 @@ def claim_delivery(
     return None
 
 
+def renew_delivery(
+    store: JobStore,
+    job_id: str,
+    token: str,
+    *,
+    now: float | None = None,
+) -> bool:
+    renewed_at = time.time() if now is None else now
+
+    def renew(job: CursorJob) -> CursorJob | None:
+        if (
+            job.delivery_claim_token != token
+            or job.delivered
+            or not _claim_is_live(job, renewed_at)
+        ):
+            return None
+        return job.renew_delivery(claimed_at=renewed_at)
+
+    return store.update(job_id, renew) is not None
+
+
 def acknowledge_delivery(
     store: JobStore,
     job_id: str,
@@ -89,7 +116,11 @@ def acknowledge_delivery(
     delivered_at = time.time() if now is None else now
 
     def acknowledge(job: CursorJob) -> CursorJob | None:
-        if job.delivery_claim_token != token or job.delivered:
+        if (
+            job.delivery_claim_token != token
+            or job.delivered
+            or not _claim_is_live(job, delivered_at)
+        ):
             return None
         return job.acknowledge_delivery(delivered_at=delivered_at)
 
@@ -132,8 +163,12 @@ def release_deliveries(store: JobStore, claims: DeliveryClaims) -> None:
     claims.clear()
 
 
-def pending_deliveries(store: JobStore) -> list[DeliveryClaim]:
+def pending_deliveries(
+    store: JobStore, *, limit: int = DELIVERY_WINDOW
+) -> list[DeliveryClaim]:
+    if limit <= 0:
+        raise ValueError("delivery limit must be positive")
     claims: list[DeliveryClaim] = []
-    while claim := claim_delivery(store):
+    while len(claims) < limit and (claim := claim_delivery(store)):
         claims.append(claim)
     return claims

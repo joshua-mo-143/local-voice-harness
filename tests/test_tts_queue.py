@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import threading
 import unittest
@@ -8,6 +9,7 @@ from pathlib import Path
 from unittest import mock
 
 from local_voice_harness.errors import HarnessError
+from local_voice_harness.tts import queue as tts_queue
 from local_voice_harness.tts.queue import (
     PlaybackQueue,
     PlaybackRequest,
@@ -27,21 +29,30 @@ class PlaybackQueueTests(unittest.TestCase):
 
         self.assertEqual(
             prefetch.call_args_list,
-            [mock.call("first"), mock.call("second")],
+            [mock.call("first")],
         )
 
     def test_prefetch_wait_can_be_interrupted(self) -> None:
         handle = PrefetchHandle.__new__(PrefetchHandle)
         handle.text = "slow response"
         handle._event = threading.Event()
-        handle._result = None
+        handle._result = PrefetchedUtterance(
+            sample_rate=0,
+            chunks=[],
+            chunk_texts=[],
+            error=HarnessError("cancelled"),
+        )
         should_interrupt = mock.Mock(return_value=True)
 
-        with mock.patch("local_voice_harness.tts.queue.STREAM_POLL_SECONDS", 0.001):
+        with (
+            mock.patch("local_voice_harness.tts.queue.STREAM_POLL_SECONDS", 0.001),
+            mock.patch.object(handle, "discard") as discard,
+        ):
             result = handle.wait(timeout=1, should_interrupt=should_interrupt)
 
         self.assertIsNone(result)
         should_interrupt.assert_called_once()
+        discard.assert_called_once()
 
     def test_drain_reports_interruption_while_prefetching(self) -> None:
         queue = PlaybackQueue()
@@ -57,7 +68,10 @@ class PlaybackQueueTests(unittest.TestCase):
             on_played=on_played,
         )
 
-        handle.wait.assert_called_once_with(should_interrupt=should_interrupt)
+        handle.wait.assert_called_once_with(
+            should_interrupt=should_interrupt,
+            on_poll=None,
+        )
         handle.discard.assert_called_once()
         self.assertEqual(len(queue), 0)
         self.assertEqual(batch[0][1:], (True, request))
@@ -177,6 +191,8 @@ class PlaybackQueueTests(unittest.TestCase):
         handle._event = threading.Event()
         handle._discard_lock = threading.Lock()
         handle._discarded = False
+        handle._thread = mock.Mock()
+        handle._thread.is_alive.return_value = False
         with tempfile.TemporaryDirectory() as temporary:
             stream_dir = Path(temporary) / "stream-request"
             stream_dir.mkdir()
@@ -189,11 +205,142 @@ class PlaybackQueueTests(unittest.TestCase):
                 error=HarnessError("stream failed"),
             )
             handle._event.set()
-            with mock.patch("local_voice_harness.tts.queue.threading.Thread") as thread:
-                handle.discard()
-                cleanup = thread.call_args.kwargs["target"]
-                cleanup()
-                handle.discard()
+            handle.discard()
+            handle.discard()
 
             self.assertFalse(stream_dir.exists())
-            thread.assert_called_once()
+            handle._thread.join.assert_called_once_with(
+                timeout=tts_queue.PREFETCH_JOIN_SECONDS
+            )
+
+    def test_discard_cancels_submitted_request_and_joins_worker(self) -> None:
+        submitted = threading.Event()
+        stream_socket = mock.Mock()
+        stream_socket.sendall.side_effect = lambda _request: submitted.set()
+        with (
+            mock.patch.object(tts_queue.socket, "socket", return_value=stream_socket),
+            mock.patch.object(
+                tts_queue.select,
+                "select",
+                return_value=([], [], []),
+            ),
+            mock.patch.object(tts_queue, "STREAM_TIMEOUT_SECONDS", 60),
+            mock.patch.object(
+                tts_queue,
+                "unix_request",
+                return_value=b'{"ok":true,"cancelled":true}\n',
+            ) as send,
+        ):
+            handle = PrefetchHandle("slow response")
+            self.assertTrue(submitted.wait(timeout=1))
+            handle.discard()
+            handle.discard()
+
+        self.assertFalse(handle._thread.is_alive())
+        stream_socket.close.assert_called_once()
+        send.assert_called_once()
+        request = json.loads(send.call_args.args[1])
+        self.assertEqual(
+            request,
+            {"op": "cancel", "request_id": handle.request_id},
+        )
+
+    def test_cancel_before_submission_never_starts_or_cancels_server_work(self) -> None:
+        started = threading.Event()
+
+        def wait_for_cancel(
+            _text: str,
+            *,
+            cancelled: threading.Event,
+            **_kwargs: object,
+        ) -> PrefetchedUtterance:
+            started.set()
+            cancelled.wait(timeout=2)
+            raise HarnessError("cancelled before submission")
+
+        with (
+            mock.patch.object(
+                tts_queue,
+                "_prefetch_utterance",
+                side_effect=wait_for_cancel,
+            ),
+            mock.patch.object(tts_queue, "unix_request") as send,
+        ):
+            handle = PrefetchHandle("cancel immediately")
+            self.assertTrue(started.wait(timeout=1))
+            handle.discard()
+
+        self.assertFalse(handle._thread.is_alive())
+        send.assert_not_called()
+
+    def test_truncated_prefetch_stream_fails_and_closes_socket(self) -> None:
+        request_id = "request-1"
+        events = [
+            {
+                "ok": True,
+                "event": "start",
+                "request_id": request_id,
+                "sample_rate": 24_000,
+                "chunks": 1,
+            },
+            {
+                "ok": True,
+                "event": "chunk",
+                "request_id": request_id,
+                "index": 0,
+                "output": "/tmp/nonexistent-prefetch.wav",
+                "text": "partial",
+            },
+        ]
+        stream_socket = mock.Mock()
+        stream_socket.recv.side_effect = [
+            b"".join(json.dumps(event).encode() + b"\n" for event in events),
+            b"",
+        ]
+
+        with (
+            mock.patch.object(tts_queue.socket, "socket", return_value=stream_socket),
+            mock.patch.object(
+                tts_queue.select,
+                "select",
+                return_value=([stream_socket], [], []),
+            ),
+            self.assertRaisesRegex(HarnessError, "before completion"),
+        ):
+            tts_queue._prefetch_utterance(
+                "partial",
+                request_id=request_id,
+                cancelled=threading.Event(),
+                register_socket=mock.Mock(),
+                submit_request=mock.Mock(),
+                clear_socket=mock.Mock(),
+            )
+
+        stream_socket.close.assert_called_once()
+        stream_socket.settimeout.assert_called_once_with(
+            tts_queue.PREFETCH_CONNECT_SECONDS
+        )
+
+    def test_silent_prefetch_stream_times_out_and_closes_socket(self) -> None:
+        stream_socket = mock.Mock()
+
+        with (
+            mock.patch.object(tts_queue.socket, "socket", return_value=stream_socket),
+            mock.patch.object(tts_queue.select, "select", return_value=([], [], [])),
+            mock.patch.object(tts_queue, "STREAM_TIMEOUT_SECONDS", 1),
+            mock.patch.object(tts_queue.time, "monotonic", side_effect=[0, 2]),
+            self.assertRaisesRegex(HarnessError, "timed out"),
+        ):
+            tts_queue._prefetch_utterance(
+                "silent",
+                request_id="request-1",
+                cancelled=threading.Event(),
+                register_socket=mock.Mock(),
+                submit_request=mock.Mock(),
+                clear_socket=mock.Mock(),
+            )
+
+        stream_socket.close.assert_called_once()
+        stream_socket.settimeout.assert_called_once_with(
+            tts_queue.PREFETCH_CONNECT_SECONDS
+        )

@@ -19,8 +19,8 @@ from pathlib import Path
 from ..config import STATE_DIR, TTS_SOCKET
 from ..errors import HarnessError
 from ..ipc import unix_request
+from .stream import STREAM_POLL_SECONDS, STREAM_TIMEOUT_SECONDS, TTSStreamParser
 
-STREAM_POLL_SECONDS = 0.08
 PLAYBACK_LATENCY = os.environ.get("VOICE_HARNESS_PLAYBACK_LATENCY", "100ms")
 
 
@@ -217,16 +217,6 @@ class StreamingPlayback:
             if process is not None and process.poll() is None:
                 self._terminate_process()
 
-    @staticmethod
-    def _events_from_buffer(buffer: bytearray) -> list[dict[str, object]]:
-        events: list[dict[str, object]] = []
-        while b"\n" in buffer:
-            line, _, remainder = buffer.partition(b"\n")
-            buffer[:] = remainder
-            if line:
-                events.append(json.loads(line))
-        return events
-
     def run(
         self,
         *,
@@ -240,7 +230,8 @@ class StreamingPlayback:
         worker: threading.Thread | None = None
         done: dict[str, object] = {}
         sentinel_sent = False
-        buffer = bytearray()
+        parser = TTSStreamParser(self.request_id)
+        last_response = time.monotonic()
         stream_socket = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         with self._state_lock:
             self._socket = stream_socket
@@ -261,48 +252,26 @@ class StreamingPlayback:
                 if should_interrupt is not None and should_interrupt():
                     self.cancel()
                     break
-                if done:
-                    if worker is None:
-                        raise HarnessError(
-                            "TTS stream completed before playback started"
-                        )
-                    if not sentinel_sent:
-                        chunks.put(None)
-                        sentinel_sent = True
-                    worker.join(
-                        timeout=(
-                            0 if should_interrupt is not None else STREAM_POLL_SECONDS
-                        )
-                    )
-                    if not worker.is_alive():
-                        break
-                    continue
                 readable, _, _ = select.select(
                     [stream_socket], [], [], STREAM_POLL_SECONDS
                 )
                 if not readable:
+                    if time.monotonic() - last_response >= STREAM_TIMEOUT_SECONDS:
+                        raise HarnessError("TTS stream timed out")
                     continue
                 data = stream_socket.recv(64 * 1024)
                 if not data:
                     if self.cancelled.is_set():
                         break
-                    if buffer:
-                        raise HarnessError("TTS backend returned an incomplete event")
-                    if not done:
-                        raise HarnessError("TTS stream ended before completion")
+                    done = parser.finish()
                     break
-                buffer.extend(data)
-                for event in self._events_from_buffer(buffer):
-                    if not event.get("ok"):
-                        raise HarnessError(
-                            f"TTS backend failed: {event.get('error', 'unknown error')}"
-                        )
+                last_response = time.monotonic()
+                for event in parser.feed(data):
                     kind = event.get("event")
                     if kind == "start":
-                        sample_rate = int(str(event["sample_rate"]))
                         worker = threading.Thread(
                             target=self._play_chunks,
-                            args=(chunks, sample_rate),
+                            args=(chunks, parser.sample_rate),
                             name=f"voice-playback-{self.request_id[:8]}",
                             daemon=True,
                         )
@@ -312,9 +281,9 @@ class StreamingPlayback:
                         self._paths.add(path)
                         chunks.put(event)
                     elif kind == "done":
-                        done = event
-                    else:
-                        raise HarnessError(f"unknown TTS stream event: {kind}")
+                        if not sentinel_sent:
+                            chunks.put(None)
+                            sentinel_sent = True
             if not sentinel_sent:
                 chunks.put(None)
             if worker is not None:
