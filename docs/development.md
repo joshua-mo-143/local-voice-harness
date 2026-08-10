@@ -1,5 +1,58 @@
 # Development
 
+## Run the current checkout
+
+The repository-local launcher runs the branch through `uv` while redirecting its
+configuration and durable state to ignored paths in the checkout:
+
+```fish
+scripts/dev.sh text "What is two plus two?"
+```
+
+The launcher sets `XDG_CONFIG_HOME` to `.dev/config` and `XDG_STATE_HOME` to
+`.dev/state`. For example, branch-specific backend configuration belongs at
+`.dev/config/voice-harness/backends.toml`, and durable jobs are stored below
+`.dev/state/voice-harness/`. Existing `VOICE_HARNESS_*` values are inherited, so
+temporary overrides remain available:
+
+```fish
+env VOICE_HARNESS_LLM_PROVIDER=venice scripts/dev.sh text "Summarize my open work"
+```
+
+To run the checkout's wake daemon in the foreground:
+
+```fish
+systemctl --user stop voice-harness-wake.service
+scripts/dev.sh wake
+# Press Ctrl-C when finished.
+systemctl --user start voice-harness-wake.service
+```
+
+Before starting, `scripts/dev.sh wake` checks
+`voice-harness-wake.service`. It refuses to run when that unit is active and prints
+the stop and restore commands; it also refuses to run if the service state cannot
+be checked safely. The launcher never stops, restarts, edits, or installs a service.
+Its command surface is intentionally limited to `text` and `wake`, so it does not
+expose service or credential management.
+
+This is branch testing isolation, not a complete runtime profile:
+
+- `XDG_RUNTIME_DIR` is preserved. Runtime sockets, recording paths, locks, and
+  other transient resources remain shared.
+- The installed STT, TTS, and LLM services and sockets are reused, and those
+  services still use their installed configuration. This workflow is mainly for
+  application, routing, integration, and wake-daemon development.
+- Wake and audio settings are loaded when the process starts. Hot reload is out
+  of scope; restart the foreground process after changing an override.
+- Only one wake listener should own the microphone and shared runtime. Stop the
+  installed wake unit yourself before using the foreground listener, then restore
+  it afterward.
+- Desktop Secret Service credentials and external integrations are not isolated.
+  The launcher can read credentials as the application normally does, but offers
+  no command that changes them.
+- A full profile manager, parallel systemd units, socket namespacing, dynamic
+  ports, service cloning, and profile CRUD are explicitly out of scope.
+
 ## Quality checks
 
 The default development environment contains only the package and quality tools;
