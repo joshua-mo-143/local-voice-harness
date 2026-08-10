@@ -695,6 +695,37 @@ class ProcessUtteranceTests(unittest.TestCase):
         self.assertEqual(request.issue_scope, "ENG")
         self.assertEqual(request.issue_scope_source, "linear")
 
+    def test_uncertain_bare_ticket_batch_requests_repository_scope(self) -> None:
+        daemon = _bare_daemon()
+        text = "Can you work on issues 92, 93 and 95?"
+        with (
+            mock.patch.object(wake_daemon, "transcribe", return_value=text),
+            mock.patch.object(wake_daemon, "start_components"),
+            mock.patch.object(
+                wake_daemon,
+                "request_context",
+                return_value=RequestContext(text),
+            ),
+            mock.patch.object(
+                wake_daemon,
+                "route_intent",
+                return_value=IntentRoute(Intent.UNCERTAIN, "low"),
+            ),
+            mock.patch.object(wake_daemon, "cursor_turn") as cursor_turn,
+            mock.patch.object(wake_daemon, "qwen_turn") as qwen_turn,
+            mock.patch.object(
+                daemon,
+                "play_response",
+                return_value=({"played_text": ""}, None),
+            ) as play,
+            mock.patch.object(wake_daemon, "notify"),
+        ):
+            daemon.process_utterance(AUDIO_GENERATION, woke=False)
+
+        cursor_turn.assert_not_called()
+        qwen_turn.assert_not_called()
+        play.assert_called_once_with(wake_daemon.MISSING_ISSUE_SCOPE_RESPONSE)
+
     def test_failed_fresh_turn_stops_components(self) -> None:
         daemon = _bare_daemon()
         with (
@@ -1150,7 +1181,9 @@ class ComponentSynchronizationTests(unittest.TestCase):
             return "OK", None
 
         with (
-            mock.patch.object(wake_daemon, "qwen_turn", side_effect=warm_qwen),
+            mock.patch.object(
+                wake_daemon, "qwen_turn", side_effect=warm_qwen
+            ) as qwen_turn,
             mock.patch.object(
                 wake_daemon,
                 "start_components",
@@ -1173,6 +1206,10 @@ class ComponentSynchronizationTests(unittest.TestCase):
             cleanup.join(timeout=2)
 
         self.assertEqual(events, ["started", "stopped"])
+        qwen_turn.assert_called_once_with(
+            "Reply with only OK. Do not call a tool.",
+            allow_tools=False,
+        )
 
 
 class PlaybackBargeInTests(unittest.TestCase):
@@ -1997,7 +2034,7 @@ class CompletedFollowupContextTests(unittest.TestCase):
         self.assertEqual(request.job_id, "aaaaaaaaaaaa")
         self.assertIs(daemon.completed_followup, retained)
 
-    def test_non_actionable_cursor_route_cannot_reach_tools(self) -> None:
+    def test_non_actionable_submit_uses_deterministic_safe_response(self) -> None:
         daemon = _bare_daemon()
         cursor_turn = self._run_route(
             daemon,
@@ -2006,8 +2043,7 @@ class CompletedFollowupContextTests(unittest.TestCase):
         )
 
         cursor_turn.assert_not_called()
-        self._last_qwen.assert_called_once()
-        self.assertFalse(self._last_qwen.call_args.kwargs["allow_tools"])
+        self._last_qwen.assert_not_called()
 
     def test_explicit_submit_clears_context(self) -> None:
         daemon = _bare_daemon()

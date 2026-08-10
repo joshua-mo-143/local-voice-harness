@@ -25,9 +25,17 @@ from .config import (
     TTS_SOCKET,
 )
 from .errors import HarnessError
-from .intent import ForkIntent, Intent, IntentRoute, decide_fork_intent, route_intent
+from .intent import (
+    NON_ACTIONABLE_SUBMIT_RESPONSE,
+    ForkIntent,
+    Intent,
+    IntentRoute,
+    decide_fork_intent,
+    route_intent,
+)
 from .ipc import socket_ready
 from .llm import qwen_response
+from .ticket_targets import MISSING_ISSUE_SCOPE_RESPONSE, extract_ticket_targets
 from .tts.client import stream_and_play
 from .vocabulary import resolve_aliases
 
@@ -80,20 +88,18 @@ def respond(text: str) -> None:
                 or context.github_pull_request
                 else {}
             )
-            # A focused ticket/repository/PR is a strong, validated signal, so a
-            # submit classification acts on it even when the router omits or lowers
-            # its confidence (some models do not populate the field reliably).
-            focused_submit_target = bool(
-                context.github_repository
-                or context.github_issue
-                or context.github_pull_request
-                or context.external_issue_reference
-                or context.issue_scope
+            extraction = extract_ticket_targets(
+                text,
+                scope_source=context.issue_scope_source,
+                scope=context.issue_scope,
             )
-            submit_requested = route.intent == Intent.AGENT_SUBMIT and (
-                route.actionable or focused_submit_target
-            )
-            if submit_requested:
+            missing_ticket_scope = extraction.has_unresolved_scope and route.intent in {
+                Intent.AGENT_SUBMIT,
+                Intent.UNCERTAIN,
+            }
+            if missing_ticket_scope:
+                response = MISSING_ISSUE_SCOPE_RESPONSE
+            elif route.actionable and route.intent == Intent.AGENT_SUBMIT:
                 response = cursor_turn(
                     CursorTurnRequest(
                         context.text,
@@ -106,6 +112,8 @@ def respond(text: str) -> None:
                     ),
                     delivery_claims=delivery_claims,
                 )[0]
+            elif route.intent == Intent.AGENT_SUBMIT:
+                response = NON_ACTIONABLE_SUBMIT_RESPONSE
             elif route.actionable and route.intent in CURSOR_MANAGEMENT_ACTIONS:
                 response = cursor_turn(
                     CursorTurnRequest(
