@@ -8,6 +8,8 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any
 
+from ..questions import Question, QuestionError
+
 CURRENT_SCHEMA_VERSION = 8
 LEGACY_SCHEMA_VERSIONS = frozenset(range(CURRENT_SCHEMA_VERSION))
 LEGACY_BOOT_ID = "legacy-unknown"
@@ -115,6 +117,7 @@ _BOOL_FIELDS = frozenset(
         "worktree_manual_inspection_required",
         "announcement_dismissed",
         "announcement_repeated",
+        "interactive_questionnaire_blocked",
     }
 )
 _INT_FIELDS = frozenset(
@@ -201,6 +204,7 @@ _STRING_FIELDS = frozenset(
         "error",
         "question",
         "clarification_kind",
+        "continuation_answer",
         "turn_token",
         "worker_token",
         "worker_boot_id",
@@ -469,6 +473,11 @@ class CursorJob:
                 values[field] = _string(values[field], field)
         for key, value in values.items():
             _validate_json(value, key)
+        if values.get("voice_question") is not None:
+            try:
+                Question.from_dict(values["voice_question"])
+            except QuestionError as exc:
+                raise JobValidationError(f"invalid voice_question: {exc}") from exc
 
         job_id = str(values.get("id") or "")
         if not re.fullmatch(r"[0-9a-f]{12}", job_id):
@@ -918,6 +927,19 @@ class CursorJob:
     def question(self) -> str | None:
         value = self._values.get("question")
         return str(value) if value is not None else None
+
+    @property
+    def voice_question(self) -> dict[str, object] | None:
+        value = self._values.get("voice_question")
+        return dict(value) if isinstance(value, dict) else None
+
+    @property
+    def continuation_answer(self) -> str | None:
+        return self._optional_string("continuation_answer")
+
+    @property
+    def interactive_questionnaire_blocked(self) -> bool:
+        return self._boolean_field("interactive_questionnaire_blocked")
 
     @property
     def utterance(self) -> str | None:

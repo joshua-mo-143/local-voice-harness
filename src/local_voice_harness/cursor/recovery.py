@@ -11,6 +11,8 @@ from typing import cast
 from ..errors import HarnessError
 from ..integrations.github import GitHubClient, GitHubError, GitHubRepository
 from ..integrations.herdr import HerdrClient, HerdrError
+from ..questions import PromptOperationState, QuestionState
+from . import questions as question_adapter
 from .model import TERMINAL_STATUSES, CursorJob, JobStatus
 from .store import JobStore, LegacyWorkerInspector
 from .worker_lifecycle import (
@@ -28,6 +30,7 @@ UNCERTAIN_RECONCILE_MAX_ATTEMPTS = 6
 OPERATION_RECONCILE_BASE_SECONDS = 5.0
 OPERATION_RECONCILE_MAX_SECONDS = 60.0
 DELIVERY_RETRY_SECONDS = 5.0
+PROMPT_ABSENT_OBSERVATIONS = 2
 
 HerdrFactory = Callable[[], HerdrClient]
 GitHubFactory = Callable[[], GitHubClient]
@@ -520,6 +523,161 @@ def _target_release_owner_alive(
     )
 
 
+def _reconcile_question_prompt(
+    store: JobStore,
+    job: CursorJob,
+    *,
+    now: float,
+    herdr_factory: HerdrFactory,
+    is_worker_alive: Callable[[CursorJob], bool],
+) -> None:
+    question = question_adapter.current(job)
+    if (
+        question is None
+        or question.state != QuestionState.DISPATCHING
+        or question.prompt_state
+        not in {PromptOperationState.SUBMITTED, PromptOperationState.OBSERVED}
+        or is_worker_alive(job)
+    ):
+        return
+
+    observed_started = question.prompt_state == PromptOperationState.OBSERVED
+    current_sequence: int | None = None
+    current_status = ""
+    if not observed_started:
+        try:
+            client = herdr_factory()
+            client.ensure_server()
+            agent = client.get_agent(job.herdr_target or "")
+        except (HarnessError, HerdrError):
+            return
+        value = agent.get("state_change_seq")
+        current_sequence = (
+            value if isinstance(value, int) and not isinstance(value, bool) else None
+        )
+        current_status = str(agent.get("agent_status") or "")
+        observed_started = current_status == "working" or (
+            current_sequence is not None
+            and question.prompt_baseline_seq is not None
+            and current_sequence != question.prompt_baseline_seq
+        )
+
+    def reconcile(current: CursorJob) -> CursorJob | None:
+        current_question = question_adapter.current(current)
+        if (
+            current_question is None
+            or current_question.id != question.id
+            or current_question.prompt_state != question.prompt_state
+            or is_worker_alive(current)
+        ):
+            return None
+        if observed_started:
+            return current.evolve(
+                status=JobStatus.QUEUED,
+                queued_at=now,
+                reconcile=True,
+                worker_pid=None,
+                worker_boot_id=None,
+                worker_process_start=None,
+                worker_token=None,
+                voice_question=question_adapter.envelope(
+                    current_question,
+                    QuestionState.DISPATCHING,
+                    prompt_state=PromptOperationState.OBSERVED,
+                ),
+            )
+        if (
+            current_question.prompt_baseline_seq is None
+            or current_sequence is None
+            or current_status not in {"idle", "done"}
+        ):
+            message = (
+                "Cursor clarification dispatch is ambiguous and requires "
+                "manual attention."
+            )
+            return current.evolve_for_delivery(
+                now=now,
+                status=JobStatus.BLOCKED,
+                result=message,
+                completed_at=now,
+                worker_pid=None,
+                worker_boot_id=None,
+                worker_process_start=None,
+                worker_token=None,
+            )
+        observations = current_question.prompt_absent_observations + 1
+        if observations < PROMPT_ABSENT_OBSERVATIONS:
+            return current.evolve(
+                voice_question=question_adapter.envelope(
+                    current_question,
+                    QuestionState.DISPATCHING,
+                    prompt_absent_observations=observations,
+                )
+            )
+        return current.evolve(
+            status=JobStatus.QUEUED,
+            queued_at=now,
+            reconcile=False,
+            worker_pid=None,
+            worker_boot_id=None,
+            worker_process_start=None,
+            worker_token=None,
+            voice_question=question_adapter.envelope(
+                current_question,
+                QuestionState.DISPATCHING,
+                prompt_state=PromptOperationState.PLANNED,
+                prompt_baseline_seq=None,
+                prompt_submitted_at=None,
+                prompt_absent_observations=0,
+            ),
+        )
+
+    store.update(job.id, reconcile)
+
+
+def _reconcile_interactive_questionnaire(
+    store: JobStore,
+    job: CursorJob,
+    *,
+    now: float,
+    herdr_factory: HerdrFactory,
+) -> None:
+    if (
+        job.status != JobStatus.BLOCKED
+        or not job.interactive_questionnaire_blocked
+        or not job.herdr_target
+    ):
+        return
+    try:
+        client = herdr_factory()
+        client.ensure_server()
+        agent = client.get_agent(job.herdr_target)
+    except (HarnessError, HerdrError):
+        return
+    if agent.get("interactive_ready") is False:
+        return
+
+    def resume(current: CursorJob) -> CursorJob | None:
+        if (
+            current.status != JobStatus.BLOCKED
+            or not current.interactive_questionnaire_blocked
+            or current.herdr_target != job.herdr_target
+        ):
+            return None
+        return current.evolve(
+            status=JobStatus.QUEUED,
+            remove=frozenset({"interactive_questionnaire_blocked"}),
+            queued_at=now,
+            reconcile=True,
+            worker_pid=None,
+            worker_boot_id=None,
+            worker_process_start=None,
+            worker_token=None,
+        )
+
+    store.update(job.id, resume)
+
+
 def recover_jobs(
     store: JobStore,
     *,
@@ -580,6 +738,21 @@ def recover_jobs(
                 herdr_factory=herdr_factory,
                 github_factory=github_factory,
             )
+            existing = store.get(existing.id)
+        _reconcile_interactive_questionnaire(
+            store,
+            existing,
+            now=recovered_at,
+            herdr_factory=herdr_factory,
+        )
+        existing = store.get(existing.id)
+        _reconcile_question_prompt(
+            store,
+            existing,
+            now=recovered_at,
+            herdr_factory=herdr_factory,
+            is_worker_alive=is_worker_alive,
+        )
     for existing in store.list():
         if (
             existing.status
@@ -606,6 +779,12 @@ def recover_jobs(
 
         def recover(job: CursorJob) -> CursorJob | None:
             nonlocal should_launch, release
+            question = question_adapter.current(job)
+            prompt_state = (
+                question.prompt_state
+                if question is not None and question.state == QuestionState.DISPATCHING
+                else None
+            )
             take_release = (
                 job.target_release_pending
                 and not _target_release_owner_alive(
@@ -654,6 +833,8 @@ def recover_jobs(
                     job.delivered
                     and job.herdr_target
                     and recovered_at >= job.next_reconcile_at
+                    and not job.interactive_questionnaire_blocked
+                    and prompt_state != PromptOperationState.SUBMITTED
                 ):
                     should_launch = True
                     return job.evolve(
@@ -686,7 +867,23 @@ def recover_jobs(
                     )
             elif job.status == JobStatus.ROUTING:
                 if not is_worker_alive(job):
+                    if prompt_state == PromptOperationState.SUBMITTED:
+                        return None
                     should_launch = True
+                    if prompt_state == PromptOperationState.OBSERVED:
+                        return job.evolve(
+                            status=JobStatus.QUEUED,
+                            queued_at=recovered_at,
+                            reconcile=True,
+                            target_release_token=release_token,
+                            target_release_owner_pid=owner_pid,
+                            target_release_owner_boot_id=owner_boot_id,
+                            target_release_owner_start=owner_start,
+                            worker_pid=None,
+                            worker_boot_id=None,
+                            worker_process_start=None,
+                            worker_token=None,
+                        )
                     return job.evolve(
                         status=JobStatus.QUEUED,
                         remove=frozenset({"reconcile"}),
@@ -702,8 +899,24 @@ def recover_jobs(
                     )
             elif job.status in {JobStatus.RUNNING, JobStatus.RECONCILING}:
                 if not is_worker_alive(job):
+                    if prompt_state == PromptOperationState.SUBMITTED:
+                        return None
                     if job.herdr_target:
                         should_launch = True
+                        if prompt_state == PromptOperationState.PLANNED:
+                            return job.evolve(
+                                status=JobStatus.QUEUED,
+                                remove=frozenset({"reconcile"}),
+                                queued_at=recovered_at,
+                                target_release_token=release_token,
+                                target_release_owner_pid=owner_pid,
+                                target_release_owner_boot_id=owner_boot_id,
+                                target_release_owner_start=owner_start,
+                                worker_pid=None,
+                                worker_boot_id=None,
+                                worker_process_start=None,
+                                worker_token=None,
+                            )
                         return job.evolve(
                             status=JobStatus.QUEUED,
                             reconcile=True,

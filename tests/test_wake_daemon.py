@@ -20,6 +20,7 @@ from local_voice_harness.cursor.service import CursorTurnRequest
 from local_voice_harness.cursor.store import JobStore
 from local_voice_harness.errors import HarnessError
 from local_voice_harness.intent import Intent, IntentRoute
+from local_voice_harness.questions import AnswerProvenance
 from local_voice_harness.tts.queue import PlaybackQueue, PlaybackRequest
 from local_voice_harness.wake import daemon as wake_daemon
 from local_voice_harness.wake.daemon import WakeConversationDaemon
@@ -520,6 +521,17 @@ class ProcessUtteranceTests(unittest.TestCase):
                 return_value=IntentRoute(Intent.CURSOR_REPLY, "high"),
             ),
             mock.patch.object(
+                daemon,
+                "_pending_cursor_question",
+                return_value=wake_daemon.PendingQuestionSnapshot(
+                    "oldjob123456",
+                    "Which repository?",
+                    "repository",
+                    "question-1",
+                    "oldjob123456-routing-0",
+                ),
+            ),
+            mock.patch.object(
                 wake_daemon, "cursor_turn", return_value=("continued", None)
             ) as cursor_turn,
             mock.patch.object(wake_daemon, "qwen_turn") as qwen_turn,
@@ -539,10 +551,68 @@ class ProcessUtteranceTests(unittest.TestCase):
                 utterance="use the api repository",
                 action="reply",
                 job_id="oldjob123456",
+                expected_question_id="question-1",
+                expected_question_turn="oldjob123456-routing-0",
+                answer_provenance=AnswerProvenance.USER_VOICE,
             ),
             delivery_claims=mock.ANY,
         )
         qwen_turn.assert_not_called()
+
+    def test_pending_question_snapshot_uses_one_store_read(self) -> None:
+        daemon = _bare_daemon()
+        daemon.cursor_session = "aaaaaaaaaaaa"
+        awaiting = CursorJob.from_dict(
+            {
+                "id": "aaaaaaaaaaaa",
+                "status": "awaiting_user",
+                "question": "Which repository?",
+                "clarification_kind": "repository",
+                "created_at": 1,
+            }
+        )
+        with mock.patch.object(
+            wake_daemon.CURSOR_STORE, "get", return_value=awaiting
+        ) as get:
+            snapshot = daemon._pending_cursor_question()
+
+        get.assert_called_once_with("aaaaaaaaaaaa")
+        assert snapshot is not None
+        self.assertEqual(snapshot.text, "Which repository?")
+        self.assertEqual(snapshot.owner, "repository")
+
+    def test_answer_later_is_not_a_control_without_pending_snapshot(self) -> None:
+        daemon = _bare_daemon()
+        daemon.cursor_session = "oldjob123456"
+        with (
+            mock.patch.object(wake_daemon, "transcribe", return_value="answer later"),
+            mock.patch.object(wake_daemon, "start_components"),
+            mock.patch.object(
+                wake_daemon,
+                "request_context",
+                return_value=RequestContext("answer later"),
+            ),
+            mock.patch.object(daemon, "_pending_cursor_question", return_value=None),
+            mock.patch.object(
+                wake_daemon,
+                "route_intent",
+                return_value=IntentRoute(Intent.CONVERSATION, "high"),
+            ),
+            mock.patch.object(wake_daemon, "cursor_turn") as cursor_turn,
+            mock.patch.object(
+                wake_daemon, "qwen_turn", return_value=("What should wait?", None)
+            ) as qwen_turn,
+            mock.patch.object(
+                daemon,
+                "_drain_playback_queue",
+                return_value=(_playback_batch("ok"), None),
+            ),
+            mock.patch.object(wake_daemon, "notify"),
+        ):
+            daemon.process_utterance(AUDIO_GENERATION, woke=False)
+
+        cursor_turn.assert_not_called()
+        qwen_turn.assert_called_once()
 
     def test_explicit_cursor_request_starts_fresh_job(self) -> None:
         daemon = _bare_daemon()
@@ -1868,6 +1938,15 @@ class CompletedFollowupContextTests(unittest.TestCase):
             expires_at=time.monotonic() + 60,
         )
         daemon.completed_followup = retained
+        daemon._pending_cursor_question = mock.Mock(
+            return_value=wake_daemon.PendingQuestionSnapshot(
+                "aaaaaaaaaaaa",
+                "Which repository?",
+                "repository",
+                "question-1",
+                "aaaaaaaaaaaa-routing-0",
+            )
+        )
 
         cursor_turn = self._run_route(
             daemon,
