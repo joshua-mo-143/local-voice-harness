@@ -42,6 +42,13 @@ _NUMBER = re.compile(r"#?\d+")
 _LINEAR_TEAM = re.compile(r"^[A-Za-z][A-Za-z0-9]+$")
 
 
+def _overlaps(start: int, end: int, spans: list[tuple[int, int]]) -> bool:
+    return any(
+        start < existing_end and end > existing_start
+        for existing_start, existing_end in spans
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class TicketReference:
     """One unique explicit target, or one deterministic extraction rejection."""
@@ -199,6 +206,8 @@ def extract_ticket_targets(
             specific_spans.append(match.span())
 
     for match in _LINEAR_REFERENCE.finditer(text):
+        if _overlaps(match.start(), match.end(), specific_spans):
+            continue
         candidates.append(
             _linear_reference(
                 match.group(0),
@@ -214,10 +223,7 @@ def extract_ticket_targets(
         for match in _NUMBER.finditer(issue_list.group("items")):
             start = items_start + match.start()
             end = items_start + match.end()
-            if any(
-                start < specific_end and end > specific_start
-                for specific_start, specific_end in specific_spans
-            ):
+            if _overlaps(start, end, specific_spans):
                 continue
             raw = match.group(0)
             candidates.append(

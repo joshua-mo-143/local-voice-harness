@@ -44,6 +44,31 @@ def test_full_references_are_ordered_across_providers() -> None:
     ]
 
 
+def test_linear_like_substrings_inside_github_references_are_ignored() -> None:
+    extraction = extract_ticket_targets(
+        "Work on joshua-mo-143/local-voice-harness#999998 and "
+        "https://github.com/example/eng-42/issues/7"
+    )
+
+    assert extraction.requested_count == 2
+    assert [(item.source, item.canonical) for item in extraction.references] == [
+        ("github", "joshua-mo-143/local-voice-harness#999998"),
+        ("github", "example/eng-42#7"),
+    ]
+
+
+def test_standalone_linear_reference_survives_github_overlap_filtering() -> None:
+    extraction = extract_ticket_targets(
+        "Work on MO-143 and joshua-mo-143/local-voice-harness#999998"
+    )
+
+    assert extraction.requested_count == 2
+    assert [(item.source, item.canonical) for item in extraction.references] == [
+        ("linear", "MO-143"),
+        ("github", "joshua-mo-143/local-voice-harness#999998"),
+    ]
+
+
 def test_issue_in_repository_is_not_duplicated_as_bare_number() -> None:
     extraction = extract_ticket_targets(
         "Please handle issue 42 in example/project",
