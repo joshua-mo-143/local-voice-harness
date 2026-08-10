@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import multiprocessing
+import os
 import socket
+import subprocess
+import sys
 import tempfile
 import time
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from multiprocessing.connection import Connection
 from multiprocessing.process import BaseProcess
@@ -101,6 +104,29 @@ def run_concurrently(
             process.close()
         for status in statuses:
             status.close()
+
+
+def run_fresh_interpreter(
+    script: Path,
+    *arguments: object,
+    timeout: float = 5,
+    env: Mapping[str, str] | None = None,
+) -> subprocess.CompletedProcess[str]:
+    """Run a Python child with bounded output capture and no inherited stdin."""
+
+    child_env = os.environ.copy()
+    if env is not None:
+        child_env.update(env)
+    return subprocess.run(
+        [sys.executable, str(script), *(str(argument) for argument in arguments)],
+        cwd=script.parents[1],
+        env=child_env,
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+        timeout=timeout,
+        check=False,
+    )
 
 
 def _serve_unix_socket(

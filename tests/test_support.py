@@ -1,16 +1,46 @@
 from __future__ import annotations
 
 import multiprocessing
+import signal
 import socket
+import tempfile
 import time
 import unittest
+from pathlib import Path
 
-from tests.support import UnixSocketServer, run_concurrently
+from tests.support import UnixSocketServer, run_concurrently, run_fresh_interpreter
 
 CONTEXT = multiprocessing.get_context("fork")
 
 
 class TestSupportTests(unittest.TestCase):
+    def test_fresh_interpreter_captures_output_and_arguments(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            script = Path(temporary) / "child.py"
+            script.write_text(
+                "import os, sys\n"
+                "print(sys.argv[1])\n"
+                "print(os.environ['CRASH_TEST_VALUE'])\n"
+            )
+
+            result = run_fresh_interpreter(
+                script, "argument", env={"CRASH_TEST_VALUE": "isolated"}
+            )
+
+        self.assertEqual(result.returncode, 0)
+        self.assertEqual(result.stdout.splitlines(), ["argument", "isolated"])
+
+    def test_fresh_interpreter_reports_sigkill(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            script = Path(temporary) / "child.py"
+            script.write_text(
+                "import os, signal\nos.kill(os.getpid(), signal.SIGKILL)\n"
+            )
+
+            result = run_fresh_interpreter(script)
+
+        self.assertEqual(result.returncode, -signal.SIGKILL)
+
     def test_concurrent_outcomes_preserve_call_order_and_errors(self) -> None:
         def fail() -> int:
             raise ValueError("expected")
