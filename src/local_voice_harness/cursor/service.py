@@ -52,6 +52,7 @@ from .model import (
 )
 from .provisioning import run_claimed_worker
 from .store import (
+    ActiveTicketConflict,
     FollowUpCheckoutBusy,
     FollowUpUnavailable,
     JobMaintenanceError,
@@ -321,7 +322,7 @@ def start_job(
             ),
         )
     )
-    _job_store().create(job)
+    _job_store().create(job, enforce_unique_ticket=True)
     launch_worker(job_id)
     return job_id
 
@@ -344,6 +345,13 @@ def start_jobs(
     def start(request: TicketJobRequest) -> TicketStartOutcome:
         try:
             job_id = start_job(request.request)
+        except ActiveTicketConflict as exc:
+            return TicketStartOutcome(
+                request.target,
+                "rejected",
+                job_id=exc.active_job_id,
+                detail=_start_error_detail(exc),
+            )
         except Exception as exc:  # noqa: BLE001 - every child needs an outcome
             return TicketStartOutcome(
                 request.target,
@@ -1497,19 +1505,22 @@ def cursor_turn(
                 return CursorTurnResult(_ticket_start_summary(outcomes), None)
             assert len(accepted) == 1 and accepted[0].job_id is not None
             return _await_foreground(accepted[0].job_id, delivery_claims)
-        job_id = start_job(
-            text,
-            repository=repository,
-            github_repository=github_repository,
-            github_issue=github_issue,
-            github_issue_context=github_issue_context,
-            fork_requested=fork_requested,
-            github_pull_request=github_pull_request,
-            agent=agent,
-            utterance=utterance,
-            context_repository=context_repository,
-            issue_key=issue_key,
-        )
+        try:
+            job_id = start_job(
+                text,
+                repository=repository,
+                github_repository=github_repository,
+                github_issue=github_issue,
+                github_issue_context=github_issue_context,
+                fork_requested=fork_requested,
+                github_pull_request=github_pull_request,
+                agent=agent,
+                utterance=utterance,
+                context_repository=context_repository,
+                issue_key=issue_key,
+            )
+        except ActiveTicketConflict as exc:
+            return CursorTurnResult(str(exc), None)
         if on_job_started is not None:
             on_job_started()
     return _await_foreground(job_id, delivery_claims)

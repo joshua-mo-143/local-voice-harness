@@ -19,6 +19,7 @@ from local_voice_harness.cursor.model import (
 )
 from local_voice_harness.cursor.recovery import stage_terminal_intent
 from local_voice_harness.cursor.store import (
+    ActiveTicketConflict,
     ArtifactQuarantinedError,
     JobMaintenanceError,
     JobQuarantinedError,
@@ -346,6 +347,111 @@ class CursorStoreIntegrationTests(unittest.TestCase):
         path = self.jobs_dir / f"{job['id']}.json"
         with locked(self.jobs_dir):
             write_unlocked(path, job)
+
+    def test_concurrent_ticket_admission_has_exactly_one_winner(self) -> None:
+        barrier = threading.Barrier(3)
+        results: list[tuple[str, str]] = []
+        result_lock = threading.Lock()
+
+        def admit(job_id: str) -> None:
+            store = JobStore(self.jobs_dir, self.jobs_dir / "legacy")
+            candidate = CursorJob.from_dict(
+                self.job(
+                    job_id,
+                    github_repository="Example/Project",
+                    github_issue=42,
+                )
+            )
+            barrier.wait()
+            try:
+                store.create(candidate, enforce_unique_ticket=True)
+            except ActiveTicketConflict as exc:
+                result = ("conflict", exc.active_job_id)
+            else:
+                result = ("created", job_id)
+            with result_lock:
+                results.append(result)
+
+        threads = [
+            threading.Thread(target=admit, args=(job_id,))
+            for job_id in ("aaaaaaaaaaaa", "bbbbbbbbbbbb")
+        ]
+        for thread in threads:
+            thread.start()
+        barrier.wait()
+        for thread in threads:
+            thread.join(timeout=2)
+
+        self.assertTrue(all(not thread.is_alive() for thread in threads))
+        created = [job_id for outcome, job_id in results if outcome == "created"]
+        conflicts = [job_id for outcome, job_id in results if outcome == "conflict"]
+        self.assertEqual(len(created), 1)
+        self.assertEqual(conflicts, created)
+        persisted = JobStore(self.jobs_dir, self.jobs_dir / "legacy").list()
+        self.assertEqual([job.id for job in persisted], created)
+
+    def test_linear_ticket_admission_is_case_insensitive(self) -> None:
+        store = JobStore(self.jobs_dir, self.jobs_dir / "legacy")
+        store.create(
+            CursorJob.from_dict(self.job("aaaaaaaaaaaa", issue_key="ENG-7")),
+            enforce_unique_ticket=True,
+        )
+
+        with self.assertRaisesRegex(
+            ActiveTicketConflict,
+            "ticket is already active as Cursor job aaaaaaaaaaaa",
+        ) as raised:
+            store.create(
+                CursorJob.from_dict(self.job("bbbbbbbbbbbb", issue_key="eng-7")),
+                enforce_unique_ticket=True,
+            )
+
+        self.assertEqual(raised.exception.active_job_id, "aaaaaaaaaaaa")
+        self.assertFalse((self.jobs_dir / "bbbbbbbbbbbb.json").exists())
+
+    def test_ticket_admission_allows_terminal_predecessor_and_distinct_repository(
+        self,
+    ) -> None:
+        store = JobStore(self.jobs_dir, self.jobs_dir / "legacy")
+        store.create(
+            CursorJob.from_dict(
+                self.job(
+                    "aaaaaaaaaaaa",
+                    status="completed",
+                    completed_at=2,
+                    result="done",
+                    github_repository="Example/Project",
+                    github_issue=42,
+                )
+            ),
+            enforce_unique_ticket=True,
+        )
+
+        store.create(
+            CursorJob.from_dict(
+                self.job(
+                    "bbbbbbbbbbbb",
+                    github_repository="example/project",
+                    github_issue=42,
+                )
+            ),
+            enforce_unique_ticket=True,
+        )
+        store.create(
+            CursorJob.from_dict(
+                self.job(
+                    "cccccccccccc",
+                    github_repository="Example/Other",
+                    github_issue=42,
+                )
+            ),
+            enforce_unique_ticket=True,
+        )
+
+        self.assertEqual(
+            [job.id for job in store.list()],
+            ["aaaaaaaaaaaa", "bbbbbbbbbbbb", "cccccccccccc"],
+        )
 
     def test_legacy_read_then_write_migrates_to_current_schema(self) -> None:
         for index, version in enumerate((None, 0, 1, 2, 3, 4, 5)):

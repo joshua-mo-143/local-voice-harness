@@ -165,6 +165,131 @@ def test_start_jobs_enforces_bound_and_preserves_outcome_order() -> None:
     assert all(outcome.status == "accepted" for outcome in outcomes)
 
 
+def test_start_jobs_reports_active_ticket_conflict_as_rejected() -> None:
+    active_job_id = "aaaaaaaaaaaa"
+    request = TicketJobRequest(
+        "example/project#7",
+        StartJobRequest(
+            "work on example/project#7",
+            github_repository="example/project",
+            github_issue=7,
+            foreground=False,
+        ),
+    )
+    with (
+        mock.patch.object(
+            service,
+            "start_job",
+            side_effect=service.ActiveTicketConflict(active_job_id),
+        ),
+        mock.patch.object(service, "read_job") as read,
+    ):
+        outcomes = service.start_jobs((request,), concurrency=1)
+
+    assert len(outcomes) == 1
+    assert outcomes[0].status == "rejected"
+    assert outcomes[0].job_id == active_job_id
+    assert active_job_id in str(outcomes[0].detail)
+    read.assert_not_called()
+
+
+def test_start_job_enforces_unique_ticket_before_worker_launch() -> None:
+    store = mock.Mock(spec=JobStore)
+    with (
+        mock.patch.object(service, "_job_store", return_value=store),
+        mock.patch.object(service, "launch_worker") as launch,
+    ):
+        job_id = service.start_job(
+            "work on the focused issue",
+            github_repository="example/project",
+            github_issue=7,
+        )
+
+    persisted = store.create.call_args.args[0]
+    assert persisted.id == job_id
+    assert persisted.github_repository == "example/project"
+    assert persisted.github_issue == 7
+    assert store.create.call_args.kwargs == {"enforce_unique_ticket": True}
+    launch.assert_called_once_with(job_id)
+
+
+def test_start_job_rejects_active_github_issue_before_second_launch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(service, "JOBS_DIR", tmp_path / "jobs")
+    monkeypatch.setattr(service, "LEGACY_JOBS_DIR", tmp_path / "legacy")
+    with mock.patch.object(service, "launch_worker") as launch:
+        active_job_id = service.start_job(
+            "work on the focused issue",
+            github_repository="Example/Project",
+            github_issue=7,
+        )
+        with pytest.raises(service.ActiveTicketConflict) as raised:
+            service.start_job(
+                "work on the focused issue again",
+                github_repository="example/project",
+                github_issue=7,
+            )
+
+    assert raised.value.active_job_id == active_job_id
+    assert [job.id for job in service._job_store().list()] == [active_job_id]
+    launch.assert_called_once_with(active_job_id)
+
+
+def test_fork_task_with_issue_context_does_not_claim_ticket(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(service, "JOBS_DIR", tmp_path / "jobs")
+    monkeypatch.setattr(service, "LEGACY_JOBS_DIR", tmp_path / "legacy")
+    with mock.patch.object(service, "launch_worker") as launch:
+        issue_job_id = service.start_job(
+            "work on the focused issue",
+            github_repository="example/project",
+            github_issue=7,
+        )
+        fork_job_id = service.start_job(
+            "fork the focused repository",
+            github_repository="example/project",
+            github_issue=7,
+            fork_requested=True,
+        )
+
+    assert [job.id for job in service._job_store().list()] == sorted(
+        [issue_job_id, fork_job_id]
+    )
+    assert launch.call_count == 2
+
+
+def test_single_ticket_conflict_does_not_notify_or_wait() -> None:
+    notified = mock.Mock()
+    active_job_id = "aaaaaaaaaaaa"
+    with (
+        mock.patch.object(
+            service,
+            "start_job",
+            side_effect=service.ActiveTicketConflict(active_job_id),
+        ),
+        mock.patch.object(service, "_await_foreground") as foreground,
+    ):
+        result = service.cursor_turn(
+            CursorTurnRequest(
+                "work on the focused issue",
+                github_repository="example/project",
+                github_issue=7,
+                on_job_started=notified,
+            )
+        )
+
+    assert result == CursorTurnResult(
+        f"ticket is already active as Cursor job {active_job_id}",
+        None,
+    )
+    notified.assert_not_called()
+    foreground.assert_not_called()
+
+
 def test_single_scoped_ticket_keeps_foreground_behavior() -> None:
     client = mock.Mock()
     client.issue_details.return_value = {
