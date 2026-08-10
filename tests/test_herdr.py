@@ -27,6 +27,15 @@ should I use?
             "Which repository should I use?",
         )
 
+    def test_ignores_prompt_marker_placeholders(self) -> None:
+        output = """
+VOICE_QUESTION[token]: <one concise question>
+or:
+WORKFLOW_PLAN[token]: <bounded multiline implementation plan>
+"""
+        self.assertIsNone(herdr.extract_marker(output, "VOICE_QUESTION", "token"))
+        self.assertIsNone(herdr.extract_marker(output, "WORKFLOW_PLAN", "token"))
+
     def test_repository_resolution_requires_unique_valid_match(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -208,6 +217,31 @@ should I use?
         self.assertLessEqual(len(name), 32)
         self.assertRegex(name, r"^[a-z][a-z0-9_-]{0,31}$")
         self.assertTrue(name.endswith("-aaaaaaaaaa"))
+
+    def test_start_agent_passes_explicit_cursor_read_only_mode(self) -> None:
+        client = herdr.HerdrClient("herdr")
+        agent = {
+            "name": "reviewer",
+            "pane_id": "pane",
+            "workspace_id": "workspace",
+            "cwd": "/tmp/worktree",
+        }
+        with mock.patch.object(
+            client, "run_json", return_value={"agent": agent}
+        ) as run:
+            client.start_agent(
+                Path("/tmp/worktree"),
+                "review",
+                "pane",
+                "workspace",
+                name="reviewer",
+                mode="ask",
+            )
+
+        self.assertEqual(
+            run.call_args.args[-4:],
+            ("--", "--trust", "--mode", "ask"),
+        )
 
     def test_non_linear_task_creates_requested_worktree(self) -> None:
         client = herdr.HerdrClient("herdr")

@@ -7,14 +7,21 @@ from pathlib import Path
 from unittest import mock
 
 from local_voice_harness.cursor import delivery
-from local_voice_harness.cursor.model import CursorJob, JobStatus, transition
+from local_voice_harness.cursor.model import (
+    CursorJob,
+    JobStatus,
+    WorkflowParticipant,
+    transition,
+)
 from local_voice_harness.cursor.recovery import (
     acknowledge_worktree_quarantine,
     cancel_target_and_release,
+    reconcile_prompt_and_pane_operations,
     reconcile_uncertain_agent,
     reconcile_uncertain_fork,
     recover_jobs,
     resolve_manual_reconciliation,
+    stage_terminal_intent,
 )
 from local_voice_harness.cursor.store import JobQuarantineWarning, JobStore
 from local_voice_harness.integrations.github import GitHubError, GitHubRepository
@@ -433,6 +440,40 @@ class CursorRecoveryTests(unittest.TestCase):
         client.cancel_agent.assert_called_once_with("agent")
         self.assertFalse(self.store.get("123456789abc").target_release_pending)
 
+    def test_cancellation_releases_every_workflow_participant(self) -> None:
+        self.create(
+            {
+                "id": "123456789abc",
+                "status": "cancelled",
+                "request": "test",
+                "created_at": 1,
+                "completed_at": 2,
+                "result": "cancelled",
+                "delivered": False,
+                "herdr_target": "implementer",
+                "planner_target": "planner",
+                "reviewer_target": "reviewer",
+                "implementer_target": "implementer",
+                "target_release_pending": True,
+                "target_release_token": "release",
+            }
+        )
+        client = mock.Mock()
+
+        cancel_target_and_release(
+            self.store,
+            "123456789abc",
+            "implementer",
+            "release",
+            herdr_factory=mock.Mock(return_value=client),
+        )
+
+        self.assertEqual(
+            client.cancel_agent.call_args_list,
+            [mock.call("implementer"), mock.call("planner"), mock.call("reviewer")],
+        )
+        self.assertFalse(self.store.get("123456789abc").target_release_pending)
+
     def test_uncertain_agent_absence_uses_backoff_then_releases_fence(self) -> None:
         self.create(
             {
@@ -531,6 +572,159 @@ class CursorRecoveryTests(unittest.TestCase):
         acknowledged = self.store.get("123456789abc")
         self.assertEqual(acknowledged.worktree_provision_state, "retained")
         self.assertFalse(acknowledged.to_dict()["worktree_manual_inspection_required"])
+
+    def test_prompt_submit_recovery_requires_positive_acceptance_evidence(self) -> None:
+        self.create(
+            {
+                "id": "123456789abc",
+                "status": "running",
+                "request": "test",
+                "created_at": 1,
+                "delivered": False,
+                "worker_token": "worker",
+                "worker_pid": 42,
+                "worker_boot_id": "boot",
+                "worker_process_start": "start",
+                "workflow_phase": "classifying",
+                "turn": 1,
+                "workflow_turn_phase": "classifying",
+                "herdr_target": "planner",
+                "planner_target": "planner",
+                "active_participant": "planner",
+                "prompt_operation_state": "submitting",
+                "prompt_operation_phase": "classifying",
+                "prompt_operation_turn": 1,
+                "prompt_operation_target": "planner",
+                "prompt_baseline_sequence": 7,
+            }
+        )
+        unavailable = mock.Mock()
+        unavailable.ensure_server.side_effect = HerdrError("offline")
+
+        reconcile_prompt_and_pane_operations(
+            self.store,
+            self.store.get("123456789abc"),
+            now=10,
+            herdr_factory=lambda: unavailable,
+        )
+        self.assertEqual(
+            self.store.get("123456789abc").prompt_operation_state,
+            "submitting",
+        )
+
+        visible = mock.Mock()
+        visible.get_agent.return_value = {"state_change_seq": 8}
+        reconcile_prompt_and_pane_operations(
+            self.store,
+            self.store.get("123456789abc"),
+            now=11,
+            herdr_factory=lambda: visible,
+        )
+        self.assertEqual(
+            self.store.get("123456789abc").prompt_operation_state,
+            "submitted",
+        )
+
+    def test_uncertain_pane_creation_becomes_manual_without_retry(self) -> None:
+        self.create(
+            {
+                "id": "123456789abc",
+                "status": "routing",
+                "request": "test",
+                "created_at": 1,
+                "delivered": False,
+                "worker_token": "worker",
+                "worker_pid": 42,
+                "worker_boot_id": "boot",
+                "worker_process_start": "start",
+                "participant_creation_state": "submitting",
+                "participant_creation_participant": "reviewer",
+                "participant_creation_target": "reviewer",
+                "participant_creation_label": "task-reviewer",
+            }
+        )
+
+        reconcile_prompt_and_pane_operations(
+            self.store,
+            self.store.get("123456789abc"),
+            now=10,
+        )
+
+        updated = self.store.get("123456789abc")
+        self.assertEqual(updated.participant_creation_state, "manual_required")
+        self.assertEqual(updated.manual_reconcile_operation, "pane")
+        self.assertTrue(updated.manual_reconcile_token)
+
+    def test_terminal_intent_cancels_every_target_before_publication(self) -> None:
+        for job_id, terminal in (
+            ("123456789abc", JobStatus.COMPLETED),
+            ("bbbbbbbbbbbb", JobStatus.FAILED),
+            ("cccccccccccc", JobStatus.CANCELLED),
+        ):
+            with self.subTest(terminal=terminal):
+                job = self.create(
+                    {
+                        "id": job_id,
+                        "status": "running",
+                        "request": "test",
+                        "created_at": 1,
+                        "delivered": False,
+                        "worker_token": f"worker-{job_id}",
+                        "worker_pid": 42,
+                        "worker_boot_id": "boot",
+                        "worker_process_start": f"start-{job_id}",
+                        "workflow_phase": "implementing",
+                        "workflow_tier": "simple",
+                        "workflow_classification_reason": "localized",
+                        "herdr_target": f"implementer-{job_id}",
+                        "active_participant": "implementer",
+                        "planner_target": f"planner-{job_id}",
+                        "reviewer_target": f"reviewer-{job_id}",
+                        "implementer_target": f"implementer-{job_id}",
+                        "agent_dispatch_state": "ready",
+                    }
+                )
+
+                def terminalize(
+                    current: CursorJob,
+                    intended: JobStatus = terminal,
+                ) -> CursorJob:
+                    return stage_terminal_intent(
+                        current,
+                        intended,
+                        now=10,
+                        result=intended.value,
+                        error=("failed" if intended == JobStatus.FAILED else None),
+                    )
+
+                staged = self.store.update(
+                    job.id,
+                    terminalize,
+                )
+                assert staged is not None and staged.target_release_token
+                client = mock.Mock()
+
+                cancel_target_and_release(
+                    self.store,
+                    job.id,
+                    f"implementer-{job_id}",
+                    staged.target_release_token,
+                    herdr_factory=lambda current_client=client: current_client,
+                )
+
+                self.assertEqual(
+                    {call.args[0] for call in client.cancel_agent.call_args_list},
+                    {
+                        f"planner-{job_id}",
+                        f"reviewer-{job_id}",
+                        f"implementer-{job_id}",
+                    },
+                )
+                completed = self.store.get(job.id)
+                self.assertEqual(completed.status, terminal)
+                self.assertIsNone(completed.herdr_target)
+                for participant in WorkflowParticipant:
+                    self.assertIsNone(completed.participant_target(participant))
 
 
 if __name__ == "__main__":

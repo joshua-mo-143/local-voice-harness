@@ -76,6 +76,58 @@ Cursor routing works as follows:
 9. Start a new Cursor agent through Herdr when no suitable agent exists.
 10. Reserve that agent and checkout until it finishes, is blocked, or is cancelled.
 
+After checkout preparation, every new ticket enters a durable tiered workflow. A
+Plan-mode participant first performs a short read-only inspection and classifies the
+ticket. Clear, localized, reversible work is `simple` and goes directly to a fresh
+Agent-mode implementer. `medium` work receives a persisted plan and one independent
+review from a fresh Ask-mode participant. `high-risk` work receives the same review
+gate plus one bounded planner revision. If the final review still rejects the plan,
+the job enters an explicit exhausted-review clarification: only a trusted spoken
+`approve` queues the unchanged plan for implementation, a trusted `abort` uses the
+normal cancellation fences, and any other reply remains awaiting. The job records
+whether approval came from the reviewer or from that explicit user override.
+Persistence, migration, recovery,
+concurrency, lifecycle, worktrees, external writes, security, infrastructure,
+destructive behavior, public APIs, and ambiguous requirements force the high-risk
+tier. Implementation cannot start until the latest review approves it; newly
+discovered scope promotes the tier and returns the job to planning.
+
+The selected tier, evidence, current phase, review round, active participant, and
+participant targets live in the job record. Full plans and reviews are bounded,
+hash-validated, content-addressed sidecar artifacts under the durable jobs
+directory, never files in the checkout. New artifacts are published
+create-exclusively and are never overwritten; an identical retry reuses the same
+reference, while conflicting bytes fail closed. Review artifacts record the exact
+plan digest they reviewed. Publication checks the current worker claim, turn,
+workflow phase, review round, and prior artifact reference while holding the same
+job-directory lock used to update the job, so stale worker output cannot create an
+orphan sidecar or advance the workflow. A crash after sidecar creation but before
+the job update can leave a harmless immutable orphan that an identical retry
+reuses and normal job pruning/deletion removes. Round-only references from earlier
+schema-v10 development builds remain read-only compatible; all new writes include
+the artifact digest in their filename. Malformed artifacts are quarantined.
+Phase-specific, turn-scoped output markers prevent stale terminal text from
+advancing a workflow. Prompt delivery is a durable operation with `planned`,
+`submitting`, `submitted`, `ambiguous`, and `none` states plus the phase, turn,
+target, and observed Herdr sequence. Recovery submits only `planned`, observes only
+`submitted`, and never retries `submitting` without positive sequence evidence.
+The former schema-v10 prompt boolean is translated in place: a true value becomes
+an ambiguous fail-closed operation because it has no trustworthy sequence baseline.
+
+Fresh workflow participants persist their deterministic name, role, label, and
+workspace intent before pane creation. The returned pane and workspace are persisted
+before agent startup. A crash across pane creation retains the identity and requires
+reconciliation rather than creating another pane.
+
+Success, failure, and cancellation first persist a terminal intent while the job is
+`reconciling`. Cleanup then cancels every deduplicated planner, reviewer, implementer,
+active, and pending participant target. Only confirmed cleanup clears those handles
+and publishes the terminal status; observation or cancellation uncertainty retains
+the release and reservation fences. User decisions always return through the
+existing voice clarification flow. One ticket
+therefore remains one inbox item across planning, review, implementation, restart,
+clarification, cancellation, and delivery.
+
 The harness never automatically commits, pushes, opens pull requests, modifies Linear,
 or deletes generated worktrees. Fork creation is the only supported GitHub write and
 is performed only after an unambiguous spoken request and a separate affirmative

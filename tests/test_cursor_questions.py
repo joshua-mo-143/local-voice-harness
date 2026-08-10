@@ -267,6 +267,9 @@ def test_duplicate_answer_cannot_launch_twice(store: JobStore) -> None:
     continuation = str(queued.to_dict()["continuation_answer"])
     assert "Which approach should I use?" in continuation
     assert "Use SQLite" in continuation
+    assert provisioning._prompt_request(queued) == continuation
+    planned = queued.evolve(continuation=False)
+    assert provisioning._prompt_request(planned) == continuation
 
 
 def test_multiple_choice_continuation_includes_label_and_question(
@@ -322,7 +325,7 @@ def test_protected_answer_requires_explicit_request_provenance(
 
 
 def test_unknown_question_owner_fails_closed(store: JobStore) -> None:
-    question = replace(_question(), owner="workflow_review")
+    question = replace(_question(), owner="unknown-owner")
     _awaiting(store, question)
 
     with mock.patch.object(service, "launch_worker") as launch:
@@ -534,6 +537,54 @@ def test_cancellation_closes_pending_question(store: JobStore) -> None:
     assert cancelled.state == QuestionState.CANCELLED
 
 
+def test_successful_cleanup_resolves_dispatched_question(store: JobStore) -> None:
+    pending = replace(
+        _question(turn_token="aaaaaaaaaaaa-1"),
+        state=QuestionState.DISPATCHING,
+        dispatch_token="aaaaaaaaaaaa-2",
+        prompt_state=PromptOperationState.SUBMITTED,
+        prompt_baseline_seq=1,
+        prompt_submitted_at=2,
+    )
+    job = store.create(
+        CursorJob.from_dict(
+            {
+                "id": "aaaaaaaaaaaa",
+                "request": "build the feature",
+                "status": JobStatus.RUNNING.value,
+                "created_at": 1,
+                "delivered": False,
+                "turn": 2,
+                "turn_token": "aaaaaaaaaaaa-2",
+                "worker_token": "worker",
+                "worker_pid": 42,
+                "worker_boot_id": "boot",
+                "worker_process_start": "start",
+                "herdr_target": "retained-agent",
+                "workflow_tier": "simple",
+                "workflow_classification_reason": "localized change",
+                "workflow_phase": "implementing",
+                "active_participant": "implementer",
+                "implementer_target": "retained-agent",
+                "voice_question": pending.to_dict(),
+            }
+        )
+    )
+
+    provisioning._worker_complete(
+        store,
+        job.id,
+        "worker",
+        output="VOICE_SUMMARY[aaaaaaaaaaaa-2]: completed",
+        agent_status="idle",
+    )
+
+    resolved = questions.current(store.get(job.id))
+    assert resolved is not None
+    assert resolved.state == QuestionState.RESOLVED
+    assert resolved.prompt_state == PromptOperationState.RESOLVED
+
+
 def test_structured_agent_question_becomes_durable_envelope() -> None:
     job = CursorJob.from_dict(
         {
@@ -667,6 +718,19 @@ def test_interactive_questionnaire_error_persists_blocked_status(
                 "worker_boot_id": "boot",
                 "worker_process_start": "start",
                 "herdr_target": "agent",
+                "workflow_tier": "simple",
+                "workflow_classification_reason": "localized",
+                "workflow_phase": "implementing",
+                "active_participant": "implementer",
+                "implementer_target": "agent",
+                "turn": 1,
+                "turn_token": "aaaaaaaaaaaa-1",
+                "workflow_turn_phase": "implementing",
+                "prompt_operation_state": "planned",
+                "prompt_operation_phase": "implementing",
+                "prompt_operation_turn": 1,
+                "prompt_operation_target": "agent",
+                "prompt_baseline_sequence": 7,
             }
         )
     )
@@ -704,3 +768,5 @@ def test_interactive_questionnaire_error_persists_blocked_status(
     assert resumed.status == JobStatus.QUEUED
     assert resumed.reconcile
     assert not resumed.interactive_questionnaire_blocked
+    assert resumed.prompt_operation_state == "none"
+    assert resumed.prompt_baseline_sequence is None

@@ -18,7 +18,9 @@ from local_voice_harness.cursor.model import (
     CURRENT_SCHEMA_VERSION,
     CursorJob,
     JobStatus,
+    WorkflowParticipant,
 )
+from local_voice_harness.cursor.recovery import stage_terminal_intent
 from local_voice_harness.cursor.store import JobQuarantineWarning, JobStore
 from local_voice_harness.integrations.github import (
     GitHubIssue,
@@ -230,6 +232,315 @@ class _ProvisioningTestAdapter:
 jobs: Any = _ProvisioningTestAdapter()
 
 
+def configure_tiered_outcomes(
+    client: mock.Mock,
+    checkout: Path,
+    *,
+    tier: str = "simple",
+) -> None:
+    job_id = "123456789abc"
+    outcomes = [
+        PromptOutcome(
+            "idle",
+            None,
+            None,
+            f"WORKFLOW_TIER[{job_id}-1]: {tier}\n"
+            f"WORKFLOW_REASON[{job_id}-1]: test classification",
+        )
+    ]
+    if tier != "simple":
+        outcomes.extend(
+            [
+                PromptOutcome(
+                    "idle",
+                    None,
+                    None,
+                    f"WORKFLOW_PLAN[{job_id}-2]: implement safely",
+                ),
+                PromptOutcome(
+                    "idle",
+                    None,
+                    None,
+                    f"WORKFLOW_REVIEW_DECISION[{job_id}-3]: approve\n"
+                    f"WORKFLOW_REVIEW[{job_id}-3]: plan is safe",
+                ),
+            ]
+        )
+    final_turn = 2 if tier == "simple" else 4
+    outcomes.append(
+        PromptOutcome(
+            "idle",
+            "done",
+            None,
+            f"VOICE_SUMMARY[{job_id}-{final_turn}]: done",
+        )
+    )
+    client.prompt_and_wait.side_effect = outcomes
+
+    def start_fresh(
+        _checkout: Path,
+        _label: str,
+        workspace: str,
+        *,
+        role: str,
+        reserve: Callable[[AgentSelection, bool], None],
+        settle: Callable[[AgentSelection], None],
+        **_kwargs: object,
+    ) -> AgentSelection:
+        selection = AgentSelection(
+            role,
+            f"pane-{role}",
+            workspace,
+            str(checkout),
+            role,
+            str(checkout),
+        )
+        reserve(selection, True)
+        settle(selection)
+        return selection
+
+    client.start_fresh_agent.side_effect = start_fresh
+
+
+class DurablePromptOperationTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        root = Path(self.temporary.name)
+        self.store = JobStore(root / "jobs", root / "legacy")
+
+    def tearDown(self) -> None:
+        self.temporary.cleanup()
+
+    def create(self, state: str = "none") -> CursorJob:
+        values: dict[str, object] = {
+            "schema_version": CURRENT_SCHEMA_VERSION,
+            "id": "123456789abc",
+            "revision": 0,
+            "request": "test",
+            "status": "running",
+            "created_at": 1,
+            "delivered": False,
+            "worker_token": "worker",
+            "worker_pid": 42,
+            "worker_boot_id": "boot",
+            "worker_process_start": "start",
+            "workflow_phase": "classifying",
+            "turn": 1,
+            "turn_token": "123456789abc-1",
+            "workflow_turn_phase": "classifying",
+            "herdr_target": "planner",
+            "planner_target": "planner",
+            "active_participant": "planner",
+            "agent_dispatch_state": "ready",
+            "prompt_operation_state": state,
+        }
+        if state != "none":
+            values.update(
+                prompt_operation_phase="classifying",
+                prompt_operation_turn=1,
+                prompt_operation_target="planner",
+                prompt_baseline_sequence=7,
+            )
+        return self.store.create(CursorJob.from_dict(values))
+
+    def test_planned_prompt_persists_submit_and_accept_boundaries(self) -> None:
+        job = self.create()
+        client = mock.Mock()
+        client.get_agent.return_value = {"state_change_seq": 7}
+
+        def prompt(*_args: object, **kwargs: object) -> PromptOutcome:
+            before_submit = cast(Callable[[int], None], kwargs["before_submit"])
+            accepted = cast(Callable[[], None], kwargs["accepted"])
+            before_submit(7)
+            self.assertEqual(
+                self.store.get(job.id).prompt_operation_state, "submitting"
+            )
+            accepted()
+            return PromptOutcome("idle", None, None, "output")
+
+        client.prompt_and_wait.side_effect = prompt
+
+        outcome = production_jobs._execute_phase_prompt(
+            self.store,
+            job,
+            "worker",
+            client,
+            lambda: None,
+            target="planner",
+            prompt="prompt",
+            token="123456789abc-1",
+        )
+
+        self.assertEqual(outcome, ("output", "idle"))
+        self.assertEqual(self.store.get(job.id).prompt_operation_state, "submitted")
+
+    def test_prompt_call_failure_is_ambiguous_even_without_callback(self) -> None:
+        job = self.create()
+        client = mock.Mock()
+        client.get_agent.return_value = {"state_change_seq": 7}
+        client.prompt_and_wait.side_effect = HerdrError("timeout")
+
+        with self.assertRaises(HerdrError):
+            production_jobs._execute_phase_prompt(
+                self.store,
+                job,
+                "worker",
+                client,
+                lambda: None,
+                target="planner",
+                prompt="prompt",
+                token="123456789abc-1",
+            )
+
+        self.assertEqual(self.store.get(job.id).prompt_operation_state, "ambiguous")
+
+    def test_pre_submit_questionnaire_keeps_planned_prompt_retryable(self) -> None:
+        job = self.create()
+        client = mock.Mock()
+        client.get_agent.return_value = {"state_change_seq": 7}
+        client.prompt_and_wait.side_effect = HerdrError(
+            "questionnaire",
+            code="interactive_questionnaire",
+        )
+
+        with self.assertRaises(HerdrError):
+            production_jobs._execute_phase_prompt(
+                self.store,
+                job,
+                "worker",
+                client,
+                lambda: None,
+                target="planner",
+                prompt="prompt",
+                token="123456789abc-1",
+            )
+
+        current = self.store.get(job.id)
+        self.assertEqual(current.prompt_operation_state, "planned")
+        self.assertIsNone(current.manual_reconcile_operation)
+
+    def test_terminal_intent_invalidates_prompt_before_submit_callback(self) -> None:
+        job = self.create()
+        client = mock.Mock()
+        client.get_agent.return_value = {"state_change_seq": 7}
+        submitted = False
+
+        def prompt(*_args: object, **kwargs: object) -> PromptOutcome:
+            nonlocal submitted
+            before_submit = cast(Callable[[int], None], kwargs["before_submit"])
+            self.store.update(
+                job.id,
+                lambda current: stage_terminal_intent(
+                    current,
+                    JobStatus.CANCELLED,
+                    now=2,
+                    result="cancelled",
+                ),
+            )
+            before_submit(7)
+            submitted = True
+            return PromptOutcome("idle", None, None, "output")
+
+        client.prompt_and_wait.side_effect = prompt
+
+        with self.assertRaises(production_jobs.WorkerCancelled):
+            production_jobs._execute_phase_prompt(
+                self.store,
+                job,
+                "worker",
+                client,
+                lambda: None,
+                target="planner",
+                prompt="prompt",
+                token="123456789abc-1",
+            )
+
+        self.assertFalse(submitted)
+        current = self.store.get(job.id)
+        self.assertEqual(current.terminal_intent_status, JobStatus.CANCELLED)
+        self.assertEqual(current.prompt_operation_state, "planned")
+
+    def test_terminal_intent_invalidates_pane_before_create_callback(self) -> None:
+        job = self.create()
+        planned = self.store.update(
+            job.id,
+            lambda current: current.evolve(
+                participant_creation_state="planned",
+                participant_creation_participant="reviewer",
+                participant_creation_target="reviewer",
+                participant_creation_label="task-reviewer",
+                participant_creation_workspace_id="workspace",
+            ),
+        )
+        assert planned is not None
+        before_create, _accepted = production_jobs._participant_pane_callbacks(
+            self.store,
+            job.id,
+            "worker",
+            "reviewer",
+        )
+        self.store.update(
+            job.id,
+            lambda current: stage_terminal_intent(
+                current,
+                JobStatus.FAILED,
+                now=2,
+                result="failed",
+                error="failed",
+            ),
+        )
+
+        with self.assertRaises(production_jobs.WorkerCancelled):
+            before_create()
+
+        current = self.store.get(job.id)
+        self.assertEqual(current.terminal_intent_status, JobStatus.FAILED)
+        self.assertEqual(current.participant_creation_state, "planned")
+
+    def test_submitted_prompt_observes_without_resubmitting(self) -> None:
+        job = self.create("submitted")
+        client = mock.Mock()
+        client.get_agent.return_value = {"agent_status": "idle"}
+        client.run_text.return_value = "output"
+
+        outcome = production_jobs._execute_phase_prompt(
+            self.store,
+            job,
+            "worker",
+            client,
+            lambda: None,
+            target="planner",
+            prompt="prompt",
+            token="123456789abc-1",
+        )
+
+        self.assertEqual(outcome, ("output", "idle"))
+        client.prompt_and_wait.assert_not_called()
+
+    def test_submitted_prompt_read_failure_keeps_reservation_for_retry(self) -> None:
+        job = self.create("submitted")
+        client = mock.Mock()
+        client.get_agent.side_effect = HerdrError("temporarily unavailable")
+
+        with self.assertRaises(production_jobs.WorkerCancelled):
+            production_jobs._execute_phase_prompt(
+                self.store,
+                job,
+                "worker",
+                client,
+                lambda: None,
+                target="planner",
+                prompt="prompt",
+                token="123456789abc-1",
+            )
+
+        deferred = self.store.get(job.id)
+        self.assertEqual(deferred.status, JobStatus.QUEUED)
+        self.assertEqual(deferred.prompt_operation_state, "submitted")
+        self.assertEqual(deferred.herdr_target, "planner")
+        self.assertTrue(deferred.reconcile)
+
+
 class CursorJobStateTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
@@ -259,6 +570,45 @@ class CursorJobStateTests(unittest.TestCase):
         self.legacy_jobs_patch.stop()
         self.jobs_patch.stop()
         self.temporary.cleanup()
+
+    def write_exhausted_review_job(self) -> None:
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "change recovery ownership",
+                "status": "awaiting_user",
+                "question": "Approve or abort?",
+                "result": "Approve or abort?",
+                "clarification_kind": "workflow_review_exhausted",
+                "workflow_tier": "high-risk",
+                "workflow_classification_reason": "recovery",
+                "workflow_phase": "reviewing",
+                "review_round": 1,
+                "review_decision": "revise",
+            }
+        )
+        store = jobs._store()
+        plan = "Preserve ownership during recovery."
+        plan_reference = store.write_artifact(
+            "123456789abc",
+            "plan",
+            1,
+            plan,
+        )
+        review_reference = store.write_artifact(
+            "123456789abc",
+            "review",
+            1,
+            "Ownership remains unresolved.",
+            source_text=plan,
+        )
+        store.update(
+            "123456789abc",
+            lambda job: job.evolve(
+                plan_artifact=plan_reference,
+                review_artifact=review_reference,
+            ),
+        )
 
     def test_malformed_job_file_is_quarantined_from_collection_read(self) -> None:
         (Path(self.temporary.name) / "123456789abc.json").write_text("{not json")
@@ -319,6 +669,374 @@ class CursorJobStateTests(unittest.TestCase):
         self.assertTrue(updated["fork_requested"])
         self.assertEqual(updated["request"], "Fork this repo and add a feature")
 
+    def test_medium_review_revision_escalates_to_user_without_implementation(
+        self,
+    ) -> None:
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "change several components",
+                "status": "running",
+                "worker_token": "worker",
+                "worker_pid": 42,
+                "worker_process_start": "start",
+                "workflow_tier": "medium",
+                "workflow_classification_reason": "cross-component",
+                "workflow_phase": "reviewing",
+                "planner_target": "planner",
+                "reviewer_target": "reviewer",
+                "active_participant": "reviewer",
+                "herdr_target": "reviewer",
+                "turn_token": "turn",
+            }
+        )
+        store = jobs._store()
+        plan = "Preserve compatibility while changing the components."
+        plan_reference = store.write_artifact("123456789abc", "plan", 0, plan)
+        store.update(
+            "123456789abc",
+            lambda job: job.evolve(plan_artifact=plan_reference),
+        )
+
+        production_jobs._advance_workflow_output(
+            store,
+            store.get("123456789abc"),
+            "worker",
+            "WORKFLOW_REVIEW_DECISION[turn]: revise\n"
+            "WORKFLOW_REVIEW[turn]: choose the compatibility policy",
+            "idle",
+        )
+
+        updated = store.get("123456789abc")
+        self.assertEqual(updated.status, JobStatus.AWAITING_USER)
+        self.assertEqual(updated.workflow_phase.value, "reviewing")
+        self.assertIsNone(updated.participant_target(WorkflowParticipant.IMPLEMENTER))
+        with mock.patch.object(service, "launch_worker"):
+            service.reply_job("123456789abc", "keep the old format")
+        resumed = store.get("123456789abc")
+        self.assertEqual(resumed.workflow_tier.value, "high-risk")
+        self.assertEqual(resumed.workflow_phase.value, "revising")
+        self.assertEqual(resumed.herdr_target, "planner")
+        self.assertIn("change several components", resumed.request)
+        self.assertIn("User clarification: keep the old format", resumed.request)
+
+    def test_deterministic_hard_risk_terms_override_simple_classification(
+        self,
+    ) -> None:
+        tier = production_jobs._classified_tier(
+            "simple", "add OAuth authorization", "localized"
+        )
+        self.assertEqual(tier.value, "high-risk")
+        self.assertEqual(
+            production_jobs._classified_tier(
+                "simple",
+                "rename a label",
+                "localized",
+                "The issue requires a schema migration.",
+            ).value,
+            "high-risk",
+        )
+        self.assertEqual(
+            production_jobs._classified_tier(
+                "simple",
+                "rename a label",
+                "Touches recovery ownership",
+            ).value,
+            "high-risk",
+        )
+        bounded_prefix = "x" * production_jobs._MAX_RISK_EVIDENCE_BYTES
+        self.assertEqual(
+            production_jobs._classified_tier(
+                "simple",
+                f"{bounded_prefix} security",
+                "localized",
+            ).value,
+            "simple",
+        )
+        with self.assertRaises(jobs.HarnessError):
+            production_jobs._classified_tier("unknown", "rename text", "localized")
+
+    def test_malformed_classification_output_blocks_without_implementation(
+        self,
+    ) -> None:
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "rename text",
+                "status": "running",
+                "worker_token": "worker",
+                "worker_pid": 42,
+                "worker_process_start": "start",
+                "workflow_phase": "classifying",
+                "planner_target": "planner",
+                "active_participant": "planner",
+                "herdr_target": "planner",
+                "turn_token": "current",
+            }
+        )
+        store = jobs._store()
+
+        production_jobs._advance_workflow_output(
+            store,
+            store.get("123456789abc"),
+            "worker",
+            "WORKFLOW_TIER[stale]: simple\nWORKFLOW_REASON[stale]: old",
+            "idle",
+        )
+
+        updated = store.get("123456789abc")
+        self.assertEqual(updated.status, JobStatus.BLOCKED)
+        self.assertIsNone(updated.participant_target(WorkflowParticipant.IMPLEMENTER))
+
+    def test_classification_user_question_pauses_current_phase(self) -> None:
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "unclear request",
+                "status": "running",
+                "worker_token": "worker",
+                "worker_pid": 42,
+                "worker_process_start": "start",
+                "workflow_phase": "classifying",
+                "planner_target": "planner",
+                "active_participant": "planner",
+                "herdr_target": "planner",
+                "turn_token": "current",
+                "phase_prompt_active": True,
+            }
+        )
+        store = jobs._store()
+
+        production_jobs._advance_workflow_output(
+            store,
+            store.get("123456789abc"),
+            "worker",
+            "VOICE_QUESTION[current]: Which behavior should win?",
+            "idle",
+        )
+
+        updated = store.get("123456789abc")
+        self.assertEqual(updated.status, JobStatus.AWAITING_USER)
+        self.assertEqual(updated.prompt_operation_state, "none")
+
+    def test_malformed_review_output_blocks_approval_gate(self) -> None:
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "change recovery",
+                "status": "running",
+                "worker_token": "worker",
+                "worker_pid": 42,
+                "worker_process_start": "start",
+                "workflow_tier": "high-risk",
+                "workflow_classification_reason": "recovery",
+                "workflow_phase": "reviewing",
+                "reviewer_target": "reviewer",
+                "active_participant": "reviewer",
+                "herdr_target": "reviewer",
+                "turn_token": "current",
+            }
+        )
+        store = jobs._store()
+
+        production_jobs._advance_workflow_output(
+            store,
+            store.get("123456789abc"),
+            "worker",
+            "WORKFLOW_REVIEW_DECISION[current]: maybe",
+            "idle",
+        )
+
+        self.assertEqual(store.get("123456789abc").status, JobStatus.BLOCKED)
+
+    def test_implementation_rejects_nonincreasing_promotion(self) -> None:
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "rename text",
+                "status": "running",
+                "worker_token": "worker",
+                "worker_pid": 42,
+                "worker_process_start": "start",
+                "workflow_tier": "simple",
+                "workflow_classification_reason": "localized",
+                "workflow_phase": "implementing",
+                "planner_target": "planner",
+                "implementer_target": "implementer",
+                "active_participant": "implementer",
+                "herdr_target": "implementer",
+                "turn_token": "current",
+            }
+        )
+        store = jobs._store()
+
+        production_jobs._advance_workflow_output(
+            store,
+            store.get("123456789abc"),
+            "worker",
+            "WORKFLOW_PROMOTE[current]: simple\n"
+            "WORKFLOW_REASON[current]: no additional risk",
+            "idle",
+        )
+
+        self.assertEqual(store.get("123456789abc").status, JobStatus.BLOCKED)
+
+    def test_promotion_carries_clarification_into_planning_request(self) -> None:
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "rename text",
+                "status": "running",
+                "worker_token": "worker",
+                "worker_pid": 42,
+                "worker_process_start": "start",
+                "workflow_tier": "simple",
+                "workflow_classification_reason": "localized",
+                "workflow_phase": "implementing",
+                "planner_target": "planner",
+                "implementer_target": "implementer",
+                "active_participant": "implementer",
+                "herdr_target": "implementer",
+                "turn_token": "current",
+                "continuation_answer": "User answered: preserve compatibility",
+            }
+        )
+        store = jobs._store()
+
+        production_jobs._advance_workflow_output(
+            store,
+            store.get("123456789abc"),
+            "worker",
+            "WORKFLOW_PROMOTE[current]: medium\n"
+            "WORKFLOW_REASON[current]: cross-component compatibility risk",
+            "idle",
+        )
+
+        promoted = store.get("123456789abc")
+        self.assertEqual(promoted.workflow_phase.value, "planning")
+        self.assertIn("rename text", promoted.request)
+        self.assertIn("preserve compatibility", promoted.request)
+        self.assertIsNone(promoted.continuation_answer)
+        self.assertFalse(promoted.continuation)
+
+    def test_high_risk_final_rejected_review_awaits_explicit_decision(self) -> None:
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "change recovery",
+                "status": "running",
+                "worker_token": "worker",
+                "worker_pid": 42,
+                "worker_process_start": "start",
+                "workflow_tier": "high-risk",
+                "workflow_classification_reason": "recovery",
+                "workflow_phase": "reviewing",
+                "review_round": 1,
+                "planner_target": "planner",
+                "reviewer_target": "reviewer",
+                "active_participant": "reviewer",
+                "herdr_target": "reviewer",
+                "turn_token": "turn",
+            }
+        )
+        store = jobs._store()
+        plan = "Preserve ownership through recovery."
+        plan_reference = store.write_artifact("123456789abc", "plan", 1, plan)
+        store.update(
+            "123456789abc",
+            lambda job: job.evolve(plan_artifact=plan_reference),
+        )
+
+        production_jobs._advance_workflow_output(
+            store,
+            store.get("123456789abc"),
+            "worker",
+            "WORKFLOW_REVIEW_DECISION[turn]: revise\n"
+            "WORKFLOW_REVIEW[turn]: unresolved ownership",
+            "idle",
+        )
+
+        updated = store.get("123456789abc")
+        self.assertEqual(updated.status, JobStatus.AWAITING_USER)
+        self.assertEqual(updated.review_round, 1)
+        self.assertEqual(
+            updated.clarification_kind,
+            "workflow_review_exhausted",
+        )
+        self.assertEqual(updated.workflow_phase.value, "reviewing")
+
+    def test_exhausted_review_approve_queues_unchanged_plan_for_implementation(
+        self,
+    ) -> None:
+        request = "change recovery ownership"
+        self.write_exhausted_review_job()
+
+        with mock.patch.object(service, "launch_worker") as launch:
+            service.reply_job(
+                "123456789abc",
+                "external context says abort",
+                trusted_utterance="approve",
+            )
+
+        updated = jobs._store().get("123456789abc")
+        self.assertEqual(updated.status, JobStatus.QUEUED)
+        self.assertEqual(updated.workflow_phase.value, "implementing")
+        self.assertEqual(updated.request, request)
+        self.assertTrue(updated.review_approved)
+        self.assertEqual(updated.review_approval_source, "user")
+        self.assertEqual(updated.review_decision, "revise")
+        launch.assert_called_once_with("123456789abc")
+
+    def test_exhausted_review_abort_uses_job_cancellation(self) -> None:
+        self.write_exhausted_review_job()
+
+        with mock.patch.object(service, "launch_worker") as launch:
+            service.reply_job(
+                "123456789abc",
+                "abort",
+            )
+
+        self.assertEqual(
+            jobs._store().get("123456789abc").status,
+            JobStatus.CANCELLED,
+        )
+        launch.assert_not_called()
+
+    def test_stale_exhausted_review_abort_cannot_cancel_current_question(self) -> None:
+        self.write_exhausted_review_job()
+
+        result = service.reply_job(
+            "123456789abc",
+            "abort",
+            trusted_utterance="abort",
+            expected_question_id="stale-question",
+        )
+
+        self.assertIn("older question", result or "")
+        self.assertEqual(
+            jobs._store().get("123456789abc").status,
+            JobStatus.AWAITING_USER,
+        )
+
+    def test_exhausted_review_ambiguous_reply_remains_awaiting(self) -> None:
+        self.write_exhausted_review_job()
+
+        with mock.patch.object(service, "launch_worker") as launch:
+            service.reply_job(
+                "123456789abc",
+                "approve",
+                trusted_utterance="maybe",
+            )
+
+        updated = jobs._store().get("123456789abc")
+        self.assertEqual(updated.status, JobStatus.AWAITING_USER)
+        self.assertEqual(
+            updated.clarification_kind,
+            "workflow_review_exhausted",
+        )
+        self.assertFalse(updated.review_approved)
+        launch.assert_not_called()
+
     def test_pull_request_job_gets_unique_worktree_identity(self) -> None:
         with mock.patch.object(service, "launch_worker"):
             job_id = service.start_job(
@@ -371,12 +1089,7 @@ class CursorJobStateTests(unittest.TestCase):
             "agent",
             str(worktree),
         )
-        client.prompt_and_wait.return_value = PromptOutcome(
-            "idle",
-            "done",
-            None,
-            "VOICE_SUMMARY[123456789abc-1]: done",
-        )
+        configure_tiered_outcomes(client, worktree)
 
         with (
             mock.patch.object(jobs, "GitHubClient", return_value=github),
@@ -394,6 +1107,7 @@ class CursorJobStateTests(unittest.TestCase):
             reserved=set(),
             worktree_branch="voice/github-pr-123456789abc",
             worktree_label="pr-42",
+            mode="plan",
             checkpoint=mock.ANY,
             reserve=mock.ANY,
             settle=mock.ANY,
@@ -401,6 +1115,10 @@ class CursorJobStateTests(unittest.TestCase):
             reserve_worktree=mock.ANY,
             settle_worktree=mock.ANY,
             fail_worktree=mock.ANY,
+            plan_participant=mock.ANY,
+            before_pane_submit=mock.ANY,
+            pane_accepted=mock.ANY,
+            participant_name=None,
         )
         github.checkout_pull_request.assert_called_once_with(
             worktree,
@@ -553,12 +1271,7 @@ class CursorJobStateTests(unittest.TestCase):
             "agent",
             "/worktree",
         )
-        client.prompt_and_wait.return_value = PromptOutcome(
-            "idle",
-            "done",
-            None,
-            "VOICE_SUMMARY[123456789abc-1]: done",
-        )
+        configure_tiered_outcomes(client, repository, tier="high-risk")
         with (
             mock.patch.object(jobs, "GitHubClient", return_value=github),
             mock.patch.object(jobs, "HerdrClient", return_value=client),
@@ -580,6 +1293,7 @@ class CursorJobStateTests(unittest.TestCase):
             reserved=set(),
             worktree_branch="voice/github-123456789abc",
             worktree_label="github-123456",
+            mode="plan",
             checkpoint=mock.ANY,
             reserve=mock.ANY,
             settle=mock.ANY,
@@ -587,11 +1301,27 @@ class CursorJobStateTests(unittest.TestCase):
             reserve_worktree=mock.ANY,
             settle_worktree=mock.ANY,
             fail_worktree=mock.ANY,
+            plan_participant=mock.ANY,
+            before_pane_submit=mock.ANY,
+            pane_accepted=mock.ANY,
+            participant_name=None,
         )
         updated = jobs.read_job("123456789abc")
         self.assertEqual(updated["status"], "completed")
         self.assertEqual(updated["fork_repository"], "me/project")
         self.assertEqual(updated["repository"], str(repository))
+        self.assertEqual(updated["workflow_tier"], "high-risk")
+        self.assertEqual(updated["workflow_phase"], "finished")
+        self.assertTrue(updated["plan_artifact"])
+        self.assertTrue(updated["review_artifact"])
+        self.assertEqual(
+            [call.kwargs["role"] for call in client.start_fresh_agent.call_args_list],
+            ["reviewer", "implementer"],
+        )
+        self.assertEqual(
+            [call.kwargs["mode"] for call in client.start_fresh_agent.call_args_list],
+            ["ask", None],
+        )
 
     def test_reconciled_fork_is_never_resubmitted(self) -> None:
         repository = Path(self.temporary.name) / "source" / "project"
@@ -641,12 +1371,7 @@ class CursorJobStateTests(unittest.TestCase):
             "agent",
             "/worktree",
         )
-        client.prompt_and_wait.return_value = PromptOutcome(
-            "idle",
-            "done",
-            None,
-            "VOICE_SUMMARY[123456789abc-1]: done",
-        )
+        configure_tiered_outcomes(client, repository)
 
         with (
             mock.patch.object(jobs, "GitHubClient", return_value=github),
@@ -832,12 +1557,7 @@ class CursorJobStateTests(unittest.TestCase):
             "agent",
             "/worktree/issue-42",
         )
-        client.prompt_and_wait.return_value = PromptOutcome(
-            "idle",
-            "done",
-            None,
-            "VOICE_SUMMARY[123456789abc-1]: done",
-        )
+        configure_tiered_outcomes(client, repository)
         with (
             mock.patch.object(jobs, "GitHubClient", return_value=github),
             mock.patch.object(jobs, "HerdrClient", return_value=client),
@@ -854,6 +1574,7 @@ class CursorJobStateTests(unittest.TestCase):
             reserved=set(),
             worktree_branch="voice/github-issue-42",
             worktree_label="issue-42",
+            mode="plan",
             checkpoint=mock.ANY,
             reserve=mock.ANY,
             settle=mock.ANY,
@@ -861,6 +1582,10 @@ class CursorJobStateTests(unittest.TestCase):
             reserve_worktree=mock.ANY,
             settle_worktree=mock.ANY,
             fail_worktree=mock.ANY,
+            plan_participant=mock.ANY,
+            before_pane_submit=mock.ANY,
+            pane_accepted=mock.ANY,
+            participant_name=None,
         )
         prompt = client.prompt_and_wait.call_args.args[1]
         self.assertIn("Title: Fix it", prompt)
@@ -1067,12 +1792,7 @@ class CursorJobStateTests(unittest.TestCase):
             name="cursor-agent",
             worktree_path=str(repository),
         )
-        client.prompt_and_wait.return_value = PromptOutcome(
-            status="idle",
-            summary="done",
-            question=None,
-            output="VOICE_SUMMARY[123456789abc-1]: done",
-        )
+        configure_tiered_outcomes(client, repository)
 
         with mock.patch.object(jobs, "HerdrClient", return_value=client):
             service.run_worker("123456789abc")
@@ -1143,9 +1863,11 @@ class CursorJobStateTests(unittest.TestCase):
             service.run_worker("123456789abc")
 
         failed = jobs.read_job("123456789abc")
-        self.assertEqual(failed["status"], "failed")
+        self.assertEqual(failed["status"], "reconciling")
+        self.assertEqual(failed["terminal_intent_status"], "failed")
         self.assertTrue(failed["target_release_pending"])
         self.assertTrue(failed["cancellation_reconciliation_pending"])
+        self.assertEqual(failed["prompt_operation_state"], "ambiguous")
         self.assertIn("cursor-agent", jobs.reserved_targets())
 
     def test_dead_worker_reconciles_existing_agent(self) -> None:
@@ -1201,7 +1923,10 @@ class CursorJobStateTests(unittest.TestCase):
             }
         )
         client = mock.Mock()
-        client.get_agent.side_effect = HerdrError("not found", code="agent_not_found")
+        client.get_agent.side_effect = [
+            HerdrError("not found", code="agent_not_found"),
+            {"state_change_seq": 1},
+        ]
         client.start_agent.return_value = selection
         client.prompt_and_wait.return_value = PromptOutcome(
             "idle",
@@ -1468,14 +2193,19 @@ class CursorJobStateTests(unittest.TestCase):
                 )
                 client.ensure_server.assert_called_once_with()
                 service.cancel_job("123456789abc")
-                self.assertEqual(jobs.read_job("123456789abc")["status"], "cancelled")
+                self.assertEqual(jobs.read_job("123456789abc")["status"], "reconciling")
+                self.assertEqual(
+                    jobs.read_job("123456789abc")["terminal_intent_status"],
+                    "cancelled",
+                )
             finally:
                 release.set()
                 worker.join(2)
 
         self.assertFalse(worker.is_alive())
         self.assertFalse(submitted.is_set())
-        self.assertEqual(jobs.read_job("123456789abc")["status"], "cancelled")
+        self.assertEqual(jobs.read_job("123456789abc")["status"], "reconciling")
+        self.assertTrue(jobs.read_job("123456789abc")["target_release_pending"])
         github.ensure_clone.assert_not_called()
         client.ensure_agent.assert_not_called()
         service_operation.assert_not_called()
@@ -1567,12 +2297,15 @@ class CursorJobStateTests(unittest.TestCase):
 
         self.assertFalse(worker.is_alive())
         retained = jobs.read_job("123456789abc")
-        self.assertEqual(retained["worktree_provision_state"], "retained")
+        self.assertEqual(retained["worktree_provision_state"], "dispatching")
+        self.assertEqual(retained["status"], "reconciling")
+        self.assertEqual(retained["terminal_intent_status"], "cancelled")
         self.assertTrue(retained["target_release_pending"])
         client.prompt_and_wait.assert_not_called()
         with mock.patch.object(jobs, "_worker_is_alive", return_value=False):
             service.recover_jobs()
-        self.assertFalse(jobs.read_job("123456789abc")["target_release_pending"])
+        self.assertTrue(jobs.read_job("123456789abc")["target_release_pending"])
+        self.assertEqual(jobs.read_job("123456789abc")["status"], "reconciling")
 
     def test_cancellation_before_agent_dispatch_uses_planned_reservation(self) -> None:
         repository = Path(self.temporary.name) / "project"
@@ -1657,6 +2390,7 @@ class CursorJobStateTests(unittest.TestCase):
         client.cancel_agent.side_effect = [
             HerdrError("not found", code="agent_not_found"),
             None,
+            None,
         ]
         client.get_agent.side_effect = [
             HerdrError("not found", code="agent_not_found"),
@@ -1704,7 +2438,8 @@ class CursorJobStateTests(unittest.TestCase):
                 service.recover_jobs()
 
         updated = jobs.read_job("123456789abc")
-        self.assertEqual(updated["agent_dispatch_state"], "ready")
+        self.assertEqual(updated["agent_dispatch_state"], "confirmed_absent")
+        self.assertEqual(updated["status"], "cancelled")
         self.assertFalse(updated["target_release_pending"])
         self.assertEqual(client.cancel_agent.call_count, 2)
 

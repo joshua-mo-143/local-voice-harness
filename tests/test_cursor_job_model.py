@@ -7,6 +7,8 @@ from local_voice_harness.cursor.model import (
     CursorJob,
     JobStatus,
     JobValidationError,
+    WorkflowPhase,
+    WorkflowTier,
     legal_transitions,
     transition,
     validate_reservations,
@@ -305,6 +307,153 @@ class CursorJobModelTests(unittest.TestCase):
         self.assertEqual(reloaded.speakable_label, "issue 42")
         self.assertTrue(reloaded.announcement_dismissed)
 
+    def test_v8_job_migrates_to_finished_simple_workflow(self) -> None:
+        job = CursorJob.from_dict(
+            {
+                "schema_version": 8,
+                "id": "123456789abc",
+                "revision": 3,
+                "request": "do it",
+                "status": "completed",
+                "created_at": 1,
+                "completed_at": 2,
+                "result": "done",
+                "delivered": True,
+            }
+        )
+
+        self.assertEqual(job.workflow_tier, WorkflowTier.SIMPLE)
+        self.assertEqual(job.workflow_phase, WorkflowPhase.FINISHED)
+        self.assertIn("Migrated", job.workflow_classification_reason or "")
+
+    def test_v9_approved_review_migrates_reviewer_approval_source(self) -> None:
+        job = CursorJob.from_dict(
+            {
+                "schema_version": 9,
+                "id": "123456789abc",
+                "revision": 3,
+                "request": "change recovery",
+                "status": "running",
+                "created_at": 1,
+                "delivered": False,
+                "workflow_tier": "high-risk",
+                "workflow_classification_reason": "recovery",
+                "workflow_phase": "implementing",
+                "review_round": 1,
+                "plan_artifact": ".artifacts/123456789abc/plan-1.json",
+                "review_artifact": ".artifacts/123456789abc/review-1.json",
+                "review_decision": "approve",
+                "review_approved": True,
+            }
+        )
+
+        self.assertEqual(job.review_approval_source, "reviewer")
+
+    def test_v9_exhausted_review_migrates_to_explicit_clarification(self) -> None:
+        job = CursorJob.from_dict(
+            {
+                "schema_version": 9,
+                "id": "123456789abc",
+                "revision": 3,
+                "request": "change recovery",
+                "status": "awaiting_user",
+                "created_at": 1,
+                "delivered": False,
+                "question": "Decide how to proceed.",
+                "result": "Decide how to proceed.",
+                "clarification_kind": "workflow_review",
+                "workflow_tier": "high-risk",
+                "workflow_classification_reason": "recovery",
+                "workflow_phase": "reviewing",
+                "review_round": 2,
+                "plan_artifact": ".artifacts/123456789abc/plan-2.json",
+                "review_artifact": ".artifacts/123456789abc/review-2.json",
+                "review_decision": "revise",
+            }
+        )
+
+        self.assertEqual(
+            job.clarification_kind,
+            "workflow_review_exhausted",
+        )
+
+    def test_v9_round_two_revising_state_fails_closed(self) -> None:
+        with self.assertRaisesRegex(
+            JobValidationError,
+            "round-two workflow cannot remain in revising",
+        ):
+            CursorJob.from_dict(
+                {
+                    "schema_version": 9,
+                    "id": "123456789abc",
+                    "revision": 3,
+                    "request": "change recovery",
+                    "status": "running",
+                    "created_at": 1,
+                    "delivered": False,
+                    "workflow_tier": "high-risk",
+                    "workflow_classification_reason": "recovery",
+                    "workflow_phase": "revising",
+                    "review_round": 2,
+                    "plan_artifact": ".artifacts/123456789abc/plan-1.json",
+                    "review_artifact": ".artifacts/123456789abc/review-1.json",
+                    "review_decision": "revise",
+                }
+            )
+
+    def test_workflow_tier_can_only_be_promoted(self) -> None:
+        job = CursorJob.from_dict(
+            {
+                "id": "123456789abc",
+                "status": "queued",
+                "workflow_tier": "high-risk",
+                "workflow_classification_reason": "recovery",
+                "workflow_phase": "planning",
+            }
+        )
+
+        with self.assertRaisesRegex(JobValidationError, "cannot be downgraded"):
+            job.evolve(
+                workflow_tier="medium",
+                workflow_classification_reason="smaller",
+            )
+
+    def test_simple_workflow_cannot_enter_review(self) -> None:
+        with self.assertRaisesRegex(
+            JobValidationError, "simple workflow cannot enter planning or review"
+        ):
+            CursorJob.from_dict(
+                {
+                    "id": "123456789abc",
+                    "status": "queued",
+                    "workflow_tier": "simple",
+                    "workflow_classification_reason": "localized",
+                    "workflow_phase": "reviewing",
+                }
+            )
+
+    def test_planned_workflow_cannot_implement_without_approved_review(
+        self,
+    ) -> None:
+        with self.assertRaisesRegex(
+            JobValidationError, "cannot implement without approved"
+        ):
+            CursorJob.from_dict(
+                {
+                    "schema_version": CURRENT_SCHEMA_VERSION,
+                    "id": "123456789abc",
+                    "revision": 0,
+                    "request": "change persistence",
+                    "status": "queued",
+                    "created_at": 1,
+                    "queued_at": 1,
+                    "delivered": False,
+                    "workflow_tier": "high-risk",
+                    "workflow_classification_reason": "persistence",
+                    "workflow_phase": "implementing",
+                }
+            )
+
     def test_illegal_status_transition_is_rejected(self) -> None:
         job = CursorJob.from_dict(
             {
@@ -406,6 +555,57 @@ class CursorJobModelTests(unittest.TestCase):
                             f"illegal Cursor job transition {source} -> {target}",
                         ):
                             transition(job, target, **fields)
+
+    def test_schema_v10_prompt_boolean_migrates_fail_closed_in_place(self) -> None:
+        job = CursorJob.from_dict(
+            {
+                "schema_version": 10,
+                "id": "123456789abc",
+                "revision": 0,
+                "request": "test",
+                "status": "running",
+                "created_at": 1,
+                "delivered": False,
+                "worker_token": "worker",
+                "worker_pid": 42,
+                "worker_boot_id": "boot",
+                "worker_process_start": "start",
+                "workflow_phase": "classifying",
+                "turn": 2,
+                "workflow_turn_phase": "classifying",
+                "herdr_target": "planner",
+                "planner_target": "planner",
+                "active_participant": "planner",
+                "phase_prompt_active": True,
+            }
+        )
+
+        self.assertEqual(job.schema_version, 10)
+        self.assertEqual(job.prompt_operation_state, "ambiguous")
+        self.assertEqual(job.prompt_operation_turn, 2)
+        self.assertEqual(job.prompt_operation_target, "planner")
+        self.assertEqual(job.prompt_baseline_sequence, -1)
+
+    def test_all_participant_targets_remain_reserved_during_cleanup(self) -> None:
+        first = self.job_for_status(JobStatus.RECONCILING).evolve(
+            terminal_intent_status="cancelled",
+            terminal_intent_result="cancelled",
+            terminal_intent_completed_at=2,
+            target_release_pending=True,
+            cancellation_reconciliation_pending=True,
+            planner_target="planner",
+        )
+        second = self.job_for_status(JobStatus.QUEUED)
+        second = CursorJob.from_dict(
+            {
+                **second.to_dict(),
+                "id": "bbbbbbbbbbbb",
+                "herdr_target": "planner",
+            }
+        )
+
+        with self.assertRaisesRegex(JobValidationError, "planner"):
+            validate_reservations([first, second])
 
 
 if __name__ == "__main__":

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import time
 import uuid
-from collections.abc import Callable, Set
+from collections.abc import Callable, Mapping, Set
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -36,7 +36,7 @@ from ..questions import (
     parse_question_spec,
 )
 from . import questions as question_adapter
-from . import worker_lifecycle
+from . import recovery, worker_lifecycle
 from .model import (
     ACTIVE_STATUSES as MODEL_ACTIVE_STATUSES,
 )
@@ -50,9 +50,18 @@ from .model import (
     CursorJob,
     JobStatus,
     JobValidationError,
+    WorkflowParticipant,
+    WorkflowPhase,
+    WorkflowTier,
     transition,
 )
-from .prompts import cursor_prompt
+from .prompts import (
+    classification_prompt,
+    implementation_prompt,
+    planning_prompt,
+    review_prompt,
+    revision_prompt,
+)
 from .store import JobStore
 
 DELIVERY_RETRY_SECONDS = 5.0
@@ -77,13 +86,29 @@ def _agent_not_found(exc: HerdrError) -> bool:
 
 
 def reserved_targets(store: JobStore, exclude_job_id: str | None = None) -> set[str]:
-    return {
-        job.herdr_target
-        for job in store.list()
-        if job.herdr_target
-        and job.id != exclude_job_id
-        and (job.status in MODEL_ACTIVE_STATUSES or job.target_release_pending)
-    }
+    reserved: set[str] = set()
+    for job in store.list():
+        if job.id == exclude_job_id:
+            continue
+        if not (
+            job.status in MODEL_ACTIVE_STATUSES
+            or job.target_release_pending
+            or job.has_uncertain_operation()
+            or job.manual_reconcile_operation
+        ):
+            continue
+        reserved.update(
+            target
+            for target in (
+                job.herdr_target,
+                job.participant_target(WorkflowParticipant.PLANNER),
+                job.participant_target(WorkflowParticipant.REVIEWER),
+                job.participant_target(WorkflowParticipant.IMPLEMENTER),
+                job.participant_creation_target,
+            )
+            if target
+        )
+    return reserved
 
 
 def repository_question(repositories: list[Path], reason: str = "") -> str:
@@ -217,7 +242,11 @@ def _worker_change(
     change: Callable[[CursorJob], CursorJob],
 ) -> CursorJob | None:
     def guarded(job: CursorJob) -> CursorJob | None:
-        if job.worker_token != token or job.status not in allowed_statuses:
+        if (
+            job.worker_token != token
+            or job.status not in allowed_statuses
+            or job.terminal_intent_status is not None
+        ):
             return None
         return change(job)
 
@@ -265,6 +294,17 @@ def _worker_complete(
             job, output=output, agent_status=agent_status, now=now
         )
         preserve = preserve_blocked_delivery and outcome.status == JobStatus.BLOCKED
+        workflow_finished = (
+            outcome.status == JobStatus.COMPLETED and job.workflow_tier is not None
+        )
+        if outcome.status == JobStatus.COMPLETED:
+            return recovery.stage_terminal_intent(
+                job,
+                JobStatus.COMPLETED,
+                now=now,
+                result=outcome.result or "",
+                voice_question=outcome.voice_question,
+            )
         return job.evolve(
             status=outcome.status,
             remove=frozenset({"reconcile", "continuation", "continuation_answer"}),
@@ -302,6 +342,21 @@ def _worker_complete(
             worker_boot_id=None,
             worker_process_start=None,
             worker_token=None,
+            workflow_phase=(
+                WorkflowPhase.FINISHED.value
+                if workflow_finished
+                else job.workflow_phase.value
+            ),
+            active_participant=(
+                None
+                if workflow_finished
+                else (
+                    job.active_participant.value
+                    if job.active_participant is not None
+                    else None
+                )
+            ),
+            prompt_operation_state="none",
         )
 
     _worker_change(
@@ -321,39 +376,29 @@ def _worker_fail(
     *,
     target_may_be_active: bool = False,
 ) -> None:
+    del target_may_be_active  # Terminal intent always retains the cleanup fence.
     message = (str(exc) or type(exc).__name__)[:500]
 
     def fail(job: CursorJob) -> CursorJob:
-        uncertain = job.has_uncertain_operation() or (
-            target_may_be_active and bool(job.herdr_target)
-        )
-        if uncertain:
-            message_with_fence = (
-                f"{message}; external operation reconciliation is pending"
-            )[:500]
-        else:
-            message_with_fence = message
-        return job.evolve_for_delivery(
-            now=time.time(),
-            status=JobStatus.FAILED,
-            remove=frozenset({"reconcile"}),
-            error=message_with_fence,
-            result=message_with_fence,
-            reconciliation_base_error=message,
-            completed_at=time.time(),
-            target_release_pending=uncertain,
-            target_release_token=None,
-            target_release_owner_pid=None,
-            target_release_owner_boot_id=None,
-            target_release_owner_start=None,
-            cancellation_reconciliation_pending=uncertain,
-            worker_pid=job.worker_pid if uncertain else None,
-            worker_boot_id=job.worker_boot_id if uncertain else None,
-            worker_process_start=job.worker_process_start if uncertain else None,
-            worker_token=job.worker_token if uncertain else None,
+        now = time.time()
+        return recovery.stage_terminal_intent(
+            job,
+            JobStatus.FAILED,
+            now=now,
+            result=message,
+            error=message,
         )
 
-    _worker_change(store, job_id, token, MODEL_WORKER_STATUSES, fail)
+    def guarded(job: CursorJob) -> CursorJob | None:
+        if (
+            job.worker_token != token
+            or job.status not in MODEL_WORKER_STATUSES
+            or job.terminal_intent_status is not None
+        ):
+            return None
+        return fail(job)
+
+    store.update(job_id, guarded)
 
 
 def _worker_block_interactive(
@@ -482,16 +527,29 @@ def _reserve_worker_target(
     issue_key: str | None,
     *,
     dispatching: bool = False,
+    participant: WorkflowParticipant | None = None,
 ) -> CursorJob | None:
     target = str(selection.target)
 
     def reserve(job: CursorJob) -> CursorJob | None:
-        if job.worker_token != token or job.status.value != "routing":
+        if job.worker_token != token or job.status not in MODEL_WORKER_STATUSES:
             return None
-        repository_value = job.repository if job.parent_job_id else str(repository)
-        worktree_value = (
-            job.worktree_path if job.parent_job_id else selection.worktree_path
+        repository_value = (
+            job.repository
+            if job.parent_job_id or (participant is not None and job.repository)
+            else str(repository)
         )
+        worktree_value = (
+            job.worktree_path
+            if job.parent_job_id or (participant is not None and job.worktree_path)
+            else selection.worktree_path
+        )
+        participant_changes: Mapping[str, object] = {}
+        if participant is not None:
+            participant_changes = {
+                "active_participant": participant.value,
+                f"{participant.value}_target": target,
+            }
         return transition(
             job,
             job.status,
@@ -504,6 +562,7 @@ def _reserve_worker_target(
             agent_name=selection.name,
             agent_dispatch_state="dispatching" if dispatching else "ready",
             worker_operation="agent_start" if dispatching else None,
+            **participant_changes,
         )
 
     try:
@@ -526,7 +585,8 @@ def _settle_worker_agent(
             job.worker_token != token
             or job.herdr_target != selection.target
             or job.agent_dispatch_state != "dispatching"
-            or job.status.value not in {"routing", "cancelled", "failed"}
+            or job.status
+            not in MODEL_WORKER_STATUSES | {JobStatus.CANCELLED, JobStatus.FAILED}
         ):
             return None
         return transition(
@@ -538,6 +598,12 @@ def _settle_worker_agent(
             agent_name=selection.name,
             agent_dispatch_state="ready",
             worker_operation=None,
+            participant_creation_state="none",
+            participant_creation_participant=None,
+            participant_creation_target=None,
+            participant_creation_label=None,
+            participant_creation_workspace_id=None,
+            participant_creation_pane_id=None,
         )
 
     return store.update(job_id, settle)
@@ -818,84 +884,1105 @@ def _provision_followup_agent(
     """Reserve a settled agent at the child's exact retained checkout."""
     repository, checkout, _branch, match = _validate_followup_checkout(client, job)
     checkpoint()
-    existing = client.find_agent(checkout=checkout, reserved=reserved)
-    if existing is not None:
-        _validate_followup_agent_cwd(checkout, existing.cwd)
-        selection = existing
-        reserved_job = _reserve_worker_target(
-            store,
-            job_id,
-            token,
-            selection,
-            repository,
-            job.issue_key,
-            dispatching=False,
+    label = job.worktree_label or repository.name
+    workspace_id = job.worktree_workspace_id or ""
+    if not workspace_id or not job.worktree_root_pane_id:
+        raise HarnessError(
+            "follow-up worktree has no retained Herdr pane for safe agent startup"
         )
+    open_workspace_id = str(match.get("open_workspace_id") or "")
+    if open_workspace_id and open_workspace_id != workspace_id:
+        raise HarnessError("follow-up worktree is open in a different Herdr workspace")
+    if (
+        job.participant_creation_state == "planned"
+        and job.participant_creation_participant == WorkflowParticipant.PLANNER
+        and job.participant_creation_target
+    ):
+        name = job.participant_creation_target
+        workspace_id = job.participant_creation_workspace_id or workspace_id
     else:
-        label = job.worktree_label or repository.name
-        workspace_id = job.worktree_workspace_id or ""
-        pane = job.worktree_root_pane_id or ""
-        if not workspace_id or not pane:
-            raise HarnessError(
-                "follow-up worktree has no retained Herdr pane for safe agent startup"
-            )
-        open_workspace_id = str(match.get("open_workspace_id") or "")
-        if open_workspace_id and open_workspace_id != workspace_id:
-            raise HarnessError(
-                "follow-up worktree is open in a different Herdr workspace"
-            )
         name = f"voice-{normalize_name(label)[:15] or 'task'}-{uuid.uuid4().hex[:10]}"
-        provisional = AgentSelection(
-            target=name,
-            pane_id=pane,
-            workspace_id=workspace_id,
-            cwd=str(checkout),
-            name=name,
-            worktree_path=job.worktree_path,
-        )
-        reserved_job = _reserve_worker_target(
+        job = _plan_participant_creation(
             store,
-            job_id,
+            job,
             token,
-            provisional,
-            repository,
-            job.issue_key,
-            dispatching=True,
+            WorkflowParticipant.PLANNER,
+            target=name,
+            label=f"{label}-planner",
+            workspace_id=workspace_id,
         )
-        if reserved_job is None:
-            raise HarnessError("could not reserve a Cursor agent for the follow-up")
-        checkpoint()
-        try:
-            selection = client.start_agent(
-                checkout,
-                label,
-                pane,
-                workspace_id,
-                name=name,
-                checkpoint=checkpoint,
-            )
-        except HerdrError as exc:
-            _fail_worker_agent_dispatch(store, job_id, token, exc)
-            raise
-        if selection.target != name:
-            error = HerdrError(
-                "Herdr started a different follow-up agent than the reserved target",
-                code="operation_ambiguous",
-            )
-            _fail_worker_agent_dispatch(store, job_id, token, error)
-            raise error
-        _validate_followup_agent_binding(
+    before_pane_submit, pane_accepted = _participant_pane_callbacks(
+        store, job_id, token, name
+    )
+    try:
+        before_pane_submit()
+        pane, workspace_id = client.new_pane(
             checkout,
-            cwd=selection.cwd,
-            pane_id=selection.pane_id,
-            workspace_id=selection.workspace_id,
-            expected_pane_id=pane,
-            expected_workspace_id=workspace_id,
+            f"{label}-planner",
+            workspace_id,
+            checkpoint=checkpoint,
         )
-        reserved_job = _settle_worker_agent(store, job_id, token, selection)
+        pane_accepted(pane, workspace_id)
+    except HerdrError as exc:
+        _fence_participant_creation(store, job_id, token, exc)
+        raise
+    provisional = AgentSelection(
+        target=name,
+        pane_id=pane,
+        workspace_id=workspace_id,
+        cwd=str(checkout),
+        name=name,
+        worktree_path=job.worktree_path,
+    )
+    reserved_job = _reserve_worker_target(
+        store,
+        job_id,
+        token,
+        provisional,
+        repository,
+        job.issue_key,
+        dispatching=True,
+        participant=WorkflowParticipant.PLANNER,
+    )
+    if reserved_job is None:
+        raise HarnessError("could not reserve a Cursor agent for the follow-up")
+    checkpoint()
+    try:
+        selection = client.start_agent(
+            checkout,
+            label,
+            pane,
+            workspace_id,
+            name=name,
+            mode="plan",
+            checkpoint=checkpoint,
+        )
+    except HerdrError as exc:
+        _fail_worker_agent_dispatch(store, job_id, token, exc)
+        raise
+    if selection.target != name:
+        error = HerdrError(
+            "Herdr started a different follow-up agent than the reserved target",
+            code="operation_ambiguous",
+        )
+        _fail_worker_agent_dispatch(store, job_id, token, error)
+        raise error
+    _validate_followup_agent_binding(
+        checkout,
+        cwd=selection.cwd,
+        pane_id=selection.pane_id,
+        workspace_id=selection.workspace_id,
+        expected_pane_id=pane,
+        expected_workspace_id=workspace_id,
+    )
+    reserved_job = _settle_worker_agent(store, job_id, token, selection)
     if reserved_job is None:
         raise HarnessError("could not reserve a Cursor agent for the follow-up")
     return reserved_job, selection.target
+
+
+_HARD_RISK_TERMS = (
+    "authentication",
+    "authorization",
+    "oauth",
+    "permission",
+    "credential",
+    "secret",
+    "privacy",
+    "security",
+    "migration",
+    "schema",
+    "database",
+    "persistence",
+    "recovery",
+    "concurrency",
+    "race condition",
+    "thread",
+    "locking",
+    "lifecycle",
+    "cancellation",
+    "worker ownership",
+    "worktree",
+    "external write",
+    "fork",
+    "infrastructure",
+    "systemd",
+    "deployment",
+    "terraform",
+    "kubernetes",
+    "public api",
+    "destructive",
+    "ambiguous",
+    "unclear acceptance",
+)
+_MAX_RISK_EVIDENCE_BYTES = 16 * 1024
+
+
+def _bounded_risk_text(value: str | None) -> str:
+    if not value:
+        return ""
+    return value.encode()[:_MAX_RISK_EVIDENCE_BYTES].decode(errors="ignore").casefold()
+
+
+def _hard_risk_evidence(
+    request: str,
+    reason: str,
+    github_issue_context: str | None = None,
+) -> str | None:
+    for source, value in (
+        ("request", request),
+        ("GitHub issue context", github_issue_context),
+        ("classification or promotion reason", reason),
+    ):
+        evidence = _bounded_risk_text(value)
+        for term in _HARD_RISK_TERMS:
+            if term in evidence:
+                return f"{source} contains {term!r}"
+    return None
+
+
+def _classified_tier(
+    value: str,
+    request: str,
+    reason: str,
+    github_issue_context: str | None = None,
+) -> WorkflowTier:
+    normalized = value.strip().casefold().replace("_", "-")
+    try:
+        tier = WorkflowTier(normalized)
+    except ValueError as exc:
+        raise HarnessError("Cursor returned an invalid workflow tier") from exc
+    if _hard_risk_evidence(request, reason, github_issue_context):
+        return WorkflowTier.HIGH_RISK
+    return tier
+
+
+def _workflow_question(
+    store: JobStore,
+    job_id: str,
+    token: str,
+    question: str,
+    *,
+    clarification_kind: str = "workflow",
+) -> None:
+    try:
+        spec = parse_question_spec(question)
+    except QuestionError:
+        spec = QuestionSpec(question, sensitivity=QuestionSensitivity.ROUTINE)
+
+    def ask(job: CursorJob) -> CursorJob:
+        now = time.time()
+        asked = question_adapter.ask(
+            job,
+            spec,
+            owner=clarification_kind,
+            turn_token=job.turn_token or token,
+            now=now,
+            clear_worker=True,
+            remove_reconcile=True,
+            prompt_operation_state="none",
+        )
+        return asked
+
+    _worker_change(store, job_id, token, MODEL_WORKER_STATUSES, ask)
+
+
+def _workflow_block(store: JobStore, job_id: str, token: str, message: str) -> None:
+    def block(job: CursorJob) -> CursorJob:
+        now = time.time()
+        return job.evolve_for_delivery(
+            now=now,
+            status=JobStatus.BLOCKED,
+            remove=frozenset({"reconcile"}),
+            result=message[:500],
+            completed_at=now,
+            prompt_operation_state="none",
+            worker_pid=None,
+            worker_boot_id=None,
+            worker_process_start=None,
+            worker_token=None,
+        )
+
+    _worker_change(store, job_id, token, MODEL_WORKER_STATUSES, block)
+
+
+def _begin_phase_turn(
+    store: JobStore, job_id: str, worker_token: str
+) -> CursorJob | None:
+    def begin(job: CursorJob) -> CursorJob:
+        turn = job.turn + 1
+        return job.evolve(
+            turn=turn,
+            turn_token=f"{job.id}-{turn}",
+            workflow_turn_phase=job.workflow_phase.value,
+            prompt_operation_state="none",
+            prompt_operation_phase=None,
+            prompt_operation_turn=None,
+            prompt_operation_target=None,
+            prompt_baseline_sequence=None,
+        )
+
+    return _worker_change(store, job_id, worker_token, MODEL_WORKER_STATUSES, begin)
+
+
+def _advance_workflow_output(
+    store: JobStore,
+    job: CursorJob,
+    worker_token: str,
+    output: str,
+    agent_status: str,
+) -> CursorJob | None:
+    token = job.turn_token or ""
+    question = extract_marker(output, "VOICE_QUESTION", token)
+    if question:
+        _workflow_question(store, job.id, worker_token, question)
+        return None
+
+    if job.workflow_phase == WorkflowPhase.CLASSIFYING:
+        raw_tier = extract_marker(output, "WORKFLOW_TIER", token)
+        reason = extract_marker(output, "WORKFLOW_REASON", token)
+        if not raw_tier or not reason:
+            _workflow_block(
+                store,
+                job.id,
+                worker_token,
+                "Cursor classification ended without valid tier and reason markers.",
+            )
+            return None
+        try:
+            tier = _classified_tier(
+                raw_tier,
+                job.request,
+                reason,
+                job.github_issue_context,
+            )
+        except HarnessError as exc:
+            _workflow_block(store, job.id, worker_token, str(exc))
+            return None
+        hard_risk_evidence = _hard_risk_evidence(
+            job.request,
+            reason,
+            job.github_issue_context,
+        )
+        classification_reason = reason
+        if hard_risk_evidence:
+            classification_reason = (
+                f"{reason} Deterministic hard-risk floor: {hard_risk_evidence}."
+            )
+        phase = (
+            WorkflowPhase.IMPLEMENTING
+            if tier == WorkflowTier.SIMPLE
+            else WorkflowPhase.PLANNING
+        )
+        return _worker_change(
+            store,
+            job.id,
+            worker_token,
+            MODEL_WORKER_STATUSES,
+            lambda current: current.evolve(
+                workflow_tier=tier.value,
+                workflow_classification_reason=classification_reason[:500],
+                workflow_phase=phase.value,
+                prompt_operation_state="none",
+                review_approved=False,
+                review_decision=None,
+                review_approval_source=None,
+            ),
+        )
+
+    if job.workflow_phase in {WorkflowPhase.PLANNING, WorkflowPhase.REVISING}:
+        plan = extract_marker(output, "WORKFLOW_PLAN", token)
+        if not plan:
+            _workflow_block(
+                store,
+                job.id,
+                worker_token,
+                "Cursor planner ended without a valid plan marker.",
+            )
+            return None
+        return store.publish_artifact(
+            job.id,
+            "plan",
+            job.review_round,
+            plan,
+            expected_worker_token=worker_token,
+            expected_turn_token=token,
+            expected_phase=job.workflow_phase.value,
+            expected_prior_reference=job.plan_artifact,
+            change=lambda current, reference: current.evolve(
+                workflow_phase=WorkflowPhase.REVIEWING.value,
+                plan_artifact=reference,
+                prompt_operation_state="none",
+                review_approved=False,
+                review_decision=None,
+                review_approval_source=None,
+            ),
+        )
+
+    if job.workflow_phase == WorkflowPhase.REVIEWING:
+        decision = (
+            extract_marker(output, "WORKFLOW_REVIEW_DECISION", token) or ""
+        ).casefold()
+        review = extract_marker(output, "WORKFLOW_REVIEW", token)
+        if decision not in {"approve", "revise"} or not review:
+            _workflow_block(
+                store,
+                job.id,
+                worker_token,
+                "Cursor reviewer ended without valid review markers.",
+            )
+            return None
+        if job.plan_artifact is None:
+            _workflow_block(
+                store,
+                job.id,
+                worker_token,
+                "Cursor reviewer has no current plan artifact.",
+            )
+            return None
+        if decision == "approve":
+            return store.publish_artifact(
+                job.id,
+                "review",
+                job.review_round,
+                review,
+                expected_worker_token=worker_token,
+                expected_turn_token=token,
+                expected_phase=job.workflow_phase.value,
+                expected_prior_reference=job.review_artifact,
+                expected_plan_reference=job.plan_artifact,
+                change=lambda current, reference: current.evolve(
+                    workflow_phase=WorkflowPhase.IMPLEMENTING.value,
+                    review_artifact=reference,
+                    prompt_operation_state="none",
+                    review_approved=True,
+                    review_decision="approve",
+                    review_approval_source="reviewer",
+                ),
+            )
+        if job.workflow_tier == WorkflowTier.MEDIUM:
+            published = store.publish_artifact(
+                job.id,
+                "review",
+                job.review_round,
+                review,
+                expected_worker_token=worker_token,
+                expected_turn_token=token,
+                expected_phase=job.workflow_phase.value,
+                expected_prior_reference=job.review_artifact,
+                expected_plan_reference=job.plan_artifact,
+                change=lambda current, reference: current.evolve(
+                    review_artifact=reference,
+                    review_approved=False,
+                    review_decision="revise",
+                    review_approval_source=None,
+                ),
+            )
+            if published is None:
+                return None
+            _workflow_question(
+                store,
+                job.id,
+                worker_token,
+                f"The plan review needs your decision: {review}"[:500],
+                clarification_kind="workflow_review",
+            )
+            return None
+        if job.review_round >= 1:
+            published = store.publish_artifact(
+                job.id,
+                "review",
+                job.review_round,
+                review,
+                expected_worker_token=worker_token,
+                expected_turn_token=token,
+                expected_phase=job.workflow_phase.value,
+                expected_prior_reference=job.review_artifact,
+                expected_plan_reference=job.plan_artifact,
+                change=lambda current, reference: current.evolve(
+                    review_artifact=reference,
+                    review_approved=False,
+                    review_decision="revise",
+                    review_approval_source=None,
+                ),
+            )
+            if published is None:
+                return None
+            _workflow_question(
+                store,
+                job.id,
+                worker_token,
+                "The final plan review still has unresolved findings. "
+                "Say approve to implement the reviewed plan anyway, or abort to "
+                f"cancel the job: {review}"[:500],
+                clarification_kind="workflow_review_exhausted",
+            )
+            return None
+        planner_target = job.participant_target(WorkflowParticipant.PLANNER)
+        if not planner_target:
+            _workflow_block(
+                store,
+                job.id,
+                worker_token,
+                "The planner agent is unavailable for the required revision.",
+            )
+            return None
+        return store.publish_artifact(
+            job.id,
+            "review",
+            job.review_round,
+            review,
+            expected_worker_token=worker_token,
+            expected_turn_token=token,
+            expected_phase=job.workflow_phase.value,
+            expected_prior_reference=job.review_artifact,
+            expected_plan_reference=job.plan_artifact,
+            change=lambda current, reference: current.evolve(
+                workflow_phase=WorkflowPhase.REVISING.value,
+                review_artifact=reference,
+                review_round=current.review_round + 1,
+                active_participant=WorkflowParticipant.PLANNER.value,
+                herdr_target=planner_target,
+                prompt_operation_state="none",
+                review_approved=False,
+                review_decision="revise",
+                review_approval_source=None,
+            ),
+        )
+
+    if job.workflow_phase == WorkflowPhase.IMPLEMENTING:
+        promotion = extract_marker(output, "WORKFLOW_PROMOTE", token)
+        promotion_reason = extract_marker(output, "WORKFLOW_REASON", token)
+        if promotion:
+            if not promotion_reason:
+                _workflow_block(
+                    store,
+                    job.id,
+                    worker_token,
+                    "Cursor requested promotion without a reason.",
+                )
+                return None
+            try:
+                promoted = _classified_tier(
+                    promotion,
+                    job.request,
+                    promotion_reason,
+                    job.github_issue_context,
+                )
+            except HarnessError as exc:
+                _workflow_block(store, job.id, worker_token, str(exc))
+                return None
+            current_order = {
+                WorkflowTier.SIMPLE: 0,
+                WorkflowTier.MEDIUM: 1,
+                WorkflowTier.HIGH_RISK: 2,
+            }
+            if (
+                job.workflow_tier is None
+                or current_order[promoted] <= current_order[job.workflow_tier]
+            ):
+                _workflow_block(
+                    store,
+                    job.id,
+                    worker_token,
+                    "Cursor requested a workflow promotion that did not increase risk.",
+                )
+                return None
+            planner_target = job.participant_target(WorkflowParticipant.PLANNER)
+            if not planner_target:
+                _workflow_block(
+                    store,
+                    job.id,
+                    worker_token,
+                    "The planner agent is unavailable for workflow promotion.",
+                )
+                return None
+            hard_risk_evidence = _hard_risk_evidence(
+                job.request,
+                promotion_reason,
+                job.github_issue_context,
+            )
+            classification_reason = promotion_reason
+            if hard_risk_evidence:
+                classification_reason = (
+                    f"{promotion_reason} Deterministic hard-risk floor: "
+                    f"{hard_risk_evidence}."
+                )
+            return _worker_change(
+                store,
+                job.id,
+                worker_token,
+                MODEL_WORKER_STATUSES,
+                lambda current: current.evolve(
+                    request=_request_with_clarification(current),
+                    remove=frozenset({"continuation", "continuation_answer"}),
+                    workflow_tier=promoted.value,
+                    workflow_classification_reason=classification_reason[:500],
+                    workflow_phase=WorkflowPhase.PLANNING.value,
+                    active_participant=WorkflowParticipant.PLANNER.value,
+                    herdr_target=planner_target,
+                    review_round=0,
+                    plan_artifact=None,
+                    review_artifact=None,
+                    prompt_operation_state="none",
+                    review_approved=False,
+                    review_decision=None,
+                    review_approval_source=None,
+                ),
+            )
+        _worker_complete(
+            store,
+            job.id,
+            worker_token,
+            output=output,
+            agent_status=agent_status,
+        )
+        return None
+
+    _workflow_block(
+        store,
+        job.id,
+        worker_token,
+        f"Cursor returned output for unsupported workflow phase "
+        f"{job.workflow_phase.value}.",
+    )
+    return None
+
+
+def _plan_participant_creation(
+    store: JobStore,
+    job: CursorJob,
+    worker_token: str,
+    participant: WorkflowParticipant,
+    *,
+    target: str,
+    label: str,
+    workspace_id: str,
+) -> CursorJob:
+    planned = _worker_change(
+        store,
+        job.id,
+        worker_token,
+        MODEL_WORKER_STATUSES,
+        lambda current: current.evolve(
+            participant_creation_state="planned",
+            participant_creation_participant=participant.value,
+            participant_creation_target=target,
+            participant_creation_label=label,
+            participant_creation_workspace_id=workspace_id,
+            participant_creation_pane_id=None,
+        ),
+    )
+    if planned is None:
+        raise WorkerCancelled
+    return planned
+
+
+def _participant_pane_callbacks(
+    store: JobStore,
+    job_id: str,
+    worker_token: str,
+    target: str,
+) -> tuple[Callable[[], None], Callable[[str, str], None]]:
+    def before_submit() -> None:
+        updated = _worker_change(
+            store,
+            job_id,
+            worker_token,
+            MODEL_WORKER_STATUSES,
+            lambda current: current.evolve(participant_creation_state="submitting"),
+        )
+        if updated is None:
+            raise WorkerCancelled
+
+    def accepted(pane_id: str, workspace_id: str) -> None:
+        updated = _worker_change(
+            store,
+            job_id,
+            worker_token,
+            MODEL_WORKER_STATUSES,
+            lambda current: current.evolve(
+                participant_creation_state="created",
+                participant_creation_pane_id=pane_id,
+                participant_creation_workspace_id=workspace_id,
+                herdr_pane_id=pane_id,
+                herdr_workspace_id=workspace_id,
+                agent_name=target,
+            ),
+        )
+        if updated is None:
+            raise WorkerCancelled
+
+    return before_submit, accepted
+
+
+def _fence_participant_creation(
+    store: JobStore, job_id: str, worker_token: str, exc: HerdrError
+) -> None:
+    def fence(current: CursorJob) -> CursorJob | None:
+        if current.participant_creation_state not in {"planned", "submitting"}:
+            return None
+        state = (
+            "ambiguous"
+            if current.participant_creation_state == "submitting"
+            or exc.code in {"operation_timeout", "operation_ambiguous"}
+            else "none"
+        )
+        return current.evolve(
+            participant_creation_state=state,
+            worker_operation=None,
+        )
+
+    store.update(job_id, fence)
+
+
+def _ensure_workflow_participant(
+    store: JobStore,
+    job: CursorJob,
+    worker_token: str,
+    client: HerdrClient,
+    participant: WorkflowParticipant,
+    checkpoint: Callable[[], None],
+) -> tuple[CursorJob, str]:
+    target = job.participant_target(participant)
+    if job.active_participant == participant and target == job.herdr_target and target:
+        return job, target
+    if participant == WorkflowParticipant.PLANNER and target:
+        updated = _worker_change(
+            store,
+            job.id,
+            worker_token,
+            MODEL_WORKER_STATUSES,
+            lambda current: current.evolve(
+                active_participant=participant.value,
+                herdr_target=target,
+            ),
+        )
+        if updated is None:
+            raise WorkerCancelled
+        return updated, target
+
+    # Non-planner roles must be fresh, but do not overwrite the only durable
+    # handle to an earlier participant until that agent has been stopped.
+    if target:
+        try:
+            client.cancel_agent(target)
+        except HerdrError as exc:
+            if not _agent_not_found(exc):
+                raise HarnessError(
+                    f"could not stop previous {participant.value} agent"
+                ) from exc
+
+    checkout_value = job.worktree_path or job.repository
+    workspace = job.herdr_workspace_id or job.worktree_workspace_id or ""
+    if not checkout_value or not workspace:
+        raise HarnessError(
+            "workflow participant requires a prepared checkout and workspace"
+        )
+    checkout = Path(checkout_value).resolve()
+    selection_holder: dict[str, AgentSelection] = {}
+    role_label = f"{job.worktree_label or checkout.name}-{participant.value}"
+    if (
+        job.participant_creation_state == "planned"
+        and job.participant_creation_participant == participant
+        and job.participant_creation_target
+    ):
+        name = job.participant_creation_target
+        role_label = job.participant_creation_label or role_label
+        workspace = job.participant_creation_workspace_id or workspace
+    else:
+        name = (
+            f"voice-{normalize_name(participant.value)[:8] or 'agent'}-"
+            f"{normalize_name(job.worktree_label or checkout.name)[:7] or 'task'}-"
+            f"{uuid.uuid4().hex[:10]}"
+        )[:32]
+        job = _plan_participant_creation(
+            store,
+            job,
+            worker_token,
+            participant,
+            target=name,
+            label=role_label,
+            workspace_id=workspace,
+        )
+    before_pane_submit, pane_accepted = _participant_pane_callbacks(
+        store, job.id, worker_token, name
+    )
+
+    def reserve(selection: AgentSelection, dispatching: bool) -> None:
+        reserved = _reserve_worker_target(
+            store,
+            job.id,
+            worker_token,
+            selection,
+            Path(job.repository or checkout),
+            job.issue_key,
+            dispatching=dispatching,
+            participant=participant,
+        )
+        if reserved is None:
+            raise WorkerCancelled
+        selection_holder["reserved"] = selection
+
+    def settle(selection: AgentSelection) -> None:
+        if _settle_worker_agent(store, job.id, worker_token, selection) is None:
+            raise WorkerCancelled
+
+    try:
+        selection = client.start_fresh_agent(
+            checkout,
+            job.worktree_label or checkout.name,
+            workspace,
+            role=participant.value,
+            mode=(
+                "ask"
+                if participant == WorkflowParticipant.REVIEWER
+                else ("plan" if participant == WorkflowParticipant.PLANNER else None)
+            ),
+            name=name,
+            checkpoint=checkpoint,
+            reserve=reserve,
+            settle=settle,
+            fail_agent=lambda exc: _fail_worker_agent_dispatch(
+                store, job.id, worker_token, exc
+            ),
+            before_pane_submit=before_pane_submit,
+            pane_accepted=pane_accepted,
+        )
+    except HerdrError as exc:
+        _fence_participant_creation(store, job.id, worker_token, exc)
+        raise
+    current = store.get(job.id)
+    return current, selection.target
+
+
+def _execute_phase_prompt(
+    store: JobStore,
+    job: CursorJob,
+    worker_token: str,
+    client: HerdrClient,
+    checkpoint: Callable[[], None],
+    *,
+    target: str,
+    prompt: str,
+    token: str,
+) -> tuple[str, str] | None:
+    phase = job.workflow_phase
+    state = job.prompt_operation_state
+    if state == "none":
+        checkpoint()
+        baseline_agent = client.get_agent(target)
+        checkpoint()
+        raw_baseline = baseline_agent.get("state_change_seq")
+        try:
+            baseline = int(raw_baseline) if isinstance(raw_baseline, int | str) else 0
+        except (TypeError, ValueError) as exc:
+            raise HarnessError("Herdr returned an invalid prompt sequence") from exc
+
+        def plan_prompt(current: CursorJob) -> CursorJob:
+            if (
+                current.workflow_phase != phase
+                or current.turn_token != token
+                or current.herdr_target != target
+            ):
+                raise WorkerCancelled
+            return current.evolve(
+                prompt_operation_state="planned",
+                prompt_operation_phase=phase.value,
+                prompt_operation_turn=current.turn,
+                prompt_operation_target=target,
+                prompt_baseline_sequence=baseline,
+                continuation=(
+                    False
+                    if phase == WorkflowPhase.IMPLEMENTING
+                    else current.continuation
+                ),
+            )
+
+        planned = _worker_change(
+            store,
+            job.id,
+            worker_token,
+            MODEL_WORKER_STATUSES,
+            plan_prompt,
+        )
+        if planned is None:
+            return None
+        job = planned
+        state = "planned"
+
+    if state == "submitting":
+        checkpoint()
+        observed = client.get_agent(target)
+        checkpoint()
+        sequence = int(observed.get("state_change_seq") or 0)
+        if (
+            job.prompt_baseline_sequence is not None
+            and job.prompt_baseline_sequence >= 0
+            and sequence != job.prompt_baseline_sequence
+        ):
+            submitted = _worker_change(
+                store,
+                job.id,
+                worker_token,
+                MODEL_WORKER_STATUSES,
+                lambda current: current.evolve(prompt_operation_state="submitted"),
+            )
+            if submitted is None:
+                return None
+            job = submitted
+            state = "submitted"
+        else:
+            _worker_change(
+                store,
+                job.id,
+                worker_token,
+                MODEL_WORKER_STATUSES,
+                lambda current: current.evolve(
+                    prompt_operation_state="ambiguous",
+                    manual_reconcile_operation="prompt",
+                    manual_reconcile_token=uuid.uuid4().hex,
+                    manual_reconcile_required_at=time.time(),
+                ),
+            )
+            raise HarnessError(
+                "Cursor prompt submission is ambiguous and requires manual "
+                "reconciliation"
+            )
+
+    if state in {"submitted", "ambiguous"}:
+        if state == "ambiguous":
+            raise HarnessError(
+                "Cursor prompt submission requires manual reconciliation"
+            )
+        try:
+            return read_agent_completion(client, job, wait=True, checkpoint=checkpoint)
+        except HerdrError:
+            _worker_change(
+                store,
+                job.id,
+                worker_token,
+                MODEL_WORKER_STATUSES,
+                lambda current: current.evolve(
+                    status=JobStatus.QUEUED,
+                    reconcile=True,
+                    queued_at=time.time(),
+                    worker_pid=None,
+                    worker_boot_id=None,
+                    worker_process_start=None,
+                    worker_token=None,
+                ),
+            )
+            raise WorkerCancelled from None
+
+    if state != "planned":
+        raise HarnessError(f"invalid durable prompt state {state}")
+
+    operation_baseline = job.prompt_baseline_sequence
+
+    def before_submit(observed_baseline: int) -> None:
+        if observed_baseline != operation_baseline:
+            raise HarnessError("Cursor prompt baseline changed before submission")
+
+        def mark_submitting(current: CursorJob) -> CursorJob:
+            if current.prompt_operation_state != "planned":
+                raise WorkerCancelled
+            return current.evolve(prompt_operation_state="submitting")
+
+        if (
+            _worker_change(
+                store,
+                job.id,
+                worker_token,
+                MODEL_WORKER_STATUSES,
+                mark_submitting,
+            )
+            is None
+        ):
+            raise WorkerCancelled
+
+    def accepted() -> None:
+        def mark_submitted(current: CursorJob) -> CursorJob:
+            if current.prompt_operation_state != "submitting":
+                raise WorkerCancelled
+            return current.evolve(prompt_operation_state="submitted")
+
+        if (
+            _worker_change(
+                store,
+                job.id,
+                worker_token,
+                MODEL_WORKER_STATUSES,
+                mark_submitted,
+            )
+            is None
+        ):
+            raise WorkerCancelled
+
+    try:
+        outcome = client.prompt_and_wait(
+            target,
+            prompt,
+            token=token,
+            checkpoint=checkpoint,
+            baseline_sequence=job.prompt_baseline_sequence,
+            before_submit=before_submit,
+            accepted=accepted,
+        )
+    except HerdrError as exc:
+        if exc.code == "interactive_questionnaire":
+            current = store.get(job.id)
+            if current.prompt_operation_state == "planned":
+                raise
+        # Third-party/test clients that fail before invoking the callback still
+        # crossed the call boundary. Conservatively fence the operation.
+        store.update(
+            job.id,
+            lambda current: (
+                current.evolve(
+                    prompt_operation_state="ambiguous",
+                    manual_reconcile_operation="prompt",
+                    manual_reconcile_token=uuid.uuid4().hex,
+                    manual_reconcile_required_at=time.time(),
+                )
+                if current.prompt_operation_state
+                in {"planned", "submitting", "submitted"}
+                else None
+            ),
+        )
+        raise
+    checkpoint()
+    return outcome.output, outcome.status
+
+
+def _run_tiered_workflow(
+    store: JobStore,
+    job: CursorJob,
+    worker_token: str,
+    client: HerdrClient,
+    checkpoint: Callable[[], None],
+    *,
+    initial_output: tuple[str, str] | None = None,
+) -> None:
+    pending_output = initial_output
+    while True:
+        checkpoint()
+        job = store.get(job.id)
+        if job.status not in MODEL_WORKER_STATUSES:
+            return
+        if pending_output is not None:
+            output, agent_status = pending_output
+            pending_output = None
+            advanced = _advance_workflow_output(
+                store, job, worker_token, output, agent_status
+            )
+            if advanced is None:
+                return
+            job = advanced
+            next_turn = _begin_phase_turn(store, job.id, worker_token)
+            if next_turn is None:
+                return
+            job = next_turn
+
+        phase = job.workflow_phase
+        participant = (
+            WorkflowParticipant.REVIEWER
+            if phase == WorkflowPhase.REVIEWING
+            else (
+                WorkflowParticipant.IMPLEMENTER
+                if phase == WorkflowPhase.IMPLEMENTING
+                else WorkflowParticipant.PLANNER
+            )
+        )
+        job, target = _ensure_workflow_participant(
+            store, job, worker_token, client, participant, checkpoint
+        )
+        token = job.turn_token or ""
+        if not token or job.workflow_turn_phase != phase:
+            next_turn = _begin_phase_turn(store, job.id, worker_token)
+            if next_turn is None:
+                return
+            job = next_turn
+            token = job.turn_token or ""
+        active_issue_key = resolve_issue_reference(job.issue_key)
+        integration_instructions = prompt_instructions(active_issue_key)
+        if phase == WorkflowPhase.CLASSIFYING:
+            prompt = classification_prompt(
+                job.request,
+                token,
+                github_issue_context=job.github_issue_context,
+                integration_instructions=integration_instructions,
+            )
+        elif phase == WorkflowPhase.PLANNING:
+            assert job.workflow_tier is not None
+            prompt = planning_prompt(
+                job.request,
+                token,
+                tier=job.workflow_tier.value,
+                github_issue_context=job.github_issue_context,
+                classification_reason=job.workflow_classification_reason,
+                integration_instructions=integration_instructions,
+            )
+        elif phase == WorkflowPhase.REVIEWING:
+            if not job.plan_artifact or job.workflow_tier is None:
+                raise HarnessError("review phase requires a durable plan")
+            plan = store.read_artifact(job.id, job.plan_artifact, kind="plan")
+            prompt = review_prompt(
+                job.request,
+                plan,
+                token,
+                tier=job.workflow_tier.value,
+                github_issue_context=job.github_issue_context,
+                classification_reason=job.workflow_classification_reason,
+                integration_instructions=integration_instructions,
+            )
+        elif phase == WorkflowPhase.REVISING:
+            if not job.plan_artifact or not job.review_artifact:
+                raise HarnessError("revision phase requires plan and review artifacts")
+            plan = store.read_artifact(job.id, job.plan_artifact, kind="plan")
+            review = store.read_artifact(job.id, job.review_artifact, kind="review")
+            prompt = revision_prompt(
+                job.request,
+                plan,
+                review,
+                token,
+                github_issue_context=job.github_issue_context,
+                classification_reason=job.workflow_classification_reason,
+                integration_instructions=integration_instructions,
+            )
+        elif phase == WorkflowPhase.IMPLEMENTING:
+            plan = (
+                store.read_artifact(job.id, job.plan_artifact, kind="plan")
+                if job.plan_artifact
+                else None
+            )
+            prompt = implementation_prompt(
+                _prompt_request(job),
+                token,
+                plan=plan,
+                continuation=job.continuation or bool(job.continuation_answer),
+                github_issue_context=job.github_issue_context,
+                classification_reason=job.workflow_classification_reason,
+                issue_reference=(
+                    job.issue_key
+                    or (f"issue {job.github_issue}" if job.github_issue else None)
+                ),
+                integration_instructions=integration_instructions,
+            )
+        else:
+            raise HarnessError(f"unsupported workflow phase {phase.value}")
+        pending_output = _execute_phase_prompt(
+            store,
+            job,
+            worker_token,
+            client,
+            checkpoint,
+            target=target,
+            prompt=prompt,
+            token=token,
+        )
+        if pending_output is None:
+            return
 
 
 def _begin_prompt_turn(job: CursorJob, turn: int, turn_token: str) -> CursorJob:
@@ -933,6 +2020,7 @@ def _begin_prompt_turn(job: CursorJob, turn: int, turn_token: str) -> CursorJob:
         turn=turn,
         turn_token=turn_token,
         voice_question=question_envelope,
+        workflow_turn_phase=job.workflow_phase.value,
     )
 
 
@@ -1002,12 +2090,17 @@ def _mark_prompt_boundary(
 
 
 def _prompt_request(job: CursorJob) -> str:
-    if not job.continuation:
-        return job.request
     return job.continuation_answer or job.request
 
 
-def run_claimed_worker(
+def _request_with_clarification(job: CursorJob) -> str:
+    answer = job.continuation_answer
+    if not answer or answer in job.request:
+        return job.request
+    return f"{job.request}\n\nUser clarification:\n{answer}"
+
+
+def run_claimed_worker(  # pyright: ignore[reportGeneralTypeIssues]
     context: worker_lifecycle.WorkerContext,
     factories: ClientFactories | None = None,
 ) -> None:
@@ -1016,7 +2109,6 @@ def run_claimed_worker(
     job_id = context.job.id
     job = context.job
     worker_token = context.token
-    prompt_may_be_active = False
 
     def checkpoint() -> None:
         context.checkpoint()
@@ -1037,6 +2129,7 @@ def run_claimed_worker(
             )
             checkpoint()
         if job.reconcile:
+            job = store.get(job_id)
             if followup_checkout is not None and job.herdr_target:
                 agent = client.get_agent(job.herdr_target)
                 if not agent:
@@ -1050,16 +2143,12 @@ def run_claimed_worker(
                     expected_workspace_id=job.herdr_workspace_id,
                 )
                 checkpoint()
-            output, agent_status = read_agent_completion(
-                client, job, wait=True, checkpoint=checkpoint
-            )
-            _worker_complete(
+            _run_tiered_workflow(
                 store,
-                job_id,
+                job,
                 worker_token,
-                output=output,
-                agent_status=agent_status,
-                preserve_blocked_delivery=job.delivered,
+                client,
+                checkpoint,
             )
             return
 
@@ -1075,8 +2164,6 @@ def run_claimed_worker(
             return
         job = updated
         checkpoint()
-        continuation = job.continuation
-        prompt_request = _prompt_request(job)
         target = job.herdr_target or ""
         if job.parent_job_id:
             _repository, followup_checkout, _branch, _match = (
@@ -1134,14 +2221,34 @@ def run_claimed_worker(
                         worktree_path=checkout_value,
                     )
                 else:
-                    selection = client.start_agent(
-                        Path(checkout_value),
-                        job.worktree_label or Path(repository_value).name,
-                        pane,
-                        workspace,
-                        name=target,
-                        checkpoint=checkpoint,
+                    mode = (
+                        "plan"
+                        if job.active_participant == WorkflowParticipant.PLANNER
+                        else (
+                            "ask"
+                            if job.active_participant == WorkflowParticipant.REVIEWER
+                            else None
+                        )
                     )
+                    if mode is None:
+                        selection = client.start_agent(
+                            Path(checkout_value),
+                            job.worktree_label or Path(repository_value).name,
+                            pane,
+                            workspace,
+                            name=target,
+                            checkpoint=checkpoint,
+                        )
+                    else:
+                        selection = client.start_agent(
+                            Path(checkout_value),
+                            job.worktree_label or Path(repository_value).name,
+                            pane,
+                            workspace,
+                            name=target,
+                            mode=mode,
+                            checkpoint=checkpoint,
+                        )
                     if followup_checkout is not None:
                         _validate_followup_agent_binding(
                             followup_checkout,
@@ -1163,6 +2270,7 @@ def run_claimed_worker(
                 def retry_dispatch(current: CursorJob) -> CursorJob:
                     return current.evolve(
                         herdr_target=None,
+                        active_participant=None,
                         herdr_pane_id=None,
                         herdr_workspace_id=None,
                         agent_name=None,
@@ -1472,6 +2580,7 @@ def run_claimed_worker(
                         repository,
                         issue_key,
                         dispatching=dispatching,
+                        participant=WorkflowParticipant.PLANNER,
                     )
                     if reservation is None:
                         checkpoint()
@@ -1535,6 +2644,50 @@ def run_claimed_worker(
                 def fail_worktree(exc: HerdrError) -> None:
                     _fail_worker_worktree(store, job_id, worker_token, exc)
 
+                planned_participant_target = [""]
+
+                def plan_participant(
+                    name: str,
+                    label: str,
+                    workspace_id: str | None,
+                    target_holder: list[str] = planned_participant_target,
+                ) -> None:
+                    nonlocal job
+                    target_holder[0] = name
+                    job = _plan_participant_creation(
+                        store,
+                        job,
+                        worker_token,
+                        WorkflowParticipant.PLANNER,
+                        target=name,
+                        label=label,
+                        workspace_id=workspace_id or "",
+                    )
+
+                def before_pane_submit(
+                    target_holder: list[str] = planned_participant_target,
+                ) -> None:
+                    callback, _accepted = _participant_pane_callbacks(
+                        store,
+                        job_id,
+                        worker_token,
+                        target_holder[0],
+                    )
+                    callback()
+
+                def pane_accepted(
+                    pane_id: str,
+                    workspace_id: str,
+                    target_holder: list[str] = planned_participant_target,
+                ) -> None:
+                    _before, callback = _participant_pane_callbacks(
+                        store,
+                        job_id,
+                        worker_token,
+                        target_holder[0],
+                    )
+                    callback(pane_id, workspace_id)
+
                 try:
                     checkpoint()
                     selection = client.ensure_agent(
@@ -1544,6 +2697,7 @@ def run_claimed_worker(
                         reserved=reserved_targets(store, job_id),
                         worktree_branch=job.worktree_branch,
                         worktree_label=job.worktree_label,
+                        mode="plan",
                         checkpoint=checkpoint,
                         reserve=reserve_selection,
                         settle=settle_selection,
@@ -1551,6 +2705,14 @@ def run_claimed_worker(
                         reserve_worktree=reserve_worktree,
                         settle_worktree=settle_worktree,
                         fail_worktree=fail_worktree,
+                        plan_participant=plan_participant,
+                        before_pane_submit=before_pane_submit,
+                        pane_accepted=pane_accepted,
+                        participant_name=(
+                            job.participant_creation_target
+                            if job.participant_creation_state == "planned"
+                            else None
+                        ),
                     )
                     if not agent_settled:
                         reserve_selection(selection, False)
@@ -1589,48 +2751,13 @@ def run_claimed_worker(
         ):
             return
         checkpoint()
-        prompt_may_be_active = True
-        outcome = client.prompt_and_wait(
-            target,
-            cursor_prompt(
-                prompt_request,
-                turn_token,
-                continuation=continuation,
-                github_issue_context=job.github_issue_context,
-                issue_reference=(
-                    active_issue_key
-                    or (f"issue {job.github_issue}" if job.github_issue else None)
-                ),
-                integration_instructions=prompt_instructions(active_issue_key),
-            ),
-            token=turn_token,
-            checkpoint=checkpoint,
-            before_submit=lambda agent: _mark_prompt_boundary(
-                store,
-                job_id,
-                worker_token,
-                turn_token,
-                state=PromptOperationState.SUBMITTED,
-                agent=agent,
-            ),
-            after_submit=lambda agent: _mark_prompt_boundary(
-                store,
-                job_id,
-                worker_token,
-                turn_token,
-                state=PromptOperationState.OBSERVED,
-                agent=agent,
-            ),
-        )
-        checkpoint()
-        _worker_complete(
+        _run_tiered_workflow(
             store,
-            job_id,
+            store.get(job_id),
             worker_token,
-            output=outcome.output,
-            agent_status=outcome.status,
+            client,
+            checkpoint,
         )
-        prompt_may_be_active = False
     except WorkerCancelled:
         return
     except Exception as exc:
@@ -1639,5 +2766,25 @@ def run_claimed_worker(
             job_id,
             worker_token,
             exc,
-            prompt_may_be_active=prompt_may_be_active,
+            prompt_may_be_active=False,
         )
+    finally:
+        try:
+            current = store.get(job_id)
+            if (
+                current.status == JobStatus.RECONCILING
+                and current.terminal_intent_status is not None
+                and current.terminal_intent_status != JobStatus.CANCELLED
+                and current.target_release_token
+            ):
+                recovery.cancel_target_and_release(
+                    store,
+                    job_id,
+                    current.herdr_target or "",
+                    current.target_release_token,
+                    worker_stopped=True,
+                    herdr_factory=clients.herdr,
+                )
+        except Exception:
+            # Durable terminal intent and release fences are recovered later.
+            pass

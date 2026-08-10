@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import os
 import re
 import time
 import uuid
@@ -290,10 +289,11 @@ def reply_job(
 ) -> str | None:
     now = time.time()
     should_launch = False
+    should_cancel = False
     immediate: str | None = None
 
     def reply(job: CursorJob) -> CursorJob | None:
-        nonlocal immediate, should_launch
+        nonlocal immediate, should_cancel, should_launch
         if job.status != JobStatus.AWAITING_USER:
             return None
         question = questions.current(job)
@@ -361,6 +361,16 @@ def reply_job(
                 trusted_text=trusted_utterance,
             ),
         )
+        if transition.cancel:
+            should_cancel = True
+            should_launch = False
+            return recovery.stage_terminal_intent(
+                job,
+                JobStatus.CANCELLED,
+                now=now,
+                result=f"Cursor job {job_id} was cancelled.",
+                voice_question=questions.envelope(question, QuestionState.CANCELLED),
+            )
         should_launch = transition.launch
         immediate = transition.message
         return transition.job
@@ -368,6 +378,15 @@ def reply_job(
     updated = _job_store().update(job_id, reply)
     if updated is None and immediate is None:
         raise HarnessError(f"Cursor job {job_id} is not waiting for a reply")
+    if should_cancel:
+        assert updated is not None
+        if updated.target_release_pending:
+            _cancel_target_and_release(
+                job_id,
+                updated.herdr_target or "",
+                updated.target_release_token or "",
+            )
+        return None
     if should_launch:
         launch_worker(job_id)
         if on_started is not None:
@@ -454,12 +473,13 @@ def cancel_job(job_id: str) -> str:
         raise HarnessError(f"could not safely stop legacy Cursor worker for {job_id}")
     target = ""
     worker: CursorJob | None = None
-    release_token = uuid.uuid4().hex
     cancelled_at = time.time()
 
     def cancel(job: CursorJob) -> CursorJob | None:
         nonlocal target, worker
         if job.status == JobStatus.CANCELLED:
+            return None
+        if job.terminal_intent_status == JobStatus.CANCELLED:
             return None
         if job.status in {JobStatus.COMPLETED, JobStatus.FAILED}:
             raise HarnessError(f"Cursor job {job_id} is already {job.status.value}")
@@ -476,59 +496,18 @@ def cancel_job(job_id: str) -> str:
             )
         target = job.herdr_target or ""
         worker = job
-        release_pending = bool(
-            target
-            or job.worktree_path
-            or job.worker_token
-            or job.has_uncertain_operation()
-        )
-        reconciliation_pending = job.has_uncertain_operation()
-        release_owner_start = (
-            worker_lifecycle.process_identity(os.getpid()) if release_pending else None
-        )
-        clear_unfenced = legacy_worker_stopped or (
-            job.status in WORKER_STATUSES and not job.worker_token
-        )
         question = questions.current(job)
-        cancelled_question = (
-            questions.envelope(question, QuestionState.CANCELLED)
-            if question is not None
-            else None
-        )
-        return job.evolve_for_delivery(
+        return recovery.stage_terminal_intent(
+            job,
+            JobStatus.CANCELLED,
             now=cancelled_at,
-            status=JobStatus.CANCELLED,
-            remove=frozenset({"reconcile"}),
-            result=(
-                f"Cursor job {job_id} was cancelled; external operation "
-                "reconciliation is pending."
-                if reconciliation_pending
-                else f"Cursor job {job_id} was cancelled."
+            result=f"Cursor job {job_id} was cancelled.",
+            clear_worker=legacy_worker_stopped,
+            voice_question=(
+                questions.envelope(question, QuestionState.CANCELLED)
+                if question is not None
+                else None
             ),
-            completed_at=cancelled_at,
-            foreground_until=(
-                cancelled_at + CURSOR_FOREGROUND_SECONDS + FOREGROUND_GRACE_SECONDS
-            ),
-            target_release_pending=release_pending,
-            target_release_token=release_token if release_pending else None,
-            target_release_owner_pid=os.getpid() if release_owner_start else None,
-            target_release_owner_boot_id=(
-                worker_lifecycle.boot_identity() if release_owner_start else None
-            ),
-            target_release_owner_start=release_owner_start,
-            cancellation_reconciliation_pending=reconciliation_pending,
-            pull_request_worktree_state=(
-                "retained"
-                if job.github_pull_request
-                and job.worktree_path
-                and job.pull_request_worktree_state != "quarantined"
-                else job.pull_request_worktree_state
-            ),
-            worker_pid=None if clear_unfenced else job.worker_pid,
-            worker_boot_id=None if clear_unfenced else job.worker_boot_id,
-            worker_process_start=None if clear_unfenced else job.worker_process_start,
-            worker_token=None if clear_unfenced else job.worker_token,
-            voice_question=cancelled_question,
         )
 
     updated = _job_store().update(job_id, cancel)
@@ -539,32 +518,41 @@ def cancel_job(job_id: str) -> str:
     if worker is not None and worker.worker_token:
         worker_stopped = _stop_worker(worker)
 
-    def clear_stopped_worker(job: CursorJob) -> CursorJob | None:
-        if job.status != JobStatus.CANCELLED or not worker_stopped:
-            return None
-        return job.clear_worker()
-
-    _job_store().update(job_id, clear_stopped_worker)
     if updated.target_release_pending:
         _cancel_target_and_release(
             job_id,
             target,
-            release_token,
+            updated.target_release_token or "",
             worker_stopped=worker_stopped,
         )
-    return updated.result or f"Cursor job {job_id} was cancelled."
+    current = read_job(job_id)
+    return (
+        current.result
+        or current.terminal_intent_result
+        or f"Cursor job {job_id} was cancelled."
+    )
 
 
 def job_status(job_id: str | None = None) -> str:
     if job_id:
         job = read_job(job_id)
-        return f"Cursor job {job_id} is {job.status.value.replace('_', ' ')}."
+        workflow = (
+            f", {job.workflow_tier.value} tier" if job.workflow_tier is not None else ""
+        )
+        return (
+            f"Cursor job {job_id} is {job.status.value.replace('_', ' ')}, "
+            f"in {job.workflow_phase.value.replace('_', ' ')}{workflow}."
+        )
     jobs = [job for job in _job_store().list() if job.status in ACTIVE_STATUSES]
     if not jobs:
         return "There are no active Cursor jobs."
     return (
         "Active Cursor jobs: "
-        + "; ".join(f"{job.id} is {job.status.value.replace('_', ' ')}" for job in jobs)
+        + "; ".join(
+            f"{job.id} is {job.status.value.replace('_', ' ')} "
+            f"({job.workflow_phase.value.replace('_', ' ')})"
+            for job in jobs
+        )
         + "."
     )
 

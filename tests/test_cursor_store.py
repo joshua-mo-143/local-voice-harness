@@ -16,7 +16,9 @@ from local_voice_harness.cursor.model import (
     JobValidationError,
     transition,
 )
+from local_voice_harness.cursor.recovery import stage_terminal_intent
 from local_voice_harness.cursor.store import (
+    ArtifactQuarantinedError,
     JobQuarantinedError,
     JobQuarantineWarning,
     JobStore,
@@ -36,6 +38,275 @@ class CursorStoreIntegrationTests(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.temporary.cleanup()
+
+    def test_workflow_artifact_round_trips_after_job_reference_is_persisted(
+        self,
+    ) -> None:
+        store = JobStore(self.jobs_dir, self.jobs_dir / "legacy")
+        store.create(CursorJob.from_dict(self.job("123456789abc")))
+
+        reference = store.write_artifact(
+            "123456789abc", "plan", 0, "1. Preserve the fence."
+        )
+        store.update(
+            "123456789abc",
+            lambda job: job.evolve(plan_artifact=reference),
+        )
+
+        self.assertEqual(
+            store.read_artifact("123456789abc", reference, kind="plan"),
+            "1. Preserve the fence.",
+        )
+
+    def test_new_artifact_write_is_content_addressed_and_idempotent(self) -> None:
+        store = JobStore(self.jobs_dir, self.jobs_dir / "legacy")
+        store.create(CursorJob.from_dict(self.job("123456789abc")))
+
+        first = store.write_artifact("123456789abc", "plan", 0, "Preserve the fence.")
+        second = store.write_artifact("123456789abc", "plan", 0, "Preserve the fence.")
+
+        self.assertEqual(first, second)
+        self.assertRegex(first, r"plan-0-[0-9a-f]{64}\.json$")
+        self.assertEqual(len(list((self.jobs_dir / ".artifacts").rglob("*.json"))), 1)
+
+    def test_existing_content_address_cannot_be_overwritten(self) -> None:
+        store = JobStore(self.jobs_dir, self.jobs_dir / "legacy")
+        store.create(CursorJob.from_dict(self.job("123456789abc")))
+        reference = store.write_artifact(
+            "123456789abc", "plan", 0, "Preserve the fence."
+        )
+        path = self.jobs_dir / reference
+        path.write_bytes(b"different")
+
+        with self.assertRaisesRegex(
+            JobValidationError, "already contains different content"
+        ):
+            store.write_artifact("123456789abc", "plan", 0, "Preserve the fence.")
+
+        self.assertEqual(path.read_bytes(), b"different")
+
+    def test_artifact_write_is_size_bounded_and_path_confined(self) -> None:
+        store = JobStore(self.jobs_dir, self.jobs_dir / "legacy")
+        store.create(CursorJob.from_dict(self.job("123456789abc")))
+
+        with self.assertRaisesRegex(JobValidationError, "exceeds size limit"):
+            store.write_artifact("123456789abc", "plan", 0, "x" * (64 * 1024))
+
+        with tempfile.TemporaryDirectory() as outside_name:
+            outside = Path(outside_name)
+            (self.jobs_dir / ".artifacts").symlink_to(outside, target_is_directory=True)
+            with self.assertRaisesRegex(JobValidationError, "cannot be a symlink"):
+                store.write_artifact("123456789abc", "plan", 0, "Preserve the fence.")
+            self.assertEqual(list(outside.iterdir()), [])
+
+    def test_stale_publication_does_not_create_artifact_sidecar(self) -> None:
+        store = JobStore(self.jobs_dir, self.jobs_dir / "legacy")
+        store.create(
+            CursorJob.from_dict(
+                self.job(
+                    "123456789abc",
+                    status="running",
+                    workflow_tier="medium",
+                    workflow_classification_reason="cross-component",
+                    workflow_phase="planning",
+                    active_participant="planner",
+                    planner_target="planner",
+                    herdr_target="planner",
+                    turn_token="turn-1",
+                    workflow_turn_phase="planning",
+                )
+            )
+        )
+
+        published = store.publish_artifact(
+            "123456789abc",
+            "plan",
+            0,
+            "Stale output.",
+            expected_worker_token="old-worker",
+            expected_turn_token="turn-1",
+            expected_phase="planning",
+            expected_prior_reference=None,
+            change=lambda job, reference: job.evolve(plan_artifact=reference),
+        )
+
+        self.assertIsNone(published)
+        self.assertFalse((self.jobs_dir / ".artifacts").exists())
+
+    def test_terminal_intent_invalidates_artifact_publication_fence(self) -> None:
+        store = JobStore(self.jobs_dir, self.jobs_dir / "legacy")
+        store.create(
+            CursorJob.from_dict(
+                self.job(
+                    "123456789abc",
+                    status="running",
+                    workflow_tier="medium",
+                    workflow_classification_reason="cross-component",
+                    workflow_phase="planning",
+                    active_participant="planner",
+                    planner_target="planner",
+                    herdr_target="planner",
+                    turn_token="turn-1",
+                    workflow_turn_phase="planning",
+                )
+            )
+        )
+        store.update(
+            "123456789abc",
+            lambda job: stage_terminal_intent(
+                job,
+                JobStatus.COMPLETED,
+                now=2,
+                result="completed",
+            ),
+        )
+
+        published = store.publish_artifact(
+            "123456789abc",
+            "plan",
+            0,
+            "Stale output.",
+            expected_worker_token="claim-123456789abc",
+            expected_turn_token="turn-1",
+            expected_phase="planning",
+            expected_prior_reference=None,
+            change=lambda job, reference: job.evolve(plan_artifact=reference),
+        )
+
+        self.assertIsNone(published)
+        self.assertFalse((self.jobs_dir / ".artifacts").exists())
+
+    def test_orphaned_identical_artifact_is_reused_during_publication(self) -> None:
+        store = JobStore(self.jobs_dir, self.jobs_dir / "legacy")
+        store.create(
+            CursorJob.from_dict(
+                self.job(
+                    "123456789abc",
+                    status="running",
+                    workflow_tier="medium",
+                    workflow_classification_reason="cross-component",
+                    workflow_phase="planning",
+                    active_participant="planner",
+                    planner_target="planner",
+                    herdr_target="planner",
+                    turn_token="turn-1",
+                    workflow_turn_phase="planning",
+                )
+            )
+        )
+        orphan = store.write_artifact("123456789abc", "plan", 0, "Preserve the fence.")
+
+        published = store.publish_artifact(
+            "123456789abc",
+            "plan",
+            0,
+            "Preserve the fence.",
+            expected_worker_token="claim-123456789abc",
+            expected_turn_token="turn-1",
+            expected_phase="planning",
+            expected_prior_reference=None,
+            change=lambda job, reference: job.evolve(
+                workflow_phase="reviewing",
+                plan_artifact=reference,
+            ),
+        )
+
+        assert published is not None
+        self.assertEqual(published.plan_artifact, orphan)
+        self.assertEqual(len(list((self.jobs_dir / ".artifacts").rglob("*.json"))), 1)
+
+    def test_legacy_round_only_artifact_reference_remains_readable(self) -> None:
+        store = JobStore(self.jobs_dir, self.jobs_dir / "legacy")
+        store.create(CursorJob.from_dict(self.job("123456789abc")))
+        reference = ".artifacts/123456789abc/plan-0.json"
+        artifact = self.jobs_dir / reference
+        artifact.parent.mkdir(mode=0o700, parents=True)
+        text = "Legacy plan."
+        artifact.write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "job_id": "123456789abc",
+                    "kind": "plan",
+                    "round": 0,
+                    "text": text,
+                    "sha256": hashlib.sha256(text.encode()).hexdigest(),
+                }
+            )
+        )
+        store.update("123456789abc", lambda job: job.evolve(plan_artifact=reference))
+
+        self.assertEqual(
+            store.read_artifact("123456789abc", reference, kind="plan"),
+            text,
+        )
+
+    def test_review_artifact_is_bound_to_reviewed_plan_digest(self) -> None:
+        store = JobStore(self.jobs_dir, self.jobs_dir / "legacy")
+        store.create(CursorJob.from_dict(self.job("123456789abc")))
+        plan = "Preserve the original fence."
+        plan_reference = store.write_artifact("123456789abc", "plan", 0, plan)
+        store.update(
+            "123456789abc",
+            lambda job: job.evolve(plan_artifact=plan_reference),
+        )
+        review_reference = store.write_artifact(
+            "123456789abc",
+            "review",
+            0,
+            "Approved.",
+            source_text=plan,
+        )
+        store.update(
+            "123456789abc",
+            lambda job: job.evolve(review_artifact=review_reference),
+        )
+        replacement = "A different plan."
+        plan_path = self.jobs_dir / plan_reference
+        payload = json.loads(plan_path.read_text())
+        payload["text"] = replacement
+        payload["sha256"] = hashlib.sha256(replacement.encode()).hexdigest()
+        plan_path.write_text(json.dumps(payload))
+
+        with self.assertRaises(ArtifactQuarantinedError):
+            store.read_artifact("123456789abc", review_reference, kind="review")
+
+    def test_malformed_workflow_artifact_is_quarantined(self) -> None:
+        store = JobStore(self.jobs_dir, self.jobs_dir / "legacy")
+        store.create(CursorJob.from_dict(self.job("123456789abc")))
+        plan = "Preserve the fence."
+        plan_reference = store.write_artifact("123456789abc", "plan", 0, plan)
+        store.update(
+            "123456789abc",
+            lambda job: job.evolve(plan_artifact=plan_reference),
+        )
+        reference = store.write_artifact(
+            "123456789abc", "review", 0, "approved", source_text=plan
+        )
+        store.update(
+            "123456789abc",
+            lambda job: job.evolve(review_artifact=reference),
+        )
+        (self.jobs_dir / reference).write_text('{"text": "tampered"}')
+
+        with self.assertRaises(ArtifactQuarantinedError):
+            store.read_artifact("123456789abc", reference, kind="review")
+
+        self.assertFalse((self.jobs_dir / reference).exists())
+        self.assertTrue(
+            list((self.jobs_dir / ".quarantine" / "artifacts").glob("*.json"))
+        )
+        failed = store.update(
+            "123456789abc",
+            lambda job: job.evolve(
+                status=JobStatus.FAILED,
+                error="artifact was corrupt",
+                result="artifact was corrupt",
+                completed_at=2,
+            ),
+        )
+        assert failed is not None
+        self.assertEqual(failed.status, JobStatus.FAILED)
 
     def job(
         self,
