@@ -966,7 +966,7 @@ class HerdrClient:
             try:
                 self.decode(stdout or stderr)
             except HerdrError as exc:
-                if exc.code != "operation_timeout":
+                if exc.code not in {"operation_timeout", "timeout"}:
                     raise
         else:
             self.decode(stdout)
