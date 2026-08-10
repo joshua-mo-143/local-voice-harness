@@ -629,7 +629,10 @@ class ProcessUtteranceTests(unittest.TestCase):
                 wake_daemon,
                 "request_context",
                 return_value=RequestContext(
-                    "ask Cursor to work on APP-43\n\nGitHub context"
+                    "ask Cursor to work on APP-43\n\nLinear context",
+                    focused_issue="APP-43",
+                    external_issue_reference="APP-43",
+                    external_issue_source="linear",
                 ),
             ),
             mock.patch.object(
@@ -649,13 +652,48 @@ class ProcessUtteranceTests(unittest.TestCase):
 
         cursor_turn.assert_called_once_with(
             CursorTurnRequest(
-                "ask Cursor to work on APP-43\n\nGitHub context",
+                "ask Cursor to work on APP-43\n\nLinear context",
                 utterance="ask Cursor to work on APP-43",
                 context_repository=None,
+                issue_key="APP-43",
             ),
             delivery_claims=mock.ANY,
         )
         qwen_turn.assert_not_called()
+
+    def test_issue_list_scope_reaches_voice_submission(self) -> None:
+        daemon = _bare_daemon()
+        context = RequestContext(
+            "work on issues 4 and 9\n\nLinear team issue list",
+            issue_scope="ENG",
+            issue_scope_source="linear",
+        )
+        with (
+            mock.patch.object(
+                wake_daemon, "transcribe", return_value="work on issues 4 and 9"
+            ),
+            mock.patch.object(wake_daemon, "start_components"),
+            mock.patch.object(wake_daemon, "request_context", return_value=context),
+            mock.patch.object(
+                wake_daemon,
+                "route_intent",
+                return_value=IntentRoute(Intent.CURSOR_SUBMIT, "high"),
+            ),
+            mock.patch.object(
+                wake_daemon, "cursor_turn", return_value=("started", None)
+            ) as cursor_turn,
+            mock.patch.object(
+                daemon,
+                "_drain_playback_queue",
+                return_value=(_playback_batch("ok"), None),
+            ),
+            mock.patch.object(wake_daemon, "notify"),
+        ):
+            daemon.process_utterance(AUDIO_GENERATION, woke=False)
+
+        request = cursor_turn.call_args.args[0]
+        self.assertEqual(request.issue_scope, "ENG")
+        self.assertEqual(request.issue_scope_source, "linear")
 
     def test_failed_fresh_turn_stops_components(self) -> None:
         daemon = _bare_daemon()

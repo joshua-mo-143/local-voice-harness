@@ -76,6 +76,30 @@ Cursor routing works as follows:
 9. Start a new Cursor agent through Herdr when no suitable agent exists.
 10. Reserve that agent and checkout until it finishes, is blocked, or is cancelled.
 
+### Multi-ticket fan-out
+
+One trusted utterance may explicitly name multiple GitHub or Linear issues. A pure
+planner extracts full references in textual order and deduplicates their canonical
+identities. Bare positive numbers are accepted only when captured provider metadata
+proves exactly one scope: an exact GitHub repository `/issues` page or a Linear
+`/team/<KEY>/...` page. Page content never supplies ticket identifiers.
+
+Every unique target is preflighted before any child starts. GitHub targets must
+resolve through `gh`; Linear targets must have valid team syntax, an enabled
+integration, and a healthy Cursor MCP capability. Rejected targets do not prevent
+the remaining valid targets from starting. Valid targets become ordinary,
+target-scoped `AgentJob` records through the existing job-creation and worker-launch
+path. Starts are bounded by the configured concurrency and immediately background;
+single-ticket requests retain the normal foreground window.
+
+Fan-out is deliberately best-effort rather than crash-atomic. There is no durable
+batch schema, manifest, rollback, or shared lifecycle: the response only summarizes
+each unique target as `accepted`, `rejected`, or `start-failed` in request order.
+Each accepted child independently owns planning, questions, recovery, delivery, and
+the job-store maintenance fence. Linear repository routing serializes acquisition,
+prompting, and marker parsing under a cancellation-aware cross-process lock around
+the stable `voice-router` agent.
+
 After checkout preparation, every new ticket enters a durable tiered workflow. A
 Plan-mode participant first performs a short read-only inspection and classifies the
 ticket. Clear, localized, reversible work is `simple` and goes directly to a fresh

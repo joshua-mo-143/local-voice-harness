@@ -197,6 +197,7 @@ OPTIONAL_ENVIRONMENT_POLICY: dict[str, dict[str, str]] = {
         "VOICE_HARNESS_CURSOR_FOREGROUND_SECONDS": "nonnegative_float",
         "VOICE_HARNESS_CURSOR_AGENT_INACTIVITY_SECONDS": "positive_float",
         "VOICE_HARNESS_CURSOR_AGENT_MAX_RUNTIME_SECONDS": "positive_float",
+        "VOICE_HARNESS_AGENT_JOB_START_CONCURRENCY": "positive_int",
         "VOICE_HARNESS_CURSOR_FOLLOWUP": "flag",
         "VOICE_HARNESS_CURSOR_FOLLOWUP_WINDOW_SECONDS": "nonnegative_float",
         "VOICE_HARNESS_HERDR_BIN": "absolute_path",

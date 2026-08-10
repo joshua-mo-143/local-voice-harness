@@ -353,6 +353,13 @@ def _env_int(name: str, *, default: int, minimum: int) -> int:
     return value if value >= minimum else default
 
 
+AGENT_JOB_START_CONCURRENCY = _env_int(
+    "VOICE_HARNESS_AGENT_JOB_START_CONCURRENCY",
+    default=3,
+    minimum=1,
+)
+
+
 def _env_nonnegative_float(
     name: str,
     *,

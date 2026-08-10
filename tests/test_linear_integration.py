@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+import multiprocessing
 import subprocess
+import tempfile
+import time
 import unittest
 from pathlib import Path
+from typing import Any
 from unittest import mock
 
 from local_voice_harness.cursor import service
@@ -12,6 +16,19 @@ from local_voice_harness.user_config import IntegrationSettings
 
 DISABLED = IntegrationSettings(linear_enabled=False)
 ENABLED = IntegrationSettings(linear_enabled=True)
+
+
+def _hold_router_lock(path: str, entered: Any, release: Any) -> None:
+    linear.LINEAR_ROUTER_LOCK = Path(path)
+    with linear._router_owner():
+        entered.set()
+        release.wait(5)
+
+
+def _observe_router_lock(path: str, acquired: Any) -> None:
+    linear.LINEAR_ROUTER_LOCK = Path(path)
+    with linear._router_owner():
+        acquired.set()
 
 
 class LinearEnablementTests(unittest.TestCase):
@@ -44,6 +61,18 @@ class LinearEnablementTests(unittest.TestCase):
         self.assertEqual(fragment.source, "linear")
         self.assertEqual(fragment.issue_reference, "API-42")
         self.assertIn("untrusted external identifier", fragment.text)
+
+    def test_team_issue_list_exposes_scope_without_an_issue_reference(self) -> None:
+        fragment = registry.capture_context(
+            "https://linear.app/acme/team/eng/active", ENABLED
+        )
+
+        self.assertIsNotNone(fragment)
+        assert fragment is not None
+        self.assertEqual(fragment.source, "linear")
+        self.assertEqual(fragment.issue_scope, "ENG")
+        self.assertIsNone(fragment.issue_reference)
+        self.assertIn("identifiers must come from the user's request", fragment.text)
 
     def test_disabled_explicit_issue_key_is_not_persisted(self) -> None:
         with (
@@ -152,14 +181,18 @@ class LinearRoutingTests(unittest.TestCase):
         client.prompt_and_wait.return_value = outcome
         client.resolve_repository.return_value = (repository, [repository])
 
-        routed = registry.route_issue_repository(
-            client,
-            "API-42",
-            [repository],
-            token="token",
-            reserved=set(),
-            integrations=ENABLED,
-        )
+        with tempfile.TemporaryDirectory() as temporary:
+            with mock.patch.object(
+                linear, "LINEAR_ROUTER_LOCK", Path(temporary) / "router.lock"
+            ):
+                routed = registry.route_issue_repository(
+                    client,
+                    "API-42",
+                    [repository],
+                    token="token",
+                    reserved=set(),
+                    integrations=ENABLED,
+                )
 
         self.assertEqual(routed, (repository, "high", "matching service"))
         prompt = client.prompt_and_wait.call_args.args[1]
@@ -178,6 +211,37 @@ class LinearRoutingTests(unittest.TestCase):
         )
         self.assertIsNone(routed)
         client.ensure_router.assert_not_called()
+
+    def test_router_ownership_is_serialized_across_processes(self) -> None:
+        context = multiprocessing.get_context("spawn")
+        entered = context.Event()
+        release = context.Event()
+        acquired = context.Event()
+        with tempfile.TemporaryDirectory() as temporary:
+            lock_path = str(Path(temporary) / "router.lock")
+            owner = context.Process(
+                target=_hold_router_lock,
+                args=(lock_path, entered, release),
+            )
+            waiter = context.Process(
+                target=_observe_router_lock,
+                args=(lock_path, acquired),
+            )
+            owner.start()
+            self.assertTrue(entered.wait(5))
+            waiter.start()
+            time.sleep(0.2)
+            self.assertFalse(acquired.is_set())
+            release.set()
+            self.assertTrue(acquired.wait(5))
+            owner.join(5)
+            waiter.join(5)
+            if owner.is_alive():
+                owner.terminate()
+            if waiter.is_alive():
+                waiter.terminate()
+            self.assertEqual(owner.exitcode, 0)
+            self.assertEqual(waiter.exitcode, 0)
 
 
 if __name__ == "__main__":

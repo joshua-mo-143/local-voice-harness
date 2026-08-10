@@ -19,6 +19,7 @@ from local_voice_harness.cursor.service import (
     CursorTurnRequest,
     CursorTurnResult,
     StartJobRequest,
+    TicketJobRequest,
 )
 from local_voice_harness.cursor.store import JobStore
 from local_voice_harness.errors import HarnessError
@@ -70,6 +71,174 @@ def test_submit_failure_does_not_notify() -> None:
         service.cursor_turn(CursorTurnRequest("fix it", on_job_started=notified))
 
     notified.assert_not_called()
+
+
+def test_fanout_preflights_every_target_before_bounded_background_starts() -> None:
+    events: list[str] = []
+    client = mock.Mock()
+
+    def details(issue: service.GitHubIssue) -> dict[str, object]:
+        number = issue.number
+        events.append(f"preflight-{number}")
+        if number == 2:
+            raise service.GitHubError("issue was not found")
+        return {
+            "number": number,
+            "title": f"Issue {number}",
+            "state": "OPEN",
+            "url": f"https://github.com/example/project/issues/{number}",
+        }
+
+    def start(request: StartJobRequest) -> str:
+        assert events[:3] == ["preflight-1", "preflight-2", "preflight-3"]
+        assert not request.foreground
+        assert request.github_issue in {1, 3}
+        assert f"example/project#{request.github_issue}" in request.text
+        events.append(f"start-{request.github_issue}")
+        if request.github_issue == 3:
+            raise HarnessError("job deletion maintenance is active")
+        return "job-one"
+
+    client.issue_details.side_effect = details
+    with (
+        mock.patch.object(service, "GitHubClient", return_value=client),
+        mock.patch.object(service, "integration_enabled", return_value=True),
+        mock.patch.object(service, "start_job", side_effect=start),
+        mock.patch.object(service, "read_job", side_effect=KeyError),
+        mock.patch.object(service, "_await_foreground") as foreground,
+    ):
+        result = service.cursor_turn(
+            CursorTurnRequest(
+                "Work on issues 1, 2, and 3",
+                utterance="Work on issues 1, 2, and 3",
+                issue_scope="example/project",
+                issue_scope_source="github",
+            )
+        )
+
+    assert result.session_id is None
+    assert result.text.index("example/project#1: accepted") < result.text.index(
+        "example/project#2: rejected"
+    )
+    assert result.text.index("example/project#2: rejected") < result.text.index(
+        "example/project#3: start-failed"
+    )
+    assert "job-one" in result.text
+    assert "job deletion maintenance is active" in result.text
+    foreground.assert_not_called()
+
+
+def test_start_jobs_enforces_bound_and_preserves_outcome_order() -> None:
+    lock = threading.Lock()
+    active = 0
+    maximum = 0
+
+    def start(request: StartJobRequest) -> str:
+        nonlocal active, maximum
+        with lock:
+            active += 1
+            maximum = max(maximum, active)
+        time.sleep(0.03)
+        with lock:
+            active -= 1
+        return f"job-{request.text}"
+
+    requests = tuple(
+        TicketJobRequest(str(index), StartJobRequest(str(index), foreground=False))
+        for index in range(6)
+    )
+    with (
+        mock.patch.object(service, "start_job", side_effect=start),
+        mock.patch.object(service, "read_job", side_effect=KeyError),
+    ):
+        outcomes = service.start_jobs(requests, concurrency=2)
+
+    assert 1 < maximum <= 2
+    assert [outcome.target for outcome in outcomes] == [
+        "0",
+        "1",
+        "2",
+        "3",
+        "4",
+        "5",
+    ]
+    assert all(outcome.status == "accepted" for outcome in outcomes)
+
+
+def test_single_scoped_ticket_keeps_foreground_behavior() -> None:
+    client = mock.Mock()
+    client.issue_details.return_value = {
+        "number": 7,
+        "title": "Do it",
+        "state": "OPEN",
+        "url": "https://github.com/example/project/issues/7",
+    }
+    started: list[StartJobRequest] = []
+
+    def start(request: StartJobRequest) -> str:
+        started.append(request)
+        return "123456789abc"
+
+    with (
+        mock.patch.object(service, "GitHubClient", return_value=client),
+        mock.patch.object(service, "integration_enabled", return_value=True),
+        mock.patch.object(service, "start_job", side_effect=start),
+        mock.patch.object(service, "read_job", side_effect=KeyError),
+        mock.patch.object(
+            service,
+            "_await_foreground",
+            return_value=CursorTurnResult("working", None),
+        ) as foreground,
+    ):
+        result = service.cursor_turn(
+            CursorTurnRequest(
+                "Work on issue 7",
+                utterance="Work on issue 7",
+                issue_scope="example/project",
+                issue_scope_source="github",
+            )
+        )
+
+    assert result == CursorTurnResult("working", None)
+    assert len(started) == 1
+    assert started[0].foreground
+    foreground.assert_called_once_with("123456789abc", None)
+
+
+def test_fanout_linear_capability_preflight_happens_before_any_start() -> None:
+    events: list[str] = []
+
+    def require(reference: str) -> None:
+        events.append(f"capability-{reference}")
+
+    def resolve(reference: str | None) -> str | None:
+        events.append(f"resolve-{reference}")
+        return reference
+
+    def start(request: StartJobRequest) -> str:
+        assert events[:3] == [
+            "capability-ENG-1",
+            "resolve-ENG-1",
+            "resolve-ENG-2",
+        ]
+        events.append(f"start-{request.issue_key}")
+        return f"job-{request.issue_key}"
+
+    with (
+        mock.patch.object(service, "require_issue_capabilities", side_effect=require),
+        mock.patch.object(service, "resolve_issue_reference", side_effect=resolve),
+        mock.patch.object(service, "start_job", side_effect=start),
+        mock.patch.object(service, "read_job", side_effect=KeyError),
+    ):
+        result = service.cursor_turn(
+            CursorTurnRequest(
+                "Work on ENG-1 and ENG-2",
+                utterance="Work on ENG-1 and ENG-2",
+            )
+        )
+
+    assert result.text.startswith("Ticket starts: ENG-1: accepted")
+    assert "ENG-2: accepted" in result.text
 
 
 def test_production_modules_do_not_import_jobs_facade() -> None:

@@ -214,6 +214,35 @@ class BrowserDispatchTests(unittest.TestCase):
         self.assertEqual(context.external_issue_source, "linear")
         self.assertIsNone(context.github_issue)
 
+    def test_issue_list_scope_is_propagated_without_fabricating_an_issue(self) -> None:
+        fragment = ContextFragment(
+            source="linear",
+            text="Linear team issue list",
+            issue_scope="ENG",
+        )
+        with (
+            mock.patch.object(
+                browser_context, "capture_text_context", return_value=None
+            ),
+            mock.patch.object(
+                browser_context,
+                "focused_firefox_url",
+                return_value="https://linear.app/acme/team/ENG/active",
+            ),
+            mock.patch.object(
+                browser_context, "capture_context", return_value=fragment
+            ),
+            mock.patch.object(
+                browser_context, "focused_app_context", return_value=None
+            ),
+        ):
+            context = browser_context.request_context("work on issues 4 and 7")
+
+        self.assertEqual(context.issue_scope, "ENG")
+        self.assertEqual(context.issue_scope_source, "linear")
+        self.assertIsNone(context.focused_issue)
+        self.assertIsNone(context.external_issue_reference)
+
     def test_disabled_github_never_parses_or_calls_cli(self) -> None:
         url = "https://github.com/example/project/issues/42"
         with (

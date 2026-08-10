@@ -69,6 +69,7 @@ _PLATFORM_KEYS = (
     "cursor_foreground_seconds",
     "cursor_agent_inactivity_seconds",
     "cursor_agent_max_runtime_seconds",
+    "agent_job_start_concurrency",
 )
 
 _TRUTHY = {"1", "true", "yes", "on"}
@@ -140,6 +141,7 @@ class PlatformSettings:
     cursor_foreground_seconds: float = 5.0
     cursor_agent_inactivity_seconds: float = 15 * 60
     cursor_agent_max_runtime_seconds: float = 60 * 60
+    agent_job_start_concurrency: int = 3
 
 
 @dataclass(frozen=True)
@@ -619,6 +621,16 @@ def _load_platform(
             ),
             label="platform.cursor_agent_max_runtime_seconds",
         ),
+        agent_job_start_concurrency=_as_positive_int(
+            _resolve(
+                environment,
+                "VOICE_HARNESS_AGENT_JOB_START_CONCURRENCY",
+                section,
+                "agent_job_start_concurrency",
+                3,
+            ),
+            label="platform.agent_job_start_concurrency",
+        ),
     )
 
 
@@ -800,6 +812,7 @@ def render_user_config(user_config: UserConfig) -> str:
                 platform.cursor_agent_inactivity_seconds
             ),
             "cursor_agent_max_runtime_seconds": platform.cursor_agent_max_runtime_seconds,
+            "agent_job_start_concurrency": platform.agent_job_start_concurrency,
         },
     )
     return "\n".join(lines).rstrip("\n") + "\n"
