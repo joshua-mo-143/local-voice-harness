@@ -195,6 +195,8 @@ OPTIONAL_ENVIRONMENT_POLICY: dict[str, dict[str, str]] = {
         "VOICE_HARNESS_PLAYBACK_QUIET_TIMEOUT_SECONDS": "nonnegative_float",
         "VOICE_HARNESS_PLAYBACK_LATENCY": "duration",
         "VOICE_HARNESS_CURSOR_FOREGROUND_SECONDS": "nonnegative_float",
+        "VOICE_HARNESS_CURSOR_AGENT_INACTIVITY_SECONDS": "positive_float",
+        "VOICE_HARNESS_CURSOR_AGENT_MAX_RUNTIME_SECONDS": "positive_float",
         "VOICE_HARNESS_CURSOR_FOLLOWUP": "flag",
         "VOICE_HARNESS_CURSOR_FOLLOWUP_WINDOW_SECONDS": "nonnegative_float",
         "VOICE_HARNESS_HERDR_BIN": "absolute_path",
@@ -815,7 +817,7 @@ def _optional_environment_errors(name: str, environment: dict[str, str]) -> list
             and not Path(_expanded_unit_value(value)).is_absolute()
         ):
             problem = "must be an absolute path"
-        elif validator in {"nonnegative_float", "probability"}:
+        elif validator in {"nonnegative_float", "positive_float", "probability"}:
             try:
                 number = float(value)
             except ValueError:
@@ -823,6 +825,8 @@ def _optional_environment_errors(name: str, environment: dict[str, str]) -> list
             else:
                 if not math.isfinite(number) or number < 0:
                     problem = "must be a finite non-negative number"
+                elif validator == "positive_float" and number <= 0:
+                    problem = "must be a finite positive number"
                 elif validator == "probability" and number > 1:
                     problem = "must be between 0 and 1"
         elif validator == "positive_int":

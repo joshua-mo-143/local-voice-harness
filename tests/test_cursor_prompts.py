@@ -40,6 +40,8 @@ class CursorPromptTests(unittest.TestCase):
         )
         self.assertIn("VOICE_QUESTION[token]", prompt)
         self.assertIn("VOICE_SUMMARY[token]", prompt)
+        self.assertIn("run them only in the foreground", prompt)
+        self.assertIn("Never leave background work running", prompt)
 
     def test_github_issue_context_is_read_only_and_preserved(self) -> None:
         prompt = cursor_prompt(

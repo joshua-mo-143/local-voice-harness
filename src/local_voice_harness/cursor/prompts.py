@@ -207,6 +207,10 @@ def implementation_prompt(
     return prompt + (
         "Follow repository rules, keep changes scoped, and run relevant checks. "
         f"{integration_text}"
+        "If you use subagents, run them only in the foreground and wait for every "
+        "subagent and tool call to finish before responding. Never leave background "
+        "work running. Emit VOICE_SUMMARY only after all subagents and tool calls "
+        "have reached a terminal state. "
         "If implementation reveals broader scope, ambiguity, or a persistence, "
         "recovery, concurrency, lifecycle, worktree, external-write, security, "
         "infrastructure, destructive, or public-API risk not covered by the approved "
@@ -241,6 +245,7 @@ def cursor_prompt(
         continuation=continuation,
         github_issue_context=github_issue_context,
         issue_reference=issue_reference,
+        integration_instructions=integration_instructions,
     )
     if not integration_text:
         return prompt

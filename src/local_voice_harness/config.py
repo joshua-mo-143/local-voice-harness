@@ -369,6 +369,28 @@ def _env_nonnegative_float(
     return value
 
 
+def _env_positive_float(
+    name: str,
+    *,
+    default: float,
+    environment: Mapping[str, str] = os.environ,
+) -> float:
+    value = _env_nonnegative_float(name, default=default, environment=environment)
+    if value <= 0:
+        raise ValueError(f"{name} must be a finite positive number")
+    return value
+
+
+CURSOR_AGENT_INACTIVITY_SECONDS = _env_positive_float(
+    "VOICE_HARNESS_CURSOR_AGENT_INACTIVITY_SECONDS",
+    default=15 * 60,
+)
+CURSOR_AGENT_MAX_RUNTIME_SECONDS = _env_positive_float(
+    "VOICE_HARNESS_CURSOR_AGENT_MAX_RUNTIME_SECONDS",
+    default=60 * 60,
+)
+
+
 def _env_classes(name: str, defaults: tuple[str, ...]) -> tuple[str, ...]:
     raw = os.environ.get(name)
     if raw is None:

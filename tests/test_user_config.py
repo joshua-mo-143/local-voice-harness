@@ -37,6 +37,8 @@ class UserConfigDefaultsTests(unittest.TestCase):
         self.assertEqual(
             config.platform.herdr_bin, self.HOME / ".local" / "bin" / "herdr"
         )
+        self.assertEqual(config.platform.cursor_agent_inactivity_seconds, 900)
+        self.assertEqual(config.platform.cursor_agent_max_runtime_seconds, 3600)
 
     def test_config_path_lives_under_xdg_config_home(self) -> None:
         path = user_config.user_config_path({"XDG_CONFIG_HOME": "/cfg"}, home=self.HOME)
@@ -140,6 +142,22 @@ class UserConfigPrecedenceTests(unittest.TestCase):
             )
         self.assertTrue(config.integrations.zendesk_enabled)
 
+    def test_cursor_watchdog_environment_overrides(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = user_config.load_user_config(
+                {
+                    "VOICE_HARNESS_CURSOR_AGENT_INACTIVITY_SECONDS": "120",
+                    "VOICE_HARNESS_CURSOR_AGENT_MAX_RUNTIME_SECONDS": "600",
+                },
+                path=root / "config.toml",
+                backends_path=root / "backends.toml",
+                home=self.HOME,
+            )
+
+        self.assertEqual(config.platform.cursor_agent_inactivity_seconds, 120)
+        self.assertEqual(config.platform.cursor_agent_max_runtime_seconds, 600)
+
 
 class UserConfigValidationTests(unittest.TestCase):
     HOME = Path("/home/example")
@@ -191,6 +209,10 @@ class UserConfigValidationTests(unittest.TestCase):
     def test_non_positive_frame_count_is_rejected(self) -> None:
         with self.assertRaisesRegex(UserConfigurationError, "positive integer"):
             self._load("[audio]\nbarge_in_speech_frames = 0\n")
+
+    def test_non_positive_cursor_watchdog_is_rejected(self) -> None:
+        with self.assertRaisesRegex(UserConfigurationError, "positive number"):
+            self._load("[platform]\ncursor_agent_inactivity_seconds = 0\n")
 
     def test_file_based_credentials_are_rejected(self) -> None:
         with self.assertRaisesRegex(UserConfigurationError, "credentials set"):
