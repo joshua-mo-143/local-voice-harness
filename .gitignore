@@ -21,6 +21,7 @@ models/
 # Runtime audio, logs, and local configuration.
 *.wav
 *.log
+.dev/
 .env
 .env.*
 !.env.example
