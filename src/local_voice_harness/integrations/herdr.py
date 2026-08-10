@@ -29,12 +29,18 @@ HERDR_WORKTREE_ROOT = Path(
 ).expanduser()
 HOME_ROOT = REPOSITORY_ROOT
 SETTLED = {"idle", "done"}
+MAX_MARKER_BYTES = 64 * 1024
 Checkpoint = Callable[[], None]
 ReserveAgent = Callable[["AgentSelection", bool], None]
 SettleAgent = Callable[["AgentSelection"], None]
 ReserveWorktree = Callable[[Path, str, Path, str], None]
 SettleWorktree = Callable[[Path, str | None, str | None], None]
 FailOperation = Callable[["HerdrError"], None]
+BeforePromptSubmit = Callable[[int], None]
+PromptAccepted = Callable[[], None]
+BeforePaneSubmit = Callable[[], None]
+PaneAccepted = Callable[[str, str], None]
+PlanParticipant = Callable[[str, str, str | None], None]
 LINEAR_ISSUE = re.compile(r"\b([A-Z][A-Z0-9]+)(?:\s*-\s*|\s+)(\d+)\b", re.IGNORECASE)
 SCP_GIT_URL = re.compile(
     r"^(?P<user>[A-Za-z0-9._-]+)@(?P<host>[A-Za-z0-9.-]+):(?P<path>[^:\s]+)$"
@@ -114,11 +120,19 @@ def extract_marker(output: str, marker: str, token: str) -> str | None:
         parts = [match.group(1).strip()]
         for continuation in lines[index + 1 :]:
             stripped = continuation.strip()
-            if not stripped or re.match(r"^(?:VOICE_|ROUTE_)[A-Z_]+\[", stripped):
+            if not stripped or re.match(
+                r"^(?:VOICE_|ROUTE_|WORKFLOW_)[A-Z_]+\[", stripped
+            ):
                 break
             parts.append(stripped)
         value = " ".join(filter(None, parts)).strip()
-        if value:
+        # Terminal history includes the prompt itself. Placeholder examples must
+        # never become accepted output when the agent omits its required marker.
+        if (
+            value
+            and not value.startswith("<")
+            and len(value.encode()) <= MAX_MARKER_BYTES
+        ):
             matches.append(value)
     return matches[-1] if matches else None
 
@@ -466,9 +480,13 @@ class HerdrClient:
         workspace_id: str | None = None,
         *,
         checkpoint: Checkpoint | None = None,
+        before_submit: BeforePaneSubmit | None = None,
+        accepted: PaneAccepted | None = None,
     ) -> tuple[str, str]:
         if checkpoint is not None:
             checkpoint()
+        if before_submit is not None:
+            before_submit()
         if workspace_id:
             result = self.run_json(
                 "tab",
@@ -499,6 +517,8 @@ class HerdrClient:
         )
         if not pane or not workspace:
             raise HerdrError("Herdr did not return a root pane")
+        if accepted is not None:
+            accepted(pane, workspace)
         return pane, workspace
 
     def start_agent(
@@ -509,8 +529,11 @@ class HerdrClient:
         workspace: str,
         *,
         name: str | None = None,
+        mode: str | None = None,
         checkpoint: Checkpoint | None = None,
     ) -> AgentSelection:
+        if mode not in {None, "plan", "ask"}:
+            raise HerdrError("invalid Cursor mode")
         if name is None:
             suffix = uuid.uuid4().hex[:10]
             name = f"voice-{normalize_name(label)[:15] or 'task'}-{suffix}"
@@ -519,6 +542,9 @@ class HerdrClient:
             try:
                 if checkpoint is not None:
                     checkpoint()
+                agent_args = ["--trust"]
+                if mode is not None:
+                    agent_args.extend(["--mode", mode])
                 result = self.run_json(
                     "agent",
                     "start",
@@ -530,7 +556,7 @@ class HerdrClient:
                     "--timeout",
                     "60000",
                     "--",
-                    "--trust",
+                    *agent_args,
                     timeout=70,
                 )
                 selection = self.selection(
@@ -551,6 +577,7 @@ class HerdrClient:
         reserved: set[str],
         worktree_branch: str | None = None,
         worktree_label: str | None = None,
+        mode: str | None = None,
         checkpoint: Checkpoint | None = None,
         reserve: ReserveAgent | None = None,
         settle: SettleAgent | None = None,
@@ -558,6 +585,10 @@ class HerdrClient:
         reserve_worktree: ReserveWorktree | None = None,
         settle_worktree: SettleWorktree | None = None,
         fail_worktree: FailOperation | None = None,
+        plan_participant: PlanParticipant | None = None,
+        before_pane_submit: BeforePaneSubmit | None = None,
+        pane_accepted: PaneAccepted | None = None,
+        participant_name: str | None = None,
     ) -> AgentSelection:
         repository = repository.resolve()
         checkout = repository
@@ -660,11 +691,15 @@ class HerdrClient:
                     settle_worktree(checkout, workspace_id, root_pane)
                 if checkpoint is not None:
                     checkpoint()
-        existing_agent = self.find_agent(
-            repository=repository,
-            checkout=checkout,
-            agent_hint=agent_hint,
-            reserved=reserved,
+        existing_agent = (
+            None
+            if mode is not None
+            else self.find_agent(
+                repository=repository,
+                checkout=checkout,
+                agent_hint=agent_hint,
+                reserved=reserved,
+            )
         )
         if existing_agent:
             if reserve is not None:
@@ -674,12 +709,21 @@ class HerdrClient:
         workspace_id = workspace_id or (
             str(workspace.get("workspace_id") or "") if workspace else None
         )
-        if not root_pane:
-            root_pane, workspace_id = self.new_pane(
-                checkout, label, workspace_id, checkpoint=checkpoint
-            )
         suffix = uuid.uuid4().hex[:10]
-        name = f"voice-{normalize_name(label)[:15] or 'task'}-{suffix}"
+        name = participant_name or (
+            f"voice-{normalize_name(label)[:15] or 'task'}-{suffix}"
+        )
+        if not root_pane:
+            if plan_participant is not None:
+                plan_participant(name, label, workspace_id)
+            root_pane, workspace_id = self.new_pane(
+                checkout,
+                label,
+                workspace_id,
+                checkpoint=checkpoint,
+                before_submit=before_pane_submit,
+                accepted=pane_accepted,
+            )
         provisional = AgentSelection(
             target=name,
             pane_id=root_pane,
@@ -691,12 +735,84 @@ class HerdrClient:
         if reserve is not None:
             reserve(provisional, True)
         try:
+            if mode is None:
+                selection = self.start_agent(
+                    checkout,
+                    label,
+                    root_pane,
+                    str(workspace_id),
+                    name=name,
+                    checkpoint=checkpoint,
+                )
+            else:
+                selection = self.start_agent(
+                    checkout,
+                    label,
+                    root_pane,
+                    str(workspace_id),
+                    name=name,
+                    mode=mode,
+                    checkpoint=checkpoint,
+                )
+        except HerdrError as exc:
+            if fail_agent is not None:
+                fail_agent(exc)
+            raise
+        if settle is not None:
+            settle(selection)
+        if checkpoint is not None:
+            checkpoint()
+        return selection
+
+    def start_fresh_agent(
+        self,
+        checkout: Path,
+        label: str,
+        workspace_id: str,
+        *,
+        role: str,
+        mode: str | None,
+        name: str | None = None,
+        checkpoint: Checkpoint | None = None,
+        reserve: ReserveAgent | None = None,
+        settle: SettleAgent | None = None,
+        fail_agent: FailOperation | None = None,
+        before_pane_submit: BeforePaneSubmit | None = None,
+        pane_accepted: PaneAccepted | None = None,
+    ) -> AgentSelection:
+        """Start a distinct participant in a new pane with a durable start fence."""
+        if name is None:
+            suffix = uuid.uuid4().hex[:10]
+            name = (
+                f"voice-{normalize_name(role)[:8] or 'agent'}-"
+                f"{normalize_name(label)[:7] or 'task'}-{suffix}"
+            )[:32]
+        pane, workspace = self.new_pane(
+            checkout,
+            f"{label}-{role}",
+            workspace_id,
+            checkpoint=checkpoint,
+            before_submit=before_pane_submit,
+            accepted=pane_accepted,
+        )
+        provisional = AgentSelection(
+            name,
+            pane,
+            workspace,
+            str(checkout),
+            name,
+            str(checkout),
+        )
+        if reserve is not None:
+            reserve(provisional, True)
+        try:
             selection = self.start_agent(
                 checkout,
-                label,
-                root_pane,
-                str(workspace_id),
+                f"{label}-{role}",
+                pane,
+                workspace,
                 name=name,
+                mode=mode,
                 checkpoint=checkpoint,
             )
         except HerdrError as exc:
@@ -746,13 +862,24 @@ class HerdrClient:
         token: str,
         timeout: float = 900,
         checkpoint: Checkpoint | None = None,
+        baseline_sequence: int | None = None,
+        before_submit: BeforePromptSubmit | None = None,
+        accepted: PromptAccepted | None = None,
     ) -> PromptOutcome:
         if checkpoint is not None:
             checkpoint()
         before = self.get_agent(target)
+        observed_baseline = int(before.get("state_change_seq") or 0)
+        if baseline_sequence is not None and observed_baseline != baseline_sequence:
+            raise HerdrError(
+                "Herdr agent changed before the planned prompt was submitted",
+                code="operation_ambiguous",
+            )
         if checkpoint is not None:
             checkpoint()
             checkpoint()
+        if before_submit is not None:
+            before_submit(observed_baseline)
         process = subprocess.Popen(
             self.command(
                 "agent",
@@ -767,6 +894,7 @@ class HerdrClient:
             stderr=subprocess.PIPE,
             text=True,
         )
+        acceptance_recorded = False
         try:
             if checkpoint is not None:
                 checkpoint()
@@ -785,6 +913,9 @@ class HerdrClient:
                 self.run_json("agent", "send-keys", target, "enter")
                 if checkpoint is not None:
                     checkpoint()
+            elif accepted is not None:
+                accepted()
+                acceptance_recorded = True
             stdout, stderr = process.communicate(timeout=timeout + 10)
             if checkpoint is not None:
                 checkpoint()
@@ -794,6 +925,8 @@ class HerdrClient:
             raise
         if process.returncode:
             self.decode(stdout or stderr)
+        if accepted is not None and not acceptance_recorded:
+            accepted()
         result = self.decode(stdout)
         agent = dict(result.get("agent") or {})
         output = self.run_text(

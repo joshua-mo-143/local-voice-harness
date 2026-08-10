@@ -11,7 +11,12 @@ from typing import cast
 from ..errors import HarnessError
 from ..integrations.github import GitHubClient, GitHubError, GitHubRepository
 from ..integrations.herdr import HerdrClient, HerdrError
-from .model import TERMINAL_STATUSES, CursorJob, JobStatus
+from .model import (
+    TERMINAL_STATUSES,
+    CursorJob,
+    JobStatus,
+    WorkflowParticipant,
+)
 from .store import JobStore, LegacyWorkerInspector
 from .worker_lifecycle import (
     boot_identity,
@@ -391,6 +396,105 @@ def reconcile_uncertain_operations(
     reconcile_uncertain_worktree(store, current, now=now, herdr_factory=herdr_factory)
 
 
+def reconcile_prompt_and_pane_operations(
+    store: JobStore,
+    job: CursorJob,
+    *,
+    now: float,
+    herdr_factory: HerdrFactory = HerdrClient,
+) -> None:
+    """Resolve only externally observable acceptance; never replay a submit."""
+    if job.prompt_operation_state == "submitting":
+        target = job.prompt_operation_target or ""
+        try:
+            client = herdr_factory()
+            client.ensure_server()
+            agent = client.get_agent(target)
+            sequence = int(agent.get("state_change_seq") or 0)
+        except (HerdrError, TypeError, ValueError):
+            # A failed observation carries no evidence. Keep the submit fence.
+            return
+
+        def reconcile_prompt(current: CursorJob) -> CursorJob | None:
+            if (
+                current.prompt_operation_state != "submitting"
+                or current.prompt_operation_target != target
+            ):
+                return None
+            accepted = (
+                current.prompt_baseline_sequence is not None
+                and current.prompt_baseline_sequence >= 0
+                and sequence != current.prompt_baseline_sequence
+            )
+            return current.evolve_recovery(
+                now=now,
+                prompt_operation_state="submitted" if accepted else "ambiguous",
+                manual_reconcile_operation=None if accepted else "prompt",
+                manual_reconcile_token=None if accepted else uuid.uuid4().hex,
+                manual_reconcile_required_at=None if accepted else now,
+            )
+
+        store.update(job.id, reconcile_prompt)
+
+    current = store.get(job.id)
+    if current.participant_creation_state == "submitting":
+        # Herdr does not expose an idempotency key for tab creation. Absence in
+        # a listing cannot prove the create was not accepted, so retain every
+        # deterministic identity and require an operator decision.
+        store.update(
+            job.id,
+            lambda candidate: (
+                candidate.evolve_recovery(
+                    now=now,
+                    participant_creation_state="manual_required",
+                    manual_reconcile_operation="pane",
+                    manual_reconcile_token=uuid.uuid4().hex,
+                    manual_reconcile_required_at=now,
+                )
+                if candidate.participant_creation_state == "submitting"
+                else None
+            ),
+        )
+
+
+def stage_terminal_intent(
+    job: CursorJob,
+    status: JobStatus,
+    *,
+    now: float,
+    result: str,
+    error: str | None = None,
+    clear_worker: bool = False,
+) -> CursorJob:
+    if status not in TERMINAL_STATUSES:
+        raise HarnessError("terminal cleanup requires a terminal intent")
+    return job.evolve(
+        status=JobStatus.RECONCILING,
+        terminal_intent_status=status.value,
+        terminal_intent_result=result,
+        terminal_intent_error=error,
+        terminal_intent_completed_at=now,
+        target_release_pending=True,
+        target_release_token=uuid.uuid4().hex,
+        target_release_owner_pid=None,
+        target_release_owner_boot_id=None,
+        target_release_owner_start=None,
+        cancellation_reconciliation_pending=True,
+        worker_operation="target_cleanup",
+        pull_request_worktree_state=(
+            "retained"
+            if job.github_pull_request
+            and job.worktree_path
+            and job.pull_request_worktree_state != "quarantined"
+            else job.pull_request_worktree_state
+        ),
+        worker_pid=None if clear_worker else job.worker_pid,
+        worker_boot_id=None if clear_worker else job.worker_boot_id,
+        worker_process_start=None if clear_worker else job.worker_process_start,
+        worker_token=None if clear_worker else job.worker_token,
+    )
+
+
 def cancel_target_and_release(
     store: JobStore,
     job_id: str,
@@ -401,28 +505,112 @@ def cancel_target_and_release(
     herdr_factory: HerdrFactory = HerdrClient,
 ) -> None:
     current = store.get(job_id)
+    staged = (
+        current.status == JobStatus.RECONCILING
+        and current.terminal_intent_status is not None
+    )
     if (
-        current.status not in {JobStatus.CANCELLED, JobStatus.FAILED}
-        or current.target_release_token != release_token
-    ):
+        not staged and current.status not in {JobStatus.CANCELLED, JobStatus.FAILED}
+    ) or current.target_release_token != release_token:
         return
-    interrupted = not target
-    if target:
+    targets = list(
+        dict.fromkeys(
+            value
+            for value in (
+                target,
+                current.participant_target(WorkflowParticipant.PLANNER),
+                current.participant_target(WorkflowParticipant.REVIEWER),
+                current.participant_target(WorkflowParticipant.IMPLEMENTER),
+                current.participant_creation_target,
+            )
+            if value
+        )
+    )
+    interrupted = True
+    if targets:
         try:
             client = herdr_factory()
             client.ensure_server()
-            client.cancel_agent(target)
-            interrupted = True
-        except HerdrError as exc:
-            interrupted = _agent_not_found(exc)
+            for participant_target in targets:
+                try:
+                    client.cancel_agent(participant_target)
+                except HerdrError as exc:
+                    if not _agent_not_found(exc):
+                        interrupted = False
+        except HerdrError:
+            interrupted = False
 
     def release(job: CursorJob) -> CursorJob | None:
         if (
-            job.status not in {JobStatus.CANCELLED, JobStatus.FAILED}
+            job.status
+            not in {JobStatus.RECONCILING, JobStatus.CANCELLED, JobStatus.FAILED}
             or job.target_release_token != release_token
         ):
             return None
-        if interrupted and worker_stopped and not job.has_uncertain_operation():
+        infrastructure_uncertain = (
+            job.agent_dispatch_state
+            in {"dispatching", "ambiguous", "failed_observing", "manual_required"}
+            or job.prompt_operation_state in {"submitting", "ambiguous"}
+            or job.fork_operation_state
+            in {"submitted", "ambiguous", "failed_observing"}
+            or job.worktree_provision_state
+            in {"dispatching", "ambiguous", "failed_observing"}
+            or job.participant_creation_state
+            in {"submitting", "ambiguous", "manual_required"}
+        )
+        if interrupted and worker_stopped and not infrastructure_uncertain:
+            if job.terminal_intent_status is not None:
+                terminal = job.terminal_intent_status
+                completed_at = job.terminal_intent_completed_at or time.time()
+                result = job.terminal_intent_result or ""
+                error = job.terminal_intent_error
+                return job.evolve_for_delivery(
+                    now=completed_at,
+                    status=terminal,
+                    result=result,
+                    error=str(error) if error is not None else None,
+                    completed_at=completed_at,
+                    terminal_intent_status=None,
+                    terminal_intent_result=None,
+                    terminal_intent_error=None,
+                    terminal_intent_completed_at=None,
+                    target_release_pending=False,
+                    target_release_token=None,
+                    target_release_owner_pid=None,
+                    target_release_owner_boot_id=None,
+                    target_release_owner_start=None,
+                    cancellation_reconciliation_pending=False,
+                    worker_operation=None,
+                    worker_pid=None,
+                    worker_boot_id=None,
+                    worker_process_start=None,
+                    worker_token=None,
+                    herdr_target=None,
+                    herdr_pane_id=None,
+                    herdr_workspace_id=None,
+                    agent_name=None,
+                    agent_dispatch_state="confirmed_absent",
+                    active_participant=None,
+                    planner_target=None,
+                    reviewer_target=None,
+                    implementer_target=None,
+                    prompt_operation_state="none",
+                    prompt_operation_phase=None,
+                    prompt_operation_turn=None,
+                    prompt_operation_target=None,
+                    prompt_baseline_sequence=None,
+                    participant_creation_state="none",
+                    participant_creation_participant=None,
+                    participant_creation_target=None,
+                    participant_creation_label=None,
+                    participant_creation_workspace_id=None,
+                    participant_creation_pane_id=None,
+                    workflow_phase=(
+                        "finished"
+                        if terminal == JobStatus.COMPLETED
+                        else job.workflow_phase.value
+                    ),
+                )
             return job.evolve(
                 target_release_pending=False,
                 target_release_token=None,
@@ -481,7 +669,7 @@ def resolve_manual_reconciliation(
     *,
     now: float | None = None,
 ) -> CursorJob:
-    if operation not in {"agent", "fork", "worktree"}:
+    if operation not in {"agent", "fork", "worktree", "prompt", "pane"}:
         raise HarnessError("manual reconciliation operation is invalid")
     if outcome not in {"confirmed_absent", "materialized"}:
         raise HarnessError("manual reconciliation outcome is invalid")
@@ -491,7 +679,8 @@ def resolve_manual_reconciliation(
         if (
             job.manual_reconcile_operation != operation
             or not secrets.compare_digest(job.manual_reconcile_token or "", token)
-            or job.operation_state(operation) != "manual_required"
+            or job.operation_state(operation)
+            != ("ambiguous" if operation == "prompt" else "manual_required")
         ):
             return None
         return job.resolve_manual_operation(operation, outcome, resolved_at=resolved_at)
@@ -572,10 +761,17 @@ def recover_jobs(
     for existing in store.list():
         if existing.id in blocked_legacy_jobs:
             continue
-        if existing.has_uncertain_operation():
+        reconcile_prompt_and_pane_operations(
+            store,
+            existing,
+            now=recovered_at,
+            herdr_factory=herdr_factory,
+        )
+        current = store.get(existing.id)
+        if current.has_uncertain_operation():
             reconcile_uncertain_operations(
                 store,
-                existing,
+                current,
                 now=recovered_at,
                 herdr_factory=herdr_factory,
                 github_factory=github_factory,
@@ -589,7 +785,10 @@ def recover_jobs(
         ):
             stop_unfenced_worker(store, existing.id)
         elif (
-            existing.status == JobStatus.CANCELLED
+            (
+                existing.status == JobStatus.CANCELLED
+                or existing.terminal_intent_status == JobStatus.CANCELLED
+            )
             and existing.target_release_pending
             and existing.worker_token
             and is_worker_alive(existing)
@@ -631,6 +830,19 @@ def recover_jobs(
                 owner_pid = owner_pid if owner_start else None
                 owner_boot_id = get_boot_identity() if owner_start else None
                 release = (job.id, job.herdr_target or "", release_token)
+            if job.terminal_intent_status is not None:
+                if take_release:
+                    return job.evolve(
+                        target_release_token=release_token,
+                        target_release_owner_pid=owner_pid,
+                        target_release_owner_boot_id=owner_boot_id,
+                        target_release_owner_start=owner_start,
+                        worker_pid=None,
+                        worker_boot_id=None,
+                        worker_process_start=None,
+                        worker_token=None,
+                    )
+                return None
             if (
                 job.has_uncertain_operation()
                 or job.manual_reconcile_operation
@@ -707,6 +919,21 @@ def recover_jobs(
                         return job.evolve(
                             status=JobStatus.QUEUED,
                             reconcile=True,
+                            queued_at=recovered_at,
+                            target_release_token=release_token,
+                            target_release_owner_pid=owner_pid,
+                            target_release_owner_boot_id=owner_boot_id,
+                            target_release_owner_start=owner_start,
+                            worker_pid=None,
+                            worker_boot_id=None,
+                            worker_process_start=None,
+                            worker_token=None,
+                        )
+                    if job.prompt_operation_state in {"none", "planned"}:
+                        should_launch = True
+                        return job.evolve(
+                            status=JobStatus.QUEUED,
+                            remove=frozenset({"reconcile"}),
                             queued_at=recovered_at,
                             target_release_token=release_token,
                             target_release_owner_pid=owner_pid,

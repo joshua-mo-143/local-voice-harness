@@ -4,6 +4,8 @@ import fcntl
 import hashlib
 import json
 import os
+import re
+import shutil
 import tempfile
 import time
 import warnings
@@ -25,12 +27,23 @@ from .model import (
 )
 
 DELIVERED_JOB_RETENTION_SECONDS = 7 * 24 * 60 * 60
+MAX_WORKFLOW_ARTIFACT_BYTES = 64 * 1024
+WORKFLOW_ARTIFACT_KINDS = frozenset({"plan", "review"})
+_ARTIFACT_REF = re.compile(
+    r"^\.artifacts/(?P<job>[0-9a-f]{12})/"
+    r"(?P<kind>plan|review)-(?P<round>[0-2])"
+    r"(?:-(?P<digest>[0-9a-f]{64}))?\.json$"
+)
 LegacyWorkerDisposition = Literal["absent", "stopped", "unsafe"]
 LegacyWorkerInspector = Callable[[CursorJob], LegacyWorkerDisposition]
 
 
 class JobQuarantinedError(JobValidationError):
     """A malformed job was isolated from active job processing."""
+
+
+class ArtifactQuarantinedError(JobValidationError):
+    """A malformed workflow artifact was isolated from active processing."""
 
 
 class FollowUpUnavailable(JobValidationError):
@@ -247,6 +260,235 @@ def _atomic_bytes(path: Path, contents: bytes) -> None:
         temporary.unlink(missing_ok=True)
 
 
+def _exclusive_bytes(path: Path, contents: bytes) -> bool:
+    """Create immutable contents, accepting only an identical replay."""
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "wb") as output:
+            output.write(contents)
+            output.flush()
+            os.fsync(output.fileno())
+        temporary.chmod(0o600)
+        try:
+            os.link(temporary, path, follow_symlinks=False)
+        except FileExistsError:
+            if path.is_symlink():
+                raise JobValidationError(
+                    "existing workflow artifact cannot be a symlink"
+                ) from None
+            try:
+                with path.open("rb") as source:
+                    existing = source.read(MAX_WORKFLOW_ARTIFACT_BYTES + 1)
+            except OSError as exc:
+                raise JobValidationError(
+                    "existing workflow artifact cannot be verified"
+                ) from exc
+            if existing != contents:
+                raise JobValidationError(
+                    "workflow artifact reference already contains different content"
+                ) from None
+            return False
+        _fsync_directory(path.parent)
+        return True
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _artifact_path(jobs_dir: Path, reference: str) -> Path:
+    match = _ARTIFACT_REF.fullmatch(reference)
+    if match is None:
+        raise JobValidationError("invalid workflow artifact reference")
+    path = jobs_dir / reference
+    if path.parent.parent != jobs_dir / ".artifacts":
+        raise JobValidationError("workflow artifact escapes artifact storage")
+    for parent in (path.parent.parent, path.parent):
+        if parent.is_symlink():
+            raise JobValidationError("workflow artifact storage cannot be a symlink")
+    return path
+
+
+def _ensure_artifact_directory_unlocked(jobs_dir: Path, job_id: str) -> Path:
+    artifacts = jobs_dir / ".artifacts"
+    directory = artifacts / job_id
+    for candidate, parent in ((artifacts, jobs_dir), (directory, artifacts)):
+        if candidate.is_symlink():
+            raise JobValidationError("workflow artifact storage cannot be a symlink")
+        if candidate.exists():
+            if not candidate.is_dir():
+                raise JobValidationError(
+                    "workflow artifact storage must be a directory"
+                )
+            continue
+        candidate.mkdir(mode=0o700)
+        candidate.chmod(0o700)
+        _fsync_directory(parent)
+    return directory
+
+
+def _artifact_payload(
+    job_id: str,
+    kind: Literal["plan", "review"],
+    round_number: int,
+    text: str,
+    *,
+    plan_sha256: str | None = None,
+) -> tuple[str, bytes]:
+    encoded = text.encode()
+    if not text.strip():
+        raise JobValidationError("workflow artifact text must be non-empty")
+    if "\x00" in text:
+        raise JobValidationError("workflow artifact contains a NUL byte")
+    payload: dict[str, object] = {
+        "schema_version": 2,
+        "job_id": job_id,
+        "kind": kind,
+        "round": round_number,
+        "text": text,
+        "sha256": hashlib.sha256(encoded).hexdigest(),
+    }
+    if kind == "review":
+        if plan_sha256 is None:
+            raise JobValidationError("workflow review requires a plan digest")
+        payload["plan_sha256"] = plan_sha256
+    serialized = json.dumps(
+        payload, allow_nan=False, separators=(",", ":"), sort_keys=True
+    ).encode()
+    if len(serialized) > MAX_WORKFLOW_ARTIFACT_BYTES:
+        raise JobValidationError("workflow artifact exceeds size limit")
+    digest = hashlib.sha256(serialized).hexdigest()
+    reference = f".artifacts/{job_id}/{kind}-{round_number}-{digest}.json"
+    return reference, serialized
+
+
+def _quarantine_artifact(path: Path, error: Exception) -> ArtifactQuarantinedError:
+    contents = (
+        os.readlink(path).encode()
+        if path.is_symlink()
+        else path.read_bytes()[: MAX_WORKFLOW_ARTIFACT_BYTES + 1]
+    )
+    digest = hashlib.sha256(contents).hexdigest()
+    quarantine_root = path.parents[2] / ".quarantine"
+    quarantine = quarantine_root / "artifacts"
+    for candidate, parent in (
+        (quarantine_root, path.parents[2]),
+        (quarantine, quarantine_root),
+    ):
+        if candidate.is_symlink() or (candidate.exists() and not candidate.is_dir()):
+            return ArtifactQuarantinedError(
+                f"{path.name}: workflow artifact is invalid and quarantine "
+                "storage is not path-confined"
+            )
+        if not candidate.exists():
+            candidate.mkdir(mode=0o700)
+            candidate.chmod(0o700)
+            _fsync_directory(parent)
+    destination = quarantine / f"{path.parent.name}-{path.stem}-{digest[:12]}.json"
+    sequence = 1
+    while destination.exists():
+        destination = quarantine / (
+            f"{path.parent.name}-{path.stem}-{digest[:12]}-{sequence}.json"
+        )
+        sequence += 1
+    metadata_path = destination.with_suffix(".metadata.json")
+    _atomic_json(
+        metadata_path,
+        {
+            "original_reference": (f".artifacts/{path.parent.name}/{path.name}"),
+            "quarantined_name": destination.name,
+            "quarantined_at": time.time(),
+            "sha256": digest,
+            "error": str(error),
+        },
+    )
+    os.replace(path, destination)
+    destination.chmod(0o600)
+    _fsync_directory(path.parent)
+    _fsync_directory(quarantine)
+    return ArtifactQuarantinedError(
+        f"{path.name}: workflow artifact is quarantined as {destination.name}: {error}"
+    )
+
+
+def _parse_artifact(
+    path: Path,
+    *,
+    expected_job_id: str,
+    expected_kind: str,
+    expected_round: int,
+    expected_source_sha256: str | None = None,
+) -> str:
+    try:
+        if path.is_symlink():
+            raise JobValidationError("workflow artifact cannot be a symlink")
+        with path.open("rb") as source:
+            payload = source.read(MAX_WORKFLOW_ARTIFACT_BYTES + 1)
+        if len(payload) > MAX_WORKFLOW_ARTIFACT_BYTES:
+            raise JobValidationError("workflow artifact exceeds size limit")
+        raw = json.loads(payload)
+        if not isinstance(raw, dict):
+            raise JobValidationError("workflow artifact must be a JSON object")
+        if raw.get("job_id") != expected_job_id:
+            raise JobValidationError("workflow artifact job identity does not match")
+        if raw.get("kind") != expected_kind:
+            raise JobValidationError("workflow artifact kind does not match")
+        if raw.get("round") != expected_round:
+            raise JobValidationError("workflow artifact round does not match")
+        text = raw.get("text")
+        if not isinstance(text, str) or not text.strip():
+            raise JobValidationError("workflow artifact text must be non-empty")
+        if "\x00" in text:
+            raise JobValidationError("workflow artifact contains a NUL byte")
+        expected_digest = hashlib.sha256(text.encode()).hexdigest()
+        if raw.get("sha256") != expected_digest:
+            raise JobValidationError("workflow artifact digest does not match")
+        match = _ARTIFACT_REF.fullmatch(f".artifacts/{expected_job_id}/{path.name}")
+        if match is None:
+            raise JobValidationError("invalid workflow artifact reference")
+        reference_digest = match.group("digest")
+        if reference_digest is not None and hashlib.sha256(payload).hexdigest() != (
+            reference_digest
+        ):
+            raise JobValidationError(
+                "workflow artifact reference digest does not match"
+            )
+        if (
+            expected_kind == "review"
+            and raw.get("plan_sha256") != expected_source_sha256
+        ):
+            raise JobValidationError(
+                "workflow review does not match the current plan digest"
+            )
+        return text
+    except (
+        OSError,
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+        JobValidationError,
+    ) as exc:
+        if isinstance(exc, FileNotFoundError):
+            raise JobValidationError("workflow artifact is missing") from exc
+        if path.exists() or path.is_symlink():
+            raise _quarantine_artifact(path, exc) from exc
+        raise JobValidationError(str(exc)) from exc
+
+
+def _delete_artifacts_unlocked(jobs_dir: Path, job_id: str) -> None:
+    parent = jobs_dir / ".artifacts"
+    if parent.is_symlink():
+        parent.unlink()
+        return
+    directory = parent / job_id
+    if directory.is_symlink():
+        directory.unlink()
+    elif directory.is_dir():
+        shutil.rmtree(directory)
+    if parent.is_dir() and not any(parent.iterdir()):
+        parent.rmdir()
+
+
 def _quarantine(path: Path, error: JobValidationError) -> JobQuarantinedError:
     contents = path.read_bytes()
     digest = hashlib.sha256(contents).hexdigest()
@@ -381,6 +623,49 @@ def _validate_candidate_reservations_unlocked(
     validate_reservations([*peers, candidate])
 
 
+def _validate_candidate_artifacts_unlocked(
+    path: Path, candidate: CursorJob, previous: CursorJob | None
+) -> None:
+    for kind, reference in (
+        ("plan", candidate.plan_artifact),
+        ("review", candidate.review_artifact),
+    ):
+        if reference is None:
+            continue
+        if (
+            previous is not None
+            and previous.to_dict().get(f"{kind}_artifact") == reference
+        ):
+            # Existing references were validated when published. If later
+            # corruption quarantines one, unrelated recovery/failure writes
+            # must still be able to terminalize the owning job.
+            continue
+        match = _ARTIFACT_REF.fullmatch(reference)
+        if match is None:
+            raise JobValidationError("invalid workflow artifact reference")
+        source_sha256 = None
+        if kind == "review":
+            plan_reference = candidate.plan_artifact
+            if plan_reference is None:
+                raise JobValidationError("workflow review has no current plan")
+            plan_match = _ARTIFACT_REF.fullmatch(plan_reference)
+            assert plan_match is not None
+            plan_text = _parse_artifact(
+                _artifact_path(path.parent, plan_reference),
+                expected_job_id=candidate.id,
+                expected_kind="plan",
+                expected_round=int(plan_match.group("round")),
+            )
+            source_sha256 = hashlib.sha256(plan_text.encode()).hexdigest()
+        _parse_artifact(
+            _artifact_path(path.parent, reference),
+            expected_job_id=candidate.id,
+            expected_kind=kind,
+            expected_round=int(match.group("round")),
+            expected_source_sha256=source_sha256,
+        )
+
+
 def _job_reserves_resources(job: CursorJob) -> bool:
     return bool(
         job.status in ACTIVE_STATUSES
@@ -492,6 +777,7 @@ def write_unlocked(path: Path, job: dict[str, object]) -> None:
                 raise JobValidationError("new Cursor job revision must be zero")
         else:
             validate_transition(previous, candidate)
+        _validate_candidate_artifacts_unlocked(path, candidate, previous)
         _validate_candidate_reservations_unlocked(path, candidate, previous)
     except JobValidationError as exc:
         if isinstance(exc, JobQuarantinedError):
@@ -511,6 +797,7 @@ def _write_model_unlocked(path: Path, candidate: CursorJob) -> CursorJob:
                 raise JobValidationError("new Cursor job revision must be zero")
         else:
             validate_transition(previous, candidate)
+        _validate_candidate_artifacts_unlocked(path, candidate, previous)
         _validate_candidate_reservations_unlocked(path, candidate, previous)
     except JobValidationError as exc:
         if isinstance(exc, JobQuarantinedError):
@@ -659,6 +946,7 @@ def prune_jobs(
                 and not _must_retain(job)
             ):
                 path.unlink()
+                _delete_artifacts_unlocked(jobs_dir, job.id)
                 removed.append(job.id)
         if removed:
             _fsync_directory(jobs_dir)
@@ -710,6 +998,7 @@ def _validate_follow_up_source(
 
 JobCommand = Callable[[CursorJob], CursorJob | None]
 FollowUpBuilder = Callable[[CursorJob], CursorJob]
+ArtifactCommand = Callable[[CursorJob, str], CursorJob]
 
 
 class JobStore:
@@ -758,6 +1047,164 @@ class JobStore:
                 raise JobValidationError(f"{path.name}: Cursor job already exists")
             created = _write_model_unlocked(path, job)
         return created
+
+    def write_artifact(
+        self,
+        job_id: str,
+        kind: Literal["plan", "review"],
+        round_number: int,
+        text: str,
+        *,
+        source_text: str | None = None,
+    ) -> str:
+        """Create an immutable artifact without publishing a job reference.
+
+        Production worker output must use :meth:`publish_artifact`, which
+        verifies the worker/turn workflow fence under the same directory lock.
+        This lower-level helper exists for migration and test fixture setup.
+        """
+        if kind not in WORKFLOW_ARTIFACT_KINDS:
+            raise JobValidationError("invalid workflow artifact kind")
+        if round_number < 0 or round_number > 2:
+            raise JobValidationError(
+                "workflow artifact round must be between zero and two"
+            )
+        plan_sha256 = None
+        if kind == "review":
+            if source_text is None or not source_text.strip():
+                raise JobValidationError(
+                    "workflow review requires the reviewed plan text"
+                )
+            plan_sha256 = hashlib.sha256(source_text.encode()).hexdigest()
+        reference, serialized = _artifact_payload(
+            job_id,
+            kind,
+            round_number,
+            text,
+            plan_sha256=plan_sha256,
+        )
+        path = _artifact_path(self.durable_dir, reference)
+        with locked(self.durable_dir):
+            _read_model_unlocked(self.path(job_id))
+            _ensure_artifact_directory_unlocked(self.durable_dir, job_id)
+            _exclusive_bytes(path, serialized)
+        return reference
+
+    def publish_artifact(
+        self,
+        job_id: str,
+        kind: Literal["plan", "review"],
+        round_number: int,
+        text: str,
+        *,
+        expected_worker_token: str,
+        expected_turn_token: str,
+        expected_phase: str,
+        expected_prior_reference: str | None,
+        change: ArtifactCommand,
+        expected_plan_reference: str | None = None,
+    ) -> CursorJob | None:
+        """Guard, create, and publish immutable worker output under one lock.
+
+        Returning ``None`` means the worker snapshot is stale. No artifact
+        directory or sidecar is created before every workflow fence matches.
+        If a crash leaves an unreferenced sidecar after creation, an identical
+        replay reuses it; different bytes can never replace it.
+        """
+        if kind not in WORKFLOW_ARTIFACT_KINDS:
+            raise JobValidationError("invalid workflow artifact kind")
+        if round_number < 0 or round_number > 2:
+            raise JobValidationError(
+                "workflow artifact round must be between zero and two"
+            )
+        with locked(self.durable_dir):
+            path = self.path(job_id)
+            current = _read_model_unlocked(path)
+            field = "plan_artifact" if kind == "plan" else "review_artifact"
+            if (
+                current.terminal_intent_status is not None
+                or current.worker_token != expected_worker_token
+                or current.turn_token != expected_turn_token
+                or current.workflow_phase.value != expected_phase
+                or current.review_round != round_number
+                or current.to_dict().get(field) != expected_prior_reference
+            ):
+                return None
+
+            plan_sha256 = None
+            if kind == "review":
+                if (
+                    expected_plan_reference is None
+                    or current.plan_artifact != expected_plan_reference
+                ):
+                    return None
+                plan_match = _ARTIFACT_REF.fullmatch(expected_plan_reference)
+                if plan_match is None:
+                    raise JobValidationError("invalid reviewed plan artifact reference")
+                plan_text = _parse_artifact(
+                    _artifact_path(self.durable_dir, expected_plan_reference),
+                    expected_job_id=job_id,
+                    expected_kind="plan",
+                    expected_round=int(plan_match.group("round")),
+                )
+                plan_sha256 = hashlib.sha256(plan_text.encode()).hexdigest()
+
+            reference, serialized = _artifact_payload(
+                job_id,
+                kind,
+                round_number,
+                text,
+                plan_sha256=plan_sha256,
+            )
+            artifact_path = _artifact_path(self.durable_dir, reference)
+            _ensure_artifact_directory_unlocked(self.durable_dir, job_id)
+            _exclusive_bytes(artifact_path, serialized)
+            candidate = change(current, reference)
+            if candidate.to_dict().get(field) != reference:
+                raise JobValidationError(
+                    f"artifact publication must set {field} to the new reference"
+                )
+            return _write_model_unlocked(path, candidate)
+
+    def read_artifact(
+        self,
+        job_id: str,
+        reference: str,
+        *,
+        kind: Literal["plan", "review"],
+    ) -> str:
+        """Load and validate a workflow artifact referenced by a job."""
+        path = _artifact_path(self.durable_dir, reference)
+        match = _ARTIFACT_REF.fullmatch(reference)
+        assert match is not None
+        if match.group("job") != job_id or match.group("kind") != kind:
+            raise JobValidationError("workflow artifact reference does not match job")
+        with locked(self.durable_dir):
+            job = _read_model_unlocked(self.path(job_id))
+            field = "plan_artifact" if kind == "plan" else "review_artifact"
+            if job.to_dict().get(field) != reference:
+                raise JobValidationError("workflow artifact reference is stale")
+            source_sha256 = None
+            if kind == "review":
+                plan_reference = job.plan_artifact
+                if plan_reference is None:
+                    raise JobValidationError("workflow review has no current plan")
+                plan_match = _ARTIFACT_REF.fullmatch(plan_reference)
+                assert plan_match is not None
+                plan_text = _parse_artifact(
+                    _artifact_path(self.durable_dir, plan_reference),
+                    expected_job_id=job_id,
+                    expected_kind="plan",
+                    expected_round=int(plan_match.group("round")),
+                )
+                source_sha256 = hashlib.sha256(plan_text.encode()).hexdigest()
+            return _parse_artifact(
+                path,
+                expected_job_id=job_id,
+                expected_kind=kind,
+                expected_round=int(match.group("round")),
+                expected_source_sha256=source_sha256,
+            )
 
     def update(self, job_id: str, command: JobCommand) -> CursorJob | None:
         return self._transaction(job_id, command)
@@ -908,6 +1355,7 @@ class JobStore:
         with locked(self.durable_dir):
             for path in sorted(self.durable_dir.glob("*.json")):
                 path.unlink()
+                _delete_artifacts_unlocked(self.durable_dir, path.stem)
                 removed.append(path.stem)
             if removed:
                 _fsync_directory(self.durable_dir)

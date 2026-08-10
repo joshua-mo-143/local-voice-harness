@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import os
 import re
 import time
 import uuid
@@ -21,6 +20,9 @@ from .model import (
     CursorJob,
     JobStatus,
     NewCursorJob,
+    WorkflowParticipant,
+    WorkflowPhase,
+    WorkflowTier,
 )
 from .provisioning import run_claimed_worker
 from .store import FollowUpCheckoutBusy, FollowUpUnavailable, JobStore
@@ -39,6 +41,8 @@ FORK_CONFIRMATIONS = {
     "fork it",
 }
 FORK_REJECTIONS = {"no", "no thanks", "do not", "don't", "cancel", "stop"}
+REVIEW_APPROVALS = {"approve", "approved", "proceed", "go ahead"}
+REVIEW_ABORTS = {"abort", "cancel", "stop"}
 
 
 @dataclass(frozen=True, slots=True)
@@ -98,6 +102,16 @@ def decide_fork_confirmation(utterance: str) -> bool | None:
         return True
     if normalized in FORK_REJECTIONS:
         return False
+    return None
+
+
+def decide_exhausted_review(utterance: str) -> str | None:
+    normalized = re.sub(r"[^\w\s'’]", "", utterance.casefold())
+    normalized = re.sub(r"\s+", " ", normalized).strip().replace("’", "'")
+    if normalized in REVIEW_APPROVALS:
+        return "approve"
+    if normalized in REVIEW_ABORTS:
+        return "abort"
     return None
 
 
@@ -264,6 +278,16 @@ def reply_job(
     trusted_utterance: str | None = None,
     on_started: Callable[[], None] | None = None,
 ) -> None:
+    initial = read_job(job_id)
+    if (
+        initial.status == JobStatus.AWAITING_USER
+        and initial.clarification_kind == "workflow_review_exhausted"
+    ):
+        decision = decide_exhausted_review(trusted_utterance or "")
+        if decision == "abort":
+            cancel_job(job_id)
+            return
+
     now = time.time()
     should_launch = True
 
@@ -280,6 +304,13 @@ def reply_job(
             fork_confirmed: bool = job.fork_confirmed,
             herdr_target: str | None = job.herdr_target,
             continuation: bool,
+            workflow_phase: WorkflowPhase = job.workflow_phase,
+            workflow_tier: WorkflowTier | None = job.workflow_tier,
+            workflow_reason: str | None = job.workflow_classification_reason,
+            review_round: int = job.review_round,
+            active_participant: WorkflowParticipant | None = job.active_participant,
+            review_approved: bool = job.review_approved,
+            review_approval_source: str | None = job.review_approval_source,
         ) -> CursorJob:
             return job.evolve(
                 status=JobStatus.QUEUED,
@@ -303,6 +334,22 @@ def reply_job(
                 fork_confirmed=fork_confirmed,
                 herdr_target=herdr_target,
                 continuation=continuation,
+                workflow_phase=workflow_phase.value,
+                workflow_tier=(
+                    workflow_tier.value if workflow_tier is not None else None
+                ),
+                workflow_classification_reason=workflow_reason,
+                review_round=review_round,
+                active_participant=(
+                    active_participant.value if active_participant is not None else None
+                ),
+                prompt_operation_state="none",
+                prompt_operation_phase=None,
+                prompt_operation_turn=None,
+                prompt_operation_target=None,
+                prompt_baseline_sequence=None,
+                review_approved=review_approved,
+                review_approval_source=review_approval_source,
             )
 
         if job.clarification_kind == "repository":
@@ -344,7 +391,61 @@ def reply_job(
                 herdr_target=None,
                 continuation=False,
             )
-        return queue(continuation=True, request_text=text)
+        if job.clarification_kind == "workflow_review":
+            planner_target = job.participant_target(WorkflowParticipant.PLANNER)
+            if not planner_target:
+                should_launch = False
+                question = (
+                    "The planner is unavailable. Please cancel or restart this job."
+                )
+                return job.evolve_for_delivery(
+                    now=now, question=question, result=question
+                )
+            promoted = (
+                WorkflowTier.HIGH_RISK
+                if job.workflow_tier == WorkflowTier.MEDIUM
+                else job.workflow_tier
+            )
+            reason = job.workflow_classification_reason or ""
+            if job.workflow_tier == WorkflowTier.MEDIUM:
+                reason = (
+                    f"{reason} Promoted after review required a user decision."
+                ).strip()
+            return queue(
+                request_text=f"{job.request}\n\nUser clarification: {text}",
+                herdr_target=planner_target,
+                continuation=True,
+                workflow_phase=WorkflowPhase.REVISING,
+                workflow_tier=promoted,
+                workflow_reason=reason,
+                review_round=max(1, job.review_round),
+                active_participant=WorkflowParticipant.PLANNER,
+            )
+        if job.clarification_kind == "workflow_review_exhausted":
+            decision = decide_exhausted_review(trusted_utterance or "")
+            if decision != "approve":
+                should_launch = False
+                question = (
+                    "Please say approve to implement the reviewed plan, or abort "
+                    "to cancel the job."
+                )
+                return job.evolve_for_delivery(
+                    now=now,
+                    question=question,
+                    result=question,
+                )
+            return queue(
+                continuation=False,
+                workflow_phase=WorkflowPhase.IMPLEMENTING,
+                review_approved=True,
+                review_approval_source="user",
+            )
+        request_text = (
+            f"{job.request}\n\nUser clarification: {text}"
+            if job.clarification_kind == "workflow"
+            else text
+        )
+        return queue(continuation=True, request_text=request_text)
 
     if _job_store().update(job_id, reply) is None:
         raise HarnessError(f"Cursor job {job_id} is not waiting for a reply")
@@ -429,12 +530,13 @@ def cancel_job(job_id: str) -> str:
         raise HarnessError(f"could not safely stop legacy Cursor worker for {job_id}")
     target = ""
     worker: CursorJob | None = None
-    release_token = uuid.uuid4().hex
     cancelled_at = time.time()
 
     def cancel(job: CursorJob) -> CursorJob | None:
         nonlocal target, worker
         if job.status == JobStatus.CANCELLED:
+            return None
+        if job.terminal_intent_status == JobStatus.CANCELLED:
             return None
         if job.status in {JobStatus.COMPLETED, JobStatus.FAILED}:
             raise HarnessError(f"Cursor job {job_id} is already {job.status.value}")
@@ -451,52 +553,12 @@ def cancel_job(job_id: str) -> str:
             )
         target = job.herdr_target or ""
         worker = job
-        release_pending = bool(
-            target
-            or job.worktree_path
-            or job.worker_token
-            or job.has_uncertain_operation()
-        )
-        reconciliation_pending = job.has_uncertain_operation()
-        release_owner_start = (
-            worker_lifecycle.process_identity(os.getpid()) if release_pending else None
-        )
-        clear_unfenced = legacy_worker_stopped or (
-            job.status in WORKER_STATUSES and not job.worker_token
-        )
-        return job.evolve_for_delivery(
+        return recovery.stage_terminal_intent(
+            job,
+            JobStatus.CANCELLED,
             now=cancelled_at,
-            status=JobStatus.CANCELLED,
-            remove=frozenset({"reconcile"}),
-            result=(
-                f"Cursor job {job_id} was cancelled; external operation "
-                "reconciliation is pending."
-                if reconciliation_pending
-                else f"Cursor job {job_id} was cancelled."
-            ),
-            completed_at=cancelled_at,
-            foreground_until=(
-                cancelled_at + CURSOR_FOREGROUND_SECONDS + FOREGROUND_GRACE_SECONDS
-            ),
-            target_release_pending=release_pending,
-            target_release_token=release_token if release_pending else None,
-            target_release_owner_pid=os.getpid() if release_owner_start else None,
-            target_release_owner_boot_id=(
-                worker_lifecycle.boot_identity() if release_owner_start else None
-            ),
-            target_release_owner_start=release_owner_start,
-            cancellation_reconciliation_pending=reconciliation_pending,
-            pull_request_worktree_state=(
-                "retained"
-                if job.github_pull_request
-                and job.worktree_path
-                and job.pull_request_worktree_state != "quarantined"
-                else job.pull_request_worktree_state
-            ),
-            worker_pid=None if clear_unfenced else job.worker_pid,
-            worker_boot_id=None if clear_unfenced else job.worker_boot_id,
-            worker_process_start=None if clear_unfenced else job.worker_process_start,
-            worker_token=None if clear_unfenced else job.worker_token,
+            result=f"Cursor job {job_id} was cancelled.",
+            clear_worker=legacy_worker_stopped,
         )
 
     updated = _job_store().update(job_id, cancel)
@@ -507,32 +569,41 @@ def cancel_job(job_id: str) -> str:
     if worker is not None and worker.worker_token:
         worker_stopped = _stop_worker(worker)
 
-    def clear_stopped_worker(job: CursorJob) -> CursorJob | None:
-        if job.status != JobStatus.CANCELLED or not worker_stopped:
-            return None
-        return job.clear_worker()
-
-    _job_store().update(job_id, clear_stopped_worker)
     if updated.target_release_pending:
         _cancel_target_and_release(
             job_id,
             target,
-            release_token,
+            updated.target_release_token or "",
             worker_stopped=worker_stopped,
         )
-    return updated.result or f"Cursor job {job_id} was cancelled."
+    current = read_job(job_id)
+    return (
+        current.result
+        or current.terminal_intent_result
+        or f"Cursor job {job_id} was cancelled."
+    )
 
 
 def job_status(job_id: str | None = None) -> str:
     if job_id:
         job = read_job(job_id)
-        return f"Cursor job {job_id} is {job.status.value.replace('_', ' ')}."
+        workflow = (
+            f", {job.workflow_tier.value} tier" if job.workflow_tier is not None else ""
+        )
+        return (
+            f"Cursor job {job_id} is {job.status.value.replace('_', ' ')}, "
+            f"in {job.workflow_phase.value.replace('_', ' ')}{workflow}."
+        )
     jobs = [job for job in _job_store().list() if job.status in ACTIVE_STATUSES]
     if not jobs:
         return "There are no active Cursor jobs."
     return (
         "Active Cursor jobs: "
-        + "; ".join(f"{job.id} is {job.status.value.replace('_', ' ')}" for job in jobs)
+        + "; ".join(
+            f"{job.id} is {job.status.value.replace('_', ' ')} "
+            f"({job.workflow_phase.value.replace('_', ' ')})"
+            for job in jobs
+        )
         + "."
     )
 

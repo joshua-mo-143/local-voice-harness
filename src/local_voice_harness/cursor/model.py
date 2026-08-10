@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any
 
-CURRENT_SCHEMA_VERSION = 8
+CURRENT_SCHEMA_VERSION = 10
 LEGACY_SCHEMA_VERSIONS = frozenset(range(CURRENT_SCHEMA_VERSION))
 LEGACY_BOOT_ID = "legacy-unknown"
 
@@ -27,6 +27,43 @@ class JobStatus(StrEnum):
     COMPLETED = "completed"
     FAILED = "failed"
     CANCELLED = "cancelled"
+
+
+class WorkflowTier(StrEnum):
+    SIMPLE = "simple"
+    MEDIUM = "medium"
+    HIGH_RISK = "high-risk"
+
+
+class WorkflowPhase(StrEnum):
+    CLASSIFYING = "classifying"
+    PLANNING = "planning"
+    REVIEWING = "reviewing"
+    REVISING = "revising"
+    IMPLEMENTING = "implementing"
+    FINISHED = "finished"
+
+
+class WorkflowParticipant(StrEnum):
+    PLANNER = "planner"
+    REVIEWER = "reviewer"
+    IMPLEMENTER = "implementer"
+
+
+_LEGAL_WORKFLOW_TRANSITIONS: dict[WorkflowPhase, frozenset[WorkflowPhase]] = {
+    WorkflowPhase.CLASSIFYING: frozenset(
+        {WorkflowPhase.PLANNING, WorkflowPhase.IMPLEMENTING}
+    ),
+    WorkflowPhase.PLANNING: frozenset({WorkflowPhase.REVIEWING}),
+    WorkflowPhase.REVIEWING: frozenset(
+        {WorkflowPhase.REVISING, WorkflowPhase.IMPLEMENTING}
+    ),
+    WorkflowPhase.REVISING: frozenset({WorkflowPhase.REVIEWING}),
+    WorkflowPhase.IMPLEMENTING: frozenset(
+        {WorkflowPhase.PLANNING, WorkflowPhase.FINISHED}
+    ),
+    WorkflowPhase.FINISHED: frozenset(),
+}
 
 
 ACTIVE_STATUSES = frozenset(
@@ -63,6 +100,7 @@ _LEGAL_TRANSITIONS: dict[JobStatus, frozenset[JobStatus]] = {
         {
             JobStatus.QUEUED,
             JobStatus.RUNNING,
+            JobStatus.RECONCILING,
             JobStatus.AWAITING_USER,
             JobStatus.FAILED,
             JobStatus.CANCELLED,
@@ -73,6 +111,7 @@ _LEGAL_TRANSITIONS: dict[JobStatus, frozenset[JobStatus]] = {
             JobStatus.QUEUED,
             JobStatus.AWAITING_USER,
             JobStatus.BLOCKED,
+            JobStatus.RECONCILING,
             JobStatus.COMPLETED,
             JobStatus.FAILED,
             JobStatus.CANCELLED,
@@ -89,9 +128,16 @@ _LEGAL_TRANSITIONS: dict[JobStatus, frozenset[JobStatus]] = {
         }
     ),
     JobStatus.AWAITING_USER: frozenset(
-        {JobStatus.QUEUED, JobStatus.COMPLETED, JobStatus.CANCELLED}
+        {
+            JobStatus.QUEUED,
+            JobStatus.RECONCILING,
+            JobStatus.COMPLETED,
+            JobStatus.CANCELLED,
+        }
     ),
-    JobStatus.BLOCKED: frozenset({JobStatus.QUEUED, JobStatus.CANCELLED}),
+    JobStatus.BLOCKED: frozenset(
+        {JobStatus.QUEUED, JobStatus.RECONCILING, JobStatus.CANCELLED}
+    ),
     JobStatus.COMPLETED: frozenset(),
     JobStatus.FAILED: frozenset(),
     JobStatus.CANCELLED: frozenset(),
@@ -115,6 +161,8 @@ _BOOL_FIELDS = frozenset(
         "worktree_manual_inspection_required",
         "announcement_dismissed",
         "announcement_repeated",
+        "phase_prompt_active",
+        "review_approved",
     }
 )
 _INT_FIELDS = frozenset(
@@ -134,6 +182,9 @@ _INT_FIELDS = frozenset(
         "fork_absent_observations",
         "worktree_reconcile_attempts",
         "worktree_absent_observations",
+        "review_round",
+        "prompt_operation_turn",
+        "prompt_baseline_sequence",
     }
 )
 _FLOAT_FIELDS = frozenset(
@@ -168,6 +219,7 @@ _FLOAT_FIELDS = frozenset(
         "manual_reconcile_required_at",
         "manual_reconcile_resolved_at",
         "worktree_quarantine_acknowledged_at",
+        "terminal_intent_completed_at",
     }
 )
 _STRING_FIELDS = frozenset(
@@ -227,6 +279,30 @@ _STRING_FIELDS = frozenset(
         "manual_reconcile_token",
         "manual_reconcile_outcome",
         "reconciliation_base_error",
+        "workflow_tier",
+        "workflow_classification_reason",
+        "workflow_phase",
+        "plan_artifact",
+        "review_artifact",
+        "active_participant",
+        "planner_target",
+        "reviewer_target",
+        "implementer_target",
+        "review_decision",
+        "review_approval_source",
+        "workflow_turn_phase",
+        "prompt_operation_state",
+        "prompt_operation_phase",
+        "prompt_operation_target",
+        "participant_creation_state",
+        "participant_creation_participant",
+        "participant_creation_target",
+        "participant_creation_label",
+        "participant_creation_workspace_id",
+        "participant_creation_pane_id",
+        "terminal_intent_status",
+        "terminal_intent_result",
+        "terminal_intent_error",
     }
 )
 _AGENT_OPERATION_STATES = frozenset(
@@ -268,6 +344,17 @@ _WORKTREE_OPERATION_STATES = frozenset(
 )
 _UNCERTAIN_OPERATION_STATES = frozenset(
     {"dispatching", "submitted", "ambiguous", "failed_observing"}
+)
+_PROMPT_OPERATION_STATES = frozenset(
+    {"none", "planned", "submitting", "submitted", "ambiguous"}
+)
+_PARTICIPANT_CREATION_STATES = frozenset(
+    {"none", "planned", "submitting", "created", "ambiguous", "manual_required"}
+)
+_WORKFLOW_ARTIFACT_REFERENCE = re.compile(
+    r"^\.artifacts/(?P<job>[0-9a-f]{12})/"
+    r"(?P<kind>plan|review)-(?P<round>[0-2])"
+    r"(?:-(?P<digest>[0-9a-f]{64}))?\.json$"
 )
 
 
@@ -367,6 +454,39 @@ def _legacy_defaults(values: dict[str, object]) -> None:
         values.get("queued_at") or values.get("completed_at") or 0,
     )
     values.setdefault("delivered", False)
+    values.setdefault("review_round", 0)
+    if values.get("review_approved"):
+        values.setdefault("review_approval_source", "reviewer")
+    if (
+        values.get("status") == JobStatus.AWAITING_USER.value
+        and values.get("clarification_kind") == "workflow_review"
+        and values.get("workflow_tier") == WorkflowTier.HIGH_RISK.value
+        and _integer(values.get("review_round") or 0, "review_round") >= 2
+        and values.get("review_decision") == "revise"
+    ):
+        values["clarification_kind"] = "workflow_review_exhausted"
+    if status in {item.value for item in TERMINAL_STATUSES}:
+        values.setdefault("workflow_phase", WorkflowPhase.FINISHED.value)
+    elif values.get("herdr_target"):
+        values.setdefault("workflow_phase", WorkflowPhase.IMPLEMENTING.value)
+        values.setdefault("workflow_tier", WorkflowTier.SIMPLE.value)
+        values.setdefault(
+            "workflow_classification_reason", "Migrated active direct workflow."
+        )
+        participant = str(
+            values.setdefault(
+                "active_participant", WorkflowParticipant.IMPLEMENTER.value
+            )
+        )
+        if participant in {item.value for item in WorkflowParticipant}:
+            values.setdefault(f"{participant}_target", values.get("herdr_target"))
+    else:
+        values.setdefault("workflow_phase", WorkflowPhase.CLASSIFYING.value)
+    if values.get("workflow_phase") != WorkflowPhase.CLASSIFYING.value:
+        values.setdefault("workflow_tier", WorkflowTier.SIMPLE.value)
+        values.setdefault(
+            "workflow_classification_reason", "Migrated pre-workflow Cursor job."
+        )
     if any(
         values.get(field) is not None
         for field in ("worker_token", "worker_pid", "worker_process_start")
@@ -408,6 +528,37 @@ def _legacy_defaults(values: dict[str, object]) -> None:
         values.setdefault("completed_at", values["created_at"])
 
 
+def _prompt_operation_defaults(values: dict[str, object]) -> None:
+    """Translate the schema-v10 boolean prompt fence without a schema bump."""
+    if "prompt_operation_state" in values:
+        return
+    active = bool(values.get("phase_prompt_active", False))
+    values["prompt_operation_state"] = "ambiguous" if active else "none"
+    if active:
+        values.setdefault(
+            "prompt_operation_phase",
+            values.get("workflow_turn_phase")
+            or values.get("workflow_phase")
+            or WorkflowPhase.CLASSIFYING.value,
+        )
+        values.setdefault("prompt_operation_turn", values.get("turn") or 1)
+        values.setdefault("prompt_operation_target", values.get("herdr_target"))
+        # The old boolean recorded no observation baseline. A negative sentinel
+        # preserves that fact and prevents recovery from claiming acceptance.
+        values.setdefault("prompt_baseline_sequence", -1)
+        values.setdefault("manual_reconcile_operation", "prompt")
+        values.setdefault(
+            "manual_reconcile_token",
+            uuid.uuid5(
+                uuid.NAMESPACE_URL,
+                "local-voice-harness:prompt:"
+                f"{values.get('id') or 'unknown'}:{values.get('turn') or 1}",
+            ).hex,
+        )
+        values.setdefault("manual_reconcile_required_at", values.get("updated_at") or 0)
+    values.setdefault("participant_creation_state", "none")
+
+
 @dataclass(frozen=True, slots=True)
 class CursorJob:
     schema_version: int
@@ -436,6 +587,10 @@ class CursorJob:
     worktree_provision_state: str | None
     manual_reconcile_operation: str | None
     manual_reconcile_token: str | None
+    workflow_tier: WorkflowTier | None
+    workflow_phase: WorkflowPhase
+    review_round: int
+    active_participant: WorkflowParticipant | None
     _values: dict[str, object]
 
     @classmethod
@@ -453,6 +608,7 @@ class CursorJob:
             )
         if loaded_version < CURRENT_SCHEMA_VERSION:
             _legacy_defaults(values)
+        _prompt_operation_defaults(values)
         values["schema_version"] = CURRENT_SCHEMA_VERSION
 
         for field in _INT_FIELDS:
@@ -485,6 +641,28 @@ class CursorJob:
             status = JobStatus(str(values.get("status") or ""))
         except ValueError as exc:
             raise JobValidationError("status has invalid value") from exc
+        try:
+            workflow_phase = WorkflowPhase(
+                str(values.get("workflow_phase") or WorkflowPhase.CLASSIFYING)
+            )
+        except ValueError as exc:
+            raise JobValidationError("workflow_phase has invalid value") from exc
+        try:
+            workflow_tier = (
+                WorkflowTier(str(values["workflow_tier"]))
+                if values.get("workflow_tier") is not None
+                else None
+            )
+        except ValueError as exc:
+            raise JobValidationError("workflow_tier has invalid value") from exc
+        try:
+            active_participant = (
+                WorkflowParticipant(str(values["active_participant"]))
+                if values.get("active_participant") is not None
+                else None
+            )
+        except ValueError as exc:
+            raise JobValidationError("active_participant has invalid value") from exc
 
         required = ("revision", "request", "created_at", "delivered")
         missing = [field for field in required if field not in values]
@@ -606,6 +784,10 @@ class CursorJob:
                 if values.get("manual_reconcile_token") is not None
                 else None
             ),
+            workflow_tier=workflow_tier,
+            workflow_phase=workflow_phase,
+            review_round=_integer(values.get("review_round") or 0, "review_round"),
+            active_participant=active_participant,
             _values=values,
         )
         job.validate_invariants(
@@ -648,6 +830,8 @@ class CursorJob:
                 "created_at": spec.created_at,
                 "queued_at": spec.created_at,
                 "foreground_until": spec.foreground_until,
+                "workflow_phase": WorkflowPhase.CLASSIFYING.value,
+                "review_round": 0,
             }
         )
 
@@ -674,6 +858,17 @@ class CursorJob:
         for field in remove:
             values.pop(field, None)
         values.update(changes)
+        if "prompt_operation_state" in changes:
+            values.pop("phase_prompt_active", None)
+        if (
+            values.get("prompt_operation_state") == "none"
+            and values.get("manual_reconcile_operation") == "prompt"
+        ) or (
+            values.get("participant_creation_state") == "none"
+            and values.get("manual_reconcile_operation") == "pane"
+        ):
+            values["manual_reconcile_operation"] = None
+            values["manual_reconcile_token"] = None
         values["status"] = (status or self.status).value
         values["schema_version"] = CURRENT_SCHEMA_VERSION
         values["revision"] = self.revision + 1
@@ -729,6 +924,8 @@ class CursorJob:
         if dynamic_changes is not None:
             values.update(dynamic_changes)
         values.update(changes)
+        if "prompt_operation_state" in values:
+            values.pop("phase_prompt_active", None)
         final_status = status or self.status
         values["status"] = final_status.value
         operation = str(values.get("manual_reconcile_operation") or "")
@@ -852,13 +1049,17 @@ class CursorJob:
                 }
             )
             if operation == "agent":
+                participant = self.active_participant
                 changes.update(
                     herdr_target=None,
+                    active_participant=None,
                     herdr_pane_id=None,
                     herdr_workspace_id=None,
                     agent_name=None,
                     agent_dispatch_exited=None,
                 )
+                if participant is not None:
+                    changes[f"{participant.value}_target"] = None
             elif operation == "worktree":
                 if self.parent_job_id is None:
                     changes.update(
@@ -1099,6 +1300,130 @@ class CursorJob:
         return self._optional_string("reconciliation_base_error")
 
     @property
+    def workflow_classification_reason(self) -> str | None:
+        return self._optional_string("workflow_classification_reason")
+
+    @property
+    def plan_artifact(self) -> str | None:
+        return self._optional_string("plan_artifact")
+
+    @property
+    def review_artifact(self) -> str | None:
+        return self._optional_string("review_artifact")
+
+    @property
+    def prompt_operation_state(self) -> str:
+        return self._optional_string("prompt_operation_state") or "none"
+
+    @property
+    def prompt_operation_phase(self) -> WorkflowPhase | None:
+        value = self._optional_string("prompt_operation_phase")
+        if value is None:
+            return None
+        try:
+            return WorkflowPhase(value)
+        except ValueError as exc:
+            raise JobValidationError(
+                "prompt_operation_phase has invalid value"
+            ) from exc
+
+    @property
+    def prompt_operation_turn(self) -> int:
+        return _integer(
+            self._values.get("prompt_operation_turn") or 0,
+            "prompt_operation_turn",
+        )
+
+    @property
+    def prompt_baseline_sequence(self) -> int | None:
+        return self._optional_int("prompt_baseline_sequence")
+
+    @property
+    def prompt_operation_target(self) -> str | None:
+        return self._optional_string("prompt_operation_target")
+
+    @property
+    def participant_creation_state(self) -> str:
+        return self._optional_string("participant_creation_state") or "none"
+
+    @property
+    def participant_creation_target(self) -> str | None:
+        return self._optional_string("participant_creation_target")
+
+    @property
+    def participant_creation_participant(self) -> WorkflowParticipant | None:
+        value = self._optional_string("participant_creation_participant")
+        if value is None:
+            return None
+        try:
+            return WorkflowParticipant(value)
+        except ValueError as exc:
+            raise JobValidationError(
+                "participant_creation_participant has invalid value"
+            ) from exc
+
+    @property
+    def participant_creation_label(self) -> str | None:
+        return self._optional_string("participant_creation_label")
+
+    @property
+    def participant_creation_workspace_id(self) -> str | None:
+        return self._optional_string("participant_creation_workspace_id")
+
+    @property
+    def participant_creation_pane_id(self) -> str | None:
+        return self._optional_string("participant_creation_pane_id")
+
+    @property
+    def terminal_intent_status(self) -> JobStatus | None:
+        value = self._optional_string("terminal_intent_status")
+        if value is None:
+            return None
+        try:
+            return JobStatus(value)
+        except ValueError as exc:
+            raise JobValidationError(
+                "terminal_intent_status has invalid value"
+            ) from exc
+
+    @property
+    def terminal_intent_result(self) -> str | None:
+        return self._optional_string("terminal_intent_result")
+
+    @property
+    def terminal_intent_error(self) -> str | None:
+        return self._optional_string("terminal_intent_error")
+
+    @property
+    def terminal_intent_completed_at(self) -> float | None:
+        return self._optional_float("terminal_intent_completed_at")
+
+    @property
+    def review_approved(self) -> bool:
+        return self._boolean_field("review_approved")
+
+    @property
+    def review_decision(self) -> str | None:
+        return self._optional_string("review_decision")
+
+    @property
+    def review_approval_source(self) -> str | None:
+        return self._optional_string("review_approval_source")
+
+    @property
+    def workflow_turn_phase(self) -> WorkflowPhase | None:
+        value = self._optional_string("workflow_turn_phase")
+        if value is None:
+            return None
+        try:
+            return WorkflowPhase(value)
+        except ValueError as exc:
+            raise JobValidationError("workflow_turn_phase has invalid value") from exc
+
+    def participant_target(self, participant: WorkflowParticipant) -> str | None:
+        return self._optional_string(f"{participant.value}_target")
+
+    @property
     def fork_operation_source(self) -> str | None:
         return self._optional_string("fork_operation_source")
 
@@ -1147,16 +1472,21 @@ class CursorJob:
             "agent": self.agent_dispatch_state,
             "fork": self.fork_operation_state,
             "worktree": self.worktree_provision_state,
+            "prompt": self.prompt_operation_state,
+            "pane": self.participant_creation_state,
         }
         return states.get(operation)
 
     def resolve_manual_operation(
         self, operation: str, outcome: str, *, resolved_at: float
     ) -> CursorJob | None:
+        retain_terminal_release = self.terminal_intent_status is not None
         state_key = {
             "agent": "agent_dispatch_state",
             "fork": "fork_operation_state",
             "worktree": "worktree_provision_state",
+            "prompt": "prompt_operation_state",
+            "pane": "participant_creation_state",
         }[operation]
         changes: dict[str, object] = {
             state_key: "confirmed_absent"
@@ -1168,8 +1498,10 @@ class CursorJob:
             "manual_reconcile_resolved_at": resolved_at,
             "manual_reconcile_outcome": outcome,
             "cancellation_reconciliation_pending": False,
-            "target_release_pending": False,
-            "target_release_token": None,
+            "target_release_pending": retain_terminal_release,
+            "target_release_token": (
+                self.target_release_token if retain_terminal_release else None
+            ),
             "target_release_owner_pid": None,
             "target_release_owner_boot_id": None,
             "target_release_owner_start": None,
@@ -1179,7 +1511,31 @@ class CursorJob:
             "worker_process_start": None,
             "worker_token": None,
         }
-        if outcome == "materialized":
+        if operation == "prompt":
+            changes[state_key] = "submitted" if outcome == "materialized" else "none"
+            if outcome == "confirmed_absent":
+                changes.update(
+                    prompt_operation_phase=None,
+                    prompt_operation_turn=None,
+                    prompt_operation_target=None,
+                    prompt_baseline_sequence=None,
+                )
+        elif operation == "pane":
+            if outcome == "materialized" and not (
+                self.participant_creation_pane_id
+                and self.participant_creation_workspace_id
+            ):
+                return None
+            changes[state_key] = "created" if outcome == "materialized" else "none"
+            if outcome == "confirmed_absent":
+                changes.update(
+                    participant_creation_participant=None,
+                    participant_creation_target=None,
+                    participant_creation_label=None,
+                    participant_creation_workspace_id=None,
+                    participant_creation_pane_id=None,
+                )
+        elif outcome == "materialized":
             if operation == "fork":
                 if not self.fork_operation_target:
                     return None
@@ -1192,14 +1548,18 @@ class CursorJob:
             elif operation == "worktree" and not self.worktree_path:
                 return None
         elif operation == "agent":
+            participant = self.active_participant
             changes.update(
                 herdr_target=None,
+                active_participant=None,
                 herdr_pane_id=None,
                 herdr_workspace_id=None,
                 agent_name=None,
                 agent_dispatch_exited=None,
                 agent_next_reconcile_at=None,
             )
+            if participant is not None:
+                changes[f"{participant.value}_target"] = None
         return self.evolve_recovery(
             changes,
             now=resolved_at,
@@ -1267,6 +1627,7 @@ class CursorJob:
         )
         if (
             require_worker_owner
+            and self.terminal_intent_status is None
             and any(item is not None for item in worker_claim)
             and not all(item is not None for item in worker_claim)
         ):
@@ -1275,6 +1636,7 @@ class CursorJob:
             )
         if (
             require_worker_owner
+            and self.terminal_intent_status is None
             and self.status in WORKER_STATUSES
             and not all(item is not None for item in worker_claim)
         ):
@@ -1287,6 +1649,157 @@ class CursorJob:
             )
         if self.delivered and self.delivery_claim_token:
             raise JobValidationError("delivered job cannot retain a delivery claim")
+        if self.review_round < 0 or self.review_round > 2:
+            raise JobValidationError("review_round must be between zero and two")
+        if (
+            self.workflow_phase != WorkflowPhase.CLASSIFYING
+            and self.workflow_tier is None
+            and self.loaded_schema_version == CURRENT_SCHEMA_VERSION
+        ):
+            raise JobValidationError(
+                f"{self.workflow_phase.value} workflow requires workflow_tier"
+            )
+        if self.workflow_tier is not None and not self.workflow_classification_reason:
+            raise JobValidationError(
+                "classified workflow requires workflow_classification_reason"
+            )
+        if self.workflow_tier == WorkflowTier.SIMPLE and self.workflow_phase in {
+            WorkflowPhase.PLANNING,
+            WorkflowPhase.REVIEWING,
+            WorkflowPhase.REVISING,
+        }:
+            raise JobValidationError("simple workflow cannot enter planning or review")
+        if self.workflow_tier == WorkflowTier.MEDIUM and self.review_round > 1:
+            raise JobValidationError("medium workflow allows only one review")
+        if self.workflow_phase == WorkflowPhase.REVISING and self.review_round >= 2:
+            raise JobValidationError(
+                "round-two workflow cannot remain in revising phase"
+            )
+        review_decision = self._optional_string("review_decision")
+        if review_decision not in {None, "approve", "revise"}:
+            raise JobValidationError("review_decision has invalid value")
+        approval_source = self.review_approval_source
+        if approval_source not in {None, "reviewer", "user"}:
+            raise JobValidationError("review_approval_source has invalid value")
+        if self.review_approved != (approval_source is not None):
+            raise JobValidationError(
+                "review approval and approval source must be paired"
+            )
+        if self.review_approved and not self.review_artifact:
+            raise JobValidationError("approved review requires a review artifact")
+        if approval_source == "reviewer" and review_decision != "approve":
+            raise JobValidationError(
+                "reviewer approval requires an approving review decision"
+            )
+        if approval_source == "user" and (
+            self.workflow_tier != WorkflowTier.HIGH_RISK
+            or review_decision != "revise"
+            or self.review_round < 1
+        ):
+            raise JobValidationError(
+                "user approval requires an exhausted high-risk rejected review"
+            )
+        if (
+            self.workflow_tier in {WorkflowTier.MEDIUM, WorkflowTier.HIGH_RISK}
+            and self.workflow_phase
+            in {WorkflowPhase.IMPLEMENTING, WorkflowPhase.FINISHED}
+            and (
+                not self.plan_artifact
+                or not self.review_artifact
+                or not self.review_approved
+            )
+        ):
+            raise JobValidationError(
+                "planned workflow cannot implement without approved plan and review"
+            )
+        turn_phase = self._optional_string("workflow_turn_phase")
+        if turn_phase is not None and turn_phase not in {
+            item.value for item in WorkflowPhase
+        }:
+            raise JobValidationError("workflow_turn_phase has invalid value")
+        if self.active_participant is not None:
+            target = self.participant_target(self.active_participant)
+            if not target or target != self.herdr_target:
+                raise JobValidationError(
+                    "active participant target must match herdr_target"
+                )
+        self._validate_operation_state(
+            "prompt_operation_state",
+            self.prompt_operation_state,
+            _PROMPT_OPERATION_STATES,
+        )
+        self._validate_operation_state(
+            "participant_creation_state",
+            self.participant_creation_state,
+            _PARTICIPANT_CREATION_STATES,
+        )
+        if self.prompt_operation_state != "none":
+            if (
+                self.prompt_operation_phase is None
+                or self.prompt_operation_turn <= 0
+                or not self.prompt_operation_target
+            ):
+                raise JobValidationError(
+                    "durable prompt operation requires phase, turn, and target"
+                )
+        if self.prompt_operation_state in {"submitting", "submitted", "ambiguous"}:
+            if self.prompt_baseline_sequence is None:
+                raise JobValidationError(
+                    f"{self.prompt_operation_state} prompt requires baseline sequence"
+                )
+        if self.participant_creation_state != "none" and not all(
+            self._values.get(field)
+            for field in (
+                "participant_creation_participant",
+                "participant_creation_target",
+                "participant_creation_label",
+            )
+        ):
+            raise JobValidationError(
+                "participant creation requires role, target, and label"
+            )
+        if self.participant_creation_state == "created" and not all(
+            self._values.get(field)
+            for field in (
+                "participant_creation_workspace_id",
+                "participant_creation_pane_id",
+            )
+        ):
+            raise JobValidationError("created participant requires pane and workspace")
+        if self.terminal_intent_status is not None:
+            if (
+                self.terminal_intent_status not in TERMINAL_STATUSES
+                or self.status != JobStatus.RECONCILING
+                or not self.target_release_pending
+            ):
+                raise JobValidationError(
+                    "terminal intent requires reconciling status and release fence"
+                )
+        artifact_rounds: dict[str, int] = {}
+        for field, kind in (
+            ("plan_artifact", "plan"),
+            ("review_artifact", "review"),
+        ):
+            reference = self._optional_string(field)
+            if reference is None:
+                continue
+            match = _WORKFLOW_ARTIFACT_REFERENCE.fullmatch(reference)
+            if (
+                match is None
+                or match.group("job") != self.id
+                or match.group("kind") != kind
+            ):
+                raise JobValidationError(
+                    f"{field} has invalid workflow artifact reference"
+                )
+            artifact_rounds[kind] = int(match.group("round"))
+        if self.review_approved and (
+            artifact_rounds.get("plan") != self.review_round
+            or artifact_rounds.get("review") != self.review_round
+        ):
+            raise JobValidationError(
+                "approved review artifacts must match the current review round"
+            )
 
         self._validate_operation_state(
             "agent_dispatch_state",
@@ -1339,6 +1852,8 @@ class CursorJob:
             "agent": self.agent_dispatch_state,
             "fork": self.fork_operation_state,
             "worktree": self.worktree_provision_state,
+            "prompt": self.prompt_operation_state,
+            "pane": self.participant_creation_state,
         }
         manual_required = any(
             state == "manual_required" for state in manual_states.values()
@@ -1352,8 +1867,13 @@ class CursorJob:
         if self.manual_reconcile_operation:
             if self.manual_reconcile_operation not in manual_states:
                 raise JobValidationError("manual reconciliation operation is invalid")
+            expected_manual_state = (
+                "ambiguous"
+                if self.manual_reconcile_operation == "prompt"
+                else "manual_required"
+            )
             if (
-                manual_states[self.manual_reconcile_operation] != "manual_required"
+                manual_states[self.manual_reconcile_operation] != expected_manual_state
                 or not self.manual_reconcile_token
             ):
                 raise JobValidationError(
@@ -1372,6 +1892,7 @@ class CursorJob:
                 "cancellation reconciliation requires an operation or release fence"
             )
         if self.cancellation_reconciliation_pending and self.status not in {
+            JobStatus.RECONCILING,
             JobStatus.CANCELLED,
             JobStatus.FAILED,
         }:
@@ -1407,6 +1928,9 @@ class CursorJob:
             self.agent_dispatch_state in _UNCERTAIN_OPERATION_STATES
             or self.fork_operation_state in _UNCERTAIN_OPERATION_STATES
             or self.worktree_provision_state in _UNCERTAIN_OPERATION_STATES
+            or self.prompt_operation_state in {"submitting", "ambiguous"}
+            or self.participant_creation_state
+            in {"submitting", "ambiguous", "manual_required"}
         )
 
     @staticmethod
@@ -1453,6 +1977,23 @@ def validate_transition(before: CursorJob, after: CursorJob) -> None:
             "illegal Cursor job transition "
             f"{before.status.value} -> {after.status.value}"
         )
+    if (
+        before.workflow_phase != after.workflow_phase
+        and after.workflow_phase
+        not in _LEGAL_WORKFLOW_TRANSITIONS[before.workflow_phase]
+    ):
+        raise JobValidationError(
+            "illegal Cursor workflow transition "
+            f"{before.workflow_phase.value} -> {after.workflow_phase.value}"
+        )
+    if before.workflow_tier is not None and after.workflow_tier is not None:
+        tier_order = {
+            WorkflowTier.SIMPLE: 0,
+            WorkflowTier.MEDIUM: 1,
+            WorkflowTier.HIGH_RISK: 2,
+        }
+        if tier_order[after.workflow_tier] < tier_order[before.workflow_tier]:
+            raise JobValidationError("Cursor workflow tier cannot be downgraded")
     after.validate_invariants(require_worker_owner=True)
 
 
@@ -1491,13 +2032,25 @@ def validate_reservations(jobs: list[CursorJob]) -> None:
             or job.worktree_provision_state in {"quarantined", "manual_required"}
             or job.pull_request_worktree_state == "quarantined"
         )
-        if reserves and job.herdr_target:
-            owner = targets.setdefault(job.herdr_target, job.id)
-            if owner != job.id:
-                raise JobValidationError(
-                    f"Herdr target {job.herdr_target} is reserved by both "
-                    f"{owner} and {job.id}"
-                )
+        job_targets = {
+            target
+            for target in (
+                job.herdr_target,
+                job.participant_target(WorkflowParticipant.PLANNER),
+                job.participant_target(WorkflowParticipant.REVIEWER),
+                job.participant_target(WorkflowParticipant.IMPLEMENTER),
+                job._optional_string("participant_creation_target"),
+            )
+            if target
+        }
+        if reserves:
+            for target in job_targets:
+                owner = targets.setdefault(target, job.id)
+                if owner != job.id:
+                    raise JobValidationError(
+                        f"Herdr target {target} is reserved by both "
+                        f"{owner} and {job.id}"
+                    )
         worktree_blocked = reserves or job.worktree_provision_state in {
             "quarantined",
             "manual_required",

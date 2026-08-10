@@ -149,7 +149,8 @@ def _detail(job: CursorJob) -> str:
         return _normalize(job.question or job.result or "")
     if job.status in TERMINAL_STATUSES or job.status == JobStatus.BLOCKED:
         return _normalize(job.error or job.result or "")
-    return job.status.value.replace("_", " ")
+    tier = f"{job.workflow_tier.value} " if job.workflow_tier is not None else ""
+    return f"{tier}{job.workflow_phase.value}".replace("_", " ")
 
 
 def summarize(job: CursorJob) -> JobSummary:

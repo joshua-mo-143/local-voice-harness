@@ -461,6 +461,7 @@ class _FakeHerdr:
         self._worktrees = worktrees
         self._agent = agent
         self.started: list[AgentSelection] = []
+        self.started_modes: list[str | None] = []
         self.new_pane_calls = 0
 
     def allowed_repository(self, path: Path) -> bool:
@@ -496,6 +497,7 @@ class _FakeHerdr:
         workspace: str,
         *,
         name: str | None = None,
+        mode: str | None = None,
         checkpoint: object | None = None,
     ) -> AgentSelection:
         target = name or "voice-agent"
@@ -508,6 +510,7 @@ class _FakeHerdr:
             worktree_path=str(checkout),
         )
         self.started.append(selection)
+        self.started_modes.append(mode)
         return selection
 
 
@@ -610,7 +613,7 @@ def test_validate_followup_checkout_rejects_missing_worktree(tmp_path: Path) -> 
         provisioning._validate_followup_checkout(cast(HerdrClient, client), job)
 
 
-def test_provision_followup_agent_reuses_settled_agent(
+def test_provision_followup_agent_starts_fresh_plan_agent(
     store: JobStore, tmp_path: Path
 ) -> None:
     repository, checkout = _isolated_checkout(tmp_path)
@@ -638,9 +641,11 @@ def test_provision_followup_agent_reuses_settled_agent(
         lambda: None,
     )
 
-    assert target == "reused-agent"
-    assert updated.herdr_target == "reused-agent"
-    assert client.started == []
+    assert target.startswith("voice-")
+    assert updated.herdr_target == target
+    assert len(client.started) == 1
+    assert client.started_modes == ["plan"]
+    assert client.new_pane_calls == 1
 
 
 def test_provision_followup_agent_starts_agent_when_absent(
@@ -666,7 +671,8 @@ def test_provision_followup_agent_starts_agent_when_absent(
     assert target.startswith("voice-")
     assert updated.herdr_target == target
     assert len(client.started) == 1
-    assert client.new_pane_calls == 0
+    assert client.started_modes == ["plan"]
+    assert client.new_pane_calls == 1
 
 
 def test_provision_followup_agent_fails_closed_without_retained_pane(

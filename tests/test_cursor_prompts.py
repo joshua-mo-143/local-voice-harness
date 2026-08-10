@@ -2,7 +2,11 @@ from __future__ import annotations
 
 import unittest
 
-from local_voice_harness.cursor.prompts import cursor_prompt
+from local_voice_harness.cursor.prompts import (
+    classification_prompt,
+    cursor_prompt,
+    review_prompt,
+)
 
 
 class CursorPromptTests(unittest.TestCase):
@@ -57,6 +61,32 @@ class CursorPromptTests(unittest.TestCase):
             prompt,
         )
         self.assertIn("a plain-text summary of at most 20 words", prompt)
+
+    def test_classification_contract_is_read_only_and_has_hard_risk_triggers(
+        self,
+    ) -> None:
+        prompt = classification_prompt("change storage", "turn")
+
+        self.assertIn("Do not edit files or implement anything", prompt)
+        self.assertIn("persistence", prompt)
+        self.assertIn("WORKFLOW_TIER[turn]", prompt)
+        self.assertIn("WORKFLOW_REASON[turn]", prompt)
+
+    def test_review_contract_is_independent_and_approval_gated(self) -> None:
+        prompt = review_prompt(
+            "change storage",
+            "Preserve atomic replacement.",
+            "turn",
+            tier="high-risk",
+            github_issue_context="Issue requires crash recovery.",
+            classification_reason="Persistence changes force high-risk.",
+        )
+
+        self.assertIn("fresh read-only reviewer", prompt)
+        self.assertIn("Approve only if implementation may safely start", prompt)
+        self.assertIn("WORKFLOW_REVIEW_DECISION[turn]", prompt)
+        self.assertIn("Issue requires crash recovery.", prompt)
+        self.assertIn("Persistence changes force high-risk.", prompt)
 
 
 if __name__ == "__main__":

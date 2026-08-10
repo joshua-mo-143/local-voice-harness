@@ -276,6 +276,7 @@ class WorkerContext:
         if (
             self.cancellation_requested.is_set()
             or current.worker_token != self.token
+            or current.terminal_intent_status is not None
             or current.status
             not in {
                 JobStatus.ROUTING,
