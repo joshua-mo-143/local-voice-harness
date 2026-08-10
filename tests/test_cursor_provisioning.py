@@ -1591,18 +1591,27 @@ class CursorJobStateTests(unittest.TestCase):
         self.assertEqual(updated.plan_approval_state, "approved")
         launch.assert_called_once_with("123456789abc")
 
-    def test_exhausted_review_abort_uses_job_cancellation(self) -> None:
+    def test_exhausted_review_abort_stages_cancellation_and_releases_target(
+        self,
+    ) -> None:
         self.write_exhausted_review_job()
 
-        with mock.patch.object(service, "launch_worker") as launch:
+        with (
+            mock.patch.object(service, "launch_worker") as launch,
+            mock.patch.object(service, "_cancel_target_and_release") as release,
+        ):
             service.reply_job(
                 "123456789abc",
                 "abort",
             )
 
-        self.assertEqual(
-            jobs._store().get("123456789abc").status,
-            JobStatus.CANCELLED,
+        updated = jobs._store().get("123456789abc")
+        self.assertEqual(updated.status, JobStatus.RECONCILING)
+        self.assertEqual(updated.terminal_intent_status, JobStatus.CANCELLED)
+        release.assert_called_once_with(
+            "123456789abc",
+            "planner",
+            updated.target_release_token,
         )
         launch.assert_not_called()
 
