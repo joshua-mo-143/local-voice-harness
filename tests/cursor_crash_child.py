@@ -155,12 +155,25 @@ class PromptHerdr(PersistentHerdr):
         max_runtime: float = 1800,
         checkpoint: Callable[[], None] | None = None,
         baseline_sequence: int | None = None,
+        expected_agent_session: str | None = None,
         before_submit: Callable[[int], None] | None = None,
         accepted: Callable[[], None] | None = None,
         before_agent: Callable[[dict[str, Any]], None] | None = None,
         after_submit: Callable[[dict[str, Any]], None] | None = None,
+        active_marker: str | None = None,
+        allow_enter_fallback: bool = True,
     ) -> PromptOutcome:
-        del text, timeout, max_runtime, checkpoint, before_agent, after_submit
+        del (
+            text,
+            timeout,
+            max_runtime,
+            checkpoint,
+            expected_agent_session,
+            before_agent,
+            after_submit,
+            active_marker,
+            allow_enter_fallback,
+        )
         if before_submit is None or accepted is None:
             raise RuntimeError("fake prompt requires durable boundary callbacks")
         before = self.get_agent(target)

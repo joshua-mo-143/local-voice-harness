@@ -8,6 +8,7 @@ from unittest import mock
 from local_voice_harness import cli
 from local_voice_harness.cursor.service import CursorTurnRequest, CursorTurnResult
 from local_voice_harness.cursor.store import QuarantineEvidence
+from local_voice_harness.user_config import PlanApprovalMode, PlanApprovalPreferences
 
 
 class JobsCliTests(unittest.TestCase):
@@ -70,6 +71,42 @@ class JobsCliTests(unittest.TestCase):
                 reference="use the api repo",
             ),
         )
+
+
+class PlanApprovalCliTests(unittest.TestCase):
+    def test_status_reports_mode_and_explicit_count(self) -> None:
+        args = cli.parser().parse_args(["plan-approval", "status"])
+        preferences = PlanApprovalPreferences(
+            mode=PlanApprovalMode.AUTO,
+            explicit_approval_ids=("one", "two", "three"),
+            offer_completed=True,
+        )
+        with (
+            mock.patch.object(
+                cli,
+                "load_plan_approval_preferences",
+                return_value=preferences,
+            ),
+            mock.patch("builtins.print") as output,
+        ):
+            cli.dispatch(args)
+
+        self.assertIn("auto (3/3", output.call_args.args[0])
+
+    def test_ask_disables_automatic_approval(self) -> None:
+        args = cli.parser().parse_args(["plan-approval", "ask"])
+        preferences = PlanApprovalPreferences(mode=PlanApprovalMode.ASK)
+        with (
+            mock.patch.object(
+                cli,
+                "set_plan_approval_mode",
+                return_value=preferences,
+            ) as set_mode,
+            mock.patch("builtins.print"),
+        ):
+            cli.dispatch(args)
+
+        set_mode.assert_called_once_with(PlanApprovalMode.ASK)
 
 
 class JobsNukeCliTests(unittest.TestCase):

@@ -16,12 +16,16 @@ API key stays in the desktop credential store (``voice-harness credentials``).
 
 from __future__ import annotations
 
+import fcntl
+import json
 import math
 import os
 import re
 import tempfile
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
+from contextlib import contextmanager
 from dataclasses import dataclass
+from enum import StrEnum
 from pathlib import Path
 
 from . import config
@@ -79,10 +83,33 @@ _DICTATION_BACKENDS = {"parakeet", "whisper"}
 _DICTATION_LANGUAGES = {"en", "zh", "english", "chinese", "auto"}
 _PLAYBACK_LATENCY = re.compile(r"^\d+(?:\.\d+)?(?:us|ms|s)$")
 _CREDENTIAL_KEYS = {"api_key", "api_key_file"}
+_PLAN_APPROVAL_VERSION = 1
 
 
 class UserConfigurationError(ValueError):
     """A unified configuration value is missing, malformed, or out of range."""
+
+
+class PlanApprovalMode(StrEnum):
+    """How reviewed Cursor Plan Mode Build gates are handled."""
+
+    ASK = "ask"
+    AUTO = "auto"
+
+
+@dataclass(frozen=True)
+class PlanApprovalPreferences:
+    """Crash-safe learning state for Cursor plan approval."""
+
+    version: int = _PLAN_APPROVAL_VERSION
+    mode: PlanApprovalMode = PlanApprovalMode.ASK
+    explicit_approval_ids: tuple[str, ...] = ()
+    offer_pending_id: str | None = None
+    offer_completed: bool = False
+
+    @property
+    def explicit_approval_count(self) -> int:
+        return len(self.explicit_approval_ids)
 
 
 @dataclass(frozen=True)
@@ -865,3 +892,249 @@ def _fsync_directory(directory: Path) -> None:
         pass
     finally:
         os.close(fd)
+
+
+def plan_approval_preferences_path(
+    environment: Mapping[str, str] = os.environ,
+    *,
+    home: Path | None = None,
+) -> Path:
+    """Return the private learned-preference store path."""
+
+    override = environment.get("VOICE_HARNESS_PLAN_APPROVAL_FILE", "").strip()
+    if override:
+        return Path(override).expanduser()
+    return (
+        xdg_config_home(environment, home=home) / "voice-harness" / "plan-approval.json"
+    )
+
+
+def _plan_approval_path(path: Path | None) -> Path:
+    return path if path is not None else plan_approval_preferences_path()
+
+
+def _parse_plan_approval_preferences(raw: object) -> PlanApprovalPreferences:
+    if not isinstance(raw, dict):
+        raise UserConfigurationError("plan-approval preferences must be an object")
+    if raw.get("version") != _PLAN_APPROVAL_VERSION:
+        raise UserConfigurationError("unsupported plan-approval preference version")
+    try:
+        mode = PlanApprovalMode(str(raw.get("mode") or PlanApprovalMode.ASK))
+    except ValueError as exc:
+        raise UserConfigurationError("plan-approval mode must be ask or auto") from exc
+    ids = raw.get("explicit_approval_ids", [])
+    if (
+        not isinstance(ids, list)
+        or any(not isinstance(value, str) or not value for value in ids)
+        or len(ids) != len(set(ids))
+        or len(ids) > 3
+    ):
+        raise UserConfigurationError(
+            "plan-approval explicit approval IDs must be up to three unique strings"
+        )
+    pending = raw.get("offer_pending_id")
+    if pending is not None and (not isinstance(pending, str) or not pending):
+        raise UserConfigurationError(
+            "plan-approval pending offer ID must be non-empty text"
+        )
+    completed = raw.get("offer_completed", False)
+    if not isinstance(completed, bool):
+        raise UserConfigurationError(
+            "plan-approval offer completion flag must be a boolean"
+        )
+    if pending is not None and (len(ids) < 3 or completed):
+        raise UserConfigurationError(
+            "plan-approval pending offer requires three approvals and no completion"
+        )
+    if len(ids) == 3 and not completed and pending is None:
+        raise UserConfigurationError(
+            "plan-approval threshold requires a pending preference offer"
+        )
+    if mode == PlanApprovalMode.AUTO and (len(ids) < 3 or not completed):
+        raise UserConfigurationError(
+            "automatic plan approval requires an accepted threshold offer"
+        )
+    return PlanApprovalPreferences(
+        mode=mode,
+        explicit_approval_ids=tuple(ids),
+        offer_pending_id=pending,
+        offer_completed=completed,
+    )
+
+
+def _read_plan_approval_unlocked(path: Path) -> PlanApprovalPreferences:
+    try:
+        payload = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return PlanApprovalPreferences()
+    try:
+        raw = json.loads(payload)
+    except json.JSONDecodeError as exc:
+        raise UserConfigurationError(
+            f"plan-approval preferences {path} are not valid JSON"
+        ) from exc
+    return _parse_plan_approval_preferences(raw)
+
+
+@contextmanager
+def _locked_plan_approval(path: Path) -> Iterator[None]:
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    lock_path = path.with_suffix(".lock")
+    with lock_path.open("a+b") as lock:
+        os.chmod(lock_path, 0o600)
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+
+def _write_plan_approval_unlocked(
+    preferences: PlanApprovalPreferences, path: Path
+) -> None:
+    payload = (
+        json.dumps(
+            {
+                "version": preferences.version,
+                "mode": preferences.mode.value,
+                "explicit_approval_ids": list(preferences.explicit_approval_ids),
+                "offer_pending_id": preferences.offer_pending_id,
+                "offer_completed": preferences.offer_completed,
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n"
+    )
+    handle = tempfile.NamedTemporaryFile(
+        "w",
+        encoding="utf-8",
+        dir=path.parent,
+        prefix=".plan-approval-",
+        suffix=".json",
+        delete=False,
+    )
+    temporary = Path(handle.name)
+    try:
+        with handle:
+            handle.write(payload)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, path)
+        _fsync_directory(path.parent)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
+
+
+def load_plan_approval_preferences(
+    path: Path | None = None,
+) -> PlanApprovalPreferences:
+    """Load learned plan-approval state, defaulting safely to ask mode."""
+
+    location = _plan_approval_path(path)
+    with _locked_plan_approval(location):
+        return _read_plan_approval_unlocked(location)
+
+
+PlanApprovalChange = Callable[[PlanApprovalPreferences], PlanApprovalPreferences]
+
+
+def update_plan_approval_preferences(
+    change: PlanApprovalChange,
+    *,
+    path: Path | None = None,
+) -> PlanApprovalPreferences:
+    """Atomically update learned plan-approval state under a file lock."""
+
+    location = _plan_approval_path(path)
+    with _locked_plan_approval(location):
+        current = _read_plan_approval_unlocked(location)
+        updated = change(current)
+        if updated.version != _PLAN_APPROVAL_VERSION:
+            raise UserConfigurationError(
+                "plan-approval update changed the preference version"
+            )
+        _parse_plan_approval_preferences(
+            {
+                "version": updated.version,
+                "mode": updated.mode.value,
+                "explicit_approval_ids": list(updated.explicit_approval_ids),
+                "offer_pending_id": updated.offer_pending_id,
+                "offer_completed": updated.offer_completed,
+            }
+        )
+        if updated != current:
+            _write_plan_approval_unlocked(updated, location)
+        return updated
+
+
+def record_explicit_plan_approval(
+    approval_id: str,
+    *,
+    path: Path | None = None,
+) -> PlanApprovalPreferences:
+    """Record one accepted explicit Herdr submission exactly once."""
+
+    if not approval_id:
+        raise UserConfigurationError("plan approval ID must not be empty")
+
+    def record(current: PlanApprovalPreferences) -> PlanApprovalPreferences:
+        if approval_id in current.explicit_approval_ids:
+            return current
+        ids = current.explicit_approval_ids
+        if len(ids) < 3:
+            ids = (*ids, approval_id)
+        pending = current.offer_pending_id
+        if len(ids) == 3 and not current.offer_completed and pending is None:
+            pending = approval_id
+        return PlanApprovalPreferences(
+            mode=current.mode,
+            explicit_approval_ids=ids,
+            offer_pending_id=pending,
+            offer_completed=current.offer_completed,
+        )
+
+    return update_plan_approval_preferences(record, path=path)
+
+
+def resolve_plan_approval_offer(
+    offer_id: str,
+    *,
+    approved: bool,
+    path: Path | None = None,
+) -> PlanApprovalPreferences:
+    """Resolve the one threshold offer, rejecting stale offer identities."""
+
+    def resolve(current: PlanApprovalPreferences) -> PlanApprovalPreferences:
+        if current.offer_pending_id != offer_id:
+            raise UserConfigurationError(
+                "that plan-approval preference offer is no longer pending"
+            )
+        return PlanApprovalPreferences(
+            mode=PlanApprovalMode.AUTO if approved else PlanApprovalMode.ASK,
+            explicit_approval_ids=current.explicit_approval_ids,
+            offer_pending_id=None,
+            offer_completed=True,
+        )
+
+    return update_plan_approval_preferences(resolve, path=path)
+
+
+def set_plan_approval_mode(
+    mode: PlanApprovalMode,
+    *,
+    path: Path | None = None,
+) -> PlanApprovalPreferences:
+    """Set the user-selected mode without disturbing the approval ledger."""
+
+    return update_plan_approval_preferences(
+        lambda current: PlanApprovalPreferences(
+            mode=mode,
+            explicit_approval_ids=current.explicit_approval_ids,
+            offer_pending_id=current.offer_pending_id,
+            offer_completed=current.offer_completed,
+        ),
+        path=path,
+    )

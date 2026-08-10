@@ -78,6 +78,23 @@ class PromptOutcome:
     summary: str | None
     question: str | None
     output: str
+    boundary_marker: str | None = None
+    agent_session: str | None = None
+    state_change_sequence: int | None = None
+    revision: int | None = None
+
+
+def agent_session_identity(value: object) -> str | None:
+    """Return one canonical durable identity for a Herdr agent session."""
+
+    if value is None or value == "":
+        return None
+    if isinstance(value, dict):
+        try:
+            return json.dumps(value, sort_keys=True, separators=(",", ":"))
+        except (TypeError, ValueError):
+            return None
+    return str(value)
 
 
 def normalize_name(value: str) -> str:
@@ -869,15 +886,27 @@ class HerdrClient:
         max_runtime: float = CURSOR_AGENT_MAX_RUNTIME_SECONDS,
         checkpoint: Checkpoint | None = None,
         baseline_sequence: int | None = None,
+        expected_agent_session: str | None = None,
         before_submit: BeforePromptSubmit | None = None,
         accepted: PromptAccepted | None = None,
         before_agent: PromptBoundary | None = None,
         after_submit: PromptBoundary | None = None,
+        active_marker: str | None = None,
+        allow_enter_fallback: bool = True,
     ) -> PromptOutcome:
         started_at = time.monotonic()
         if checkpoint is not None:
             checkpoint()
         before = self.get_agent(target)
+        before_session = agent_session_identity(before.get("agent_session"))
+        if (
+            expected_agent_session is not None
+            and before_session != expected_agent_session
+        ):
+            raise HerdrError(
+                f"Herdr agent {target} no longer has the expected session",
+                code="agent_session_changed",
+            )
         if before.get("interactive_ready") is False:
             raise HerdrError(
                 f"Herdr agent {target} is showing an interactive questionnaire",
@@ -911,6 +940,7 @@ class HerdrClient:
             text=True,
         )
         acceptance_recorded = False
+        observed_acceptance = False
         try:
             if after_submit is not None:
                 after_submit(before)
@@ -920,6 +950,18 @@ class HerdrClient:
             if checkpoint is not None:
                 checkpoint()
             current = self.get_agent(target)
+            if (
+                expected_agent_session is not None
+                and agent_session_identity(current.get("agent_session"))
+                != expected_agent_session
+            ):
+                raise HerdrError(
+                    f"Herdr agent {target} changed sessions during prompt submission",
+                    code="agent_session_changed",
+                )
+            observed_acceptance = current.get("state_change_seq") != before.get(
+                "state_change_seq"
+            )
             if checkpoint is not None:
                 checkpoint()
             if current.get("interactive_ready") is False:
@@ -930,13 +972,14 @@ class HerdrClient:
             if (
                 current.get("state_change_seq") == before.get("state_change_seq")
                 and current.get("agent_status") in SETTLED
+                and allow_enter_fallback
             ):
                 if checkpoint is not None:
                     checkpoint()
                 self.run_json("agent", "send-keys", target, "enter")
                 if checkpoint is not None:
                     checkpoint()
-            elif accepted is not None:
+            elif observed_acceptance and accepted is not None:
                 accepted()
                 acceptance_recorded = True
             deadline = time.monotonic() + AGENT_PROMPT_WAIT_SECONDS + 5
@@ -950,6 +993,20 @@ class HerdrClient:
                     if checkpoint is not None:
                         checkpoint()
                     current = self.get_agent(target)
+                    if (
+                        expected_agent_session is not None
+                        and agent_session_identity(current.get("agent_session"))
+                        != expected_agent_session
+                    ):
+                        raise HerdrError(
+                            f"Herdr agent {target} changed sessions during "
+                            "prompt submission",
+                            code="agent_session_changed",
+                        ) from None
+                    observed_acceptance = observed_acceptance or (
+                        current.get("state_change_seq")
+                        != before.get("state_change_seq")
+                    )
                     if current.get("interactive_ready") is False:
                         raise HerdrError(
                             f"Herdr agent {target} opened an interactive questionnaire",
@@ -970,8 +1027,35 @@ class HerdrClient:
                     raise
         else:
             self.decode(stdout)
-        if accepted is not None and not acceptance_recorded:
+        if expected_agent_session is not None or (
+            accepted is not None and not acceptance_recorded
+        ):
+            if checkpoint is not None:
+                checkpoint()
+            current = self.get_agent(target)
+            if (
+                expected_agent_session is not None
+                and agent_session_identity(current.get("agent_session"))
+                != expected_agent_session
+            ):
+                raise HerdrError(
+                    f"Herdr agent {target} changed sessions during prompt submission",
+                    code="agent_session_changed",
+                )
+            if accepted is not None and not acceptance_recorded:
+                observed_acceptance = observed_acceptance or (
+                    current.get("state_change_seq") != before.get("state_change_seq")
+                )
+            if checkpoint is not None:
+                checkpoint()
+        if accepted is not None and not acceptance_recorded and observed_acceptance:
             accepted()
+            acceptance_recorded = True
+        if accepted is not None and not acceptance_recorded:
+            raise HerdrError(
+                f"Herdr did not accept the prompt for agent {target}",
+                code="agent_prompt_stalled",
+            )
         return self.wait_for_stable_completion(
             target,
             token=token,
@@ -979,6 +1063,8 @@ class HerdrClient:
             max_runtime=max_runtime,
             started_at=started_at,
             checkpoint=checkpoint,
+            expected_agent_session=expected_agent_session,
+            active_marker=active_marker,
         )
 
     def wait_for_stable_completion(
@@ -991,14 +1077,17 @@ class HerdrClient:
         quiet_period: float = AGENT_COMPLETION_QUIET_SECONDS,
         started_at: float | None = None,
         checkpoint: Checkpoint | None = None,
+        expected_agent_session: str | None = None,
+        active_marker: str | None = None,
     ) -> PromptOutcome:
-        """Wait for a token marker and a stable, non-working agent state."""
+        """Wait for stable completion or an opt-in active marker boundary."""
 
         started = time.monotonic() if started_at is None else started_at
         last_activity = started
         last_signature: tuple[object, str, str] | None = None
         initial_session: str | None = None
         settled_since: float | None = None
+        boundary_since: float | None = None
         marker_output: str | None = None
 
         while True:
@@ -1021,7 +1110,12 @@ class HerdrClient:
 
             now = time.monotonic()
             status = str(agent.get("agent_status") or "unknown")
-            session = str(agent.get("agent_session") or "") or None
+            session = agent_session_identity(agent.get("agent_session"))
+            if expected_agent_session is not None and session != expected_agent_session:
+                raise HerdrError(
+                    f"Herdr agent {target} no longer has the expected session",
+                    code="agent_session_changed",
+                )
             if initial_session is None:
                 initial_session = session
             elif session is not None and session != initial_session:
@@ -1039,11 +1133,49 @@ class HerdrClient:
                 last_signature = signature
                 last_activity = now
                 settled_since = now if status in OBSERVABLE_AGENT_STATES else None
+                boundary_since = None
 
             summary = extract_marker(output, "VOICE_SUMMARY", token)
             question = extract_marker(output, "VOICE_QUESTION", token)
             if summary or question:
                 marker_output = output
+            boundary = (
+                extract_marker(output, active_marker, token) if active_marker else None
+            )
+            if agent.get("interactive_ready") is False:
+                raise HerdrError(
+                    f"Herdr agent {target} opened an interactive questionnaire",
+                    code="interactive_questionnaire",
+                )
+            if boundary and not question and status in {"working", "blocked"}:
+                marker_output = output
+                if boundary_since is None:
+                    boundary_since = now
+                if now - boundary_since >= quiet_period:
+                    sequence = agent.get("state_change_seq")
+                    revision = agent.get("revision")
+                    return PromptOutcome(
+                        status=status,
+                        summary=summary,
+                        question=None,
+                        output=output,
+                        boundary_marker=active_marker,
+                        agent_session=session,
+                        state_change_sequence=(
+                            sequence
+                            if isinstance(sequence, int)
+                            and not isinstance(sequence, bool)
+                            else None
+                        ),
+                        revision=(
+                            revision
+                            if isinstance(revision, int)
+                            and not isinstance(revision, bool)
+                            else None
+                        ),
+                    )
+            else:
+                boundary_since = None
 
             if status in OBSERVABLE_AGENT_STATES:
                 if settled_since is None:
@@ -1057,6 +1189,28 @@ class HerdrClient:
                             selected_output, "VOICE_QUESTION", token
                         ),
                         output=selected_output,
+                        boundary_marker=(
+                            active_marker
+                            if active_marker
+                            and extract_marker(selected_output, active_marker, token)
+                            and not extract_marker(
+                                selected_output, "VOICE_QUESTION", token
+                            )
+                            else None
+                        ),
+                        agent_session=session,
+                        state_change_sequence=(
+                            agent.get("state_change_seq")
+                            if isinstance(agent.get("state_change_seq"), int)
+                            and not isinstance(agent.get("state_change_seq"), bool)
+                            else None
+                        ),
+                        revision=(
+                            agent.get("revision")
+                            if isinstance(agent.get("revision"), int)
+                            and not isinstance(agent.get("revision"), bool)
+                            else None
+                        ),
                     )
             else:
                 settled_since = None

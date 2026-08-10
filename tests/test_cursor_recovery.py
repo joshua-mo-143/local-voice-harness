@@ -654,6 +654,79 @@ class CursorRecoveryTests(unittest.TestCase):
             "submitted",
         )
 
+    def test_plan_approval_recovery_rejects_replaced_agent_session(self) -> None:
+        created = self.create(
+            {
+                "id": "123456789abc",
+                "status": "running",
+                "request": "implement reviewed behavior",
+                "created_at": 1,
+                "delivered": False,
+                "worker_token": "worker",
+                "worker_pid": 42,
+                "worker_boot_id": "boot",
+                "worker_process_start": "start",
+                "workflow_tier": "medium",
+                "workflow_classification_reason": "cross-component",
+                "workflow_phase": "reviewing",
+                "turn": 4,
+                "turn_token": "123456789abc-4",
+                "workflow_turn_phase": "reviewing",
+                "herdr_target": "planner",
+                "planner_target": "planner",
+                "active_participant": "planner",
+                "plan_approval_state": "boundary",
+                "plan_approval_id": "gate-id",
+                "plan_approval_agent_session": "original-session",
+                "plan_approval_state_change_sequence": 7,
+            }
+        )
+        plan = "Implement reviewed behavior."
+        plan_reference = self.store.write_artifact(created.id, "plan", 0, plan)
+        review_reference = self.store.write_artifact(
+            created.id,
+            "review",
+            0,
+            "The plan is safe.",
+            source_text=plan,
+        )
+        submitting = self.store.update(
+            created.id,
+            lambda current: current.evolve(
+                workflow_phase="implementing",
+                workflow_turn_phase="implementing",
+                plan_artifact=plan_reference,
+                review_artifact=review_reference,
+                review_approved=True,
+                review_decision="approve",
+                review_approval_source="reviewer",
+                plan_approval_state="approved",
+                plan_approval_source="explicit",
+                prompt_operation_state="submitting",
+                prompt_operation_phase="implementing",
+                prompt_operation_turn=4,
+                prompt_operation_target="planner",
+                prompt_baseline_sequence=7,
+            ),
+        )
+        assert submitting is not None
+        replacement = mock.Mock()
+        replacement.get_agent.return_value = {
+            "state_change_seq": 8,
+            "agent_session": "replacement-session",
+        }
+
+        reconcile_prompt_and_pane_operations(
+            self.store,
+            submitting,
+            now=10,
+            herdr_factory=lambda: replacement,
+        )
+
+        recovered = self.store.get(created.id)
+        self.assertEqual(recovered.prompt_operation_state, "ambiguous")
+        self.assertFalse(recovered.plan_approval_counted)
+
     def test_uncertain_pane_creation_becomes_manual_without_retry(self) -> None:
         self.create(
             {

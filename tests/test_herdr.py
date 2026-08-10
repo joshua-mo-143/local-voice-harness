@@ -501,6 +501,76 @@ WORKFLOW_PLAN[token]: <bounded multiline implementation plan>
         self.assertEqual(outcome.status, "idle")
         self.assertEqual(outcome.summary, "finished")
 
+    def test_active_plan_marker_returns_fenced_build_boundary(self) -> None:
+        client = herdr.HerdrClient("herdr")
+        agent = {
+            "agent_status": "working",
+            "state_change_seq": 7,
+            "revision": 11,
+            "agent_session": {"id": "session", "generation": 2},
+            "interactive_ready": True,
+        }
+        with (
+            mock.patch.object(client, "get_agent", return_value=agent),
+            mock.patch.object(
+                client,
+                "run_text",
+                return_value="WORKFLOW_PLAN[token]: implement safely",
+            ),
+            mock.patch(
+                "local_voice_harness.integrations.herdr.time.monotonic",
+                side_effect=[0, 0, 1],
+            ),
+            mock.patch("local_voice_harness.integrations.herdr.time.sleep"),
+        ):
+            outcome = client.wait_for_stable_completion(
+                "agent",
+                token="token",
+                active_marker="WORKFLOW_PLAN",
+                quiet_period=1,
+            )
+
+        self.assertEqual(outcome.status, "working")
+        self.assertEqual(outcome.boundary_marker, "WORKFLOW_PLAN")
+        self.assertEqual(outcome.state_change_sequence, 7)
+        self.assertEqual(outcome.revision, 11)
+        self.assertEqual(
+            outcome.agent_session,
+            '{"generation":2,"id":"session"}',
+        )
+
+    def test_active_plan_marker_never_bypasses_interactive_questionnaire(self) -> None:
+        client = herdr.HerdrClient("herdr")
+        with (
+            mock.patch.object(
+                client,
+                "get_agent",
+                return_value={
+                    "agent_status": "working",
+                    "state_change_seq": 7,
+                    "agent_session": "session",
+                    "interactive_ready": False,
+                },
+            ),
+            mock.patch.object(
+                client,
+                "run_text",
+                return_value="WORKFLOW_PLAN[token]: implement safely",
+            ),
+            mock.patch(
+                "local_voice_harness.integrations.herdr.time.monotonic",
+                side_effect=[0, 0],
+            ),
+            self.assertRaises(herdr.HerdrError) as raised,
+        ):
+            client.wait_for_stable_completion(
+                "agent",
+                token="token",
+                active_marker="WORKFLOW_PLAN",
+            )
+
+        self.assertEqual(raised.exception.code, "interactive_questionnaire")
+
     def test_prompt_wait_timeout_continues_with_stable_observer(self) -> None:
         client = herdr.HerdrClient("herdr")
         expected = herdr.PromptOutcome(
@@ -545,6 +615,70 @@ WORKFLOW_PLAN[token]: <bounded multiline implementation plan>
 
                 self.assertEqual(outcome, expected)
                 wait_for_stable_completion.assert_called_once()
+
+    def test_successful_prompt_requires_sequence_proof_before_acceptance(self) -> None:
+        client = herdr.HerdrClient("herdr")
+        process = mock.Mock()
+        process.returncode = 0
+        process.poll.return_value = 0
+        process.communicate.return_value = ('{"result":{}}', "")
+        agent = {
+            "agent_status": "blocked",
+            "state_change_seq": 7,
+            "agent_session": "session",
+            "interactive_ready": True,
+        }
+        accepted = mock.Mock()
+        with (
+            mock.patch.object(client, "get_agent", side_effect=[agent, agent, agent]),
+            mock.patch.object(client, "wait_for_stable_completion") as wait,
+            mock.patch(
+                "local_voice_harness.integrations.herdr.subprocess.Popen",
+                return_value=process,
+            ),
+            mock.patch("local_voice_harness.integrations.herdr.time.sleep"),
+            self.assertRaisesRegex(
+                herdr.HerdrError, "did not accept the prompt"
+            ) as raised,
+        ):
+            client.prompt_and_wait(
+                "agent",
+                "approve",
+                token="token",
+                accepted=accepted,
+                expected_agent_session="session",
+                allow_enter_fallback=False,
+            )
+
+        self.assertEqual(raised.exception.code, "agent_prompt_stalled")
+        accepted.assert_not_called()
+        wait.assert_not_called()
+
+    def test_prompt_rejects_replaced_expected_agent_session(self) -> None:
+        client = herdr.HerdrClient("herdr")
+        with (
+            mock.patch.object(
+                client,
+                "get_agent",
+                return_value={
+                    "agent_status": "blocked",
+                    "state_change_seq": 7,
+                    "agent_session": "replacement",
+                    "interactive_ready": True,
+                },
+            ),
+            self.assertRaisesRegex(
+                herdr.HerdrError, "no longer has the expected session"
+            ) as raised,
+        ):
+            client.prompt_and_wait(
+                "agent",
+                "approve",
+                token="token",
+                expected_agent_session="original",
+            )
+
+        self.assertEqual(raised.exception.code, "agent_session_changed")
 
     def test_completion_wait_times_out_after_inactivity(self) -> None:
         client = herdr.HerdrClient("herdr")

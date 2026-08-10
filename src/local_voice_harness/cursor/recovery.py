@@ -4,13 +4,17 @@ import os
 import secrets
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import cast
 
 from ..errors import HarnessError
 from ..integrations.github import GitHubClient, GitHubError, GitHubRepository
-from ..integrations.herdr import HerdrClient, HerdrError
+from ..integrations.herdr import (
+    HerdrClient,
+    HerdrError,
+    agent_session_identity,
+)
 from ..questions import PromptOperationState, QuestionState
 from . import questions as question_adapter
 from .model import (
@@ -424,8 +428,14 @@ def reconcile_prompt_and_pane_operations(
                 or current.prompt_operation_target != target
             ):
                 return None
+            approval_session_matches = (
+                current.plan_approval_state != "approved"
+                or agent_session_identity(agent.get("agent_session"))
+                == current.plan_approval_agent_session
+            )
             accepted = (
-                current.prompt_baseline_sequence is not None
+                approval_session_matches
+                and current.prompt_baseline_sequence is not None
                 and current.prompt_baseline_sequence >= 0
                 and sequence != current.prompt_baseline_sequence
             )
@@ -470,37 +480,42 @@ def stage_terminal_intent(
     clear_worker: bool = False,
     preserve_worker_operation: bool = False,
     voice_question: dict[str, object] | None = None,
+    job_changes: Mapping[str, object] | None = None,
 ) -> CursorJob:
     if status not in TERMINAL_STATUSES:
         raise HarnessError("terminal cleanup requires a terminal intent")
-    return job.evolve(
-        status=JobStatus.RECONCILING,
-        terminal_intent_status=status.value,
-        terminal_intent_result=result,
-        terminal_intent_error=error,
-        terminal_intent_completed_at=now,
-        voice_question=job.voice_question if voice_question is None else voice_question,
-        target_release_pending=True,
-        target_release_token=uuid.uuid4().hex,
-        target_release_owner_pid=None,
-        target_release_owner_boot_id=None,
-        target_release_owner_start=None,
-        cancellation_reconciliation_pending=True,
-        worker_operation=(
+    changes: dict[str, object] = {
+        "terminal_intent_status": status.value,
+        "terminal_intent_result": result,
+        "terminal_intent_error": error,
+        "terminal_intent_completed_at": now,
+        "voice_question": (
+            job.voice_question if voice_question is None else voice_question
+        ),
+        "target_release_pending": True,
+        "target_release_token": uuid.uuid4().hex,
+        "target_release_owner_pid": None,
+        "target_release_owner_boot_id": None,
+        "target_release_owner_start": None,
+        "cancellation_reconciliation_pending": True,
+        "worker_operation": (
             job.worker_operation if preserve_worker_operation else "target_cleanup"
         ),
-        pull_request_worktree_state=(
+        "pull_request_worktree_state": (
             "retained"
             if job.github_pull_request
             and job.worktree_path
             and job.pull_request_worktree_state != "quarantined"
             else job.pull_request_worktree_state
         ),
-        worker_pid=None if clear_worker else job.worker_pid,
-        worker_boot_id=None if clear_worker else job.worker_boot_id,
-        worker_process_start=None if clear_worker else job.worker_process_start,
-        worker_token=None if clear_worker else job.worker_token,
-    )
+        "worker_pid": None if clear_worker else job.worker_pid,
+        "worker_boot_id": None if clear_worker else job.worker_boot_id,
+        "worker_process_start": None if clear_worker else job.worker_process_start,
+        "worker_token": None if clear_worker else job.worker_token,
+    }
+    changes.update(job_changes or {})
+    changes["status"] = JobStatus.RECONCILING.value
+    return job._updated(**changes)
 
 
 def cancel_target_and_release(

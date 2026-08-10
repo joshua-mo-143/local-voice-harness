@@ -119,6 +119,37 @@ credentials are intentionally unsupported. Restart the wake and TTS services aft
 changing providers, then run `voice-harness doctor` to verify the configuration and
 credential.
 
+## Cursor plan approval
+
+Reviewed medium- and high-risk Cursor plans default to `ask` mode. At the Plan Mode
+Build boundary the harness speaks a yes-or-no question. Natural affirmative answers
+such as "yes", "sure", "go ahead", "lgtm", and "ok then" approve the current
+fenced plan; "no", "nah", "don't", and "cancel" cancel the job while retaining its
+plan artifact. Ambiguous replies leave the same question pending.
+
+Only explicit approvals accepted by the Herdr prompt API count toward the learning
+threshold. After three distinct accepted approvals, the third implementation
+finishes before the harness offers to automatically approve future ordinary reviewed
+plans. Accepting writes `auto`; declining leaves `ask`. Automatic mode never answers
+reviewer objections, unresolved product or architecture questions, security or
+destructive confirmations, interactive questionnaires, or tool permission prompts.
+High-risk workflows remain in `ask` regardless of the learned mode, and deterministic
+hard-risk evidence also keeps the Plan Mode gate in `ask`.
+
+The learned mode, capped approval ledger, and one-time offer identity live in
+`~/.config/voice-harness/plan-approval.json`. Updates use a sibling file lock,
+temporary-file replacement, directory sync, and owner-only permissions. The file is
+separate from `config.toml` because the harness updates it from accepted user
+decisions. A temporary read or write failure preserves the completed Cursor result
+and retries preference reconciliation locally.
+
+Inspect the mode and threshold count, or return to explicit approval, with:
+
+```console
+voice-harness plan-approval status
+voice-harness plan-approval ask
+```
+
 ## Runtime variables
 
 | Variable | Purpose | Default | Configuration channel |

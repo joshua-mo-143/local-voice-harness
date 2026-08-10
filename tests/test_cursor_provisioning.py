@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 import signal
 import subprocess
 import tempfile
@@ -11,6 +12,7 @@ from pathlib import Path
 from typing import Any, cast
 from unittest import mock
 
+from local_voice_harness import user_config
 from local_voice_harness.cursor import provisioning as production_jobs
 from local_voice_harness.cursor import service, worker_lifecycle
 from local_voice_harness.cursor.delivery import DeliveryClaim, DeliveryClaims
@@ -256,6 +258,10 @@ def configure_tiered_outcomes(
                     None,
                     None,
                     f"WORKFLOW_PLAN[{job_id}-2]: implement safely",
+                    boundary_marker="WORKFLOW_PLAN",
+                    agent_session="planner-session",
+                    state_change_sequence=2,
+                    revision=2,
                 ),
                 PromptOutcome(
                     "idle",
@@ -342,6 +348,413 @@ class DurablePromptOperationTests(unittest.TestCase):
                 prompt_baseline_sequence=7,
             )
         return self.store.create(CursorJob.from_dict(values))
+
+    def create_approved_plan(self) -> CursorJob:
+        created = self.store.create(
+            CursorJob.from_dict(
+                {
+                    "schema_version": CURRENT_SCHEMA_VERSION,
+                    "id": "123456789abc",
+                    "revision": 0,
+                    "request": "implement reviewed plan",
+                    "status": "running",
+                    "created_at": 1,
+                    "delivered": False,
+                    "worker_token": "worker",
+                    "worker_pid": 42,
+                    "worker_boot_id": "boot",
+                    "worker_process_start": "start",
+                    "workflow_tier": "medium",
+                    "workflow_classification_reason": "reviewed",
+                    "workflow_phase": "reviewing",
+                    "review_round": 0,
+                    "turn": 4,
+                    "turn_token": "123456789abc-4",
+                    "workflow_turn_phase": "reviewing",
+                    "herdr_target": "planner",
+                    "planner_target": "planner",
+                    "active_participant": "planner",
+                    "agent_dispatch_state": "ready",
+                    "prompt_operation_state": "none",
+                    "plan_approval_state": "boundary",
+                    "plan_approval_id": "gate-id",
+                    "plan_approval_agent_session": "planner-session",
+                    "plan_approval_state_change_sequence": 7,
+                    "plan_approval_revision": 3,
+                    "plan_approval_counted": False,
+                }
+            )
+        )
+        plan = "Implement the reviewed plan."
+        plan_reference = self.store.write_artifact(created.id, "plan", 0, plan)
+        review_reference = self.store.write_artifact(
+            created.id,
+            "review",
+            0,
+            "The plan is safe.",
+            source_text=plan,
+        )
+        updated = self.store.update(
+            created.id,
+            lambda job: job.evolve(
+                workflow_phase="implementing",
+                workflow_turn_phase="implementing",
+                plan_artifact=plan_reference,
+                review_artifact=review_reference,
+                review_decision="approve",
+                review_approved=True,
+                review_approval_source="reviewer",
+                plan_approval_state="approved",
+                plan_approval_source="explicit",
+            ),
+        )
+        assert updated is not None
+        return updated
+
+    def test_explicit_plan_approval_uses_api_without_enter_and_counts_acceptance(
+        self,
+    ) -> None:
+        job = self.create_approved_plan()
+        preferences_path = Path(self.temporary.name) / "approval.json"
+        client = mock.Mock()
+        agent = {
+            "agent_status": "blocked",
+            "state_change_seq": 7,
+            "revision": 3,
+            "agent_session": "planner-session",
+            "interactive_ready": True,
+        }
+        client.get_agent.return_value = agent
+
+        def prompt(*_args: object, **kwargs: object) -> PromptOutcome:
+            before_agent = cast(
+                Callable[[dict[str, object]], None],
+                kwargs["before_agent"],
+            )
+            before_submit = cast(Callable[[int], None], kwargs["before_submit"])
+            accepted = cast(Callable[[], None], kwargs["accepted"])
+            before_agent(agent)
+            before_submit(7)
+            accepted()
+            return PromptOutcome(
+                "idle",
+                "done",
+                None,
+                "VOICE_SUMMARY[123456789abc-4]: done",
+                agent_session="planner-session",
+                state_change_sequence=8,
+                revision=4,
+            )
+
+        client.prompt_and_wait.side_effect = prompt
+        with mock.patch.dict(
+            os.environ,
+            {"VOICE_HARNESS_PLAN_APPROVAL_FILE": str(preferences_path)},
+        ):
+            outcome = production_jobs._execute_phase_prompt(
+                self.store,
+                job,
+                "worker",
+                client,
+                lambda: None,
+                target="planner",
+                prompt="lgtm. Implement the approved plan.",
+                token="123456789abc-4",
+            )
+            preferences = user_config.load_plan_approval_preferences(preferences_path)
+
+        self.assertEqual(
+            outcome,
+            ("VOICE_SUMMARY[123456789abc-4]: done", "idle"),
+        )
+        current = self.store.get(job.id)
+        self.assertEqual(current.plan_approval_state, "observed")
+        self.assertTrue(current.plan_approval_counted)
+        self.assertEqual(preferences.explicit_approval_count, 1)
+        self.assertFalse(
+            client.prompt_and_wait.call_args.kwargs["allow_enter_fallback"]
+        )
+        self.assertEqual(
+            client.prompt_and_wait.call_args.kwargs["expected_agent_session"],
+            "planner-session",
+        )
+
+    def test_unaccepted_plan_approval_is_not_counted(self) -> None:
+        job = self.create_approved_plan()
+        preferences_path = Path(self.temporary.name) / "approval.json"
+        client = mock.Mock()
+        client.get_agent.return_value = {
+            "agent_status": "blocked",
+            "state_change_seq": 7,
+            "revision": 3,
+            "agent_session": "planner-session",
+            "interactive_ready": True,
+        }
+        client.prompt_and_wait.side_effect = HerdrError(
+            "not accepted",
+            code="agent_prompt_stalled",
+        )
+
+        with (
+            mock.patch.dict(
+                os.environ,
+                {"VOICE_HARNESS_PLAN_APPROVAL_FILE": str(preferences_path)},
+            ),
+            self.assertRaises(HerdrError),
+        ):
+            production_jobs._execute_phase_prompt(
+                self.store,
+                job,
+                "worker",
+                client,
+                lambda: None,
+                target="planner",
+                prompt="lgtm. Implement the approved plan.",
+                token="123456789abc-4",
+            )
+
+        preferences = user_config.load_plan_approval_preferences(preferences_path)
+        self.assertEqual(preferences.explicit_approval_count, 0)
+        self.assertFalse(self.store.get(job.id).plan_approval_counted)
+
+    def test_crash_after_approval_submit_recovers_without_duplicate_prompt(
+        self,
+    ) -> None:
+        created = self.create_approved_plan()
+        job = self.store.update(
+            created.id,
+            lambda current: current.evolve(
+                prompt_operation_state="submitting",
+                prompt_operation_phase="implementing",
+                prompt_operation_turn=4,
+                prompt_operation_target="planner",
+                prompt_baseline_sequence=7,
+            ),
+        )
+        assert job is not None
+        preferences_path = Path(self.temporary.name) / "approval.json"
+        client = mock.Mock()
+        client.get_agent.return_value = {
+            "state_change_seq": 8,
+            "agent_session": "planner-session",
+        }
+        client.wait_for_stable_completion.return_value = PromptOutcome(
+            "idle",
+            "done",
+            None,
+            "VOICE_SUMMARY[123456789abc-4]: done",
+            agent_session="planner-session",
+            state_change_sequence=8,
+            revision=4,
+        )
+
+        with mock.patch.dict(
+            os.environ,
+            {"VOICE_HARNESS_PLAN_APPROVAL_FILE": str(preferences_path)},
+        ):
+            outcome = production_jobs._execute_phase_prompt(
+                self.store,
+                job,
+                "worker",
+                client,
+                lambda: None,
+                target="planner",
+                prompt="lgtm. Implement the approved plan.",
+                token="123456789abc-4",
+            )
+
+        self.assertEqual(
+            outcome,
+            ("VOICE_SUMMARY[123456789abc-4]: done", "idle"),
+        )
+        client.prompt_and_wait.assert_not_called()
+        current = self.store.get(job.id)
+        self.assertEqual(current.plan_approval_state, "observed")
+        self.assertTrue(current.plan_approval_counted)
+        self.assertEqual(
+            user_config.load_plan_approval_preferences(
+                preferences_path
+            ).explicit_approval_count,
+            1,
+        )
+
+    def test_approval_submit_recovery_rejects_replaced_agent_session(self) -> None:
+        created = self.create_approved_plan()
+        job = self.store.update(
+            created.id,
+            lambda current: current.evolve(
+                prompt_operation_state="submitting",
+                prompt_operation_phase="implementing",
+                prompt_operation_turn=4,
+                prompt_operation_target="planner",
+                prompt_baseline_sequence=7,
+            ),
+        )
+        assert job is not None
+        client = mock.Mock()
+        client.get_agent.return_value = {
+            "state_change_seq": 8,
+            "agent_session": "replacement-session",
+        }
+
+        with self.assertRaisesRegex(
+            production_jobs.HarnessError, "requires manual reconciliation"
+        ):
+            production_jobs._execute_phase_prompt(
+                self.store,
+                job,
+                "worker",
+                client,
+                lambda: None,
+                target="planner",
+                prompt="lgtm. Implement the approved plan.",
+                token="123456789abc-4",
+            )
+
+        current = self.store.get(job.id)
+        self.assertEqual(current.prompt_operation_state, "ambiguous")
+        self.assertFalse(current.plan_approval_counted)
+        client.wait_for_stable_completion.assert_not_called()
+
+    def test_preference_read_failure_defers_third_approval_completion(self) -> None:
+        created = self.create_approved_plan()
+        job = self.store.update(
+            created.id,
+            lambda current: current.evolve(
+                plan_approval_state="observed",
+                plan_approval_counted=True,
+                prompt_operation_state="submitted",
+                prompt_operation_phase="implementing",
+                prompt_operation_turn=4,
+                prompt_operation_target="planner",
+                prompt_baseline_sequence=7,
+            ),
+        )
+        assert job is not None
+
+        with mock.patch.object(
+            production_jobs,
+            "load_plan_approval_preferences",
+            side_effect=OSError("temporary read failure"),
+        ):
+            production_jobs._worker_complete(
+                self.store,
+                job.id,
+                "worker",
+                output="VOICE_SUMMARY[123456789abc-4]: done",
+                agent_status="idle",
+            )
+
+        deferred = self.store.get(job.id)
+        self.assertEqual(deferred.status, JobStatus.QUEUED)
+        self.assertTrue(deferred.reconcile)
+        self.assertTrue(deferred.plan_approval_completion_pending)
+        self.assertEqual(deferred.workflow_phase.value, "finished")
+        self.assertEqual(deferred.prompt_operation_state, "none")
+        self.assertEqual(deferred.result, "done")
+        self.assertIsNone(deferred.worker_token)
+
+        reclaimed = self.store.update(
+            job.id,
+            lambda current: current.evolve(
+                status=JobStatus.RECONCILING,
+                worker_token="worker-2",
+                worker_pid=43,
+                worker_boot_id="boot-2",
+                worker_process_start="start-2",
+            ),
+        )
+        assert reclaimed is not None
+        pending = user_config.PlanApprovalPreferences(
+            explicit_approval_ids=("first", "second", "gate-id"),
+            offer_pending_id="gate-id",
+        )
+        with mock.patch.object(
+            production_jobs,
+            "load_plan_approval_preferences",
+            return_value=pending,
+        ):
+            client = mock.Mock()
+            production_jobs._run_tiered_workflow(
+                self.store,
+                reclaimed,
+                "worker-2",
+                client,
+                lambda: None,
+            )
+
+        offered = self.store.get(job.id)
+        self.assertEqual(offered.status, JobStatus.AWAITING_USER)
+        self.assertEqual(offered.clarification_kind, "workflow_plan_auto_offer")
+        self.assertFalse(offered.plan_approval_completion_pending)
+        client.get_agent.assert_not_called()
+        client.wait_for_stable_completion.assert_not_called()
+
+    def test_preference_write_failure_retries_accepted_approval_locally(self) -> None:
+        created = self.create_approved_plan()
+        job = self.store.update(
+            created.id,
+            lambda current: current.evolve(
+                plan_approval_state="observed",
+                prompt_operation_state="submitted",
+                prompt_operation_phase="implementing",
+                prompt_operation_turn=4,
+                prompt_operation_target="planner",
+                prompt_baseline_sequence=7,
+            ),
+        )
+        assert job is not None
+
+        with mock.patch.object(
+            production_jobs,
+            "record_explicit_plan_approval",
+            side_effect=OSError("temporary write failure"),
+        ):
+            production_jobs._worker_complete(
+                self.store,
+                job.id,
+                "worker",
+                output="VOICE_SUMMARY[123456789abc-4]: done",
+                agent_status="idle",
+            )
+
+        deferred = self.store.get(job.id)
+        self.assertTrue(deferred.plan_approval_completion_pending)
+        self.assertFalse(deferred.plan_approval_counted)
+        reclaimed = self.store.update(
+            job.id,
+            lambda current: current.evolve(
+                status=JobStatus.RECONCILING,
+                worker_token="worker-2",
+                worker_pid=43,
+                worker_boot_id="boot-2",
+                worker_process_start="start-2",
+            ),
+        )
+        assert reclaimed is not None
+        recorded = user_config.PlanApprovalPreferences(
+            explicit_approval_ids=("gate-id",),
+        )
+        with mock.patch.object(
+            production_jobs,
+            "record_explicit_plan_approval",
+            return_value=recorded,
+        ):
+            client = mock.Mock()
+            production_jobs._run_tiered_workflow(
+                self.store,
+                reclaimed,
+                "worker-2",
+                client,
+                lambda: None,
+            )
+
+        completed = self.store.get(job.id)
+        self.assertEqual(completed.terminal_intent_status, JobStatus.COMPLETED)
+        self.assertTrue(completed.plan_approval_counted)
+        self.assertFalse(completed.plan_approval_completion_pending)
+        client.get_agent.assert_not_called()
+        client.wait_for_stable_completion.assert_not_called()
 
     def test_planned_prompt_persists_submit_and_accept_boundaries(self) -> None:
         job = self.create()
@@ -591,6 +1004,13 @@ class CursorJobStateTests(unittest.TestCase):
                 "workflow_phase": "reviewing",
                 "review_round": 1,
                 "review_decision": "revise",
+                "herdr_target": "planner",
+                "planner_target": "planner",
+                "active_participant": "planner",
+                "plan_approval_state": "boundary",
+                "plan_approval_id": "gate-id",
+                "plan_approval_agent_session": "planner-session",
+                "plan_approval_state_change_sequence": 2,
             }
         )
         store = jobs._store()
@@ -726,6 +1146,159 @@ class CursorJobStateTests(unittest.TestCase):
         self.assertIn("change several components", resumed.request)
         self.assertIn("User clarification: keep the old format", resumed.request)
 
+    def test_auto_mode_approves_only_the_reviewed_plan_gate(self) -> None:
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "update ordinary application behavior",
+                "status": "running",
+                "worker_token": "worker",
+                "worker_pid": 42,
+                "worker_process_start": "start",
+                "workflow_tier": "medium",
+                "workflow_classification_reason": "cross-component",
+                "workflow_phase": "reviewing",
+                "planner_target": "planner",
+                "reviewer_target": "reviewer",
+                "active_participant": "reviewer",
+                "herdr_target": "reviewer",
+                "turn_token": "turn",
+                "plan_approval_state": "boundary",
+                "plan_approval_id": "gate-id",
+                "plan_approval_agent_session": "planner-session",
+                "plan_approval_state_change_sequence": 7,
+            }
+        )
+        store = jobs._store()
+        plan = "Update behavior with compatibility tests."
+        plan_reference = store.write_artifact("123456789abc", "plan", 0, plan)
+        store.update(
+            "123456789abc",
+            lambda job: job.evolve(plan_artifact=plan_reference),
+        )
+        before_review = store.get("123456789abc")
+
+        with mock.patch.object(
+            production_jobs,
+            "load_plan_approval_preferences",
+            return_value=user_config.PlanApprovalPreferences(
+                mode=user_config.PlanApprovalMode.AUTO
+            ),
+        ):
+            advanced = production_jobs._advance_workflow_output(
+                store,
+                before_review,
+                "worker",
+                "WORKFLOW_REVIEW_DECISION[turn]: approve\n"
+                "WORKFLOW_REVIEW[turn]: plan is safe",
+                "idle",
+            )
+
+        assert advanced is not None
+        self.assertEqual(advanced.revision, before_review.revision + 1)
+        self.assertEqual(advanced.workflow_phase.value, "implementing")
+        self.assertEqual(advanced.plan_approval_state, "approved")
+        self.assertEqual(advanced.plan_approval_source, "auto")
+        self.assertFalse(advanced.plan_approval_counted)
+        self.assertEqual(advanced.herdr_target, "planner")
+
+    def test_review_approval_and_voice_question_commit_atomically(self) -> None:
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "update ordinary application behavior",
+                "status": "running",
+                "worker_token": "worker",
+                "worker_pid": 42,
+                "worker_process_start": "start",
+                "workflow_tier": "medium",
+                "workflow_classification_reason": "cross-component",
+                "workflow_phase": "reviewing",
+                "planner_target": "planner",
+                "reviewer_target": "reviewer",
+                "active_participant": "reviewer",
+                "herdr_target": "reviewer",
+                "turn_token": "turn",
+                "plan_approval_state": "boundary",
+                "plan_approval_id": "gate-id",
+                "plan_approval_agent_session": "planner-session",
+                "plan_approval_state_change_sequence": 7,
+            }
+        )
+        store = jobs._store()
+        plan = "Update behavior with compatibility tests."
+        plan_reference = store.write_artifact("123456789abc", "plan", 0, plan)
+        store.update(
+            "123456789abc",
+            lambda job: job.evolve(plan_artifact=plan_reference),
+        )
+        before_review = store.get("123456789abc")
+
+        with mock.patch.object(
+            production_jobs,
+            "load_plan_approval_preferences",
+            return_value=user_config.PlanApprovalPreferences(),
+        ):
+            advanced = production_jobs._advance_workflow_output(
+                store,
+                before_review,
+                "worker",
+                "WORKFLOW_REVIEW_DECISION[turn]: approve\n"
+                "WORKFLOW_REVIEW[turn]: plan is safe",
+                "idle",
+            )
+
+        self.assertIsNone(advanced)
+        awaiting = store.get("123456789abc")
+        self.assertEqual(awaiting.revision, before_review.revision + 1)
+        self.assertEqual(awaiting.status, JobStatus.AWAITING_USER)
+        self.assertEqual(awaiting.clarification_kind, "workflow_plan_approval")
+        self.assertEqual(awaiting.plan_approval_state, "awaiting")
+        self.assertTrue(awaiting.review_approved)
+        self.assertIsNotNone(awaiting.review_artifact)
+
+    def test_auto_mode_does_not_bypass_destructive_confirmation(self) -> None:
+        job = CursorJob.from_dict(
+            {
+                "id": "123456789abc",
+                "request": "drop every table",
+                "status": "running",
+                "created_at": 1,
+                "delivered": False,
+                "worker_token": "worker",
+                "worker_pid": 42,
+                "worker_boot_id": "boot",
+                "worker_process_start": "start",
+                "workflow_tier": "high-risk",
+                "workflow_classification_reason": "irreversible data loss",
+                "workflow_phase": "reviewing",
+                "plan_artifact": ".artifacts/123456789abc/plan-0.json",
+                "review_artifact": ".artifacts/123456789abc/review-0.json",
+                "review_decision": "approve",
+                "review_approved": True,
+                "review_approval_source": "reviewer",
+                "plan_approval_state": "boundary",
+                "plan_approval_id": "gate-id",
+                "plan_approval_agent_session": "planner-session",
+                "plan_approval_state_change_sequence": 7,
+            }
+        )
+
+        with mock.patch.object(
+            production_jobs,
+            "load_plan_approval_preferences",
+            return_value=user_config.PlanApprovalPreferences(
+                mode=user_config.PlanApprovalMode.AUTO
+            ),
+        ):
+            self.assertFalse(
+                production_jobs._auto_plan_approval_allowed(
+                    job,
+                    plan="Apply the approved DDL.",
+                    review="approve",
+                )
+            )
+
     def test_deterministic_hard_risk_terms_override_simple_classification(
         self,
     ) -> None:
@@ -758,6 +1331,29 @@ class CursorJobStateTests(unittest.TestCase):
                 "localized",
             ).value,
             "simple",
+        )
+        self.assertEqual(
+            production_jobs._hard_risk_evidence(
+                "rename a label",
+                "localized",
+                plan="Rotate the deployment credential.",
+            ),
+            "approved plan contains 'credential'",
+        )
+        self.assertIsNone(
+            production_jobs._hard_risk_evidence(
+                "rename a label",
+                "localized",
+                review="No security or permission concerns.",
+            )
+        )
+        self.assertEqual(
+            production_jobs._hard_risk_evidence(
+                "rename a label",
+                "localized",
+                review="Requires a permission confirmation.",
+            ),
+            "review contains 'permission'",
         )
         with self.assertRaises(jobs.HarnessError):
             production_jobs._classified_tier("unknown", "rename text", "localized")
@@ -991,6 +1587,8 @@ class CursorJobStateTests(unittest.TestCase):
         self.assertTrue(updated.review_approved)
         self.assertEqual(updated.review_approval_source, "user")
         self.assertEqual(updated.review_decision, "revise")
+        self.assertEqual(updated.plan_approval_source, "explicit")
+        self.assertEqual(updated.plan_approval_state, "approved")
         launch.assert_called_once_with("123456789abc")
 
     def test_exhausted_review_abort_uses_job_cancellation(self) -> None:
@@ -1313,20 +1911,22 @@ class CursorJobStateTests(unittest.TestCase):
             participant_name=None,
         )
         updated = jobs.read_job("123456789abc")
-        self.assertEqual(updated["status"], "completed")
+        self.assertEqual(updated["status"], "awaiting_user")
         self.assertEqual(updated["fork_repository"], "me/project")
         self.assertEqual(updated["repository"], str(repository))
         self.assertEqual(updated["workflow_tier"], "high-risk")
-        self.assertEqual(updated["workflow_phase"], "finished")
+        self.assertEqual(updated["workflow_phase"], "reviewing")
+        self.assertEqual(updated["clarification_kind"], "workflow_plan_approval")
+        self.assertEqual(updated["plan_approval_state"], "awaiting")
         self.assertTrue(updated["plan_artifact"])
         self.assertTrue(updated["review_artifact"])
         self.assertEqual(
             [call.kwargs["role"] for call in client.start_fresh_agent.call_args_list],
-            ["reviewer", "implementer"],
+            ["reviewer"],
         )
         self.assertEqual(
             [call.kwargs["mode"] for call in client.start_fresh_agent.call_args_list],
-            ["ask", None],
+            ["ask"],
         )
 
     def test_reconciled_fork_is_never_resubmitted(self) -> None:
@@ -1460,6 +2060,37 @@ class CursorJobStateTests(unittest.TestCase):
         updated = jobs.read_job("123456789abc")
         self.assertEqual(updated["status"], "awaiting_user")
         self.assertFalse(updated.get("fork_confirmed", False))
+
+    def test_plan_approval_vocabulary_does_not_confirm_forks(self) -> None:
+        for job_id, answer in (
+            ("aaaaaaaaaaaa", "lgtm"),
+            ("bbbbbbbbbbbb", "approve"),
+            ("cccccccccccc", "proceed"),
+        ):
+            with self.subTest(answer=answer):
+                jobs.write_job(
+                    {
+                        "id": job_id,
+                        "request": "fork this repo",
+                        "fork_requested": True,
+                        "status": "awaiting_user",
+                        "clarification_kind": "fork_confirmation",
+                        "delivered": True,
+                    }
+                )
+                with mock.patch.object(service, "launch_worker") as launch:
+                    message = service.reply_job(
+                        job_id,
+                        answer,
+                        trusted_utterance=answer,
+                    )
+
+                self.assertIsNotNone(message)
+                self.assertIn("yes or no", message or "")
+                launch.assert_not_called()
+                updated = jobs.read_job(job_id)
+                self.assertEqual(updated["status"], "awaiting_user")
+                self.assertFalse(updated.get("fork_confirmed", False))
 
     def test_affirmative_confirmation_queues_provisioning(self) -> None:
         jobs.write_job(
