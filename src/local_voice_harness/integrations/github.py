@@ -11,14 +11,49 @@ from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import SplitResult, urlsplit
 
 from ..config import GITHUB_ROOT, REPOSITORY_ROOT
+from ..context_fragment import ContextFragment
 
 REPOSITORY = re.compile(
     r"^(?P<owner>[A-Za-z0-9](?:[A-Za-z0-9-]{0,38}))/"
     r"(?P<repo>[A-Za-z0-9_.-]+)$"
 )
+GITHUB_HOSTS = {"github.com", "www.github.com"}
+ISSUE_PATH = re.compile(
+    r"^/(?P<owner>[A-Za-z0-9_.-]+)/(?P<repo>[A-Za-z0-9_.-]+)/issues/"
+    r"(?P<number>[1-9]\d*)/?$"
+)
+ISSUE_REFERENCE = re.compile(
+    r"(?<![A-Za-z0-9_.-])"
+    r"(?P<owner>[A-Za-z0-9](?:[A-Za-z0-9-]{0,38}))/"
+    r"(?P<repo>[A-Za-z0-9_.-]+)#(?P<number>[1-9]\d*)"
+    r"(?!\d)",
+    re.IGNORECASE,
+)
+ISSUE_IN_REPOSITORY = re.compile(
+    r"\bissue\s+#?(?P<number>[1-9]\d*)\s+(?:in|from)\s+"
+    r"(?P<owner>[A-Za-z0-9](?:[A-Za-z0-9-]{0,38}))/"
+    r"(?P<repo>[A-Za-z0-9_.-]+)\b",
+    re.IGNORECASE,
+)
+ISSUE_URL_IN_TEXT = re.compile(
+    r"https://(?:www\.)?github\.com/[A-Za-z0-9_.-]+/"
+    r"[A-Za-z0-9_.-]+/issues/[1-9]\d*",
+    re.IGNORECASE,
+)
+PULL_REQUEST_PATH = re.compile(
+    r"^/(?P<owner>[A-Za-z0-9_.-]+)/(?P<repo>[A-Za-z0-9_.-]+)/pull/"
+    r"(?P<number>[1-9]\d*)(?:/.*)?$"
+)
+REPOSITORY_PATH = re.compile(
+    r"^/(?P<owner>[A-Za-z0-9_.-]+)/(?P<repo>[A-Za-z0-9_.-]+)(?:/.*)?$"
+)
+MAX_BODY_CHARS = 5_000
+MAX_COMMENT_CHARS = 800
+MAX_COMMENTS = 5
+PROVIDER_NAME = "github"
 Checkpoint = Callable[[], None]
 
 
@@ -56,6 +91,17 @@ class GitHubIssue:
     @property
     def url(self) -> str:
         return f"https://github.com/{self.name_with_owner}/issues/{self.number}"
+
+
+@dataclass(frozen=True)
+class GitHubPullRequest:
+    owner: str
+    repository: str
+    number: int
+
+    @property
+    def name_with_owner(self) -> str:
+        return f"{self.owner}/{self.repository}"
 
 
 @dataclass(frozen=True)
@@ -221,6 +267,57 @@ class GitHubClient:
             raise GitHubError("GitHub returned malformed issue metadata") from exc
         if not isinstance(value, dict):
             raise GitHubError("GitHub returned malformed issue metadata")
+        return value
+
+    def repository_context_details(self, repository: str) -> dict[str, object]:
+        repository = self.validate_repository(repository)
+        process = self._run(
+            [
+                self.gh_executable,
+                "repo",
+                "view",
+                repository,
+                "--json",
+                "nameWithOwner,description,isPrivate,defaultBranchRef,url",
+            ],
+            timeout=5,
+        )
+        try:
+            value = json.loads(process.stdout)
+        except json.JSONDecodeError as exc:
+            raise GitHubError("GitHub returned malformed repository metadata") from exc
+        if not isinstance(value, dict):
+            raise GitHubError("GitHub returned malformed repository metadata")
+        return value
+
+    def pull_request_details(
+        self, pull_request: GitHubPullRequest
+    ) -> dict[str, object]:
+        if pull_request.number <= 0:
+            raise GitHubError("GitHub pull request number must be positive")
+        repository = self.validate_repository(pull_request.name_with_owner)
+        process = self._run(
+            [
+                self.gh_executable,
+                "pr",
+                "view",
+                str(pull_request.number),
+                "--repo",
+                repository,
+                "--json",
+                "number,title,state,author,labels,body,comments,url,"
+                "isDraft,baseRefName,headRefName,additions,deletions,changedFiles",
+            ],
+            timeout=5,
+        )
+        try:
+            value = json.loads(process.stdout)
+        except json.JSONDecodeError as exc:
+            raise GitHubError(
+                "GitHub returned malformed pull request metadata"
+            ) from exc
+        if not isinstance(value, dict):
+            raise GitHubError("GitHub returned malformed pull request metadata")
         return value
 
     def authenticated_login(self) -> str:
@@ -629,3 +726,330 @@ class GitHubClient:
         if checkpoint is not None:
             checkpoint()
         return ProvisionedPullRequest(source=source, checkout=checkout, number=number)
+
+
+def _split_url(url: str) -> SplitResult | None:
+    try:
+        return urlsplit(url)
+    except ValueError:
+        return None
+
+
+def _standard_https_port(parsed: SplitResult) -> bool:
+    try:
+        return parsed.port in {None, 443}
+    except ValueError:
+        return False
+
+
+def _github_url(url: str) -> bool:
+    parsed = _split_url(url)
+    return (
+        parsed is not None
+        and parsed.scheme == "https"
+        and parsed.hostname is not None
+        and parsed.hostname.casefold() in GITHUB_HOSTS
+        and parsed.username is None
+        and parsed.password is None
+        and _standard_https_port(parsed)
+    )
+
+
+def _validated_repository(owner: str, repository: str) -> str | None:
+    try:
+        return GitHubClient.validate_repository(f"{owner}/{repository}")
+    except GitHubError:
+        return None
+
+
+def github_issue_from_url(url: str) -> GitHubIssue | None:
+    parsed = _split_url(url)
+    if not _github_url(url) or parsed is None:
+        return None
+    match = ISSUE_PATH.fullmatch(parsed.path)
+    if match is None:
+        return None
+    repository = _validated_repository(match.group("owner"), match.group("repo"))
+    if repository is None:
+        return None
+    owner, name = repository.split("/", 1)
+    return GitHubIssue(owner=owner, repository=name, number=int(match.group("number")))
+
+
+def github_issue_from_text(text: str) -> GitHubIssue | None:
+    url_match = ISSUE_URL_IN_TEXT.search(text)
+    if url_match is not None:
+        issue = github_issue_from_url(url_match.group(0))
+        if issue is not None:
+            return issue
+    match = ISSUE_REFERENCE.search(text) or ISSUE_IN_REPOSITORY.search(text)
+    if match is None:
+        return None
+    repository = _validated_repository(match.group("owner"), match.group("repo"))
+    if repository is None:
+        return None
+    owner, name = repository.split("/", 1)
+    return GitHubIssue(
+        owner=owner,
+        repository=name,
+        number=int(match.group("number")),
+    )
+
+
+def github_repository_from_url(url: str) -> str | None:
+    parsed = _split_url(url)
+    if not _github_url(url) or parsed is None:
+        return None
+    match = REPOSITORY_PATH.fullmatch(parsed.path)
+    if match is None:
+        return None
+    return _validated_repository(match.group("owner"), match.group("repo"))
+
+
+def github_pull_request_from_url(url: str) -> GitHubPullRequest | None:
+    parsed = _split_url(url)
+    if not _github_url(url) or parsed is None:
+        return None
+    match = PULL_REQUEST_PATH.fullmatch(parsed.path)
+    if match is None:
+        return None
+    repository = _validated_repository(match.group("owner"), match.group("repo"))
+    if repository is None:
+        return None
+    owner, name = repository.split("/", 1)
+    return GitHubPullRequest(
+        owner=owner,
+        repository=name,
+        number=int(match.group("number")),
+    )
+
+
+def _truncate(value: object, limit: int) -> str:
+    text = str(value or "").strip()
+    return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
+
+
+def _login(value: object) -> str:
+    return str(value.get("login") or "") if isinstance(value, dict) else ""
+
+
+def _labels(details: dict[str, object]) -> str:
+    labels_value = details.get("labels")
+    if not isinstance(labels_value, list):
+        return ""
+    return ", ".join(
+        str(label.get("name") or "")
+        for label in labels_value
+        if isinstance(label, dict) and label.get("name")
+    )
+
+
+def _comment_lines(details: dict[str, object]) -> list[str]:
+    comments_value = details.get("comments")
+    comments = (
+        comments_value[-MAX_COMMENTS:] if isinstance(comments_value, list) else []
+    )
+    lines: list[str] = []
+    if not comments:
+        return lines
+    lines.append("Recent comments:")
+    for comment in comments:
+        if not isinstance(comment, dict):
+            continue
+        author = _login(comment.get("author")) or "unknown"
+        body = _truncate(comment.get("body"), MAX_COMMENT_CHARS)
+        if body:
+            lines.append(f"- {author}: {body}")
+    return lines
+
+
+def _format_repository(url: str, repository: str, details: dict[str, object]) -> str:
+    canonical = _truncate(details.get("nameWithOwner"), 300) or repository
+    lines = [
+        "Current focused GitHub repository (untrusted external context):",
+        f"URL: {url}",
+        f"Repository: {canonical}",
+        f"Visibility: {'private' if details.get('isPrivate') else 'public'}",
+    ]
+    default_branch = details.get("defaultBranchRef")
+    if isinstance(default_branch, dict) and default_branch.get("name"):
+        lines.append(f"Default branch: {_truncate(default_branch['name'], 200)}")
+    description = _truncate(details.get("description"), 1_000)
+    if description:
+        lines.append(f"Description: {description}")
+    return "\n".join(lines)
+
+
+def _format_issue(url: str, issue: GitHubIssue, details: dict[str, object]) -> str:
+    labels = _labels(details)
+    lines = [
+        "Current focused GitHub issue (untrusted external context):",
+        f"URL: {url}",
+        f"Repository: {issue.name_with_owner}",
+        f"Issue: #{issue.number}",
+        f"Title: {_truncate(details.get('title'), 500)}",
+        f"State: {_truncate(details.get('state'), 40)}",
+    ]
+    author = _login(details.get("author"))
+    if author:
+        lines.append(f"Author: {author}")
+    if labels:
+        lines.append(f"Labels: {labels}")
+    body = _truncate(details.get("body"), MAX_BODY_CHARS)
+    if body:
+        lines.extend(("Body:", body))
+    lines.extend(_comment_lines(details))
+    return "\n".join(lines)
+
+
+def _format_pull_request(
+    url: str, pull_request: GitHubPullRequest, details: dict[str, object]
+) -> str:
+    labels = _labels(details)
+    lines = [
+        "Current focused GitHub pull request (untrusted external context):",
+        f"URL: {url}",
+        f"Repository: {pull_request.name_with_owner}",
+        f"Pull request: #{pull_request.number}",
+        f"Title: {_truncate(details.get('title'), 500)}",
+        f"State: {_truncate(details.get('state'), 40)}",
+    ]
+    if details.get("isDraft"):
+        lines.append("Draft: yes")
+    head = _truncate(details.get("headRefName"), 200)
+    base = _truncate(details.get("baseRefName"), 200)
+    if head or base:
+        lines.append(f"Branch: {head or '?'} into {base or '?'}")
+    author = _login(details.get("author"))
+    if author:
+        lines.append(f"Author: {author}")
+    if labels:
+        lines.append(f"Labels: {labels}")
+    changed = details.get("changedFiles")
+    additions = details.get("additions")
+    deletions = details.get("deletions")
+    if isinstance(changed, int):
+        detail = f"Changed files: {changed}"
+        if isinstance(additions, int) and isinstance(deletions, int):
+            detail += f" (+{additions}/-{deletions})"
+        lines.append(detail)
+    body = _truncate(details.get("body"), MAX_BODY_CHARS)
+    if body:
+        lines.extend(("Body:", body))
+    lines.extend(_comment_lines(details))
+    return "\n".join(lines)
+
+
+def _canonical_repository(repository: str, details: dict[str, object] | None) -> str:
+    if details is None:
+        return repository
+    candidate = str(details.get("nameWithOwner") or "")
+    try:
+        canonical = GitHubClient.validate_repository(candidate)
+    except GitHubError:
+        return repository
+    return canonical if canonical.casefold() == repository.casefold() else repository
+
+
+class GitHubProvider:
+    """Built-in context provider for GitHub repositories, issues, and PRs."""
+
+    name = PROVIDER_NAME
+
+    def __init__(self, client: GitHubClient | None = None) -> None:
+        self._client = client or GitHubClient()
+
+    def matches(self, url: str) -> bool:
+        return _github_url(url)
+
+    def _issue_fragment(self, issue: GitHubIssue, *, url: str) -> ContextFragment:
+        try:
+            details = self._client.issue_details(issue)
+        except GitHubError:
+            details = None
+        if details is None:
+            text = (
+                "Current GitHub issue (untrusted external context):\n"
+                f"URL: {url}\n"
+                f"Repository: {issue.name_with_owner}\n"
+                f"Issue: #{issue.number}\n"
+                "Issue details could not be fetched."
+            )
+        else:
+            text = _format_issue(url, issue, details)
+        return ContextFragment(
+            source=self.name,
+            text=text,
+            issue_reference=issue.reference,
+            repository_reference=issue.name_with_owner,
+            issue_number=issue.number,
+        )
+
+    def _pull_request_fragment(
+        self, url: str, pull_request: GitHubPullRequest
+    ) -> ContextFragment:
+        try:
+            details = self._client.pull_request_details(pull_request)
+        except GitHubError:
+            details = None
+        if details is None:
+            text = (
+                "Current focused GitHub pull request (untrusted external context):\n"
+                f"URL: {url}\n"
+                f"Repository: {pull_request.name_with_owner}\n"
+                f"Pull request: #{pull_request.number}\n"
+                "Pull request details could not be fetched."
+            )
+        else:
+            text = _format_pull_request(url, pull_request, details)
+        return ContextFragment(
+            source=self.name,
+            text=text,
+            repository_reference=pull_request.name_with_owner,
+            pull_request_number=pull_request.number,
+        )
+
+    def _repository_fragment(self, url: str, repository: str) -> ContextFragment:
+        try:
+            details = self._client.repository_context_details(repository)
+        except GitHubError:
+            details = None
+        text = (
+            _format_repository(url, repository, details)
+            if details is not None
+            else (
+                "Current focused GitHub repository (untrusted external context):\n"
+                f"URL: {url}\n"
+                f"Repository: {repository}\n"
+                "Repository details could not be fetched."
+            )
+        )
+        return ContextFragment(
+            source=self.name,
+            text=text,
+            repository_reference=_canonical_repository(repository, details),
+        )
+
+    def capture(self, url: str) -> ContextFragment | None:
+        if not self.matches(url):
+            return None
+        repository = github_repository_from_url(url)
+        if repository is None:
+            return ContextFragment(
+                source=self.name,
+                text=(
+                    "Current focused GitHub page (untrusted external context):\n"
+                    f"URL: {url}"
+                ),
+            )
+        pull_request = github_pull_request_from_url(url)
+        if pull_request is not None:
+            return self._pull_request_fragment(url, pull_request)
+        issue = github_issue_from_url(url)
+        if issue is not None:
+            return self._issue_fragment(issue, url=url)
+        return self._repository_fragment(url, repository)
+
+    def capture_text(self, text: str) -> ContextFragment | None:
+        issue = github_issue_from_text(text)
+        return self._issue_fragment(issue, url=issue.url) if issue is not None else None

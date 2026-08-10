@@ -7,12 +7,13 @@
 - Focused GitHub issue and pull request content is read through `gh`, and rendered
   Zendesk ticket content is copied from the browser session; all are bounded before
   prompting and treated as untrusted external data.
-- Optional context integrations are disabled by default on fresh installations.
-  Zendesk is off unless explicitly enabled through `[integrations] zendesk` in
-  `config.toml` or `VOICE_HARNESS_INTEGRATION_ZENDESK`; while disabled, Zendesk
-  URLs are never inspected and no page text is copied. A misconfigured or
-  unreadable configuration fails closed to the disabled defaults, and an
-  individual provider failing never breaks an ordinary voice request.
+- Context integrations are gated by the built-in provider registry. GitHub remains
+  enabled by default for compatibility, but `[integrations] github = false` (or
+  `VOICE_HARNESS_INTEGRATION_GITHUB=0`) prevents GitHub URL/reference parsing,
+  context API calls, and downstream GitHub metadata. Zendesk is off unless
+  explicitly enabled; while disabled, Zendesk URLs are never inspected and no page
+  text is copied. An individual provider failing never breaks an ordinary voice
+  request.
 - Repository cloning requires explicit Rofi confirmation, accepts only HTTPS or SSH
   Git URLs, and places the checkout beneath the configured project root.
 - Merely focusing a GitHub page cannot create a fork. The original spoken request must

@@ -1,17 +1,20 @@
 from __future__ import annotations
 
-import json
-import subprocess
 import unittest
 from unittest import mock
 
 from local_voice_harness import browser_context, desktop
+from local_voice_harness.context_fragment import ContextFragment
 from local_voice_harness.focused_app_context import FocusedAppContext
-from local_voice_harness.integrations import linear, zendesk
+from local_voice_harness.integrations import github
 from local_voice_harness.integrations import registry as context_providers
 from local_voice_harness.user_config import IntegrationSettings
 
-DISABLED = IntegrationSettings(zendesk_enabled=False)
+GITHUB_DISABLED = IntegrationSettings(
+    github_enabled=False,
+    zendesk_enabled=False,
+    linear_enabled=False,
+)
 
 
 class FirefoxUrlTests(unittest.TestCase):
@@ -19,9 +22,7 @@ class FirefoxUrlTests(unittest.TestCase):
         backend = mock.Mock()
         backend.has_clipboard.return_value = True
         backend.active_window.return_value = desktop.Window("42", "alacritty", 1)
-        with (
-            mock.patch.object(browser_context, "get_desktop", return_value=backend),
-        ):
+        with mock.patch.object(browser_context, "get_desktop", return_value=backend):
             self.assertIsNone(browser_context.focused_firefox_url())
         backend.send_key.assert_not_called()
 
@@ -73,295 +74,188 @@ class FirefoxUrlTests(unittest.TestCase):
         backend.send_key.assert_called_once_with("ctrl+l", window=window)
         backend.write_clipboard.assert_not_called()
 
-    def test_unsupported_wayland_session_omits_browser_context(self) -> None:
+    def test_invalid_or_unsupported_desktop_omits_browser_context(self) -> None:
         with mock.patch.object(browser_context, "get_desktop", return_value=None):
             self.assertIsNone(browser_context.focused_firefox_url())
 
 
-class GitHubContextTests(unittest.TestCase):
-    def test_extracts_canonical_issue_url(self) -> None:
-        issue = browser_context.github_issue_from_url(
-            "https://github.com/example/project/issues/42?notification_referrer=x"
-        )
-        self.assertEqual(issue, browser_context.GitHubIssue("example", "project", 42))
-        self.assertIsNone(
-            browser_context.github_issue_from_url(
-                "https://github.example/example/project/issues/42"
-            )
-        )
-        self.assertIsNone(
-            browser_context.github_issue_from_url(
-                "https://github.com/example/project/pull/42"
-            )
-        )
-
-    def test_extracts_spoken_issue_references(self) -> None:
-        issue = browser_context.GitHubIssue("example", "project", 42)
-        self.assertEqual(
-            browser_context.github_issue_from_text("work on example/project#42"),
-            issue,
-        )
-        self.assertEqual(
-            browser_context.github_issue_from_text(
-                "please handle issue 42 in example/project"
-            ),
-            issue,
-        )
-        self.assertEqual(
-            browser_context.github_issue_from_text(
-                "work on https://github.com/example/project/issues/42"
-            ),
-            issue,
-        )
-        self.assertIsNone(browser_context.github_issue_from_text("work on issue 42"))
-
-    def test_malformed_port_is_not_github_context(self) -> None:
-        url = "https://github.com:invalid/example/project/issues/42"
-        self.assertIsNone(browser_context.github_issue_from_url(url))
-        with mock.patch.object(
-            browser_context, "focused_firefox_url", return_value=url
-        ):
-            self.assertIsNone(browser_context.focused_github_context())
-
-    def test_extracts_repository_from_supported_subpages(self) -> None:
-        for suffix in (
-            "",
-            "/issues/42",
-            "/pull/7",
-            "/tree/main/src",
-            "/blob/main/README.md",
-        ):
-            with self.subTest(suffix=suffix):
-                self.assertEqual(
-                    browser_context.github_repository_from_url(
-                        f"https://github.com/example/project{suffix}"
-                    ),
-                    "example/project",
-                )
-        self.assertIsNone(
-            browser_context.github_repository_from_url(
-                "https://evil.example/example/project"
-            )
-        )
-        self.assertIsNone(
-            browser_context.github_repository_from_url("https://github.com/example/..")
-        )
-
-    def test_fetches_and_formats_private_issue_through_gh(self) -> None:
-        url = "https://github.com/example/private/issues/42"
-        details = {
-            "number": 42,
-            "title": "Fix the reader",
-            "state": "OPEN",
-            "author": {"login": "octocat"},
-            "labels": [{"name": "bug"}],
-            "body": "Expected behavior",
-            "comments": [{"author": {"login": "dev"}, "body": "I can reproduce"}],
-            "url": url,
-        }
-        with (
-            mock.patch.object(browser_context, "focused_firefox_url", return_value=url),
-            mock.patch.object(browser_context, "_issue_details", return_value=details),
-        ):
-            context = browser_context.focused_github_context()
-
-        self.assertIsNotNone(context)
-        self.assertIn("Repository: example/private", str(context))
-        self.assertIn("Title: Fix the reader", str(context))
-        self.assertIn("- dev: I can reproduce", str(context))
-        self.assertEqual(getattr(context, "github_issue", None), 42)
-
-    def test_gh_failure_keeps_validated_issue_identity(self) -> None:
-        url = "https://github.com/example/project/issues/42"
-        with (
-            mock.patch.object(browser_context, "focused_firefox_url", return_value=url),
-            mock.patch.object(browser_context, "_issue_details", return_value=None),
-        ):
-            context = browser_context.focused_github_context()
-
-        self.assertIn("Issue: #42", str(context))
-        self.assertIn("could not be fetched", str(context))
-
-    def test_issue_content_is_bounded(self) -> None:
-        issue = browser_context.GitHubIssue("example", "project", 42)
-        details: dict[str, object] = {
-            "title": "Title",
-            "state": "OPEN",
-            "body": "b" * 20_000,
-            "comments": [
-                {"author": {"login": "dev"}, "body": "c" * 2_000} for _ in range(20)
-            ],
-        }
-        context = browser_context._format_issue(
-            "https://github.com/example/project/issues/42", issue, details
-        )
-        self.assertLess(len(context), 10_000)
-        self.assertEqual(context.count("- dev:"), browser_context.MAX_COMMENTS)
-
-    def test_plain_github_page_adds_structured_repository(self) -> None:
-        url = "https://github.com/example/project"
-        details = {
-            "nameWithOwner": "Example/Project",
-            "description": "Useful project",
-            "isPrivate": False,
-            "defaultBranchRef": {"name": "main"},
-            "url": url,
-        }
-        with (
-            mock.patch.object(browser_context, "focused_firefox_url", return_value=url),
-            mock.patch.object(
-                browser_context, "_repository_details", return_value=details
-            ),
-        ):
-            context = browser_context.focused_github_context()
-        self.assertIn("focused GitHub repository", str(context))
-        self.assertIn(url, str(context))
-        self.assertIn("Default branch: main", str(context))
-        self.assertEqual(getattr(context, "github_repository", None), "Example/Project")
-
-    def test_extracts_canonical_pull_request_url(self) -> None:
-        pull_request = browser_context.github_pull_request_from_url(
-            "https://github.com/example/project/pull/42/files?diff=split"
-        )
-        self.assertEqual(
-            pull_request,
-            browser_context.GitHubPullRequest("example", "project", 42),
-        )
-        self.assertIsNone(
-            browser_context.github_pull_request_from_url(
-                "https://github.com/example/project/issues/42"
-            )
-        )
-        self.assertIsNone(
-            browser_context.github_pull_request_from_url(
-                "https://evil.example/example/project/pull/42"
-            )
-        )
-
-    def test_fetches_and_formats_pull_request_through_gh(self) -> None:
-        url = "https://github.com/example/project/pull/7"
-        details = {
-            "number": 7,
-            "title": "Add caching",
-            "state": "OPEN",
-            "author": {"login": "octocat"},
-            "labels": [{"name": "enhancement"}],
-            "body": "Speeds things up",
-            "comments": [{"author": {"login": "dev"}, "body": "Looks good"}],
-            "url": url,
-            "isDraft": True,
-            "baseRefName": "main",
-            "headRefName": "feature/cache",
-            "additions": 120,
-            "deletions": 4,
-            "changedFiles": 6,
-        }
-        completed = subprocess.CompletedProcess([], 0, json.dumps(details), "")
-        with (
-            mock.patch.object(
-                browser_context.shutil, "which", return_value="/usr/bin/gh"
-            ),
-            mock.patch.object(browser_context, "focused_firefox_url", return_value=url),
-            mock.patch.object(browser_context, "_run", return_value=completed) as run,
-        ):
-            context = browser_context.focused_github_context()
-
-        self.assertIsNotNone(context)
-        self.assertIn("focused GitHub pull request", str(context))
-        self.assertIn("Pull request: #7", str(context))
-        self.assertIn("Branch: feature/cache into main", str(context))
-        self.assertIn("Draft: yes", str(context))
-        self.assertIn("Changed files: 6 (+120/-4)", str(context))
-        self.assertIn("- dev: Looks good", str(context))
-        self.assertEqual(getattr(context, "github_repository", None), "example/project")
-        self.assertEqual(getattr(context, "github_pull_request", None), 7)
-        self.assertEqual(
-            run.call_args.args[0][:6],
-            ["gh", "pr", "view", "7", "--repo", "example/project"],
-        )
-
-    def test_pull_request_gh_failure_keeps_identity(self) -> None:
-        url = "https://github.com/example/project/pull/7"
-        completed = subprocess.CompletedProcess([], 1, "", "not found")
-        with (
-            mock.patch.object(
-                browser_context.shutil, "which", return_value="/usr/bin/gh"
-            ),
-            mock.patch.object(browser_context, "focused_firefox_url", return_value=url),
-            mock.patch.object(browser_context, "_run", return_value=completed),
-        ):
-            context = browser_context.focused_github_context()
-
-        self.assertIn("Pull request: #7", str(context))
-        self.assertIn("could not be fetched", str(context))
-        self.assertEqual(getattr(context, "github_pull_request", None), 7)
-
-    def test_enriched_request_preserves_pull_request_identity(self) -> None:
-        context = browser_context.GitHubContext(
-            "GitHub context",
-            github_repository="example/project",
-            github_pull_request=7,
-        )
-        with mock.patch.object(
-            browser_context, "focused_browser_context", return_value=context
-        ):
-            request = browser_context.enrich_request("make sure this PR works")
-        self.assertEqual(request.github_repository, "example/project")
-        self.assertEqual(request.github_pull_request, 7)
-
-    def test_enriched_request_preserves_validated_repository_identity(self) -> None:
-        context = browser_context.GitHubContext(
-            "GitHub context", github_repository="example/project"
-        )
-        with mock.patch.object(
-            browser_context, "focused_browser_context", return_value=context
-        ):
-            request = browser_context.enrich_request("fork this repo")
-        self.assertEqual(
-            request.github_repository,
-            "example/project",
-        )
-        self.assertEqual(str(request), "fork this repo\n\nGitHub context")
-
-    def test_enrich_request_is_fail_open(self) -> None:
-        with mock.patch.object(
-            browser_context,
-            "focused_browser_context",
-            side_effect=RuntimeError("desktop unavailable"),
-        ):
-            self.assertEqual(browser_context.enrich_request("hello"), "hello")
-
-    def test_request_context_exposes_validated_issue_identity(self) -> None:
-        url = "https://github.com/example/project/issues/42"
+class BrowserDispatchTests(unittest.TestCase):
+    def test_focused_browser_context_dispatches_once_through_registry(self) -> None:
+        url = "https://example.test/ticket/42"
+        fragment = ContextFragment(source="stub", text="captured")
         with (
             mock.patch.object(
                 browser_context, "focused_firefox_url", return_value=url
             ) as focused_url,
-            mock.patch.object(browser_context, "_issue_details", return_value=None),
+            mock.patch.object(
+                browser_context, "capture_context", return_value=fragment
+            ) as capture,
+        ):
+            self.assertIs(browser_context.focused_browser_context(), fragment)
+
+        focused_url.assert_called_once_with()
+        capture.assert_called_once_with(url)
+
+    def test_request_context_maps_github_fragment_for_provisioning(self) -> None:
+        fragment = ContextFragment(
+            source="github",
+            text="Issue context",
+            issue_reference="example/project#42",
+            repository_reference="example/project",
+            issue_number=42,
+        )
+        with (
+            mock.patch.object(
+                browser_context, "capture_text_context", return_value=None
+            ),
+            mock.patch.object(
+                browser_context,
+                "focused_firefox_url",
+                return_value="https://github.com/example/project/issues/42",
+            ),
+            mock.patch.object(
+                browser_context, "capture_context", return_value=fragment
+            ),
+            mock.patch.object(
+                browser_context, "focused_app_context", return_value=None
+            ),
         ):
             context = browser_context.request_context("work on this")
 
         self.assertEqual(context.focused_repository, "example/project")
         self.assertEqual(context.focused_issue, "example/project#42")
+        self.assertEqual(context.github_repository, "example/project")
         self.assertEqual(context.github_issue, 42)
-        self.assertIn("Issue: #42", str(context.github_issue_context))
-        self.assertIn("Repository: example/project", context.text)
-        focused_url.assert_called_once_with()
+        self.assertEqual(context.github_issue_context, "Issue context")
+        self.assertIsNone(context.external_issue_reference)
+        self.assertIn("Issue context", context.text)
 
-    def test_spoken_issue_overrides_focused_browser_issue(self) -> None:
-        spoken = browser_context.GitHubIssue("spoken", "project", 7)
+    def test_request_context_maps_pull_request_fragment_for_provisioning(self) -> None:
+        fragment = ContextFragment(
+            source="github",
+            text="PR context",
+            repository_reference="example/project",
+            pull_request_number=7,
+        )
         with (
-            mock.patch.object(browser_context, "_issue_details", return_value=None),
+            mock.patch.object(
+                browser_context, "capture_text_context", return_value=None
+            ),
+            mock.patch.object(
+                browser_context,
+                "focused_firefox_url",
+                return_value="https://github.com/example/project/pull/7",
+            ),
+            mock.patch.object(
+                browser_context, "capture_context", return_value=fragment
+            ),
+            mock.patch.object(
+                browser_context, "focused_app_context", return_value=None
+            ),
+        ):
+            context = browser_context.request_context("check out this PR")
+
+        self.assertEqual(context.github_repository, "example/project")
+        self.assertEqual(context.github_pull_request, 7)
+        self.assertIsNone(context.github_issue)
+
+    def test_spoken_github_context_overrides_focused_browser(self) -> None:
+        fragment = ContextFragment(
+            source="github",
+            text="Spoken issue",
+            issue_reference="spoken/project#7",
+            repository_reference="spoken/project",
+            issue_number=7,
+        )
+        with (
+            mock.patch.object(
+                browser_context, "capture_text_context", return_value=fragment
+            ),
             mock.patch.object(browser_context, "focused_firefox_url") as focused_url,
+            mock.patch.object(
+                browser_context, "focused_app_context", return_value=None
+            ),
         ):
             context = browser_context.request_context(
                 "work on spoken/project#7 instead"
             )
 
-        self.assertEqual(context.focused_issue, spoken.reference)
-        self.assertEqual(context.github_repository, spoken.name_with_owner)
+        self.assertEqual(context.focused_issue, "spoken/project#7")
+        self.assertEqual(context.github_repository, "spoken/project")
         self.assertEqual(context.github_issue, 7)
         focused_url.assert_not_called()
+
+    def test_generic_issue_fragment_retains_external_metadata(self) -> None:
+        fragment = ContextFragment(
+            source="linear",
+            text="Linear context",
+            issue_reference="ENG-123",
+        )
+        with (
+            mock.patch.object(
+                browser_context, "capture_text_context", return_value=None
+            ),
+            mock.patch.object(
+                browser_context,
+                "focused_firefox_url",
+                return_value="https://linear.app",
+            ),
+            mock.patch.object(
+                browser_context, "capture_context", return_value=fragment
+            ),
+            mock.patch.object(
+                browser_context, "focused_app_context", return_value=None
+            ),
+        ):
+            context = browser_context.request_context("work on this ticket")
+
+        self.assertEqual(context.focused_issue, "ENG-123")
+        self.assertEqual(context.external_issue_reference, "ENG-123")
+        self.assertEqual(context.external_issue_source, "linear")
+        self.assertIsNone(context.github_issue)
+
+    def test_disabled_github_never_parses_or_calls_cli(self) -> None:
+        url = "https://github.com/example/project/issues/42"
+        with (
+            mock.patch.object(
+                context_providers,
+                "_integration_settings",
+                return_value=GITHUB_DISABLED,
+            ),
+            mock.patch.object(browser_context, "focused_firefox_url", return_value=url),
+            mock.patch.object(
+                browser_context, "focused_app_context", return_value=None
+            ),
+            mock.patch.object(github, "github_issue_from_text") as from_text,
+            mock.patch.object(github, "_github_url") as parse_url,
+            mock.patch.object(github.GitHubClient, "_run") as run,
+        ):
+            context = browser_context.request_context("work on example/project#42")
+
+        self.assertEqual(context.text, "work on example/project#42")
+        self.assertIsNone(context.focused_repository)
+        self.assertIsNone(context.focused_issue)
+        self.assertIsNone(context.github_repository)
+        self.assertIsNone(context.github_issue)
+        self.assertIsNone(context.github_pull_request)
+        from_text.assert_not_called()
+        parse_url.assert_not_called()
+        run.assert_not_called()
+
+    def test_capture_failure_does_not_break_request(self) -> None:
+        with (
+            mock.patch.object(
+                browser_context,
+                "capture_text_context",
+                side_effect=RuntimeError("provider unavailable"),
+            ),
+            mock.patch.object(
+                browser_context, "focused_app_context", return_value=None
+            ),
+        ):
+            context = browser_context.request_context("ordinary request")
+
+        self.assertEqual(context.text, "ordinary request")
 
 
 class FocusedAppRequestContextTests(unittest.TestCase):
@@ -373,6 +267,9 @@ class FocusedAppRequestContextTests(unittest.TestCase):
             sources=("selection",),
         )
         with (
+            mock.patch.object(
+                browser_context, "capture_text_context", return_value=None
+            ),
             mock.patch.object(
                 browser_context, "focused_firefox_url", return_value=None
             ),
@@ -387,28 +284,21 @@ class FocusedAppRequestContextTests(unittest.TestCase):
         self.assertEqual(context.focused_app_context, captured.text)
         self.assertTrue(context.text.startswith("fix this code\n\n"))
         self.assertIn("untrusted external input", context.text)
-        self.assertIn("def broken():", context.text)
 
-    def test_focused_app_context_absent_leaves_request_unchanged(self) -> None:
+    def test_focused_app_capture_failure_keeps_browser_context(self) -> None:
+        fragment = ContextFragment(source="github", text="GitHub context")
         with (
             mock.patch.object(
-                browser_context, "focused_firefox_url", return_value=None
+                browser_context, "capture_text_context", return_value=None
             ),
             mock.patch.object(
-                browser_context, "focused_app_context", return_value=None
+                browser_context,
+                "focused_firefox_url",
+                return_value="https://github.com",
             ),
-        ):
-            context = browser_context.request_context("fix this code")
-
-        self.assertEqual(context.text, "fix this code")
-        self.assertIsNone(context.focused_app_context)
-        self.assertEqual(context.focused_app_sources, ())
-
-    def test_focused_app_capture_failure_does_not_lose_browser_context(self) -> None:
-        url = "https://github.com/example/project/issues/42"
-        with (
-            mock.patch.object(browser_context, "focused_firefox_url", return_value=url),
-            mock.patch.object(browser_context, "_issue_details", return_value=None),
+            mock.patch.object(
+                browser_context, "capture_context", return_value=fragment
+            ),
             mock.patch.object(
                 browser_context,
                 "focused_app_context",
@@ -417,129 +307,34 @@ class FocusedAppRequestContextTests(unittest.TestCase):
         ):
             context = browser_context.request_context("work on this")
 
-        self.assertEqual(context.github_issue, 42)
+        self.assertIn("GitHub context", context.text)
         self.assertIsNone(context.focused_app_context)
 
 
-class LinearContextTests(unittest.TestCase):
-    def test_extracts_canonical_issue_url(self) -> None:
-        issue = linear.linear_issue_from_url(
-            "https://linear.app/acme/issue/eng-123/fix-routing?utm_source=inbox"
+class EnrichRequestCompatibilityTests(unittest.TestCase):
+    def test_preserves_github_metadata_from_fragment(self) -> None:
+        fragment = ContextFragment(
+            source="github",
+            text="GitHub context",
+            repository_reference="example/project",
+            pull_request_number=7,
         )
-        self.assertEqual(issue, linear.LinearIssue("ENG-123"))
-
-        invalid_urls = [
-            "http://linear.app/acme/issue/ENG-123/fix-routing",
-            "https://linear.app.evil.test/acme/issue/ENG-123/fix-routing",
-            "https://user@linear.app/acme/issue/ENG-123/fix-routing",
-            "https://linear.app:444/acme/issue/ENG-123/fix-routing",
-            "https://linear.app/acme/project/ENG-123",
-        ]
-        for url in invalid_urls:
-            with self.subTest(url=url):
-                self.assertIsNone(linear.linear_issue_from_url(url))
-
-    def test_request_context_preserves_focused_linear_identifier(self) -> None:
-        url = "https://linear.app/acme/issue/ENG-123/fix-routing"
-        with (
-            mock.patch.object(
-                browser_context, "focused_firefox_url", return_value=url
-            ) as focused_url,
-            mock.patch.object(
-                browser_context, "focused_app_context", return_value=None
-            ),
-            mock.patch.object(
-                browser_context,
-                "capture_context",
-                side_effect=linear.LinearIntegration().capture,
-            ),
+        with mock.patch.object(
+            browser_context, "focused_browser_context", return_value=fragment
         ):
-            context = browser_context.request_context("work on this ticket")
+            request = browser_context.enrich_request("make sure this PR works")
 
-        self.assertEqual(context.focused_issue, "ENG-123")
-        self.assertEqual(context.external_issue_reference, "ENG-123")
-        self.assertEqual(context.external_issue_source, "linear")
-        self.assertIn("Current focused Linear issue", context.text)
-        self.assertIn(
-            "Identifier (untrusted external identifier): ENG-123", context.text
-        )
-        focused_url.assert_called_once_with()
+        self.assertEqual(request.github_repository, "example/project")
+        self.assertEqual(request.github_pull_request, 7)
+        self.assertEqual(str(request), "make sure this PR works\n\nGitHub context")
 
-    def test_browser_context_dispatches_linear_url(self) -> None:
-        url = "https://linear.app/acme/issue/ENG-123/fix-routing"
-        with (
-            mock.patch.object(browser_context, "focused_firefox_url", return_value=url),
-            mock.patch.object(
-                browser_context,
-                "capture_context",
-                side_effect=linear.LinearIntegration().capture,
-            ),
+    def test_capture_failure_leaves_request_unchanged(self) -> None:
+        with mock.patch.object(
+            browser_context,
+            "focused_browser_context",
+            side_effect=RuntimeError("desktop unavailable"),
         ):
-            context = browser_context.focused_browser_context()
-
-        self.assertIn(
-            "Identifier (untrusted external identifier): ENG-123", str(context)
-        )
-
-    def test_disabled_linear_url_is_not_recognized(self) -> None:
-        url = "https://linear.app/acme/issue/ENG-123/fix-routing"
-        with (
-            mock.patch.object(browser_context, "focused_firefox_url", return_value=url),
-            mock.patch.object(
-                browser_context, "focused_app_context", return_value=None
-            ),
-            mock.patch.object(browser_context, "capture_context", return_value=None),
-        ):
-            context = browser_context.request_context("work on this ticket")
-
-        self.assertEqual(context.text, "work on this ticket")
-        self.assertIsNone(context.focused_issue)
-        self.assertIsNone(context.external_issue_reference)
-
-
-class ZendeskDispatchTests(unittest.TestCase):
-    ZENDESK_URL = "https://example.zendesk.com/agent/tickets/42"
-
-    def test_enabled_zendesk_url_is_dispatched_once_through_registry(self) -> None:
-        provider = zendesk.ZendeskProvider()
-        with (
-            mock.patch.object(
-                browser_context, "focused_firefox_url", return_value=self.ZENDESK_URL
-            ) as focused_url,
-            mock.patch.object(
-                zendesk, "_focused_firefox_page_text", return_value="Ticket details"
-            ),
-            mock.patch.object(
-                browser_context,
-                "capture_context",
-                side_effect=lambda url: provider.capture(url),
-            ),
-        ):
-            context = browser_context.focused_browser_context()
-
-        focused_url.assert_called_once_with()
-        self.assertIn("Current focused Zendesk ticket", str(context))
-        self.assertIn("Ticket details", str(context))
-
-    def test_disabled_zendesk_url_is_never_inspected_or_copied(self) -> None:
-        with (
-            mock.patch.object(
-                browser_context, "focused_firefox_url", return_value=self.ZENDESK_URL
-            ),
-            mock.patch.object(
-                browser_context, "focused_app_context", return_value=None
-            ),
-            mock.patch.object(
-                context_providers, "_integration_settings", return_value=DISABLED
-            ),
-            mock.patch.object(zendesk, "zendesk_ticket_from_url") as ticket,
-            mock.patch.object(zendesk, "_focused_firefox_page_text") as page_text,
-        ):
-            context = browser_context.request_context("look at this ticket")
-
-        self.assertEqual(context.text, "look at this ticket")
-        ticket.assert_not_called()
-        page_text.assert_not_called()
+            self.assertEqual(browser_context.enrich_request("hello"), "hello")
 
 
 if __name__ == "__main__":

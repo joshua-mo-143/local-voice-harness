@@ -19,8 +19,9 @@ metadata is persisted only as part of the active job and is not an offline cache
 focused pull request page adds the same details plus its draft state, source and
 target branches, and change summary, and lets a Cursor request check the branch out
 locally. Missing tools, unsupported Wayland compositors, focus changes during
-capture, and browser or GitHub errors simply omit some or all browser context
-without failing the voice request.
+capture, and browser or GitHub errors retain validated repository, issue, or pull
+request identity where available while omitting unavailable details; they do not
+fail the voice request.
 
 ### Optional context providers
 
@@ -28,12 +29,17 @@ Optional integrations are supplied by a small registry of context providers,
 keyed off the `[integrations]` flags in the unified configuration. Each provider
 owns its own URL matching and capture, emits a bounded, provenance-labelled,
 untrusted fragment, and is only ever instantiated when its flag is enabled. A
-provider that raises is isolated and cannot break an ordinary voice request, and
-an unreadable configuration falls back to the disabled defaults.
+provider that raises is isolated and cannot break an ordinary voice request.
 
-Zendesk is the first such provider and is **disabled by default on fresh
-installations**. Enable it with `[integrations] zendesk = true` in `config.toml`
-or `VOICE_HARNESS_INTEGRATION_ZENDESK=1`; existing installations preserve prior
+GitHub is a built-in provider and is enabled by default for compatibility. Disable
+it with `[integrations] github = false` in `config.toml` or
+`VOICE_HARNESS_INTEGRATION_GITHUB=0`. While disabled, GitHub URLs and spoken issue
+references are not parsed by the provider, `gh` is not called for context, and no
+GitHub-specific context or provisioning metadata is emitted.
+
+Zendesk is **disabled by default on fresh installations**. Enable it with
+`[integrations] zendesk = true` in `config.toml` or
+`VOICE_HARNESS_INTEGRATION_ZENDESK=1`; existing installations preserve prior
 behaviour by setting the same flag. While it is disabled, Zendesk URLs are never
 inspected and no page text is copied. When enabled, a focused
 `https://<tenant>.zendesk.com/agent/tickets/<number>` page contributes its URL,

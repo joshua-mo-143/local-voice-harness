@@ -21,15 +21,18 @@ class ContextFragment:
 
     ``source`` records which provider produced the fragment (its provenance).
     ``text`` is the already-bounded, untrusted-labelled rendering that is safe
-    to append to a request. ``issue_reference`` optionally carries a validated
-    but still untrusted external identifier for generic job routing. Stringifying
-    a fragment yields its text so it can be composed with existing plain-string
-    context.
+    to append to a request. The optional reference fields carry validated but
+    still untrusted identifiers needed by downstream routing and provisioning.
+    Stringifying a fragment yields its text so it can be composed with existing
+    plain-string context.
     """
 
     source: str
     text: str
     issue_reference: str | None = None
+    repository_reference: str | None = None
+    issue_number: int | None = None
+    pull_request_number: int | None = None
 
     def __str__(self) -> str:
         return self.text

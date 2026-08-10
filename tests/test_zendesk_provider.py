@@ -155,7 +155,7 @@ class ZendeskProviderTests(unittest.TestCase):
 class ZendeskRegistryTests(unittest.TestCase):
     def test_enabled_flag_registers_zendesk_provider(self) -> None:
         providers = context_providers.available_context_providers(
-            IntegrationSettings(zendesk_enabled=True)
+            IntegrationSettings(github_enabled=False, zendesk_enabled=True)
         )
         self.assertEqual(len(providers), 1)
         self.assertIsInstance(providers[0], zendesk.ZendeskProvider)
@@ -163,7 +163,7 @@ class ZendeskRegistryTests(unittest.TestCase):
     def test_disabled_flag_registers_no_provider(self) -> None:
         self.assertEqual(
             context_providers.available_context_providers(
-                IntegrationSettings(zendesk_enabled=False)
+                IntegrationSettings(github_enabled=False, zendesk_enabled=False)
             ),
             (),
         )
@@ -174,7 +174,8 @@ class ZendeskRegistryTests(unittest.TestCase):
             mock.patch.object(zendesk, "_focused_firefox_page_text") as page_text,
         ):
             fragment = context_providers.capture_context(
-                ZendeskProviderTests.URL, IntegrationSettings(zendesk_enabled=False)
+                ZendeskProviderTests.URL,
+                IntegrationSettings(github_enabled=False, zendesk_enabled=False),
             )
 
         self.assertIsNone(fragment)
