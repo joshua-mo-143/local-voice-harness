@@ -254,7 +254,7 @@ class AppContextTests(unittest.TestCase):
             delivery_claims=mock.ANY,
         )
 
-    def test_focused_github_issue_submits_despite_low_confidence(self) -> None:
+    def test_focused_github_issue_does_not_submit_at_low_confidence(self) -> None:
         context = RequestContext(
             "work on this issue please\n\nIssue: #56",
             focused_repository="source/project",
@@ -275,26 +275,15 @@ class AppContextTests(unittest.TestCase):
                 app, "cursor_turn", return_value=("started", None)
             ) as cursor,
             mock.patch.object(app, "qwen_response") as qwen,
-            mock.patch.object(app, "stream_and_play"),
+            mock.patch.object(app, "stream_and_play") as play,
         ):
             app.respond("work on this issue please")
 
         qwen.assert_not_called()
-        cursor.assert_called_once_with(
-            CursorTurnRequest(
-                context.text,
-                utterance="work on this issue please",
-                context_repository="source/project",
-                github_repository="source/project",
-                github_issue=56,
-                github_issue_context="Issue: #56",
-                fork_requested=False,
-                github_pull_request=None,
-            ),
-            delivery_claims=mock.ANY,
-        )
+        cursor.assert_not_called()
+        play.assert_called_once_with(app.NON_ACTIONABLE_SUBMIT_RESPONSE)
 
-    def test_low_confidence_submit_without_focus_stays_conversational(self) -> None:
+    def test_low_confidence_submit_without_focus_uses_safe_response(self) -> None:
         context = RequestContext("work on this please")
         with (
             mock.patch.object(app, "start_components"),
@@ -306,17 +295,37 @@ class AppContextTests(unittest.TestCase):
             ),
             mock.patch.object(app, "cursor_turn") as cursor,
             mock.patch.object(app, "qwen_response", return_value="ok") as qwen,
-            mock.patch.object(app, "stream_and_play"),
+            mock.patch.object(app, "stream_and_play") as play,
         ):
             app.respond("work on this please")
 
         cursor.assert_not_called()
-        qwen.assert_called_once_with(
-            "work on this please",
-            trusted_utterance="work on this please",
-            delivery_claims=mock.ANY,
-            allow_tools=False,
-        )
+        qwen.assert_not_called()
+        play.assert_called_once_with(app.NON_ACTIONABLE_SUBMIT_RESPONSE)
+
+    def test_uncertain_bare_ticket_batch_requests_repository_scope(self) -> None:
+        text = "Can you work on issues 92, 93 and 95?"
+        with (
+            mock.patch.object(app, "start_components"),
+            mock.patch.object(
+                app,
+                "request_context",
+                return_value=RequestContext(text),
+            ),
+            mock.patch.object(
+                app,
+                "route_intent",
+                return_value=IntentRoute(Intent.UNCERTAIN, "low"),
+            ),
+            mock.patch.object(app, "cursor_turn") as cursor,
+            mock.patch.object(app, "qwen_response") as qwen,
+            mock.patch.object(app, "stream_and_play") as play,
+        ):
+            app.respond(text)
+
+        cursor.assert_not_called()
+        qwen.assert_not_called()
+        play.assert_called_once_with(app.MISSING_ISSUE_SCOPE_RESPONSE)
 
     def test_actionable_linear_issue_metadata_reaches_cursor(self) -> None:
         context = RequestContext(
@@ -389,7 +398,7 @@ class AppContextTests(unittest.TestCase):
             delivery_claims=mock.ANY,
         )
 
-    def test_focused_linear_issue_submits_despite_low_confidence(self) -> None:
+    def test_focused_linear_issue_does_not_submit_at_low_confidence(self) -> None:
         context = RequestContext(
             "work on this ticket\n\nIdentifier (untrusted external identifier): ENG-123",
             focused_issue="ENG-123",
@@ -408,20 +417,13 @@ class AppContextTests(unittest.TestCase):
                 app, "cursor_turn", return_value=("started", None)
             ) as cursor,
             mock.patch.object(app, "qwen_response") as qwen,
-            mock.patch.object(app, "stream_and_play"),
+            mock.patch.object(app, "stream_and_play") as play,
         ):
             app.respond("work on this ticket")
 
         qwen.assert_not_called()
-        cursor.assert_called_once_with(
-            CursorTurnRequest(
-                context.text,
-                utterance="work on this ticket",
-                context_repository=None,
-                issue_key="ENG-123",
-            ),
-            delivery_claims=mock.ANY,
-        )
+        cursor.assert_not_called()
+        play.assert_called_once_with(app.NON_ACTIONABLE_SUBMIT_RESPONSE)
 
 
 class CursorFastPathTests(unittest.TestCase):

@@ -9,6 +9,13 @@ from typing import Literal
 from .integrations.github import GitHubClient, GitHubError
 
 TicketSource = Literal["github", "linear"]
+MISSING_ISSUE_SCOPE_ERROR = (
+    "bare issue number requires an unambiguous issues-page scope"
+)
+MISSING_ISSUE_SCOPE_RESPONSE = (
+    "Those issue numbers are ambiguous. Open a repository-scoped issues page "
+    "or provide fully qualified references."
+)
 
 _GITHUB_URL = re.compile(
     r"https://(?:www\.)?github\.com/"
@@ -73,6 +80,15 @@ class TicketExtraction:
     @property
     def batch_requested(self) -> bool:
         return self.requested_count > 1
+
+    @property
+    def has_unresolved_scope(self) -> bool:
+        return any(
+            reference.scoped
+            and reference.canonical is None
+            and reference.error == MISSING_ISSUE_SCOPE_ERROR
+            for reference in self.references
+        )
 
 
 def _github_reference(
@@ -143,7 +159,7 @@ def _scoped_reference(
             None,
             None,
             scoped=True,
-            error="bare issue number requires an unambiguous issues-page scope",
+            error=MISSING_ISSUE_SCOPE_ERROR,
         )
     if scope_source == "github":
         try:

@@ -68,6 +68,67 @@ class QwenClientTests(unittest.TestCase):
         payload = json.loads(urlopen.call_args.args[0].data)
         self.assertNotIn("tools", payload)
         self.assertNotIn("tool_choice", payload)
+        system_prompt = payload["messages"][0]["content"]
+        self.assertIn("No executable tools are available", system_prompt)
+        self.assertNotIn("You have a Cursor coding tool", system_prompt)
+        self.assertNotIn("Never claim you lack tool access", system_prompt)
+
+    def test_tool_free_cursor_session_omits_operational_guidance(self) -> None:
+        with (
+            mock.patch.object(
+                llm.urllib.request,
+                "urlopen",
+                return_value=_response({"content": "Please clarify."}),
+            ) as urlopen,
+            redirect_stdout(io.StringIO()),
+        ):
+            answer, session = llm.qwen_turn(
+                "What next?",
+                cursor_session="123456789abc",
+                allow_tools=False,
+            )
+
+        payload = json.loads(urlopen.call_args.args[0].data)
+        system_prompt = payload["messages"][0]["content"]
+        self.assertNotIn("awaiting the user's reply", system_prompt)
+        self.assertEqual((answer, session), ("Please clarify.", "123456789abc"))
+
+    def test_tool_free_text_cannot_claim_work_started(self) -> None:
+        with (
+            mock.patch.object(
+                llm.urllib.request,
+                "urlopen",
+                return_value=_response(
+                    {
+                        "content": (
+                            "I'll start working on issues 92, 93, and 95 right away."
+                        )
+                    }
+                ),
+            ),
+            redirect_stdout(io.StringIO()),
+        ):
+            answer, session = llm.qwen_turn(
+                "work on issues 92, 93 and 95",
+                allow_tools=False,
+            )
+
+        self.assertEqual(answer, llm.TOOL_FREE_ACTION_RECOVERY)
+        self.assertIsNone(session)
+
+    def test_tool_enabled_text_requires_confirmed_tool_result(self) -> None:
+        with (
+            mock.patch.object(
+                llm.urllib.request,
+                "urlopen",
+                return_value=_response({"content": "I've submitted issue 92."}),
+            ),
+            redirect_stdout(io.StringIO()),
+        ):
+            answer, session = llm.qwen_turn("work on issue 92")
+
+        self.assertEqual(answer, llm.TOOL_FREE_ACTION_RECOVERY)
+        self.assertIsNone(session)
 
     def test_allow_tools_false_rejects_returned_tool_calls(self) -> None:
         message = {
@@ -139,7 +200,8 @@ class QwenClientTests(unittest.TestCase):
             'respond only with "I\'ve finished working on <identifier>"',
             system_prompt,
         )
-        self.assertIn("acknowledge it in one brief sentence", system_prompt)
+        self.assertIn("When a submission succeeds, acknowledge it", system_prompt)
+        self.assertIn("until the Cursor tool result confirms", system_prompt)
         self.assertEqual(payload["messages"][1], history[2])
         self.assertEqual(payload["messages"][-1], {"role": "user", "content": "hello"})
         self.assertEqual(payload["tools"], llm.QWEN_TOOLS)
@@ -191,7 +253,7 @@ class QwenClientTests(unittest.TestCase):
                 utterance=None,
                 action="submit",
                 job_id=None,
-                on_job_started=llm._notify_cursor_started,
+                on_job_started=mock.ANY,
             ),
             delivery_claims=None,
         )
@@ -206,6 +268,42 @@ class QwenClientTests(unittest.TestCase):
                 "content": "accepted",
             },
         )
+
+    def test_rejected_tool_result_cannot_be_rewritten_as_started(self) -> None:
+        tool_call = {
+            "id": "call-1",
+            "function": {
+                "name": "cursor",
+                "arguments": json.dumps(
+                    {"task": "fix issues 92 and 93", "action": "submit"}
+                ),
+            },
+        }
+        with (
+            mock.patch.object(
+                llm.urllib.request,
+                "urlopen",
+                side_effect=[
+                    _response({"content": None, "tool_calls": [tool_call]}),
+                    _response({"content": "I've submitted both issues."}),
+                ],
+            ),
+            mock.patch.object(
+                llm,
+                "cursor_turn",
+                return_value=(
+                    "Ticket starts: #92: rejected; #93: rejected.",
+                    None,
+                ),
+            ) as cursor_turn,
+            mock.patch.object(llm, "notify") as notify,
+            redirect_stdout(io.StringIO()),
+        ):
+            answer, session = llm.qwen_turn("work on issues 92 and 93")
+
+        self.assertEqual((answer, session), (llm.TOOL_FREE_ACTION_RECOVERY, None))
+        cursor_turn.assert_called_once()
+        notify.assert_not_called()
 
     def test_retries_without_replaying_malformed_tool_arguments(self) -> None:
         malformed_call = {
@@ -315,7 +413,7 @@ class QwenClientTests(unittest.TestCase):
                 utterance=None,
                 action="submit",
                 job_id=None,
-                on_job_started=llm._notify_cursor_started,
+                on_job_started=mock.ANY,
             ),
             delivery_claims=None,
         )
@@ -458,6 +556,34 @@ class QwenClientTests(unittest.TestCase):
         self.assertEqual((answer, session), ("Started.", "job-123"))
         self.assertEqual(chunks, ["Started."])
         cursor_turn.assert_called_once()
+
+    def test_venice_tool_free_claim_is_blocked_before_stream_callback(self) -> None:
+        settings = replace(
+            load_backend_settings({}),
+            llm_provider="venice",
+            llm_model="zai-org-glm-5-2",
+        )
+        with (
+            mock.patch.object(llm, "load_backend_settings", return_value=settings),
+            mock.patch.object(llm, "get_venice_api_key", return_value="secret"),
+            mock.patch.object(
+                llm.urllib.request,
+                "urlopen",
+                return_value=_stream_response(
+                    {"content": "Submitting a Cursor job for all three tickets."}
+                ),
+            ),
+            redirect_stdout(io.StringIO()),
+        ):
+            chunks: list[str] = []
+            answer, session = llm.qwen_turn(
+                "work on issues 92, 93 and 95",
+                on_text_chunk=chunks.append,
+                allow_tools=False,
+            )
+
+        self.assertEqual((answer, session), (llm.TOOL_FREE_ACTION_RECOVERY, None))
+        self.assertEqual(chunks, [llm.TOOL_FREE_ACTION_RECOVERY])
 
     def test_logs_payload_aggregated_response_and_tool_exchange(self) -> None:
         settings = replace(

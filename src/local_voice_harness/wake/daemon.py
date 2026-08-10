@@ -60,11 +60,19 @@ from ..cursor.delivery import (
 )
 from ..cursor.store import JobStore
 from ..errors import HarnessError
-from ..intent import ForkIntent, Intent, IntentRoute, decide_fork_intent, route_intent
+from ..intent import (
+    NON_ACTIONABLE_SUBMIT_RESPONSE,
+    ForkIntent,
+    Intent,
+    IntentRoute,
+    decide_fork_intent,
+    route_intent,
+)
 from ..llm import qwen_turn
 from ..notifications import notify
 from ..questions import AnswerProvenance, question_control
 from ..stt.client import transcribe
+from ..ticket_targets import MISSING_ISSUE_SCOPE_RESPONSE, extract_ticket_targets
 from ..tts.queue import PlaybackQueue, PlaybackRequest
 from ..vad import FRAME_BYTES, FRAME_MS, SAMPLE_RATE, SpeechDetector
 
@@ -352,7 +360,10 @@ class WakeConversationDaemon:
                 with self.component_lock:
                     start_components()
                     if load_backend_settings().llm_provider == "local":
-                        qwen_turn("Reply with only OK. Do not call a tool.")
+                        qwen_turn(
+                            "Reply with only OK. Do not call a tool.",
+                            allow_tools=False,
+                        )
                     log("LLM tool graph and TTS backend are warm")
             except Exception as exc:
                 self.activation_error = exc
@@ -867,7 +878,18 @@ class WakeConversationDaemon:
                 or context.github_pull_request
                 else {}
             )
-            if route.actionable and route.intent == Intent.AGENT_LIST:
+            extraction = extract_ticket_targets(
+                text,
+                scope_source=context.issue_scope_source,
+                scope=context.issue_scope,
+            )
+            missing_ticket_scope = extraction.has_unresolved_scope and route.intent in {
+                Intent.AGENT_SUBMIT,
+                Intent.UNCERTAIN,
+            }
+            if missing_ticket_scope:
+                response = MISSING_ISSUE_SCOPE_RESPONSE
+            elif route.actionable and route.intent == Intent.AGENT_LIST:
                 response, next_cursor_session = cursor_turn(
                     CursorTurnRequest(
                         "",
@@ -972,6 +994,8 @@ class WakeConversationDaemon:
                     ),
                     delivery_claims=delivery_claims,
                 )
+            elif route.intent == Intent.AGENT_SUBMIT:
+                response = NON_ACTIONABLE_SUBMIT_RESPONSE
             elif route.intent == Intent.AGENT_PR_UNSUPPORTED:
                 response = (
                     "I can't open pull requests. I can review the changes or run "

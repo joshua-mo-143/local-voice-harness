@@ -85,11 +85,23 @@ def test_bare_batch_without_scope_is_rejected_deterministically() -> None:
     extraction = extract_ticket_targets("Work on issues 12 and 18")
 
     assert extraction.batch_requested
+    assert extraction.has_unresolved_scope
     assert [reference.canonical for reference in extraction.references] == [None, None]
     assert all(
         reference.error == "bare issue number requires an unambiguous issues-page scope"
         for reference in extraction.references
     )
+
+
+def test_scoped_batch_does_not_report_unresolved_scope() -> None:
+    extraction = extract_ticket_targets(
+        "Work on issues 12 and 18",
+        scope_source="github",
+        scope="example/project",
+    )
+
+    assert extraction.batch_requested
+    assert not extraction.has_unresolved_scope
 
 
 def test_nonpositive_scoped_number_is_rejected() -> None:
