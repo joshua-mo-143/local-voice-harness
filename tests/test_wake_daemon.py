@@ -64,6 +64,7 @@ def _delivery_claim(
     *,
     result: str | None = None,
     question: str | None = None,
+    voice_question: dict[str, object] | None = None,
     token: str = "claim",
 ) -> DeliveryClaim:
     job_id = {
@@ -82,6 +83,8 @@ def _delivery_claim(
         values["result"] = result
     if question is not None:
         values["question"] = question
+    if voice_question is not None:
+        values["voice_question"] = voice_question
     if status in {"completed", "failed", "cancelled", "blocked"}:
         values["completed_at"] = 1
     if status == "failed":
@@ -916,6 +919,48 @@ class InboxIntentRoutingTests(unittest.TestCase):
 
 
 class AnnounceJobTests(unittest.TestCase):
+    def test_multiple_choice_announcement_numbers_stored_options(self) -> None:
+        daemon = _bare_daemon()
+        claim = _delivery_claim(
+            "job1",
+            "awaiting_user",
+            question="What should authorize irreversible audio deletion?",
+            voice_question={
+                "version": 1,
+                "id": "question-1",
+                "text": "What should authorize irreversible audio deletion?",
+                "kind": "multiple_choice",
+                "sensitivity": "architecture",
+                "origin": {
+                    "provider": "cursor",
+                    "job_id": "aaaaaaaaaaaa",
+                    "turn_token": "aaaaaaaaaaaa-1",
+                },
+                "choices": [
+                    {
+                        "id": "send-complete",
+                        "label": "Successful server send completion",
+                    },
+                    {
+                        "id": "client-ack",
+                        "label": "Explicit client acknowledgment",
+                    },
+                ],
+                "owner": "workflow",
+                "state": "pending",
+                "asked_at": 1,
+            },
+        )
+
+        response = daemon._job_response_text(claim.job)
+
+        self.assertEqual(
+            response,
+            "Cursor needs clarification. What should authorize irreversible "
+            "audio deletion? Option 1 is Successful server send completion. "
+            "Option 2 is Explicit client acknowledgment. Please choose one.",
+        )
+
     def test_play_response_finalizes_queued_job_announcements(self) -> None:
         daemon = _bare_daemon()
         job_batch = _playback_batch(

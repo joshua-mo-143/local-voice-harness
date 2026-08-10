@@ -35,6 +35,7 @@ from ..questions import (
     AnswerProvenance,
     QuestionState,
     choices_prompt,
+    question_prompt,
     resolve_answer,
 )
 from ..ticket_targets import TicketExtraction, TicketReference, extract_ticket_targets
@@ -598,7 +599,7 @@ def reply_job(
             provenance=answer_provenance,
         )
         if resolution.outcome == AnswerOutcome.REPEAT:
-            immediate = question.text
+            immediate = question_prompt(question)
             should_launch = False
             return None
         if resolution.outcome == AnswerOutcome.DEFERRED:
@@ -1501,12 +1502,14 @@ def _await_foreground(
             return CursorTurnResult(str(result or "").strip(), None)
         if job.status == JobStatus.AWAITING_USER:
             claimed = _defer_or_acknowledge(job_id, delivery_claims)
-            question = (
-                claimed.question or claimed.result
-                if claimed is not None
-                else job.question or job.result
+            awaiting = claimed if claimed is not None else job
+            pending = questions.current(awaiting)
+            rendered_question = (
+                question_prompt(pending)
+                if pending is not None
+                else str(awaiting.question or awaiting.result or "").strip()
             )
-            return CursorTurnResult(str(question or "").strip(), job_id)
+            return CursorTurnResult(rendered_question, job_id)
         if job.status == JobStatus.BLOCKED:
             claimed = _defer_or_acknowledge(job_id, delivery_claims)
             result = claimed.result if claimed is not None else job.result
