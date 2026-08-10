@@ -84,6 +84,59 @@ its isolated local worktree. PR worktrees are reused only by recovery or continu
 of the same job. Completed and cancelled worktrees are retained for inspection, while
 an invalid or partially prepared checkout is marked quarantined and is never dispatched.
 
+### Durable question broker
+
+Agent questions cross a provider-neutral broker contract before entering the Cursor
+job flow. A question records its type (free text or multiple choice), choices,
+decision sensitivity, provider, opaque job identity, and originating turn token.
+The initial Cursor adapter stores that versioned envelope in the same atomically
+replaced job JSON as `AWAITING_USER`; the legacy `question` and
+`clarification_kind` fields remain mirrored for voice and inbox compatibility.
+There is no sidecar transaction that can disagree with job state.
+
+Answers are compare-and-swap fenced by question identity and originating turn.
+Multiple-choice matching accepts only an exact choice identifier, exact spoken
+label, or unambiguous ordinal. Ambiguous and stale answers do not mutate or launch
+the job. Security, destructive, architecture, and product questions have no
+automatic/default answer path: only trusted user voice or user-text provenance can
+be recorded. Legacy plain-text questions have unspecified sensitivity and therefore
+use the same protected policy; automation provenance is rejected without mutation.
+“Answer later” leaves the question durably deferred, while “repeat” speaks the
+same pending question.
+
+An accepted agent answer preserves the original request and retained agent target.
+The answer continuation includes the original question and, for multiple choice,
+both the stable choice ID and spoken label. Before prompting, the worker persists a
+two-phase operation as `planned` with one immutable next-turn token. Immediately
+around subprocess launch it records the Herdr baseline sequence and advances through
+`submitted` and `observed`. Recovery reuses that turn: a planned operation is safe
+to retry, a proven observed operation is read without prompting, and a submitted
+operation is retried only after repeated proof that Herdr did not change. Missing or
+contradictory evidence blocks for manual attention rather than risking duplicate
+delivery. The answer and question remain durable until matching output resolves the
+operation.
+
+Cursor owner-specific transitions are selected by a typed handler registry. Built-in
+handlers cover agent continuation, local repository selection, GitHub repository
+selection, and fork confirmation. Unknown owners remain awaiting input without a
+worker launch. Workflow adapters such as tiered planning can register their own
+phase handler without adding planning concepts to the provider-neutral package.
+
+Wake routing obtains question text, owner, ID, and turn token from one immutable job
+snapshot and uses that same snapshot for intent context and answer fencing. Broker
+controls are forced only while that snapshot proves the job is awaiting the question.
+Herdr waiting polls `interactive_ready` while the prompt process runs. An unexpected
+questionnaire promptly blocks the job without sending keys or selecting an answer.
+Recovery performs read-only checks while it remains open; after the user manually
+closes it, the same agent and turn are queued for reconciliation-only output reading.
+Completion resolves the question; a new question replaces it; cancellation closes
+it atomically.
+
+The broker package imports neither Cursor nor Herdr. Provider adapters own their
+persistence and opaque resume handles, allowing OpenCode or tiered planning to use
+the same question and answer policy without putting workflow phases into the
+broker contract.
+
 After a completed job is announced, the wake conversation retains a bounded, one-shot
 reference to it. A referential follow-up within that window ("review the changes",
 "run the tests") starts a child job that reuses the completed parent's exact retained

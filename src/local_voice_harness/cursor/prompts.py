@@ -51,8 +51,14 @@ def cursor_prompt(
         "checkout. Herdr has already selected and opened the current checkout and agent "
         "pane. Do not create or switch Git worktrees, Herdr workspaces, tabs, or panes. "
         "Follow repository rules, keep changes scoped, and run relevant checks. "
-        f"If you need user input, end with exactly VOICE_QUESTION[{token}]: followed by one "
-        f"concise question. When finished, end with exactly VOICE_SUMMARY[{token}]: followed "
+        "Never open or use an interactive questionnaire UI. If you need user input, "
+        f"end with exactly VOICE_QUESTION[{token}]: followed by one compact JSON object: "
+        '{"version":1,"text":"one concise question","kind":"free_text" or '
+        '"multiple_choice","choices":[{"id":"stable-id","label":"spoken label"}],'
+        '"sensitivity":"routine" or "security" or "destructive" or "architecture" '
+        'or "product"}. Use an empty choices list for free text. Never choose a default '
+        "for security, destructive, architecture, or product decisions. "
+        f"When finished, end with exactly VOICE_SUMMARY[{token}]: followed "
         "by a plain-text summary of at most 20 words."
         f"{completion_instruction} Include only one marker.\n\n"
         f"User request: {text}{issue_context}"

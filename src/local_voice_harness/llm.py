@@ -14,6 +14,7 @@ from .config import load_backend_settings
 from .credentials import get_venice_api_key
 from .errors import HarnessError
 from .notifications import notify
+from .questions import AnswerProvenance
 
 SYSTEM_PROMPT = (
     "You are a fast conversational voice assistant. Every spoken answer must be complete and "
@@ -404,6 +405,11 @@ def qwen_turn(
                                     github_pull_request=github_pull_request,
                                     agent=agent,
                                     utterance=trusted_utterance,
+                                    answer_provenance=(
+                                        AnswerProvenance.USER_VOICE
+                                        if action == "reply"
+                                        else AnswerProvenance.USER_TEXT
+                                    ),
                                     action=action,
                                     job_id=job_id,
                                     on_job_started=_notify_cursor_started,
@@ -418,6 +424,11 @@ def qwen_turn(
                                     repository=repository,
                                     agent=agent,
                                     utterance=trusted_utterance,
+                                    answer_provenance=(
+                                        AnswerProvenance.USER_VOICE
+                                        if action == "reply"
+                                        else AnswerProvenance.USER_TEXT
+                                    ),
                                     action=action,
                                     job_id=job_id,
                                     on_job_started=_notify_cursor_started,

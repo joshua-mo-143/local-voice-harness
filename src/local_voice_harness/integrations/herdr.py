@@ -30,6 +30,7 @@ HERDR_WORKTREE_ROOT = Path(
 HOME_ROOT = REPOSITORY_ROOT
 SETTLED = {"idle", "done"}
 Checkpoint = Callable[[], None]
+PromptBoundary = Callable[[dict[str, Any]], None]
 ReserveAgent = Callable[["AgentSelection", bool], None]
 SettleAgent = Callable[["AgentSelection"], None]
 ReserveWorktree = Callable[[Path, str, Path, str], None]
@@ -740,10 +741,19 @@ class HerdrClient:
         token: str,
         timeout: float = 900,
         checkpoint: Checkpoint | None = None,
+        before_submit: PromptBoundary | None = None,
+        after_submit: PromptBoundary | None = None,
     ) -> PromptOutcome:
         if checkpoint is not None:
             checkpoint()
         before = self.get_agent(target)
+        if before.get("interactive_ready") is False:
+            raise HerdrError(
+                f"Herdr agent {target} is showing an interactive questionnaire",
+                code="interactive_questionnaire",
+            )
+        if before_submit is not None:
+            before_submit(before)
         if checkpoint is not None:
             checkpoint()
             checkpoint()
@@ -762,6 +772,8 @@ class HerdrClient:
             text=True,
         )
         try:
+            if after_submit is not None:
+                after_submit(before)
             if checkpoint is not None:
                 checkpoint()
             time.sleep(0.35)
@@ -770,6 +782,11 @@ class HerdrClient:
             current = self.get_agent(target)
             if checkpoint is not None:
                 checkpoint()
+            if current.get("interactive_ready") is False:
+                raise HerdrError(
+                    f"Herdr agent {target} opened an interactive questionnaire",
+                    code="interactive_questionnaire",
+                )
             if (
                 current.get("state_change_seq") == before.get("state_change_seq")
                 and current.get("agent_status") in SETTLED
@@ -779,7 +796,23 @@ class HerdrClient:
                 self.run_json("agent", "send-keys", target, "enter")
                 if checkpoint is not None:
                     checkpoint()
-            stdout, stderr = process.communicate(timeout=timeout + 10)
+            deadline = time.monotonic() + timeout + 10
+            while process.poll() is None:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise subprocess.TimeoutExpired(process.args, timeout + 10)
+                try:
+                    process.wait(timeout=min(1.0, remaining))
+                except subprocess.TimeoutExpired:
+                    if checkpoint is not None:
+                        checkpoint()
+                    current = self.get_agent(target)
+                    if current.get("interactive_ready") is False:
+                        raise HerdrError(
+                            f"Herdr agent {target} opened an interactive questionnaire",
+                            code="interactive_questionnaire",
+                        ) from None
+            stdout, stderr = process.communicate()
             if checkpoint is not None:
                 checkpoint()
         except Exception:
@@ -790,6 +823,11 @@ class HerdrClient:
             self.decode(stdout or stderr)
         result = self.decode(stdout)
         agent = dict(result.get("agent") or {})
+        if agent.get("interactive_ready") is False:
+            raise HerdrError(
+                f"Herdr agent {target} opened an interactive questionnaire",
+                code="interactive_questionnaire",
+            )
         output = self.run_text(
             "agent", "read", target, "--source", "recent-unwrapped", "--lines", "160"
         )
