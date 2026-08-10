@@ -9,16 +9,21 @@ import sys
 import threading
 import uuid
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
 from .. import config, recorder, vocabulary
 
 SOCKET_PATH = config.STT_SOCKET
+PROTOCOL_VERSION = 2
 MAX_REQUEST_BYTES = 4096
 ACCEPT_TIMEOUT_SECONDS = 0.5
 READ_TIMEOUT_SECONDS = 2.0
 MAX_CONNECTIONS = 16
+PROCESSING_DIRECTORY = "stt-processing"
+DELIVERED_DIRECTORY = "stt-delivered"
+QUARANTINE_DIRECTORY = "stt-quarantine"
 WHISPER_MODELS = frozenset(
     {
         "tiny",
@@ -100,9 +105,41 @@ LOCK = threading.Lock()
 
 
 class ProtocolError(Exception):
-    def __init__(self, code: str, message: str) -> None:
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        *,
+        retry_path: Path | None = None,
+        quarantine_path: Path | None = None,
+        preserved_path: Path | None = None,
+    ) -> None:
         super().__init__(message)
         self.code = code
+        self.retry_path = retry_path
+        self.quarantine_path = quarantine_path
+        self.preserved_path = preserved_path
+
+
+@dataclass(frozen=True)
+class TranscriptionRequest:
+    requested: Path
+    paths: recorder.RecorderPaths
+    version: int | None
+
+
+@dataclass(frozen=True)
+class AudioClaim:
+    original: Path
+    processing: Path
+    paths: recorder.RecorderPaths
+
+
+@dataclass(frozen=True)
+class RecoveryResult:
+    retry_path: Path | None = None
+    quarantine_path: Path | None = None
+    preserved_path: Path | None = None
 
 
 def log(message: str) -> None:
@@ -199,39 +236,32 @@ def load_transcriber() -> Transcriber:
 
 
 def _read_frame(connection: socket.socket) -> bytes:
-    request = bytearray()
+    frame = bytearray()
     while True:
         try:
-            chunk = connection.recv(min(4096, MAX_REQUEST_BYTES + 2 - len(request)))
+            chunk = connection.recv(min(4096, MAX_REQUEST_BYTES + 2 - len(frame)))
         except TimeoutError as exc:
             raise ProtocolError(
                 "request_timeout", "request was not completed before the deadline"
             ) from exc
         if not chunk:
             raise ProtocolError("incomplete_request", "request must end with a newline")
-        request.extend(chunk)
-        newline = request.find(b"\n")
+        frame.extend(chunk)
+        newline = frame.find(b"\n")
         if newline >= 0:
             if newline > MAX_REQUEST_BYTES:
                 raise ProtocolError("request_too_large", "request exceeds size limit")
-            if newline != len(request) - 1:
+            if newline != len(frame) - 1:
                 raise ProtocolError(
-                    "unexpected_data", "only one newline-delimited request is allowed"
+                    "unexpected_data", "only one newline-delimited frame is allowed"
                 )
-            return bytes(request[:newline])
-        if len(request) > MAX_REQUEST_BYTES:
+            return bytes(frame[:newline])
+        if len(frame) > MAX_REQUEST_BYTES:
             raise ProtocolError("request_too_large", "request exceeds size limit")
 
 
-def _parse_audio_path(frame: bytes) -> tuple[Path, recorder.RecorderPaths]:
-    try:
-        text = frame.decode("utf-8")
-    except UnicodeDecodeError as exc:
-        raise ProtocolError("invalid_encoding", "request must be valid UTF-8") from exc
-    if not text:
-        raise ProtocolError("invalid_request", "audio path is required")
-    requested = Path(text)
-    path_sets = tuple(
+def _recorder_path_sets() -> tuple[recorder.RecorderPaths, ...]:
+    return tuple(
         recorder.RecorderPaths(
             audio.parent,
             audio,
@@ -241,7 +271,15 @@ def _parse_audio_path(frame: bytes) -> tuple[Path, recorder.RecorderPaths]:
         )
         for audio in (config.WAV_PATH, config.DICTATION_WAV_PATH)
     )
-    for paths in path_sets:
+
+
+def _resolve_audio_path(
+    value: str,
+) -> tuple[Path, recorder.RecorderPaths]:
+    if not value:
+        raise ProtocolError("invalid_request", "audio path is required")
+    requested = Path(value)
+    for paths in _recorder_path_sets():
         if recorder.is_generation_path(paths, requested):
             return requested, paths
     raise ProtocolError(
@@ -249,16 +287,71 @@ def _parse_audio_path(frame: bytes) -> tuple[Path, recorder.RecorderPaths]:
     )
 
 
-def _claim_audio_path(requested: Path, paths: recorder.RecorderPaths) -> Path:
-    processing_dir = paths.state_dir / "stt-processing"
+def _parse_request(frame: bytes) -> TranscriptionRequest:
+    try:
+        text = frame.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise ProtocolError("invalid_encoding", "request must be valid UTF-8") from exc
+
+    try:
+        value = json.loads(text)
+    except json.JSONDecodeError:
+        requested, paths = _resolve_audio_path(text)
+        return TranscriptionRequest(requested, paths, None)
+
+    if not isinstance(value, dict):
+        raise ProtocolError("invalid_request", "request must be a JSON object")
+    if value.get("version") != PROTOCOL_VERSION:
+        raise ProtocolError("unsupported_protocol", "unsupported STT protocol version")
+    if value.get("type") != "transcribe":
+        raise ProtocolError("invalid_request", "request type must be transcribe")
+    audio_path = value.get("audio_path")
+    if not isinstance(audio_path, str):
+        raise ProtocolError("invalid_request", "audio_path must be a string")
+    requested, paths = _resolve_audio_path(audio_path)
+    return TranscriptionRequest(requested, paths, PROTOCOL_VERSION)
+
+
+def _prepare_private_directory(path: Path) -> None:
+    path.mkdir(mode=0o700, exist_ok=True)
+    metadata = path.lstat()
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid != os.getuid()
+        or metadata.st_mode & 0o077
+    ):
+        raise OSError(f"directory is not private and harness-owned: {path}")
+    path.chmod(0o700)
+
+
+def _quarantine_locked(
+    path: Path,
+    paths: recorder.RecorderPaths,
+    *,
+    reason: str,
+) -> Path:
+    quarantine_dir = paths.state_dir / QUARANTINE_DIRECTORY
+    _prepare_private_directory(quarantine_dir)
+    destination = quarantine_dir / path.name
+    if destination.exists() or destination.is_symlink():
+        destination = quarantine_dir / f"{path.stem}-{uuid.uuid4().hex}{path.suffix}"
+    path.rename(destination)
+    log(f"quarantined STT audio at {destination}: {reason}")
+    return destination
+
+
+def _claim_audio_path(requested: Path, paths: recorder.RecorderPaths) -> AudioClaim:
+    processing_dir = paths.state_dir / PROCESSING_DIRECTORY
     with recorder.recording_lock(paths.state_dir, paths.lock):
         try:
             generation_directory_metadata = paths.generations.lstat()
-            processing_dir.mkdir(mode=0o700, exist_ok=True)
-            directory_metadata = processing_dir.lstat()
+            metadata = requested.lstat()
+            _prepare_private_directory(processing_dir)
+        except FileNotFoundError as exc:
+            raise ProtocolError("audio_not_found", "audio file does not exist") from exc
         except OSError as exc:
             raise ProtocolError(
-                "invalid_audio_path", "audio processing directory is inaccessible"
+                "invalid_audio_path", "audio processing path is inaccessible"
             ) from exc
         if (
             not stat.S_ISDIR(generation_directory_metadata.st_mode)
@@ -270,14 +363,15 @@ def _claim_audio_path(requested: Path, paths: recorder.RecorderPaths) -> Path:
                 "audio generation directory must be private and harness-owned",
             )
         if (
-            not stat.S_ISDIR(directory_metadata.st_mode)
-            or directory_metadata.st_uid != os.getuid()
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.getuid()
+            or metadata.st_size <= 44
         ):
             raise ProtocolError(
                 "invalid_audio_path",
-                "audio processing directory must be harness-owned",
+                "audio path must be a non-empty harness-owned regular file",
             )
-        processing_dir.chmod(0o700)
+
         claimed = processing_dir / f"{requested.stem}-{uuid.uuid4().hex}.wav"
         try:
             requested.rename(claimed)
@@ -290,24 +384,250 @@ def _claim_audio_path(requested: Path, paths: recorder.RecorderPaths) -> Path:
         try:
             metadata = claimed.lstat()
         except OSError as exc:
-            claimed.unlink(missing_ok=True)
             raise ProtocolError(
-                "invalid_audio_path", "claimed audio file is inaccessible"
+                "invalid_audio_path",
+                "claimed audio file is inaccessible",
+                preserved_path=claimed,
             ) from exc
         if not stat.S_ISREG(metadata.st_mode) or metadata.st_uid != os.getuid():
-            claimed.unlink(missing_ok=True)
-            raise ProtocolError(
-                "invalid_audio_path", "audio path must be a harness-owned regular file"
+            quarantine = _quarantine_locked(
+                claimed, paths, reason="claimed audio failed ownership validation"
             )
-        return claimed
+            raise ProtocolError(
+                "invalid_audio_path",
+                "claimed audio failed ownership validation",
+                quarantine_path=quarantine,
+            )
+        try:
+            claimed.chmod(0o600)
+        except OSError as exc:
+            recovery = _restore_claim_locked(AudioClaim(requested, claimed, paths))
+            raise _recovery_error(
+                "invalid_audio_path",
+                "claimed audio permissions could not be secured",
+                recovery,
+            ) from exc
+        return AudioClaim(requested, claimed, paths)
+
+
+def _original_path_for_claim(
+    claim_path: Path, paths: recorder.RecorderPaths
+) -> Path | None:
+    stem, separator, claim_id = claim_path.stem.rpartition("-")
+    if not separator or re.fullmatch(r"[0-9a-f]{32}", claim_id) is None or not stem:
+        return None
+    original = paths.generations / f"{stem}{claim_path.suffix}"
+    if not recorder.is_generation_path(paths, original):
+        return None
+    return original
+
+
+def _restore_claim_locked(claim: AudioClaim) -> RecoveryResult:
+    try:
+        metadata = claim.processing.lstat()
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.getuid()
+            or metadata.st_size <= 44
+        ):
+            quarantine = _quarantine_locked(
+                claim.processing,
+                claim.paths,
+                reason="processing claim failed ownership validation",
+            )
+            return RecoveryResult(quarantine_path=quarantine)
+        _prepare_private_directory(claim.paths.generations)
+        os.link(claim.processing, claim.original, follow_symlinks=False)
+    except FileExistsError:
+        try:
+            processing_metadata = claim.processing.lstat()
+            original_metadata = claim.original.lstat()
+        except OSError as exc:
+            quarantine = _quarantine_locked(
+                claim.processing,
+                claim.paths,
+                reason=f"could not inspect restoration collision: {exc}",
+            )
+            return RecoveryResult(quarantine_path=quarantine)
+        if (
+            stat.S_ISREG(processing_metadata.st_mode)
+            and stat.S_ISREG(original_metadata.st_mode)
+            and processing_metadata.st_uid == os.getuid()
+            and original_metadata.st_uid == os.getuid()
+            and processing_metadata.st_size > 44
+            and original_metadata.st_size > 44
+            and processing_metadata.st_dev == original_metadata.st_dev
+            and processing_metadata.st_ino == original_metadata.st_ino
+        ):
+            try:
+                claim.processing.unlink()
+            except OSError as exc:
+                quarantine = _quarantine_locked(
+                    claim.processing,
+                    claim.paths,
+                    reason=f"partial restoration cleanup failed: {exc}",
+                )
+                return RecoveryResult(
+                    quarantine_path=quarantine,
+                    preserved_path=claim.original,
+                )
+            else:
+                return RecoveryResult(retry_path=claim.original)
+        quarantine = _quarantine_locked(
+            claim.processing,
+            claim.paths,
+            reason=f"restoration would overwrite {claim.original}",
+        )
+        return RecoveryResult(quarantine_path=quarantine)
+    except OSError as exc:
+        quarantine = _quarantine_locked(
+            claim.processing,
+            claim.paths,
+            reason=f"could not restore generation: {exc}",
+        )
+        return RecoveryResult(quarantine_path=quarantine)
+
+    try:
+        claim.processing.unlink()
+    except OSError as exc:
+        try:
+            claim.original.unlink()
+        except OSError as rollback_exc:
+            quarantine = _quarantine_locked(
+                claim.processing,
+                claim.paths,
+                reason=(
+                    f"processing cleanup failed ({exc}) and restoration rollback "
+                    f"failed ({rollback_exc})"
+                ),
+            )
+            return RecoveryResult(
+                quarantine_path=quarantine,
+                preserved_path=claim.original,
+            )
+        log(
+            f"restoration cleanup failed; STT audio retained at {claim.processing}: {exc}"
+        )
+        return RecoveryResult(preserved_path=claim.processing)
+    return RecoveryResult(retry_path=claim.original)
+
+
+def _restore_claim(claim: AudioClaim) -> RecoveryResult:
+    try:
+        with recorder.recording_lock(claim.paths.state_dir, claim.paths.lock):
+            result = _restore_claim_locked(claim)
+    except Exception as exc:
+        log(f"could not restore STT audio retained at {claim.processing}: {exc}")
+        return RecoveryResult(preserved_path=claim.processing)
+    if result.retry_path is not None:
+        log(f"restored retryable STT audio at {result.retry_path}")
+    return result
+
+
+def _commit_claim(claim: AudioClaim) -> None:
+    delivered_dir = claim.paths.state_dir / DELIVERED_DIRECTORY
+    delivered: Path | None = None
+    committed = False
+    try:
+        with recorder.recording_lock(claim.paths.state_dir, claim.paths.lock):
+            _prepare_private_directory(delivered_dir)
+            delivered = delivered_dir / claim.processing.name
+            if delivered.exists() or delivered.is_symlink():
+                raise FileExistsError(f"delivered claim already exists: {delivered}")
+            claim.processing.rename(delivered)
+            committed = True
+    except Exception as exc:
+        if not committed:
+            raise
+        log(f"STT delivery committed despite recording lock cleanup failure: {exc}")
+    assert delivered is not None
+    try:
+        delivered.unlink()
+    except OSError as exc:
+        log(
+            f"acknowledged STT audio retained for startup cleanup at {delivered}: {exc}"
+        )
+
+
+def _recovery_error(
+    code: str,
+    message: str,
+    recovery: RecoveryResult,
+) -> ProtocolError:
+    return ProtocolError(
+        code,
+        message,
+        retry_path=recovery.retry_path,
+        quarantine_path=recovery.quarantine_path,
+        preserved_path=recovery.preserved_path,
+    )
+
+
+def _recover_processing_directory(paths: recorder.RecorderPaths) -> None:
+    processing_dir = paths.state_dir / PROCESSING_DIRECTORY
+    if not processing_dir.exists():
+        return
+    _prepare_private_directory(processing_dir)
+    for processing in tuple(processing_dir.iterdir()):
+        original = _original_path_for_claim(processing, paths)
+        if original is None:
+            _quarantine_locked(
+                processing, paths, reason="processing filename is not recoverable"
+            )
+            continue
+        result = _restore_claim_locked(AudioClaim(original, processing, paths))
+        if result.retry_path is not None:
+            log(f"recovered retryable STT audio at {result.retry_path}")
+
+
+def _recover_delivered_directory(paths: recorder.RecorderPaths) -> None:
+    delivered_dir = paths.state_dir / DELIVERED_DIRECTORY
+    if not delivered_dir.exists():
+        return
+    _prepare_private_directory(delivered_dir)
+    for delivered in tuple(delivered_dir.iterdir()):
+        original = _original_path_for_claim(delivered, paths)
+        try:
+            metadata = delivered.lstat()
+        except OSError as exc:
+            log(f"could not inspect delivered STT audio at {delivered}: {exc}")
+            continue
+        if (
+            original is None
+            or not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.getuid()
+        ):
+            _quarantine_locked(
+                delivered, paths, reason="delivered claim failed validation"
+            )
+            continue
+        try:
+            delivered.unlink()
+        except OSError as exc:
+            log(f"could not finish delivered STT cleanup at {delivered}: {exc}")
+
+
+def recover_stranded_audio() -> None:
+    for paths in _recorder_path_sets():
+        with recorder.recording_lock(paths.state_dir, paths.lock):
+            _recover_processing_directory(paths)
+            _recover_delivered_directory(paths)
 
 
 def _error_response(error: ProtocolError) -> bytes:
+    details: dict[str, object] = {"code": error.code, "message": str(error)}
+    if error.retry_path is not None:
+        details["retry_path"] = str(error.retry_path)
+    if error.quarantine_path is not None:
+        details["quarantine_path"] = str(error.quarantine_path)
+    if error.preserved_path is not None:
+        details["preserved_path"] = str(error.preserved_path)
     return (
         json.dumps(
             {
                 "ok": False,
-                "error": {"code": error.code, "message": str(error)},
+                "version": PROTOCOL_VERSION,
+                "error": details,
             },
             separators=(",", ":"),
         ).encode()
@@ -316,45 +636,132 @@ def _error_response(error: ProtocolError) -> bytes:
 
 
 def _send(connection: socket.socket, payload: bytes) -> None:
+    connection.sendall(payload)
+
+
+def _send_error(connection: socket.socket, error: ProtocolError) -> None:
     try:
-        connection.sendall(payload)
-    except (BrokenPipeError, ConnectionResetError, TimeoutError):
-        pass
+        _send(connection, _error_response(error))
+    except OSError as exc:
+        log(f"could not deliver STT error response: {exc}")
+
+
+def _success_response(text: str, delivery_id: str) -> bytes:
+    return (
+        json.dumps(
+            {
+                "ok": True,
+                "version": PROTOCOL_VERSION,
+                "type": "transcript",
+                "delivery_id": delivery_id,
+                "text": text,
+            },
+            separators=(",", ":"),
+        ).encode()
+        + b"\n"
+    )
+
+
+def _validate_ack(frame: bytes, delivery_id: str) -> None:
+    try:
+        value = json.loads(frame)
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ProtocolError("invalid_ack", "acknowledgment must be valid JSON") from exc
+    if not isinstance(value, dict):
+        raise ProtocolError("invalid_ack", "acknowledgment must be a JSON object")
+    if (
+        value.get("version") != PROTOCOL_VERSION
+        or value.get("type") != "ack"
+        or value.get("delivery_id") != delivery_id
+    ):
+        raise ProtocolError(
+            "invalid_ack", "acknowledgment does not match the transcription"
+        )
 
 
 def handle_connection(connection: socket.socket, transcriber: Transcriber) -> None:
     connection.settimeout(READ_TIMEOUT_SECONDS)
-    audio_path: Path | None = None
+    claim: AudioClaim | None = None
+    slot_acquired = False
     try:
         try:
-            requested, paths = _parse_audio_path(_read_frame(connection))
+            request = _parse_request(_read_frame(connection))
             if not LOCK.acquire(blocking=False):
                 raise ProtocolError(
                     "server_busy", "another transcription is already active"
                 )
+            slot_acquired = True
             try:
-                audio_path = _claim_audio_path(requested, paths)
-                text = normalize(transcriber.transcribe(str(audio_path)))
-            finally:
-                LOCK.release()
+                claim = _claim_audio_path(request.requested, request.paths)
+                text = normalize(transcriber.transcribe(str(claim.processing)))
+            except ProtocolError:
+                raise
+            except Exception as exc:
+                log(f"transcription failed: {exc}")
+                recovery = (
+                    _restore_claim(claim) if claim is not None else RecoveryResult()
+                )
+                claim = None
+                raise _recovery_error(
+                    "transcription_failed",
+                    f"{type(exc).__name__}: {exc}",
+                    recovery,
+                ) from exc
         except ProtocolError as exc:
-            _send(connection, _error_response(exc))
+            _send_error(connection, exc)
             return
-        except Exception as exc:
-            log(f"transcription failed: {exc}")
-            _send(
+
+        assert claim is not None
+        if request.version is None:
+            try:
+                _send(connection, text.encode())
+            except OSError as exc:
+                log(f"legacy STT response delivery failed: {exc}")
+            recovery = _restore_claim(claim)
+            claim = None
+            if recovery.retry_path is None:
+                log("legacy STT audio could not be restored to its retry generation")
+            return
+
+        delivery_id = uuid.uuid4().hex
+        try:
+            _send(connection, _success_response(text, delivery_id))
+        except OSError as exc:
+            log(f"STT response delivery failed: {exc}")
+            return
+
+        try:
+            _validate_ack(_read_frame(connection), delivery_id)
+        except ProtocolError as exc:
+            recovery = _restore_claim(claim)
+            claim = None
+            _send_error(
                 connection,
-                _error_response(
-                    ProtocolError(
-                        "transcription_failed", f"{type(exc).__name__}: {exc}"
-                    )
+                _recovery_error(exc.code, str(exc), recovery),
+            )
+            return
+
+        try:
+            _commit_claim(claim)
+        except Exception as exc:
+            log(f"could not commit acknowledged STT audio deletion: {exc}")
+            recovery = _restore_claim(claim)
+            claim = None
+            _send_error(
+                connection,
+                _recovery_error(
+                    "delivery_commit_failed",
+                    "transcription was received but audio cleanup could not be committed",
+                    recovery,
                 ),
             )
             return
-        _send(connection, text.encode())
+        claim = None
     finally:
-        if audio_path is not None:
-            audio_path.unlink(missing_ok=True)
+        if claim is not None:
+            _restore_claim(claim)
+        if slot_acquired:
+            LOCK.release()
         connection.close()
 
 
@@ -391,12 +798,10 @@ def serve(
                 threads = {thread for thread in threads if thread.is_alive()}
                 continue
             if not slots.acquire(blocking=False):
-                _send(
+                _send_error(
                     connection,
-                    _error_response(
-                        ProtocolError(
-                            "server_busy", "too many incomplete requests are active"
-                        )
+                    ProtocolError(
+                        "server_busy", "too many incomplete requests are active"
                     ),
                 )
                 connection.close()
@@ -412,6 +817,7 @@ def serve(
 
 
 def main() -> None:
+    recover_stranded_audio()
     transcriber = load_transcriber()
     log(
         f"model ready (backend={BACKEND}, model={MODEL_NAME}, "

@@ -234,10 +234,24 @@ strictly named UUID generations beneath the two harness recording directories.
 Stopping capture atomically moves the writable WAV to its immutable generation while
 the recorder lock is still held; wake-mode recording performs the same handoff. A
 later capture only replaces the writable path. After acquiring the model slot, STT
-atomically moves that generation to a unique private processing path and removes only
-the claimed file after the attempt. Cancellation removes writable audio after
-recorder termination is confirmed. Recorder ownership includes the Linux process
-start identity as well as its PID; it is not durable across login sessions.
+atomically moves that generation to a unique private processing path. The bundled
+client and server use versioned newline-delimited JSON: the server sends a complete
+transcript and unique delivery ID, and the client acknowledges that ID only after
+parsing the transcript. A matching acknowledgment atomically commits the claim to a
+delivered path before cleanup; backend failures, response failures, disconnects,
+timeouts, and invalid acknowledgments restore the original retryable generation
+without overwriting another file.
+
+Before loading the model, STT startup restores valid processing claims and finishes
+cleanup of delivered claims. Recovery recognizes a partially completed hard-link
+restore, while malformed claims and conflicting destination files move to a private
+`stt-quarantine` directory whose exact path is logged. The dictation runtime directory
+is preserved across service restarts so this recovery can run; all recording state
+remains session-scoped and is removed when `$XDG_RUNTIME_DIR` is retired. Legacy
+path-only clients receive their transcript but do not authorize deletion, so the new
+server restores those unacknowledged generations. Cancellation removes writable audio
+after recorder termination is confirmed. Recorder ownership includes the Linux
+process start identity as well as its PID; it is not durable across login sessions.
 
 The wake-service journal records user and assistant text, raw LLM request payloads,
 aggregated responses, and tool-call arguments and results for diagnostics. These logs

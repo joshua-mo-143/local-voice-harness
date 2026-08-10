@@ -355,6 +355,9 @@ The package includes a dictation backend for fresh installs, but cleanup does no
 replace an active standalone service such as `~/.local/share/dictation`. The service
 installer reports that it preserved the existing unit. The wake daemon continues to
 use the same `$XDG_RUNTIME_DIR/dictation.sock`, so both backends are protocol
-compatible. Preservation also means the standalone unit may retain unrestricted
+compatible: the client detects a legacy server and retries once with the path-only
+request. That fallback cannot provide the bundled versioned protocol's explicit
+transcript acknowledgment, crash recovery, or guarantee that failed delivery retains
+audio. Preservation also means the standalone unit may retain unrestricted
 environment-file or sandbox behavior. It is not hardened merely because the other
 voice-harness units were updated.
