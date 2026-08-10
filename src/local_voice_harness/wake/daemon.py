@@ -15,6 +15,11 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .. import recorder
+from ..agents.model import AgentJob as CursorJob
+from ..agents.model import JobStatus
+from ..agents.service import AgentTurnRequest as CursorTurnRequest
+from ..agents.service import agent_turn as cursor_turn
+from ..agents.service import recover_jobs
 from ..browser_context import request_context
 from ..components import start_components, stop_components
 from ..config import (
@@ -35,6 +40,7 @@ from ..config import (
     WAV_PATH,
     load_backend_settings,
 )
+from ..cursor import questions as cursor_questions
 from ..cursor import service as cursor_service
 from ..cursor.delivery import (
     DeliveryClaim,
@@ -52,13 +58,12 @@ from ..cursor.delivery import (
 from ..cursor.delivery import (
     release_delivery as release_claim,
 )
-from ..cursor.model import CursorJob, JobStatus
-from ..cursor.service import CursorTurnRequest, cursor_turn, recover_jobs
 from ..cursor.store import JobStore
 from ..errors import HarnessError
-from ..intent import ForkIntent, Intent, decide_fork_intent, route_intent
+from ..intent import ForkIntent, Intent, IntentRoute, decide_fork_intent, route_intent
 from ..llm import qwen_turn
 from ..notifications import notify
+from ..questions import AnswerProvenance, question_control
 from ..stt.client import transcribe
 from ..tts.queue import PlaybackQueue, PlaybackRequest
 from ..vad import FRAME_BYTES, FRAME_MS, SAMPLE_RATE, SpeechDetector
@@ -157,6 +162,15 @@ class CompletedFollowup:
     job_id: str
     completed_at: float | None
     expires_at: float
+
+
+@dataclass(frozen=True, slots=True)
+class PendingQuestionSnapshot:
+    job_id: str
+    text: str
+    owner: str
+    question_id: str
+    turn_token: str
 
 
 def log(message: str) -> None:
@@ -661,10 +675,10 @@ class WakeConversationDaemon:
             return None
         return followup
 
-    def _pending_cursor_clarification(self) -> tuple[str | None, str | None]:
-        """Return trusted clarification context for the active Cursor session."""
+    def _pending_cursor_question(self) -> PendingQuestionSnapshot | None:
+        """Load one immutable question snapshot for routing and answer fencing."""
         if self.cursor_session is None:
-            return None, None
+            return None
         try:
             job = CURSOR_STORE.get(self.cursor_session)
         except Exception as exc:  # noqa: BLE001 - routing must fail closed
@@ -672,10 +686,19 @@ class WakeConversationDaemon:
                 "clarification context unavailable for "
                 f"{self.cursor_session}: {type(exc).__name__}: {exc}"
             )
-            return None, None
+            return None
         if job.status != JobStatus.AWAITING_USER:
-            return None, None
-        return job.question, job.clarification_kind
+            return None
+        question = cursor_questions.current(job)
+        if question is None:
+            return None
+        return PendingQuestionSnapshot(
+            job_id=job.id,
+            text=question.text,
+            owner=question.owner,
+            question_id=question.id,
+            turn_token=question.origin.turn_token,
+        )
 
     def _finish_job_playback(
         self,
@@ -816,15 +839,17 @@ class WakeConversationDaemon:
             interruption: BargeIn | None = None
             context = request_context(text)
             active_completed = self._active_completed_followup()
-            pending_question, clarification_kind = self._pending_cursor_clarification()
+            pending = self._pending_cursor_question()
             route = route_intent(
                 text,
                 context,
-                cursor_session=self.cursor_session,
-                pending_question=pending_question,
-                clarification_kind=clarification_kind,
+                cursor_session=pending.job_id if pending is not None else None,
+                pending_question=pending.text if pending is not None else None,
+                clarification_kind=pending.owner if pending is not None else None,
                 recent_completion=active_completed is not None,
             )
+            if pending is not None and question_control(text) is not None:
+                route = IntentRoute(Intent.AGENT_REPLY, "high")
             if route.actionable and route.intent == Intent.END_CONVERSATION:
                 return self.end_conversation()
             fork_requested = decide_fork_intent(text) == ForkIntent.AFFIRMATIVE
@@ -842,7 +867,7 @@ class WakeConversationDaemon:
                 or context.github_pull_request
                 else {}
             )
-            if route.actionable and route.intent == Intent.CURSOR_LIST:
+            if route.actionable and route.intent == Intent.AGENT_LIST:
                 response, next_cursor_session = cursor_turn(
                     CursorTurnRequest(
                         "",
@@ -851,7 +876,7 @@ class WakeConversationDaemon:
                     ),
                     delivery_claims=delivery_claims,
                 )
-            elif route.actionable and route.intent == Intent.CURSOR_CANCEL:
+            elif route.actionable and route.intent == Intent.AGENT_CANCEL:
                 response, next_cursor_session = cursor_turn(
                     CursorTurnRequest(
                         text,
@@ -862,7 +887,7 @@ class WakeConversationDaemon:
                     ),
                     delivery_claims=delivery_claims,
                 )
-            elif route.actionable and route.intent == Intent.CURSOR_STATUS:
+            elif route.actionable and route.intent == Intent.AGENT_STATUS:
                 response, next_cursor_session = cursor_turn(
                     CursorTurnRequest(
                         text,
@@ -874,39 +899,65 @@ class WakeConversationDaemon:
                     delivery_claims=delivery_claims,
                 )
             elif route.actionable and route.intent in {
-                Intent.CURSOR_DISMISS,
-                Intent.CURSOR_REPEAT,
+                Intent.AGENT_DISMISS,
+                Intent.AGENT_REPEAT,
             }:
+                action = (
+                    "reply"
+                    if route.intent == Intent.AGENT_REPEAT and pending is not None
+                    else (
+                        "dismiss" if route.intent == Intent.AGENT_DISMISS else "repeat"
+                    )
+                )
                 response, next_cursor_session = cursor_turn(
                     CursorTurnRequest(
                         text,
                         self.cursor_session,
-                        action=(
-                            "dismiss"
-                            if route.intent == Intent.CURSOR_DISMISS
-                            else "repeat"
-                        ),
+                        utterance=text if action == "reply" else None,
+                        action=action,
                         job_id=self.cursor_session,
                         reference=text,
+                        expected_question_id=(
+                            pending.question_id
+                            if action == "reply" and pending is not None
+                            else None
+                        ),
+                        expected_question_turn=(
+                            pending.turn_token
+                            if action == "reply" and pending is not None
+                            else None
+                        ),
+                        answer_provenance=(
+                            AnswerProvenance.USER_VOICE
+                            if action == "reply"
+                            else AnswerProvenance.USER_TEXT
+                        ),
                     ),
                     delivery_claims=delivery_claims,
                 )
             elif (
                 route.actionable
-                and route.intent == Intent.CURSOR_REPLY
-                and self.cursor_session is not None
+                and route.intent == Intent.AGENT_REPLY
+                and pending is not None
             ):
                 response, next_cursor_session = cursor_turn(
                     CursorTurnRequest(
                         context.text,
-                        self.cursor_session,
+                        pending.job_id,
                         utterance=text,
                         action="reply",
-                        job_id=self.cursor_session,
+                        job_id=pending.job_id,
+                        expected_question_id=(
+                            pending.question_id if pending is not None else None
+                        ),
+                        expected_question_turn=(
+                            pending.turn_token if pending is not None else None
+                        ),
+                        answer_provenance=AnswerProvenance.USER_VOICE,
                     ),
                     delivery_claims=delivery_claims,
                 )
-            elif route.actionable and route.intent == Intent.CURSOR_SUBMIT:
+            elif route.actionable and route.intent == Intent.AGENT_SUBMIT:
                 # Explicit new work invalidates any retained completed-job slot.
                 self.completed_followup = None
                 response, next_cursor_session = cursor_turn(
@@ -918,12 +969,12 @@ class WakeConversationDaemon:
                     ),
                     delivery_claims=delivery_claims,
                 )
-            elif route.intent == Intent.CURSOR_PR_UNSUPPORTED:
+            elif route.intent == Intent.AGENT_PR_UNSUPPORTED:
                 response = (
                     "I can't open pull requests. I can review the changes or run "
                     "the tests in that checkout instead."
                 )
-            elif route.actionable and route.intent == Intent.CURSOR_FOLLOWUP:
+            elif route.actionable and route.intent == Intent.AGENT_FOLLOWUP:
                 current_completed = self._active_completed_followup()
                 if (
                     self.cursor_session is not None

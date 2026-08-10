@@ -58,12 +58,18 @@ cursor_followup = true
 ```
 
 Fresh installations default the optional `zendesk` and `linear` integrations to
-disabled. The `[integrations] zendesk` flag is enforced by the browser
-context-provider registry: while it is disabled, Zendesk URLs are not inspected
-and no page text is copied; existing installations preserve prior behaviour by
-setting `zendesk = true` (or `VOICE_HARNESS_INTEGRATION_ZENDESK=1`). Invalid
-values (an unknown provider, an out-of-range TTS speed or wake threshold, an
-unknown section or key, a malformed playback latency, and so on) raise an
+disabled. While disabled, their URLs are not recognized and they contribute no
+context, routing, agent instructions, or diagnostics. Existing installations can
+preserve prior behavior by enabling the corresponding key or
+`VOICE_HARNESS_INTEGRATION_*` override.
+
+The initial Linear connector requires the `cursor-mcp` harness capability and an
+enabled Linear MCP server. Enable it with `linear = true`, then run
+`agent mcp login linear && agent mcp enable linear`. `voice-harness doctor`
+reports a fatal, actionable configuration result when Linear is enabled without
+that capability, and a Linear job is rejected before it is persisted or dispatched.
+Invalid values (an unknown provider, an out-of-range TTS speed or wake threshold,
+an unknown section or key, a malformed playback latency, and so on) raise an
 actionable error rather than being silently ignored. Writes are atomic: the file
 is written to a temporary sibling and renamed into place with owner-only (`0600`)
 permissions.

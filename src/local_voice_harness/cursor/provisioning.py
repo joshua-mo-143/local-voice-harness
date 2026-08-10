@@ -18,10 +18,24 @@ from ..integrations.herdr import (
     AgentSelection,
     HerdrClient,
     HerdrError,
-    extract_linear_issue,
     extract_marker,
     normalize_name,
 )
+from ..integrations.registry import (
+    prompt_instructions,
+    require_issue_capabilities,
+    resolve_issue_reference,
+    route_issue_repository,
+)
+from ..questions import (
+    PromptOperationState,
+    QuestionError,
+    QuestionSensitivity,
+    QuestionSpec,
+    QuestionState,
+    parse_question_spec,
+)
+from . import questions as question_adapter
 from . import recovery, worker_lifecycle
 from .model import (
     ACTIVE_STATUSES as MODEL_ACTIVE_STATUSES,
@@ -135,19 +149,44 @@ def complete_from_output(
     summary_position = output.rfind(f"VOICE_SUMMARY[{token}]")
     question_position = output.rfind(f"VOICE_QUESTION[{token}]")
     if question and question_position > summary_position:
-        return job.evolve_for_delivery(
+        try:
+            spec = parse_question_spec(question)
+        except QuestionError as exc:
+            return job.evolve_for_delivery(
+                now=completed_at,
+                status=JobStatus.BLOCKED,
+                result=f"Cursor returned an invalid voice question: {exc}",
+                completed_at=completed_at,
+            )
+        return question_adapter.ask(
+            job,
+            spec,
+            owner="agent",
+            turn_token=token,
             now=completed_at,
-            status=JobStatus.AWAITING_USER,
-            question=question,
-            result=question,
-            clarification_kind="agent",
         )
+    pending = question_adapter.current(job)
+    resolved_question = (
+        question_adapter.envelope(
+            pending,
+            QuestionState.RESOLVED,
+            prompt_state=(
+                PromptOperationState.RESOLVED
+                if pending.prompt_state is not None
+                else None
+            ),
+        )
+        if pending is not None
+        and pending.state in {QuestionState.ANSWERED, QuestionState.DISPATCHING}
+        else job.voice_question
+    )
     if summary and summary_position > question_position:
         return job.evolve_for_delivery(
             now=completed_at,
             status=JobStatus.COMPLETED,
             result=summary,
             completed_at=completed_at,
+            voice_question=resolved_question,
         )
     return job.evolve_for_delivery(
         now=completed_at,
@@ -157,6 +196,7 @@ def complete_from_output(
             f"it settled as {agent_status} without a voice summary."
         ),
         completed_at=completed_at,
+        voice_question=resolved_question,
     )
 
 
@@ -222,18 +262,18 @@ def _worker_question(
     clarification_kind: str,
 ) -> None:
     def ask(job: CursorJob) -> CursorJob:
-        return job.evolve_for_delivery(
-            now=time.time(),
-            status=JobStatus.AWAITING_USER,
-            remove=frozenset({"reconcile"}),
-            question=question,
-            result=question,
-            clarification_kind=clarification_kind,
-            prompt_operation_state="none",
-            worker_pid=None,
-            worker_boot_id=None,
-            worker_process_start=None,
-            worker_token=None,
+        now = time.time()
+        return question_adapter.ask(
+            job,
+            QuestionSpec(
+                question,
+                sensitivity=QuestionSensitivity.ROUTINE,
+            ),
+            owner=clarification_kind,
+            turn_token=job.turn_token or f"{job.id}-routing-{job.turn}",
+            now=now,
+            clear_worker=True,
+            remove_reconcile=True,
         )
 
     _worker_change(store, job_id, token, {JobStatus.ROUTING, JobStatus.RUNNING}, ask)
@@ -263,14 +303,16 @@ def _worker_complete(
                 JobStatus.COMPLETED,
                 now=now,
                 result=outcome.result or "",
+                voice_question=outcome.voice_question,
             )
         return job.evolve(
             status=outcome.status,
-            remove=frozenset({"reconcile"}),
+            remove=frozenset({"reconcile", "continuation", "continuation_answer"}),
             result=outcome.result,
             error=outcome.error,
             question=outcome.question,
             clarification_kind=outcome.clarification_kind,
+            voice_question=outcome.voice_question,
             completed_at=outcome.completed_at,
             updated_at=outcome.updated_at,
             delivered=job.delivered if preserve else outcome.delivered,
@@ -331,7 +373,10 @@ def _worker_fail(
     job_id: str,
     token: str,
     exc: Exception,
+    *,
+    target_may_be_active: bool = False,
 ) -> None:
+    del target_may_be_active  # Terminal intent always retains the cleanup fence.
     message = (str(exc) or type(exc).__name__)[:500]
 
     def fail(job: CursorJob) -> CursorJob:
@@ -354,6 +399,56 @@ def _worker_fail(
         return fail(job)
 
     store.update(job_id, guarded)
+
+
+def _worker_block_interactive(
+    store: JobStore,
+    job_id: str,
+    token: str,
+    message: str,
+) -> None:
+    def block(job: CursorJob) -> CursorJob:
+        now = time.time()
+        return job.evolve_for_delivery(
+            now=now,
+            status=JobStatus.BLOCKED,
+            result=message,
+            completed_at=now,
+            next_reconcile_at=now + DELIVERY_RETRY_SECONDS,
+            interactive_questionnaire_blocked=True,
+            worker_pid=None,
+            worker_boot_id=None,
+            worker_process_start=None,
+            worker_token=None,
+        )
+
+    _worker_change(store, job_id, token, MODEL_WORKER_STATUSES, block)
+
+
+def _worker_error(
+    store: JobStore,
+    job_id: str,
+    token: str,
+    exc: Exception,
+    *,
+    prompt_may_be_active: bool,
+) -> None:
+    if isinstance(exc, HerdrError) and exc.code == "interactive_questionnaire":
+        _worker_block_interactive(
+            store,
+            job_id,
+            token,
+            "Cursor opened an interactive questionnaire and is blocked for "
+            "manual attention.",
+        )
+        return
+    _worker_fail(
+        store,
+        job_id,
+        token,
+        exc,
+        target_may_be_active=prompt_may_be_active,
+    )
 
 
 def _pull_request_branch(job: CursorJob) -> str:
@@ -970,20 +1065,24 @@ def _workflow_question(
     *,
     clarification_kind: str = "workflow",
 ) -> None:
+    try:
+        spec = parse_question_spec(question)
+    except QuestionError:
+        spec = QuestionSpec(question, sensitivity=QuestionSensitivity.ROUTINE)
+
     def ask(job: CursorJob) -> CursorJob:
-        return job.evolve_for_delivery(
-            now=time.time(),
-            status=JobStatus.AWAITING_USER,
-            remove=frozenset({"reconcile"}),
-            question=question[:500],
-            result=question[:500],
-            clarification_kind=clarification_kind,
+        now = time.time()
+        asked = question_adapter.ask(
+            job,
+            spec,
+            owner=clarification_kind,
+            turn_token=job.turn_token or token,
+            now=now,
+            clear_worker=True,
+            remove_reconcile=True,
             prompt_operation_state="none",
-            worker_pid=None,
-            worker_boot_id=None,
-            worker_process_start=None,
-            worker_token=None,
         )
+        return asked
 
     _worker_change(store, job_id, token, MODEL_WORKER_STATUSES, ask)
 
@@ -1315,6 +1414,8 @@ def _advance_workflow_output(
                 worker_token,
                 MODEL_WORKER_STATUSES,
                 lambda current: current.evolve(
+                    request=_request_with_clarification(current),
+                    remove=frozenset({"continuation", "continuation_answer"}),
                     workflow_tier=promoted.value,
                     workflow_classification_reason=classification_reason[:500],
                     workflow_phase=WorkflowPhase.PLANNING.value,
@@ -1728,7 +1829,11 @@ def _execute_phase_prompt(
             before_submit=before_submit,
             accepted=accepted,
         )
-    except HerdrError:
+    except HerdrError as exc:
+        if exc.code == "interactive_questionnaire":
+            current = store.get(job.id)
+            if current.prompt_operation_state == "planned":
+                raise
         # Third-party/test clients that fail before invoking the callback still
         # crossed the call boundary. Conservatively fence the operation.
         store.update(
@@ -1799,11 +1904,14 @@ def _run_tiered_workflow(
                 return
             job = next_turn
             token = job.turn_token or ""
+        active_issue_key = resolve_issue_reference(job.issue_key)
+        integration_instructions = prompt_instructions(active_issue_key)
         if phase == WorkflowPhase.CLASSIFYING:
             prompt = classification_prompt(
                 job.request,
                 token,
                 github_issue_context=job.github_issue_context,
+                integration_instructions=integration_instructions,
             )
         elif phase == WorkflowPhase.PLANNING:
             assert job.workflow_tier is not None
@@ -1813,6 +1921,7 @@ def _run_tiered_workflow(
                 tier=job.workflow_tier.value,
                 github_issue_context=job.github_issue_context,
                 classification_reason=job.workflow_classification_reason,
+                integration_instructions=integration_instructions,
             )
         elif phase == WorkflowPhase.REVIEWING:
             if not job.plan_artifact or job.workflow_tier is None:
@@ -1825,6 +1934,7 @@ def _run_tiered_workflow(
                 tier=job.workflow_tier.value,
                 github_issue_context=job.github_issue_context,
                 classification_reason=job.workflow_classification_reason,
+                integration_instructions=integration_instructions,
             )
         elif phase == WorkflowPhase.REVISING:
             if not job.plan_artifact or not job.review_artifact:
@@ -1838,6 +1948,7 @@ def _run_tiered_workflow(
                 token,
                 github_issue_context=job.github_issue_context,
                 classification_reason=job.workflow_classification_reason,
+                integration_instructions=integration_instructions,
             )
         elif phase == WorkflowPhase.IMPLEMENTING:
             plan = (
@@ -1846,16 +1957,17 @@ def _run_tiered_workflow(
                 else None
             )
             prompt = implementation_prompt(
-                job.request,
+                _prompt_request(job),
                 token,
                 plan=plan,
-                continuation=job.continuation,
+                continuation=job.continuation or bool(job.continuation_answer),
                 github_issue_context=job.github_issue_context,
                 classification_reason=job.workflow_classification_reason,
                 issue_reference=(
                     job.issue_key
                     or (f"issue {job.github_issue}" if job.github_issue else None)
                 ),
+                integration_instructions=integration_instructions,
             )
         else:
             raise HarnessError(f"unsupported workflow phase {phase.value}")
@@ -1873,6 +1985,121 @@ def _run_tiered_workflow(
             return
 
 
+def _begin_prompt_turn(job: CursorJob, turn: int, turn_token: str) -> CursorJob:
+    question = question_adapter.current(job)
+    question_envelope = job.voice_question
+    if job.continuation:
+        if (
+            question is not None
+            and question.state == QuestionState.DISPATCHING
+            and question.dispatch_token == turn_token
+        ):
+            question_envelope = question.to_dict()
+        elif (
+            question is None
+            or question.state != QuestionState.ANSWERED
+            or question.origin.job_id != job.id
+            or question.origin.turn_token != job.turn_token
+        ):
+            raise HarnessError(
+                "Cursor clarification no longer matches its originating turn"
+            )
+        else:
+            question_envelope = question_adapter.envelope(
+                question,
+                QuestionState.DISPATCHING,
+                dispatch_token=turn_token,
+                prompt_state=PromptOperationState.PLANNED,
+                prompt_baseline_seq=None,
+                prompt_submitted_at=None,
+                prompt_absent_observations=0,
+            )
+    elif question is not None and question.state == QuestionState.ANSWERED:
+        question_envelope = question_adapter.envelope(question, QuestionState.RESOLVED)
+    return job.evolve(
+        turn=turn,
+        turn_token=turn_token,
+        voice_question=question_envelope,
+        workflow_turn_phase=job.workflow_phase.value,
+    )
+
+
+def _prompt_turn_identity(job: CursorJob) -> tuple[int, str]:
+    question = question_adapter.current(job)
+    if (
+        job.continuation
+        and question is not None
+        and question.state == QuestionState.DISPATCHING
+        and question.dispatch_token
+    ):
+        return job.turn, question.dispatch_token
+    turn = job.turn + 1
+    return turn, f"{job.id}-{turn}"
+
+
+def _state_change_sequence(agent: dict[str, object]) -> int | None:
+    value = agent.get("state_change_seq")
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def _mark_prompt_boundary(
+    store: JobStore,
+    job_id: str,
+    worker_token: str,
+    turn_token: str,
+    *,
+    state: PromptOperationState,
+    agent: dict[str, object],
+) -> None:
+    def mark(job: CursorJob) -> CursorJob:
+        question = question_adapter.current(job)
+        if (
+            question is None
+            or question.state != QuestionState.DISPATCHING
+            or question.dispatch_token != turn_token
+        ):
+            raise WorkerCancelled
+        baseline = (
+            _state_change_sequence(agent)
+            if state == PromptOperationState.SUBMITTED
+            else question.prompt_baseline_seq
+        )
+        return job.evolve(
+            voice_question=question_adapter.envelope(
+                question,
+                QuestionState.DISPATCHING,
+                prompt_state=state,
+                prompt_baseline_seq=baseline,
+                prompt_submitted_at=(
+                    time.time()
+                    if state == PromptOperationState.SUBMITTED
+                    else question.prompt_submitted_at
+                ),
+            )
+        )
+
+    updated = _worker_change(
+        store,
+        job_id,
+        worker_token,
+        {JobStatus.RUNNING},
+        mark,
+    )
+    if updated is None:
+        raise WorkerCancelled
+
+
+def _prompt_request(job: CursorJob) -> str:
+    return job.continuation_answer or job.request
+
+
+def _request_with_clarification(job: CursorJob) -> str:
+    answer = job.continuation_answer
+    if not answer or answer in job.request:
+        return job.request
+    return f"{job.request}\n\nUser clarification:\n{answer}"
+
+
 def run_claimed_worker(  # pyright: ignore[reportGeneralTypeIssues]
     context: worker_lifecycle.WorkerContext,
     factories: ClientFactories | None = None,
@@ -1887,6 +2114,9 @@ def run_claimed_worker(  # pyright: ignore[reportGeneralTypeIssues]
         context.checkpoint()
 
     try:
+        active_issue_key = resolve_issue_reference(job.issue_key)
+        if active_issue_key:
+            require_issue_capabilities(active_issue_key)
         client = clients.herdr()
         checkpoint()
         client.ensure_server()
@@ -1922,15 +2152,10 @@ def run_claimed_worker(  # pyright: ignore[reportGeneralTypeIssues]
             )
             return
 
-        turn = job.turn + 1
-        turn_token = f"{job_id}-{turn}"
+        turn, turn_token = _prompt_turn_identity(job)
 
         def begin_turn(current: CursorJob) -> CursorJob:
-            return current.evolve(
-                turn=turn,
-                turn_token=turn_token,
-                workflow_turn_phase=current.workflow_phase.value,
-            )
+            return _begin_prompt_turn(current, turn, turn_token)
 
         updated = _worker_change(
             store, job_id, worker_token, {JobStatus.ROUTING}, begin_turn
@@ -2101,9 +2326,7 @@ def run_claimed_worker(  # pyright: ignore[reportGeneralTypeIssues]
             repositories: list[Path] = []
             candidates: list[Path] = []
             hint = (job.repository_hint or "").strip() or None
-            task = job.request
-            utterance = job.utterance or task
-            issue_key = job.issue_key or extract_linear_issue(utterance)
+            issue_key = active_issue_key
             reason = ""
             if job.github_pull_request:
                 github_repository = (job.github_repository or "").strip()
@@ -2305,13 +2528,16 @@ def run_claimed_worker(  # pyright: ignore[reportGeneralTypeIssues]
                 and not job.github_issue
             ):
                 checkpoint()
-                repository, _confidence, reason = client.infer_repository(
+                routed = route_issue_repository(
+                    client,
                     issue_key,
                     repositories,
                     token=f"{job_id}-route",
                     reserved=reserved_targets(store, job_id),
                     checkpoint=checkpoint,
                 )
+                if routed is not None:
+                    repository, _confidence, reason = routed
                 checkpoint()
             if repository is None:
                 checkpoint()
@@ -2535,11 +2761,12 @@ def run_claimed_worker(  # pyright: ignore[reportGeneralTypeIssues]
     except WorkerCancelled:
         return
     except Exception as exc:
-        _worker_fail(
+        _worker_error(
             store,
             job_id,
             worker_token,
             exc,
+            prompt_may_be_active=False,
         )
     finally:
         try:

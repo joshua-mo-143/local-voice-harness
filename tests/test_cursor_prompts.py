@@ -5,7 +5,9 @@ import unittest
 from local_voice_harness.cursor.prompts import (
     classification_prompt,
     cursor_prompt,
+    planning_prompt,
     review_prompt,
+    revision_prompt,
 )
 
 
@@ -87,6 +89,55 @@ class CursorPromptTests(unittest.TestCase):
         self.assertIn("WORKFLOW_REVIEW_DECISION[turn]", prompt)
         self.assertIn("Issue requires crash recovery.", prompt)
         self.assertIn("Persistence changes force high-risk.", prompt)
+
+    def test_linear_instructions_are_only_added_as_a_contribution(self) -> None:
+        without = cursor_prompt("fix API-98", "token", issue_reference="API-98")
+        with_linear = cursor_prompt(
+            "fix API-98",
+            "token",
+            issue_reference="API-98",
+            integration_instructions=(
+                "Use configured Linear MCP tools only to read it.",
+            ),
+        )
+
+        self.assertNotIn("Linear MCP", without)
+        self.assertIn("Linear MCP", with_linear)
+
+    def test_integration_instructions_reach_every_read_only_phase(self) -> None:
+        instructions = ("Use configured Linear MCP tools only to read it.",)
+        prompts = (
+            classification_prompt(
+                "fix API-98",
+                "token",
+                integration_instructions=instructions,
+            ),
+            planning_prompt(
+                "fix API-98",
+                "token",
+                tier="medium",
+                integration_instructions=instructions,
+            ),
+            review_prompt(
+                "fix API-98",
+                "plan",
+                "token",
+                tier="medium",
+                integration_instructions=instructions,
+            ),
+            revision_prompt(
+                "fix API-98",
+                "plan",
+                "review",
+                "token",
+                integration_instructions=instructions,
+            ),
+        )
+
+        for prompt in prompts:
+            with self.subTest(prompt=prompt.splitlines()[0]):
+                self.assertIn("Trusted integration instructions", prompt)
+                self.assertIn("Linear MCP", prompt)
 
 
 if __name__ == "__main__":

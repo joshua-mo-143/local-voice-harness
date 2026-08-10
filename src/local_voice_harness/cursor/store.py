@@ -100,6 +100,11 @@ def _quarantine_metadata_resolved(metadata_path: Path) -> bool:
         return False
 
 
+def _mapping_field(value: dict[str, object], field: str) -> dict[str, object]:
+    nested = value.get(field)
+    return dict(nested) if isinstance(nested, dict) else {}
+
+
 def _quarantine_may_reserve(
     metadata_path: Path,
     *,
@@ -121,9 +126,13 @@ def _quarantine_may_reserve(
     except (OSError, UnicodeDecodeError, json.JSONDecodeError):
         return True
     status = str(raw.get("status") or "")
+    harness_state = _mapping_field(raw, "harness_state")
+    checkout_state = _mapping_field(raw, "checkout_state")
+    provider_state = _mapping_field(raw, "provider_state")
+    github_state = _mapping_field(provider_state, "github")
     if status in {item.value for item in TERMINAL_STATUSES}:
         uncertain = any(
-            str(raw.get(field) or "")
+            str(value or "")
             in {
                 "dispatching",
                 "submitted",
@@ -131,14 +140,18 @@ def _quarantine_may_reserve(
                 "failed_observing",
                 "manual_required",
             }
-            for field in (
-                "agent_dispatch_state",
-                "fork_operation_state",
-                "worktree_provision_state",
+            for value in (
+                raw.get("agent_dispatch_state")
+                or harness_state.get("agent_dispatch_state"),
+                raw.get("fork_operation_state")
+                or github_state.get("fork_operation_state"),
+                raw.get("worktree_provision_state")
+                or checkout_state.get("worktree_provision_state"),
             )
         )
         fenced = bool(
             raw.get("target_release_pending")
+            or harness_state.get("target_release_pending")
             or raw.get("cancellation_reconciliation_pending")
             or raw.get("manual_reconcile_operation")
             or uncertain
@@ -146,9 +159,14 @@ def _quarantine_may_reserve(
         if reservation == "worktree":
             fenced = fenced or bool(
                 raw.get("worktree_manual_inspection_required")
-                or raw.get("worktree_provision_state")
+                or checkout_state.get("worktree_manual_inspection_required")
+                or (
+                    raw.get("worktree_provision_state")
+                    or checkout_state.get("worktree_provision_state")
+                )
                 in {"quarantined", "manual_required"}
                 or raw.get("pull_request_worktree_state") == "quarantined"
+                or github_state.get("pull_request_worktree_state") == "quarantined"
             )
         if not fenced:
             return False
@@ -156,8 +174,11 @@ def _quarantine_may_reserve(
         # Treat an unknown status as reservation-bearing, but still compare a
         # usable resource identity below rather than blocking unrelated jobs.
         pass
-    field = "herdr_target" if reservation == "target" else "worktree_path"
-    reserved = raw.get(field)
+    reserved = (
+        raw.get("herdr_target") or raw.get("session_id")
+        if reservation == "target"
+        else raw.get("worktree_path") or checkout_state.get("path")
+    )
     if reserved is None:
         return False
     if not isinstance(reserved, str):
@@ -760,6 +781,9 @@ def _normalize_for_durable_write(
             target_release_owner_start=None,
         )
     values["schema_version"] = CURRENT_SCHEMA_VERSION
+    if candidate._compatibility_layout:
+        values.pop("harness_kind", None)
+        values.pop("session_id", None)
     normalized = CursorJob.from_dict(values)
     normalized.validate_invariants(require_worker_owner=True)
     return normalized
@@ -783,7 +807,7 @@ def write_unlocked(path: Path, job: dict[str, object]) -> None:
         if isinstance(exc, JobQuarantinedError):
             raise
         raise JobValidationError(f"{path.name}: {exc}") from exc
-    _atomic_json(path, candidate.to_dict())
+    _atomic_json(path, candidate.to_record())
 
 
 def _write_model_unlocked(path: Path, candidate: CursorJob) -> CursorJob:
@@ -803,7 +827,7 @@ def _write_model_unlocked(path: Path, candidate: CursorJob) -> CursorJob:
         if isinstance(exc, JobQuarantinedError):
             raise
         raise JobValidationError(f"{path.name}: {exc}") from exc
-    _atomic_json(path, candidate.to_dict())
+    _atomic_json(path, candidate.to_record())
     return candidate
 
 
@@ -880,7 +904,7 @@ def migrate_legacy_jobs(
                         _fsync_directory(legacy_dir)
                         continue
                     if existing.revision == candidate.revision:
-                        if existing.to_dict() != candidate.to_dict():
+                        if existing.to_record() != candidate.to_record():
                             raise JobValidationError(
                                 "legacy import conflicts with durable job at the "
                                 "same revision"
@@ -893,7 +917,7 @@ def migrate_legacy_jobs(
                     candidate,
                     existing,
                 )
-                _atomic_json(destination, candidate.to_dict())
+                _atomic_json(destination, candidate.to_record())
                 source.unlink()
                 _fsync_directory(legacy_dir)
             except JobValidationError as error:
@@ -1360,3 +1384,6 @@ class JobStore:
             if removed:
                 _fsync_directory(self.durable_dir)
         return removed
+
+
+AgentJobStore = JobStore

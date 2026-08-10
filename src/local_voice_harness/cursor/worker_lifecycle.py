@@ -24,6 +24,7 @@ from .model import (
 from .store import JobStore
 
 WORKER_MODULE = "local_voice_harness.cursor.worker"
+LEGACY_WORKER_MODULE = WORKER_MODULE
 CRITICAL_WORKER_OPERATIONS = frozenset(
     {"agent_start", "fork_create", "worktree_create"}
 )
@@ -78,7 +79,10 @@ def legacy_worker_command_matches(job: CursorJob) -> bool:
         arguments = Path(f"/proc/{job.worker_pid}/cmdline").read_bytes().split(b"\0")
     except OSError:
         return False
-    return WORKER_MODULE.encode() in arguments and job.id.encode() in arguments
+    return (
+        WORKER_MODULE.encode() in arguments
+        or LEGACY_WORKER_MODULE.encode() in arguments
+    ) and job.id.encode() in arguments
 
 
 def has_legacy_worker_claim(job: CursorJob) -> bool:

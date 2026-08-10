@@ -8,6 +8,8 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any
 
+from ..questions import Question, QuestionError
+
 CURRENT_SCHEMA_VERSION = 10
 LEGACY_SCHEMA_VERSIONS = frozenset(range(CURRENT_SCHEMA_VERSION))
 LEGACY_BOOT_ID = "legacy-unknown"
@@ -27,6 +29,12 @@ class JobStatus(StrEnum):
     COMPLETED = "completed"
     FAILED = "failed"
     CANCELLED = "cancelled"
+
+
+class HarnessKind(StrEnum):
+    """Coding-agent harness responsible for a durable job."""
+
+    CURSOR = "cursor"
 
 
 class WorkflowTier(StrEnum):
@@ -163,6 +171,7 @@ _BOOL_FIELDS = frozenset(
         "announcement_repeated",
         "phase_prompt_active",
         "review_approved",
+        "interactive_questionnaire_blocked",
     }
 )
 _INT_FIELDS = frozenset(
@@ -253,6 +262,7 @@ _STRING_FIELDS = frozenset(
         "error",
         "question",
         "clarification_kind",
+        "continuation_answer",
         "turn_token",
         "worker_token",
         "worker_boot_id",
@@ -303,6 +313,8 @@ _STRING_FIELDS = frozenset(
         "terminal_intent_status",
         "terminal_intent_result",
         "terminal_intent_error",
+        "harness_kind",
+        "session_id",
     }
 )
 _AGENT_OPERATION_STATES = frozenset(
@@ -359,7 +371,7 @@ _WORKFLOW_ARTIFACT_REFERENCE = re.compile(
 
 
 @dataclass(frozen=True, slots=True)
-class NewCursorJob:
+class NewAgentJob:
     id: str
     request: str
     created_at: float
@@ -386,6 +398,8 @@ class NewCursorJob:
     worktree_workspace_id: str | None = None
     worktree_root_pane_id: str | None = None
     worktree_provision_state: str | None = None
+    harness_kind: HarnessKind = HarnessKind.CURSOR
+    session_id: str | None = None
 
 
 def _integer(value: object, field: str) -> int:
@@ -442,6 +456,260 @@ def _validate_json(value: object, field: str) -> None:
             _validate_json(item, f"{field}.{key}")
         return
     raise JobValidationError(f"{field} is not JSON serializable")
+
+
+_HARNESS_STATE_FIELDS = frozenset(
+    {
+        "agent_hint",
+        "herdr_pane_id",
+        "herdr_workspace_id",
+        "agent_name",
+        "agent_dispatch_state",
+        "agent_dispatch_exited",
+        "agent_reconcile_attempts",
+        "agent_absent_observations",
+        "agent_next_reconcile_at",
+        "agent_last_reconciled_at",
+        "agent_confirmed_absent_at",
+        "agent_automatic_reconcile_stopped_at",
+        "agent_retained_at",
+        "turn",
+        "turn_token",
+        "continuation",
+        "next_reconcile_at",
+        "target_release_pending",
+        "target_release_token",
+        "target_release_owner_pid",
+        "target_release_owner_boot_id",
+        "target_release_owner_start",
+    }
+)
+_CHECKOUT_STATE_FIELDS = frozenset(
+    {
+        "repository",
+        "worktree_branch",
+        "worktree_label",
+        "worktree_path",
+        "worktree_workspace_id",
+        "worktree_root_pane_id",
+        "worktree_provision_state",
+        "worktree_provision_error",
+        "worktree_dispatch_exited",
+        "worktree_reconcile_attempts",
+        "worktree_absent_observations",
+        "worktree_next_reconcile_at",
+        "worktree_last_reconciled_at",
+        "worktree_confirmed_absent_at",
+        "worktree_automatic_reconcile_stopped_at",
+        "worktree_retained_at",
+        "worktree_manual_inspection_required",
+        "worktree_quarantine_acknowledged_at",
+    }
+)
+_GITHUB_STATE_FIELDS = frozenset(
+    {
+        "github_repository",
+        "github_issue",
+        "github_issue_url",
+        "github_issue_context",
+        "github_pull_request",
+        "fork_requested",
+        "fork_confirmed",
+        "fork_committed",
+        "fork_exists",
+        "fork_dispatch_exited",
+        "fork_committed_at",
+        "fork_operation_state",
+        "fork_operation_source",
+        "fork_operation_source_url",
+        "fork_operation_source_parent",
+        "fork_operation_source_default_branch",
+        "fork_operation_source_private",
+        "fork_operation_login",
+        "fork_operation_target",
+        "fork_repository",
+        "fork_reconcile_attempts",
+        "fork_absent_observations",
+        "fork_next_reconcile_at",
+        "fork_last_reconciled_at",
+        "fork_confirmed_absent_at",
+        "fork_automatic_reconcile_stopped_at",
+        "fork_retained_at",
+        "pull_request_worktree_state",
+        "pull_request_branch",
+        "pull_request_worktree_error",
+    }
+)
+_LINEAR_STATE_FIELDS = frozenset({"issue_key"})
+_CHECKOUT_ALIASES = {
+    "branch": "worktree_branch",
+    "label": "worktree_label",
+    "path": "worktree_path",
+    "workspace_id": "worktree_workspace_id",
+    "root_pane_id": "worktree_root_pane_id",
+}
+
+
+def _object_mapping(value: object, field: str) -> dict[str, object]:
+    if not isinstance(value, dict):
+        raise JobValidationError(f"{field} must be an object")
+    return dict(value)
+
+
+def _flatten_structured_state(values: dict[str, object]) -> None:
+    """Expose schema-v9 structured state through the legacy typed properties."""
+
+    harness_state = _object_mapping(values.pop("harness_state", {}), "harness_state")
+    checkout_state = _object_mapping(values.pop("checkout_state", {}), "checkout_state")
+    provider_state = _object_mapping(values.pop("provider_state", {}), "provider_state")
+    github_state = _object_mapping(
+        provider_state.get("github", {}), "provider_state.github"
+    )
+    linear_state = _object_mapping(
+        provider_state.get("linear", {}), "provider_state.linear"
+    )
+    provider_state.pop("github", None)
+    provider_state.pop("linear", None)
+    if provider_state:
+        raise JobValidationError("provider_state contains an unsupported provider")
+
+    aliases = {
+        "pane_id": "herdr_pane_id",
+        "workspace_id": "herdr_workspace_id",
+    }
+    for key, value in harness_state.items():
+        field = aliases.get(key, key)
+        if field not in _HARNESS_STATE_FIELDS:
+            raise JobValidationError(f"harness_state contains unsupported field {key}")
+        values.setdefault(field, value)
+    for field, value in github_state.items():
+        if field not in _GITHUB_STATE_FIELDS:
+            raise JobValidationError(
+                f"provider_state.github contains unsupported field {field}"
+            )
+        values.setdefault(field, value)
+    for field, value in checkout_state.items():
+        compatibility_field = _CHECKOUT_ALIASES.get(field, field)
+        if compatibility_field not in _CHECKOUT_STATE_FIELDS:
+            raise JobValidationError(
+                f"checkout_state contains unsupported field {field}"
+            )
+        values.setdefault(compatibility_field, value)
+    for field, value in linear_state.items():
+        if field not in _LINEAR_STATE_FIELDS:
+            raise JobValidationError(
+                f"provider_state.linear contains unsupported field {field}"
+            )
+        values.setdefault(field, value)
+    if values.get("session_id") is not None:
+        values.setdefault("herdr_target", values["session_id"])
+
+
+def _advance_legacy_version(values: dict[str, object], version: int) -> None:
+    """Apply one compatibility step and advance exactly one schema version."""
+
+    if version == 5:
+        if any(
+            values.get(field) is not None
+            for field in ("worker_token", "worker_pid", "worker_process_start")
+        ):
+            values.setdefault("worker_boot_id", LEGACY_BOOT_ID)
+        if any(
+            values.get(field) is not None
+            for field in ("target_release_owner_pid", "target_release_owner_start")
+        ):
+            values.setdefault("target_release_owner_boot_id", LEGACY_BOOT_ID)
+    elif version == 6:
+        values.setdefault("announcement_dismissed", False)
+        values.setdefault("announcement_repeated", False)
+    elif version == 7:
+        values.setdefault("parent_job_id", None)
+    elif version == 8:
+        values.setdefault("harness_kind", HarnessKind.CURSOR.value)
+        if values.get("herdr_target") is not None:
+            values.setdefault("session_id", values["herdr_target"])
+    values["schema_version"] = version + 1
+
+
+def migrate_job_record(raw: Mapping[str, object]) -> tuple[dict[str, object], int]:
+    """Migrate a persisted record to the current in-memory representation."""
+
+    values = dict(raw)
+    loaded_version = (
+        _integer(values["schema_version"], "schema_version")
+        if "schema_version" in values
+        else 0
+    )
+    if loaded_version not in LEGACY_SCHEMA_VERSIONS | {CURRENT_SCHEMA_VERSION}:
+        raise JobValidationError(
+            f"unsupported agent job schema version {loaded_version}"
+        )
+    compatibility_input = not (
+        "harness_state" in values
+        or "checkout_state" in values
+        or "provider_state" in values
+    )
+    _flatten_structured_state(values)
+    if loaded_version < CURRENT_SCHEMA_VERSION:
+        if compatibility_input:
+            values.setdefault("harness_kind", HarnessKind.CURSOR.value)
+            if values.get("herdr_target") is not None:
+                values.setdefault("session_id", values["herdr_target"])
+            elif values.get("session_id") is not None:
+                values.setdefault("herdr_target", values["session_id"])
+        _legacy_defaults(values)
+        for version in range(loaded_version, CURRENT_SCHEMA_VERSION):
+            _advance_legacy_version(values, version)
+    else:
+        if compatibility_input:
+            values.setdefault("harness_kind", HarnessKind.CURSOR.value)
+            if values.get("herdr_target") is not None:
+                values.setdefault("session_id", values["herdr_target"])
+    values["schema_version"] = CURRENT_SCHEMA_VERSION
+    return values, loaded_version
+
+
+def _structured_record(values: Mapping[str, object]) -> dict[str, object]:
+    """Serialize the compatibility representation as the agent-neutral v9 schema."""
+
+    record = dict(values)
+    record["schema_version"] = CURRENT_SCHEMA_VERSION
+    record["harness_kind"] = str(record.get("harness_kind") or HarnessKind.CURSOR.value)
+    session_id = record.pop("herdr_target", None)
+    record["session_id"] = record.get("session_id") or session_id
+
+    harness_state: dict[str, object] = {}
+    for field in _HARNESS_STATE_FIELDS:
+        if field not in record:
+            continue
+        value = record.pop(field)
+        key = {
+            "herdr_pane_id": "pane_id",
+            "herdr_workspace_id": "workspace_id",
+        }.get(field, field)
+        harness_state[key] = value
+    github_state: dict[str, object] = {}
+    for field in _GITHUB_STATE_FIELDS:
+        if field in record:
+            github_state[field] = record.pop(field)
+    checkout_state: dict[str, object] = {}
+    checkout_names = {value: key for key, value in _CHECKOUT_ALIASES.items()}
+    for field in _CHECKOUT_STATE_FIELDS:
+        if field in record:
+            checkout_state[checkout_names.get(field, field)] = record.pop(field)
+    linear_state: dict[str, object] = {}
+    for field in _LINEAR_STATE_FIELDS:
+        if field in record:
+            linear_state[field] = record.pop(field)
+    record["harness_state"] = harness_state
+    record["checkout_state"] = checkout_state
+    provider_state: dict[str, object] = {}
+    if github_state:
+        provider_state["github"] = github_state
+    if linear_state:
+        provider_state["linear"] = linear_state
+    record["provider_state"] = provider_state
+    return record
 
 
 def _legacy_defaults(values: dict[str, object]) -> None:
@@ -560,9 +828,11 @@ def _prompt_operation_defaults(values: dict[str, object]) -> None:
 
 
 @dataclass(frozen=True, slots=True)
-class CursorJob:
+class AgentJob:
     schema_version: int
     loaded_schema_version: int
+    harness_kind: HarnessKind
+    session_id: str | None
     id: str
     revision: int
     request: str
@@ -591,25 +861,26 @@ class CursorJob:
     workflow_phase: WorkflowPhase
     review_round: int
     active_participant: WorkflowParticipant | None
+    _compatibility_layout: bool
     _values: dict[str, object]
 
     @classmethod
     def from_dict(cls, raw: dict[str, object]) -> CursorJob:
         if not isinstance(raw, dict):
             raise JobValidationError("job must be a JSON object")
-        values = dict(raw)
-        if "schema_version" not in values:
-            loaded_version = 0
-        else:
-            loaded_version = _integer(values["schema_version"], "schema_version")
-        if loaded_version not in LEGACY_SCHEMA_VERSIONS | {CURRENT_SCHEMA_VERSION}:
-            raise JobValidationError(
-                f"unsupported Cursor job schema version {loaded_version}"
-            )
-        if loaded_version < CURRENT_SCHEMA_VERSION:
-            _legacy_defaults(values)
+        raw_version = (
+            _integer(raw["schema_version"], "schema_version")
+            if "schema_version" in raw
+            else 0
+        )
+        compatibility_layout = (
+            raw_version == CURRENT_SCHEMA_VERSION
+            and "harness_kind" not in raw
+            and "harness_state" not in raw
+            and "provider_state" not in raw
+        )
+        values, loaded_version = migrate_job_record(raw)
         _prompt_operation_defaults(values)
-        values["schema_version"] = CURRENT_SCHEMA_VERSION
 
         for field in _INT_FIELDS:
             if field in values and values[field] is not None:
@@ -625,6 +896,11 @@ class CursorJob:
                 values[field] = _string(values[field], field)
         for key, value in values.items():
             _validate_json(value, key)
+        if values.get("voice_question") is not None:
+            try:
+                Question.from_dict(values["voice_question"])
+            except QuestionError as exc:
+                raise JobValidationError(f"invalid voice_question: {exc}") from exc
 
         job_id = str(values.get("id") or "")
         if not re.fullmatch(r"[0-9a-f]{12}", job_id):
@@ -641,6 +917,10 @@ class CursorJob:
             status = JobStatus(str(values.get("status") or ""))
         except ValueError as exc:
             raise JobValidationError("status has invalid value") from exc
+        try:
+            harness_kind = HarnessKind(str(values.get("harness_kind") or ""))
+        except ValueError as exc:
+            raise JobValidationError("harness_kind has invalid value") from exc
         try:
             workflow_phase = WorkflowPhase(
                 str(values.get("workflow_phase") or WorkflowPhase.CLASSIFYING)
@@ -694,6 +974,12 @@ class CursorJob:
         job = cls(
             schema_version=CURRENT_SCHEMA_VERSION,
             loaded_schema_version=loaded_version,
+            harness_kind=harness_kind,
+            session_id=(
+                str(values["session_id"])
+                if values.get("session_id") is not None
+                else None
+            ),
             id=job_id,
             revision=_integer(values["revision"], "revision"),
             request=str(values["request"]),
@@ -788,6 +1074,7 @@ class CursorJob:
             workflow_phase=workflow_phase,
             review_round=_integer(values.get("review_round") or 0, "review_round"),
             active_participant=active_participant,
+            _compatibility_layout=compatibility_layout,
             _values=values,
         )
         job.validate_invariants(
@@ -802,6 +1089,8 @@ class CursorJob:
                 "id": spec.id,
                 "parent_job_id": spec.parent_job_id,
                 "schema_version": CURRENT_SCHEMA_VERSION,
+                "harness_kind": spec.harness_kind.value,
+                "session_id": spec.session_id,
                 "revision": 0,
                 "request": spec.request,
                 "utterance": spec.utterance,
@@ -847,6 +1136,16 @@ class CursorJob:
                 values["schema_version"] = self.loaded_schema_version
         return values
 
+    def to_record(self) -> dict[str, object]:
+        """Return the structured, agent-neutral durable representation."""
+
+        if self._compatibility_layout:
+            record = dict(self._values)
+            record.pop("harness_kind", None)
+            record.pop("session_id", None)
+            return record
+        return _structured_record(self._values)
+
     def evolve(
         self,
         *,
@@ -869,6 +1168,10 @@ class CursorJob:
         ):
             values["manual_reconcile_operation"] = None
             values["manual_reconcile_token"] = None
+        if "herdr_target" in changes and "session_id" not in changes:
+            values["session_id"] = changes["herdr_target"]
+        elif "session_id" in changes and "herdr_target" not in changes:
+            values["herdr_target"] = changes["session_id"]
         values["status"] = (status or self.status).value
         values["schema_version"] = CURRENT_SCHEMA_VERSION
         values["revision"] = self.revision + 1
@@ -926,6 +1229,14 @@ class CursorJob:
         values.update(changes)
         if "prompt_operation_state" in values:
             values.pop("phase_prompt_active", None)
+        combined_changes = dict(dynamic_changes or {})
+        combined_changes.update(changes)
+        if "herdr_target" in combined_changes and "session_id" not in combined_changes:
+            values["session_id"] = combined_changes["herdr_target"]
+        elif (
+            "session_id" in combined_changes and "herdr_target" not in combined_changes
+        ):
+            values["herdr_target"] = combined_changes["session_id"]
         final_status = status or self.status
         values["status"] = final_status.value
         operation = str(values.get("manual_reconcile_operation") or "")
@@ -1119,6 +1430,19 @@ class CursorJob:
     def question(self) -> str | None:
         value = self._values.get("question")
         return str(value) if value is not None else None
+
+    @property
+    def voice_question(self) -> dict[str, object] | None:
+        value = self._values.get("voice_question")
+        return dict(value) if isinstance(value, dict) else None
+
+    @property
+    def continuation_answer(self) -> str | None:
+        return self._optional_string("continuation_answer")
+
+    @property
+    def interactive_questionnaire_blocked(self) -> bool:
+        return self._boolean_field("interactive_questionnaire_blocked")
 
     @property
     def utterance(self) -> str | None:
@@ -1948,6 +2272,8 @@ def validate_transition(before: CursorJob, after: CursorJob) -> None:
         raise JobValidationError("Cursor job transition cannot change created_at")
     if before.parent_job_id != after.parent_job_id:
         raise JobValidationError("Cursor job transition cannot change parent_job_id")
+    if before.harness_kind != after.harness_kind:
+        raise JobValidationError("agent job transition cannot change harness_kind")
     if after.parent_job_id is not None:
         # A follow-up child inherits its parent's exact checkout. That identity
         # must never be substituted, removed, or reconstructed by recovery.
@@ -2004,6 +2330,10 @@ def transition(
 ) -> CursorJob:
     values = job.to_dict()
     values.update(changes)
+    if "herdr_target" in changes and "session_id" not in changes:
+        values["session_id"] = changes["herdr_target"]
+    elif "session_id" in changes and "herdr_target" not in changes:
+        values["herdr_target"] = changes["session_id"]
     values["status"] = status.value
     values["schema_version"] = CURRENT_SCHEMA_VERSION
     values.setdefault("revision", job.revision + 1)
@@ -2062,3 +2392,10 @@ def validate_reservations(jobs: list[CursorJob]) -> None:
                     f"worktree {job.worktree_path} is reserved by both "
                     f"{owner} and {job.id}"
                 )
+
+
+# Agent-neutral names are canonical for new integrations. Cursor names remain
+# aliases so existing callers and persisted-job recovery continue to work.
+CursorJob = AgentJob
+NewCursorJob = NewAgentJob
+AgentJobValidationError = JobValidationError

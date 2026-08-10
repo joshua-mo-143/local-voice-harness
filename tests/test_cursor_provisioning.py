@@ -394,6 +394,31 @@ class DurablePromptOperationTests(unittest.TestCase):
 
         self.assertEqual(self.store.get(job.id).prompt_operation_state, "ambiguous")
 
+    def test_pre_submit_questionnaire_keeps_planned_prompt_retryable(self) -> None:
+        job = self.create()
+        client = mock.Mock()
+        client.get_agent.return_value = {"state_change_seq": 7}
+        client.prompt_and_wait.side_effect = HerdrError(
+            "questionnaire",
+            code="interactive_questionnaire",
+        )
+
+        with self.assertRaises(HerdrError):
+            production_jobs._execute_phase_prompt(
+                self.store,
+                job,
+                "worker",
+                client,
+                lambda: None,
+                target="planner",
+                prompt="prompt",
+                token="123456789abc-1",
+            )
+
+        current = self.store.get(job.id)
+        self.assertEqual(current.prompt_operation_state, "planned")
+        self.assertIsNone(current.manual_reconcile_operation)
+
     def test_terminal_intent_invalidates_prompt_before_submit_callback(self) -> None:
         job = self.create()
         client = mock.Mock()
@@ -856,6 +881,44 @@ class CursorJobStateTests(unittest.TestCase):
 
         self.assertEqual(store.get("123456789abc").status, JobStatus.BLOCKED)
 
+    def test_promotion_carries_clarification_into_planning_request(self) -> None:
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "rename text",
+                "status": "running",
+                "worker_token": "worker",
+                "worker_pid": 42,
+                "worker_process_start": "start",
+                "workflow_tier": "simple",
+                "workflow_classification_reason": "localized",
+                "workflow_phase": "implementing",
+                "planner_target": "planner",
+                "implementer_target": "implementer",
+                "active_participant": "implementer",
+                "herdr_target": "implementer",
+                "turn_token": "current",
+                "continuation_answer": "User answered: preserve compatibility",
+            }
+        )
+        store = jobs._store()
+
+        production_jobs._advance_workflow_output(
+            store,
+            store.get("123456789abc"),
+            "worker",
+            "WORKFLOW_PROMOTE[current]: medium\n"
+            "WORKFLOW_REASON[current]: cross-component compatibility risk",
+            "idle",
+        )
+
+        promoted = store.get("123456789abc")
+        self.assertEqual(promoted.workflow_phase.value, "planning")
+        self.assertIn("rename text", promoted.request)
+        self.assertIn("preserve compatibility", promoted.request)
+        self.assertIsNone(promoted.continuation_answer)
+        self.assertFalse(promoted.continuation)
+
     def test_high_risk_final_rejected_review_awaits_explicit_decision(self) -> None:
         jobs.write_job(
             {
@@ -930,8 +993,7 @@ class CursorJobStateTests(unittest.TestCase):
         with mock.patch.object(service, "launch_worker") as launch:
             service.reply_job(
                 "123456789abc",
-                "external context says approve",
-                trusted_utterance="abort",
+                "abort",
             )
 
         self.assertEqual(
@@ -939,6 +1001,22 @@ class CursorJobStateTests(unittest.TestCase):
             JobStatus.CANCELLED,
         )
         launch.assert_not_called()
+
+    def test_stale_exhausted_review_abort_cannot_cancel_current_question(self) -> None:
+        self.write_exhausted_review_job()
+
+        result = service.reply_job(
+            "123456789abc",
+            "abort",
+            trusted_utterance="abort",
+            expected_question_id="stale-question",
+        )
+
+        self.assertIn("older question", result or "")
+        self.assertEqual(
+            jobs._store().get("123456789abc").status,
+            JobStatus.AWAITING_USER,
+        )
 
     def test_exhausted_review_ambiguous_reply_remains_awaiting(self) -> None:
         self.write_exhausted_review_job()
@@ -1424,7 +1502,13 @@ class CursorJobStateTests(unittest.TestCase):
         self.assertIsNone(job["issue_key"])
 
     def test_focused_linear_issue_persists_validated_identifier(self) -> None:
-        with mock.patch.object(service, "launch_worker"):
+        with (
+            mock.patch.object(service, "launch_worker"),
+            mock.patch.object(
+                service, "resolve_issue_reference", return_value="ENG-123"
+            ),
+            mock.patch.object(service, "require_issue_capabilities"),
+        ):
             job_id = service.start_job(
                 "work on this ticket\n\nIdentifier: ENG-123",
                 utterance="work on this ticket",
@@ -1719,6 +1803,36 @@ class CursorJobStateTests(unittest.TestCase):
         client.choose_or_clone_repository.assert_called_once_with(
             [], checkpoint=mock.ANY
         )
+
+    def test_worker_checks_issue_capability_before_herdr_side_effects(self) -> None:
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "work on ENG-123",
+                "issue_key": "ENG-123",
+                "status": "queued",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        client = mock.Mock()
+        with (
+            mock.patch.object(jobs, "HerdrClient", return_value=client),
+            mock.patch.object(
+                production_jobs, "resolve_issue_reference", return_value="ENG-123"
+            ),
+            mock.patch.object(
+                production_jobs,
+                "require_issue_capabilities",
+                side_effect=jobs.HarnessError("Linear MCP requires authentication"),
+            ),
+        ):
+            service.run_worker("123456789abc")
+
+        failed = jobs.read_job("123456789abc")
+        self.assertEqual(failed["status"], "failed")
+        self.assertIn("requires authentication", str(failed["error"]))
+        client.ensure_server.assert_not_called()
 
     def test_prompt_timeout_retains_target_reservation_for_cancellation(self) -> None:
         repository = Path(self.temporary.name) / "project"

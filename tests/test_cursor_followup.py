@@ -46,6 +46,7 @@ def _completed_parent(
     *,
     worktree_provision_state: str = "ready",
     completed_at: float | None = None,
+    issue_key: str | None = None,
 ) -> CursorJob:
     now = completed_at if completed_at is not None else time.time()
     repository = tmp_path / "repo"
@@ -65,6 +66,7 @@ def _completed_parent(
         "worktree_path": str(checkout),
         "worktree_provision_state": worktree_provision_state,
         "speakable_label": "the feature",
+        "issue_key": issue_key,
     }
     return store.create(CursorJob.from_dict(values))
 
@@ -372,6 +374,28 @@ def test_start_follow_up_creates_and_launches_child(
     child = store.get(child_id)
     assert child.parent_job_id == parent.id
     assert child.worktree_path == parent.worktree_path
+
+
+def test_start_follow_up_checks_capability_before_creating_child(
+    store: JobStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    parent = _completed_parent(store, tmp_path, issue_key="ENG-123")
+    launch = mock.Mock()
+    monkeypatch.setattr(service, "launch_worker", launch)
+    monkeypatch.setattr(
+        service, "resolve_issue_reference", lambda _reference: "ENG-123"
+    )
+
+    def reject(_reference: str) -> None:
+        raise HarnessError("Linear MCP requires authentication")
+
+    monkeypatch.setattr(service, "require_issue_capabilities", reject)
+
+    with pytest.raises(HarnessError, match="requires authentication"):
+        service.start_follow_up(parent.id, "review the changes")
+
+    assert [job.id for job in store.list()] == [parent.id]
+    launch.assert_not_called()
 
 
 def test_cursor_turn_follow_up_reports_busy(store: JobStore, tmp_path: Path) -> None:
