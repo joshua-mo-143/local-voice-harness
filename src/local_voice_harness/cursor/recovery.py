@@ -468,6 +468,7 @@ def stage_terminal_intent(
     result: str,
     error: str | None = None,
     clear_worker: bool = False,
+    preserve_worker_operation: bool = False,
     voice_question: dict[str, object] | None = None,
 ) -> CursorJob:
     if status not in TERMINAL_STATUSES:
@@ -485,7 +486,9 @@ def stage_terminal_intent(
         target_release_owner_boot_id=None,
         target_release_owner_start=None,
         cancellation_reconciliation_pending=True,
-        worker_operation="target_cleanup",
+        worker_operation=(
+            job.worker_operation if preserve_worker_operation else "target_cleanup"
+        ),
         pull_request_worktree_state=(
             "retained"
             if job.github_pull_request
@@ -899,6 +902,8 @@ def recover_jobs(
     inspect_legacy_worker: LegacyWorkerInspector = inspect_and_stop_legacy_worker,
     now: float | None = None,
 ) -> None:
+    if store.maintenance_active() is True:
+        return
     blocked_legacy_jobs = store.migrate_legacy(inspect_worker=inspect_legacy_worker)
     store.prune(now=now)
     recovered_at = time.time() if now is None else now

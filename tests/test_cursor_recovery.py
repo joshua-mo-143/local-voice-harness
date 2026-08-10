@@ -23,7 +23,11 @@ from local_voice_harness.cursor.recovery import (
     resolve_manual_reconciliation,
     stage_terminal_intent,
 )
-from local_voice_harness.cursor.store import JobQuarantineWarning, JobStore
+from local_voice_harness.cursor.store import (
+    JobQuarantineWarning,
+    JobStore,
+    MaintenanceLease,
+)
 from local_voice_harness.integrations.github import GitHubError, GitHubRepository
 from local_voice_harness.integrations.herdr import HerdrError
 
@@ -55,6 +59,31 @@ class CursorRecoveryTests(unittest.TestCase):
             calls,
             ["migrate", "prune", "scan", "scan", "scan", "scan"],
         )
+
+    def test_recovery_does_not_scan_or_launch_during_maintenance(self) -> None:
+        self.create(
+            {
+                "id": "123456789abc",
+                "status": "queued",
+                "request": "test",
+                "created_at": 1,
+                "queued_at": 1,
+                "delivered": False,
+            }
+        )
+        lease = MaintenanceLease("maintenance", 1, 42, "boot", "start")
+        self.store.begin_maintenance(
+            lease,
+            lambda _job: None,
+            owner_alive=lambda _lease: False,
+        )
+        launch = mock.Mock()
+
+        recover_jobs(self.store, launch_worker=launch, now=100)
+
+        launch.assert_not_called()
+        self.assertEqual(self.store.get("123456789abc").revision, 0)
+        self.assertTrue(self.store.abort_maintenance(lease.token))
 
     def test_abandoned_queued_job_is_launched_once_across_recovery_passes(
         self,

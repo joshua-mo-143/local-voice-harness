@@ -52,6 +52,32 @@ def boot_identity() -> str | None:
     return identity or None
 
 
+def process_owner_alive(
+    pid: int,
+    boot_id: str,
+    process_start: str,
+    *,
+    get_boot_identity: Callable[[], str | None] = boot_identity,
+    get_process_identity: Callable[[int], str | None] = process_identity,
+) -> bool | None:
+    """Return whether an exact process owner lives, or ``None`` if unknowable."""
+    current_boot = get_boot_identity()
+    if current_boot is None:
+        return None
+    if current_boot != boot_id:
+        return False
+    current_start = get_process_identity(pid)
+    if current_start is not None:
+        return current_start == process_start
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return None
+    return None
+
+
 def worker_command_matches(job: CursorJob) -> bool:
     if job.worker_pid is None:
         return False
@@ -276,9 +302,10 @@ class WorkerContext:
     def checkpoint(self) -> CursorJob:
         if self.cancellation_requested.is_set():
             raise WorkerCancelled
-        current = self.store.get(self.job.id)
+        current = self.store.get_unless_maintenance(self.job.id)
         if (
-            self.cancellation_requested.is_set()
+            current is None
+            or self.cancellation_requested.is_set()
             or current.worker_token != self.token
             or current.terminal_intent_status is not None
             or current.status
@@ -329,7 +356,7 @@ def begin_worker(
             started_at=started_at,
         )
 
-    claimed = store.update(job_id, begin)
+    claimed = store.update_unless_maintenance(job_id, begin)
     return (claimed, token) if claimed is not None else None
 
 
@@ -377,7 +404,7 @@ def launch_worker(
             attempt_started_at=reserved_at,
         )
 
-    reserved = store.update(job_id, reserve)
+    reserved = store.update_unless_maintenance(job_id, reserve)
     if reserved is None:
         return
 
@@ -468,7 +495,7 @@ def launch_worker(
                     worker_process_start=child_start,
                 )
 
-            handed_off = store.update(job_id, hand_off)
+            handed_off = store.update_unless_maintenance(job_id, hand_off)
             if handed_off is not None:
                 child_adopted = True
             else:
@@ -489,5 +516,22 @@ def launch_worker(
                     "could not stop Cursor worker after process identity handoff failed"
                 )
             persist_launch_failure(failure_message)
+
+            def clear_launcher(job: CursorJob) -> CursorJob | None:
+                if (
+                    job.worker_token != claim_token
+                    or job.worker_pid != launcher_pid
+                    or job.worker_boot_id != launcher_boot
+                    or job.worker_process_start != launcher_start
+                ):
+                    return None
+                return job.evolve(
+                    worker_token=None,
+                    worker_pid=None,
+                    worker_boot_id=None,
+                    worker_process_start=None,
+                )
+
+            store.update(job_id, clear_launcher)
     if child_adopted:
         threading.Thread(target=process.wait, daemon=True).start()
