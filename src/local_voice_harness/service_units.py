@@ -73,6 +73,7 @@ SERVICE_SECURITY_POLICY = {
         "RestrictRealtime": "true",
         "RestrictAddressFamilies": "AF_UNIX AF_INET AF_INET6 AF_NETLINK",
         "RuntimeDirectory": "dictation",
+        "RuntimeDirectoryPreserve": "yes",
         "CacheDirectory": "huggingface",
         "CacheDirectoryMode": "0700",
         "TasksMax": "512",

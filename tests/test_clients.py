@@ -97,7 +97,15 @@ class SpeechToTextClientTests(unittest.TestCase):
         output = io.StringIO()
         with (
             mock.patch.object(
-                stt_client, "unix_request", return_value=b"  hello world \n"
+                stt_client,
+                "_v2_request",
+                return_value={
+                    "ok": True,
+                    "version": stt_client.PROTOCOL_VERSION,
+                    "type": "transcript",
+                    "delivery_id": "delivery-id",
+                    "text": "  hello world \n",
+                },
             ) as request,
             mock.patch.object(
                 stt_client.time, "perf_counter", side_effect=[10.0, 10.125]
@@ -108,31 +116,46 @@ class SpeechToTextClientTests(unittest.TestCase):
 
         self.assertEqual(result, "hello world")
         request.assert_called_once_with(
-            stt_client.STT_SOCKET, b"/tmp/request.wav\n", timeout=120
+            audio,
+            timeout=120,
         )
         self.assertEqual(json.loads(output.getvalue())["stage"], "stt")
 
     def test_transcribe_reports_backend_empty_and_transport_errors(self) -> None:
         cases = [
-            (b"__DICTATION_ERROR__:RuntimeError: failed", "RuntimeError: failed"),
             (
-                b'{"ok":false,"error":{"code":"invalid_audio_path",'
-                b'"message":"not allowed"}}\n',
+                {
+                    "ok": False,
+                    "version": stt_client.PROTOCOL_VERSION,
+                    "error": {
+                        "code": "invalid_audio_path",
+                        "message": "not allowed",
+                    },
+                },
                 "invalid_audio_path: not allowed",
             ),
-            (b" \n", "did not recognize any speech"),
+            (
+                {
+                    "ok": True,
+                    "version": stt_client.PROTOCOL_VERSION,
+                    "type": "transcript",
+                    "delivery_id": "empty",
+                    "text": "",
+                },
+                "did not recognize any speech",
+            ),
         ]
         for response, message in cases:
             with (
                 self.subTest(response=response),
-                mock.patch.object(stt_client, "unix_request", return_value=response),
+                mock.patch.object(stt_client, "_v2_request", return_value=response),
                 self.assertRaisesRegex(HarnessError, message),
             ):
                 stt_client.transcribe(Path("/runtime/recordings/request-test.wav"))
 
         with (
             mock.patch.object(
-                stt_client, "unix_request", side_effect=ConnectionRefusedError()
+                stt_client, "_v2_request", side_effect=ConnectionRefusedError()
             ),
             self.assertRaisesRegex(HarnessError, "STT request failed"),
         ):
@@ -143,13 +166,24 @@ class SpeechToTextClientTests(unittest.TestCase):
             "/runtime/voice-harness/recordings/"
             "request-0123456789abcdef0123456789abcdef.wav"
         )
-        busy = (
-            b'{"ok":false,"error":{"code":"server_busy",'
-            b'"message":"active transcription"}}\n'
-        )
+        busy = {
+            "ok": False,
+            "version": stt_client.PROTOCOL_VERSION,
+            "error": {
+                "code": "server_busy",
+                "message": "active transcription",
+            },
+        }
+        success = {
+            "ok": True,
+            "version": stt_client.PROTOCOL_VERSION,
+            "type": "transcript",
+            "delivery_id": "delivery",
+            "text": "hello",
+        }
         with (
             mock.patch.object(
-                stt_client, "unix_request", side_effect=[busy, b"hello"]
+                stt_client, "_v2_request", side_effect=[busy, success]
             ) as request,
             mock.patch.object(stt_client.time, "sleep") as sleep,
         ):
@@ -158,8 +192,8 @@ class SpeechToTextClientTests(unittest.TestCase):
         self.assertEqual(result, "hello")
         self.assertEqual(request.call_count, 2)
         self.assertEqual(
-            [call.args[1] for call in request.call_args_list],
-            [f"{audio}\n".encode(), f"{audio}\n".encode()],
+            [call.args[0] for call in request.call_args_list],
+            [audio, audio],
         )
         sleep.assert_called_once_with(stt_client.BUSY_BACKOFF_SECONDS)
 
@@ -167,13 +201,17 @@ class SpeechToTextClientTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             audio = Path(temporary) / "request-generation.wav"
             audio.write_bytes(b"RIFF" + b"\0" * 64)
-            busy = (
-                b'{"ok":false,"error":{"code":"server_busy",'
-                b'"message":"active transcription"}}\n'
-            )
+            busy = {
+                "ok": False,
+                "version": stt_client.PROTOCOL_VERSION,
+                "error": {
+                    "code": "server_busy",
+                    "message": "active transcription",
+                },
+            }
             with (
                 mock.patch.object(stt_client, "REQUEST_DEADLINE_SECONDS", 0.0),
-                mock.patch.object(stt_client, "unix_request", return_value=busy),
+                mock.patch.object(stt_client, "_v2_request", return_value=busy),
                 self.assertRaisesRegex(
                     HarnessError,
                     rf"voice-harness transcribe --generation {audio}",
@@ -182,6 +220,130 @@ class SpeechToTextClientTests(unittest.TestCase):
                 stt_client.transcribe(audio)
 
             self.assertTrue(audio.exists())
+
+    def test_v2_request_frames_multiline_text_and_sends_matching_ack(self) -> None:
+        response = {
+            "ok": True,
+            "version": stt_client.PROTOCOL_VERSION,
+            "type": "transcript",
+            "delivery_id": "delivery-id",
+            "text": "first line\n第二行",
+        }
+        connection = mock.Mock()
+        connection.recv.side_effect = [
+            json.dumps(response, separators=(",", ":")).encode() + b"\n",
+            b"",
+        ]
+        with mock.patch.object(stt_client.socket, "socket", return_value=connection):
+            result = stt_client._v2_request(Path("/runtime/request.wav"), timeout=3)
+
+        self.assertEqual(result, response)
+        request = json.loads(connection.sendall.call_args_list[0].args[0])
+        acknowledgment = json.loads(connection.sendall.call_args_list[1].args[0])
+        self.assertEqual(request["type"], "transcribe")
+        self.assertEqual(request["audio_path"], "/runtime/request.wav")
+        self.assertEqual(
+            acknowledgment,
+            {
+                "version": stt_client.PROTOCOL_VERSION,
+                "type": "ack",
+                "delivery_id": "delivery-id",
+            },
+        )
+
+    def test_transcribe_falls_back_to_legacy_server_once(self) -> None:
+        audio = Path("/runtime/recordings/request.wav")
+        with (
+            mock.patch.object(
+                stt_client, "_v2_request", side_effect=stt_client._LegacyServer
+            ),
+            mock.patch.object(
+                stt_client, "unix_request", return_value=b"legacy transcript"
+            ) as legacy,
+        ):
+            result = stt_client.transcribe(audio)
+
+        self.assertEqual(result, "legacy transcript")
+        legacy.assert_called_once_with(
+            stt_client.STT_SOCKET,
+            f"{audio}\n".encode(),
+            timeout=mock.ANY,
+        )
+        timeout = legacy.call_args.kwargs["timeout"]
+        self.assertGreater(timeout, 0)
+        self.assertLessEqual(timeout, stt_client.REQUEST_DEADLINE_SECONDS)
+
+    def test_post_ack_protocol_failure_does_not_trigger_legacy_retry(self) -> None:
+        response = {
+            "ok": True,
+            "version": stt_client.PROTOCOL_VERSION,
+            "type": "transcript",
+            "delivery_id": "delivery-id",
+            "text": "hello",
+        }
+        connection = mock.Mock()
+        connection.recv.side_effect = [
+            json.dumps(response, separators=(",", ":")).encode() + b"\n",
+            b'{"version":1}\n',
+            b"",
+        ]
+        with (
+            mock.patch.object(stt_client.socket, "socket", return_value=connection),
+            mock.patch.object(stt_client, "unix_request") as legacy,
+            self.assertRaisesRegex(HarnessError, "invalid acknowledgment response"),
+        ):
+            stt_client.transcribe(Path("/runtime/request.wav"))
+
+        legacy.assert_not_called()
+
+    def test_legacy_fallback_respects_expired_overall_deadline(self) -> None:
+        audio = Path("/runtime/recordings/request.wav")
+        with (
+            mock.patch.object(stt_client, "REQUEST_DEADLINE_SECONDS", 1.0),
+            mock.patch.object(
+                stt_client.time,
+                "monotonic",
+                side_effect=[100.0, 101.1],
+            ),
+            mock.patch.object(
+                stt_client, "_v2_request", side_effect=stt_client._LegacyServer
+            ),
+            mock.patch.object(stt_client, "unix_request") as legacy,
+            self.assertRaisesRegex(HarnessError, "deadline expired"),
+        ):
+            stt_client.transcribe(audio)
+
+        legacy.assert_not_called()
+
+    def test_protocol_error_only_suggests_an_existing_retry_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            audio = Path(temporary) / "request.wav"
+            audio.write_bytes(b"RIFF" + b"\0" * 64)
+            response = {
+                "ok": False,
+                "version": stt_client.PROTOCOL_VERSION,
+                "error": {
+                    "code": "transcription_failed",
+                    "message": "backend failed",
+                    "retry_path": str(audio),
+                },
+            }
+            with (
+                mock.patch.object(stt_client, "_v2_request", return_value=response),
+                self.assertRaisesRegex(
+                    HarnessError,
+                    rf"voice-harness transcribe --generation {audio}",
+                ),
+            ):
+                stt_client.transcribe(audio)
+
+            audio.unlink()
+            with (
+                mock.patch.object(stt_client, "_v2_request", return_value=response),
+                self.assertRaises(HarnessError) as caught,
+            ):
+                stt_client.transcribe(audio)
+            self.assertNotIn("voice-harness transcribe", str(caught.exception))
 
 
 class TextToSpeechClientTests(unittest.TestCase):

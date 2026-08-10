@@ -200,6 +200,10 @@ class ServiceUnitValidationTests(unittest.TestCase):
             "%t",
         )
         self.assertEqual(
+            policy["dictation.service"]["RuntimeDirectoryPreserve"],
+            "yes",
+        )
+        self.assertEqual(
             policy["voice-harness-wake.service"]["ProtectHome"],
             "false",
         )

@@ -17,6 +17,7 @@ WorkingDirectory=%h/local-voice-harness
 ExecStart=%h/local-voice-harness/.venv-dictation/bin/voice-harness-dictation
 RuntimeDirectory=dictation
 RuntimeDirectoryMode=0700
+RuntimeDirectoryPreserve=yes
 CacheDirectory=huggingface
 CacheDirectoryMode=0700
 UMask=0077
