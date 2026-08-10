@@ -11,7 +11,11 @@ from typing import NamedTuple
 
 from ..config import CURSOR_FOREGROUND_SECONDS, JOB_LOGS_DIR, JOBS_DIR, LEGACY_JOBS_DIR
 from ..errors import HarnessError
-from ..integrations.herdr import extract_linear_issue
+from ..integrations.registry import (
+    extract_issue_reference,
+    require_issue_capabilities,
+    resolve_issue_reference,
+)
 from ..questions import (
     AnswerOutcome,
     AnswerProvenance,
@@ -208,6 +212,13 @@ def start_job(
     job_id = uuid.uuid4().hex[:12]
     now = time.time()
     spoken_text = utterance if utterance is not None else text
+    resolved_issue_key = (
+        resolve_issue_reference(issue_key)
+        if issue_key is not None
+        else extract_issue_reference(spoken_text)
+    )
+    if resolved_issue_key:
+        require_issue_capabilities(resolved_issue_key)
     issue_repository = (github_repository or "").strip()
     github_issue_url = (
         f"https://github.com/{issue_repository}/issues/{github_issue}"
@@ -252,10 +263,10 @@ def start_job(
             ),
             pull_request_worktree_state=("pending" if github_pull_request else None),
             agent_hint=agent,
-            issue_key=issue_key or extract_linear_issue(spoken_text),
+            issue_key=resolved_issue_key,
             speakable_label=inbox.build_speakable_label(
                 text,
-                issue_key=issue_key or extract_linear_issue(spoken_text),
+                issue_key=resolved_issue_key,
                 github_repository=github_repository,
                 github_issue=github_issue,
                 github_pull_request=github_pull_request,
@@ -376,8 +387,12 @@ def start_follow_up(
     now = time.time()
     child_id = uuid.uuid4().hex[:12]
     spoken = utterance if utterance is not None else text
+    store = _job_store()
 
     def build(parent: CursorJob) -> CursorJob:
+        active_issue_key = resolve_issue_reference(parent.issue_key)
+        if active_issue_key:
+            require_issue_capabilities(active_issue_key)
         return CursorJob.new(
             NewCursorJob(
                 id=child_id,
@@ -402,7 +417,7 @@ def start_follow_up(
             )
         )
 
-    created = _job_store().create_follow_up(
+    created = store.create_follow_up(
         parent_job_id, build, expected_completed_at=expected_completed_at
     )
     if on_created is not None:
@@ -1000,3 +1015,10 @@ def _await_foreground(
         f"Cursor is still working on job {job_id}. I will report back when it finishes.",
         None,
     )
+
+
+# Compatibility aliases for callers migrating to the agent-neutral service API.
+StartAgentJobRequest = StartJobRequest
+AgentTurnRequest = CursorTurnRequest
+AgentTurnResult = CursorTurnResult
+agent_turn = cursor_turn

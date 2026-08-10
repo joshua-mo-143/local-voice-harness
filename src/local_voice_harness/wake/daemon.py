@@ -15,6 +15,11 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .. import recorder
+from ..agents.model import AgentJob as CursorJob
+from ..agents.model import JobStatus
+from ..agents.service import AgentTurnRequest as CursorTurnRequest
+from ..agents.service import agent_turn as cursor_turn
+from ..agents.service import recover_jobs
 from ..browser_context import request_context
 from ..components import start_components, stop_components
 from ..config import (
@@ -53,8 +58,6 @@ from ..cursor.delivery import (
 from ..cursor.delivery import (
     release_delivery as release_claim,
 )
-from ..cursor.model import CursorJob, JobStatus
-from ..cursor.service import CursorTurnRequest, cursor_turn, recover_jobs
 from ..cursor.store import JobStore
 from ..errors import HarnessError
 from ..intent import ForkIntent, Intent, IntentRoute, decide_fork_intent, route_intent
@@ -846,7 +849,7 @@ class WakeConversationDaemon:
                 recent_completion=active_completed is not None,
             )
             if pending is not None and question_control(text) is not None:
-                route = IntentRoute(Intent.CURSOR_REPLY, "high")
+                route = IntentRoute(Intent.AGENT_REPLY, "high")
             if route.actionable and route.intent == Intent.END_CONVERSATION:
                 return self.end_conversation()
             fork_requested = decide_fork_intent(text) == ForkIntent.AFFIRMATIVE
@@ -864,7 +867,7 @@ class WakeConversationDaemon:
                 or context.github_pull_request
                 else {}
             )
-            if route.actionable and route.intent == Intent.CURSOR_LIST:
+            if route.actionable and route.intent == Intent.AGENT_LIST:
                 response, next_cursor_session = cursor_turn(
                     CursorTurnRequest(
                         "",
@@ -873,7 +876,7 @@ class WakeConversationDaemon:
                     ),
                     delivery_claims=delivery_claims,
                 )
-            elif route.actionable and route.intent == Intent.CURSOR_CANCEL:
+            elif route.actionable and route.intent == Intent.AGENT_CANCEL:
                 response, next_cursor_session = cursor_turn(
                     CursorTurnRequest(
                         text,
@@ -884,7 +887,7 @@ class WakeConversationDaemon:
                     ),
                     delivery_claims=delivery_claims,
                 )
-            elif route.actionable and route.intent == Intent.CURSOR_STATUS:
+            elif route.actionable and route.intent == Intent.AGENT_STATUS:
                 response, next_cursor_session = cursor_turn(
                     CursorTurnRequest(
                         text,
@@ -896,14 +899,14 @@ class WakeConversationDaemon:
                     delivery_claims=delivery_claims,
                 )
             elif route.actionable and route.intent in {
-                Intent.CURSOR_DISMISS,
-                Intent.CURSOR_REPEAT,
+                Intent.AGENT_DISMISS,
+                Intent.AGENT_REPEAT,
             }:
                 action = (
                     "reply"
-                    if route.intent == Intent.CURSOR_REPEAT and pending is not None
+                    if route.intent == Intent.AGENT_REPEAT and pending is not None
                     else (
-                        "dismiss" if route.intent == Intent.CURSOR_DISMISS else "repeat"
+                        "dismiss" if route.intent == Intent.AGENT_DISMISS else "repeat"
                     )
                 )
                 response, next_cursor_session = cursor_turn(
@@ -934,7 +937,7 @@ class WakeConversationDaemon:
                 )
             elif (
                 route.actionable
-                and route.intent == Intent.CURSOR_REPLY
+                and route.intent == Intent.AGENT_REPLY
                 and pending is not None
             ):
                 response, next_cursor_session = cursor_turn(
@@ -954,7 +957,7 @@ class WakeConversationDaemon:
                     ),
                     delivery_claims=delivery_claims,
                 )
-            elif route.actionable and route.intent == Intent.CURSOR_SUBMIT:
+            elif route.actionable and route.intent == Intent.AGENT_SUBMIT:
                 # Explicit new work invalidates any retained completed-job slot.
                 self.completed_followup = None
                 response, next_cursor_session = cursor_turn(
@@ -966,12 +969,12 @@ class WakeConversationDaemon:
                     ),
                     delivery_claims=delivery_claims,
                 )
-            elif route.intent == Intent.CURSOR_PR_UNSUPPORTED:
+            elif route.intent == Intent.AGENT_PR_UNSUPPORTED:
                 response = (
                     "I can't open pull requests. I can review the changes or run "
                     "the tests in that checkout instead."
                 )
-            elif route.actionable and route.intent == Intent.CURSOR_FOLLOWUP:
+            elif route.actionable and route.intent == Intent.AGENT_FOLLOWUP:
                 current_completed = self._active_completed_followup()
                 if (
                     self.cursor_session is not None

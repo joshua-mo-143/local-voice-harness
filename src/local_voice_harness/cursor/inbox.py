@@ -80,7 +80,7 @@ def build_speakable_label(
     """Derive a short, speakable label from job metadata.
 
     Preference order favours the most unambiguous handle a user is likely to
-    speak: an explicit Linear issue key, a GitHub issue or pull-request number,
+    speak: an explicit external issue key, a GitHub issue or pull-request number,
     then the opening words of the request.
     """
 

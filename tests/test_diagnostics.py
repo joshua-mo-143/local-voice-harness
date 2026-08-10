@@ -17,6 +17,7 @@ from local_voice_harness.diagnostics.model import (
     Repair,
     Severity,
 )
+from local_voice_harness.integrations.linear import CapabilityStatus
 
 
 def _result(severity: Severity, name: str = "x", **kwargs: object) -> CheckResult:
@@ -759,28 +760,33 @@ class IntegrationCheckTests(unittest.TestCase):
         self.assertIs(results[0].severity, Severity.WARNING)
         self.assertIn("gh auth login", results[0].suggestion or "")
 
-    def test_linear_mcp_absent_agent_is_unavailable(self) -> None:
-        with mock.patch.object(checks, "_which", return_value=None):
-            results = checks.check_mcp_linear()
-        self.assertIs(results[0].severity, Severity.UNAVAILABLE)
+    def test_disabled_linear_has_no_diagnostic(self) -> None:
+        with mock.patch.object(checks, "capability_statuses", return_value=()):
+            self.assertEqual(checks.check_mcp_linear(), [])
 
     def test_linear_mcp_configured_is_ok(self) -> None:
-        with (
-            mock.patch.object(checks, "_which", return_value="/usr/bin/agent"),
-            mock.patch.object(
-                checks, "_run", return_value=_completed(0, "linear enabled")
-            ),
+        with mock.patch.object(
+            checks,
+            "capability_statuses",
+            return_value=(("linear", CapabilityStatus(True, "available")),),
         ):
             results = checks.check_mcp_linear()
         self.assertIs(results[0].severity, Severity.OK)
 
-    def test_linear_mcp_not_configured_is_unavailable(self) -> None:
-        with (
-            mock.patch.object(checks, "_which", return_value="/usr/bin/agent"),
-            mock.patch.object(checks, "_run", return_value=_completed(0, "github")),
+    def test_enabled_linear_missing_mcp_is_fatal_and_actionable(self) -> None:
+        with mock.patch.object(
+            checks,
+            "capability_statuses",
+            return_value=(
+                (
+                    "linear",
+                    CapabilityStatus(False, "cursor-mcp unavailable", "enable Linear"),
+                ),
+            ),
         ):
             results = checks.check_mcp_linear()
-        self.assertIs(results[0].severity, Severity.UNAVAILABLE)
+        self.assertIs(results[0].severity, Severity.FATAL)
+        self.assertEqual(results[0].suggestion, "enable Linear")
 
 
 class CliWiringTests(unittest.TestCase):

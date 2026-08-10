@@ -777,7 +777,13 @@ class CursorJobStateTests(unittest.TestCase):
         self.assertIsNone(job["issue_key"])
 
     def test_focused_linear_issue_persists_validated_identifier(self) -> None:
-        with mock.patch.object(service, "launch_worker"):
+        with (
+            mock.patch.object(service, "launch_worker"),
+            mock.patch.object(
+                service, "resolve_issue_reference", return_value="ENG-123"
+            ),
+            mock.patch.object(service, "require_issue_capabilities"),
+        ):
             job_id = service.start_job(
                 "work on this ticket\n\nIdentifier: ENG-123",
                 utterance="work on this ticket",
@@ -1077,6 +1083,36 @@ class CursorJobStateTests(unittest.TestCase):
         client.choose_or_clone_repository.assert_called_once_with(
             [], checkpoint=mock.ANY
         )
+
+    def test_worker_checks_issue_capability_before_herdr_side_effects(self) -> None:
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "work on ENG-123",
+                "issue_key": "ENG-123",
+                "status": "queued",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        client = mock.Mock()
+        with (
+            mock.patch.object(jobs, "HerdrClient", return_value=client),
+            mock.patch.object(
+                production_jobs, "resolve_issue_reference", return_value="ENG-123"
+            ),
+            mock.patch.object(
+                production_jobs,
+                "require_issue_capabilities",
+                side_effect=jobs.HarnessError("Linear MCP requires authentication"),
+            ),
+        ):
+            service.run_worker("123456789abc")
+
+        failed = jobs.read_job("123456789abc")
+        self.assertEqual(failed["status"], "failed")
+        self.assertIn("requires authentication", str(failed["error"]))
+        client.ensure_server.assert_not_called()
 
     def test_prompt_timeout_retains_target_reservation_for_cancellation(self) -> None:
         repository = Path(self.temporary.name) / "project"

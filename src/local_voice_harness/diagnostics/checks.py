@@ -27,6 +27,7 @@ from ..config import (
 from ..credentials import CredentialError, get_venice_api_key
 from ..errors import HarnessError
 from ..integrations.herdr import HERDR_BIN, HerdrClient, HerdrError
+from ..integrations.registry import capability_statuses
 from ..ipc import socket_ready
 from .model import CheckResult, Repair, Severity
 
@@ -985,50 +986,28 @@ def check_github_auth() -> list[CheckResult]:
     ]
 
 
-def check_mcp_linear() -> list[CheckResult]:
-    if _which("agent") is None:
-        return [
+def check_optional_integrations() -> list[CheckResult]:
+    results: list[CheckResult] = []
+    for name, status in capability_statuses():
+        results.append(
             CheckResult(
-                name="integration:linear-mcp",
+                name=f"integration:{name}",
                 category="integrations",
-                severity=Severity.UNAVAILABLE,
-                detail="Cursor CLI is absent; optional Linear MCP cannot be checked",
+                severity=Severity.OK if status.available else Severity.FATAL,
+                detail=status.detail,
+                suggestion=status.suggestion,
             )
-        ]
-    process = _run(["agent", "mcp", "list"], timeout=10)
-    if process is None or process.returncode:
-        return [
-            CheckResult(
-                name="integration:linear-mcp",
-                category="integrations",
-                severity=Severity.UNAVAILABLE,
-                detail=(
-                    "optional Linear MCP is not configured; repository tasks still "
-                    "work without it"
-                ),
-                suggestion="agent mcp login linear && agent mcp enable linear",
-            )
-        ]
-    if "linear" in process.stdout.casefold():
-        return [
-            CheckResult(
-                name="integration:linear-mcp",
-                category="integrations",
-                severity=Severity.OK,
-                detail="Linear MCP server is configured",
-            )
-        ]
-    return [
-        CheckResult(
-            name="integration:linear-mcp",
-            category="integrations",
-            severity=Severity.UNAVAILABLE,
-            detail=(
-                "optional Linear MCP is not configured; repository tasks still work "
-                "without it"
-            ),
-            suggestion="agent mcp login linear && agent mcp enable linear",
         )
+    return results
+
+
+def check_mcp_linear() -> list[CheckResult]:
+    """Backward-compatible entry point; disabled Linear yields no diagnostic."""
+
+    return [
+        result
+        for result in check_optional_integrations()
+        if result.name == "integration:linear"
     ]
 
 
@@ -1049,5 +1028,5 @@ ALL_CHECKS: tuple[Check, ...] = (
     check_herdr,
     check_cursor_cli,
     check_github_auth,
-    check_mcp_linear,
+    check_optional_integrations,
 )

@@ -7,7 +7,7 @@ PipeWire microphone
   -> Qwen3.5-4B Q4_K_M via llama.cpp (CUDA)
        -> focused intent classification
        -> ordinary conversational response
-       -> Herdr-managed Cursor agent, GitHub CLI, and Linear MCP
+       -> Herdr-managed Cursor agent, GitHub CLI, and optional integrations
   -> Chatterbox Turbo (CUDA)
   -> PipeWire playback
 ```
@@ -55,8 +55,10 @@ Cursor routing works as follows:
    waiting for the inactivity timeout. A spoken close phrase such as "goodbye" or "stop
    listening" remains a fast path that closes immediately.
 2. Prefer an idle Cursor agent already running in the requested checkout.
-3. For a Linear issue without a repository name, ask a dedicated routing agent to
-   inspect the ticket through Linear MCP and infer the repository.
+3. Enabled integrations may contribute issue recognition, bounded external context,
+   agent instructions, and repository routing. The optional Linear connector asks a
+   dedicated routing agent to inspect the ticket through Linear MCP when no repository
+   is named; it is never loaded or diagnosed while disabled.
 4. For a focused or explicitly spoken GitHub issue, validate it through `gh`, reuse
    an exact matching local checkout or clone its repository below the GitHub root,
    and preserve bounded issue context with the job.

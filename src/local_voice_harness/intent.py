@@ -16,7 +16,7 @@ ROUTER_SYSTEM_PROMPT = (
     "You are an intent router for a local voice assistant. Classify the user's next "
     "action; do not answer or perform it. Use cursor_submit for software-engineering "
     "work that requires inspecting or changing code, files, repositories, running "
-    "commands, or working on a GitHub or Linear issue. Phrases such as 'work on the "
+    "commands, or working on a GitHub or focused external issue. Phrases such as 'work on the "
     "task' or 'handle this' mean cursor_submit when focused_repository or focused_issue "
     "is present. Use cursor_reply only when a Cursor job is awaiting a clarification "
     "and the utterance answers that clarification, or says repeat, ask me later, or "
@@ -80,6 +80,16 @@ ROUTE_TOOL = {
 
 class Intent(StrEnum):
     CONVERSATION = "conversation"
+    AGENT_SUBMIT = "cursor_submit"
+    AGENT_REPLY = "cursor_reply"
+    AGENT_FOLLOWUP = "cursor_followup"
+    AGENT_PR_UNSUPPORTED = "cursor_pr_unsupported"
+    AGENT_STATUS = "cursor_status"
+    AGENT_CANCEL = "cursor_cancel"
+    AGENT_LIST = "cursor_list"
+    AGENT_DISMISS = "cursor_dismiss"
+    AGENT_REPEAT = "cursor_repeat"
+    # Compatibility aliases for the original Cursor-specific intent names.
     CURSOR_SUBMIT = "cursor_submit"
     CURSOR_REPLY = "cursor_reply"
     CURSOR_FOLLOWUP = "cursor_followup"
