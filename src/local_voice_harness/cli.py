@@ -2,11 +2,18 @@ from __future__ import annotations
 
 import argparse
 import getpass
+import json
 from pathlib import Path
 
 from .agents.service import AgentTurnRequest as CursorTurnRequest
+from .agents.service import (
+    acknowledge_quarantine_reservations,
+    count_jobs,
+    list_quarantine_evidence,
+    nuke_jobs,
+)
 from .agents.service import agent_turn as cursor_turn
-from .agents.service import count_jobs, nuke_jobs
+from .agents.store import QuarantineEvidence
 from .app import respond, status
 from .credentials import (
     delete_venice_api_key,
@@ -83,6 +90,44 @@ def parser() -> argparse.ArgumentParser:
     job_reply = job_commands.add_parser("reply", help="answer a job clarification")
     job_reply.add_argument("--job", "-j", help="target job id")
     job_reply.add_argument("message", nargs="+")
+    job_quarantine = job_commands.add_parser(
+        "quarantine", help="inspect and resolve quarantined job records"
+    )
+    quarantine_commands = job_quarantine.add_subparsers(
+        dest="quarantine_command", required=True
+    )
+    quarantine_list = quarantine_commands.add_parser(
+        "list", help="show unresolved quarantine evidence"
+    )
+    quarantine_list.add_argument(
+        "--all",
+        action="store_true",
+        help="include previously acknowledged evidence",
+    )
+    quarantine_list.add_argument(
+        "--json",
+        action="store_true",
+        dest="json_output",
+        help="emit machine-readable evidence",
+    )
+    quarantine_acknowledge = quarantine_commands.add_parser(
+        "acknowledge",
+        help="release reservations after manually inspecting one job's evidence",
+    )
+    quarantine_acknowledge.add_argument(
+        "job_id", help="12-character quarantined job ID"
+    )
+    quarantine_acknowledge.add_argument(
+        "--reason",
+        required=True,
+        help="operator verification recorded in the resolution tombstone",
+    )
+    quarantine_acknowledge.add_argument(
+        "--force",
+        "-f",
+        action="store_true",
+        help="acknowledge without the confirmation prompt",
+    )
     job_nuke = job_commands.add_parser(
         "nuke", help="permanently delete ALL Cursor jobs"
     )
@@ -149,6 +194,9 @@ def parser() -> argparse.ArgumentParser:
 
 
 def run_job_command(args: argparse.Namespace) -> None:
+    if args.jobs_command == "quarantine":
+        _run_job_quarantine(args)
+        return
     if args.jobs_command == "nuke":
         _run_job_nuke(force=args.force)
         return
@@ -172,9 +220,89 @@ def run_job_command(args: argparse.Namespace) -> None:
     print(cursor_turn(request).text)
 
 
+def _print_quarantine_evidence(record: QuarantineEvidence) -> None:
+    identity = record.job_id or f"unknown ({record.metadata_path.name})"
+    state = "acknowledged" if record.resolved else "unresolved"
+    print(f"{identity}: {state}")
+    print(f"  metadata: {record.metadata_path}")
+    if record.payload_path is not None:
+        print(f"  payload: {record.payload_path}")
+    print(f"  quarantine error: {record.quarantine_error}")
+    if record.status is not None:
+        print(f"  recorded status: {record.status}")
+    if record.worker_pid is not None:
+        print(
+            "  recorded worker: "
+            f"pid={record.worker_pid} "
+            f"boot={record.worker_boot_id or 'unknown'} "
+            f"start={record.worker_process_start or 'unknown'}"
+        )
+    if record.herdr_target is not None:
+        print(f"  recorded Herdr target: {record.herdr_target}")
+    if record.worktree_path is not None:
+        print(f"  recorded worktree: {record.worktree_path}")
+    if record.inspection_error is not None:
+        print(f"  inspection error: {record.inspection_error}")
+
+
+def _run_job_quarantine(args: argparse.Namespace) -> None:
+    if args.quarantine_command == "list":
+        evidence = list_quarantine_evidence(include_resolved=args.all)
+        if args.json_output:
+            print(
+                json.dumps(
+                    [record.to_dict() for record in evidence],
+                    indent=2,
+                    sort_keys=True,
+                )
+            )
+            return
+        if not evidence:
+            qualifier = "" if args.all else " unresolved"
+            print(f"There are no{qualifier} quarantined job records.")
+            return
+        for index, record in enumerate(evidence):
+            if index:
+                print()
+            _print_quarantine_evidence(record)
+        return
+
+    evidence = [
+        record
+        for record in list_quarantine_evidence(include_resolved=True)
+        if record.job_id == args.job_id
+    ]
+    unresolved = [record for record in evidence if not record.resolved]
+    if unresolved and not args.force:
+        print(
+            "WARNING: acknowledging quarantine evidence releases any target and "
+            "worktree reservation fences recorded for this job."
+        )
+        for record in unresolved:
+            _print_quarantine_evidence(record)
+        confirmation = input("Type 'acknowledge' to confirm: ").strip().casefold()
+        if confirmation != "acknowledge":
+            print("Aborted. Quarantine reservations were not acknowledged.")
+            return
+    print(
+        acknowledge_quarantine_reservations(
+            args.job_id,
+            reason=args.reason,
+        )
+    )
+
+
 def _run_job_nuke(*, force: bool) -> None:
     total = count_jobs()
     if total == 0:
+        unresolved = list_quarantine_evidence()
+        if unresolved:
+            print(
+                "There are no live Cursor jobs to delete, but unresolved quarantine "
+                "evidence remains. Inspect it with "
+                "'voice-harness jobs quarantine list'."
+            )
+            return
         print("There are no Cursor jobs to delete.")
         return
     if not force:

@@ -893,6 +893,7 @@ def check_cursor_jobs() -> list[CheckResult]:
                         f"{len(unresolved)} quarantined job record(s) may fence "
                         f"reservations: {unresolved}"
                     ),
+                    suggestion="voice-harness jobs quarantine list",
                 )
             )
     return results

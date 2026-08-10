@@ -758,6 +758,17 @@ class CursorStoreIntegrationTests(unittest.TestCase):
             reason="operator verified no external reservation remains",
             now=100,
         )
+        resolution_path = next(
+            (self.jobs_dir / ".quarantine").glob(
+                "aaaaaaaaaaaa-*.reservation-resolution.json"
+            )
+        )
+        resolution = resolution_path.read_bytes()
+        repeated = store.acknowledge_quarantine_reservations(
+            "aaaaaaaaaaaa",
+            reason="do not replace the original audit record",
+            now=200,
+        )
         reserved = store.reserve_target(
             "bbbbbbbbbbbb",
             lambda job: transition(job, JobStatus.QUEUED, herdr_target="shared-agent"),
@@ -765,9 +776,88 @@ class CursorStoreIntegrationTests(unittest.TestCase):
 
         self.assertIsNotNone(reserved)
         self.assertEqual(acknowledgement.acknowledged_at, 100)
+        self.assertEqual(repeated.resolved_metadata, ())
+        self.assertEqual(resolution_path.read_bytes(), resolution)
         self.assertTrue(
             list((self.jobs_dir / ".quarantine").glob("aaaaaaaaaaaa-*.json"))
         )
+
+    def test_quarantine_evidence_lists_operator_reconciliation_fields(self) -> None:
+        store = JobStore(self.jobs_dir, self.jobs_dir / "legacy")
+        malformed = self.job(
+            "aaaaaaaaaaaa",
+            status="running",
+            herdr_target="shared-agent",
+            worktree_path="/worktrees/shared",
+            worker_pid=42,
+            worker_boot_id="boot",
+            worker_process_start="start",
+        )
+        malformed["parent_job_id"] = "invalid"
+        (self.jobs_dir / "aaaaaaaaaaaa.json").write_text(json.dumps(malformed))
+        with self.assertWarns(JobQuarantineWarning):
+            store.list()
+
+        evidence = store.list_quarantine_evidence()
+
+        self.assertEqual(len(evidence), 1)
+        record = evidence[0]
+        self.assertEqual(record.job_id, "aaaaaaaaaaaa")
+        self.assertEqual(record.status, "running")
+        self.assertEqual(record.worker_pid, 42)
+        self.assertEqual(record.worker_boot_id, "boot")
+        self.assertEqual(record.worker_process_start, "start")
+        self.assertEqual(record.herdr_target, "shared-agent")
+        self.assertEqual(record.worktree_path, "/worktrees/shared")
+        self.assertIsNone(record.inspection_error)
+        self.assertFalse(record.resolved)
+        self.assertTrue(record.metadata_path.is_file())
+        assert record.payload_path is not None
+        self.assertTrue(record.payload_path.is_file())
+
+        store.acknowledge_quarantine_reservations(
+            "aaaaaaaaaaaa", reason="operator reconciled reservations"
+        )
+
+        self.assertEqual(store.list_quarantine_evidence(), [])
+        resolved = store.list_quarantine_evidence(include_resolved=True)
+        self.assertEqual(len(resolved), 1)
+        self.assertTrue(resolved[0].resolved)
+
+    def test_quarantine_evidence_reports_unreadable_metadata_without_mutation(
+        self,
+    ) -> None:
+        store = JobStore(self.jobs_dir, self.jobs_dir / "legacy")
+        quarantine = self.jobs_dir / ".quarantine"
+        quarantine.mkdir()
+        metadata = quarantine / "aaaaaaaaaaaa-deadbeef.metadata.json"
+        metadata.write_text("{not json")
+        before = metadata.read_bytes()
+
+        evidence = store.list_quarantine_evidence()
+
+        self.assertEqual(len(evidence), 1)
+        self.assertEqual(evidence[0].job_id, "aaaaaaaaaaaa")
+        self.assertIsNotNone(evidence[0].inspection_error)
+        self.assertEqual(metadata.read_bytes(), before)
+        self.assertFalse(next(quarantine.glob("*.metadata.json")).is_symlink())
+
+    def test_quarantine_acknowledgement_rejects_symlinked_metadata(self) -> None:
+        store = JobStore(self.jobs_dir, self.jobs_dir / "legacy")
+        quarantine = self.jobs_dir / ".quarantine"
+        quarantine.mkdir()
+        outside = self.jobs_dir / "outside.json"
+        outside.write_text(json.dumps({"error": "outside"}))
+        metadata = quarantine / "aaaaaaaaaaaa-deadbeef.metadata.json"
+        metadata.symlink_to(outside)
+
+        evidence = store.list_quarantine_evidence()
+
+        self.assertEqual(len(evidence), 1)
+        self.assertIn("symlink", evidence[0].inspection_error or "")
+        with self.assertRaisesRegex(JobValidationError, "cannot be a symlink"):
+            store.acknowledge_quarantine_reservations("aaaaaaaaaaaa", reason="unsafe")
+        self.assertFalse(list(quarantine.glob("*.reservation-resolution.json")))
 
     def test_newly_quarantined_peer_blocks_plain_create_reservation(self) -> None:
         store = JobStore(self.jobs_dir, self.jobs_dir / "legacy")
@@ -1172,16 +1262,25 @@ class CursorStoreIntegrationTests(unittest.TestCase):
         evidence = quarantine / "bbbbbbbbbbbb-deadbeef.metadata.json"
         evidence.write_text(json.dumps({"error": "held"}))
         lease = self.maintenance_lease()
+        stage = mock.Mock()
+
+        with self.assertRaisesRegex(JobMaintenanceError, "quarantine evidence"):
+            store.begin_maintenance(lease, stage, owner_alive=lambda _lease: False)
+
+        stage.assert_not_called()
+        self.assertTrue((self.jobs_dir / "aaaaaaaaaaaa.json").exists())
+        self.assertTrue(evidence.exists())
+        self.assertFalse(store.maintenance_active())
+
+        store.acknowledge_quarantine_reservations(
+            "bbbbbbbbbbbb", reason="operator inspected evidence"
+        )
         store.begin_maintenance(
             lease, lambda _job: None, owner_alive=lambda _lease: False
         )
 
-        with self.assertRaisesRegex(JobMaintenanceError, "quarantine evidence"):
-            store.finalize_maintenance(lease.token)
-
-        self.assertTrue((self.jobs_dir / "aaaaaaaaaaaa.json").exists())
+        self.assertEqual(store.finalize_maintenance(lease.token), ["aaaaaaaaaaaa"])
         self.assertTrue(evidence.exists())
-        self.assertTrue(store.abort_maintenance(lease.token))
 
     def test_maintenance_finalize_empty_store_returns_empty(self) -> None:
         store = JobStore(self.jobs_dir / "absent", self.jobs_dir / "legacy")

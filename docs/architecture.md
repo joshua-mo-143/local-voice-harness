@@ -274,4 +274,7 @@ Unresolved quarantine evidence conservatively fences conflicting target and
 worktree reservations. Operators may explicitly release that fence through the
 typed `JobStore.acknowledge_quarantine_reservations()` API, which writes a
 hash-bound resolution tombstone while preserving the quarantined payload and
-metadata.
+metadata. `voice-harness jobs quarantine list` exposes the recorded worker and
+reservation identities for inspection; the confirmation-gated `acknowledge`
+subcommand records the operator's reason. Bulk job deletion preflights this
+evidence before staging cancellations or stopping workers.

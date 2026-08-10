@@ -56,6 +56,7 @@ from .store import (
     JobMaintenanceError,
     JobStore,
     MaintenanceLease,
+    QuarantineEvidence,
 )
 
 DELIVERY_RETRY_SECONDS = 5.0
@@ -980,6 +981,28 @@ def count_jobs() -> int:
     return len(_job_store().list())
 
 
+def list_quarantine_evidence(
+    *, include_resolved: bool = False
+) -> list[QuarantineEvidence]:
+    """Return quarantine evidence for operator inspection."""
+    return _job_store().list_quarantine_evidence(include_resolved=include_resolved)
+
+
+def acknowledge_quarantine_reservations(job_id: str, *, reason: str) -> str:
+    """Release reservations after an operator verifies quarantine evidence."""
+    acknowledgement = _job_store().acknowledge_quarantine_reservations(
+        job_id, reason=reason
+    )
+    count = len(acknowledgement.resolved_metadata)
+    if not count:
+        return f"Quarantine reservations for job {job_id} were already acknowledged."
+    noun = "record" if count == 1 else "records"
+    return (
+        f"Acknowledged {count} quarantined {noun} for job {job_id}. "
+        "The payload and metadata were preserved."
+    )
+
+
 def nuke_jobs() -> str:
     """Fence claims, drain workers, and delete only fully reconciled jobs."""
     store = _job_store()
@@ -1171,7 +1194,13 @@ def nuke_jobs() -> str:
         removed = store.finalize_maintenance(lease.token)
     except JobMaintenanceError as exc:
         abort_owned_lease()
-        raise HarnessError(str(exc)) from exc
+        message = str(exc)
+        if "quarantine evidence" in message:
+            message += (
+                ". Inspect it with 'voice-harness jobs quarantine list', then "
+                "acknowledge each verified job before retrying"
+            )
+        raise HarnessError(message) from exc
     except Exception:
         abort_owned_lease()
         raise

@@ -669,6 +669,13 @@ class CursorJobTests(unittest.TestCase):
         self.assertIn("jobs:stuck", names)
         self.assertIn("jobs:unreadable", names)
         self.assertIn("jobs:quarantine", names)
+        quarantine_result = next(
+            result for result in results if result.name == "jobs:quarantine"
+        )
+        self.assertEqual(
+            quarantine_result.suggestion,
+            "voice-harness jobs quarantine list",
+        )
 
     def test_reading_jobs_does_not_mutate_files(self) -> None:
         import tempfile
