@@ -501,42 +501,50 @@ WORKFLOW_PLAN[token]: <bounded multiline implementation plan>
         self.assertEqual(outcome.status, "idle")
         self.assertEqual(outcome.summary, "finished")
 
-    def test_prompt_transport_timeout_continues_with_stable_observer(self) -> None:
+    def test_prompt_wait_timeout_continues_with_stable_observer(self) -> None:
         client = herdr.HerdrClient("herdr")
-        process = mock.Mock()
-        process.returncode = 1
-        process.communicate.return_value = (
-            '{"error":{"code":"operation_timeout","message":"still working"}}',
-            "",
-        )
         expected = herdr.PromptOutcome(
             status="idle",
             summary="finished",
             question=None,
             output="VOICE_SUMMARY[token]: finished",
         )
-        with (
-            mock.patch.object(
-                client,
-                "get_agent",
-                side_effect=[
-                    {"agent_status": "idle", "state_change_seq": 1},
-                    {"agent_status": "working", "state_change_seq": 2},
-                ],
-            ),
-            mock.patch.object(
-                client, "wait_for_stable_completion", return_value=expected
-            ) as wait_for_stable_completion,
-            mock.patch(
-                "local_voice_harness.integrations.herdr.subprocess.Popen",
-                return_value=process,
-            ),
-            mock.patch("local_voice_harness.integrations.herdr.time.sleep"),
-        ):
-            outcome = client.prompt_and_wait("agent", "do work", token="token")
+        errors = (
+            ("timeout", "timed out waiting for agent status"),
+            ("operation_timeout", "still working"),
+        )
+        for code, message in errors:
+            with self.subTest(code=code):
+                process = mock.Mock()
+                process.returncode = 1
+                process.communicate.return_value = (
+                    f'{{"error":{{"code":"{code}","message":"{message}"}}}}',
+                    "",
+                )
+                with (
+                    mock.patch.object(
+                        client,
+                        "get_agent",
+                        side_effect=[
+                            {"agent_status": "idle", "state_change_seq": 1},
+                            {"agent_status": "working", "state_change_seq": 2},
+                        ],
+                    ),
+                    mock.patch.object(
+                        client,
+                        "wait_for_stable_completion",
+                        return_value=expected,
+                    ) as wait_for_stable_completion,
+                    mock.patch(
+                        "local_voice_harness.integrations.herdr.subprocess.Popen",
+                        return_value=process,
+                    ),
+                    mock.patch("local_voice_harness.integrations.herdr.time.sleep"),
+                ):
+                    outcome = client.prompt_and_wait("agent", "do work", token="token")
 
-        self.assertEqual(outcome, expected)
-        wait_for_stable_completion.assert_called_once()
+                self.assertEqual(outcome, expected)
+                wait_for_stable_completion.assert_called_once()
 
     def test_completion_wait_times_out_after_inactivity(self) -> None:
         client = herdr.HerdrClient("herdr")
