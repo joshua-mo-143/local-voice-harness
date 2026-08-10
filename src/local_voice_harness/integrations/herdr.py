@@ -1236,7 +1236,7 @@ class HerdrClient:
                 checkpoint()
 
     def cancel_agent(self, target: str) -> None:
-        self.run_json("agent", "send-keys", target, "ctrl-c")
+        self.run_json("agent", "send-keys", target, "ctrl+c")
         result = self.run_json("agent", "wait", target, "--timeout", "5000", timeout=10)
         agent = dict(result.get("agent") or {})
         if agent.get("agent_status") == "working":
