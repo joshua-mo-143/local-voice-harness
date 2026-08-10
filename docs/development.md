@@ -19,6 +19,12 @@ temporary overrides remain available:
 env VOICE_HARNESS_LLM_PROVIDER=venice scripts/dev.sh text "Summarize my open work"
 ```
 
+GitHub CLI authentication remains shared with the normal user profile. Before
+isolating `XDG_CONFIG_HOME`, the launcher sets `GH_CONFIG_DIR` to the directory
+that `gh` would normally use (`$XDG_CONFIG_HOME/gh` or `$HOME/.config/gh`).
+An existing `GH_CONFIG_DIR` override is preserved. Run `gh auth login` outside
+the launcher if that profile is not authenticated.
+
 To run the checkout's wake daemon in the foreground:
 
 ```fish

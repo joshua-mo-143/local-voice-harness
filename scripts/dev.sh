@@ -34,6 +34,9 @@ case "$command" in
     ;;
 esac
 
+if [[ -z "${GH_CONFIG_DIR:-}" ]]; then
+  export GH_CONFIG_DIR="${XDG_CONFIG_HOME:-"$HOME/.config"}/gh"
+fi
 export XDG_CONFIG_HOME="$PROJECT_DIR/.dev/config"
 export XDG_STATE_HOME="$PROJECT_DIR/.dev/state"
 mkdir -p -- "$XDG_CONFIG_HOME" "$XDG_STATE_HOME"

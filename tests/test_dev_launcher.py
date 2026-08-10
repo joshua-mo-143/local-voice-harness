@@ -9,6 +9,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from typing import cast
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 LAUNCHER = PROJECT_ROOT / "scripts" / "dev.sh"
@@ -45,6 +46,7 @@ record = {
     "environment": {
         name: os.environ.get(name)
         for name in (
+            "GH_CONFIG_DIR",
             "XDG_CONFIG_HOME",
             "XDG_STATE_HOME",
             "XDG_RUNTIME_DIR",
@@ -106,6 +108,9 @@ raise SystemExit(int(os.environ.get("FAKE_SYSTEMCTL_EXIT", "3")))
     def _uv_invocation(self) -> dict[str, object]:
         return json.loads(self.uv_record.read_text())
 
+    def _uv_environment(self) -> dict[str, str | None]:
+        return cast(dict[str, str | None], self._uv_invocation()["environment"])
+
     def test_text_uses_checkout_with_isolated_homes_and_inherited_overrides(
         self,
     ) -> None:
@@ -135,6 +140,7 @@ raise SystemExit(int(os.environ.get("FAKE_SYSTEMCTL_EXIT", "3")))
         self.assertEqual(
             invocation["environment"],
             {
+                "GH_CONFIG_DIR": str(self.test_root / "official-config" / "gh"),
                 "XDG_CONFIG_HOME": str(PROJECT_ROOT / ".dev" / "config"),
                 "XDG_STATE_HOME": str(PROJECT_ROOT / ".dev" / "state"),
                 "XDG_RUNTIME_DIR": str(self.test_root / "shared-runtime"),
@@ -144,6 +150,34 @@ raise SystemExit(int(os.environ.get("FAKE_SYSTEMCTL_EXIT", "3")))
         self.assertTrue((PROJECT_ROOT / ".dev" / "config").is_dir())
         self.assertTrue((PROJECT_ROOT / ".dev" / "state").is_dir())
         self.assertFalse(self.systemctl_record.exists())
+
+    def test_preserves_explicit_github_cli_config_directory(self) -> None:
+        github_config = self.test_root / "github-config"
+
+        process = self._run(
+            "text",
+            "request",
+            environment=self._environment(GH_CONFIG_DIR=str(github_config)),
+        )
+
+        self.assertEqual(process.returncode, 0, process.stderr)
+        self.assertEqual(
+            self._uv_environment()["GH_CONFIG_DIR"],
+            str(github_config),
+        )
+
+    def test_uses_home_github_cli_config_without_xdg_override(self) -> None:
+        home = self.test_root / "home"
+        environment = self._environment(HOME=str(home))
+        environment.pop("XDG_CONFIG_HOME")
+
+        process = self._run("text", "request", environment=environment)
+
+        self.assertEqual(process.returncode, 0, process.stderr)
+        self.assertEqual(
+            self._uv_environment()["GH_CONFIG_DIR"],
+            str(home / ".config" / "gh"),
+        )
 
     def test_wake_checks_inactive_service_before_running_foreground_daemon(
         self,
