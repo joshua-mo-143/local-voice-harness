@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import ast
+import inspect
 import io
 import json
 import unittest
@@ -7,6 +9,7 @@ import urllib.error
 from contextlib import redirect_stdout
 from dataclasses import replace
 from email.message import Message
+from pathlib import Path
 from unittest import mock
 
 from local_voice_harness import llm
@@ -27,6 +30,56 @@ def _stream_response(*deltas: dict[str, object]) -> io.BytesIO:
     return io.BytesIO("".join(lines).encode())
 
 
+class ToolPolicyContractTests(unittest.TestCase):
+    def test_public_helpers_require_tool_opt_in(self) -> None:
+        for helper in (llm.qwen_turn, llm.qwen_response):
+            with self.subTest(helper=helper.__name__):
+                self.assertIs(
+                    inspect.signature(helper).parameters["allow_tools"].default,
+                    False,
+                )
+
+    def test_production_call_sites_declare_their_tool_policy(self) -> None:
+        source_root = Path(llm.__file__).resolve().parent
+        call_sites: list[tuple[str, str, str]] = []
+        for path in source_root.rglob("*.py"):
+            tree = ast.parse(path.read_text(), filename=str(path))
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Call):
+                    continue
+                name = (
+                    node.func.id
+                    if isinstance(node.func, ast.Name)
+                    else (
+                        node.func.attr if isinstance(node.func, ast.Attribute) else None
+                    )
+                )
+                if name not in {"qwen_turn", "qwen_response"}:
+                    continue
+                policy = next(
+                    (
+                        ast.unparse(keyword.value)
+                        for keyword in node.keywords
+                        if keyword.arg == "allow_tools"
+                    ),
+                    "<missing>",
+                )
+                call_sites.append((str(path.relative_to(source_root)), name, policy))
+
+        self.assertEqual(
+            sorted(call_sites),
+            sorted(
+                [
+                    ("app.py", "qwen_response", "False"),
+                    ("llm.py", "qwen_turn", "allow_tools"),
+                    ("wake/daemon.py", "qwen_turn", "False"),
+                    ("wake/daemon.py", "qwen_turn", "False"),
+                    ("wake/daemon.py", "qwen_turn", "False"),
+                ]
+            ),
+        )
+
+
 class QwenClientTests(unittest.TestCase):
     def test_cursor_followup_uses_only_one_leading_system_message(self) -> None:
         with (
@@ -41,6 +94,7 @@ class QwenClientTests(unittest.TestCase):
                 "Continue please.",
                 [{"role": "assistant", "content": "The job needs authentication."}],
                 "123456789abc",
+                allow_tools=True,
             )
 
         request = urlopen.call_args.args[0]
@@ -53,7 +107,7 @@ class QwenClientTests(unittest.TestCase):
         self.assertIn("awaiting the user's reply", system_messages[0]["content"])
         self.assertEqual((answer, session), ("Continuing now.", "123456789abc"))
 
-    def test_allow_tools_false_omits_tools_and_returns_content(self) -> None:
+    def test_tools_are_disabled_by_default(self) -> None:
         with (
             mock.patch.object(
                 llm.urllib.request,
@@ -62,7 +116,7 @@ class QwenClientTests(unittest.TestCase):
             ) as urlopen,
             redirect_stdout(io.StringIO()),
         ):
-            answer, session = llm.qwen_turn("hello", allow_tools=False)
+            answer, session = llm.qwen_turn("hello")
 
         self.assertEqual((answer, session), ("Just chatting.", None))
         payload = json.loads(urlopen.call_args.args[0].data)
@@ -125,7 +179,7 @@ class QwenClientTests(unittest.TestCase):
             ),
             redirect_stdout(io.StringIO()),
         ):
-            answer, session = llm.qwen_turn("work on issue 92")
+            answer, session = llm.qwen_turn("work on issue 92", allow_tools=True)
 
         self.assertEqual(answer, llm.TOOL_FREE_ACTION_RECOVERY)
         self.assertIsNone(session)
@@ -184,7 +238,7 @@ class QwenClientTests(unittest.TestCase):
             ) as urlopen,
             redirect_stdout(io.StringIO()),
         ):
-            answer, session = llm.qwen_turn("hello", history)
+            answer, session = llm.qwen_turn("hello", history, allow_tools=True)
 
         self.assertEqual(answer, "concise answer")
         self.assertIsNone(session)
@@ -240,7 +294,7 @@ class QwenClientTests(unittest.TestCase):
             mock.patch.object(llm, "notify") as notify,
             redirect_stdout(io.StringIO()),
         ):
-            answer, session = llm.qwen_turn("please fix it")
+            answer, session = llm.qwen_turn("please fix it", allow_tools=True)
 
         self.assertEqual((answer, session), ("job started", "job-123"))
         notify.assert_called_once_with("Cursor is working…")
@@ -299,7 +353,10 @@ class QwenClientTests(unittest.TestCase):
             mock.patch.object(llm, "notify") as notify,
             redirect_stdout(io.StringIO()),
         ):
-            answer, session = llm.qwen_turn("work on issues 92 and 93")
+            answer, session = llm.qwen_turn(
+                "work on issues 92 and 93",
+                allow_tools=True,
+            )
 
         self.assertEqual((answer, session), (llm.TOOL_FREE_ACTION_RECOVERY, None))
         cursor_turn.assert_called_once()
@@ -326,7 +383,10 @@ class QwenClientTests(unittest.TestCase):
             mock.patch.object(llm, "cursor_turn") as cursor_turn,
             redirect_stdout(io.StringIO()),
         ):
-            answer, session = llm.qwen_turn("on this issue please.")
+            answer, session = llm.qwen_turn(
+                "on this issue please.",
+                allow_tools=True,
+            )
 
         self.assertEqual((answer, session), ("Please try that request again.", None))
         cursor_turn.assert_not_called()
@@ -359,7 +419,10 @@ class QwenClientTests(unittest.TestCase):
             mock.patch.object(llm, "cursor_turn") as cursor_turn,
             redirect_stdout(io.StringIO()),
         ):
-            answer, session = llm.qwen_turn("on this issue please.")
+            answer, session = llm.qwen_turn(
+                "on this issue please.",
+                allow_tools=True,
+            )
 
         self.assertEqual((answer, session), (llm.MALFORMED_TOOL_CALL_RECOVERY, None))
         self.assertEqual(urlopen.call_count, 2)
@@ -397,6 +460,7 @@ class QwenClientTests(unittest.TestCase):
                 "fork this repo and add Venice",
                 github_repository="source/project",
                 fork_requested=True,
+                allow_tools=True,
             )
 
         cursor_turn.assert_called_once_with(
@@ -551,7 +615,11 @@ class QwenClientTests(unittest.TestCase):
             redirect_stdout(io.StringIO()),
         ):
             chunks: list[str] = []
-            answer, session = llm.qwen_turn("fix it", on_text_chunk=chunks.append)
+            answer, session = llm.qwen_turn(
+                "fix it",
+                on_text_chunk=chunks.append,
+                allow_tools=True,
+            )
 
         self.assertEqual((answer, session), ("Started.", "job-123"))
         self.assertEqual(chunks, ["Started."])
@@ -621,7 +689,7 @@ class QwenClientTests(unittest.TestCase):
             mock.patch.object(llm, "notify"),
             redirect_stdout(output),
         ):
-            llm.qwen_turn("fix it")
+            llm.qwen_turn("fix it", allow_tools=True)
 
         records = [json.loads(line) for line in output.getvalue().splitlines()]
         requests = [record for record in records if record.get("event") == "request"]
@@ -699,7 +767,10 @@ class QwenClientTests(unittest.TestCase):
             mock.patch.object(llm, "cursor_turn") as cursor_turn,
             redirect_stdout(io.StringIO()),
         ):
-            answer, session = llm.qwen_turn("on this issue please.")
+            answer, session = llm.qwen_turn(
+                "on this issue please.",
+                allow_tools=True,
+            )
 
         self.assertEqual((answer, session), ("Please try that request again.", None))
         cursor_turn.assert_not_called()

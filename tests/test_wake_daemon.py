@@ -11,7 +11,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from local_voice_harness import recorder
+from local_voice_harness import llm, recorder
 from local_voice_harness.browser_context import RequestContext
 from local_voice_harness.cursor import service as cursor_service
 from local_voice_harness.cursor.delivery import DeliveryClaim
@@ -1214,6 +1214,71 @@ class AnnounceJobTests(unittest.TestCase):
 
 
 class ComponentSynchronizationTests(unittest.TestCase):
+    def test_warmup_rejects_tool_call_without_invoking_agent(self) -> None:
+        daemon = _bare_daemon()
+        settings = mock.Mock(
+            llm_provider="local",
+            llm_model="test-model",
+            llm_endpoint="http://127.0.0.1:8090/v1/chat/completions",
+            llm_timeout=1,
+        )
+        response = io.BytesIO(
+            json.dumps(
+                {
+                    "choices": [
+                        {
+                            "message": {
+                                "content": None,
+                                "tool_calls": [
+                                    {
+                                        "id": "warmup-call",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "cursor",
+                                            "arguments": json.dumps(
+                                                {
+                                                    "task": "mutate the workspace",
+                                                    "action": "submit",
+                                                }
+                                            ),
+                                        },
+                                    }
+                                ],
+                            }
+                        }
+                    ]
+                }
+            ).encode()
+        )
+
+        with (
+            mock.patch.object(wake_daemon, "start_components"),
+            mock.patch.object(
+                wake_daemon,
+                "load_backend_settings",
+                return_value=settings,
+            ),
+            mock.patch.object(llm, "load_backend_settings", return_value=settings),
+            mock.patch.object(
+                llm.urllib.request,
+                "urlopen",
+                return_value=response,
+            ) as urlopen,
+            mock.patch.object(llm, "cursor_turn") as cursor_turn,
+            mock.patch.object(wake_daemon, "log"),
+        ):
+            daemon.begin_activation()
+            assert daemon.activation_thread is not None
+            daemon.activation_thread.join(timeout=2)
+
+        self.assertFalse(daemon.activation_thread.is_alive())
+        self.assertIsInstance(daemon.activation_error, HarnessError)
+        self.assertIn("tools are disabled", str(daemon.activation_error))
+        cursor_turn.assert_not_called()
+        payload = json.loads(urlopen.call_args.args[0].data)
+        self.assertNotIn("tools", payload)
+        self.assertNotIn("tool_choice", payload)
+
     def test_cleanup_waits_for_activation_before_stopping(self) -> None:
         daemon = _bare_daemon()
         activation_started = threading.Event()

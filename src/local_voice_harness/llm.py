@@ -299,7 +299,7 @@ def qwen_turn(
     trusted_utterance: str | None = None,
     delivery_claims: DeliveryClaims | None = None,
     on_text_chunk: Callable[[str], None] | None = None,
-    allow_tools: bool = True,
+    allow_tools: bool = False,
 ) -> tuple[str, str | None]:
     settings = load_backend_settings()
     venice_api_key = get_venice_api_key() if settings.llm_provider == "venice" else None
@@ -524,7 +524,7 @@ def qwen_response(
     github_pull_request: int | None = None,
     trusted_utterance: str | None = None,
     delivery_claims: DeliveryClaims | None = None,
-    allow_tools: bool = True,
+    allow_tools: bool = False,
 ) -> str:
     return qwen_turn(
         text,
