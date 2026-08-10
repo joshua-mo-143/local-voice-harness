@@ -31,13 +31,24 @@ def test_v8_cursor_fixture_migrates_to_structured_agent_schema() -> None:
     assert job.harness_kind == HarnessKind.CURSOR
     assert job.session_id == "cursor-agent-61"
     assert job.herdr_target == job.session_id
-    assert job.to_record() == fixture("agent-v9.json")
+    record = job.to_record()
+    assert record["schema_version"] == CURRENT_SCHEMA_VERSION
+    assert record["harness_kind"] == "cursor"
+    assert record["session_id"] == "cursor-agent-61"
+    assert record["workflow_tier"] == "simple"
+    assert record["workflow_phase"] == "implementing"
+    assert record["active_participant"] == "implementer"
+    assert record["implementer_target"] == "cursor-agent-61"
+    assert record["harness_state"] == fixture("agent-v9.json")["harness_state"]
+    assert record["checkout_state"] == fixture("agent-v9.json")["checkout_state"]
+    assert record["provider_state"] == fixture("agent-v9.json")["provider_state"]
 
 
 def test_v9_agent_fixture_loads_with_legacy_recovery_accessors() -> None:
     job = AgentJob.from_dict(fixture("agent-v9.json"))
 
-    assert job.loaded_schema_version == CURRENT_SCHEMA_VERSION
+    assert job.loaded_schema_version == 9
+    assert job.schema_version == CURRENT_SCHEMA_VERSION
     assert job.herdr_pane_id == "pane-1"
     assert job.agent_dispatch_state == "ready"
     assert job.github_repository == "owner/project"
@@ -87,7 +98,8 @@ def test_legacy_directory_import_rewrites_v8_record(tmp_path: Path) -> None:
     assert migrate_legacy_jobs(legacy, durable) == set()
 
     persisted = json.loads((durable / source.name).read_text())
-    assert persisted == fixture("agent-v9.json")
+    expected = AgentJob.from_dict(fixture("cursor-v8.json")).to_record()
+    assert persisted == expected
     assert not source.exists()
 
 

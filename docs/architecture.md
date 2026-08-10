@@ -76,6 +76,58 @@ Cursor routing works as follows:
 9. Start a new Cursor agent through Herdr when no suitable agent exists.
 10. Reserve that agent and checkout until it finishes, is blocked, or is cancelled.
 
+After checkout preparation, every new ticket enters a durable tiered workflow. A
+Plan-mode participant first performs a short read-only inspection and classifies the
+ticket. Clear, localized, reversible work is `simple` and goes directly to a fresh
+Agent-mode implementer. `medium` work receives a persisted plan and one independent
+review from a fresh Ask-mode participant. `high-risk` work receives the same review
+gate plus one bounded planner revision. If the final review still rejects the plan,
+the job enters an explicit exhausted-review clarification: only a trusted spoken
+`approve` queues the unchanged plan for implementation, a trusted `abort` uses the
+normal cancellation fences, and any other reply remains awaiting. The job records
+whether approval came from the reviewer or from that explicit user override.
+Persistence, migration, recovery,
+concurrency, lifecycle, worktrees, external writes, security, infrastructure,
+destructive behavior, public APIs, and ambiguous requirements force the high-risk
+tier. Implementation cannot start until the latest review approves it; newly
+discovered scope promotes the tier and returns the job to planning.
+
+The selected tier, evidence, current phase, review round, active participant, and
+participant targets live in the job record. Full plans and reviews are bounded,
+hash-validated, content-addressed sidecar artifacts under the durable jobs
+directory, never files in the checkout. New artifacts are published
+create-exclusively and are never overwritten; an identical retry reuses the same
+reference, while conflicting bytes fail closed. Review artifacts record the exact
+plan digest they reviewed. Publication checks the current worker claim, turn,
+workflow phase, review round, and prior artifact reference while holding the same
+job-directory lock used to update the job, so stale worker output cannot create an
+orphan sidecar or advance the workflow. A crash after sidecar creation but before
+the job update can leave a harmless immutable orphan that an identical retry
+reuses and normal job pruning/deletion removes. Round-only references from earlier
+schema-v10 development builds remain read-only compatible; all new writes include
+the artifact digest in their filename. Malformed artifacts are quarantined.
+Phase-specific, turn-scoped output markers prevent stale terminal text from
+advancing a workflow. Prompt delivery is a durable operation with `planned`,
+`submitting`, `submitted`, `ambiguous`, and `none` states plus the phase, turn,
+target, and observed Herdr sequence. Recovery submits only `planned`, observes only
+`submitted`, and never retries `submitting` without positive sequence evidence.
+The former schema-v10 prompt boolean is translated in place: a true value becomes
+an ambiguous fail-closed operation because it has no trustworthy sequence baseline.
+
+Fresh workflow participants persist their deterministic name, role, label, and
+workspace intent before pane creation. The returned pane and workspace are persisted
+before agent startup. A crash across pane creation retains the identity and requires
+reconciliation rather than creating another pane.
+
+Success, failure, and cancellation first persist a terminal intent while the job is
+`reconciling`. Cleanup then cancels every deduplicated planner, reviewer, implementer,
+active, and pending participant target. Only confirmed cleanup clears those handles
+and publishes the terminal status; observation or cancellation uncertainty retains
+the release and reservation fences. User decisions always return through the
+existing voice clarification flow. One ticket
+therefore remains one inbox item across planning, review, implementation, restart,
+clarification, cancellation, and delivery.
+
 The harness never automatically commits, pushes, opens pull requests, modifies Linear,
 or deletes generated worktrees. Fork creation is the only supported GitHub write and
 is performed only after an unambiguous spoken request and a separate affirmative
@@ -83,6 +135,59 @@ confirmation. Checking out a focused pull request only reads from GitHub and wri
 its isolated local worktree. PR worktrees are reused only by recovery or continuation
 of the same job. Completed and cancelled worktrees are retained for inspection, while
 an invalid or partially prepared checkout is marked quarantined and is never dispatched.
+
+### Durable question broker
+
+Agent questions cross a provider-neutral broker contract before entering the Cursor
+job flow. A question records its type (free text or multiple choice), choices,
+decision sensitivity, provider, opaque job identity, and originating turn token.
+The initial Cursor adapter stores that versioned envelope in the same atomically
+replaced job JSON as `AWAITING_USER`; the legacy `question` and
+`clarification_kind` fields remain mirrored for voice and inbox compatibility.
+There is no sidecar transaction that can disagree with job state.
+
+Answers are compare-and-swap fenced by question identity and originating turn.
+Multiple-choice matching accepts only an exact choice identifier, exact spoken
+label, or unambiguous ordinal. Ambiguous and stale answers do not mutate or launch
+the job. Security, destructive, architecture, and product questions have no
+automatic/default answer path: only trusted user voice or user-text provenance can
+be recorded. Legacy plain-text questions have unspecified sensitivity and therefore
+use the same protected policy; automation provenance is rejected without mutation.
+“Answer later” leaves the question durably deferred, while “repeat” speaks the
+same pending question.
+
+An accepted agent answer preserves the original request and retained agent target.
+The answer continuation includes the original question and, for multiple choice,
+both the stable choice ID and spoken label. Before prompting, the worker persists a
+two-phase operation as `planned` with one immutable next-turn token. Immediately
+around subprocess launch it records the Herdr baseline sequence and advances through
+`submitted` and `observed`. Recovery reuses that turn: a planned operation is safe
+to retry, a proven observed operation is read without prompting, and a submitted
+operation is retried only after repeated proof that Herdr did not change. Missing or
+contradictory evidence blocks for manual attention rather than risking duplicate
+delivery. The answer and question remain durable until matching output resolves the
+operation.
+
+Cursor owner-specific transitions are selected by a typed handler registry. Built-in
+handlers cover agent continuation, local repository selection, GitHub repository
+selection, and fork confirmation. Unknown owners remain awaiting input without a
+worker launch. Workflow adapters such as tiered planning can register their own
+phase handler without adding planning concepts to the provider-neutral package.
+
+Wake routing obtains question text, owner, ID, and turn token from one immutable job
+snapshot and uses that same snapshot for intent context and answer fencing. Broker
+controls are forced only while that snapshot proves the job is awaiting the question.
+Herdr waiting polls `interactive_ready` while the prompt process runs. An unexpected
+questionnaire promptly blocks the job without sending keys or selecting an answer.
+Recovery performs read-only checks while it remains open; after the user manually
+closes it, the same agent and turn are queued for reconciliation-only output reading.
+Completion resolves the question; a new question replaces it; cancellation closes
+it atomically.
+
+The broker package imports neither Cursor nor Herdr. Provider adapters own their
+persistence and opaque resume handles, allowing OpenCode or tiered planning to use
+the same question and answer policy without putting workflow phases into the
+broker contract.
 
 After a completed job is announced, the wake conversation retains a bounded, one-shot
 reference to it. A referential follow-up within that window ("review the changes",

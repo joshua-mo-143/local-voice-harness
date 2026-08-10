@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import os
 import re
 import time
 import uuid
@@ -16,7 +15,14 @@ from ..integrations.registry import (
     require_issue_capabilities,
     resolve_issue_reference,
 )
-from . import delivery, inbox, provisioning, recovery, worker_lifecycle
+from ..questions import (
+    AnswerOutcome,
+    AnswerProvenance,
+    QuestionState,
+    choices_prompt,
+    resolve_answer,
+)
+from . import delivery, inbox, provisioning, questions, recovery, worker_lifecycle
 from .delivery import DeliveryClaim, DeliveryClaims
 from .model import (
     ACTIVE_STATUSES,
@@ -77,6 +83,9 @@ class CursorTurnRequest:
     action: str = "submit"
     job_id: str | None = None
     reference: str | None = None
+    expected_question_id: str | None = None
+    expected_question_turn: str | None = None
+    answer_provenance: AnswerProvenance = AnswerProvenance.USER_TEXT
     expected_completed_at: float | None = None
     on_follow_up_started: Callable[[], None] | None = None
     on_job_started: Callable[[], None] | None = None
@@ -273,96 +282,116 @@ def reply_job(
     text: str,
     *,
     trusted_utterance: str | None = None,
+    expected_question_id: str | None = None,
+    expected_question_turn: str | None = None,
+    answer_provenance: AnswerProvenance = AnswerProvenance.USER_TEXT,
     on_started: Callable[[], None] | None = None,
-) -> None:
+) -> str | None:
     now = time.time()
-    should_launch = True
+    should_launch = False
+    should_cancel = False
+    immediate: str | None = None
 
     def reply(job: CursorJob) -> CursorJob | None:
-        nonlocal should_launch
+        nonlocal immediate, should_cancel, should_launch
         if job.status != JobStatus.AWAITING_USER:
             return None
-
-        def queue(
-            *,
-            request_text: str = job.request,
-            repository_hint: str | None = job.repository_hint,
-            github_repository: str | None = job.github_repository,
-            fork_confirmed: bool = job.fork_confirmed,
-            herdr_target: str | None = job.herdr_target,
-            continuation: bool,
-        ) -> CursorJob:
+        question = questions.current(job)
+        if question is None:
+            return None
+        if (
+            expected_question_id is not None and question.id != expected_question_id
+        ) or (
+            expected_question_turn is not None
+            and question.origin.turn_token != expected_question_turn
+        ):
+            immediate = "That answer belongs to an older question, so I did not use it."
+            should_launch = False
+            return None
+        resolution = resolve_answer(
+            question,
+            text,
+            trusted_answer=trusted_utterance,
+            provenance=answer_provenance,
+        )
+        if resolution.outcome == AnswerOutcome.REPEAT:
+            immediate = question.text
+            should_launch = False
+            return None
+        if resolution.outcome == AnswerOutcome.DEFERRED:
+            immediate = "Okay, I'll keep that question for later."
+            should_launch = False
             return job.evolve(
-                status=JobStatus.QUEUED,
-                question=None,
-                clarification_kind=None,
                 delivered=True,
                 delivery_claim_token=None,
                 delivery_claimed_at=None,
-                queued_at=now,
                 updated_at=now,
+                voice_question=questions.envelope(question, QuestionState.DEFERRED),
+            )
+        if resolution.outcome == AnswerOutcome.AMBIGUOUS:
+            immediate = (
+                choices_prompt(question)
+                if question.choices
+                else "I could not tell what your answer was. Please answer again."
+            )
+            should_launch = False
+            return None
+        if resolution.outcome == AnswerOutcome.REJECTED:
+            immediate = (
+                "That decision requires a direct user answer, so I did not use "
+                "an automated response."
+            )
+            return None
+        handler = questions.answer_handler(question.owner)
+        if handler is None:
+            immediate = (
+                f"I cannot safely route an answer for question owner {question.owner}."
+            )
+            return None
+        transition = handler(
+            job,
+            question,
+            resolution,
+            questions.AnswerContext(
+                now=now,
                 foreground_until=(
                     now + CURSOR_FOREGROUND_SECONDS + FOREGROUND_GRACE_SECONDS
                 ),
-                worker_pid=None,
-                worker_boot_id=None,
-                worker_process_start=None,
-                worker_token=None,
-                request=request_text,
-                repository_hint=repository_hint,
-                github_repository=github_repository,
-                fork_confirmed=fork_confirmed,
-                herdr_target=herdr_target,
-                continuation=continuation,
+                text=text,
+                trusted_text=trusted_utterance,
+            ),
+        )
+        if transition.cancel:
+            should_cancel = True
+            should_launch = False
+            return recovery.stage_terminal_intent(
+                job,
+                JobStatus.CANCELLED,
+                now=now,
+                result=f"Cursor job {job_id} was cancelled.",
+                voice_question=questions.envelope(question, QuestionState.CANCELLED),
             )
+        should_launch = transition.launch
+        immediate = transition.message
+        return transition.job
 
-        if job.clarification_kind == "repository":
-            return queue(
-                repository_hint=text,
-                herdr_target=None,
-                continuation=False,
-            )
-        if job.clarification_kind == "github_repository":
-            return queue(
-                github_repository=text.strip(),
-                herdr_target=None,
-                continuation=False,
-            )
-        if job.clarification_kind == "fork_confirmation":
-            confirmation = decide_fork_confirmation(trusted_utterance or "")
-            if confirmation is False:
-                should_launch = False
-                return job.evolve_for_delivery(
-                    now=now,
-                    status=JobStatus.COMPLETED,
-                    question=None,
-                    clarification_kind=None,
-                    result="Okay, I did not create a GitHub fork.",
-                    completed_at=now,
-                    worker_pid=None,
-                    worker_boot_id=None,
-                    worker_process_start=None,
-                    worker_token=None,
-                )
-            if confirmation is None:
-                should_launch = False
-                question = "Please answer yes or no. Should I create the GitHub fork?"
-                return job.evolve_for_delivery(
-                    now=now, question=question, result=question
-                )
-            return queue(
-                fork_confirmed=True,
-                herdr_target=None,
-                continuation=False,
-            )
-        return queue(continuation=True, request_text=text)
-
-    if _job_store().update(job_id, reply) is None:
+    updated = _job_store().update(job_id, reply)
+    if updated is None and immediate is None:
         raise HarnessError(f"Cursor job {job_id} is not waiting for a reply")
+    if should_cancel:
+        assert updated is not None
+        if updated.target_release_pending:
+            _cancel_target_and_release(
+                job_id,
+                updated.herdr_target or "",
+                updated.target_release_token or "",
+            )
+        return None
     if should_launch:
         launch_worker(job_id)
         if on_started is not None:
             on_started()
+    return immediate
 
 
 def start_follow_up(
@@ -444,12 +473,13 @@ def cancel_job(job_id: str) -> str:
         raise HarnessError(f"could not safely stop legacy Cursor worker for {job_id}")
     target = ""
     worker: CursorJob | None = None
-    release_token = uuid.uuid4().hex
     cancelled_at = time.time()
 
     def cancel(job: CursorJob) -> CursorJob | None:
         nonlocal target, worker
         if job.status == JobStatus.CANCELLED:
+            return None
+        if job.terminal_intent_status == JobStatus.CANCELLED:
             return None
         if job.status in {JobStatus.COMPLETED, JobStatus.FAILED}:
             raise HarnessError(f"Cursor job {job_id} is already {job.status.value}")
@@ -466,52 +496,18 @@ def cancel_job(job_id: str) -> str:
             )
         target = job.herdr_target or ""
         worker = job
-        release_pending = bool(
-            target
-            or job.worktree_path
-            or job.worker_token
-            or job.has_uncertain_operation()
-        )
-        reconciliation_pending = job.has_uncertain_operation()
-        release_owner_start = (
-            worker_lifecycle.process_identity(os.getpid()) if release_pending else None
-        )
-        clear_unfenced = legacy_worker_stopped or (
-            job.status in WORKER_STATUSES and not job.worker_token
-        )
-        return job.evolve_for_delivery(
+        question = questions.current(job)
+        return recovery.stage_terminal_intent(
+            job,
+            JobStatus.CANCELLED,
             now=cancelled_at,
-            status=JobStatus.CANCELLED,
-            remove=frozenset({"reconcile"}),
-            result=(
-                f"Cursor job {job_id} was cancelled; external operation "
-                "reconciliation is pending."
-                if reconciliation_pending
-                else f"Cursor job {job_id} was cancelled."
+            result=f"Cursor job {job_id} was cancelled.",
+            clear_worker=legacy_worker_stopped,
+            voice_question=(
+                questions.envelope(question, QuestionState.CANCELLED)
+                if question is not None
+                else None
             ),
-            completed_at=cancelled_at,
-            foreground_until=(
-                cancelled_at + CURSOR_FOREGROUND_SECONDS + FOREGROUND_GRACE_SECONDS
-            ),
-            target_release_pending=release_pending,
-            target_release_token=release_token if release_pending else None,
-            target_release_owner_pid=os.getpid() if release_owner_start else None,
-            target_release_owner_boot_id=(
-                worker_lifecycle.boot_identity() if release_owner_start else None
-            ),
-            target_release_owner_start=release_owner_start,
-            cancellation_reconciliation_pending=reconciliation_pending,
-            pull_request_worktree_state=(
-                "retained"
-                if job.github_pull_request
-                and job.worktree_path
-                and job.pull_request_worktree_state != "quarantined"
-                else job.pull_request_worktree_state
-            ),
-            worker_pid=None if clear_unfenced else job.worker_pid,
-            worker_boot_id=None if clear_unfenced else job.worker_boot_id,
-            worker_process_start=None if clear_unfenced else job.worker_process_start,
-            worker_token=None if clear_unfenced else job.worker_token,
         )
 
     updated = _job_store().update(job_id, cancel)
@@ -522,32 +518,41 @@ def cancel_job(job_id: str) -> str:
     if worker is not None and worker.worker_token:
         worker_stopped = _stop_worker(worker)
 
-    def clear_stopped_worker(job: CursorJob) -> CursorJob | None:
-        if job.status != JobStatus.CANCELLED or not worker_stopped:
-            return None
-        return job.clear_worker()
-
-    _job_store().update(job_id, clear_stopped_worker)
     if updated.target_release_pending:
         _cancel_target_and_release(
             job_id,
             target,
-            release_token,
+            updated.target_release_token or "",
             worker_stopped=worker_stopped,
         )
-    return updated.result or f"Cursor job {job_id} was cancelled."
+    current = read_job(job_id)
+    return (
+        current.result
+        or current.terminal_intent_result
+        or f"Cursor job {job_id} was cancelled."
+    )
 
 
 def job_status(job_id: str | None = None) -> str:
     if job_id:
         job = read_job(job_id)
-        return f"Cursor job {job_id} is {job.status.value.replace('_', ' ')}."
+        workflow = (
+            f", {job.workflow_tier.value} tier" if job.workflow_tier is not None else ""
+        )
+        return (
+            f"Cursor job {job_id} is {job.status.value.replace('_', ' ')}, "
+            f"in {job.workflow_phase.value.replace('_', ' ')}{workflow}."
+        )
     jobs = [job for job in _job_store().list() if job.status in ACTIVE_STATUSES]
     if not jobs:
         return "There are no active Cursor jobs."
     return (
         "Active Cursor jobs: "
-        + "; ".join(f"{job.id} is {job.status.value.replace('_', ' ')}" for job in jobs)
+        + "; ".join(
+            f"{job.id} is {job.status.value.replace('_', ' ')} "
+            f"({job.workflow_phase.value.replace('_', ' ')})"
+            for job in jobs
+        )
         + "."
     )
 
@@ -787,6 +792,9 @@ def cursor_turn(
 ) -> CursorTurnResult:
     on_follow_up_started: Callable[[], None] | None = None
     on_job_started: Callable[[], None] | None = None
+    expected_question_id: str | None = None
+    expected_question_turn: str | None = None
+    answer_provenance = AnswerProvenance.AUTOMATION
     if isinstance(request, CursorTurnRequest):
         text = request.text
         session_id = request.session_id
@@ -803,6 +811,9 @@ def cursor_turn(
         action = request.action
         job_id = request.job_id
         reference = request.reference
+        expected_question_id = request.expected_question_id
+        expected_question_turn = request.expected_question_turn
+        answer_provenance = request.answer_provenance
         expected_completed_at = request.expected_completed_at
         on_follow_up_started = request.on_follow_up_started
         on_job_started = request.on_job_started
@@ -870,12 +881,23 @@ def cursor_turn(
                 return CursorTurnResult(resolved.clarification, session_id)
             reply_id = resolved.job_id
         assert reply_id is not None
-        reply_job(
+        immediate = reply_job(
             reply_id,
             text,
             trusted_utterance=utterance,
+            expected_question_id=expected_question_id,
+            expected_question_turn=expected_question_turn,
+            answer_provenance=answer_provenance,
             on_started=on_job_started,
         )
+        if immediate is not None:
+            pending = questions.current(read_job(reply_id))
+            next_session = (
+                None
+                if pending is not None and pending.state == QuestionState.DEFERRED
+                else reply_id
+            )
+            return CursorTurnResult(immediate, next_session)
         job_id = reply_id
     elif action == "follow_up":
         if not job_id:
