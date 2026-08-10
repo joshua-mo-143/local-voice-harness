@@ -89,8 +89,12 @@ resolve through `gh`; Linear targets must have valid team syntax, an enabled
 integration, and a healthy Cursor MCP capability. Rejected targets do not prevent
 the remaining valid targets from starting. Valid targets become ordinary,
 target-scoped `AgentJob` records through the existing job-creation and worker-launch
-path. Starts are bounded by the configured concurrency and immediately background;
-single-ticket requests retain the normal foreground window.
+path. Durable creation atomically rejects a canonical GitHub or Linear ticket while
+another job for that ticket still owns resources, so simultaneous submissions cannot
+both reach worker launch. The rejection identifies the existing job; a ticket can be
+submitted again after its prior job releases its resource fences. Starts are bounded
+by the configured concurrency and immediately background; single-ticket requests
+retain the normal foreground window.
 
 Fan-out is deliberately best-effort rather than crash-atomic. There is no durable
 batch schema, manifest, rollback, or shared lifecycle: the response only summarizes

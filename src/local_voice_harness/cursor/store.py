@@ -61,6 +61,14 @@ class JobMaintenanceError(JobValidationError):
     """The durable job store is fenced for maintenance."""
 
 
+class ActiveTicketConflict(JobValidationError):
+    """Another resource-owning job already handles this canonical ticket."""
+
+    def __init__(self, active_job_id: str) -> None:
+        self.active_job_id = active_job_id
+        super().__init__(f"ticket is already active as Cursor job {active_job_id}")
+
+
 class JobQuarantineWarning(UserWarning):
     """A malformed job file was moved into quarantine."""
 
@@ -905,6 +913,40 @@ def _job_reserves_resources(job: CursorJob) -> bool:
     )
 
 
+def _ticket_identity(job: CursorJob) -> tuple[str, ...] | None:
+    if (
+        not job.fork_requested
+        and job.github_pull_request is None
+        and job.github_repository
+        and job.github_issue
+    ):
+        return (
+            "github",
+            job.github_repository.casefold(),
+            str(job.github_issue),
+        )
+    if job.issue_key:
+        return ("linear", job.issue_key.casefold())
+    return None
+
+
+def _active_ticket_conflict_unlocked(
+    path: Path,
+    candidate: CursorJob,
+) -> CursorJob | None:
+    identity = _ticket_identity(candidate)
+    if identity is None:
+        return None
+    return next(
+        (
+            peer
+            for peer in _peer_models_unlocked(path)
+            if _job_reserves_resources(peer) and _ticket_identity(peer) == identity
+        ),
+        None,
+    )
+
+
 def _has_legacy_worker_claim(job: CursorJob) -> bool:
     ownership = (
         job.worker_token,
@@ -1351,7 +1393,12 @@ class JobStore:
             _fsync_directory(self.durable_dir)
             return True
 
-    def create(self, job: CursorJob) -> CursorJob:
+    def create(
+        self,
+        job: CursorJob,
+        *,
+        enforce_unique_ticket: bool = False,
+    ) -> CursorJob:
         with locked(self.durable_dir):
             if _read_maintenance_unlocked(self.durable_dir) is not None:
                 raise JobMaintenanceError(
@@ -1360,6 +1407,10 @@ class JobStore:
             path = self.path(job.id)
             if path.exists():
                 raise JobValidationError(f"{path.name}: Cursor job already exists")
+            if enforce_unique_ticket:
+                conflict = _active_ticket_conflict_unlocked(path, job)
+                if conflict is not None:
+                    raise ActiveTicketConflict(conflict.id)
             created = _write_model_unlocked(path, job)
         return created
 
