@@ -88,8 +88,9 @@ class UserConfigurationError(ValueError):
 class IntegrationSettings:
     """Optional context and routing integrations.
 
-    Optional integrations default to disabled on fresh installations. Nothing in
-    this module enforces the flags at runtime yet; consumers are wired in later.
+    Optional integrations default to disabled on fresh installations except for
+    GitHub, which remains enabled for compatibility. The integration registry
+    enforces these flags before constructing providers.
     """
 
     github_enabled: bool = True

@@ -11,6 +11,7 @@ from local_voice_harness.integrations.github import (
     GitHubClient,
     GitHubError,
     GitHubIssue,
+    GitHubPullRequest,
     GitHubRepository,
 )
 
@@ -211,6 +212,60 @@ class GitHubClientTests(unittest.TestCase):
         )
         self.assertEqual(issue.reference, "example/project#42")
         self.assertEqual(issue.url, "https://github.com/example/project/issues/42")
+
+    def test_context_metadata_is_read_through_gh(self) -> None:
+        client = GitHubClient()
+        repository_details = {"nameWithOwner": "example/project"}
+        pull_request_details = {"number": 7, "title": "Fix it"}
+        with mock.patch.object(
+            client,
+            "_run",
+            side_effect=[
+                _completed(json.dumps(repository_details)),
+                _completed(json.dumps(pull_request_details)),
+            ],
+        ) as run:
+            self.assertEqual(
+                client.repository_context_details("example/project"),
+                repository_details,
+            )
+            self.assertEqual(
+                client.pull_request_details(GitHubPullRequest("example", "project", 7)),
+                pull_request_details,
+            )
+
+        self.assertEqual(
+            run.call_args_list[0].args[0][:4],
+            ["gh", "repo", "view", "example/project"],
+        )
+        self.assertEqual(
+            run.call_args_list[1].args[0][:6],
+            ["gh", "pr", "view", "7", "--repo", "example/project"],
+        )
+
+    def test_context_metadata_rejects_invalid_responses(self) -> None:
+        client = GitHubClient()
+        with self.assertRaisesRegex(GitHubError, "positive"):
+            client.pull_request_details(GitHubPullRequest("example", "project", 0))
+        for method, malformed in (
+            (
+                lambda: client.repository_context_details("example/project"),
+                "repository",
+            ),
+            (
+                lambda: client.pull_request_details(
+                    GitHubPullRequest("example", "project", 7)
+                ),
+                "pull request",
+            ),
+        ):
+            for payload in ("not-json", "[]"):
+                with (
+                    self.subTest(kind=malformed, payload=payload),
+                    mock.patch.object(client, "_run", return_value=_completed(payload)),
+                    self.assertRaisesRegex(GitHubError, f"malformed {malformed}"),
+                ):
+                    method()
 
     def test_provision_issue_reuses_matching_checkout(self) -> None:
         client = GitHubClient()

@@ -8,10 +8,12 @@ from typing import Any
 
 from ..context_fragment import ContextFragment, ContextProvider
 from ..user_config import IntegrationSettings, load_user_config
+from .github import GitHubProvider
 from .linear import CapabilityStatus, LinearIntegration
 from .zendesk import ZendeskProvider
 
 _INTEGRATION_FACTORIES: tuple[tuple[str, Callable[[], object]], ...] = (
+    ("github_enabled", GitHubProvider),
     ("zendesk_enabled", ZendeskProvider),
     ("linear_enabled", LinearIntegration),
 )
@@ -51,7 +53,26 @@ def capture_context(
 ) -> ContextFragment | None:
     for provider in available_context_providers(integrations):
         try:
+            if not provider.matches(url):
+                continue
             fragment = provider.capture(url)
+        except Exception:
+            continue
+        if fragment is not None:
+            return fragment
+    return None
+
+
+def capture_text_context(
+    text: str,
+    integrations: IntegrationSettings | None = None,
+) -> ContextFragment | None:
+    for provider in available_context_providers(integrations):
+        capture_text = getattr(provider, "capture_text", None)
+        if capture_text is None:
+            continue
+        try:
+            fragment = capture_text(text)
         except Exception:
             continue
         if fragment is not None:

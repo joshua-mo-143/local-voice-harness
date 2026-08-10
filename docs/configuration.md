@@ -59,6 +59,9 @@ cursor_agent_inactivity_seconds = 900
 cursor_agent_max_runtime_seconds = 3600
 ```
 
+GitHub is enabled by default for compatibility. Setting `github = false` prevents
+the GitHub provider from parsing focused URLs or spoken issue references, calling
+`gh` for context, or emitting repository, issue, and pull-request metadata.
 Fresh installations default the optional `zendesk` and `linear` integrations to
 disabled. While disabled, their URLs are not recognized and they contribute no
 context, routing, agent instructions, or diagnostics. Existing installations can

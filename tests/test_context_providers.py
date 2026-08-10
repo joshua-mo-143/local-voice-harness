@@ -30,7 +30,8 @@ class RegistryTests(unittest.TestCase):
         self.assertIsInstance(_StubProvider(), ContextProvider)
 
     def test_no_registered_factories_expose_no_providers(self) -> None:
-        self.assertEqual(context_providers.available_context_providers(), ())
+        with mock.patch.object(context_providers, "_INTEGRATION_FACTORIES", ()):
+            self.assertEqual(context_providers.available_context_providers(), ())
 
     def test_flag_gates_provider_instantiation(self) -> None:
         fragment = ContextFragment(source="stub", text="context")
@@ -52,8 +53,9 @@ class RegistryTests(unittest.TestCase):
             self.assertEqual(len(enabled), 1)
             factory.assert_called_once_with()
 
-    def test_defaults_disable_optional_providers(self) -> None:
-        self.assertEqual(context_providers.available_context_providers(), ())
+    def test_defaults_enable_only_builtin_github_provider(self) -> None:
+        providers = context_providers.available_context_providers()
+        self.assertEqual(tuple(provider.name for provider in providers), ("github",))
 
     def test_malformed_config_falls_back_to_disabled_defaults(self) -> None:
         factory = mock.Mock(return_value=_StubProvider())
@@ -86,6 +88,7 @@ class CaptureContextTests(unittest.TestCase):
             result = context_providers.capture_context(URL)
 
         self.assertIs(result, fragment)
+        provider.matches.assert_called_once_with(URL)
         provider.capture.assert_called_once_with(URL)
 
     def test_provider_failure_is_isolated(self) -> None:
@@ -105,13 +108,15 @@ class CaptureContextTests(unittest.TestCase):
 
     def test_no_match_returns_none(self) -> None:
         provider = mock.Mock()
-        provider.capture.return_value = None
+        provider.matches.return_value = False
         with mock.patch.object(
             context_providers,
             "available_context_providers",
             return_value=(provider,),
         ):
             self.assertIsNone(context_providers.capture_context(URL))
+        provider.matches.assert_called_once_with(URL)
+        provider.capture.assert_not_called()
 
     def test_disabled_registry_inspects_nothing(self) -> None:
         with mock.patch.object(
@@ -120,10 +125,53 @@ class CaptureContextTests(unittest.TestCase):
             self.assertIsNone(context_providers.capture_context(URL))
 
 
+class CaptureTextContextTests(unittest.TestCase):
+    def test_returns_first_text_fragment(self) -> None:
+        fragment = ContextFragment(source="stub", text="spoken context")
+        provider = mock.Mock()
+        provider.capture_text.return_value = fragment
+        with mock.patch.object(
+            context_providers,
+            "available_context_providers",
+            return_value=(provider,),
+        ):
+            result = context_providers.capture_text_context("work on owner/repo#42")
+
+        self.assertIs(result, fragment)
+        provider.capture_text.assert_called_once_with("work on owner/repo#42")
+
+    def test_text_provider_failure_is_isolated(self) -> None:
+        broken = mock.Mock()
+        broken.capture_text.side_effect = RuntimeError("unavailable")
+        fragment = ContextFragment(source="stub", text="recovered")
+        healthy = mock.Mock()
+        healthy.capture_text.return_value = fragment
+        with mock.patch.object(
+            context_providers,
+            "available_context_providers",
+            return_value=(broken, healthy),
+        ):
+            self.assertIs(
+                context_providers.capture_text_context("work on owner/repo#42"),
+                fragment,
+            )
+
+
 class ContextFragmentTests(unittest.TestCase):
     def test_stringifies_to_its_text(self) -> None:
-        fragment = ContextFragment(source="stub", text="rendered context")
+        fragment = ContextFragment(
+            source="stub",
+            text="rendered context",
+            issue_reference="owner/repo#42",
+            repository_reference="owner/repo",
+            issue_number=42,
+            pull_request_number=7,
+        )
         self.assertEqual(str(fragment), "rendered context")
+        self.assertEqual(fragment.repository_reference, "owner/repo")
+        self.assertEqual(fragment.issue_reference, "owner/repo#42")
+        self.assertEqual(fragment.issue_number, 42)
+        self.assertEqual(fragment.pull_request_number, 7)
 
 
 if __name__ == "__main__":
