@@ -164,14 +164,26 @@ WORKFLOW_PLAN[token]: <bounded multiline implementation plan>
                 return subprocess.CompletedProcess(command, 0, "", "")
 
             with (
-                mock.patch.object(herdr, "HOME_ROOT", root),
-                mock.patch.object(
-                    herdr,
-                    "choose_repository",
+                mock.patch(
+                    "local_voice_harness.integrations.herdr.repository.HOME_ROOT",
+                    root,
+                ),
+                mock.patch(
+                    "local_voice_harness.integrations.herdr.types.HOME_ROOT",
+                    root,
+                ),
+                mock.patch(
+                    "local_voice_harness.integrations.herdr.repository.choose_repository",
                     return_value="https://github.com/example/project.git",
                 ),
-                mock.patch.object(herdr, "confirm_clone", return_value=True),
-                mock.patch("subprocess.run", side_effect=clone) as run,
+                mock.patch(
+                    "local_voice_harness.integrations.herdr.repository.confirm_clone",
+                    return_value=True,
+                ),
+                mock.patch(
+                    "local_voice_harness.integrations.herdr.repository.subprocess.run",
+                    side_effect=clone,
+                ) as run,
             ):
                 repository, reason = client.choose_or_clone_repository([])
 
@@ -187,12 +199,14 @@ WORKFLOW_PLAN[token]: <bounded multiline implementation plan>
     def test_cancelled_rofi_clone_returns_spoken_fallback_reason(self) -> None:
         client = herdr.HerdrClient("herdr")
         with (
-            mock.patch.object(
-                herdr,
-                "choose_repository",
+            mock.patch(
+                "local_voice_harness.integrations.herdr.repository.choose_repository",
                 return_value="https://github.com/example/project.git",
             ),
-            mock.patch.object(herdr, "confirm_clone", return_value=False),
+            mock.patch(
+                "local_voice_harness.integrations.herdr.repository.confirm_clone",
+                return_value=False,
+            ),
         ):
             repository, reason = client.choose_or_clone_repository([])
 
@@ -204,7 +218,7 @@ WORKFLOW_PLAN[token]: <bounded multiline implementation plan>
         states = iter([False, False, True])
         completed = subprocess.CompletedProcess([], 0, "", "")
         with (
-            mock.patch.object(client, "is_running", side_effect=lambda: next(states)),
+            mock.patch.object(client.transport, "is_running", side_effect=lambda: next(states)),
             mock.patch("subprocess.run", return_value=completed) as run,
             mock.patch("time.sleep"),
         ):
@@ -223,7 +237,7 @@ WORKFLOW_PLAN[token]: <bounded multiline implementation plan>
         with (
             mock.patch.object(client, "run_json", return_value={"agent": agent}) as run,
             mock.patch.object(
-                herdr.uuid,
+                herdr.workspace.uuid,
                 "uuid4",
                 return_value=mock.Mock(hex="a" * 32),
             ),
@@ -324,6 +338,7 @@ WORKFLOW_PLAN[token]: <bounded multiline implementation plan>
             "pane",
             "workspace",
             name=mock.ANY,
+            mode=None,
             checkpoint=None,
         )
 
@@ -485,10 +500,10 @@ WORKFLOW_PLAN[token]: <bounded multiline implementation plan>
             ),
             mock.patch.object(client, "run_text", return_value=marker),
             mock.patch(
-                "local_voice_harness.integrations.herdr.time.monotonic",
+                "local_voice_harness.integrations.herdr.transport.time.monotonic",
                 side_effect=[0, 0, 1, 2, 3],
             ),
-            mock.patch("local_voice_harness.integrations.herdr.time.sleep"),
+            mock.patch("local_voice_harness.integrations.herdr.transport.time.sleep"),
         ):
             outcome = client.wait_for_stable_completion(
                 "agent",
@@ -518,10 +533,10 @@ WORKFLOW_PLAN[token]: <bounded multiline implementation plan>
                 return_value="WORKFLOW_PLAN[token]: implement safely",
             ),
             mock.patch(
-                "local_voice_harness.integrations.herdr.time.monotonic",
+                "local_voice_harness.integrations.herdr.transport.time.monotonic",
                 side_effect=[0, 0, 1],
             ),
-            mock.patch("local_voice_harness.integrations.herdr.time.sleep"),
+            mock.patch("local_voice_harness.integrations.herdr.transport.time.sleep"),
         ):
             outcome = client.wait_for_stable_completion(
                 "agent",
@@ -558,7 +573,7 @@ WORKFLOW_PLAN[token]: <bounded multiline implementation plan>
                 return_value="WORKFLOW_PLAN[token]: implement safely",
             ),
             mock.patch(
-                "local_voice_harness.integrations.herdr.time.monotonic",
+                "local_voice_harness.integrations.herdr.transport.time.monotonic",
                 side_effect=[0, 0],
             ),
             self.assertRaises(herdr.HerdrError) as raised,
@@ -601,15 +616,17 @@ WORKFLOW_PLAN[token]: <bounded multiline implementation plan>
                         ],
                     ),
                     mock.patch.object(
-                        client,
+                        client.session,
                         "wait_for_stable_completion",
                         return_value=expected,
                     ) as wait_for_stable_completion,
                     mock.patch(
-                        "local_voice_harness.integrations.herdr.subprocess.Popen",
+                        "local_voice_harness.integrations.herdr.transport.subprocess.Popen",
                         return_value=process,
                     ),
-                    mock.patch("local_voice_harness.integrations.herdr.time.sleep"),
+                    mock.patch(
+                        "local_voice_harness.integrations.herdr.transport.time.sleep"
+                    ),
                 ):
                     outcome = client.prompt_and_wait("agent", "do work", token="token")
 
@@ -633,10 +650,10 @@ WORKFLOW_PLAN[token]: <bounded multiline implementation plan>
             mock.patch.object(client, "get_agent", side_effect=[agent, agent, agent]),
             mock.patch.object(client, "wait_for_stable_completion") as wait,
             mock.patch(
-                "local_voice_harness.integrations.herdr.subprocess.Popen",
+                "local_voice_harness.integrations.herdr.transport.subprocess.Popen",
                 return_value=process,
             ),
-            mock.patch("local_voice_harness.integrations.herdr.time.sleep"),
+            mock.patch("local_voice_harness.integrations.herdr.transport.time.sleep"),
             self.assertRaisesRegex(
                 herdr.HerdrError, "did not accept the prompt"
             ) as raised,
@@ -690,10 +707,10 @@ WORKFLOW_PLAN[token]: <bounded multiline implementation plan>
             ),
             mock.patch.object(client, "run_text", return_value="still working"),
             mock.patch(
-                "local_voice_harness.integrations.herdr.time.monotonic",
+                "local_voice_harness.integrations.herdr.transport.time.monotonic",
                 side_effect=[0, 0, 1, 2],
             ),
-            mock.patch("local_voice_harness.integrations.herdr.time.sleep"),
+            mock.patch("local_voice_harness.integrations.herdr.transport.time.sleep"),
             self.assertRaisesRegex(herdr.HerdrError, "inactivity timeout") as raised,
         ):
             client.wait_for_stable_completion(
@@ -723,10 +740,10 @@ WORKFLOW_PLAN[token]: <bounded multiline implementation plan>
                 side_effect=["one", "two", "three"],
             ),
             mock.patch(
-                "local_voice_harness.integrations.herdr.time.monotonic",
+                "local_voice_harness.integrations.herdr.transport.time.monotonic",
                 side_effect=[0, 0, 1, 2],
             ),
-            mock.patch("local_voice_harness.integrations.herdr.time.sleep"),
+            mock.patch("local_voice_harness.integrations.herdr.transport.time.sleep"),
             self.assertRaisesRegex(herdr.HerdrError, "maximum runtime") as raised,
         ):
             client.wait_for_stable_completion(
@@ -759,10 +776,10 @@ WORKFLOW_PLAN[token]: <bounded multiline implementation plan>
             ),
             mock.patch.object(client, "run_text", return_value="working"),
             mock.patch(
-                "local_voice_harness.integrations.herdr.time.monotonic",
+                "local_voice_harness.integrations.herdr.transport.time.monotonic",
                 side_effect=[0, 0, 1],
             ),
-            mock.patch("local_voice_harness.integrations.herdr.time.sleep"),
+            mock.patch("local_voice_harness.integrations.herdr.transport.time.sleep"),
             self.assertRaisesRegex(herdr.HerdrError, "changed sessions") as raised,
         ):
             client.wait_for_stable_completion("agent", token="token")

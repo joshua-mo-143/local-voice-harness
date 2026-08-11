@@ -313,8 +313,7 @@ class LinearIntegration:
                 timeout=180,
                 checkpoint=checkpoint,
             )
-            # Imported lazily to keep this connector independent of Herdr orchestration.
-            from .herdr import extract_marker
+            from .herdr.types import extract_marker
 
             name = extract_marker(outcome.output, "ROUTE_REPO", token) or ""
             confidence = (
