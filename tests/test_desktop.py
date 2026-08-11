@@ -248,6 +248,42 @@ class DesktopCommandTests(unittest.TestCase):
             ]
         )
 
+    def test_x11_type_targets_validated_window(self) -> None:
+        backend = desktop.X11Desktop()
+        window = desktop.Window("42", "firefox", 10)
+        with (
+            mock.patch.object(desktop.shutil, "which", return_value="/usr/bin/xdotool"),
+            mock.patch.object(desktop, "_run", return_value=completed()) as run,
+        ):
+            backend.type_text("hello", window=window)
+        run.assert_called_once_with(
+            [
+                "xdotool",
+                "type",
+                "--window",
+                "42",
+                "--clearmodifiers",
+                "--",
+                "hello",
+            ]
+        )
+
+    def test_wayland_type_rejects_changed_focus(self) -> None:
+        backend = desktop.HyprlandDesktop()
+        expected = desktop.Window("one", "firefox", 1)
+        with (
+            mock.patch.object(desktop.shutil, "which", return_value="/usr/bin/wtype"),
+            mock.patch.object(
+                backend,
+                "active_window",
+                return_value=desktop.Window("two", "foot", 2),
+            ),
+            mock.patch.object(desktop, "_run") as run,
+            self.assertRaisesRegex(desktop.DesktopError, "active window"),
+        ):
+            backend.type_text("hello", window=expected)
+        run.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()

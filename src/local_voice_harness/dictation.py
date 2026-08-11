@@ -19,7 +19,7 @@ from .config import (
     RECORDING_LOCK,
     STT_SOCKET,
 )
-from .desktop import DesktopError, get_desktop
+from .desktop import Desktop, DesktopError, Window, get_desktop
 from .errors import HarnessError, NoSpeechError
 from .ipc import socket_ready
 from .notifications import notify
@@ -155,25 +155,41 @@ def _send_to_herdr(text: str) -> bool:
     return _run(["herdr", "pane", "send-text", pane_id, text]).returncode == 0
 
 
-def _active_window_class() -> str:
+def _active_window() -> Window | None:
     desktop = get_desktop()
-    window = desktop.active_window() if desktop is not None else None
-    return window.window_class if window is not None else ""
+    if desktop is None:
+        return None
+    return desktop.active_window()
+
+
+def _window_is_blocked(window: Window) -> bool:
+    return any(name in window.window_class for name in BLOCKED_WINDOW_CLASSES)
 
 
 def _ensure_dictation_allowed() -> None:
-    window_class = _active_window_class()
-    if any(name in window_class for name in BLOCKED_WINDOW_CLASSES):
+    window = _active_window()
+    if window is not None and _window_is_blocked(window):
         raise HarnessError(
             "Dictation is disabled for RuneLite because simulated input may "
             "violate Jagex's rules."
         )
 
 
-def _copy_to_clipboard(text: str) -> None:
-    desktop = get_desktop()
-    if desktop is None:
-        raise HarnessError("focused-window automation is unavailable in this session")
+def _ensure_window_allowed(window: Window) -> None:
+    if _window_is_blocked(window):
+        raise HarnessError(
+            "Dictation is disabled for RuneLite because simulated input may "
+            "violate Jagex's rules."
+        )
+
+
+def _require_focus(desktop: Desktop, window: Window) -> None:
+    if desktop.active_window() != window:
+        raise HarnessError("dictation cancelled because the focused window changed")
+
+
+def _copy_to_clipboard(desktop: Desktop, window: Window, text: str) -> None:
+    _require_focus(desktop, window)
     try:
         copied = desktop.write_clipboard(text)
     except DesktopError as exc:
@@ -182,30 +198,41 @@ def _copy_to_clipboard(text: str) -> None:
         raise HarnessError("could not copy recognized text to the clipboard")
 
 
-def _type_text(text: str) -> None:
-    desktop = get_desktop()
-    if desktop is None:
-        raise HarnessError("focused-window automation is unavailable in this session")
+def _type_text(desktop: Desktop, window: Window, text: str) -> None:
+    _require_focus(desktop, window)
     try:
-        desktop.type_text(text)
+        desktop.type_text(text, window=window)
     except DesktopError as exc:
         raise HarnessError(str(exc)) from exc
 
 
-def _send_key(key: str) -> None:
-    desktop = get_desktop()
-    if desktop is None:
-        raise HarnessError("focused-window automation is unavailable in this session")
+def _send_key(desktop: Desktop, window: Window, key: str) -> None:
+    _require_focus(desktop, window)
     try:
-        sent = desktop.send_key(key)
+        sent = desktop.send_key(key, window=window)
     except DesktopError as exc:
         raise HarnessError(str(exc)) from exc
     if not sent:
         raise HarnessError("could not insert recognized text into the active window")
 
 
+def _restore_clipboard(
+    desktop: Desktop,
+    *,
+    copied_text: str,
+    clipboard_existed: bool,
+    previous_clipboard: str,
+) -> None:
+    current_exists, current_clipboard = desktop.read_clipboard()
+    if not current_exists or current_clipboard != copied_text:
+        return
+    try:
+        desktop.write_clipboard(previous_clipboard if clipboard_existed else "")
+    except DesktopError:
+        pass
+
+
 def inject(text: str) -> None:
-    _ensure_dictation_allowed()
     mode = os.environ.get("DICTATION_INJECT", "auto").lower()
     if mode not in INJECT_MODES:
         raise HarnessError(
@@ -215,31 +242,54 @@ def inject(text: str) -> None:
     if mode == "stdout":
         print(text)
         return
+
+    desktop = get_desktop()
+    window = desktop.active_window() if desktop is not None else None
+    if window is not None:
+        _ensure_window_allowed(window)
+
     if mode != "type" and _send_to_herdr(text):
         return
-    if mode == "auto":
-        mode = (
-            "type"
-            if any(name in _active_window_class() for name in TERMINAL_CLASSES)
-            else "paste"
-        )
-    desktop = get_desktop()
+
     if desktop is None:
         raise HarnessError(
             "focused-window automation supports X11, Hyprland, and Sway only"
         )
+    if window is None:
+        raise HarnessError("could not determine the focused window for dictation")
+
+    if mode == "auto":
+        mode = (
+            "type"
+            if any(name in window.window_class for name in TERMINAL_CLASSES)
+            else "paste"
+        )
+
     if mode == "type" or not desktop.has_clipboard():
         time.sleep(0.12)
-        _type_text(text)
+        _type_text(desktop, window, text)
         return
-    _copy_to_clipboard(text)
-    time.sleep(0.12)
-    shortcut = (
-        "ctrl+shift+v"
-        if any(name in _active_window_class() for name in TERMINAL_CLASSES)
-        else "ctrl+v"
-    )
-    _send_key(shortcut)
+
+    clipboard_existed, previous_clipboard = desktop.read_clipboard()
+    copied = False
+    try:
+        _copy_to_clipboard(desktop, window, text)
+        copied = True
+        time.sleep(0.12)
+        shortcut = (
+            "ctrl+shift+v"
+            if any(name in window.window_class for name in TERMINAL_CLASSES)
+            else "ctrl+v"
+        )
+        _send_key(desktop, window, shortcut)
+    finally:
+        if copied:
+            _restore_clipboard(
+                desktop,
+                copied_text=text,
+                clipboard_existed=clipboard_existed,
+                previous_clipboard=previous_clipboard,
+            )
 
 
 def transcribe_and_type(audio_path: Path) -> None:
