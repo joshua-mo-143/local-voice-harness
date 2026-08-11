@@ -4,6 +4,7 @@ import stat
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from local_voice_harness import user_config
 from local_voice_harness.user_config import UserConfigurationError
@@ -232,6 +233,77 @@ class UserConfigValidationTests(unittest.TestCase):
     def test_section_must_be_a_table(self) -> None:
         with self.assertRaisesRegex(UserConfigurationError, "TOML table"):
             self._load("audio = 1\n")
+
+    def test_malformed_config_names_source_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config_path = root / "config.toml"
+            config_path.write_text("[audio\n")
+
+            with self.assertRaisesRegex(
+                UserConfigurationError,
+                rf"user configuration {config_path}",
+            ):
+                user_config.load_user_config(
+                    {},
+                    path=config_path,
+                    backends_path=root / "missing.toml",
+                    home=self.HOME,
+                )
+
+    def test_malformed_backends_config_names_source_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            backends_path = root / "backends.toml"
+            backends_path.write_text("[llm\n")
+
+            with self.assertRaisesRegex(
+                UserConfigurationError,
+                rf"backend configuration {backends_path}",
+            ):
+                user_config.load_user_config(
+                    {},
+                    path=root / "missing.toml",
+                    backends_path=backends_path,
+                    home=self.HOME,
+                )
+
+    def test_invalid_utf8_config_names_source_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config_path = root / "config.toml"
+            config_path.write_bytes(b"\xff")
+
+            with self.assertRaisesRegex(
+                UserConfigurationError,
+                rf"user configuration {config_path}",
+            ):
+                user_config.load_user_config(
+                    {},
+                    path=config_path,
+                    backends_path=root / "missing.toml",
+                    home=self.HOME,
+                )
+
+    def test_unreadable_config_names_source_path(self) -> None:
+        config_path = Path("/config/config.toml")
+        with (
+            mock.patch.object(
+                Path,
+                "read_text",
+                side_effect=PermissionError("permission denied"),
+            ),
+            self.assertRaisesRegex(
+                UserConfigurationError,
+                rf"user configuration {config_path}",
+            ),
+        ):
+            user_config.load_user_config(
+                {},
+                path=config_path,
+                backends_path=Path("/config/backends.toml"),
+                home=self.HOME,
+            )
 
 
 class UserConfigWriteTests(unittest.TestCase):

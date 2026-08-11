@@ -57,7 +57,7 @@ class RegistryTests(unittest.TestCase):
         providers = context_providers.available_context_providers()
         self.assertEqual(tuple(provider.name for provider in providers), ("github",))
 
-    def test_malformed_config_falls_back_to_disabled_defaults(self) -> None:
+    def test_malformed_config_fails_before_constructing_providers(self) -> None:
         factory = mock.Mock(return_value=_StubProvider())
         with (
             mock.patch.object(
@@ -71,7 +71,8 @@ class RegistryTests(unittest.TestCase):
                 side_effect=UserConfigurationError("bad config"),
             ),
         ):
-            self.assertEqual(context_providers.available_context_providers(), ())
+            with self.assertRaisesRegex(UserConfigurationError, "bad config"):
+                context_providers.available_context_providers()
         factory.assert_not_called()
 
 

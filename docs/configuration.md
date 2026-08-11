@@ -84,9 +84,26 @@ Credentials are never read from or written to `config.toml`; a Venice API key in
 any section is rejected. Store it with `voice-harness credentials set` instead, as
 described under [AI backends](#ai-backends).
 
-This section is the foundation for later configuration and integration
-management; runtime services continue to read the environment variables and files
-described below until they are migrated.
+Malformed, invalid-encoding, and unreadable `config.toml` or `backends.toml` files
+fail with an error that identifies the source path. Runtime capability discovery
+does not replace such failures with defaults, because that could silently enable
+or disable an integration. Failures from an individual provider while capturing
+optional context remain isolated from configuration loading failures.
+
+## Runtime lifecycle
+
+Runtime configuration uses a process-start snapshot. Each migrated composition
+root resolves `UserConfig` once, then injects its immutable typed sections into
+the process's consumers. Editing `config.toml`, a documented legacy input, or an
+environment override does not mutate an already running process. Restart every
+affected foreground process, service, or detached worker to apply the change;
+the configuration commands report affected active services.
+
+There is no general configuration hot reload. The vocabulary store is the
+documented exception: the dictation service reads it for each transcription, so
+vocabulary edits apply without a restart. Runtime migration is staged; consumers
+not yet migrated continue to use the legacy channels described below until their
+tracking children in the runtime configuration epic are complete.
 
 ## Configuration commands
 
