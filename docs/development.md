@@ -22,6 +22,10 @@ temporary overrides remain available:
 env VOICE_HARNESS_LLM_PROVIDER=venice scripts/dev.sh text "Summarize my open work"
 ```
 
+Every launcher command selects the `wake` extra because the checkout's `.venv`
+is also used by the installed wake service. This prevents a development run from
+re-syncing that environment without OpenWakeWord and its compatible NumPy version.
+
 GitHub CLI authentication remains shared with the normal user profile. Before
 isolating `XDG_CONFIG_HOME`, the launcher sets `GH_CONFIG_DIR` to the directory
 that `gh` would normally use (`$XDG_CONFIG_HOME/gh` or `$HOME/.config/gh`).
