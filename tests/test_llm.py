@@ -16,6 +16,7 @@ from local_voice_harness import llm, llm_transport
 from local_voice_harness.config import load_backend_settings
 from local_voice_harness.cursor.service import CursorTurnRequest
 from local_voice_harness.errors import HarnessError
+from local_voice_harness.responses import AssistantResponse
 
 
 def _response(message: dict[str, object]) -> io.BytesIO:
@@ -335,6 +336,10 @@ class QwenClientTests(unittest.TestCase):
         )
 
     def test_rejected_tool_result_cannot_be_rewritten_as_started(self) -> None:
+        result = AssistantResponse(
+            spoken_text="Two tickets were rejected.",
+            display_text="Ticket starts: #92: rejected; #93: rejected.",
+        )
         tool_call = {
             "id": "call-1",
             "function": {
@@ -352,14 +357,11 @@ class QwenClientTests(unittest.TestCase):
                     _response({"content": None, "tool_calls": [tool_call]}),
                     _response({"content": "I've submitted both issues."}),
                 ],
-            ),
+            ) as urlopen,
             mock.patch.object(
                 llm,
                 "cursor_turn",
-                return_value=(
-                    "Ticket starts: #92: rejected; #93: rejected.",
-                    None,
-                ),
+                return_value=(result, None),
             ) as cursor_turn,
             mock.patch.object(llm, "notify") as notify,
             redirect_stdout(io.StringIO()),
@@ -372,6 +374,9 @@ class QwenClientTests(unittest.TestCase):
         self.assertEqual((answer, session), (llm.TOOL_FREE_ACTION_RECOVERY, None))
         cursor_turn.assert_called_once()
         notify.assert_not_called()
+        second_request = urlopen.call_args_list[1].args[0]
+        second_payload = json.loads(second_request.data)
+        self.assertEqual(second_payload["messages"][-1]["content"], result.display_text)
 
     def test_retries_without_replaying_malformed_tool_arguments(self) -> None:
         malformed_call = {

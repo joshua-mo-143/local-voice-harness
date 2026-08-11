@@ -22,6 +22,7 @@ from ..integrations.github import (
     GitHubError,
     GitHubIssue,
     GitHubIssueLookupError,
+    GitHubIssueLookupReason,
     format_issue_context,
     github_issue_from_url,
 )
@@ -39,6 +40,7 @@ from ..questions import (
     question_prompt,
     resolve_answer,
 )
+from ..responses import AssistantResponse, ResponseLike
 from ..ticket_targets import TicketExtraction, TicketReference, extract_ticket_targets
 from ..user_config import load_user_config
 from . import delivery, inbox, provisioning, questions, recovery, worker_lifecycle
@@ -122,7 +124,7 @@ class CursorTurnRequest:
 
 
 class CursorTurnResult(NamedTuple):
-    text: str
+    text: ResponseLike
     session_id: str | None
 
 
@@ -141,6 +143,7 @@ class TicketStartOutcome:
     status: TicketStartStatus
     job_id: str | None = None
     detail: str | None = None
+    github_lookup_reason: GitHubIssueLookupReason | None = None
 
 
 def _job_store() -> JobStore:
@@ -401,11 +404,17 @@ def _scoped_request_text(base: StartJobRequest, target: str, source: str) -> str
     )
 
 
-def _rejected(reference: TicketReference, detail: str) -> TicketStartOutcome:
+def _rejected(
+    reference: TicketReference,
+    detail: str,
+    *,
+    github_lookup_reason: GitHubIssueLookupReason | None = None,
+) -> TicketStartOutcome:
     return TicketStartOutcome(
         reference.label,
         "rejected",
         detail=_start_error_detail(HarnessError(detail)),
+        github_lookup_reason=github_lookup_reason,
     )
 
 
@@ -427,10 +436,13 @@ def _github_target(
     try:
         details = client.issue_details(issue)
     except GitHubError as exc:
-        detail = (
-            exc.voice_message if isinstance(exc, GitHubIssueLookupError) else str(exc)
-        )
-        return _rejected(reference, detail)
+        if isinstance(exc, GitHubIssueLookupError):
+            return _rejected(
+                reference,
+                exc.voice_message,
+                github_lookup_reason=exc.reason,
+            )
+        return _rejected(reference, str(exc))
 
     detail_number = details.get("number")
     if isinstance(detail_number, int) and detail_number != issue.number:
@@ -545,18 +557,95 @@ def _preflight_ticket_targets(
     return slots, prepared
 
 
-def _ticket_start_summary(outcomes: tuple[TicketStartOutcome, ...]) -> str:
+def _counted(count: int, singular: str, plural: str | None = None) -> str:
+    quantity = {
+        1: "one",
+        2: "two",
+        3: "three",
+        4: "four",
+        5: "five",
+    }.get(count, str(count))
+    return f"{quantity} {singular if count == 1 else plural or singular + 's'}"
+
+
+def _ticket_start_spoken(outcomes: tuple[TicketStartOutcome, ...]) -> str:
+    lookup_reason = outcomes[0].github_lookup_reason if len(outcomes) == 1 else None
+    if lookup_reason is not None:
+        outcome = outcomes[0]
+        _repository, separator, number = outcome.target.rpartition("#")
+        identity = f"GitHub issue {number}" if separator else "that GitHub issue"
+        messages = {
+            GitHubIssueLookupReason.NOT_FOUND_OR_INACCESSIBLE: (
+                f"I couldn't find or access {identity}."
+            ),
+            GitHubIssueLookupReason.UNAUTHORIZED: (
+                f"I couldn't access {identity} because GitHub authorization "
+                "is required."
+            ),
+            GitHubIssueLookupReason.TRANSIENT: (
+                f"GitHub is temporarily unavailable while checking {identity}."
+            ),
+            GitHubIssueLookupReason.UNKNOWN: f"I couldn't verify {identity}.",
+        }
+        return messages.get(
+            lookup_reason,
+            f"I couldn't verify {identity}.",
+        )
+    accepted = sum(outcome.status == "accepted" for outcome in outcomes)
+    lookup_failures = sum(
+        outcome.github_lookup_reason is not None for outcome in outcomes
+    )
+    rejected = sum(
+        outcome.status == "rejected" and outcome.github_lookup_reason is None
+        for outcome in outcomes
+    )
+    start_failed = sum(outcome.status == "start-failed" for outcome in outcomes)
+    parts: list[str] = []
+    if accepted:
+        parts.append(f"{_counted(accepted, 'job')} started")
+    if lookup_failures:
+        parts.append(
+            f"{_counted(lookup_failures, 'GitHub issue')} could not be accessed"
+        )
+    if rejected:
+        parts.append(f"{_counted(rejected, 'ticket')} rejected")
+    if start_failed:
+        parts.append(f"{_counted(start_failed, 'job')} failed to start")
+    if not parts:
+        return "No ticket jobs were started."
+    sentence = "; ".join(parts) + "."
+    return sentence[0].upper() + sentence[1:]
+
+
+def _ticket_display_detail(outcome: TicketStartOutcome) -> str | None:
+    if outcome.github_lookup_reason is None:
+        return outcome.detail
+    classified = {
+        GitHubIssueLookupReason.NOT_FOUND_OR_INACCESSIBLE: (
+            "issue not found or inaccessible"
+        ),
+        GitHubIssueLookupReason.UNAUTHORIZED: "GitHub authorization required",
+        GitHubIssueLookupReason.TRANSIENT: "GitHub temporarily unavailable",
+        GitHubIssueLookupReason.UNKNOWN: "GitHub issue could not be verified",
+    }
+    return classified[outcome.github_lookup_reason]
+
+
+def _ticket_start_summary(
+    outcomes: tuple[TicketStartOutcome, ...],
+) -> AssistantResponse:
     parts: list[str] = []
     for outcome in outcomes:
         if outcome.status == "accepted":
             parts.append(f"{outcome.target}: accepted as job {outcome.job_id}")
         else:
-            detail = f" ({outcome.detail})" if outcome.detail else ""
-            if len(outcomes) == 1:
-                parts.append(f"{outcome.status}{detail}")
-            else:
-                parts.append(f"{outcome.target}: {outcome.status}{detail}")
-    return "Ticket starts: " + "; ".join(parts) + "."
+            display_detail = _ticket_display_detail(outcome)
+            detail = f" ({display_detail})" if display_detail else ""
+            parts.append(f"{outcome.target}: {outcome.status}{detail}")
+    return AssistantResponse(
+        spoken_text=_ticket_start_spoken(outcomes),
+        display_text="Ticket starts: " + "; ".join(parts) + ".",
+    )
 
 
 def _submit_extracted_targets(
@@ -1533,6 +1622,33 @@ def cursor_turn(
     return _await_foreground(job_id, delivery_claims)
 
 
+def _job_failure_stage(job: CursorJob) -> str:
+    if job.worktree_provision_state not in {None, "ready"}:
+        return "repository setup"
+    if job.agent_dispatch_state not in {None, "ready"}:
+        return "agent setup"
+    phase = {
+        "classifying": "workflow classification",
+        "planning": "planning",
+        "reviewing": "plan review",
+        "revising": "plan revision",
+        "implementing": "implementation",
+    }.get(job.workflow_phase.value)
+    return phase or "execution"
+
+
+def _foreground_failure_response(job: CursorJob) -> AssistantResponse:
+    stage = _job_failure_stage(job)
+    log_path = JOB_LOGS_DIR / f"{job.id}.log"
+    return AssistantResponse(
+        spoken_text=f"The Cursor job failed during {stage}.",
+        display_text=(
+            f"Cursor job {job.id} failed during {stage}. "
+            f"Inspect {log_path} for diagnostic details before retrying."
+        ),
+    )
+
+
 def _await_foreground(
     job_id: str, delivery_claims: DeliveryClaims | None
 ) -> CursorTurnResult:
@@ -1572,8 +1688,8 @@ def _await_foreground(
             )
         if job.status == JobStatus.FAILED:
             claimed = _defer_or_acknowledge(job_id, delivery_claims)
-            error = claimed.error if claimed is not None else job.error
-            raise HarnessError(str(error or "Cursor failed"))
+            failed = claimed if claimed is not None else job
+            return CursorTurnResult(_foreground_failure_response(failed), None)
         if job.status == JobStatus.CANCELLED:
             claimed = _defer_or_acknowledge(job_id, delivery_claims)
             result = claimed.result if claimed is not None else job.result

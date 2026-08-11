@@ -11,6 +11,7 @@ from .errors import HarnessError
 from .llm_transport import ChatCompletionRequest, LlmTransport
 from .notifications import notify
 from .questions import AnswerProvenance
+from .responses import as_assistant_response
 
 BASE_SYSTEM_PROMPT = (
     "You are a fast conversational voice assistant. Every spoken answer must be complete and "
@@ -270,7 +271,7 @@ def qwen_turn(
                             or fork_requested
                             or github_pull_request
                         ):
-                            tool_result, cursor_session = cursor_turn(
+                            turn_response, cursor_session = cursor_turn(
                                 CursorTurnRequest(
                                     task,
                                     job_id if action == "reply" else None,
@@ -294,7 +295,7 @@ def qwen_turn(
                                 delivery_claims=delivery_claims,
                             )
                         else:
-                            tool_result, cursor_session = cursor_turn(
+                            turn_response, cursor_session = cursor_turn(
                                 CursorTurnRequest(
                                     task,
                                     job_id if action == "reply" else None,
@@ -312,6 +313,7 @@ def qwen_turn(
                                 ),
                                 delivery_claims=delivery_claims,
                             )
+                        tool_result = as_assistant_response(turn_response).display_text
                     except Exception as exc:
                         tool_result = f"Cursor tool failed: {type(exc).__name__}: {exc}"
             _log_llm_event(

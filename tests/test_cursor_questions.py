@@ -32,6 +32,7 @@ from local_voice_harness.questions import (
     question_prompt,
     resolve_answer,
 )
+from local_voice_harness.responses import as_assistant_response
 
 
 @pytest.fixture
@@ -579,7 +580,7 @@ def test_stale_answer_does_not_mutate_or_launch(store: JobStore) -> None:
         )
 
     launch.assert_not_called()
-    assert "older question" in result.text
+    assert "older question" in as_assistant_response(result.text).display_text
     assert store.get(original.id).revision == original.revision
 
 
@@ -639,7 +640,7 @@ def test_protected_answer_requires_explicit_request_provenance(
             )
         )
     launch.assert_not_called()
-    assert "direct user answer" in rejected.text
+    assert "direct user answer" in as_assistant_response(rejected.text).display_text
     assert store.get("aaaaaaaaaaaa").status == JobStatus.AWAITING_USER
 
     with mock.patch.object(service, "launch_worker") as launch:
@@ -669,7 +670,7 @@ def test_unknown_question_owner_fails_closed(store: JobStore) -> None:
         )
 
     launch.assert_not_called()
-    assert "cannot safely route" in result.text
+    assert "cannot safely route" in as_assistant_response(result.text).display_text
     assert store.get("aaaaaaaaaaaa").status == JobStatus.AWAITING_USER
 
 
