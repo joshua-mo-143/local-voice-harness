@@ -20,10 +20,7 @@ _INTEGRATION_FACTORIES: tuple[tuple[str, Callable[[], object]], ...] = (
 
 
 def _integration_settings() -> IntegrationSettings:
-    try:
-        return load_user_config().integrations
-    except Exception:
-        return IntegrationSettings()
+    return load_user_config().integrations
 
 
 def enabled_integrations(

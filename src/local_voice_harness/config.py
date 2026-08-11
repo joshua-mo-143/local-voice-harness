@@ -140,7 +140,9 @@ def read_toml_table(
     """Read ``config_path`` into a TOML table, tolerating a missing file."""
 
     try:
-        raw = tomllib.loads(config_path.read_text()) if config_path.exists() else {}
+        raw = tomllib.loads(config_path.read_text())
+    except FileNotFoundError:
+        raw = {}
     except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError) as exc:
         raise error(f"could not read {label} {config_path}: {exc}") from exc
     if not isinstance(raw, dict):
