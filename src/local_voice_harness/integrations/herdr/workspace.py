@@ -172,6 +172,7 @@ class HerdrWorkspace:
         *,
         name: str | None = None,
         mode: str | None = None,
+        model: str | None = None,
         checkpoint: Checkpoint | None = None,
     ) -> AgentSelection:
         if mode not in {None, "plan", "ask"}:
@@ -187,6 +188,8 @@ class HerdrWorkspace:
                 agent_args = ["--trust"]
                 if mode is not None:
                     agent_args.extend(["--mode", mode])
+                if model:
+                    agent_args.extend(["--model", model])
                 result = self._operations.run_json(
                     "agent",
                     "start",
@@ -405,6 +408,7 @@ class HerdrWorkspace:
         role: str,
         mode: str | None,
         name: str | None = None,
+        model: str | None = None,
         checkpoint: Checkpoint | None = None,
         reserve: ReserveAgent | None = None,
         settle: SettleAgent | None = None,
@@ -445,6 +449,7 @@ class HerdrWorkspace:
                 workspace,
                 name=name,
                 mode=mode,
+                model=model,
                 checkpoint=checkpoint,
             )
         except HerdrError as exc:

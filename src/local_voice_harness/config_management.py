@@ -166,6 +166,41 @@ def _provider_field(section: str, attribute: str, *, parse: Parser) -> ConfigFie
     )
 
 
+def _cursor_economy_field(attribute: str, *, parse: Parser) -> ConfigField:
+    def apply(config: UserConfig, value: object) -> UserConfig:
+        economy = replace(config.cursor.economy, **{attribute: value})
+        cursor = replace(config.cursor, economy=economy)
+        return replace(config, cursor=cursor)
+
+    def describe(config: UserConfig) -> object:
+        return getattr(config.cursor.economy, attribute)
+
+    return ConfigField(
+        parse=parse,
+        apply=apply,
+        describe=describe,
+        services=(_WAKE_SERVICE,),
+    )
+
+
+def _cursor_model_field(attribute: str, *, parse: Parser) -> ConfigField:
+    def apply(config: UserConfig, value: object) -> UserConfig:
+        models = replace(config.cursor.economy.models, **{attribute: value})
+        economy = replace(config.cursor.economy, models=models)
+        cursor = replace(config.cursor, economy=economy)
+        return replace(config, cursor=cursor)
+
+    def describe(config: UserConfig) -> object:
+        return getattr(config.cursor.economy.models, attribute)
+
+    return ConfigField(
+        parse=parse,
+        apply=apply,
+        describe=describe,
+        services=(_WAKE_SERVICE,),
+    )
+
+
 _CONFIG_FIELDS: dict[str, ConfigField] = {
     "providers.llm.provider": _provider_field("llm", "provider", parse=_parse_str),
     "providers.llm.model": _provider_field("llm", "model", parse=_parse_str),
@@ -356,6 +391,22 @@ _CONFIG_FIELDS: dict[str, ConfigField] = {
         section="platform",
         attribute="agent_job_start_concurrency",
         services=(_WAKE_SERVICE,),
+    ),
+    "cursor.economy.enabled": _cursor_economy_field("enabled", parse=_parse_bool),
+    "cursor.economy.verify_simple_tier": _cursor_economy_field(
+        "verify_simple_tier",
+        parse=_parse_bool,
+    ),
+    "cursor.models.classifier": _cursor_model_field("classifier", parse=_parse_str),
+    "cursor.models.planner": _cursor_model_field("planner", parse=_parse_str),
+    "cursor.models.reviewer": _cursor_model_field("reviewer", parse=_parse_str),
+    "cursor.models.implementer": _cursor_model_field(
+        "implementer",
+        parse=_parse_str,
+    ),
+    "cursor.models.implementer_high_risk": _cursor_model_field(
+        "implementer_high_risk",
+        parse=_parse_str,
     ),
 }
 

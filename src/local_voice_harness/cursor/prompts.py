@@ -181,6 +181,7 @@ def implementation_prompt(
     issue_reference: str | None = None,
     classification_reason: str | None = None,
     integration_instructions: tuple[str, ...] = (),
+    economy_simple: bool = False,
 ) -> str:
     integration_text = (
         " ".join(integration_instructions) + " " if integration_instructions else ""
@@ -189,6 +190,13 @@ def implementation_prompt(
         "Continue the existing task using this clarification. "
         if continuation
         else "Implement the following user request in the current checkout. "
+    )
+    economy_policy = (
+        "Economy mode: keep changes minimal and localized. Do not commit or open a "
+        "pull request unless the user asked. Run the repository CI checks before "
+        "finishing. Stop and emit WORKFLOW_PROMOTE if scope grows beyond simple.\n\n"
+        if economy_simple
+        else ""
     )
     completion_instruction = (
         f" For this issue, the summary must be exactly \"I've finished working on "
@@ -204,26 +212,30 @@ def implementation_prompt(
         if classification_reason
         else ""
     )
-    return prompt + (
-        "Follow repository rules, keep changes scoped, and run relevant checks. "
-        f"{integration_text}"
-        "If you use subagents, run them only in the foreground and wait for every "
-        "subagent and tool call to finish before responding. Never leave background "
-        "work running. Emit VOICE_SUMMARY only after all subagents and tool calls "
-        "have reached a terminal state. "
-        "If implementation reveals broader scope, ambiguity, or a persistence, "
-        "recovery, concurrency, lifecycle, worktree, external-write, security, "
-        "infrastructure, destructive, or public-API risk not covered by the approved "
-        "tier, stop before further edits and emit exactly "
-        f"WORKFLOW_PROMOTE[{token}]: medium|high-risk followed by "
-        f"WORKFLOW_REASON[{token}]: <brief evidence>. "
-        f"If you need user input, end with exactly {_voice_question_marker(token)} "
-        f"When finished, end with exactly VOICE_SUMMARY[{token}]: followed "
-        "by a plain-text summary of at most 20 words."
-        f"{completion_instruction} Include only one outcome marker set.\n\n"
-        + _boundary(text, github_issue_context=github_issue_context)
-        + risk_context
-        + plan_instruction
+    return (
+        prompt
+        + economy_policy
+        + (
+            "Follow repository rules, keep changes scoped, and run relevant checks. "
+            f"{integration_text}"
+            "If you use subagents, run them only in the foreground and wait for every "
+            "subagent and tool call to finish before responding. Never leave background "
+            "work running. Emit VOICE_SUMMARY only after all subagents and tool calls "
+            "have reached a terminal state. "
+            "If implementation reveals broader scope, ambiguity, or a persistence, "
+            "recovery, concurrency, lifecycle, worktree, external-write, security, "
+            "infrastructure, destructive, or public-API risk not covered by the approved "
+            "tier, stop before further edits and emit exactly "
+            f"WORKFLOW_PROMOTE[{token}]: medium|high-risk followed by "
+            f"WORKFLOW_REASON[{token}]: <brief evidence>. "
+            f"If you need user input, end with exactly {_voice_question_marker(token)} "
+            f"When finished, end with exactly VOICE_SUMMARY[{token}]: followed "
+            "by a plain-text summary of at most 20 words."
+            f"{completion_instruction} Include only one outcome marker set.\n\n"
+            + _boundary(text, github_issue_context=github_issue_context)
+            + risk_context
+            + plan_instruction
+        )
     )
 
 

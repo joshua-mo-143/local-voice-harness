@@ -37,7 +37,14 @@ from .config import (
     xdg_config_home,
 )
 
-_TOP_LEVEL_SECTIONS = ("providers", "integrations", "compute", "audio", "platform")
+_TOP_LEVEL_SECTIONS = (
+    "providers",
+    "integrations",
+    "compute",
+    "audio",
+    "platform",
+    "cursor",
+)
 _PROVIDER_TABLES = ("llm", "tts", "venice")
 _LLM_KEYS = ("provider", "model", "endpoint", "timeout")
 _TTS_KEYS = ("provider", "model", "voice", "speed", "endpoint", "timeout")
@@ -154,6 +161,31 @@ class AudioSettings:
 
 
 @dataclass(frozen=True)
+class CursorModelSettings:
+    """Optional Cursor agent model overrides when economy mode is enabled."""
+
+    classifier: str = ""
+    planner: str = ""
+    reviewer: str = ""
+    implementer: str = ""
+    implementer_high_risk: str = ""
+
+
+@dataclass(frozen=True)
+class CursorEconomySettings:
+    """Optional cost-saving Cursor workflow: model routing and CI verification."""
+
+    enabled: bool = False
+    verify_simple_tier: bool = True
+    models: CursorModelSettings = CursorModelSettings()
+
+
+@dataclass(frozen=True)
+class CursorSettings:
+    economy: CursorEconomySettings = CursorEconomySettings()
+
+
+@dataclass(frozen=True)
 class PlatformSettings:
     """Local trust boundaries and desktop capability toggles."""
 
@@ -180,6 +212,18 @@ class UserConfig:
     compute: ComputeSettings
     audio: AudioSettings
     platform: PlatformSettings
+    cursor: CursorSettings
+
+
+_CURSOR_SECTION_KEYS = ("economy", "models")
+_CURSOR_ECONOMY_KEYS = ("enabled", "verify_simple_tier")
+_CURSOR_MODEL_KEYS = (
+    "classifier",
+    "planner",
+    "reviewer",
+    "implementer",
+    "implementer_high_risk",
+)
 
 
 def user_config_path(
@@ -309,6 +353,13 @@ def _as_nonempty(value: object, *, label: str) -> str:
     if not text:
         raise UserConfigurationError(f"{label} must not be empty")
     return text
+
+
+def _as_optional_str(value: object, *, label: str) -> str:
+    del label  # Model slugs are validated by Cursor at runtime.
+    if value is None:
+        return ""
+    return str(value).strip()
 
 
 def _as_choice(value: object, choices: set[str], *, label: str) -> str:
@@ -661,6 +712,116 @@ def _load_platform(
     )
 
 
+def _load_cursor_models(
+    section: Mapping[str, object],
+    environment: Mapping[str, str],
+) -> CursorModelSettings:
+    _reject_unknown(section, _CURSOR_MODEL_KEYS, label="[cursor.models]")
+    return CursorModelSettings(
+        classifier=_as_optional_str(
+            _resolve(
+                environment,
+                "VOICE_HARNESS_CURSOR_MODEL_CLASSIFIER",
+                section,
+                "classifier",
+                "",
+            ),
+            label="cursor.models.classifier",
+        ),
+        planner=_as_optional_str(
+            _resolve(
+                environment,
+                "VOICE_HARNESS_CURSOR_MODEL_PLANNER",
+                section,
+                "planner",
+                "",
+            ),
+            label="cursor.models.planner",
+        ),
+        reviewer=_as_optional_str(
+            _resolve(
+                environment,
+                "VOICE_HARNESS_CURSOR_MODEL_REVIEWER",
+                section,
+                "reviewer",
+                "",
+            ),
+            label="cursor.models.reviewer",
+        ),
+        implementer=_as_optional_str(
+            _resolve(
+                environment,
+                "VOICE_HARNESS_CURSOR_MODEL_IMPLEMENTER",
+                section,
+                "implementer",
+                "",
+            ),
+            label="cursor.models.implementer",
+        ),
+        implementer_high_risk=_as_optional_str(
+            _resolve(
+                environment,
+                "VOICE_HARNESS_CURSOR_MODEL_IMPLEMENTER_HIGH_RISK",
+                section,
+                "implementer_high_risk",
+                "",
+            ),
+            label="cursor.models.implementer_high_risk",
+        ),
+    )
+
+
+def _load_cursor_economy(
+    section: Mapping[str, object],
+    environment: Mapping[str, str],
+    *,
+    models: CursorModelSettings,
+) -> CursorEconomySettings:
+    _reject_unknown(section, _CURSOR_ECONOMY_KEYS, label="[cursor.economy]")
+    return CursorEconomySettings(
+        enabled=_as_bool(
+            _resolve(
+                environment,
+                "VOICE_HARNESS_CURSOR_ECONOMY_ENABLED",
+                section,
+                "enabled",
+                False,
+            ),
+            label="cursor.economy.enabled",
+        ),
+        verify_simple_tier=_as_bool(
+            _resolve(
+                environment,
+                "VOICE_HARNESS_CURSOR_ECONOMY_VERIFY_SIMPLE_TIER",
+                section,
+                "verify_simple_tier",
+                True,
+            ),
+            label="cursor.economy.verify_simple_tier",
+        ),
+        models=models,
+    )
+
+
+def _load_cursor(
+    section: Mapping[str, object],
+    environment: Mapping[str, str],
+) -> CursorSettings:
+    _reject_unknown(section, _CURSOR_SECTION_KEYS, label="[cursor]")
+    models = _load_cursor_models(
+        _table(section, "models", label="cursor.models") if "models" in section else {},
+        environment,
+    )
+    economy = _load_cursor_economy(
+        _table(section, "economy", label="cursor.economy")
+        if "economy" in section
+        else {},
+        environment,
+        models=models,
+    )
+    return CursorSettings(economy=economy)
+
+
 def _load_providers(
     section: Mapping[str, object],
     environment: Mapping[str, str],
@@ -726,6 +887,7 @@ def load_user_config(
         platform=_load_platform(
             _section(raw, "platform"), environment, home=resolved_home
         ),
+        cursor=_load_cursor(_section(raw, "cursor"), environment),
     )
 
 
@@ -768,6 +930,7 @@ def render_user_config(user_config: UserConfig) -> str:
     compute = user_config.compute
     platform = user_config.platform
     integrations = user_config.integrations
+    cursor = user_config.cursor
 
     lines: list[str] = []
     lines += _render_table(
@@ -840,6 +1003,23 @@ def render_user_config(user_config: UserConfig) -> str:
             ),
             "cursor_agent_max_runtime_seconds": platform.cursor_agent_max_runtime_seconds,
             "agent_job_start_concurrency": platform.agent_job_start_concurrency,
+        },
+    )
+    lines += _render_table(
+        "cursor.economy",
+        {
+            "enabled": cursor.economy.enabled,
+            "verify_simple_tier": cursor.economy.verify_simple_tier,
+        },
+    )
+    lines += _render_table(
+        "cursor.models",
+        {
+            "classifier": cursor.economy.models.classifier,
+            "planner": cursor.economy.models.planner,
+            "reviewer": cursor.economy.models.reviewer,
+            "implementer": cursor.economy.models.implementer,
+            "implementer_high_risk": cursor.economy.models.implementer_high_risk,
         },
     )
     return "\n".join(lines).rstrip("\n") + "\n"

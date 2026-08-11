@@ -165,6 +165,7 @@ class HerdrClient:
         *,
         name: str | None = None,
         mode: str | None = None,
+        model: str | None = None,
         checkpoint: Checkpoint | None = None,
     ) -> AgentSelection:
         return HerdrWorkspace.start_agent(
@@ -175,6 +176,7 @@ class HerdrClient:
             workspace,
             name=name,
             mode=mode,
+            model=model,
             checkpoint=checkpoint,
         )
 
@@ -230,6 +232,7 @@ class HerdrClient:
         role: str,
         mode: str | None,
         name: str | None = None,
+        model: str | None = None,
         checkpoint: Checkpoint | None = None,
         reserve: ReserveAgent | None = None,
         settle: SettleAgent | None = None,
@@ -244,6 +247,7 @@ class HerdrClient:
             role=role,
             mode=mode,
             name=name,
+            model=model,
             checkpoint=checkpoint,
             reserve=reserve,
             settle=settle,

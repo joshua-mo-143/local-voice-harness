@@ -40,6 +40,9 @@ class UserConfigDefaultsTests(unittest.TestCase):
         self.assertEqual(config.platform.cursor_agent_inactivity_seconds, 900)
         self.assertEqual(config.platform.cursor_agent_max_runtime_seconds, 3600)
         self.assertEqual(config.platform.agent_job_start_concurrency, 3)
+        self.assertFalse(config.cursor.economy.enabled)
+        self.assertTrue(config.cursor.economy.verify_simple_tier)
+        self.assertEqual(config.cursor.economy.models.implementer, "")
 
     def test_config_path_lives_under_xdg_config_home(self) -> None:
         path = user_config.user_config_path({"XDG_CONFIG_HOME": "/cfg"}, home=self.HOME)
@@ -160,6 +163,33 @@ class UserConfigPrecedenceTests(unittest.TestCase):
         self.assertEqual(config.platform.cursor_agent_inactivity_seconds, 120)
         self.assertEqual(config.platform.cursor_agent_max_runtime_seconds, 600)
         self.assertEqual(config.platform.agent_job_start_concurrency, 5)
+
+    def test_cursor_economy_config_and_environment_override(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config_path = root / "config.toml"
+            config_path.write_text(
+                """
+[cursor.economy]
+enabled = true
+
+[cursor.models]
+implementer = "gpt-5.6-luna-medium"
+"""
+            )
+            config = user_config.load_user_config(
+                {"VOICE_HARNESS_CURSOR_ECONOMY_VERIFY_SIMPLE_TIER": "false"},
+                path=config_path,
+                backends_path=root / "backends.toml",
+                home=self.HOME,
+            )
+
+        self.assertTrue(config.cursor.economy.enabled)
+        self.assertFalse(config.cursor.economy.verify_simple_tier)
+        self.assertEqual(
+            config.cursor.economy.models.implementer,
+            "gpt-5.6-luna-medium",
+        )
 
 
 class UserConfigValidationTests(unittest.TestCase):

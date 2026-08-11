@@ -60,6 +60,28 @@ cursor_agent_max_runtime_seconds = 3600
 agent_job_start_concurrency = 3
 ```
 
+Optional Cursor economy mode routes cheaper models to simple-tier implementers
+and can run local CI checks before marking those jobs complete. It is disabled
+by default so existing workflows stay unchanged.
+
+```toml
+[cursor.economy]
+enabled = false
+verify_simple_tier = true
+
+[cursor.models]
+classifier = ""
+planner = ""
+reviewer = ""
+implementer = "gpt-5.6-luna-medium"
+implementer_high_risk = ""
+```
+
+Set `cursor.economy.enabled = true` to activate model routing and simple-tier
+verification. Empty model strings leave Cursor's default model for that role.
+Override with `VOICE_HARNESS_CURSOR_ECONOMY_ENABLED=true` or
+`voice-harness config set cursor.economy.enabled true`.
+
 GitHub is enabled by default for compatibility. Setting `github = false` prevents
 the GitHub provider from parsing focused URLs or spoken issue references, calling
 `gh` for context, or emitting repository, issue, and pull-request metadata.

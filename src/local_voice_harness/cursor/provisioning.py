@@ -48,6 +48,7 @@ from ..user_config import (
 )
 from . import questions as question_adapter
 from . import recovery, worker_lifecycle
+from .economy import cursor_economy_settings, resolve_cursor_model, verify_checkout
 from .model import (
     ACTIVE_STATUSES as MODEL_ACTIVE_STATUSES,
 )
@@ -1841,6 +1842,26 @@ def _advance_workflow_output(
                     plan_approval_counted=False,
                 ),
             )
+        economy = cursor_economy_settings()
+        if (
+            economy.enabled
+            and economy.verify_simple_tier
+            and job.workflow_tier == WorkflowTier.SIMPLE
+        ):
+            checkout_value = job.worktree_path or job.repository
+            if checkout_value:
+                verification = verify_checkout(Path(checkout_value))
+                if not verification.passed:
+                    _workflow_block(
+                        store,
+                        job.id,
+                        worker_token,
+                        (
+                            "Simple-tier implementation finished, but local "
+                            f"verification failed: {verification.detail}"
+                        ),
+                    )
+                    return None
         _worker_complete(
             store,
             job.id,
@@ -2040,6 +2061,13 @@ def _ensure_workflow_participant(
             raise WorkerCancelled
 
     try:
+        economy = cursor_economy_settings()
+        model = resolve_cursor_model(
+            economy,
+            participant=participant,
+            phase=job.workflow_phase,
+            tier=job.workflow_tier,
+        )
         selection = client.start_fresh_agent(
             checkout,
             job.worktree_label or checkout.name,
@@ -2051,6 +2079,7 @@ def _ensure_workflow_participant(
                 else ("plan" if participant == WorkflowParticipant.PLANNER else None)
             ),
             name=name,
+            model=model,
             checkpoint=checkpoint,
             reserve=reserve,
             settle=settle,
@@ -2501,6 +2530,7 @@ def _run_tiered_workflow(
             issue_reference = job.issue_key or (
                 f"issue {job.github_issue}" if job.github_issue else None
             )
+            economy = cursor_economy_settings()
             if job.plan_approval_state in {"approved", "observed"}:
                 if plan is None:
                     raise HarnessError("plan approval requires a durable plan")
@@ -2523,6 +2553,11 @@ def _run_tiered_workflow(
                     classification_reason=job.workflow_classification_reason,
                     issue_reference=issue_reference,
                     integration_instructions=integration_instructions,
+                    economy_simple=(
+                        economy.enabled
+                        and job.workflow_tier == WorkflowTier.SIMPLE
+                        and plan is None
+                    ),
                 )
         else:
             raise HarnessError(f"unsupported workflow phase {phase.value}")
