@@ -17,6 +17,7 @@ from urllib.parse import SplitResult, urlsplit
 
 from ..config import GITHUB_ROOT, REPOSITORY_ROOT
 from ..context_fragment import ContextFragment
+from ..diagnostic_safety import redact_diagnostic
 
 REPOSITORY = re.compile(
     r"^(?P<owner>[A-Za-z0-9](?:[A-Za-z0-9-]{0,38}))/"
@@ -105,17 +106,7 @@ class GitHubIssueLookupError(GitHubError):
 
 def _redact_diagnostic(value: str) -> str:
     """Remove credentials and authorization values before diagnostics are logged."""
-    redacted = re.sub(
-        r"(?i)(authorization|token|password|secret)(\s*[:=]\s*)\S+",
-        r"\1\2[REDACTED]",
-        value,
-    )
-    redacted = re.sub(
-        r"(?i)\b(?:gh[pousr]|github_pat)_[A-Za-z0-9_]+",
-        "[REDACTED_TOKEN]",
-        redacted,
-    )
-    return re.sub(r"\s+", " ", redacted).strip()[:2_000]
+    return redact_diagnostic(value)
 
 
 def _classify_issue_lookup(detail: str) -> GitHubIssueLookupReason:

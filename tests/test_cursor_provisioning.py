@@ -2561,7 +2561,11 @@ class CursorJobStateTests(unittest.TestCase):
 
         blocked = jobs.read_job("123456789abc")
         self.assertEqual(blocked["status"], "blocked")
-        self.assertIn("inactivity timeout", str(blocked["result"]))
+        self.assertEqual(
+            blocked["result"],
+            "Cursor needs manual attention in Herdr.",
+        )
+        self.assertIn("inactivity timeout", str(blocked["error"]))
         self.assertFalse(blocked.get("target_release_pending", False))
         client.cancel_agent.assert_called_once_with("cursor-agent")
 
@@ -3420,8 +3424,9 @@ class CursorJobStateTests(unittest.TestCase):
                 "delivered": False,
             }
         )
+        diagnostic = "spawn failed: Authorization: Bearer launch-secret"
         with (
-            mock.patch("subprocess.Popen", side_effect=OSError("spawn failed")),
+            mock.patch("subprocess.Popen", side_effect=OSError(diagnostic)),
             self.assertRaisesRegex(OSError, "spawn failed"),
         ):
             service.launch_worker("123456789abc")
@@ -3429,7 +3434,12 @@ class CursorJobStateTests(unittest.TestCase):
         updated = jobs.read_job("123456789abc")
         self.assertEqual(updated["status"], "failed")
         self.assertFalse(updated["delivered"])
-        self.assertEqual(updated["error"], "spawn failed")
+        self.assertNotIn("launch-secret", str(updated["error"]))
+        self.assertIn("[REDACTED]", str(updated["error"]))
+        self.assertEqual(
+            updated["result"],
+            "Cursor job failed to start. Check the job log for details.",
+        )
 
     def test_abandoned_queued_job_is_launched_only_once(self) -> None:
         process = mock.Mock(spec=subprocess.Popen)

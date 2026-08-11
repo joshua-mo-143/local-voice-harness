@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import unittest
 from pathlib import Path
@@ -8,6 +10,7 @@ from unittest import mock
 from local_voice_harness import cli
 from local_voice_harness.cursor.service import CursorTurnRequest, CursorTurnResult
 from local_voice_harness.cursor.store import QuarantineEvidence
+from local_voice_harness.diagnostic_safety import COMMAND_FAILURE
 from local_voice_harness.responses import AssistantResponse
 from local_voice_harness.user_config import PlanApprovalMode, PlanApprovalPreferences
 
@@ -415,6 +418,29 @@ class CredentialsCliTests(unittest.TestCase):
             ):
                 cli.dispatch(cli.parser().parse_args(["credentials", action]))
                 function.assert_called_once_with()
+
+
+class MainFailureTests(unittest.TestCase):
+    def test_failure_uses_semantic_notification_and_redacted_diagnostic_log(
+        self,
+    ) -> None:
+        error = RuntimeError("Authorization: Bearer cli-secret")
+        stderr = io.StringIO()
+        with (
+            mock.patch.object(cli, "parser") as parser,
+            mock.patch.object(cli, "dispatch", side_effect=error),
+            mock.patch.object(cli, "notify") as notify,
+            contextlib.redirect_stderr(stderr),
+            self.assertRaises(SystemExit),
+        ):
+            parser.return_value.parse_args.return_value = mock.sentinel.args
+            cli.main()
+
+        output = stderr.getvalue()
+        self.assertNotIn("cli-secret", output)
+        self.assertIn("[REDACTED]", output)
+        self.assertIn(COMMAND_FAILURE, output)
+        notify.assert_called_once_with(COMMAND_FAILURE, error=True)
 
 
 if __name__ == "__main__":

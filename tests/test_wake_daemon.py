@@ -1157,6 +1157,7 @@ class AnnounceJobTests(unittest.TestCase):
 
     def test_playback_failure_releases_delivery_without_acknowledging(self) -> None:
         daemon = _bare_daemon()
+        errors = io.StringIO()
         with (
             mock.patch.object(wake_daemon, "acknowledge_delivery") as acknowledge,
             mock.patch.object(wake_daemon, "release_delivery") as release,
@@ -1165,9 +1166,10 @@ class AnnounceJobTests(unittest.TestCase):
             mock.patch.object(
                 daemon,
                 "_drain_playback_queue",
-                side_effect=RuntimeError("speaker unavailable"),
+                side_effect=RuntimeError("speaker unavailable token=playback-secret"),
             ),
-            mock.patch.object(wake_daemon, "notify"),
+            mock.patch.object(wake_daemon, "notify") as notify,
+            contextlib.redirect_stderr(errors),
         ):
             daemon._enqueue_job_announcement(
                 _delivery_claim("job2", "completed", result="done")
@@ -1177,6 +1179,9 @@ class AnnounceJobTests(unittest.TestCase):
         acknowledge.assert_not_called()
         release.assert_called_once_with("bbbbbbbbbbbb", "claim")
         self.assertEqual(len(daemon.playback_queue), 0)
+        notify.assert_called_once_with(wake_daemon.PLAYBACK_FAILURE, error=True)
+        self.assertNotIn("playback-secret", errors.getvalue())
+        self.assertIn("[REDACTED]", errors.getvalue())
 
     def test_truncated_queue_stream_releases_without_acknowledging(self) -> None:
         daemon = _bare_daemon()

@@ -132,9 +132,11 @@ def test_fanout_preflights_every_target_before_bounded_background_starts() -> No
         "example/project#2: rejected"
     ) < response.display_text.index("example/project#3: start-failed")
     assert "job-one" in response.display_text
-    assert "job deletion maintenance is active" in response.display_text
+    assert "job deletion maintenance is active" not in response.display_text
+    assert "check the harness logs" in response.display_text
     assert response.spoken_text == (
-        "One job started; one ticket rejected; one job failed to start."
+        "One job started; one GitHub issue could not be accessed; "
+        "one job failed to start."
     )
     assert "job-one" not in response.spoken_text
     assert "job deletion maintenance is active" not in response.spoken_text
@@ -446,6 +448,37 @@ def test_foreground_agent_failure_keeps_diagnostics_out_of_speech(
     defer.assert_called_once_with(job.id, [])
 
 
+def test_foreground_blocked_job_keeps_stored_stderr_out_of_response() -> None:
+    job = CursorJob.from_dict(
+        {
+            "id": "123456789abc",
+            "request": "fix it",
+            "status": "blocked",
+            "created_at": 1,
+            "completed_at": 2,
+            "delivered": False,
+            "result": "stderr Authorization: Bearer blocked-secret",
+            "error": "stderr Authorization: Bearer blocked-secret",
+            "speakable_label": "issue 42",
+        }
+    )
+    with (
+        mock.patch.object(service, "read_job", return_value=job),
+        mock.patch.object(
+            service,
+            "_defer_or_acknowledge",
+            return_value=job,
+        ),
+    ):
+        result = service._await_foreground(job.id, [])
+
+    response = as_assistant_response(result.text)
+    assert response.spoken_text == "Cursor needs attention for issue 42."
+    assert "recovery guidance" in response.display_text
+    assert "blocked-secret" not in response.spoken_text
+    assert "blocked-secret" not in response.display_text
+
+
 def test_background_job_renderings_cover_each_deliverable_status() -> None:
     def job(status: JobStatus, **changes: object) -> CursorJob:
         values: dict[str, object] = {
@@ -486,15 +519,49 @@ def test_background_job_renderings_cover_each_deliverable_status() -> None:
     assert awaiting.spoken_text.endswith("Which repo?")
     assert "needs clarification" in awaiting.display_text
     assert blocked.spoken_text == "Cursor needs attention for issue 42."
-    assert "Open Herdr pane 7." in blocked.display_text
+    assert "Open Herdr pane 7." not in blocked.display_text
+    assert "recovery guidance" in blocked.display_text
     assert cancelled.spoken_text == "Cursor cancelled issue 42."
-    assert "Cancelled by request." in cancelled.display_text
+    assert "Cancelled by request." not in cancelled.display_text
+    assert "was cancelled" in cancelled.display_text
     assert failed.spoken_text == "Cursor failed issue 42 during execution."
     assert "123456789abc.log" in failed.display_text
     assert "secret-value" not in failed.spoken_text
     assert "secret-value" not in failed.display_text
     for response in (completed, awaiting, blocked, cancelled, failed):
         assert "123456789abc" in response.display_text
+
+
+@pytest.mark.parametrize(
+    ("status", "safe_detail"),
+    [
+        (JobStatus.FAILED, None),
+        (JobStatus.BLOCKED, "Manual attention required in Herdr"),
+    ],
+)
+def test_status_message_never_surfaces_stored_diagnostics(
+    status: JobStatus,
+    safe_detail: str | None,
+) -> None:
+    stored = CursorJob.from_dict(
+        {
+            "id": "123456789abc",
+            "request": "fix it",
+            "status": status.value,
+            "created_at": 1,
+            "completed_at": 2,
+            "delivered": False,
+            "error": "Authorization: Bearer status-secret",
+            "result": "stderr token=status-secret",
+            "speakable_label": "issue 42",
+        }
+    )
+    with mock.patch.object(service, "read_job", return_value=stored):
+        message = service._status_message(stored.id)
+
+    assert "status-secret" not in message
+    if safe_detail is not None:
+        assert safe_detail in message
 
 
 def test_production_modules_do_not_import_jobs_facade() -> None:
