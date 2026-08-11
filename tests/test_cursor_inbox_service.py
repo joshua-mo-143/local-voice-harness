@@ -146,10 +146,14 @@ def test_repeat_rearms_delivery_preserving_at_least_once(store: JobStore) -> Non
 def test_reply_without_session_resolves_single_awaiting_job(store: JobStore) -> None:
     _make(store, "aaaaaaaaaaaa", status="awaiting_user", label="api refactor")
 
-    with mock.patch.object(service, "launch_worker") as launch:
+    with (
+        mock.patch.object(service, "launch_worker") as launch,
+        mock.patch.object(service, "_await_foreground") as foreground,
+    ):
         cursor_turn(CursorTurnRequest("use the api repository", action="reply"))
 
     launch.assert_called_once_with("aaaaaaaaaaaa")
+    foreground.assert_called_once_with("aaaaaaaaaaaa", None)
     assert store.get("aaaaaaaaaaaa").status.value == "queued"
 
 
