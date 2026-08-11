@@ -88,6 +88,9 @@ class HerdrClient:
             self.transport.run_json("workspace", "list").get("workspaces") or []
         )
 
+    def focused_checkout(self) -> Path | None:
+        return self.workspace.focused_checkout()
+
     def get_agent(self, target: str) -> dict[str, Any]:
         return dict(self.run_json("agent", "get", target).get("agent") or {})
 

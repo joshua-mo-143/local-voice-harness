@@ -18,6 +18,7 @@ from ..local_git import (
     LocalGitError,
     LocalGitOperationAmbiguous,
     LocalGitRepository,
+    remote_identity,
 )
 from ..process import run_command
 
@@ -552,6 +553,31 @@ class GitHubClient:
                 f"GitHub did not create the expected fork at {target_name}"
             )
         return fork
+
+    def repository_for_checkout(self, checkout: Path) -> str:
+        """Return the validated GitHub origin for an allowed local checkout."""
+
+        resolved = checkout.expanduser().resolve()
+        try:
+            resolved.relative_to(self.allowed_root)
+        except ValueError as exc:
+            raise GitHubError(
+                "Git checkout is outside the configured project root"
+            ) from exc
+        if resolved == self.allowed_root:
+            raise GitHubError(f"{resolved} is not an allowed Git repository")
+        try:
+            self.local_git.verify_checkout(resolved)
+            remote = self.local_git.git(
+                resolved, "remote", "get-url", "origin"
+            ).stdout.strip()
+        except LocalGitError as exc:
+            self._raise_local_git_error(exc)
+        identity = remote_identity(remote)
+        prefix = "github.com/"
+        if identity is None or not identity.startswith(prefix):
+            raise GitHubError("Git origin is not a GitHub repository")
+        return self.validate_repository(identity.removeprefix(prefix))
 
     @staticmethod
     def _expected_remote(repository: GitHubRepository) -> ExpectedRemote:

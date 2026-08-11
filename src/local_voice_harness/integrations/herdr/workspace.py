@@ -46,6 +46,33 @@ class HerdrWorkspace:
     def list_workspaces(self) -> list[dict[str, Any]]:
         return list(self._operations.list_workspaces())
 
+    def focused_checkout(self) -> Path | None:
+        """Return the checkout for exactly one focused Herdr workspace."""
+
+        try:
+            focused = [
+                workspace
+                for workspace in self.list_workspaces()
+                if isinstance(workspace, dict) and workspace.get("focused") is True
+            ]
+        except (HerdrError, TypeError):
+            return None
+        if len(focused) != 1:
+            return None
+        worktree = focused[0].get("worktree")
+        if not isinstance(worktree, dict):
+            return None
+        value = worktree.get("checkout_path")
+        if not isinstance(value, str) or not value.strip():
+            return None
+        path = Path(value).expanduser()
+        if not path.is_absolute():
+            return None
+        try:
+            return path.resolve()
+        except OSError:
+            return None
+
     @staticmethod
     def target(agent: dict[str, Any]) -> str:
         return str(agent.get("name") or agent.get("pane_id") or "")

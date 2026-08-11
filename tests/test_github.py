@@ -589,6 +589,52 @@ class GitHubClientTests(unittest.TestCase):
         )
         self.assertEqual(pr_cwd, checkout)
 
+    def test_repository_for_checkout_reads_and_validates_github_origin(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkout = root / "project"
+            (checkout / ".git").mkdir(parents=True)
+            client = GitHubClient(allowed_root=root)
+            with (
+                mock.patch.object(client.local_git, "verify_checkout") as verify,
+                mock.patch.object(
+                    client.local_git,
+                    "git",
+                    return_value=_completed("git@github.com:Example/Project.git\n"),
+                ) as git,
+            ):
+                self.assertEqual(
+                    client.repository_for_checkout(checkout),
+                    "example/project",
+                )
+
+        verify.assert_called_once_with(checkout.resolve())
+        git.assert_called_once_with(checkout.resolve(), "remote", "get-url", "origin")
+
+    def test_repository_for_checkout_rejects_invalid_checkout_or_remote(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkout = root / "project"
+            checkout.mkdir()
+            client = GitHubClient(allowed_root=root)
+            with self.assertRaisesRegex(GitHubError, "not a Git repository"):
+                client.repository_for_checkout(checkout)
+
+            (checkout / ".git").mkdir()
+            with (
+                mock.patch.object(
+                    client.local_git,
+                    "git",
+                    return_value=_completed("https://example.com/owner/project\n"),
+                ),
+                self.assertRaisesRegex(GitHubError, "not a GitHub repository"),
+            ):
+                client.repository_for_checkout(checkout)
+
+            outside = root.parent / "outside"
+            with self.assertRaisesRegex(GitHubError, "outside"):
+                client.repository_for_checkout(outside)
+
     def test_local_git_ambiguous_failure_is_preserved(self) -> None:
         client = GitHubClient()
         with (

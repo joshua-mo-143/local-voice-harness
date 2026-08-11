@@ -23,6 +23,14 @@ capture, and browser or GitHub errors retain validated repository, issue, or pul
 request identity where available while omitting unavailable details; they do not
 fail the voice request.
 
+When no supported browser context or explicit repository reference is available,
+bare issue lists such as “work on issues 12 and 18” use the repository attached to
+Herdr's focused workspace as a fallback scope. The checkout's `origin` must be a
+validated GitHub remote beneath the configured project root. Missing or ambiguous
+Herdr focus, non-GitHub remotes, and disabled GitHub integration fail closed and
+retain the normal request for an explicit repository scope. Explicit issue
+references and focused browser issue-list pages always take precedence.
+
 ### Optional context providers
 
 Optional integrations are supplied by a small registry of context providers,

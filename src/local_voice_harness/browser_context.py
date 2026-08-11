@@ -5,11 +5,19 @@ from dataclasses import dataclass
 from urllib.parse import urlsplit
 
 from .context_fragment import ContextFragment
-from .context_providers import capture_context, capture_text_context
+from .context_providers import (
+    capture_context,
+    capture_text_context,
+)
 from .desktop import DesktopError, get_desktop
 from .focused_app_context import focused_app_context
 from .integrations import github as _github
-from .integrations.registry import RegistryInput
+from .integrations.registry import (
+    IntegrationRegistry,
+    RegistryInput,
+    integration_enabled,
+)
+from .ticket_targets import extract_ticket_targets
 from .user_config import PlatformSettings
 
 GitHubIssue = _github.GitHubIssue
@@ -124,6 +132,25 @@ def focused_browser_context() -> ContextFragment | None:
     return capture_context(url) if url is not None else None
 
 
+def focused_herdr_github_context(
+    integrations: RegistryInput,
+) -> ContextFragment | None:
+    """Capture GitHub issue-list scope from Herdr's focused workspace."""
+
+    if not isinstance(integrations, IntegrationRegistry) or not integration_enabled(
+        "github", integrations
+    ):
+        return None
+    try:
+        checkout = integrations.herdr_client().focused_checkout()
+        if checkout is None:
+            return None
+        repository = integrations.github_client().repository_for_checkout(checkout)
+    except Exception:
+        return None
+    return capture_context(f"https://github.com/{repository}/issues", integrations)
+
+
 def request_context(
     text: str,
     *,
@@ -137,6 +164,8 @@ def request_context(
             url = focused_firefox_url()
             if url is not None:
                 context = capture_context(url, integrations)
+        if context is None and extract_ticket_targets(text).has_unresolved_scope:
+            context = focused_herdr_github_context(integrations)
     except Exception:
         context = None
 
