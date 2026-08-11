@@ -336,6 +336,42 @@ def test_single_ticket_conflict_does_not_notify_or_wait() -> None:
     foreground.assert_not_called()
 
 
+def test_foreground_timeout_confirms_new_job_by_channel(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(service, "JOBS_DIR", tmp_path / "jobs")
+    monkeypatch.setattr(service, "LEGACY_JOBS_DIR", tmp_path / "legacy")
+    monkeypatch.setattr(service, "CURSOR_FOREGROUND_SECONDS", 0)
+    job = CursorJob.from_dict(
+        {
+            "id": "123456789abc",
+            "request": "work on the focused issue",
+            "status": "running",
+            "created_at": 1,
+            "delivered": False,
+            "foreground_until": 10,
+            "speakable_label": "local-voice-harness issue 149",
+        }
+    )
+    service._job_store().create(job)
+
+    result = service._await_foreground(job.id, [])
+
+    response = as_assistant_response(result.text)
+    assert result.session_id is None
+    assert response.spoken_text == (
+        "Cursor started local-voice-harness issue 149. "
+        "I will report back when it finishes."
+    )
+    assert "still working" not in response.spoken_text
+    assert "already working" not in response.spoken_text
+    assert job.id not in response.spoken_text
+    assert job.id in response.display_text
+    assert "local-voice-harness issue 149" in response.display_text
+    assert service.read_job(job.id).foreground_until == 0
+
+
 def test_single_scoped_ticket_keeps_foreground_behavior() -> None:
     client = mock.Mock()
     client.issue_details.return_value = {

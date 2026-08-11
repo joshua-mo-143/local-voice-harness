@@ -1755,7 +1755,7 @@ def _await_foreground(
             cancelled = claimed if claimed is not None else job
             return CursorTurnResult(render_job_announcement(cancelled), None)
         time.sleep(0.1)
-    _job_store().update(
+    updated = _job_store().update(
         job_id,
         lambda job: job.evolve(foreground_until=0, updated_at=time.time()),
     )
@@ -1769,8 +1769,18 @@ def _await_foreground(
             }
         )
     )
+    job = updated if updated is not None else read_job(job_id)
+    label = inbox.speakable_label_for(job)
     return CursorTurnResult(
-        f"Cursor is still working on job {job_id}. I will report back when it finishes.",
+        AssistantResponse(
+            spoken_text=(
+                f"Cursor started {label}. I will report back when it finishes."
+            ),
+            display_text=(
+                f"Cursor job {job_id} started for {label} and is continuing in "
+                "the background. Its result will be announced when it finishes."
+            ),
+        ),
         None,
     )
 
