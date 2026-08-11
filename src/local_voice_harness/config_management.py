@@ -515,8 +515,6 @@ def restart_services_for_keys(
         if field is None:
             continue
         for service in field.services:
-            if service == _LLM_SERVICE and config.providers.llm_provider != "local":
-                continue
             services.append(service)
     return tuple(dict.fromkeys(services))
 
@@ -543,7 +541,8 @@ def format_restart_notice(services: Sequence[str]) -> str:
     names = ", ".join(services)
     return (
         f"Restart to apply: {names}. "
-        "Run `voice-harness services restart` when convenient."
+        "Run `voice-harness services restart` when convenient; always-on services "
+        "restart now and active on-demand services restart on their next use."
     )
 
 

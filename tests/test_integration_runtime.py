@@ -20,6 +20,7 @@ class IntegrationRuntimeTests(unittest.TestCase):
                 config.platform,
                 github_root=Path("/startup/github"),
                 herdr_bin=Path("/startup/herdr"),
+                git_bin=Path("/startup/git"),
             ),
         )
         restarted = replace(
@@ -28,6 +29,7 @@ class IntegrationRuntimeTests(unittest.TestCase):
                 config.platform,
                 github_root=Path("/restart/github"),
                 herdr_bin=Path("/restart/herdr"),
+                git_bin=Path("/restart/git"),
             ),
         )
 
@@ -37,9 +39,17 @@ class IntegrationRuntimeTests(unittest.TestCase):
         self.assertEqual(
             running_registry.github_client().clone_root, Path("/startup/github")
         )
+        self.assertEqual(
+            running_registry.github_client().local_git.git_executable,
+            "/startup/git",
+        )
         self.assertEqual(running_registry.herdr_client().executable, "/startup/herdr")
         self.assertEqual(
             restarted_registry.github_client().clone_root, Path("/restart/github")
+        )
+        self.assertEqual(
+            restarted_registry.github_client().local_git.git_executable,
+            "/restart/git",
         )
         self.assertEqual(restarted_registry.herdr_client().executable, "/restart/herdr")
 

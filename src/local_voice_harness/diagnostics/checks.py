@@ -7,11 +7,11 @@ import subprocess
 import time
 from collections import Counter
 from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 
 from ..components import llm_ready
 from ..config import (
-    DEFAULT_SOURCE,
     JOBS_DIR,
     PROJECT_ROOT,
     RUNTIME,
@@ -21,18 +21,59 @@ from ..config import (
     STT_SOCKET,
     SYSTEMD_USER_DIR,
     TTS_SOCKET,
-    BackendConfigurationError,
-    load_backend_settings,
 )
 from ..credentials import CredentialError, get_venice_api_key
+from ..diagnostic_safety import redact_diagnostic
 from ..errors import HarnessError
-from ..integrations.herdr import HerdrClient, HerdrError
-from ..integrations.registry import capability_statuses
+from ..integrations.herdr import HerdrError
+from ..integrations.registry import (
+    IntegrationRegistry,
+    build_integration_registry,
+    capability_statuses,
+)
 from ..ipc import socket_ready
 from ..process import capability_diagnostics
+from ..user_config import UserConfig, UserConfigurationError, load_user_config
 from .model import CheckResult, Repair, Severity
 
-Check = Callable[[], list[CheckResult]]
+
+@dataclass(frozen=True)
+class DiagnosticSnapshot:
+    """One immutable configuration and configured-client view for a doctor run."""
+
+    config: UserConfig | None
+    registry: IntegrationRegistry | None
+    error: UserConfigurationError | None = None
+
+    @classmethod
+    def load(cls) -> DiagnosticSnapshot:
+        try:
+            config = load_user_config()
+        except UserConfigurationError as exc:
+            return cls(config=None, registry=None, error=exc)
+        return cls(
+            config=config,
+            registry=build_integration_registry(config),
+        )
+
+
+Check = Callable[..., list[CheckResult]]
+
+
+def _resolved(snapshot: DiagnosticSnapshot | None) -> DiagnosticSnapshot:
+    return snapshot if snapshot is not None else DiagnosticSnapshot.load()
+
+
+def _configured_executable(
+    name: str,
+    config: UserConfig | None,
+) -> str | None:
+    if name == "herdr":
+        return str(config.platform.herdr_bin) if config is not None else None
+    if name == "gh":
+        return str(config.platform.gh_bin) if config is not None else None
+    return name
+
 
 # A worker-owned job that has not advanced for this long is treated as stuck.
 STUCK_JOB_SECONDS = 60 * 60
@@ -145,20 +186,24 @@ def _remove_stale_socket_repair(path: Path) -> Repair:
     return Repair(summary=f"remove stale socket {path}", action=action)
 
 
-def check_required_executables() -> list[CheckResult]:
-    try:
-        settings = load_backend_settings()
-    except BackendConfigurationError:
-        settings = None
+def check_required_executables(
+    snapshot: DiagnosticSnapshot | None = None,
+) -> list[CheckResult]:
+    settings = _resolved(snapshot).config
     results: list[CheckResult] = []
     for name, purpose in REQUIRED_EXECUTABLES:
+        if name in {"llama-server", "ffmpeg"} and settings is None:
+            continue
+        executable = _configured_executable(name, settings)
+        if executable is None:
+            continue
         if name == "llama-server" and settings is not None:
-            if settings.llm_provider == "venice":
+            if settings.providers.llm_provider == "venice":
                 continue
         if name == "ffmpeg" and settings is not None:
-            if settings.tts_provider != "venice":
+            if settings.providers.tts_provider != "venice":
                 continue
-        location = _which(name)
+        location = _which(executable)
         if location is not None:
             results.append(
                 CheckResult(
@@ -181,24 +226,38 @@ def check_required_executables() -> list[CheckResult]:
     return results
 
 
-def check_backend_configuration() -> list[CheckResult]:
-    try:
-        settings = load_backend_settings()
-        if "venice" in {settings.llm_provider, settings.tts_provider}:
-            get_venice_api_key()
-    except (BackendConfigurationError, CredentialError) as exc:
+def check_backend_configuration(
+    snapshot: DiagnosticSnapshot | None = None,
+) -> list[CheckResult]:
+    resolved = _resolved(snapshot)
+    if resolved.error is not None:
         return [
             CheckResult(
-                name="configuration:backends",
+                name="configuration:user",
                 category="configuration",
                 severity=Severity.FATAL,
-                detail=str(exc),
+                detail=redact_diagnostic(resolved.error),
+                suggestion="fix ~/.config/voice-harness/config.toml or its legacy inputs",
+            )
+        ]
+    assert resolved.config is not None
+    settings = resolved.config.providers
+    try:
+        if "venice" in {settings.llm_provider, settings.tts_provider}:
+            get_venice_api_key()
+    except CredentialError as exc:
+        return [
+            CheckResult(
+                name="configuration:user",
+                category="configuration",
+                severity=Severity.FATAL,
+                detail=redact_diagnostic(exc),
                 suggestion="see README backend configuration",
             )
         ]
     return [
         CheckResult(
-            name="configuration:backends",
+            name="configuration:user",
             category="configuration",
             severity=Severity.OK,
             detail=(
@@ -209,10 +268,16 @@ def check_backend_configuration() -> list[CheckResult]:
     ]
 
 
-def check_optional_executables() -> list[CheckResult]:
+def check_optional_executables(
+    snapshot: DiagnosticSnapshot | None = None,
+) -> list[CheckResult]:
+    config = _resolved(snapshot).config
     results: list[CheckResult] = []
     for name, purpose in OPTIONAL_EXECUTABLES:
-        location = _which(name)
+        executable = _configured_executable(name, config)
+        if executable is None:
+            continue
+        location = _which(executable)
         if location is not None:
             results.append(
                 CheckResult(
@@ -235,7 +300,9 @@ def check_optional_executables() -> list[CheckResult]:
     return results
 
 
-def check_focus_automation() -> list[CheckResult]:
+def check_focus_automation(
+    _snapshot: DiagnosticSnapshot | None = None,
+) -> list[CheckResult]:
     """One complete X11 or Wayland stack enables focused-window dictation."""
 
     x11 = {tool: _which(tool) is not None for tool in ("xdotool", "xclip")}
@@ -304,7 +371,9 @@ def _python_environments() -> tuple[tuple[str, Path, Path, str], ...]:
     )
 
 
-def check_python_environments() -> list[CheckResult]:
+def check_python_environments(
+    _snapshot: DiagnosticSnapshot | None = None,
+) -> list[CheckResult]:
     results: list[CheckResult] = []
     for label, venv_dir, executable, suggestion in _python_environments():
         if executable.exists():
@@ -342,19 +411,19 @@ def check_python_environments() -> list[CheckResult]:
     return results
 
 
-def check_model_file() -> list[CheckResult]:
-    try:
-        if load_backend_settings().llm_provider == "venice":
-            return [
-                CheckResult(
-                    name="model:qwen",
-                    category="models",
-                    severity=Severity.OK,
-                    detail="local Qwen model is not required by the Venice LLM backend",
-                )
-            ]
-    except BackendConfigurationError:
-        pass
+def check_model_file(snapshot: DiagnosticSnapshot | None = None) -> list[CheckResult]:
+    resolved = _resolved(snapshot)
+    if resolved.config is None:
+        return []
+    if resolved.config.providers.llm_provider == "venice":
+        return [
+            CheckResult(
+                name="model:qwen",
+                category="models",
+                severity=Severity.OK,
+                detail="local Qwen model is not required by the Venice LLM backend",
+            )
+        ]
     if MODEL_FILE.is_file():
         try:
             size_gb = MODEL_FILE.stat().st_size / 1024**3
@@ -382,7 +451,9 @@ def check_model_file() -> list[CheckResult]:
     ]
 
 
-def check_model_caches() -> list[CheckResult]:
+def check_model_caches(
+    snapshot: DiagnosticSnapshot | None = None,
+) -> list[CheckResult]:
     if HUGGINGFACE_CACHE.is_dir():
         return [
             CheckResult(
@@ -392,10 +463,10 @@ def check_model_caches() -> list[CheckResult]:
                 detail=f"Hugging Face cache present at {HUGGINGFACE_CACHE}",
             )
         ]
-    try:
-        local_tts = load_backend_settings().tts_provider == "local"
-    except BackendConfigurationError:
-        local_tts = True
+    resolved = _resolved(snapshot)
+    if resolved.config is None:
+        return []
+    local_tts = resolved.config.providers.tts_provider == "local"
     cache_users = (
         "Chatterbox runs offline and Parakeet downloads on first use"
         if local_tts
@@ -412,15 +483,15 @@ def check_model_caches() -> list[CheckResult]:
     ]
 
 
-def check_cuda() -> list[CheckResult]:
-    try:
-        settings = load_backend_settings()
-    except BackendConfigurationError:
-        settings = None
+def check_cuda(snapshot: DiagnosticSnapshot | None = None) -> list[CheckResult]:
+    resolved = _resolved(snapshot)
+    if resolved.config is None:
+        return []
+    settings = resolved.config
     selected_models = ["STT"]
-    if settings is None or settings.llm_provider == "local":
+    if settings.providers.llm_provider == "local":
         selected_models.append("LLM")
-    if settings is None or settings.tts_provider == "local":
+    if settings.providers.tts_provider == "local":
         selected_models.append("TTS")
     model_label = "/".join(selected_models)
     if _which("nvidia-smi") is None:
@@ -457,14 +528,19 @@ def check_cuda() -> list[CheckResult]:
             severity=Severity.OK,
             detail=(
                 f"nvidia-smi reports a working GPU for {model_label}; "
-                "the local LLM service uses CUDA0 when selected"
+                f"the configured CUDA device is {settings.compute.cuda_device}"
             ),
         )
     ]
 
 
-def check_pipewire_devices() -> list[CheckResult]:
-    configured_source = os.environ.get("VOICE_HARNESS_SOURCE", DEFAULT_SOURCE)
+def check_pipewire_devices(
+    snapshot: DiagnosticSnapshot | None = None,
+) -> list[CheckResult]:
+    resolved = _resolved(snapshot)
+    configured_source = (
+        resolved.config.audio.source if resolved.config is not None else "unavailable"
+    )
     if _which("wpctl") is None:
         return [
             CheckResult(
@@ -505,7 +581,9 @@ def check_pipewire_devices() -> list[CheckResult]:
     ]
 
 
-def check_systemd_units() -> list[CheckResult]:
+def check_systemd_units(
+    _snapshot: DiagnosticSnapshot | None = None,
+) -> list[CheckResult]:
     results: list[CheckResult] = []
     for name in SERVICE_FILES:
         always_on = name in START_SERVICES
@@ -535,7 +613,7 @@ def check_systemd_units() -> list[CheckResult]:
         except ValueError:
             restarts = 0
 
-        if restarts >= RESTART_LOOP_THRESHOLD:
+        if restarts >= RESTART_LOOP_THRESHOLD and active in {"activating", "failed"}:
             results.append(
                 CheckResult(
                     name=f"unit:{name}",
@@ -650,11 +728,11 @@ def _socket_result(
     )
 
 
-def check_runtime_sockets() -> list[CheckResult]:
-    try:
-        settings = load_backend_settings()
-    except BackendConfigurationError:
-        settings = None
+def check_runtime_sockets(
+    snapshot: DiagnosticSnapshot | None = None,
+) -> list[CheckResult]:
+    resolved = _resolved(snapshot)
+    settings = resolved.config.providers if resolved.config is not None else None
     results = [
         _socket_result(
             name="socket:stt",
@@ -673,7 +751,7 @@ def check_runtime_sockets() -> list[CheckResult]:
     ]
 
     llm_unit = "voice-harness-llm.service"
-    if settings is not None and llm_ready():
+    if settings is not None and llm_ready(settings):
         results.append(
             CheckResult(
                 name="socket:llm",
@@ -733,7 +811,7 @@ def _directory_result(name: str, path: Path, *, required: bool) -> CheckResult:
             name=name,
             category="runtime",
             severity=Severity.WARNING,
-            detail=f"could not stat {path}: {exc}",
+            detail=redact_diagnostic(f"could not stat {path}: {exc}"),
         )
     if info.st_uid != os.getuid():
         return CheckResult(
@@ -760,7 +838,9 @@ def _directory_result(name: str, path: Path, *, required: bool) -> CheckResult:
     )
 
 
-def check_runtime_directories() -> list[CheckResult]:
+def check_runtime_directories(
+    _snapshot: DiagnosticSnapshot | None = None,
+) -> list[CheckResult]:
     results: list[CheckResult] = []
     if not RUNTIME.exists() or not os.access(RUNTIME, os.W_OK):
         results.append(
@@ -788,7 +868,9 @@ def check_runtime_directories() -> list[CheckResult]:
     return results
 
 
-def check_process_capabilities() -> list[CheckResult]:
+def check_process_capabilities(
+    _snapshot: DiagnosticSnapshot | None = None,
+) -> list[CheckResult]:
     issues = capability_diagnostics()
     if not issues:
         return [
@@ -809,7 +891,9 @@ def check_process_capabilities() -> list[CheckResult]:
     ]
 
 
-def check_cursor_jobs() -> list[CheckResult]:
+def check_cursor_jobs(
+    _snapshot: DiagnosticSnapshot | None = None,
+) -> list[CheckResult]:
     """Read job JSON read-only; never quarantine or mutate durable state."""
 
     results: list[CheckResult] = []
@@ -921,19 +1005,22 @@ def check_cursor_jobs() -> list[CheckResult]:
     return results
 
 
-def check_herdr() -> list[CheckResult]:
-    herdr_bin = "herdr"
+def check_herdr(snapshot: DiagnosticSnapshot | None = None) -> list[CheckResult]:
+    resolved = _resolved(snapshot)
+    if resolved.config is None or resolved.registry is None:
+        return []
+    herdr_bin = str(resolved.config.platform.herdr_bin)
     if _which(herdr_bin) is None and not Path(herdr_bin).exists():
         return []
     try:
-        running = HerdrClient().is_running()
+        running = resolved.registry.herdr_client().is_running()
     except HerdrError as exc:
         return [
             CheckResult(
                 name="integration:herdr",
                 category="integrations",
                 severity=Severity.WARNING,
-                detail=f"could not query the Herdr server: {exc}",
+                detail=redact_diagnostic(f"could not query the Herdr server: {exc}"),
                 suggestion="herdr status server",
             )
         ]
@@ -957,7 +1044,9 @@ def check_herdr() -> list[CheckResult]:
     ]
 
 
-def check_cursor_cli() -> list[CheckResult]:
+def check_cursor_cli(
+    _snapshot: DiagnosticSnapshot | None = None,
+) -> list[CheckResult]:
     if _which("agent") is None:
         return []
     process = _run(["agent", "--version"], timeout=10)
@@ -983,10 +1072,17 @@ def check_cursor_cli() -> list[CheckResult]:
     ]
 
 
-def check_github_auth() -> list[CheckResult]:
-    if _which("gh") is None:
+def check_github_auth(snapshot: DiagnosticSnapshot | None = None) -> list[CheckResult]:
+    resolved = _resolved(snapshot)
+    if resolved.config is None:
         return []
-    process = _run(["gh", "auth", "status"], timeout=10)
+    gh_bin = str(resolved.config.platform.gh_bin)
+    if _which(gh_bin) is None and not Path(gh_bin).exists():
+        return []
+    process = _run(
+        [gh_bin, "auth", "status"],
+        timeout=resolved.config.platform.github_timeout_seconds,
+    )
     if process is None or process.returncode:
         return [
             CheckResult(
@@ -1010,9 +1106,14 @@ def check_github_auth() -> list[CheckResult]:
     ]
 
 
-def check_optional_integrations() -> list[CheckResult]:
+def check_optional_integrations(
+    snapshot: DiagnosticSnapshot | None = None,
+) -> list[CheckResult]:
+    resolved = _resolved(snapshot)
+    if resolved.registry is None:
+        return []
     results: list[CheckResult] = []
-    for name, status in capability_statuses():
+    for name, status in capability_statuses(resolved.registry):
         results.append(
             CheckResult(
                 name=f"integration:{name}",
@@ -1025,12 +1126,14 @@ def check_optional_integrations() -> list[CheckResult]:
     return results
 
 
-def check_mcp_linear() -> list[CheckResult]:
+def check_mcp_linear(
+    snapshot: DiagnosticSnapshot | None = None,
+) -> list[CheckResult]:
     """Backward-compatible entry point; disabled Linear yields no diagnostic."""
 
     return [
         result
-        for result in check_optional_integrations()
+        for result in check_optional_integrations(snapshot)
         if result.name == "integration:linear"
     ]
 

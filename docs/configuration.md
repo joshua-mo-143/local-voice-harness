@@ -1,8 +1,9 @@
 # Configuration
 
-Only the variables marked “environment override” may be added to
-`voice-harness-wake.service` with `systemctl --user edit`. The installed-unit audit
-rejects other extra variables and every `EnvironmentFile` on every shipped service.
+`config.toml` owns user choices for shipped services. The units set only operational
+runtime values such as private sockets and cache paths; they do not set provider,
+model, device, audio, integration, or platform choices. The installed-unit audit
+rejects user-choice `Environment=` drop-ins and every `EnvironmentFile`.
 `backends.toml` and `~/.config/dictation/backend.env` remain supported only as
 legacy inputs to the unified resolver.
 
@@ -118,6 +119,12 @@ worker startup; durable provider identity across later restarts is handled
 separately. Restart every
 affected foreground process, service, or detached worker to apply the change;
 the configuration commands report affected active services.
+
+`voice-harness doctor` likewise resolves one snapshot before running any check and
+injects its configured GitHub and Herdr clients. An invalid configuration is reported
+once as the direct fatal cause; checks that do not depend on configuration may still
+run. Each service-management command also resolves one snapshot, including
+`services restart`, which reuses it across the stop/start sequence.
 
 There is no general configuration hot reload. The vocabulary store is the
 documented exception: the dictation service reads it for each transcription, so
@@ -243,36 +250,36 @@ voice-harness plan-approval ask
 
 | Variable | Purpose | Default | Configuration channel |
 | --- | --- | --- | --- |
-| `VOICE_HARNESS_SOURCE` | PipeWire microphone source | Development-machine source | Wake drop-in |
-| `VOICE_HARNESS_VOICE` | Absolute Chatterbox reference WAV path | Built-in voice | Wake drop-in |
-| `VOICE_HARNESS_WAKE_THRESHOLD` | OpenWakeWord activation threshold (`0`–`1`) | `0.55` | Wake drop-in |
-| `VOICE_HARNESS_MIN_SPEECH_RMS` | Non-negative speech energy gate | `1100` | Wake drop-in |
-| `VOICE_HARNESS_BARGE_IN_MODE` | Playback interruption (`wake`, `vad`, or `off`) | `wake` | Wake drop-in |
-| `VOICE_HARNESS_BARGE_IN_SPEECH_FRAMES` | Positive count of consecutive 80 ms speech frames | `5` | Wake drop-in |
-| `VOICE_HARNESS_PLAYBACK_QUIET_FRAMES` | Positive count of quiet 80 ms frames after playback | `4` | Wake drop-in |
-| `VOICE_HARNESS_PLAYBACK_QUIET_TIMEOUT_SECONDS` | Non-negative post-playback echo-drain timeout | `2` | Wake drop-in |
-| `VOICE_HARNESS_PLAYBACK_LATENCY` | Non-negative `pw-play` duration ending in `us`, `ms`, or `s` | `100ms` | Wake drop-in |
-| `VOICE_HARNESS_CURSOR_FOREGROUND_SECONDS` | Non-negative time before a Cursor job backgrounds | `5` | Wake drop-in |
-| `VOICE_HARNESS_CURSOR_AGENT_INACTIVITY_SECONDS` | Positive time without observable Cursor progress before cancellation | `900` | Wake drop-in |
-| `VOICE_HARNESS_CURSOR_AGENT_MAX_RUNTIME_SECONDS` | Positive absolute runtime limit for one Cursor turn | `3600` | Wake drop-in |
-| `VOICE_HARNESS_AGENT_JOB_START_CONCURRENCY` | Positive maximum number of concurrent durable job starts in a multi-ticket request | `3` | Wake drop-in |
-| `VOICE_HARNESS_CURSOR_FOLLOWUP` | Enable completed-job follow-up context (kill switch) | `1` | Wake drop-in |
-| `VOICE_HARNESS_CURSOR_FOLLOWUP_WINDOW_SECONDS` | Finite, non-negative absolute lifetime of the retained completed-job reference | `60` | Wake drop-in |
-| `VOICE_HARNESS_HERDR_BIN` | Absolute Herdr executable path | `~/.local/bin/herdr` | Wake drop-in |
-| `VOICE_HARNESS_HERDR_WORKTREE_ROOT` | Root for Herdr-created worktrees | `~/.herdr/worktrees` | Wake drop-in |
-| `VOICE_HARNESS_GH_BIN` | GitHub CLI executable | `gh` | Wake drop-in |
-| `VOICE_HARNESS_GIT_BIN` | Git executable used for GitHub checkouts | `git` | Wake drop-in |
-| `VOICE_HARNESS_GITHUB_TIMEOUT_SECONDS` | Positive default for GitHub commands without an operation-specific timeout | `30` | Wake drop-in |
-| `VOICE_HARNESS_HERDR_TIMEOUT_SECONDS` | Positive Herdr command and startup timeout | `30` | Wake drop-in |
-| `VOICE_HARNESS_PROJECT_ROOT` | Absolute allowed root for inferred repositories | Home directory | Wake drop-in |
-| `VOICE_HARNESS_GITHUB_ROOT` | Absolute fork-clone root inside the project root | `~/src` | Wake drop-in |
-| `VOICE_HARNESS_FOCUSED_APP_CONTEXT` | Enable focused editor/terminal context capture | `1` | Wake drop-in |
-| `VOICE_HARNESS_FOCUSED_APP_DENY` | Comma-separated denied focused window classes | Password managers, RuneLite | Wake drop-in |
-| `VOICE_HARNESS_FOCUSED_APP_MAX_CHARS` | Positive combined focused-app context character cap | `12000` | Wake drop-in |
+| `VOICE_HARNESS_SOURCE` | PipeWire microphone source | Development-machine source | Process environment override |
+| `VOICE_HARNESS_VOICE` | Absolute Chatterbox reference WAV path | Built-in voice | Process environment override |
+| `VOICE_HARNESS_WAKE_THRESHOLD` | OpenWakeWord activation threshold (`0`–`1`) | `0.55` | Process environment override |
+| `VOICE_HARNESS_MIN_SPEECH_RMS` | Non-negative speech energy gate | `1100` | Process environment override |
+| `VOICE_HARNESS_BARGE_IN_MODE` | Playback interruption (`wake`, `vad`, or `off`) | `wake` | Process environment override |
+| `VOICE_HARNESS_BARGE_IN_SPEECH_FRAMES` | Positive count of consecutive 80 ms speech frames | `5` | Process environment override |
+| `VOICE_HARNESS_PLAYBACK_QUIET_FRAMES` | Positive count of quiet 80 ms frames after playback | `4` | Process environment override |
+| `VOICE_HARNESS_PLAYBACK_QUIET_TIMEOUT_SECONDS` | Non-negative post-playback echo-drain timeout | `2` | Process environment override |
+| `VOICE_HARNESS_PLAYBACK_LATENCY` | Non-negative `pw-play` duration ending in `us`, `ms`, or `s` | `100ms` | Process environment override |
+| `VOICE_HARNESS_CURSOR_FOREGROUND_SECONDS` | Non-negative time before a Cursor job backgrounds | `5` | Process environment override |
+| `VOICE_HARNESS_CURSOR_AGENT_INACTIVITY_SECONDS` | Positive time without observable Cursor progress before cancellation | `900` | Process environment override |
+| `VOICE_HARNESS_CURSOR_AGENT_MAX_RUNTIME_SECONDS` | Positive absolute runtime limit for one Cursor turn | `3600` | Process environment override |
+| `VOICE_HARNESS_AGENT_JOB_START_CONCURRENCY` | Positive maximum number of concurrent durable job starts in a multi-ticket request | `3` | Process environment override |
+| `VOICE_HARNESS_CURSOR_FOLLOWUP` | Enable completed-job follow-up context (kill switch) | `1` | Process environment override |
+| `VOICE_HARNESS_CURSOR_FOLLOWUP_WINDOW_SECONDS` | Finite, non-negative absolute lifetime of the retained completed-job reference | `60` | Process environment override |
+| `VOICE_HARNESS_HERDR_BIN` | Absolute Herdr executable path | `~/.local/bin/herdr` | Process environment override |
+| `VOICE_HARNESS_HERDR_WORKTREE_ROOT` | Root for Herdr-created worktrees | `~/.herdr/worktrees` | Process environment override |
+| `VOICE_HARNESS_GH_BIN` | GitHub CLI executable | `gh` | Process environment override |
+| `VOICE_HARNESS_GIT_BIN` | Git executable used for GitHub checkouts | `git` | Process environment override |
+| `VOICE_HARNESS_GITHUB_TIMEOUT_SECONDS` | Positive default for GitHub commands without an operation-specific timeout | `30` | Process environment override |
+| `VOICE_HARNESS_HERDR_TIMEOUT_SECONDS` | Positive Herdr command and startup timeout | `30` | Process environment override |
+| `VOICE_HARNESS_PROJECT_ROOT` | Absolute allowed root for inferred repositories | Home directory | Process environment override |
+| `VOICE_HARNESS_GITHUB_ROOT` | Absolute fork-clone root inside the project root | `~/src` | Process environment override |
+| `VOICE_HARNESS_FOCUSED_APP_CONTEXT` | Enable focused editor/terminal context capture | `1` | Process environment override |
+| `VOICE_HARNESS_FOCUSED_APP_DENY` | Comma-separated denied focused window classes | Password managers, RuneLite | Process environment override |
+| `VOICE_HARNESS_FOCUSED_APP_MAX_CHARS` | Positive combined focused-app context character cap | `12000` | Process environment override |
 | `DICTATION_SOURCE` | Dictation PipeWire source, independently overriding `audio.source` | `audio.source` | Environment override |
-| `DICTATION_INJECT` | Focused-window insertion mode (`auto`, `paste`, `type`, or `stdout`) | `auto` | Wake drop-in |
+| `DICTATION_INJECT` | Focused-window insertion mode (`auto`, `paste`, `type`, or `stdout`) | `auto` | Process environment override |
 | `DICTATION_PROMPT` | Initial Whisper transcription prompt | Technical dictation prompt | Environment override |
-| `DICTATION_REPLACEMENTS` | Semicolon-separated STT corrections | Cursor/Herdr defaults | Wake drop-in |
+| `DICTATION_REPLACEMENTS` | Semicolon-separated STT corrections | Cursor/Herdr defaults | Process environment override |
 | `DICTATION_VAD_END_SILENCE_MS` | Positive silence duration that finishes VAD dictation | `900` | Environment override |
 | `DICTATION_VAD_START_SPEECH_FRAMES` | Consecutive 80 ms speech frames required to start an utterance | `3` | Environment override |
 | `DICTATION_VAD_MAX_SECONDS` | Positive maximum duration of each VAD utterance | `120` | Environment override |

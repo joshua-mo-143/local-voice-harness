@@ -6,9 +6,6 @@ StartLimitBurst=5
 
 [Service]
 Type=simple
-Environment=DICTATION_BACKEND=parakeet
-Environment=DICTATION_MODEL=nemo-parakeet-tdt-0.6b-v2
-Environment=DICTATION_QUANTIZATION=int8
 Environment=DICTATION_SOCKET=%t/dictation.sock
 Environment=CUDA_CACHE_PATH=%t/dictation/cuda-cache
 Environment=HF_HOME=%h/.cache/huggingface
