@@ -291,6 +291,87 @@ class ListenCliTests(unittest.TestCase):
         request_listen.assert_called_once_with()
 
 
+class ConfigCliTests(unittest.TestCase):
+    def test_config_show_prints_rendered_configuration(self) -> None:
+        args = cli.parser().parse_args(["config", "show"])
+        with (
+            mock.patch.object(
+                cli,
+                "show_config",
+                return_value="[audio]\nwake_threshold = 0.55\n",
+            ) as show_config,
+            mock.patch("builtins.print") as output,
+        ):
+            cli.dispatch(args)
+
+        show_config.assert_called_once_with(key=None, json_output=False)
+        self.assertIn("wake_threshold", output.call_args.args[0])
+
+    def test_config_set_commits_and_reports_restart(self) -> None:
+        args = cli.parser().parse_args(["config", "set", "audio.wake_threshold", "0.6"])
+        result = mock.Mock(restart_services=("voice-harness-wake.service",))
+        with (
+            mock.patch.object(
+                cli, "commit_config_change", return_value=result
+            ) as commit,
+            mock.patch.object(
+                cli,
+                "format_restart_notice",
+                return_value="Restart to apply: voice-harness-wake.service.",
+            ) as notice,
+            mock.patch("builtins.print") as output,
+        ):
+            cli.dispatch(args)
+
+        commit.assert_called_once_with({"audio.wake_threshold": "0.6"})
+        notice.assert_called_once_with(result.restart_services)
+        self.assertIn("Restart to apply", output.call_args.args[0])
+
+    def test_integrations_enable_and_doctor(self) -> None:
+        enable_args = cli.parser().parse_args(["integrations", "enable", "linear"])
+        result = mock.Mock(restart_services=())
+        with (
+            mock.patch.object(
+                cli, "set_integration_enabled", return_value=result
+            ) as enable,
+            mock.patch.object(
+                cli,
+                "format_restart_notice",
+                return_value="No running services require a restart for this change.",
+            ),
+            mock.patch("builtins.print"),
+        ):
+            cli.dispatch(enable_args)
+
+        enable.assert_called_once_with("linear", enabled=True)
+
+        doctor_args = cli.parser().parse_args(["integrations", "doctor", "--json"])
+        with (
+            mock.patch.object(
+                cli,
+                "run_integration_doctor",
+                return_value=(1, '{"name":"linear"}'),
+            ) as doctor,
+            mock.patch("builtins.print") as output,
+        ):
+            with self.assertRaises(SystemExit) as raised:
+                cli.dispatch(doctor_args)
+
+        doctor.assert_called_once_with(json_output=True)
+        self.assertEqual(raised.exception.code, 1)
+        self.assertIn("linear", output.call_args.args[0])
+
+    def test_setup_defaults_runs_non_interactively(self) -> None:
+        args = cli.parser().parse_args(["setup", "--defaults"])
+        with (
+            mock.patch.object(cli, "run_setup") as run_setup,
+            mock.patch("builtins.print"),
+        ):
+            cli.dispatch(args)
+
+        run_setup.assert_called_once_with(defaults_only=True)
+
+
 class CredentialsCliTests(unittest.TestCase):
     def test_set_prompts_without_accepting_key_as_argument(self) -> None:
         args = cli.parser().parse_args(["credentials", "set"])
