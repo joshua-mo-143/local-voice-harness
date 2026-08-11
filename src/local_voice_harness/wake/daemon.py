@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import collections
 import contextlib
+import fcntl
+import json
 import os
 import re
 import signal
@@ -36,6 +38,7 @@ from ..config import (
     RECORDER_LOG,
     RECORDING_LOCK,
     STATE_DIR,
+    WAKE_LOCK,
     WAKE_PID_PATH,
     WAV_PATH,
     load_backend_settings,
@@ -75,6 +78,7 @@ from ..intent import (
 )
 from ..llm import qwen_turn
 from ..notifications import notify
+from ..process import ProcessHandle, process_identity
 from ..questions import AnswerProvenance, question_control, question_prompt
 from ..stt.client import transcribe
 from ..ticket_targets import MISSING_ISSUE_SCOPE_RESPONSE, extract_ticket_targets
@@ -1283,21 +1287,68 @@ class WakeConversationDaemon:
                 self.microphone.wait(timeout=2)
 
 
+def _read_wake_state() -> tuple[int, str] | None:
+    try:
+        raw = WAKE_PID_PATH.read_text().strip()
+    except OSError:
+        return None
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(value, dict):
+        return None
+    pid = value.get("pid")
+    start = value.get("process_start")
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+        return None
+    if not isinstance(start, str) or not start:
+        return None
+    return pid, start
+
+
 def request_listen() -> None:
     """Ask a running wake daemon to start a conversation without the wake word."""
+    state = _read_wake_state()
+    if state is None:
+        raise HarnessError("wake daemon is not running")
+    pid, start = state
+    handle = ProcessHandle.open(pid, expected_start=start)
+    if handle is None:
+        raise HarnessError("wake daemon is not running")
     try:
-        pid = int(WAKE_PID_PATH.read_text().strip())
-    except (OSError, ValueError) as exc:
-        raise HarnessError("wake daemon is not running") from exc
-    try:
-        os.kill(pid, signal.SIGUSR1)
+        handle.send_signal(signal.SIGUSR1)
     except ProcessLookupError as exc:
         raise HarnessError("wake daemon is not running") from exc
+    finally:
+        handle.close()
+
+
+def _acquire_wake_singleton() -> int:
+    WAKE_LOCK.parent.mkdir(parents=True, exist_ok=True)
+    descriptor = os.open(WAKE_LOCK, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError as exc:
+        os.close(descriptor)
+        raise HarnessError("wake daemon is already running") from exc
+    return descriptor
 
 
 def _write_pidfile() -> None:
+    identity = process_identity(os.getpid())
+    if identity is None:
+        raise HarnessError("could not establish wake daemon process identity")
     WAKE_PID_PATH.parent.mkdir(parents=True, exist_ok=True)
-    WAKE_PID_PATH.write_text(str(os.getpid()))
+    temporary = WAKE_PID_PATH.with_suffix(".tmp")
+    temporary.write_text(
+        json.dumps(
+            {"pid": os.getpid(), "process_start": identity}, separators=(",", ":")
+        )
+        + "\n"
+    )
+    temporary.chmod(0o600)
+    os.replace(temporary, WAKE_PID_PATH)
 
 
 def _remove_pidfile() -> None:
@@ -1309,6 +1360,7 @@ def main() -> None:
     if "--check" in sys.argv[1:]:
         print("voice-harness-wake: ok")
         return
+    singleton = _acquire_wake_singleton()
     daemon = WakeConversationDaemon()
 
     def handle_signal(_signum: int, _frame: object) -> None:
@@ -1331,6 +1383,8 @@ def main() -> None:
     finally:
         daemon.stop()
         _remove_pidfile()
+        fcntl.flock(singleton, fcntl.LOCK_UN)
+        os.close(singleton)
 
 
 if __name__ == "__main__":

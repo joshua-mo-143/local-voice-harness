@@ -20,6 +20,7 @@ GITHUB_ROOT = Path(
 ).resolve()
 RUNTIME = Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp"))
 RECORDING_LOCK = RUNTIME / "voice-harness-recording.lock"
+WAKE_LOCK = RUNTIME / "voice-harness-wake.lock"
 STATE_DIR = RUNTIME / "voice-harness"
 LEGACY_JOBS_DIR = STATE_DIR / "jobs"
 JOB_LOGS_DIR = STATE_DIR / "jobs"

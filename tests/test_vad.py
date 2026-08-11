@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import io
+import os
 import tempfile
 import threading
+import time
 import unittest
 import wave
 from pathlib import Path
@@ -192,6 +194,37 @@ class VadCaptureTests(unittest.TestCase):
                 detector=mock.Mock(is_speech=mock.Mock(return_value=False)),
                 stop_requested=stop_requested,
             )
+
+        process.send_signal.assert_called_once()
+
+    def test_stop_during_stalled_pipe_read_cleans_up_microphone(self) -> None:
+        read_fd, write_fd = os.pipe()
+        process = mock.Mock()
+        process.stdout = os.fdopen(read_fd, "rb", buffering=0)
+        process.stderr = io.BytesIO()
+        process.poll.return_value = None
+        stop_requested = threading.Event()
+
+        def request_stop_after_delay() -> None:
+            time.sleep(0.05)
+            stop_requested.set()
+
+        try:
+            with (
+                tempfile.TemporaryDirectory() as temporary,
+                mock.patch.object(vad.subprocess, "Popen", return_value=process),
+                self.assertRaisesRegex(HarnessError, "cancelled"),
+            ):
+                threading.Thread(target=request_stop_after_delay, daemon=True).start()
+                vad.capture_vad_audio(
+                    Path(temporary) / "capture.wav",
+                    source="",
+                    settings=_settings(),
+                    detector=mock.Mock(is_speech=mock.Mock(return_value=False)),
+                    stop_requested=stop_requested,
+                )
+        finally:
+            os.close(write_fd)
 
         process.send_signal.assert_called_once()
 

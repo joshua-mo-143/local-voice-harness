@@ -4,7 +4,6 @@ import fcntl
 import json
 import os
 import re
-import select
 import signal
 import stat
 import subprocess
@@ -16,6 +15,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .errors import HarnessError
+from .process import pidfd_exited, pidfd_send, process_identity, terminate_pidfd
 
 
 @dataclass(frozen=True)
@@ -40,16 +40,6 @@ class RecorderState:
     pid: int
     identity: str | None
     mode: str
-
-
-def process_identity(pid: int) -> str | None:
-    """Return the Linux process start tick, which remains stable for its lifetime."""
-
-    try:
-        suffix = Path(f"/proc/{pid}/stat").read_text().rpartition(")")[2].split()
-        return suffix[19]
-    except (IndexError, OSError):
-        return None
 
 
 @contextmanager
@@ -292,12 +282,11 @@ def _owned_pidfd(paths: RecorderPaths) -> tuple[int, int] | None:
 
 
 def _pidfd_send(pidfd: int, sig: signal.Signals) -> None:
-    signal.pidfd_send_signal(pidfd, sig)
+    pidfd_send(pidfd, sig)
 
 
 def _pidfd_exited(pidfd: int, timeout: float) -> bool:
-    readable, _, _ = select.select([pidfd], [], [], timeout)
-    return bool(readable)
+    return pidfd_exited(pidfd, timeout)
 
 
 def recording_active(paths: RecorderPaths) -> bool:
@@ -479,7 +468,10 @@ def start_recording(
             try:
                 _write_state(paths, process.pid, identity)
             except Exception:
-                _pidfd_send(pidfd, signal.SIGTERM)
+                if not terminate_pidfd(pidfd):
+                    raise HarnessError(
+                        "could not stop recorder after ownership write failed"
+                    ) from None
                 raise
         finally:
             os.close(pidfd)

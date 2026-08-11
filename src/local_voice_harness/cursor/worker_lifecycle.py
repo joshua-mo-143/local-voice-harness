@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
+from .. import process as _process
 from ..errors import HarnessError
 from .model import (
     CURRENT_SCHEMA_VERSION,
@@ -23,6 +24,10 @@ from .model import (
 )
 from .store import JobStore
 
+boot_identity = _process.boot_identity
+process_identity = _process.process_identity
+process_owner_alive = _process.process_owner_alive
+
 WORKER_MODULE = "local_voice_harness.cursor.worker"
 LEGACY_WORKER_MODULE = WORKER_MODULE
 CRITICAL_WORKER_OPERATIONS = frozenset(
@@ -32,50 +37,6 @@ CRITICAL_WORKER_OPERATIONS = frozenset(
 
 class WorkerCancelled(Exception):
     """The durable worker claim was cancelled or fenced by another owner."""
-
-
-def process_identity(pid: int) -> str | None:
-    try:
-        stat = Path(f"/proc/{pid}/stat").read_text()
-    except OSError:
-        return None
-    closing = stat.rfind(")")
-    fields = stat[closing + 2 :].split()
-    return fields[19] if closing >= 0 and len(fields) > 19 else None
-
-
-def boot_identity() -> str | None:
-    try:
-        identity = Path("/proc/sys/kernel/random/boot_id").read_text().strip()
-    except OSError:
-        return None
-    return identity or None
-
-
-def process_owner_alive(
-    pid: int,
-    boot_id: str,
-    process_start: str,
-    *,
-    get_boot_identity: Callable[[], str | None] = boot_identity,
-    get_process_identity: Callable[[int], str | None] = process_identity,
-) -> bool | None:
-    """Return whether an exact process owner lives, or ``None`` if unknowable."""
-    current_boot = get_boot_identity()
-    if current_boot is None:
-        return None
-    if current_boot != boot_id:
-        return False
-    current_start = get_process_identity(pid)
-    if current_start is not None:
-        return current_start == process_start
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return None
-    return None
 
 
 def worker_command_matches(job: CursorJob) -> bool:
