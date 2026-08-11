@@ -2,15 +2,13 @@ from __future__ import annotations
 
 import json
 import re
-import urllib.error
-import urllib.request
 from dataclasses import dataclass
 from enum import StrEnum
 
 from .browser_context import RequestContext
-from .config import BackendConfigurationError, load_backend_settings
-from .credentials import get_venice_api_key
+from .config import BackendConfigurationError, BackendSettings
 from .errors import HarnessError
+from .llm_transport import ChatCompletionRequest, LlmTransport
 
 ROUTER_SYSTEM_PROMPT = (
     "You are an intent router for a local voice assistant. Classify the user's next "
@@ -31,6 +29,9 @@ ROUTER_SYSTEM_PROMPT = (
     "cursor_dismiss to silence or acknowledge a job announcement, and cursor_repeat "
     "to hear a job update again. When several jobs run at once the user may name a "
     "job by its label, issue number, or short id; still classify only the action. "
+    "Use cursor_details when the user asks to see or hear more detail about the "
+    "just-announced completed result, such as 'tell me more' or 'show me the details'; "
+    "this is read-only and must not start more work. "
     "Use end_conversation when the user signals the exchange is over and nothing "
     "further is needed, for example saying goodbye, thanking you with no new "
     "request, answering that there is nothing else, or replying with only a short "
@@ -66,6 +67,7 @@ ROUTE_TOOL = {
                         "cursor_list",
                         "cursor_dismiss",
                         "cursor_repeat",
+                        "cursor_details",
                         "end_conversation",
                         "uncertain",
                     ],
@@ -93,6 +95,7 @@ class Intent(StrEnum):
     AGENT_LIST = "cursor_list"
     AGENT_DISMISS = "cursor_dismiss"
     AGENT_REPEAT = "cursor_repeat"
+    AGENT_DETAILS = "cursor_details"
     # Compatibility aliases for the original Cursor-specific intent names.
     CURSOR_SUBMIT = "cursor_submit"
     CURSOR_REPLY = "cursor_reply"
@@ -103,6 +106,7 @@ class Intent(StrEnum):
     CURSOR_LIST = "cursor_list"
     CURSOR_DISMISS = "cursor_dismiss"
     CURSOR_REPEAT = "cursor_repeat"
+    CURSOR_DETAILS = "cursor_details"
     END_CONVERSATION = "end_conversation"
     UNCERTAIN = "uncertain"
 
@@ -186,13 +190,7 @@ def decide_fork_intent(utterance: str) -> ForkIntent:
     return ForkIntent.NON_AFFIRMATIVE
 
 
-def _parse_route(result: object) -> IntentRoute:
-    if not isinstance(result, dict):
-        return FALLBACK_ROUTE
-    choices = result.get("choices")
-    if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
-        return FALLBACK_ROUTE
-    message = choices[0].get("message")
+def _parse_route_message(message: object) -> IntentRoute:
     if not isinstance(message, dict):
         return FALLBACK_ROUTE
     calls = message.get("tool_calls")
@@ -220,62 +218,51 @@ def route_intent(
     pending_question: str | None = None,
     clarification_kind: str | None = None,
     recent_completion: bool = False,
+    settings: BackendSettings | None = None,
 ) -> IntentRoute:
     try:
-        settings = load_backend_settings()
-        request_data: dict[str, object] = {
-            "model": settings.llm_model,
-            "messages": [
-                {"role": "system", "content": ROUTER_SYSTEM_PROMPT},
-                {
-                    "role": "user",
-                    "content": json.dumps(
-                        {
-                            "utterance": text,
-                            "cursor_job_awaiting_reply": cursor_session is not None,
-                            "pending_cursor_question": pending_question,
-                            "clarification_kind": clarification_kind,
-                            "recent_completed_job": (
-                                recent_completion and cursor_session is None
-                            ),
-                            "focused_repository": context.focused_repository,
-                            "focused_issue": context.focused_issue,
-                        }
-                    ),
+        transport = LlmTransport.from_settings(settings)
+        message = transport.chat_completion(
+            ChatCompletionRequest(
+                messages=[
+                    {"role": "system", "content": ROUTER_SYSTEM_PROMPT},
+                    {
+                        "role": "user",
+                        "content": json.dumps(
+                            {
+                                "utterance": text,
+                                "cursor_job_awaiting_reply": cursor_session is not None,
+                                "pending_cursor_question": pending_question,
+                                "clarification_kind": clarification_kind,
+                                "recent_completed_job": (
+                                    recent_completion and cursor_session is None
+                                ),
+                                "focused_repository": context.focused_repository,
+                                "focused_issue": context.focused_issue,
+                            }
+                        ),
+                    },
+                ],
+                temperature=0,
+                # Reasoning models spend part of the completion budget before the
+                # forced tool call; too small a cap truncates the arguments after
+                # ``intent`` and silently drops ``confidence``, which the parser then
+                # treats as low confidence. Keep enough headroom for the full object.
+                max_tokens=128,
+                stream=False,
+                tools=[ROUTE_TOOL],
+                tool_choice={
+                    "type": "function",
+                    "function": {"name": "route_intent"},
                 },
-            ],
-            "tools": [ROUTE_TOOL],
-            "tool_choice": {
-                "type": "function",
-                "function": {"name": "route_intent"},
-            },
-            "parallel_tool_calls": False,
-            "temperature": 0,
-            # Reasoning models spend part of the completion budget before the
-            # forced tool call; too small a cap truncates the arguments after
-            # ``intent`` and silently drops ``confidence``, which the parser then
-            # treats as low confidence. Keep enough headroom for the full object.
-            "max_tokens": 128,
-            "stream": False,
-        }
-        if settings.llm_provider == "venice":
-            request_data["reasoning"] = {"enabled": False}
-        payload = json.dumps(request_data).encode()
-        headers = {"Content-Type": "application/json"}
-        if settings.llm_provider == "venice":
-            headers["Authorization"] = f"Bearer {get_venice_api_key()}"
-        request = urllib.request.Request(
-            settings.llm_endpoint,
-            data=payload,
-            headers=headers,
+                parallel_tool_calls=False,
+            ),
         )
-        with urllib.request.urlopen(request, timeout=settings.llm_timeout) as response:
-            return _parse_route(json.load(response))
+        return _parse_route_message(message)
     except (
         BackendConfigurationError,
         HarnessError,
         OSError,
-        urllib.error.URLError,
         json.JSONDecodeError,
     ):
         return FALLBACK_ROUTE

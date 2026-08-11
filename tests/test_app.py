@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import contextlib
+import io
 import unittest
 from unittest import mock
 
@@ -7,6 +9,7 @@ from local_voice_harness import app
 from local_voice_harness.browser_context import RequestContext
 from local_voice_harness.cursor.service import CursorTurnRequest
 from local_voice_harness.intent import Intent, IntentRoute
+from local_voice_harness.responses import AssistantResponse
 
 
 class ForegroundDeliveryTests(unittest.TestCase):
@@ -17,6 +20,7 @@ class ForegroundDeliveryTests(unittest.TestCase):
             request: CursorTurnRequest,
             *,
             delivery_claims: list[tuple[str, str]],
+            integrations: object,
         ) -> tuple[str, None]:
             self.assertEqual(request.utterance, "Use Cursor to inspect this repository")
             self.assertIsNone(request.context_repository)
@@ -26,14 +30,16 @@ class ForegroundDeliveryTests(unittest.TestCase):
         with (
             mock.patch.object(app, "start_components"),
             mock.patch.object(
-                app, "request_context", side_effect=lambda text: RequestContext(text)
+                app,
+                "request_context",
+                side_effect=lambda text, **_settings: RequestContext(text),
             ),
             mock.patch.object(app, "route_intent") as route_intent,
             mock.patch.object(app, "cursor_turn", side_effect=cursor_turn),
             mock.patch.object(
                 app,
                 "stream_and_play",
-                side_effect=lambda _text: events.append("played"),
+                side_effect=lambda _text, **_settings: events.append("played"),
             ),
             mock.patch.object(
                 app,
@@ -52,6 +58,7 @@ class ForegroundDeliveryTests(unittest.TestCase):
             request: CursorTurnRequest,
             *,
             delivery_claims: list[tuple[str, str]],
+            integrations: object,
         ) -> tuple[str, None]:
             self.assertEqual(request.utterance, "Use Cursor to inspect this repository")
             self.assertIsNone(request.context_repository)
@@ -61,7 +68,9 @@ class ForegroundDeliveryTests(unittest.TestCase):
         with (
             mock.patch.object(app, "start_components"),
             mock.patch.object(
-                app, "request_context", side_effect=lambda text: RequestContext(text)
+                app,
+                "request_context",
+                side_effect=lambda text, **_settings: RequestContext(text),
             ),
             mock.patch.object(app, "route_intent") as route_intent,
             mock.patch.object(app, "cursor_turn", side_effect=cursor_turn),
@@ -82,6 +91,33 @@ class ForegroundDeliveryTests(unittest.TestCase):
 
 
 class AppContextTests(unittest.TestCase):
+    def test_response_channels_are_selected_at_foreground_boundary(self) -> None:
+        output = io.StringIO()
+        response = AssistantResponse(
+            spoken_text="The job started.",
+            display_text="Started job 123456789abc in /tmp/example.",
+        )
+        with (
+            mock.patch.object(app, "start_components"),
+            mock.patch.object(
+                app, "request_context", return_value=RequestContext("start it")
+            ),
+            mock.patch.object(
+                app,
+                "route_intent",
+                return_value=IntentRoute(Intent.CONVERSATION, "high"),
+            ),
+            mock.patch.object(app, "qwen_response", return_value=response) as qwen,
+            mock.patch.object(app, "stream_and_play") as play,
+            contextlib.redirect_stdout(output),
+        ):
+            app.respond("start it")
+
+        self.assertIn(f"Assistant: {response.display_text}", output.getvalue())
+        self.assertNotIn(response.spoken_text, output.getvalue())
+        play.assert_called_once_with(response.spoken_text, settings=mock.ANY)
+        qwen.assert_called_once()
+
     def test_manual_cursor_request_includes_focused_context(self) -> None:
         with (
             mock.patch.object(app, "start_components"),
@@ -102,7 +138,11 @@ class AppContextTests(unittest.TestCase):
             app.respond("ask Cursor to fix this")
 
         route_intent.assert_not_called()
-        enrich.assert_called_once_with("ask Cursor to fix this")
+        enrich.assert_called_once_with(
+            "ask Cursor to fix this",
+            platform=mock.ANY,
+            integrations=mock.ANY,
+        )
         cursor_turn.assert_called_once_with(
             CursorTurnRequest(
                 "ask Cursor to fix this\n\ncontext",
@@ -110,6 +150,7 @@ class AppContextTests(unittest.TestCase):
                 context_repository="example/project",
             ),
             delivery_claims=mock.ANY,
+            integrations=mock.ANY,
         )
 
     def test_manual_conversation_includes_focused_context(self) -> None:
@@ -135,6 +176,7 @@ class AppContextTests(unittest.TestCase):
             trusted_utterance="summarize this",
             delivery_claims=mock.ANY,
             allow_tools=False,
+            settings=mock.ANY,
         )
 
     def test_explicit_fork_passes_validated_focused_repository(self) -> None:
@@ -165,6 +207,7 @@ class AppContextTests(unittest.TestCase):
             trusted_utterance="fork this repo and add Venice",
             delivery_claims=mock.ANY,
             allow_tools=False,
+            settings=mock.ANY,
         )
 
     def test_external_fork_language_cannot_authorize_fork(self) -> None:
@@ -196,7 +239,9 @@ class AppContextTests(unittest.TestCase):
         with (
             mock.patch.object(app, "start_components"),
             mock.patch.object(
-                app, "request_context", side_effect=lambda text: RequestContext(text)
+                app,
+                "request_context",
+                side_effect=lambda text, **_settings: RequestContext(text),
             ),
             mock.patch.object(
                 app,
@@ -252,6 +297,7 @@ class AppContextTests(unittest.TestCase):
                 github_pull_request=None,
             ),
             delivery_claims=mock.ANY,
+            integrations=mock.ANY,
         )
 
     def test_focused_github_issue_does_not_submit_at_low_confidence(self) -> None:
@@ -281,7 +327,9 @@ class AppContextTests(unittest.TestCase):
 
         qwen.assert_not_called()
         cursor.assert_not_called()
-        play.assert_called_once_with(app.NON_ACTIONABLE_SUBMIT_RESPONSE)
+        play.assert_called_once_with(
+            app.NON_ACTIONABLE_SUBMIT_RESPONSE, settings=mock.ANY
+        )
 
     def test_low_confidence_submit_without_focus_uses_safe_response(self) -> None:
         context = RequestContext("work on this please")
@@ -301,7 +349,9 @@ class AppContextTests(unittest.TestCase):
 
         cursor.assert_not_called()
         qwen.assert_not_called()
-        play.assert_called_once_with(app.NON_ACTIONABLE_SUBMIT_RESPONSE)
+        play.assert_called_once_with(
+            app.NON_ACTIONABLE_SUBMIT_RESPONSE, settings=mock.ANY
+        )
 
     def test_uncertain_bare_ticket_batch_requests_repository_scope(self) -> None:
         text = "Can you work on issues 92, 93 and 95?"
@@ -325,7 +375,9 @@ class AppContextTests(unittest.TestCase):
 
         cursor.assert_not_called()
         qwen.assert_not_called()
-        play.assert_called_once_with(app.MISSING_ISSUE_SCOPE_RESPONSE)
+        play.assert_called_once_with(
+            app.MISSING_ISSUE_SCOPE_RESPONSE, settings=mock.ANY
+        )
 
     def test_actionable_linear_issue_metadata_reaches_cursor(self) -> None:
         context = RequestContext(
@@ -357,6 +409,7 @@ class AppContextTests(unittest.TestCase):
                 issue_key="ENG-123",
             ),
             delivery_claims=mock.ANY,
+            integrations=mock.ANY,
         )
 
     def test_issue_list_scope_reaches_cursor_submission(self) -> None:
@@ -396,6 +449,7 @@ class AppContextTests(unittest.TestCase):
                 github_pull_request=None,
             ),
             delivery_claims=mock.ANY,
+            integrations=mock.ANY,
         )
 
     def test_focused_linear_issue_does_not_submit_at_low_confidence(self) -> None:
@@ -423,7 +477,9 @@ class AppContextTests(unittest.TestCase):
 
         qwen.assert_not_called()
         cursor.assert_not_called()
-        play.assert_called_once_with(app.NON_ACTIONABLE_SUBMIT_RESPONSE)
+        play.assert_called_once_with(
+            app.NON_ACTIONABLE_SUBMIT_RESPONSE, settings=mock.ANY
+        )
 
 
 class CursorFastPathTests(unittest.TestCase):
@@ -431,7 +487,9 @@ class CursorFastPathTests(unittest.TestCase):
         with (
             mock.patch.object(app, "start_components"),
             mock.patch.object(
-                app, "request_context", side_effect=lambda text: RequestContext(text)
+                app,
+                "request_context",
+                side_effect=lambda text, **_settings: RequestContext(text),
             ),
             mock.patch.object(app, "route_intent") as route_intent,
             mock.patch.object(
@@ -449,6 +507,7 @@ class CursorFastPathTests(unittest.TestCase):
                 context_repository=None,
             ),
             delivery_claims=mock.ANY,
+            integrations=mock.ANY,
         )
 
     def test_non_cursor_utterance_uses_router(self) -> None:
@@ -466,7 +525,9 @@ class CursorFastPathTests(unittest.TestCase):
         ):
             app.respond("what is the weather")
 
-        route_intent.assert_called_once_with("what is the weather", context)
+        route_intent.assert_called_once_with(
+            "what is the weather", context, settings=mock.ANY
+        )
 
 
 if __name__ == "__main__":

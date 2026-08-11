@@ -13,7 +13,10 @@ from local_voice_harness.cursor import service
 from local_voice_harness.cursor.model import (
     CURRENT_SCHEMA_VERSION,
     CursorJob,
+    HarnessKind,
+    JobStatus,
     NewCursorJob,
+    WorkflowPhase,
 )
 from local_voice_harness.cursor.service import (
     CursorTurnRequest,
@@ -23,6 +26,13 @@ from local_voice_harness.cursor.service import (
 )
 from local_voice_harness.cursor.store import JobStore
 from local_voice_harness.errors import HarnessError
+from local_voice_harness.integrations.github import (
+    GitHubIssueLookupError,
+    GitHubIssueLookupReason,
+)
+from local_voice_harness.integrations.registry import build_integration_registry
+from local_voice_harness.responses import AssistantResponse, as_assistant_response
+from local_voice_harness.user_config import default_user_config
 
 
 def test_service_request_and_result_types_are_explicit() -> None:
@@ -33,6 +43,29 @@ def test_service_request_and_result_types_are_explicit() -> None:
     assert start.repository == "project"
     assert turn.session_id == "123456789abc"
     assert tuple(result) == ("done", None)
+
+
+def test_admission_persists_selected_provider_and_harness(tmp_path: Path) -> None:
+    store = JobStore(tmp_path / "jobs", tmp_path / "legacy")
+    registry = build_integration_registry(default_user_config(tmp_path))
+    with (
+        mock.patch.object(service, "_job_store", return_value=store),
+        mock.patch.object(service, "launch_worker"),
+    ):
+        job_id = service.start_job(
+            "work on the issue",
+            github_repository="owner/project",
+            github_issue=42,
+            foreground=False,
+            integrations=registry,
+        )
+
+    job = store.get(job_id)
+    assert job.harness_kind == HarnessKind.CURSOR
+    assert job.issue_provider == "github"
+    persisted = json.loads(store.path(job_id).read_text())
+    assert persisted["harness_kind"] == "cursor"
+    assert persisted["issue_provider"] == "github"
 
 
 def test_submit_notifies_only_after_job_starts() -> None:
@@ -89,7 +122,7 @@ def test_fanout_preflights_every_target_before_bounded_background_starts() -> No
             "url": f"https://github.com/example/project/issues/{number}",
         }
 
-    def start(request: StartJobRequest) -> str:
+    def start(request: StartJobRequest, **_kwargs: object) -> str:
         assert events[:3] == ["preflight-1", "preflight-2", "preflight-3"]
         assert not request.foreground
         assert request.github_issue in {1, 3}
@@ -117,14 +150,22 @@ def test_fanout_preflights_every_target_before_bounded_background_starts() -> No
         )
 
     assert result.session_id is None
-    assert result.text.index("example/project#1: accepted") < result.text.index(
+    response = as_assistant_response(result.text)
+    assert response.display_text.index(
+        "example/project#1: accepted"
+    ) < response.display_text.index("example/project#2: rejected")
+    assert response.display_text.index(
         "example/project#2: rejected"
+    ) < response.display_text.index("example/project#3: start-failed")
+    assert "job-one" in response.display_text
+    assert "job deletion maintenance is active" not in response.display_text
+    assert "check the harness logs" in response.display_text
+    assert response.spoken_text == (
+        "One job started; one GitHub issue could not be accessed; "
+        "one job failed to start."
     )
-    assert result.text.index("example/project#2: rejected") < result.text.index(
-        "example/project#3: start-failed"
-    )
-    assert "job-one" in result.text
-    assert "job deletion maintenance is active" in result.text
+    assert "job-one" not in response.spoken_text
+    assert "job deletion maintenance is active" not in response.spoken_text
     foreground.assert_not_called()
 
 
@@ -133,7 +174,7 @@ def test_start_jobs_enforces_bound_and_preserves_outcome_order() -> None:
     active = 0
     maximum = 0
 
-    def start(request: StartJobRequest) -> str:
+    def start(request: StartJobRequest, **_kwargs: object) -> str:
         nonlocal active, maximum
         with lock:
             active += 1
@@ -191,6 +232,37 @@ def test_start_jobs_reports_active_ticket_conflict_as_rejected() -> None:
     assert outcomes[0].job_id == active_job_id
     assert active_job_id in str(outcomes[0].detail)
     read.assert_not_called()
+
+
+def test_single_github_lookup_failure_renders_target_by_channel() -> None:
+    client = mock.Mock()
+    client.issue_details.side_effect = GitHubIssueLookupError(
+        GitHubIssueLookupReason.NOT_FOUND_OR_INACCESSIBLE,
+        "GraphQL: Could not resolve to an Issue in "
+        "very-long-owner-name/very-long-repository-name",
+    )
+    with (
+        mock.patch.object(service, "GitHubClient", return_value=client),
+        mock.patch.object(service, "integration_enabled", return_value=True),
+    ):
+        result = service.cursor_turn(
+            CursorTurnRequest(
+                "Work on issue 42",
+                utterance="Work on issue 42",
+                issue_scope="very-long-owner-name/very-long-repository-name",
+                issue_scope_source="github",
+            )
+        )
+
+    assert result.session_id is None
+    assert isinstance(result.text, AssistantResponse)
+    assert result.text.spoken_text == ("I couldn't find or access GitHub issue 42.")
+    assert result.text.display_text == (
+        "Ticket starts: very-long-owner-name/very-long-repository-name#42: "
+        "rejected (issue not found or inaccessible)."
+    )
+    assert "very-long-owner-name" not in result.text.spoken_text
+    assert "GraphQL" not in result.text.display_text
 
 
 def test_start_job_enforces_unique_ticket_before_worker_launch() -> None:
@@ -290,6 +362,41 @@ def test_single_ticket_conflict_does_not_notify_or_wait() -> None:
     foreground.assert_not_called()
 
 
+def test_foreground_timeout_confirms_new_job_by_channel(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(service, "JOBS_DIR", tmp_path / "jobs")
+    monkeypatch.setattr(service, "LEGACY_JOBS_DIR", tmp_path / "legacy")
+    job = CursorJob.from_dict(
+        {
+            "id": "123456789abc",
+            "request": "work on the focused issue",
+            "status": "running",
+            "created_at": 1,
+            "delivered": False,
+            "foreground_until": 10,
+            "speakable_label": "local-voice-harness issue 149",
+        }
+    )
+    service._job_store().create(job)
+
+    result = service._await_foreground(job.id, [], timeout=0)
+
+    response = as_assistant_response(result.text)
+    assert result.session_id is None
+    assert response.spoken_text == (
+        "Cursor started local-voice-harness issue 149. "
+        "I will report back when it finishes."
+    )
+    assert "still working" not in response.spoken_text
+    assert "already working" not in response.spoken_text
+    assert job.id not in response.spoken_text
+    assert job.id in response.display_text
+    assert "local-voice-harness issue 149" in response.display_text
+    assert service.read_job(job.id).foreground_until == 0
+
+
 def test_single_scoped_ticket_keeps_foreground_behavior() -> None:
     client = mock.Mock()
     client.issue_details.return_value = {
@@ -300,7 +407,7 @@ def test_single_scoped_ticket_keeps_foreground_behavior() -> None:
     }
     started: list[StartJobRequest] = []
 
-    def start(request: StartJobRequest) -> str:
+    def start(request: StartJobRequest, **_kwargs: object) -> str:
         started.append(request)
         return "123456789abc"
 
@@ -327,20 +434,20 @@ def test_single_scoped_ticket_keeps_foreground_behavior() -> None:
     assert result == CursorTurnResult("working", None)
     assert len(started) == 1
     assert started[0].foreground
-    foreground.assert_called_once_with("123456789abc", None)
+    foreground.assert_called_once_with("123456789abc", None, timeout=5.0)
 
 
 def test_fanout_linear_capability_preflight_happens_before_any_start() -> None:
     events: list[str] = []
 
-    def require(reference: str) -> None:
+    def require(reference: str, *_args: object) -> None:
         events.append(f"capability-{reference}")
 
-    def resolve(reference: str | None) -> str | None:
+    def resolve(reference: str | None, *_args: object) -> str | None:
         events.append(f"resolve-{reference}")
         return reference
 
-    def start(request: StartJobRequest) -> str:
+    def start(request: StartJobRequest, **_kwargs: object) -> str:
         assert events[:3] == [
             "capability-ENG-1",
             "resolve-ENG-1",
@@ -362,8 +469,160 @@ def test_fanout_linear_capability_preflight_happens_before_any_start() -> None:
             )
         )
 
-    assert result.text.startswith("Ticket starts: ENG-1: accepted")
-    assert "ENG-2: accepted" in result.text
+    response = as_assistant_response(result.text)
+    assert response.display_text.startswith("Ticket starts: ENG-1: accepted")
+    assert "ENG-2: accepted" in response.display_text
+    assert response.spoken_text == "Two jobs started."
+
+
+def test_foreground_agent_failure_keeps_diagnostics_out_of_speech(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    job = mock.Mock(spec=CursorJob)
+    job.id = "123456789abc"
+    job.status = JobStatus.FAILED
+    job.error = "token=secret-value repository command failed"
+    job.worktree_provision_state = "failed"
+    job.agent_dispatch_state = None
+    job.workflow_phase = WorkflowPhase.FINISHED
+    monkeypatch.setattr(service, "JOB_LOGS_DIR", tmp_path / "logs")
+    with (
+        mock.patch.object(service, "read_job", return_value=job),
+        mock.patch.object(
+            service,
+            "_defer_or_acknowledge",
+            return_value=job,
+        ) as defer,
+    ):
+        result = service._await_foreground(job.id, [])
+
+    response = as_assistant_response(result.text)
+    assert response.spoken_text == ("The Cursor job failed during repository setup.")
+    assert response.display_text == (
+        f"Cursor job {job.id} failed during repository setup. "
+        f"Inspect {tmp_path / 'logs' / f'{job.id}.log'} for diagnostic details "
+        "before retrying."
+    )
+    assert "secret-value" not in response.spoken_text
+    assert "secret-value" not in response.display_text
+    defer.assert_called_once_with(job.id, [])
+
+
+def test_foreground_blocked_job_keeps_stored_stderr_out_of_response() -> None:
+    job = CursorJob.from_dict(
+        {
+            "id": "123456789abc",
+            "request": "fix it",
+            "status": "blocked",
+            "created_at": 1,
+            "completed_at": 2,
+            "delivered": False,
+            "result": "stderr Authorization: Bearer blocked-secret",
+            "error": "stderr Authorization: Bearer blocked-secret",
+            "speakable_label": "issue 42",
+        }
+    )
+    with (
+        mock.patch.object(service, "read_job", return_value=job),
+        mock.patch.object(
+            service,
+            "_defer_or_acknowledge",
+            return_value=job,
+        ),
+    ):
+        result = service._await_foreground(job.id, [])
+
+    response = as_assistant_response(result.text)
+    assert response.spoken_text == "Cursor needs attention for issue 42."
+    assert "recovery guidance" in response.display_text
+    assert "blocked-secret" not in response.spoken_text
+    assert "blocked-secret" not in response.display_text
+
+
+def test_background_job_renderings_cover_each_deliverable_status() -> None:
+    def job(status: JobStatus, **changes: object) -> CursorJob:
+        values: dict[str, object] = {
+            "id": "123456789abc",
+            "request": "work on the issue",
+            "status": status.value,
+            "created_at": 1,
+            "delivered": False,
+            "speakable_label": "issue 42",
+        }
+        values.update(changes)
+        return CursorJob.from_dict(values)
+
+    completed = service.render_job_announcement(
+        job(JobStatus.COMPLETED, result="Changed /srv/config.toml.", completed_at=2)
+    )
+    awaiting = service.render_job_announcement(
+        job(JobStatus.AWAITING_USER, question="Which repo?", result="Which repo?")
+    )
+    blocked = service.render_job_announcement(
+        job(JobStatus.BLOCKED, result="Open Herdr pane 7.", completed_at=2)
+    )
+    cancelled = service.render_job_announcement(
+        job(JobStatus.CANCELLED, result="Cancelled by request.", completed_at=2)
+    )
+    failed = service.render_job_announcement(
+        job(
+            JobStatus.FAILED,
+            result="token=secret-value command failed",
+            error="token=secret-value command failed",
+            completed_at=2,
+        )
+    )
+
+    assert completed.spoken_text == "Cursor finished issue 42."
+    assert "/srv/config.toml" not in completed.spoken_text
+    assert "/srv/config.toml" in completed.display_text
+    assert awaiting.spoken_text.endswith("Which repo?")
+    assert "needs clarification" in awaiting.display_text
+    assert blocked.spoken_text == "Cursor needs attention for issue 42."
+    assert "Open Herdr pane 7." not in blocked.display_text
+    assert "recovery guidance" in blocked.display_text
+    assert cancelled.spoken_text == "Cursor cancelled issue 42."
+    assert "Cancelled by request." not in cancelled.display_text
+    assert "was cancelled" in cancelled.display_text
+    assert failed.spoken_text == "Cursor failed issue 42 during execution."
+    assert "123456789abc.log" in failed.display_text
+    assert "secret-value" not in failed.spoken_text
+    assert "secret-value" not in failed.display_text
+    for response in (completed, awaiting, blocked, cancelled, failed):
+        assert "123456789abc" in response.display_text
+
+
+@pytest.mark.parametrize(
+    ("status", "safe_detail"),
+    [
+        (JobStatus.FAILED, None),
+        (JobStatus.BLOCKED, "Manual attention required in Herdr"),
+    ],
+)
+def test_status_message_never_surfaces_stored_diagnostics(
+    status: JobStatus,
+    safe_detail: str | None,
+) -> None:
+    stored = CursorJob.from_dict(
+        {
+            "id": "123456789abc",
+            "request": "fix it",
+            "status": status.value,
+            "created_at": 1,
+            "completed_at": 2,
+            "delivered": False,
+            "error": "Authorization: Bearer status-secret",
+            "result": "stderr token=status-secret",
+            "speakable_label": "issue 42",
+        }
+    )
+    with mock.patch.object(service, "read_job", return_value=stored):
+        message = service._status_message(stored.id)
+
+    assert "status-secret" not in message
+    if safe_detail is not None:
+        assert safe_detail in message
 
 
 def test_production_modules_do_not_import_jobs_facade() -> None:

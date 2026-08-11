@@ -25,6 +25,7 @@ from .config import (
     TTS_SOCKET,
 )
 from .errors import HarnessError
+from .integrations.registry import build_integration_registry
 from .intent import (
     NON_ACTIONABLE_SUBMIT_RESPONSE,
     ForkIntent,
@@ -35,8 +36,10 @@ from .intent import (
 )
 from .ipc import socket_ready
 from .llm import qwen_response
+from .responses import as_assistant_response
 from .ticket_targets import MISSING_ISSUE_SCOPE_RESPONSE, extract_ticket_targets
 from .tts.client import stream_and_play
+from .user_config import UserConfig, load_user_config
 from .vocabulary import resolve_aliases
 
 CURSOR_STORE = JobStore(JOBS_DIR, LEGACY_JOBS_DIR)
@@ -58,7 +61,10 @@ def release_deliveries(claims: DeliveryClaims) -> None:
     release_claims(CURSOR_STORE, claims)
 
 
-def respond(text: str) -> None:
+def respond(text: str, *, user_config: UserConfig | None = None) -> None:
+    """Handle one foreground request from one immutable startup snapshot."""
+    settings = user_config if user_config is not None else load_user_config()
+    integrations = build_integration_registry(settings)
     text = text.strip()
     if not text:
         raise HarnessError("request text is empty")
@@ -66,13 +72,17 @@ def respond(text: str) -> None:
     delivery_claims: DeliveryClaims = []
     with component_usage():
         try:
-            start_components()
+            start_components(settings.providers)
             print(f"You: {text}")
-            context = request_context(text)
+            context = request_context(
+                text,
+                platform=settings.platform,
+                integrations=integrations,
+            )
             if CURSOR_PATTERN.search(text):
                 route = IntentRoute(Intent.AGENT_SUBMIT, "high")
             else:
-                route = route_intent(text, context)
+                route = route_intent(text, context, settings=settings.providers)
             fork_requested = decide_fork_intent(text) == ForkIntent.AFFIRMATIVE
             github_arguments = (
                 {
@@ -111,6 +121,7 @@ def respond(text: str) -> None:
                         **github_arguments,
                     ),
                     delivery_claims=delivery_claims,
+                    integrations=integrations,
                 )[0]
             elif route.intent == Intent.AGENT_SUBMIT:
                 response = NON_ACTIONABLE_SUBMIT_RESPONSE
@@ -122,6 +133,7 @@ def respond(text: str) -> None:
                         reference=text,
                     ),
                     delivery_claims=delivery_claims,
+                    integrations=integrations,
                 )[0]
             elif route.intent == Intent.AGENT_PR_UNSUPPORTED:
                 response = (
@@ -137,6 +149,7 @@ def respond(text: str) -> None:
                         utterance=text,
                     ),
                     delivery_claims=delivery_claims,
+                    integrations=integrations,
                 )[0]
             else:
                 response = qwen_response(
@@ -145,9 +158,11 @@ def respond(text: str) -> None:
                     trusted_utterance=text,
                     delivery_claims=delivery_claims,
                     allow_tools=False,
+                    settings=settings.providers,
                 )
-            print(f"Assistant: {response}")
-            stream_and_play(response)
+            rendered_response = as_assistant_response(response)
+            print(f"Assistant: {rendered_response.display_text}")
+            stream_and_play(rendered_response.spoken_text, settings=settings.audio)
             acknowledge_deliveries(delivery_claims)
         except Exception:
             release_deliveries(delivery_claims)

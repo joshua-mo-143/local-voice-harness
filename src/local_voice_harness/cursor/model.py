@@ -8,9 +8,15 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any
 
+from ..integrations.github import (
+    GITHUB_PROVIDER_STATE_FIELDS,
+    GitHubError,
+    dump_github_provider_state,
+    load_github_provider_state,
+)
 from ..questions import Question, QuestionError
 
-CURRENT_SCHEMA_VERSION = 12
+CURRENT_SCHEMA_VERSION = 13
 LEGACY_SCHEMA_VERSIONS = frozenset(range(CURRENT_SCHEMA_VERSION))
 LEGACY_BOOT_ID = "legacy-unknown"
 
@@ -257,6 +263,9 @@ _STRING_FIELDS = frozenset(
         "pull_request_worktree_state",
         "pull_request_branch",
         "pull_request_worktree_error",
+        "pull_request_remote_url",
+        "pull_request_head_ref",
+        "pull_request_head_oid",
         "agent_hint",
         "agent_name",
         "issue_key",
@@ -312,6 +321,7 @@ _STRING_FIELDS = frozenset(
         "prompt_operation_state",
         "prompt_operation_phase",
         "prompt_operation_target",
+        "prompt_operation_agent_session",
         "participant_creation_state",
         "participant_creation_participant",
         "participant_creation_target",
@@ -322,6 +332,7 @@ _STRING_FIELDS = frozenset(
         "terminal_intent_result",
         "terminal_intent_error",
         "harness_kind",
+        "issue_provider",
         "session_id",
     }
 )
@@ -410,6 +421,7 @@ class NewAgentJob:
     worktree_root_pane_id: str | None = None
     worktree_provision_state: str | None = None
     harness_kind: HarnessKind = HarnessKind.CURSOR
+    issue_provider: str | None = None
     session_id: str | None = None
 
 
@@ -517,40 +529,7 @@ _CHECKOUT_STATE_FIELDS = frozenset(
         "worktree_quarantine_acknowledged_at",
     }
 )
-_GITHUB_STATE_FIELDS = frozenset(
-    {
-        "github_repository",
-        "github_issue",
-        "github_issue_url",
-        "github_issue_context",
-        "github_pull_request",
-        "fork_requested",
-        "fork_confirmed",
-        "fork_committed",
-        "fork_exists",
-        "fork_dispatch_exited",
-        "fork_committed_at",
-        "fork_operation_state",
-        "fork_operation_source",
-        "fork_operation_source_url",
-        "fork_operation_source_parent",
-        "fork_operation_source_default_branch",
-        "fork_operation_source_private",
-        "fork_operation_login",
-        "fork_operation_target",
-        "fork_repository",
-        "fork_reconcile_attempts",
-        "fork_absent_observations",
-        "fork_next_reconcile_at",
-        "fork_last_reconciled_at",
-        "fork_confirmed_absent_at",
-        "fork_automatic_reconcile_stopped_at",
-        "fork_retained_at",
-        "pull_request_worktree_state",
-        "pull_request_branch",
-        "pull_request_worktree_error",
-    }
-)
+_GITHUB_STATE_FIELDS = GITHUB_PROVIDER_STATE_FIELDS
 _LINEAR_STATE_FIELDS = frozenset({"issue_key"})
 _CHECKOUT_ALIASES = {
     "branch": "worktree_branch",
@@ -573,9 +552,13 @@ def _flatten_structured_state(values: dict[str, object]) -> None:
     harness_state = _object_mapping(values.pop("harness_state", {}), "harness_state")
     checkout_state = _object_mapping(values.pop("checkout_state", {}), "checkout_state")
     provider_state = _object_mapping(values.pop("provider_state", {}), "provider_state")
-    github_state = _object_mapping(
+    raw_github_state = _object_mapping(
         provider_state.get("github", {}), "provider_state.github"
     )
+    try:
+        github_state = load_github_provider_state(raw_github_state)
+    except GitHubError as exc:
+        raise JobValidationError(str(exc)) from exc
     linear_state = _object_mapping(
         provider_state.get("linear", {}), "provider_state.linear"
     )
@@ -657,7 +640,21 @@ def _advance_legacy_version(values: dict[str, object], version: int) -> None:
             values.setdefault("plan_approval_state", "none")
     elif version == 11:
         values.setdefault("plan_approval_completion_pending", False)
+    elif version == 12:
+        values.setdefault("issue_provider", _infer_legacy_issue_provider(values))
+        # The GitHub provider-state serializer independently migrates its
+        # legacy flat v12 payload to the nested provider-owned representation.
     values["schema_version"] = version + 1
+
+
+def _infer_legacy_issue_provider(values: Mapping[str, object]) -> str | None:
+    if values.get("issue_key") is not None:
+        # Historically issue_key was exclusively owned by the Linear
+        # integration. GitHub fields could also be present as captured context.
+        return "linear"
+    if values.get("github_issue") is not None:
+        return "github"
+    return None
 
 
 def migrate_job_record(raw: Mapping[str, object]) -> tuple[dict[str, object], int]:
@@ -694,6 +691,7 @@ def migrate_job_record(raw: Mapping[str, object]) -> tuple[dict[str, object], in
             values.setdefault("harness_kind", HarnessKind.CURSOR.value)
             if values.get("herdr_target") is not None:
                 values.setdefault("session_id", values["herdr_target"])
+        values.setdefault("issue_provider", _infer_legacy_issue_provider(values))
     values["schema_version"] = CURRENT_SCHEMA_VERSION
     return values, loaded_version
 
@@ -734,7 +732,7 @@ def _structured_record(values: Mapping[str, object]) -> dict[str, object]:
     record["checkout_state"] = checkout_state
     provider_state: dict[str, object] = {}
     if github_state:
-        provider_state["github"] = github_state
+        provider_state["github"] = dump_github_provider_state(github_state)
     if linear_state:
         provider_state["linear"] = linear_state
     record["provider_state"] = provider_state
@@ -861,6 +859,7 @@ class AgentJob:
     schema_version: int
     loaded_schema_version: int
     harness_kind: HarnessKind
+    issue_provider: str | None
     session_id: str | None
     id: str
     revision: int
@@ -950,6 +949,11 @@ class AgentJob:
             harness_kind = HarnessKind(str(values.get("harness_kind") or ""))
         except ValueError as exc:
             raise JobValidationError("harness_kind has invalid value") from exc
+        issue_provider = values.get("issue_provider")
+        if issue_provider is not None and not re.fullmatch(
+            r"[a-z][a-z0-9-]*", str(issue_provider)
+        ):
+            raise JobValidationError("issue_provider has invalid value")
         try:
             workflow_phase = WorkflowPhase(
                 str(values.get("workflow_phase") or WorkflowPhase.CLASSIFYING)
@@ -1004,6 +1008,7 @@ class AgentJob:
             schema_version=CURRENT_SCHEMA_VERSION,
             loaded_schema_version=loaded_version,
             harness_kind=harness_kind,
+            issue_provider=str(issue_provider) if issue_provider is not None else None,
             session_id=(
                 str(values["session_id"])
                 if values.get("session_id") is not None
@@ -1119,6 +1124,7 @@ class AgentJob:
                 "parent_job_id": spec.parent_job_id,
                 "schema_version": CURRENT_SCHEMA_VERSION,
                 "harness_kind": spec.harness_kind.value,
+                "issue_provider": spec.issue_provider,
                 "session_id": spec.session_id,
                 "revision": 0,
                 "request": spec.request,
@@ -1571,6 +1577,18 @@ class AgentJob:
         return self._optional_string("pull_request_worktree_error")
 
     @property
+    def pull_request_remote_url(self) -> str | None:
+        return self._optional_string("pull_request_remote_url")
+
+    @property
+    def pull_request_head_ref(self) -> str | None:
+        return self._optional_string("pull_request_head_ref")
+
+    @property
+    def pull_request_head_oid(self) -> str | None:
+        return self._optional_string("pull_request_head_oid")
+
+    @property
     def agent_hint(self) -> str | None:
         return self._optional_string("agent_hint")
 
@@ -1694,6 +1712,10 @@ class AgentJob:
     @property
     def prompt_operation_target(self) -> str | None:
         return self._optional_string("prompt_operation_target")
+
+    @property
+    def prompt_operation_agent_session(self) -> str | None:
+        return self._optional_string("prompt_operation_agent_session")
 
     @property
     def participant_creation_state(self) -> str:
@@ -1823,6 +1845,10 @@ class AgentJob:
     @property
     def fork_operation_source_default_branch(self) -> str | None:
         return self._optional_string("fork_operation_source_default_branch")
+
+    @property
+    def fork_operation_login(self) -> str | None:
+        return self._optional_string("fork_operation_login")
 
     @property
     def fork_operation_source_private(self) -> bool:
@@ -2003,6 +2029,20 @@ class AgentJob:
         return updated
 
     def validate_invariants(self, *, require_worker_owner: bool = False) -> None:
+        if (
+            self.github_issue is not None
+            and self.issue_key is None
+            and self.issue_provider != "github"
+        ):
+            raise JobValidationError("GitHub issue job requires github issue_provider")
+        if self.issue_key is not None and self.issue_provider is None:
+            raise JobValidationError("issue-key job requires issue_provider")
+        if self.issue_provider == "github" and self.github_issue is None:
+            raise JobValidationError(
+                "github issue_provider requires a GitHub issue identity"
+            )
+        if self.issue_provider not in {None, "github"} and self.issue_key is None:
+            raise JobValidationError("selected issue_provider requires an issue key")
         if self.revision < 0:
             raise JobValidationError("revision must not be negative")
         if self.worker_pid is not None and self.worker_pid <= 0:
@@ -2431,6 +2471,8 @@ def validate_transition(before: CursorJob, after: CursorJob) -> None:
         raise JobValidationError("Cursor job transition cannot change parent_job_id")
     if before.harness_kind != after.harness_kind:
         raise JobValidationError("agent job transition cannot change harness_kind")
+    if before.issue_provider != after.issue_provider:
+        raise JobValidationError("agent job transition cannot change issue_provider")
     if after.parent_job_id is not None:
         # A follow-up child inherits its parent's exact checkout. That identity
         # must never be substituted, removed, or reconstructed by recovery.

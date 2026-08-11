@@ -119,11 +119,11 @@ the compositor environment setup the wake service needs, are in
 
 ## Configuration
 
-Runtime behaviour is set through environment variables on the wake service drop-in
-(`systemctl --user edit voice-harness-wake.service`) and dictation selectors in
-`~/.config/dictation/backend.env`. A unified, typed
-`~/.config/voice-harness/config.toml` also collects user-facing defaults for
-providers, integrations, compute, audio, and platform capabilities. The
+Runtime behaviour is resolved into immutable process-start snapshots from the typed
+`~/.config/voice-harness/config.toml`. Environment variables remain the
+highest-precedence overrides; existing `backends.toml` and dictation `backend.env`
+files remain compatible legacy resolver inputs. The configuration covers providers,
+integrations, compute, audio, dictation, and platform capabilities. The
 [configuration reference](docs/configuration.md) lists every variable, its default,
 and where it may be set, plus the unified configuration file, repository-root, and
 vocabulary options.
@@ -145,6 +145,7 @@ full command reference.
 - [Architecture](docs/architecture.md) - pipeline, background jobs, Cursor routing, runtime privacy and durability.
 - [Context capture](docs/context-capture.md) - browser and focused editor/terminal context, compositor setup.
 - [Vocabulary and entity aliases](docs/vocabulary.md) - the local transcription/routing correction store.
+- [Reproducible replay](docs/replay.md) - safe semantic capture, replay, export, and fixture review.
 - [Development](docs/development.md) - quality checks, CI matrix, observed performance.
 - [Security notes](docs/security.md) - trust model and safe-by-default behavior.
 - [Troubleshooting](docs/troubleshooting.md) - common failures and diagnostics.

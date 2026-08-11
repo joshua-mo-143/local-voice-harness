@@ -1,0 +1,47 @@
+{
+  "schema_version": 12,
+  "harness_kind": "cursor",
+  "session_id": "cursor-agent-150",
+  "harness_state": {
+    "agent_dispatch_state": "ready"
+  },
+  "checkout_state": {
+    "repository": "/repo",
+    "branch": "voice/github-pr-abcdef123456",
+    "path": "/repo-worktree",
+    "worktree_provision_state": "ready"
+  },
+  "provider_state": {
+    "github": {
+      "github_repository": "source/project",
+      "github_pull_request": 42,
+      "pull_request_worktree_state": "quarantined",
+      "pull_request_worktree_error": "checkout interrupted",
+      "fork_requested": true,
+      "fork_confirmed": true,
+      "fork_committed": true,
+      "fork_committed_at": 10,
+      "fork_operation_state": "submitted",
+      "fork_operation_source": "source/project",
+      "fork_operation_source_url": "https://github.com/source/project",
+      "fork_operation_source_default_branch": "main",
+      "fork_operation_source_private": false,
+      "fork_operation_login": "me",
+      "fork_operation_target": "me/project",
+      "fork_reconcile_attempts": 1,
+      "fork_absent_observations": 1,
+      "fork_next_reconcile_at": 15
+    }
+  },
+  "id": "abcdef123456",
+  "revision": 4,
+  "request": "review pull request 42",
+  "status": "routing",
+  "created_at": 1,
+  "delivered": false,
+  "worker_token": "claim",
+  "worker_pid": 42,
+  "worker_boot_id": "boot",
+  "worker_process_start": "start",
+  "worker_operation": "fork_create"
+}

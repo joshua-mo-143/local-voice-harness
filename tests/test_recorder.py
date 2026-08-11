@@ -145,6 +145,27 @@ class RecorderTests(unittest.TestCase):
                 state["process_start"], recorder.process_identity(os.getpid())
             )
 
+    def test_start_rollback_waits_and_escalates_after_state_write_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = _paths(Path(temporary))
+            process = mock.Mock(pid=os.getpid(), returncode=None)
+            process.poll.return_value = None
+            with (
+                mock.patch.object(recorder.subprocess, "Popen", return_value=process),
+                mock.patch.object(recorder.time, "sleep"),
+                mock.patch.object(
+                    recorder, "_write_state", side_effect=OSError("disk")
+                ),
+                mock.patch.object(
+                    recorder, "terminate_pidfd", return_value=True
+                ) as stop,
+                self.assertRaises(OSError),
+            ):
+                recorder.start_recording(paths, source="", ready=lambda: True)
+
+            stop.assert_called_once()
+            self.assertFalse(paths.process.exists())
+
     def test_cross_mode_live_owner_blocks_start_in_both_orderings(self) -> None:
         identity = recorder.process_identity(os.getpid())
         assert identity is not None

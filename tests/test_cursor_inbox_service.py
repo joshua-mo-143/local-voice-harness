@@ -11,6 +11,7 @@ from local_voice_harness.cursor.delivery import claim_delivery
 from local_voice_harness.cursor.model import CURRENT_SCHEMA_VERSION, CursorJob
 from local_voice_harness.cursor.service import CursorTurnRequest, cursor_turn
 from local_voice_harness.cursor.store import JobStore
+from local_voice_harness.responses import as_assistant_response
 from tests.support import run_concurrently
 
 
@@ -68,10 +69,11 @@ def test_list_jobs_summarizes_inbox(store: JobStore) -> None:
     _make(store, "bbbbbbbbbbbb", status="awaiting_user", label="api refactor")
 
     result = cursor_turn(CursorTurnRequest("", action="list"))
+    text = as_assistant_response(result.text).display_text
 
-    assert "You have 2 Cursor jobs." in result.text
-    assert "api refactor" in result.text
-    assert "issue 42" in result.text
+    assert "You have 2 Cursor jobs." in text
+    assert "api refactor" in text
+    assert "issue 42" in text
 
 
 def test_ambiguous_cancel_clarifies_without_cancelling(store: JobStore) -> None:
@@ -80,7 +82,7 @@ def test_ambiguous_cancel_clarifies_without_cancelling(store: JobStore) -> None:
 
     result = cursor_turn(CursorTurnRequest("cancel the issue job", action="cancel"))
 
-    assert "Which one" in result.text
+    assert "Which one" in as_assistant_response(result.text).display_text
     assert store.get("aaaaaaaaaaaa").status.value == "running"
     assert store.get("bbbbbbbbbbbb").status.value == "running"
 
@@ -116,7 +118,7 @@ def test_dismiss_suppresses_delivery_and_persists_state(store: JobStore) -> None
 
     result = cursor_turn(CursorTurnRequest("bug fix", action="dismiss"))
 
-    assert "Dismissed" in result.text
+    assert "Dismissed" in as_assistant_response(result.text).display_text
     dismissed = store.get("aaaaaaaaaaaa")
     assert dismissed.announcement_dismissed is True
     assert dismissed.delivered is True
@@ -133,7 +135,7 @@ def test_repeat_rearms_delivery_preserving_at_least_once(store: JobStore) -> Non
 
     result = cursor_turn(CursorTurnRequest("bug fix", action="repeat"))
 
-    assert "repeat" in result.text
+    assert "repeat" in as_assistant_response(result.text).display_text
     repeated = store.get("aaaaaaaaaaaa")
     assert repeated.announcement_repeated is True
     assert repeated.delivered is False
@@ -144,10 +146,14 @@ def test_repeat_rearms_delivery_preserving_at_least_once(store: JobStore) -> Non
 def test_reply_without_session_resolves_single_awaiting_job(store: JobStore) -> None:
     _make(store, "aaaaaaaaaaaa", status="awaiting_user", label="api refactor")
 
-    with mock.patch.object(service, "launch_worker") as launch:
+    with (
+        mock.patch.object(service, "launch_worker") as launch,
+        mock.patch.object(service, "_await_foreground") as foreground,
+    ):
         cursor_turn(CursorTurnRequest("use the api repository", action="reply"))
 
     launch.assert_called_once_with("aaaaaaaaaaaa")
+    foreground.assert_called_once_with("aaaaaaaaaaaa", None, timeout=5.0)
     assert store.get("aaaaaaaaaaaa").status.value == "queued"
 
 

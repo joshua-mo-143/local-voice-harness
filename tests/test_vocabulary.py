@@ -331,7 +331,9 @@ class RoutingPrepassTests(unittest.TestCase):
             mock.patch.object(
                 app,
                 "request_context",
-                side_effect=lambda text: captured.append(text) or RequestContext(text),
+                side_effect=lambda text, **_settings: (
+                    captured.append(text) or RequestContext(text)
+                ),
             ),
             mock.patch.object(
                 app,
@@ -344,7 +346,9 @@ class RoutingPrepassTests(unittest.TestCase):
             app.respond("summarize the harness repo readme")
 
         self.assertEqual(captured, ["summarize owner/harness readme"])
-        route_intent.assert_called_once_with("summarize owner/harness readme", mock.ANY)
+        route_intent.assert_called_once_with(
+            "summarize owner/harness readme", mock.ANY, settings=mock.ANY
+        )
 
 
 class VocabularyCliTests(unittest.TestCase):

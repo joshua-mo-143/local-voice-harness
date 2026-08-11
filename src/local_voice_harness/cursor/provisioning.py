@@ -8,12 +8,17 @@ from collections.abc import Callable, Mapping, Set
 from dataclasses import dataclass
 from pathlib import Path
 
+from ..diagnostic_safety import redact_diagnostic
 from ..errors import HarnessError
 from ..integrations.github import (
     GitHubClient,
     GitHubError,
+    GitHubForkPlan,
     GitHubIssue,
+    GitHubIssueLookupError,
     GitHubOperationAmbiguous,
+    GitHubProvider,
+    GitHubPullRequestCheckoutInputs,
     GitHubRepository,
 )
 from ..integrations.herdr import (
@@ -26,11 +31,15 @@ from ..integrations.herdr import (
     normalize_name,
 )
 from ..integrations.registry import (
+    IntegrationRegistry,
+    build_integration_registry,
     prompt_instructions,
     require_issue_capabilities,
+    require_issue_provider,
     resolve_issue_reference,
     route_issue_repository,
 )
+from ..local_git import LocalGitRefChanged
 from ..questions import (
     PromptOperationState,
     QuestionError,
@@ -43,6 +52,7 @@ from ..user_config import (
     PlanApprovalMode,
     PlanApprovalPreferences,
     UserConfigurationError,
+    default_user_config,
     load_plan_approval_preferences,
     record_explicit_plan_approval,
 )
@@ -69,7 +79,6 @@ from .model import (
 from .prompts import (
     classification_prompt,
     implementation_prompt,
-    plan_approval_prompt,
     planning_prompt,
     review_prompt,
     revision_prompt,
@@ -85,8 +94,20 @@ WorkerCancelled = worker_lifecycle.WorkerCancelled
 
 @dataclass(frozen=True, slots=True)
 class ClientFactories:
-    herdr: Callable[[], HerdrClient] = HerdrClient
-    github: Callable[[], GitHubClient] = GitHubClient
+    herdr: Callable[[], HerdrClient]
+    github: Callable[[], GitHubClient | GitHubProvider]
+    integrations: IntegrationRegistry | None = None
+
+
+def _github_provider(
+    factory: Callable[[], GitHubClient | GitHubProvider],
+) -> GitHubProvider:
+    integration = factory()
+    return (
+        integration
+        if isinstance(integration, GitHubProvider)
+        else GitHubProvider(integration)
+    )
 
 
 class ReservationConflict(Exception):
@@ -539,7 +560,12 @@ def _worker_fail(
     target_may_be_active: bool = False,
 ) -> None:
     del target_may_be_active  # Terminal intent always retains the cleanup fence.
-    message = (str(exc) or type(exc).__name__)[:500]
+    diagnostic = redact_diagnostic(str(exc) or type(exc).__name__, limit=500)
+    result = (
+        exc.voice_message
+        if isinstance(exc, GitHubIssueLookupError)
+        else "Cursor job failed. Check the job log for diagnostic details."
+    )
 
     def fail(job: CursorJob) -> CursorJob:
         now = time.time()
@@ -547,8 +573,8 @@ def _worker_fail(
             job,
             JobStatus.FAILED,
             now=now,
-            result=message,
-            error=message,
+            result=result,
+            error=diagnostic,
         )
 
     def guarded(job: CursorJob) -> CursorJob | None:
@@ -647,12 +673,14 @@ def _worker_block(
     message: str,
 ) -> None:
     blocked_at = time.time()
+    diagnostic = redact_diagnostic(message, limit=500)
 
     def block(job: CursorJob) -> CursorJob:
         return job.evolve_for_delivery(
             now=blocked_at,
             status=JobStatus.BLOCKED,
-            result=message[:500],
+            result="Cursor needs manual attention in Herdr.",
+            error=diagnostic,
             completed_at=blocked_at,
         )
 
@@ -661,9 +689,10 @@ def _worker_block(
 
 def _pull_request_branch(job: CursorJob) -> str:
     configured = job.worktree_branch or ""
-    if configured:
-        return configured
-    return f"voice/github-pr-{job.id}"
+    branch = configured or f"voice/github-pr-{job.id}"
+    if not re.fullmatch(r"voice/[a-z0-9][a-z0-9._/-]{0,100}", branch):
+        raise HarnessError("invalid voice pull-request branch")
+    return branch
 
 
 def _prepare_pull_request_checkout(
@@ -673,7 +702,7 @@ def _prepare_pull_request_checkout(
     job: CursorJob,
     checkpoint: Callable[[], None] | None = None,
     *,
-    github_factory: Callable[[], GitHubClient] | None = None,
+    github_factory: Callable[[], GitHubClient | GitHubProvider] | None = None,
 ) -> CursorJob | None:
     if not job.github_pull_request:
         return job
@@ -682,9 +711,9 @@ def _prepare_pull_request_checkout(
     repository = Path(job.repository or "").resolve()
     checkout_value = job.worktree_path or ""
     checkout = Path(checkout_value).resolve() if checkout_value else repository
-    branch = _pull_request_branch(job)
     number = job.github_pull_request
     try:
+        branch = _pull_request_branch(job)
         if checkout == repository:
             raise HarnessError(
                 "refusing to check out a pull request in the shared repository clone"
@@ -693,19 +722,74 @@ def _prepare_pull_request_checkout(
             raise HarnessError("pull-request worktree is missing or invalid")
         if checkpoint is not None:
             checkpoint()
-        github = (github_factory or GitHubClient)()
-        if checkpoint is None:
-            checked_out_branch = github.checkout_pull_request(
-                checkout, number, branch=branch
+        github = _github_provider(github_factory or GitHubClient)
+        if not job.github_repository:
+            raise HarnessError("pull-request repository metadata is missing")
+        repository_name = job.github_repository
+        checked_out_branch: str | None = None
+        for attempt in range(2):
+            plan = github.plan_pull_request(repository_name, number)
+            source_name = plan.source.name_with_owner
+            remote_url = plan.checkout.remote_url
+            head_ref = plan.checkout.head_ref
+            head_oid = plan.checkout.head_oid
+
+            def refresh_checkout_inputs(
+                current: CursorJob,
+                source_name: str = source_name,
+                remote_url: str = remote_url,
+                head_ref: str = head_ref,
+                head_oid: str = head_oid,
+            ) -> CursorJob:
+                return current.evolve(
+                    github_repository=source_name,
+                    pull_request_remote_url=remote_url,
+                    pull_request_head_ref=head_ref,
+                    pull_request_head_oid=head_oid,
+                )
+
+            refreshed = _worker_change(
+                store,
+                job_id,
+                token,
+                {JobStatus.ROUTING},
+                refresh_checkout_inputs,
             )
-        else:
-            checked_out_branch = github.checkout_pull_request(
-                checkout, number, branch=branch, checkpoint=checkpoint
+            if refreshed is None:
+                return None
+            job = refreshed
+            if checkpoint is not None:
+                checkpoint()
+            inputs = GitHubPullRequestCheckoutInputs(
+                remote_url=job.pull_request_remote_url or "",
+                head_ref=job.pull_request_head_ref or "",
+                head_oid=job.pull_request_head_oid or "",
             )
+            github.validate_pull_request_checkout_inputs(
+                job.github_repository or "",
+                number,
+                inputs,
+            )
+            try:
+                checked_out_branch = github.local_git.checkout_remote_ref(
+                    checkout,
+                    remote_url=inputs.remote_url,
+                    remote_ref=inputs.head_ref,
+                    branch=branch,
+                    expected_oid=inputs.head_oid,
+                    checkpoint=checkpoint,
+                )
+            except LocalGitRefChanged:
+                if attempt == 0:
+                    if checkpoint is not None:
+                        checkpoint()
+                    continue
+                raise
+            break
         if checkpoint is not None:
             checkpoint()
     except Exception as exc:
-        message = (str(exc) or type(exc).__name__)[:500]
+        message = redact_diagnostic(str(exc) or type(exc).__name__, limit=500)
 
         def quarantine(current: CursorJob) -> CursorJob:
             return current.evolve(
@@ -961,6 +1045,33 @@ def _begin_fork_operation(
         )
 
     return _worker_change(store, job_id, token, {JobStatus.ROUTING}, begin)
+
+
+def _persisted_fork_plan(job: CursorJob) -> GitHubForkPlan | None:
+    if job.fork_operation_state is None:
+        return None
+    source_name = job.fork_operation_source or ""
+    source_url = job.fork_operation_source_url or ""
+    target = job.fork_operation_target or ""
+    if not all((source_name, source_url, target)):
+        raise HarnessError("persisted GitHub fork operation is incomplete")
+    login = job.fork_operation_login or target.split("/", 1)[0]
+    if (
+        job.github_repository
+        and job.github_repository.casefold() != source_name.casefold()
+    ):
+        raise HarnessError("persisted GitHub fork source does not match the job")
+    return GitHubForkPlan(
+        source=GitHubRepository(
+            name_with_owner=source_name,
+            url=source_url,
+            is_private=job.fork_operation_source_private,
+            default_branch=job.fork_operation_source_default_branch or "",
+            parent=job.fork_operation_source_parent,
+        ),
+        login=login,
+        target=target,
+    )
 
 
 def _mark_fork_dispatching(store: JobStore, job_id: str, token: str) -> None:
@@ -1397,6 +1508,7 @@ def _begin_phase_turn(
             prompt_operation_phase=None,
             prompt_operation_turn=None,
             prompt_operation_target=None,
+            prompt_operation_agent_session=None,
             prompt_baseline_sequence=None,
         )
 
@@ -1586,15 +1698,6 @@ def _advance_workflow_output(
             )
             return None
         if decision == "approve":
-            planner_target = job.participant_target(WorkflowParticipant.PLANNER)
-            if not planner_target:
-                _workflow_block(
-                    store,
-                    job.id,
-                    worker_token,
-                    "The approved plan has no live Plan Mode agent.",
-                )
-                return None
             plan = store.read_artifact(job.id, job.plan_artifact, kind="plan")
             auto_approval = _auto_plan_approval_allowed(
                 job,
@@ -1608,8 +1711,6 @@ def _advance_workflow_output(
                 if auto_approval:
                     return current.evolve(
                         workflow_phase=WorkflowPhase.IMPLEMENTING.value,
-                        active_participant=WorkflowParticipant.PLANNER.value,
-                        herdr_target=planner_target,
                         review_artifact=reference,
                         prompt_operation_state="none",
                         review_approved=True,
@@ -1623,7 +1724,8 @@ def _advance_workflow_output(
                     current,
                     QuestionSpec(
                         "The reviewed implementation plan is ready. Should I "
-                        "approve Cursor's Build step and start implementation? "
+                        "approve it and start implementation in a fresh Agent-mode "
+                        "session? "
                         "Say yes to implement it, or no to cancel this job.",
                         sensitivity=QuestionSensitivity.ARCHITECTURE,
                     ),
@@ -2089,14 +2191,9 @@ def _execute_phase_prompt(
             baseline = int(raw_baseline) if isinstance(raw_baseline, int | str) else 0
         except (TypeError, ValueError) as exc:
             raise HarnessError("Herdr returned an invalid prompt sequence") from exc
-        if job.plan_approval_state == "approved" and (
-            baseline != job.plan_approval_state_change_sequence
-            or agent_session_identity(baseline_agent.get("agent_session"))
-            != job.plan_approval_agent_session
-        ):
-            raise HarnessError(
-                "Cursor Plan Mode boundary changed before approval submission"
-            )
+        baseline_session = agent_session_identity(baseline_agent.get("agent_session"))
+        if baseline_session is None:
+            raise HarnessError("Herdr returned no agent session for prompt fencing")
 
         def plan_prompt(current: CursorJob) -> CursorJob:
             if (
@@ -2110,6 +2207,7 @@ def _execute_phase_prompt(
                 prompt_operation_phase=phase.value,
                 prompt_operation_turn=current.turn,
                 prompt_operation_target=target,
+                prompt_operation_agent_session=baseline_session,
                 prompt_baseline_sequence=baseline,
                 continuation=(
                     False
@@ -2135,13 +2233,10 @@ def _execute_phase_prompt(
         observed = client.get_agent(target)
         checkpoint()
         sequence = int(observed.get("state_change_seq") or 0)
-        approval_session_matches = (
-            job.plan_approval_state != "approved"
-            or agent_session_identity(observed.get("agent_session"))
-            == job.plan_approval_agent_session
-        )
+        observed_session = agent_session_identity(observed.get("agent_session"))
         if (
-            approval_session_matches
+            observed_session == job.prompt_operation_agent_session
+            and observed_session is not None
             and job.prompt_baseline_sequence is not None
             and job.prompt_baseline_sequence >= 0
             and sequence != job.prompt_baseline_sequence
@@ -2204,17 +2299,14 @@ def _execute_phase_prompt(
                 target,
                 token=job.turn_token or "",
                 checkpoint=checkpoint,
-                expected_agent_session=(
-                    job.plan_approval_agent_session
-                    if phase == WorkflowPhase.IMPLEMENTING
-                    and job.plan_approval_source in {"auto", "explicit"}
-                    else None
-                ),
+                expected_agent_session=job.prompt_operation_agent_session,
                 active_marker=(
                     "WORKFLOW_PLAN"
                     if phase in {WorkflowPhase.PLANNING, WorkflowPhase.REVISING}
                     else None
                 ),
+                allow_interactive_plan_boundary=phase
+                in {WorkflowPhase.PLANNING, WorkflowPhase.REVISING},
             )
             completion = (outcome.output, outcome.status)
             if phase in {WorkflowPhase.PLANNING, WorkflowPhase.REVISING}:
@@ -2264,18 +2356,6 @@ def _execute_phase_prompt(
         raise HarnessError(f"invalid durable prompt state {state}")
 
     operation_baseline = job.prompt_baseline_sequence
-
-    def before_agent(agent: dict[str, object]) -> None:
-        if job.plan_approval_state != "approved":
-            return
-        if (
-            agent_session_identity(agent.get("agent_session"))
-            != job.plan_approval_agent_session
-            or _state_change_sequence(agent) != job.plan_approval_state_change_sequence
-        ):
-            raise HarnessError(
-                "Cursor Plan Mode boundary changed before approval submission"
-            )
 
     def before_submit(observed_baseline: int) -> None:
         if observed_baseline != operation_baseline:
@@ -2330,18 +2410,14 @@ def _execute_phase_prompt(
             baseline_sequence=job.prompt_baseline_sequence,
             before_submit=before_submit,
             accepted=accepted,
-            before_agent=before_agent,
-            expected_agent_session=(
-                job.plan_approval_agent_session
-                if job.plan_approval_state == "approved"
-                else None
-            ),
+            expected_agent_session=job.prompt_operation_agent_session,
             active_marker=(
                 "WORKFLOW_PLAN"
                 if phase in {WorkflowPhase.PLANNING, WorkflowPhase.REVISING}
                 else None
             ),
-            allow_enter_fallback=job.plan_approval_state != "approved",
+            allow_interactive_plan_boundary=phase
+            in {WorkflowPhase.PLANNING, WorkflowPhase.REVISING},
         )
     except HerdrError as exc:
         if exc.code == "interactive_questionnaire":
@@ -2398,7 +2474,9 @@ def _run_tiered_workflow(
     checkpoint: Callable[[], None],
     *,
     initial_output: tuple[str, str] | None = None,
+    integrations: IntegrationRegistry | None = None,
 ) -> None:
+    registry = integrations or build_integration_registry(default_user_config())
     pending_output = initial_output
     while True:
         checkpoint()
@@ -2427,11 +2505,7 @@ def _run_tiered_workflow(
             WorkflowParticipant.REVIEWER
             if phase == WorkflowPhase.REVIEWING
             else (
-                (
-                    WorkflowParticipant.PLANNER
-                    if job.plan_approval_state in {"approved", "observed"}
-                    else WorkflowParticipant.IMPLEMENTER
-                )
+                WorkflowParticipant.IMPLEMENTER
                 if phase == WorkflowPhase.IMPLEMENTING
                 else WorkflowParticipant.PLANNER
             )
@@ -2446,8 +2520,16 @@ def _run_tiered_workflow(
                 return
             job = next_turn
             token = job.turn_token or ""
-        active_issue_key = resolve_issue_reference(job.issue_key)
-        integration_instructions = prompt_instructions(active_issue_key)
+        active_issue_key = resolve_issue_reference(
+            job.issue_key,
+            registry,
+            provider=job.issue_provider,
+        )
+        integration_instructions = prompt_instructions(
+            active_issue_key,
+            registry,
+            provider=job.issue_provider,
+        )
         if phase == WorkflowPhase.CLASSIFYING:
             prompt = classification_prompt(
                 job.request,
@@ -2501,29 +2583,16 @@ def _run_tiered_workflow(
             issue_reference = job.issue_key or (
                 f"issue {job.github_issue}" if job.github_issue else None
             )
-            if job.plan_approval_state in {"approved", "observed"}:
-                if plan is None:
-                    raise HarnessError("plan approval requires a durable plan")
-                prompt = plan_approval_prompt(
-                    _prompt_request(job),
-                    token,
-                    plan=plan,
-                    github_issue_context=job.github_issue_context,
-                    classification_reason=job.workflow_classification_reason,
-                    issue_reference=issue_reference,
-                    integration_instructions=integration_instructions,
-                )
-            else:
-                prompt = implementation_prompt(
-                    _prompt_request(job),
-                    token,
-                    plan=plan,
-                    continuation=job.continuation or bool(job.continuation_answer),
-                    github_issue_context=job.github_issue_context,
-                    classification_reason=job.workflow_classification_reason,
-                    issue_reference=issue_reference,
-                    integration_instructions=integration_instructions,
-                )
+            prompt = implementation_prompt(
+                _prompt_request(job),
+                token,
+                plan=plan,
+                continuation=job.continuation or bool(job.continuation_answer),
+                github_issue_context=job.github_issue_context,
+                classification_reason=job.workflow_classification_reason,
+                issue_reference=issue_reference,
+                integration_instructions=integration_instructions,
+            )
         else:
             raise HarnessError(f"unsupported workflow phase {phase.value}")
         pending_output = _execute_phase_prompt(
@@ -2659,7 +2728,14 @@ def run_claimed_worker(  # pyright: ignore[reportGeneralTypeIssues]
     context: worker_lifecycle.WorkerContext,
     factories: ClientFactories | None = None,
 ) -> None:
-    clients = factories or ClientFactories(HerdrClient, GitHubClient)
+    if factories is None:
+        registry = build_integration_registry(default_user_config())
+        clients = ClientFactories(HerdrClient, GitHubClient, registry)
+    else:
+        clients = factories
+        registry = clients.integrations or build_integration_registry(
+            default_user_config()
+        )
     store = context.store
     job_id = context.job.id
     job = context.job
@@ -2675,9 +2751,18 @@ def run_claimed_worker(  # pyright: ignore[reportGeneralTypeIssues]
             checkpoint()
             _resume_plan_approval_completion(store, job, worker_token)
             return
-        active_issue_key = resolve_issue_reference(job.issue_key)
+        require_issue_provider(job.issue_provider, registry)
+        active_issue_key = resolve_issue_reference(
+            job.issue_key,
+            registry,
+            provider=job.issue_provider,
+        )
         if active_issue_key:
-            require_issue_capabilities(active_issue_key)
+            require_issue_capabilities(
+                active_issue_key,
+                registry,
+                provider=job.issue_provider,
+            )
         client = clients.herdr()
         checkpoint()
         client.ensure_server()
@@ -2710,6 +2795,7 @@ def run_claimed_worker(  # pyright: ignore[reportGeneralTypeIssues]
                 worker_token,
                 client,
                 checkpoint,
+                integrations=registry,
             )
             return
 
@@ -2903,18 +2989,24 @@ def run_claimed_worker(  # pyright: ignore[reportGeneralTypeIssues]
                     )
                     return
                 checkpoint()
-                provisioned_pr = clients.github().provision_pull_request(
-                    github_repository, number, checkpoint=checkpoint
+                github = _github_provider(clients.github)
+                pull_request_plan = github.plan_pull_request(github_repository, number)
+                checkpoint()
+                repository = github.materialize_repository(
+                    pull_request_plan.source,
+                    checkpoint=checkpoint,
                 )
                 checkpoint()
-                repository = provisioned_pr.checkout
                 issue_key = None
 
                 def record_pull_request(current: CursorJob) -> CursorJob:
                     return current.evolve(
-                        github_repository=provisioned_pr.source.name_with_owner,
-                        repository=str(provisioned_pr.checkout),
+                        github_repository=pull_request_plan.source.name_with_owner,
+                        repository=str(repository),
                         pull_request_worktree_state="provisioning",
+                        pull_request_remote_url=pull_request_plan.checkout.remote_url,
+                        pull_request_head_ref=pull_request_plan.checkout.head_ref,
+                        pull_request_head_oid=pull_request_plan.checkout.head_oid,
                     )
 
                 updated = _worker_change(
@@ -2949,18 +3041,35 @@ def run_claimed_worker(  # pyright: ignore[reportGeneralTypeIssues]
                         clarification_kind="fork_confirmation",
                     )
                     return
-                github = clients.github()
+                github = _github_provider(clients.github)
                 checkpoint()
-                source, login, fork_target = github.prepare_public_fork(
-                    github_repository
-                )
+                fork_plan = _persisted_fork_plan(job)
+                if fork_plan is None:
+                    fork_plan = github.plan_fork(github_repository)
+                else:
+                    fork_plan = github.refresh_fork_plan(fork_plan)
+                    github.validate_fork_plan(
+                        fork_plan,
+                        materialized_repository=(
+                            job.fork_repository
+                            if job.fork_operation_state == "exists"
+                            else None
+                        ),
+                    )
+                source = fork_plan.source
+                login = fork_plan.login
+                fork_target = fork_plan.target
                 checkpoint()
                 if job.fork_operation_state == "exists" and job.fork_repository:
-                    fork = github.reconcile_fork(source, fork_target)
+                    fork = github.observe_fork(fork_plan)
                     if fork is None:
                         raise HarnessError(
                             "reconciled GitHub fork is no longer observable"
                         )
+                elif job.fork_operation_state not in {None, "planned"}:
+                    raise HarnessError(
+                        "GitHub fork operation requires reconciliation before retry"
+                    )
                 else:
                     updated = _begin_fork_operation(
                         store, job_id, worker_token, source, login, fork_target
@@ -2969,9 +3078,9 @@ def run_claimed_worker(  # pyright: ignore[reportGeneralTypeIssues]
                         return
                     job = updated
                     try:
-                        fork = github.ensure_fork(
-                            source,
-                            login,
+                        fork = github.submit_fork(
+                            fork_plan,
+                            confirmed=job.fork_confirmed,
                             checkpoint=checkpoint,
                             before_submit=lambda: _mark_fork_dispatching(
                                 store, job_id, worker_token
@@ -2983,9 +3092,7 @@ def run_claimed_worker(  # pyright: ignore[reportGeneralTypeIssues]
                         current = store.get(job_id)
                         was_submitted = current.fork_operation_state == "submitted"
                         visible = (
-                            github.reconcile_fork(source, fork_target)
-                            if was_submitted
-                            else None
+                            github.observe_fork(fork_plan) if was_submitted else None
                         )
                         _settle_fork_operation(
                             store,
@@ -3011,7 +3118,11 @@ def run_claimed_worker(  # pyright: ignore[reportGeneralTypeIssues]
                 checkpoint()
                 if job.status != JobStatus.ROUTING:
                     raise WorkerCancelled
-                checkout = github.ensure_clone(source, fork, checkpoint=checkpoint)
+                checkout = github.materialize_fork(
+                    fork_plan,
+                    fork,
+                    checkpoint=checkpoint,
+                )
                 checkpoint()
                 repository = checkout
 
@@ -3045,8 +3156,15 @@ def run_claimed_worker(  # pyright: ignore[reportGeneralTypeIssues]
                 checkpoint()
                 repositories = client.repository_roots()
                 checkpoint()
-                provisioned_issue = clients.github().provision_issue(
-                    GitHubIssue(owner, repository_name, number),
+                github = _github_provider(clients.github)
+                issue = GitHubIssue(owner, repository_name, number)
+                # The preflight may have happened long ago; verify the issue
+                # again so a vanished or newly inaccessible issue fails with
+                # the same classified, voice-safe error.
+                github.resolve_issue(issue)
+                checkpoint()
+                provisioned_issue = github.provision_issue(
+                    issue,
                     candidates=repositories,
                     checkpoint=checkpoint,
                 )
@@ -3096,6 +3214,8 @@ def run_claimed_worker(  # pyright: ignore[reportGeneralTypeIssues]
                     token=f"{job_id}-route",
                     reserved=reserved_targets(store, job_id),
                     checkpoint=checkpoint,
+                    integrations=registry,
+                    provider=job.issue_provider,
                 )
                 if routed is not None:
                     repository, _confidence, reason = routed
@@ -3318,6 +3438,7 @@ def run_claimed_worker(  # pyright: ignore[reportGeneralTypeIssues]
             worker_token,
             client,
             checkpoint,
+            integrations=registry,
         )
     except WorkerCancelled:
         return

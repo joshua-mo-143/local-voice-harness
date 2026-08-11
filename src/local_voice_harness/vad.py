@@ -1,17 +1,16 @@
 from __future__ import annotations
 
-import math
-import os
+import select
 import signal
 import subprocess
 import threading
 import wave
-from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 from .errors import HarnessError
+from .user_config import DictationSettings
 
 SAMPLE_RATE = 16_000
 FRAME_MS = 80
@@ -19,43 +18,6 @@ FRAME_SAMPLES = SAMPLE_RATE * FRAME_MS // 1000
 FRAME_BYTES = FRAME_SAMPLES * 2
 VAD_CHUNK_MS = 20
 VAD_CHUNK_BYTES = SAMPLE_RATE * VAD_CHUNK_MS // 1000 * 2
-
-
-def _positive_number(
-    environment: Mapping[str, str], name: str, default: float
-) -> float:
-    raw = environment.get(name, str(default))
-    try:
-        value = float(raw)
-    except ValueError as exc:
-        raise HarnessError(f"{name} must be a positive number") from exc
-    if not math.isfinite(value) or value <= 0:
-        raise HarnessError(f"{name} must be a positive number")
-    return value
-
-
-def _nonnegative_number(
-    environment: Mapping[str, str], name: str, default: float
-) -> float:
-    raw = environment.get(name, str(default))
-    try:
-        value = float(raw)
-    except ValueError as exc:
-        raise HarnessError(f"{name} must be a non-negative number") from exc
-    if not math.isfinite(value) or value < 0:
-        raise HarnessError(f"{name} must be a non-negative number")
-    return value
-
-
-def _positive_integer(environment: Mapping[str, str], name: str, default: int) -> int:
-    raw = environment.get(name, str(default))
-    try:
-        value = int(raw)
-    except ValueError as exc:
-        raise HarnessError(f"{name} must be a positive integer") from exc
-    if value <= 0:
-        raise HarnessError(f"{name} must be a positive integer")
-    return value
 
 
 @dataclass(frozen=True)
@@ -66,20 +28,12 @@ class VadCaptureSettings:
     start_speech_frames: int
 
     @classmethod
-    def from_environment(
-        cls, environment: Mapping[str, str] = os.environ
-    ) -> VadCaptureSettings:
+    def from_dictation(cls, settings: DictationSettings) -> VadCaptureSettings:
         return cls(
-            end_silence_ms=_positive_number(
-                environment, "DICTATION_VAD_END_SILENCE_MS", 900
-            ),
-            max_seconds=_positive_number(environment, "DICTATION_VAD_MAX_SECONDS", 120),
-            minimum_rms=_nonnegative_number(
-                environment, "DICTATION_VAD_MIN_SPEECH_RMS", 1100
-            ),
-            start_speech_frames=_positive_integer(
-                environment, "DICTATION_VAD_START_SPEECH_FRAMES", 3
-            ),
+            end_silence_ms=settings.vad_end_silence_ms,
+            max_seconds=settings.vad_max_seconds,
+            minimum_rms=settings.vad_min_speech_rms,
+            start_speech_frames=settings.vad_start_speech_frames,
         )
 
 
@@ -115,12 +69,31 @@ class SpeechDetector:
         )
 
 
-def _read_frame(process: subprocess.Popen[bytes]) -> bytes:
+def _read_frame(
+    process: subprocess.Popen[bytes],
+    stop_requested: threading.Event,
+    *,
+    poll_timeout: float = 0.5,
+) -> bytes:
     if process.stdout is None:
         raise HarnessError("microphone stream is unavailable")
     data = bytearray()
     while len(data) < FRAME_BYTES:
-        chunk = process.stdout.read(FRAME_BYTES - len(data))
+        if stop_requested.is_set():
+            raise HarnessError("VAD dictation was cancelled")
+        stdout = process.stdout
+        pollable = False
+        try:
+            pollable = select.select([stdout], [], [], poll_timeout) == (
+                [stdout],
+                [],
+                [],
+            )
+        except (OSError, ValueError):
+            pollable = True
+        if not pollable:
+            continue
+        chunk = stdout.read(FRAME_BYTES - len(data))
         if not chunk:
             detail = (
                 process.stderr.read().decode(errors="replace").strip()
@@ -181,9 +154,9 @@ def capture_vad_audio(
             output.setsampwidth(2)
             output.setframerate(SAMPLE_RATE)
             while True:
-                frame = _read_frame(process)
                 if stop_requested.is_set():
                     raise HarnessError("VAD dictation was cancelled")
+                frame = _read_frame(process, stop_requested)
                 speech_detected = detector.is_speech(frame)
                 if not has_speech:
                     if speech_detected:

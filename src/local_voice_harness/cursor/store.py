@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
+from ..integrations.github import GitHubError, load_github_provider_state
 from .model import (
     ACTIVE_STATUSES,
     CURRENT_SCHEMA_VERSION,
@@ -291,7 +292,12 @@ def _quarantine_may_reserve(
     harness_state = _mapping_field(raw, "harness_state")
     checkout_state = _mapping_field(raw, "checkout_state")
     provider_state = _mapping_field(raw, "provider_state")
-    github_state = _mapping_field(provider_state, "github")
+    try:
+        github_state = load_github_provider_state(
+            _mapping_field(provider_state, "github")
+        )
+    except GitHubError:
+        return True
     if status in {item.value for item in TERMINAL_STATUSES}:
         uncertain = any(
             str(value or "")
@@ -926,7 +932,7 @@ def _ticket_identity(job: CursorJob) -> tuple[str, ...] | None:
             str(job.github_issue),
         )
     if job.issue_key:
-        return ("linear", job.issue_key.casefold())
+        return (job.issue_provider or "legacy", job.issue_key.casefold())
     return None
 
 
@@ -1606,6 +1612,14 @@ class JobStore:
             if child.parent_job_id != parent.id:
                 raise JobValidationError(
                     "follow-up child must reference its parent job id"
+                )
+            if child.harness_kind != parent.harness_kind:
+                raise JobValidationError(
+                    "follow-up child must inherit parent harness_kind exactly"
+                )
+            if child.issue_provider != parent.issue_provider:
+                raise JobValidationError(
+                    "follow-up child must inherit parent issue_provider exactly"
                 )
             for field in (
                 "repository",

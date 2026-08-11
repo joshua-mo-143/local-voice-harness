@@ -3,7 +3,6 @@ from __future__ import annotations
 import contextlib
 import fcntl
 import json
-import os
 import queue
 import select
 import shutil
@@ -19,9 +18,8 @@ from pathlib import Path
 from ..config import STATE_DIR, TTS_SOCKET
 from ..errors import HarnessError
 from ..ipc import unix_request
+from ..user_config import AudioSettings, default_user_config
 from .stream import STREAM_POLL_SECONDS, STREAM_TIMEOUT_SECONDS, TTSStreamParser
-
-PLAYBACK_LATENCY = os.environ.get("VOICE_HARNESS_PLAYBACK_LATENCY", "100ms")
 
 
 @contextlib.contextmanager
@@ -35,14 +33,17 @@ def playback_slot() -> Iterator[None]:
             fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
 
 
-def synthesize_and_play(text: str) -> dict[str, object]:
+def synthesize_and_play(
+    text: str, settings: AudioSettings | None = None
+) -> dict[str, object]:
+    audio = settings or default_user_config().audio
     output = STATE_DIR / f"reply-{uuid.uuid4().hex}.wav"
     request = (
         json.dumps(
             {
                 "text": text,
                 "output": str(output),
-                "voice": os.environ.get("VOICE_HARNESS_VOICE", ""),
+                "voice": audio.voice,
             }
         ).encode()
         + b"\n"
@@ -81,8 +82,9 @@ def synthesize_and_play(text: str) -> dict[str, object]:
 class StreamingPlayback:
     """One cancellable, chunked TTS request feeding one PipeWire stream."""
 
-    def __init__(self, text: str) -> None:
+    def __init__(self, text: str, settings: AudioSettings | None = None) -> None:
         self.text = text
+        self.audio = settings or default_user_config().audio
         self.request_id = uuid.uuid4().hex
         self.cancelled = threading.Event()
         self._cancel_sent = threading.Event()
@@ -142,7 +144,7 @@ class StreamingPlayback:
                 "--channels=1",
                 f"--rate={sample_rate}",
                 "--format=s16",
-                f"--latency={PLAYBACK_LATENCY}",
+                f"--latency={self.audio.playback_latency}",
                 "-",
             ],
             stdin=subprocess.PIPE,
@@ -239,7 +241,7 @@ class StreamingPlayback:
             stream_socket.connect(str(TTS_SOCKET))
             request = {
                 "text": self.text,
-                "voice": os.environ.get("VOICE_HARNESS_VOICE", ""),
+                "voice": self.audio.voice,
                 "stream": True,
                 "request_id": self.request_id,
             }
@@ -320,6 +322,7 @@ def stream_and_play(
     text: str,
     *,
     should_interrupt: Callable[[], bool] | None = None,
+    settings: AudioSettings | None = None,
 ) -> dict[str, object]:
     with playback_slot():
-        return StreamingPlayback(text).run(should_interrupt=should_interrupt)
+        return StreamingPlayback(text, settings).run(should_interrupt=should_interrupt)

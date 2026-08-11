@@ -130,6 +130,8 @@ raise SystemExit(int(os.environ.get("FAKE_SYSTEMCTL_EXIT", "3")))
                 "run",
                 "--project",
                 str(PROJECT_ROOT),
+                "--extra",
+                "wake",
                 "voice-harness",
                 "text",
                 "request with spaces",
@@ -236,6 +238,36 @@ raise SystemExit(int(os.environ.get("FAKE_SYSTEMCTL_EXIT", "3")))
         self.assertIn("unable to determine", process.stderr)
         self.assertIn("No services were changed.", process.stderr)
         self.assertFalse(self.uv_record.exists())
+
+    def test_config_uses_checkout_with_isolated_homes(self) -> None:
+        process = self._run(
+            "config",
+            "show",
+            "audio.wake_threshold",
+            environment=self._environment(FAKE_UV_EXIT="0"),
+        )
+
+        self.assertEqual(process.returncode, 0, process.stderr)
+        invocation = self._uv_invocation()
+        self.assertEqual(
+            invocation["arguments"],
+            [
+                "run",
+                "--project",
+                str(PROJECT_ROOT),
+                "--extra",
+                "wake",
+                "voice-harness",
+                "config",
+                "show",
+                "audio.wake_threshold",
+            ],
+        )
+        self.assertEqual(
+            self._uv_environment()["XDG_CONFIG_HOME"],
+            str(PROJECT_ROOT / ".dev" / "config"),
+        )
+        self.assertFalse(self.systemctl_record.exists())
 
     def test_rejects_commands_outside_the_narrow_surface(self) -> None:
         for arguments in (("services", "stop"), ("text",), ("wake", "--check")):

@@ -2,9 +2,9 @@
 
 This module introduces a single typed model for user-facing defaults instead of
 spreading settings across ``backends.toml``, environment variables, backend
-environment files, and systemd drop-ins. It is additive: existing installations
-that rely on ``backends.toml`` and environment overrides keep working unchanged,
-and no runtime consumer is rewired here.
+environment files, and systemd drop-ins. Existing installations that rely on
+``backends.toml`` and environment overrides keep working unchanged; runtime
+composition roots consume only the resolved typed snapshot.
 
 Precedence, from lowest to highest, is::
 
@@ -21,6 +21,7 @@ import json
 import math
 import os
 import re
+import shlex
 import tempfile
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import contextmanager
@@ -37,7 +38,14 @@ from .config import (
     xdg_config_home,
 )
 
-_TOP_LEVEL_SECTIONS = ("providers", "integrations", "compute", "audio", "platform")
+_TOP_LEVEL_SECTIONS = (
+    "providers",
+    "integrations",
+    "compute",
+    "audio",
+    "dictation",
+    "platform",
+)
 _PROVIDER_TABLES = ("llm", "tts", "venice")
 _LLM_KEYS = ("provider", "model", "endpoint", "timeout")
 _TTS_KEYS = ("provider", "model", "voice", "speed", "endpoint", "timeout")
@@ -61,10 +69,25 @@ _AUDIO_KEYS = (
     "playback_quiet_timeout_seconds",
     "playback_latency",
 )
+_DICTATION_KEYS = (
+    "source",
+    "inject",
+    "prompt",
+    "replacements",
+    "vad_end_silence_ms",
+    "vad_max_seconds",
+    "vad_min_speech_rms",
+    "vad_start_speech_frames",
+)
 _PLATFORM_KEYS = (
     "project_root",
     "github_root",
+    "herdr_worktree_root",
+    "gh_bin",
+    "git_bin",
     "herdr_bin",
+    "github_timeout_seconds",
+    "herdr_timeout_seconds",
     "focused_app_context",
     "focused_app_deny_classes",
     "focused_app_max_chars",
@@ -81,6 +104,7 @@ _FALSY = {"0", "false", "no", "off"}
 _BARGE_IN_MODES = {"wake", "vad", "off"}
 _DICTATION_BACKENDS = {"parakeet", "whisper"}
 _DICTATION_LANGUAGES = {"en", "zh", "english", "chinese", "auto"}
+_DICTATION_INJECT_MODES = {"auto", "paste", "type", "stdout"}
 _PLAYBACK_LATENCY = re.compile(r"^\d+(?:\.\d+)?(?:us|ms|s)$")
 _CREDENTIAL_KEYS = {"api_key", "api_key_file"}
 _PLAN_APPROVAL_VERSION = 1
@@ -153,13 +177,46 @@ class AudioSettings:
     playback_latency: str = "100ms"
 
 
+DEFAULT_DICTATION_PROMPT = (
+    "Technical software engineering dictation that may mention Cursor, Herdr, "
+    "code, files, functions, terminals, and command-line tools."
+)
+DEFAULT_DICTATION_REPLACEMENTS = (
+    ("herder", "herdr"),
+    ("cursa", "Cursor"),
+    ("curser", "Cursor"),
+    ("service", "Jarvis"),
+    ("jarvus", "Jarvis"),
+    ("jervis", "Jarvis"),
+)
+
+
+@dataclass(frozen=True)
+class DictationSettings:
+    """Focused-window injection, transcription prompting, and VAD tuning."""
+
+    source: str = config.DEFAULT_SOURCE
+    inject: str = "auto"
+    prompt: str = DEFAULT_DICTATION_PROMPT
+    replacements: tuple[tuple[str, str], ...] = DEFAULT_DICTATION_REPLACEMENTS
+    vad_end_silence_ms: float = 900.0
+    vad_max_seconds: float = 120.0
+    vad_min_speech_rms: float = 1100.0
+    vad_start_speech_frames: int = 3
+
+
 @dataclass(frozen=True)
 class PlatformSettings:
     """Local trust boundaries and desktop capability toggles."""
 
     project_root: Path
     github_root: Path
+    herdr_worktree_root: Path
+    gh_bin: Path
+    git_bin: Path
     herdr_bin: Path
+    github_timeout_seconds: float = 30.0
+    herdr_timeout_seconds: float = 30.0
     focused_app_context_enabled: bool = True
     focused_app_deny_classes: tuple[str, ...] = config.DEFAULT_FOCUSED_APP_DENY_CLASSES
     focused_app_max_chars: int = 12_000
@@ -179,6 +236,7 @@ class UserConfig:
     integrations: IntegrationSettings
     compute: ComputeSettings
     audio: AudioSettings
+    dictation: DictationSettings
     platform: PlatformSettings
 
 
@@ -331,6 +389,87 @@ def _as_classes(value: object, *, label: str) -> tuple[str, ...]:
     return tuple(part for part in (piece.strip().casefold() for piece in parts) if part)
 
 
+def _as_replacements(value: object, *, label: str) -> tuple[tuple[str, str], ...]:
+    if isinstance(value, Mapping):
+        entries = ((str(source), str(target)) for source, target in value.items())
+    else:
+        entries = (
+            tuple(entry.split(":", 1))
+            for entry in str(value).split(";")
+            if entry.strip() and ":" in entry
+        )
+    replacements = tuple(
+        (source.strip(), target.strip()) for source, target in entries if source.strip()
+    )
+    return replacements
+
+
+def backend_environment_path(
+    environment: Mapping[str, str] = os.environ,
+    *,
+    home: Path | None = None,
+) -> Path:
+    """Return the legacy dictation ``backend.env`` path."""
+
+    return xdg_config_home(environment, home=home) / "dictation" / "backend.env"
+
+
+def load_backend_environment(path: Path) -> dict[str, str]:
+    """Parse the allowlisted legacy dictation selectors."""
+
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except FileNotFoundError:
+        return {}
+    except (OSError, UnicodeDecodeError) as exc:
+        raise UserConfigurationError(
+            f"could not read backend environment {path}: {exc}"
+        ) from exc
+    environment: dict[str, str] = {}
+    allowed = {
+        "DICTATION_BACKEND",
+        "DICTATION_MODEL",
+        "DICTATION_LANGUAGE",
+        "DICTATION_COMPUTE",
+        "DICTATION_QUANTIZATION",
+    }
+    for line_number, raw_line in enumerate(lines, start=1):
+        try:
+            fields = shlex.split(raw_line, comments=True, posix=True)
+        except ValueError as exc:
+            raise UserConfigurationError(
+                f"{path}:{line_number}: invalid environment assignment: {exc}"
+            ) from exc
+        if not fields:
+            continue
+        if len(fields) != 1 or "=" not in fields[0]:
+            raise UserConfigurationError(
+                f"{path}:{line_number}: invalid environment assignment"
+            )
+        key, value = fields[0].split("=", 1)
+        if key not in allowed:
+            raise UserConfigurationError(
+                f"{path}:{line_number}: unsupported backend environment key {key!r}"
+            )
+        environment[key] = value
+    return environment
+
+
+def _resolve_legacy(
+    environment: Mapping[str, str],
+    legacy: Mapping[str, str],
+    env_key: str,
+    section: Mapping[str, object],
+    key: str,
+    default: object,
+) -> object:
+    if env_key in environment:
+        return environment[env_key]
+    if env_key in legacy:
+        return legacy[env_key]
+    return section.get(key, default)
+
+
 def _load_integrations(
     section: Mapping[str, object], environment: Mapping[str, str]
 ) -> IntegrationSettings:
@@ -370,7 +509,9 @@ def _load_integrations(
 
 
 def _load_compute(
-    section: Mapping[str, object], environment: Mapping[str, str]
+    section: Mapping[str, object],
+    environment: Mapping[str, str],
+    legacy: Mapping[str, str],
 ) -> ComputeSettings:
     _reject_unknown(section, _COMPUTE_KEYS, label="[compute]")
     return ComputeSettings(
@@ -385,8 +526,9 @@ def _load_compute(
             label="compute.cuda_device",
         ),
         dictation_backend=_as_choice(
-            _resolve(
+            _resolve_legacy(
                 environment,
+                legacy,
                 "DICTATION_BACKEND",
                 section,
                 "dictation_backend",
@@ -396,8 +538,9 @@ def _load_compute(
             label="compute.dictation_backend",
         ),
         dictation_model=_as_nonempty(
-            _resolve(
+            _resolve_legacy(
                 environment,
+                legacy,
                 "DICTATION_MODEL",
                 section,
                 "dictation_model",
@@ -406,8 +549,9 @@ def _load_compute(
             label="compute.dictation_model",
         ),
         dictation_quantization=_as_nonempty(
-            _resolve(
+            _resolve_legacy(
                 environment,
+                legacy,
                 "DICTATION_QUANTIZATION",
                 section,
                 "dictation_quantization",
@@ -416,8 +560,9 @@ def _load_compute(
             label="compute.dictation_quantization",
         ),
         dictation_compute=_as_nonempty(
-            _resolve(
+            _resolve_legacy(
                 environment,
+                legacy,
                 "DICTATION_COMPUTE",
                 section,
                 "dictation_compute",
@@ -426,11 +571,103 @@ def _load_compute(
             label="compute.dictation_compute",
         ),
         dictation_language=_as_choice(
-            _resolve(
-                environment, "DICTATION_LANGUAGE", section, "dictation_language", "auto"
+            _resolve_legacy(
+                environment,
+                legacy,
+                "DICTATION_LANGUAGE",
+                section,
+                "dictation_language",
+                "auto",
             ),
             _DICTATION_LANGUAGES,
             label="compute.dictation_language",
+        ),
+    )
+
+
+def _load_dictation(
+    section: Mapping[str, object],
+    environment: Mapping[str, str],
+    *,
+    default_source: str,
+) -> DictationSettings:
+    _reject_unknown(section, _DICTATION_KEYS, label="[dictation]")
+    return DictationSettings(
+        source=str(
+            _resolve(
+                environment,
+                "DICTATION_SOURCE",
+                section,
+                "source",
+                default_source,
+            ),
+        ).strip(),
+        inject=_as_choice(
+            _resolve(environment, "DICTATION_INJECT", section, "inject", "auto"),
+            _DICTATION_INJECT_MODES,
+            label="dictation.inject",
+        ),
+        prompt=str(
+            _resolve(
+                environment,
+                "DICTATION_PROMPT",
+                section,
+                "prompt",
+                DEFAULT_DICTATION_PROMPT,
+            ),
+        ).strip(),
+        replacements=_as_replacements(
+            _resolve(
+                environment,
+                "DICTATION_REPLACEMENTS",
+                section,
+                "replacements",
+                ";".join(
+                    f"{source}:{target}"
+                    for source, target in DEFAULT_DICTATION_REPLACEMENTS
+                ),
+            ),
+            label="dictation.replacements",
+        ),
+        vad_end_silence_ms=_as_positive_float(
+            _resolve(
+                environment,
+                "DICTATION_VAD_END_SILENCE_MS",
+                section,
+                "vad_end_silence_ms",
+                900,
+            ),
+            label="dictation.vad_end_silence_ms",
+        ),
+        vad_max_seconds=_as_positive_float(
+            _resolve(
+                environment,
+                "DICTATION_VAD_MAX_SECONDS",
+                section,
+                "vad_max_seconds",
+                120,
+            ),
+            label="dictation.vad_max_seconds",
+        ),
+        vad_min_speech_rms=_as_nonnegative_float(
+            _resolve(
+                environment,
+                "DICTATION_VAD_MIN_SPEECH_RMS",
+                section,
+                "vad_min_speech_rms",
+                1100,
+            ),
+            label="dictation.vad_min_speech_rms",
+        ),
+        vad_start_speech_frames=_as_positive_int(
+            _resolve(
+                environment,
+                "DICTATION_VAD_START_SPEECH_FRAMES",
+                section,
+                "vad_start_speech_frames",
+                3,
+            ),
+            label="dictation.vad_start_speech_frames",
         ),
     )
 
@@ -541,7 +778,7 @@ def _load_platform(
     home: Path,
 ) -> PlatformSettings:
     _reject_unknown(section, _PLATFORM_KEYS, label="[platform]")
-    return PlatformSettings(
+    settings = PlatformSettings(
         project_root=_as_path(
             _resolve(
                 environment, "VOICE_HARNESS_PROJECT_ROOT", section, "project_root", home
@@ -558,6 +795,36 @@ def _load_platform(
             ),
             label="platform.github_root",
         ),
+        herdr_worktree_root=_as_path(
+            _resolve(
+                environment,
+                "VOICE_HARNESS_HERDR_WORKTREE_ROOT",
+                section,
+                "herdr_worktree_root",
+                home / ".herdr" / "worktrees",
+            ),
+            label="platform.herdr_worktree_root",
+        ),
+        gh_bin=_as_path(
+            _resolve(
+                environment,
+                "VOICE_HARNESS_GH_BIN",
+                section,
+                "gh_bin",
+                Path("gh"),
+            ),
+            label="platform.gh_bin",
+        ),
+        git_bin=_as_path(
+            _resolve(
+                environment,
+                "VOICE_HARNESS_GIT_BIN",
+                section,
+                "git_bin",
+                Path("git"),
+            ),
+            label="platform.git_bin",
+        ),
         herdr_bin=_as_path(
             _resolve(
                 environment,
@@ -567,6 +834,26 @@ def _load_platform(
                 home / ".local" / "bin" / "herdr",
             ),
             label="platform.herdr_bin",
+        ),
+        github_timeout_seconds=_as_positive_float(
+            _resolve(
+                environment,
+                "VOICE_HARNESS_GITHUB_TIMEOUT_SECONDS",
+                section,
+                "github_timeout_seconds",
+                30,
+            ),
+            label="platform.github_timeout_seconds",
+        ),
+        herdr_timeout_seconds=_as_positive_float(
+            _resolve(
+                environment,
+                "VOICE_HARNESS_HERDR_TIMEOUT_SECONDS",
+                section,
+                "herdr_timeout_seconds",
+                30,
+            ),
+            label="platform.herdr_timeout_seconds",
         ),
         focused_app_context_enabled=_as_bool(
             _resolve(
@@ -659,6 +946,21 @@ def _load_platform(
             label="platform.agent_job_start_concurrency",
         ),
     )
+    for label, path in (
+        ("platform.project_root", settings.project_root),
+        ("platform.github_root", settings.github_root),
+        ("platform.herdr_worktree_root", settings.herdr_worktree_root),
+        ("platform.herdr_bin", settings.herdr_bin),
+    ):
+        if not path.is_absolute():
+            raise UserConfigurationError(f"{label} must be an absolute path")
+    try:
+        settings.github_root.resolve().relative_to(settings.project_root.resolve())
+    except ValueError as exc:
+        raise UserConfigurationError(
+            "platform.github_root must be inside platform.project_root"
+        ) from exc
+    return settings
 
 
 def _load_providers(
@@ -696,17 +998,21 @@ def load_user_config(
     *,
     path: Path | None = None,
     backends_path: Path | None = None,
+    backend_env_path: Path | None = None,
     home: Path | None = None,
 ) -> UserConfig:
     """Load and validate the unified configuration.
 
-    Precedence is built-in defaults, then ``config.toml``, then ``backends.toml``
-    (providers only, for backward compatibility), then environment overrides.
+    Precedence is built-in defaults, then ``config.toml``, then legacy
+    ``backends.toml``/``backend.env`` inputs, then environment overrides.
     """
 
     resolved_home = _home(home)
     config_path = path or user_config_path(environment, home=resolved_home)
     backends = backends_path or config.backend_config_path(
+        environment, home=resolved_home
+    )
+    backend_env = backend_env_path or backend_environment_path(
         environment, home=resolved_home
     )
 
@@ -715,14 +1021,19 @@ def load_user_config(
     )
     _reject_unknown(raw, _TOP_LEVEL_SECTIONS, label="configuration section")
     _reject_file_credentials(raw)
+    legacy_compute = load_backend_environment(backend_env)
+    audio = _load_audio(_section(raw, "audio"), environment)
 
     return UserConfig(
         providers=_load_providers(
             _section(raw, "providers"), environment, backends_path=backends
         ),
         integrations=_load_integrations(_section(raw, "integrations"), environment),
-        compute=_load_compute(_section(raw, "compute"), environment),
-        audio=_load_audio(_section(raw, "audio"), environment),
+        compute=_load_compute(_section(raw, "compute"), environment, legacy_compute),
+        audio=audio,
+        dictation=_load_dictation(
+            _section(raw, "dictation"), environment, default_source=audio.source
+        ),
         platform=_load_platform(
             _section(raw, "platform"), environment, home=resolved_home
         ),
@@ -733,7 +1044,9 @@ def default_user_config(home: Path | None = None) -> UserConfig:
     """Return the built-in configuration with no files or environment applied."""
 
     empty = Path(os.devnull)
-    return load_user_config({}, path=empty, backends_path=empty, home=home)
+    return load_user_config(
+        {}, path=empty, backends_path=empty, backend_env_path=empty, home=home
+    )
 
 
 def _toml_scalar(value: object) -> str:
@@ -765,6 +1078,7 @@ def render_user_config(user_config: UserConfig) -> str:
 
     providers = user_config.providers
     audio = user_config.audio
+    dictation = user_config.dictation
     compute = user_config.compute
     platform = user_config.platform
     integrations = user_config.integrations
@@ -824,11 +1138,31 @@ def render_user_config(user_config: UserConfig) -> str:
         },
     )
     lines += _render_table(
+        "dictation",
+        {
+            "source": dictation.source,
+            "inject": dictation.inject,
+            "prompt": dictation.prompt,
+            "replacements": ";".join(
+                f"{source}:{target}" for source, target in dictation.replacements
+            ),
+            "vad_end_silence_ms": dictation.vad_end_silence_ms,
+            "vad_max_seconds": dictation.vad_max_seconds,
+            "vad_min_speech_rms": dictation.vad_min_speech_rms,
+            "vad_start_speech_frames": dictation.vad_start_speech_frames,
+        },
+    )
+    lines += _render_table(
         "platform",
         {
             "project_root": str(platform.project_root),
             "github_root": str(platform.github_root),
+            "herdr_worktree_root": str(platform.herdr_worktree_root),
+            "gh_bin": str(platform.gh_bin),
+            "git_bin": str(platform.git_bin),
             "herdr_bin": str(platform.herdr_bin),
+            "github_timeout_seconds": platform.github_timeout_seconds,
+            "herdr_timeout_seconds": platform.herdr_timeout_seconds,
             "focused_app_context": platform.focused_app_context_enabled,
             "focused_app_deny_classes": list(platform.focused_app_deny_classes),
             "focused_app_max_chars": platform.focused_app_max_chars,

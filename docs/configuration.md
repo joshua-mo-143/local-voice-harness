@@ -1,16 +1,17 @@
 # Configuration
 
-Only the variables marked “wake drop-in” may be added to
-`voice-harness-wake.service` with `systemctl --user edit`. The installed-unit audit
-rejects other extra variables and every `EnvironmentFile` on every shipped service.
-Dictation backend selectors belong in `~/.config/dictation/backend.env`, which the
-launcher parses through its separate allowlist.
+`config.toml` owns user choices for shipped services. The units set only operational
+runtime values such as private sockets and cache paths; they do not set provider,
+model, device, audio, integration, or platform choices. The installed-unit audit
+rejects user-choice `Environment=` drop-ins and every `EnvironmentFile`.
+`backends.toml` and `~/.config/dictation/backend.env` remain supported only as
+legacy inputs to the unified resolver.
 
 ## Unified configuration (`config.toml`)
 
 `~/.config/voice-harness/config.toml` provides one validated, typed model for
-user-facing defaults across five sections: `providers`, `integrations`,
-`compute`, `audio`, and `platform`. The file is optional. When it is absent, or a
+user-facing defaults across six sections: `providers`, `integrations`,
+`compute`, `audio`, `dictation`, and `platform`. The file is optional. When it is absent, or a
 key is omitted, built-in defaults apply, so existing installations that rely only
 on `backends.toml` and environment variables keep working unchanged.
 
@@ -18,7 +19,7 @@ Values are resolved with a fixed precedence, from lowest to highest:
 
 1. built-in defaults
 2. `config.toml`
-3. `backends.toml` (providers only, for backward compatibility)
+3. legacy `backends.toml` provider values and `backend.env` dictation selectors
 4. environment variables
 
 In other words, an environment override always wins, and a legacy `backends.toml`
@@ -52,7 +53,21 @@ wake_threshold = 0.55
 barge_in_mode = "wake"
 playback_latency = "100ms"
 
+[dictation]
+inject = "auto"
+prompt = "Technical software engineering dictation."
+replacements = "herder:herdr;cursa:Cursor"
+vad_end_silence_ms = 900
+
 [platform]
+project_root = "/home/example"
+github_root = "/home/example/src"
+herdr_worktree_root = "/home/example/.herdr/worktrees"
+gh_bin = "gh"
+git_bin = "git"
+herdr_bin = "/home/example/.local/bin/herdr"
+github_timeout_seconds = 30
+herdr_timeout_seconds = 30
 focused_app_context = true
 cursor_followup = true
 cursor_agent_inactivity_seconds = 900
@@ -84,15 +99,117 @@ Credentials are never read from or written to `config.toml`; a Venice API key in
 any section is rejected. Store it with `voice-harness credentials set` instead, as
 described under [AI backends](#ai-backends).
 
-This section is the foundation for later configuration and integration
-management; runtime services continue to read the environment variables and files
-described below until they are migrated.
+Malformed, invalid-encoding, and unreadable `config.toml`, `backends.toml`, or
+legacy `backend.env` files fail with an error that identifies the source path (and
+line for environment assignments). Runtime capability discovery does not replace
+such failures with defaults, because that could silently enable or disable an
+integration. Failures from an individual provider while capturing optional context
+remain isolated from configuration loading failures.
+
+## Runtime lifecycle
+
+Runtime configuration uses a process-start snapshot. Each migrated composition
+root resolves `UserConfig` once, then injects its immutable typed sections into
+the process's consumers. Editing `config.toml`, a documented legacy input, or an
+environment override does not mutate an already running process. LLM routing and
+conversation calls, STT startup, TTS serving, playback, dictation injection, audio
+capture, VAD, the integration registry, and configured GitHub and Herdr client
+factories all use the injected snapshot. Detached workers resolve one snapshot at
+worker startup; durable provider identity across later restarts is handled
+separately. Restart every
+affected foreground process, service, or detached worker to apply the change;
+the configuration commands report affected active services.
+
+`voice-harness doctor` likewise resolves one snapshot before running any check and
+injects its configured GitHub and Herdr clients. An invalid configuration is reported
+once as the direct fatal cause; checks that do not depend on configuration may still
+run. Each service-management command also resolves one snapshot, including
+`services restart`, which reuses it across the stop/start sequence.
+
+There is no general configuration hot reload. The vocabulary store is the
+documented exception: the dictation service reads it for each transcription, so
+vocabulary edits apply without a restart. Legacy backend files are read only by
+the resolver; provider and speech runtime consumers do not parse them
+independently.
+
+The lifecycle policy for every `config.toml` setting is:
+
+| Settings | Snapshot owner | Apply changes by |
+| --- | --- | --- |
+| `providers.llm.provider`, `model`, `endpoint`, `timeout` | Wake process and local LLM service | Restart `voice-harness-wake.service` and `voice-harness-llm.service`; the local LLM service is stopped when the selected provider is remote |
+| `providers.tts.provider`, `model`, `voice`, `speed`, `endpoint`, `timeout` | Wake process and TTS service | Restart `voice-harness-wake.service` and `voice-harness-tts.service` |
+| `integrations.github`, `zendesk`, `linear` | Wake process integration registry | Restart `voice-harness-wake.service` |
+| `compute.cuda_device` | Local LLM service | Restart `voice-harness-llm.service` |
+| `compute.dictation_backend`, `dictation_model`, `dictation_quantization`, `dictation_compute`, `dictation_language` | Dictation service | Restart `dictation.service` |
+| Every `audio.*` setting | Wake process | Restart `voice-harness-wake.service` |
+| `dictation.prompt`, `dictation.replacements` | Dictation service | Restart `dictation.service` |
+| `dictation.source`, `dictation.inject`, `dictation.vad_end_silence_ms`, `dictation.vad_max_seconds`, `dictation.vad_min_speech_rms`, `dictation.vad_start_speech_frames` | Each foreground dictation command | Start the next command; an already-running VAD command keeps its startup snapshot |
+| Every `platform.*` setting | Wake process and each detached worker | Restart `voice-harness-wake.service`; already-admitted workers keep their snapshot, while newly started or restarted workers resolve the new value |
+
+The same lifecycle applies regardless of whether the winning value came from
+`config.toml`, a supported legacy file, or an environment override. Changing an
+environment variable outside a running process has no effect until that process
+is restarted. `voice-harness config set` reports the active systemd services from
+this matrix; command-scoped settings intentionally produce no service restart
+notice.
+
+## Configuration commands
+
+Use the CLI to inspect or persist unified settings in `config.toml`. Values are
+validated before every write and persisted atomically with owner-only permissions.
+These commands never create or update legacy `backends.toml` or `backend.env`
+files. Existing legacy values continue to participate in resolution until those
+files are removed.
+
+```console
+voice-harness setup
+voice-harness setup --defaults
+voice-harness config show
+voice-harness config show audio.wake_threshold
+voice-harness config set providers.llm.provider venice
+voice-harness config set integrations.linear true
+voice-harness config reset --section audio
+voice-harness integrations list
+voice-harness integrations enable linear
+voice-harness integrations disable zendesk
+voice-harness integrations doctor
+```
+
+`setup` walks through provider, integration, audio, and compute choices that are
+supported on the current machine. Use `--defaults` for a non-interactive first
+write. `config set` accepts dotted keys such as `audio.wake_threshold`,
+`compute.dictation_backend`, and `platform.cursor_followup`. After a change, the
+CLI reports which installed services are currently running and need a restart,
+for example `voice-harness-wake.service` or `dictation.service`.
+
+`integrations doctor` inspects only enabled integrations. Linear uses the MCP
+capability check; GitHub reports `gh` authentication when GitHub is enabled;
+Zendesk confirms that browser capture is active.
+
+Common examples:
+
+```console
+# Hosted LLM/TTS with local dictation
+voice-harness config set providers.llm.provider venice
+voice-harness config set providers.tts.provider venice
+voice-harness credentials set
+
+# Tighter wake sensitivity and faster playback drain
+voice-harness config set audio.wake_threshold 0.65
+voice-harness config set audio.playback_quiet_timeout_seconds 1.5
+
+# Enable optional ticket context providers
+voice-harness integrations enable linear
+voice-harness integrations doctor
+```
 
 ## AI backends
 
-LLM and TTS providers are selected independently in
-`~/.config/voice-harness/backends.toml`. Both default to `local`; use `venice` for
-either hosted backend:
+LLM and TTS providers are selected independently in `[providers.llm]` and
+`[providers.tts]` in `config.toml`. Both default to `local`; use `venice` for
+either hosted backend. Existing values in
+`~/.config/voice-harness/backends.toml` continue to override `config.toml` until
+that legacy file is removed:
 
 ```toml
 [llm]
@@ -154,38 +271,45 @@ voice-harness plan-approval ask
 
 | Variable | Purpose | Default | Configuration channel |
 | --- | --- | --- | --- |
-| `VOICE_HARNESS_SOURCE` | PipeWire microphone source | Development-machine source | Wake drop-in |
-| `VOICE_HARNESS_VOICE` | Absolute Chatterbox reference WAV path | Built-in voice | Wake drop-in |
-| `VOICE_HARNESS_WAKE_THRESHOLD` | OpenWakeWord activation threshold (`0`–`1`) | `0.55` | Wake drop-in |
-| `VOICE_HARNESS_MIN_SPEECH_RMS` | Non-negative speech energy gate | `1100` | Wake drop-in |
-| `VOICE_HARNESS_BARGE_IN_MODE` | Playback interruption (`wake`, `vad`, or `off`) | `wake` | Wake drop-in |
-| `VOICE_HARNESS_BARGE_IN_SPEECH_FRAMES` | Positive count of consecutive 80 ms speech frames | `5` | Wake drop-in |
-| `VOICE_HARNESS_PLAYBACK_QUIET_FRAMES` | Positive count of quiet 80 ms frames after playback | `4` | Wake drop-in |
-| `VOICE_HARNESS_PLAYBACK_QUIET_TIMEOUT_SECONDS` | Non-negative post-playback echo-drain timeout | `2` | Wake drop-in |
-| `VOICE_HARNESS_PLAYBACK_LATENCY` | Non-negative `pw-play` duration ending in `us`, `ms`, or `s` | `100ms` | Wake drop-in |
-| `VOICE_HARNESS_CURSOR_FOREGROUND_SECONDS` | Non-negative time before a Cursor job backgrounds | `5` | Wake drop-in |
-| `VOICE_HARNESS_CURSOR_AGENT_INACTIVITY_SECONDS` | Positive time without observable Cursor progress before cancellation | `900` | Wake drop-in |
-| `VOICE_HARNESS_CURSOR_AGENT_MAX_RUNTIME_SECONDS` | Positive absolute runtime limit for one Cursor turn | `3600` | Wake drop-in |
-| `VOICE_HARNESS_AGENT_JOB_START_CONCURRENCY` | Positive maximum number of concurrent durable job starts in a multi-ticket request | `3` | Wake drop-in |
-| `VOICE_HARNESS_CURSOR_FOLLOWUP` | Enable completed-job follow-up context (kill switch) | `1` | Wake drop-in |
-| `VOICE_HARNESS_CURSOR_FOLLOWUP_WINDOW_SECONDS` | Finite, non-negative absolute lifetime of the retained completed-job reference | `60` | Wake drop-in |
-| `VOICE_HARNESS_HERDR_BIN` | Absolute Herdr executable path | `~/.local/bin/herdr` | Wake drop-in |
-| `VOICE_HARNESS_PROJECT_ROOT` | Absolute allowed root for inferred repositories | Home directory | Wake drop-in |
-| `VOICE_HARNESS_GITHUB_ROOT` | Absolute fork-clone root inside the project root | `~/src` | Wake drop-in |
-| `VOICE_HARNESS_FOCUSED_APP_CONTEXT` | Enable focused editor/terminal context capture | `1` | Wake drop-in |
-| `VOICE_HARNESS_FOCUSED_APP_DENY` | Comma-separated denied focused window classes | Password managers, RuneLite | Wake drop-in |
-| `VOICE_HARNESS_FOCUSED_APP_MAX_CHARS` | Positive combined focused-app context character cap | `12000` | Wake drop-in |
-| `DICTATION_INJECT` | Focused-window insertion mode (`auto`, `paste`, `type`, or `stdout`) | `auto` | Wake drop-in |
-| `DICTATION_REPLACEMENTS` | Semicolon-separated STT corrections | Cursor/Herdr defaults | Wake drop-in |
-| `DICTATION_VAD_END_SILENCE_MS` | Positive silence duration that finishes VAD dictation | `900` | Calling environment |
-| `DICTATION_VAD_START_SPEECH_FRAMES` | Consecutive 80 ms speech frames required to start an utterance | `3` | Calling environment |
-| `DICTATION_VAD_MAX_SECONDS` | Positive maximum duration of each VAD utterance | `120` | Calling environment |
-| `DICTATION_VAD_MIN_SPEECH_RMS` | Non-negative VAD speech energy gate | `1100` | Calling environment |
-| `DICTATION_BACKEND` | Dictation engine (`parakeet` or `whisper`) | `parakeet` | `backend.env` |
-| `DICTATION_MODEL` | Backend model | `nemo-parakeet-tdt-0.6b-v2` | `backend.env` |
-| `DICTATION_QUANTIZATION` | Parakeet ONNX quantization (`none` disables it) | `int8` | `backend.env` |
-| `DICTATION_COMPUTE` | faster-whisper compute type | `float16` | `backend.env` |
-| `DICTATION_LANGUAGE` | Spoken language to transcribe (`en`, `zh`, `english`, `chinese`, or `auto`) | `auto` | `backend.env` |
+| `VOICE_HARNESS_SOURCE` | PipeWire microphone source | Development-machine source | Process environment override |
+| `VOICE_HARNESS_VOICE` | Absolute Chatterbox reference WAV path | Built-in voice | Process environment override |
+| `VOICE_HARNESS_WAKE_THRESHOLD` | OpenWakeWord activation threshold (`0`–`1`) | `0.55` | Process environment override |
+| `VOICE_HARNESS_MIN_SPEECH_RMS` | Non-negative speech energy gate | `1100` | Process environment override |
+| `VOICE_HARNESS_BARGE_IN_MODE` | Playback interruption (`wake`, `vad`, or `off`) | `wake` | Process environment override |
+| `VOICE_HARNESS_BARGE_IN_SPEECH_FRAMES` | Positive count of consecutive 80 ms speech frames | `5` | Process environment override |
+| `VOICE_HARNESS_PLAYBACK_QUIET_FRAMES` | Positive count of quiet 80 ms frames after playback | `4` | Process environment override |
+| `VOICE_HARNESS_PLAYBACK_QUIET_TIMEOUT_SECONDS` | Non-negative post-playback echo-drain timeout | `2` | Process environment override |
+| `VOICE_HARNESS_PLAYBACK_LATENCY` | Non-negative `pw-play` duration ending in `us`, `ms`, or `s` | `100ms` | Process environment override |
+| `VOICE_HARNESS_CURSOR_FOREGROUND_SECONDS` | Non-negative time before a Cursor job backgrounds | `5` | Process environment override |
+| `VOICE_HARNESS_CURSOR_AGENT_INACTIVITY_SECONDS` | Positive time without observable Cursor progress before cancellation | `900` | Process environment override |
+| `VOICE_HARNESS_CURSOR_AGENT_MAX_RUNTIME_SECONDS` | Positive absolute runtime limit for one Cursor turn | `3600` | Process environment override |
+| `VOICE_HARNESS_AGENT_JOB_START_CONCURRENCY` | Positive maximum number of concurrent durable job starts in a multi-ticket request | `3` | Process environment override |
+| `VOICE_HARNESS_CURSOR_FOLLOWUP` | Enable completed-job follow-up context (kill switch) | `1` | Process environment override |
+| `VOICE_HARNESS_CURSOR_FOLLOWUP_WINDOW_SECONDS` | Finite, non-negative absolute lifetime of the retained completed-job reference | `60` | Process environment override |
+| `VOICE_HARNESS_HERDR_BIN` | Absolute Herdr executable path | `~/.local/bin/herdr` | Process environment override |
+| `VOICE_HARNESS_HERDR_WORKTREE_ROOT` | Root for Herdr-created worktrees | `~/.herdr/worktrees` | Process environment override |
+| `VOICE_HARNESS_GH_BIN` | GitHub CLI executable | `gh` | Process environment override |
+| `VOICE_HARNESS_GIT_BIN` | Git executable used for GitHub checkouts | `git` | Process environment override |
+| `VOICE_HARNESS_GITHUB_TIMEOUT_SECONDS` | Positive default for GitHub commands without an operation-specific timeout | `30` | Process environment override |
+| `VOICE_HARNESS_HERDR_TIMEOUT_SECONDS` | Positive Herdr command and startup timeout | `30` | Process environment override |
+| `VOICE_HARNESS_PROJECT_ROOT` | Absolute allowed root for inferred repositories | Home directory | Process environment override |
+| `VOICE_HARNESS_GITHUB_ROOT` | Absolute fork-clone root inside the project root | `~/src` | Process environment override |
+| `VOICE_HARNESS_FOCUSED_APP_CONTEXT` | Enable focused editor/terminal context capture | `1` | Process environment override |
+| `VOICE_HARNESS_FOCUSED_APP_DENY` | Comma-separated denied focused window classes | Password managers, RuneLite | Process environment override |
+| `VOICE_HARNESS_FOCUSED_APP_MAX_CHARS` | Positive combined focused-app context character cap | `12000` | Process environment override |
+| `DICTATION_SOURCE` | Dictation PipeWire source, independently overriding `audio.source` | `audio.source` | Environment override |
+| `DICTATION_INJECT` | Focused-window insertion mode (`auto`, `paste`, `type`, or `stdout`) | `auto` | Process environment override |
+| `DICTATION_PROMPT` | Initial Whisper transcription prompt | Technical dictation prompt | Environment override |
+| `DICTATION_REPLACEMENTS` | Semicolon-separated STT corrections | Cursor/Herdr defaults | Process environment override |
+| `DICTATION_VAD_END_SILENCE_MS` | Positive silence duration that finishes VAD dictation | `900` | Environment override |
+| `DICTATION_VAD_START_SPEECH_FRAMES` | Consecutive 80 ms speech frames required to start an utterance | `3` | Environment override |
+| `DICTATION_VAD_MAX_SECONDS` | Positive maximum duration of each VAD utterance | `120` | Environment override |
+| `DICTATION_VAD_MIN_SPEECH_RMS` | Non-negative VAD speech energy gate | `1100` | Environment override |
+| `DICTATION_BACKEND` | Dictation engine (`parakeet` or `whisper`) | `parakeet` | Environment override; legacy `backend.env` input |
+| `DICTATION_MODEL` | Backend model | `nemo-parakeet-tdt-0.6b-v2` | Environment override; legacy `backend.env` input |
+| `DICTATION_QUANTIZATION` | Parakeet ONNX quantization (`none` disables it) | `int8` | Environment override; legacy `backend.env` input |
+| `DICTATION_COMPUTE` | faster-whisper compute type | `float16` | Environment override; legacy `backend.env` input |
+| `DICTATION_LANGUAGE` | Spoken language to transcribe (`en`, `zh`, `english`, `chinese`, or `auto`) | `auto` | Environment override; legacy `backend.env` input |
 
 `VOICE_HARNESS_PROJECT_ROOT` can narrow repository discovery to another directory.
 `VOICE_HARNESS_GITHUB_ROOT` must resolve inside it. Forks are cloned to

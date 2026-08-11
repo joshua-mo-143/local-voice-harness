@@ -1,12 +1,10 @@
 from __future__ import annotations
 
-import os
 from pathlib import Path
 
 from . import recorder
 from .components import start_components
 from .config import (
-    DEFAULT_SOURCE,
     DICTATION_PID_PATH,
     DICTATION_RECORDER_LOG,
     DICTATION_STATE_DIR,
@@ -20,6 +18,7 @@ from .config import (
 )
 from .ipc import socket_ready
 from .notifications import notify
+from .user_config import AudioSettings
 
 PATHS = recorder.RecorderPaths(
     STATE_DIR, WAV_PATH, PID_PATH, RECORDER_LOG, RECORDING_LOCK
@@ -33,11 +32,10 @@ DICTATION_PATHS = recorder.RecorderPaths(
 )
 
 
-def start_recording() -> None:
-    source = os.environ.get("VOICE_HARNESS_SOURCE", DEFAULT_SOURCE)
+def start_recording(settings: AudioSettings) -> None:
     recorder.start_recording(
         PATHS,
-        source=source,
+        source=settings.source,
         ready=lambda: socket_ready(STT_SOCKET),
         prepare=start_components,
         conflicts=(DICTATION_PATHS,),

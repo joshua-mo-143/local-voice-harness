@@ -12,10 +12,11 @@ from email.message import Message
 from pathlib import Path
 from unittest import mock
 
-from local_voice_harness import llm
+from local_voice_harness import llm, llm_transport
 from local_voice_harness.config import load_backend_settings
 from local_voice_harness.cursor.service import CursorTurnRequest
 from local_voice_harness.errors import HarnessError
+from local_voice_harness.responses import AssistantResponse
 
 
 def _response(message: dict[str, object]) -> io.BytesIO:
@@ -81,10 +82,22 @@ class ToolPolicyContractTests(unittest.TestCase):
 
 
 class QwenClientTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self._settings = replace(load_backend_settings({}), llm_provider="local")
+        self._settings_patch = mock.patch.object(
+            llm_transport,
+            "default_user_config",
+            return_value=mock.Mock(providers=self._settings),
+        )
+        self._settings_patch.start()
+
+    def tearDown(self) -> None:
+        self._settings_patch.stop()
+
     def test_cursor_followup_uses_only_one_leading_system_message(self) -> None:
         with (
             mock.patch.object(
-                llm.urllib.request,
+                llm_transport.urllib.request,
                 "urlopen",
                 return_value=_response({"content": "Continuing now."}),
             ) as urlopen,
@@ -110,7 +123,7 @@ class QwenClientTests(unittest.TestCase):
     def test_tools_are_disabled_by_default(self) -> None:
         with (
             mock.patch.object(
-                llm.urllib.request,
+                llm_transport.urllib.request,
                 "urlopen",
                 return_value=_response({"content": "Just chatting."}),
             ) as urlopen,
@@ -130,7 +143,7 @@ class QwenClientTests(unittest.TestCase):
     def test_tool_free_cursor_session_omits_operational_guidance(self) -> None:
         with (
             mock.patch.object(
-                llm.urllib.request,
+                llm_transport.urllib.request,
                 "urlopen",
                 return_value=_response({"content": "Please clarify."}),
             ) as urlopen,
@@ -150,7 +163,7 @@ class QwenClientTests(unittest.TestCase):
     def test_tool_free_text_cannot_claim_work_started(self) -> None:
         with (
             mock.patch.object(
-                llm.urllib.request,
+                llm_transport.urllib.request,
                 "urlopen",
                 return_value=_response(
                     {
@@ -173,7 +186,7 @@ class QwenClientTests(unittest.TestCase):
     def test_tool_enabled_text_requires_confirmed_tool_result(self) -> None:
         with (
             mock.patch.object(
-                llm.urllib.request,
+                llm_transport.urllib.request,
                 "urlopen",
                 return_value=_response({"content": "I've submitted issue 92."}),
             ),
@@ -199,7 +212,7 @@ class QwenClientTests(unittest.TestCase):
         }
         with (
             mock.patch.object(
-                llm.urllib.request,
+                llm_transport.urllib.request,
                 "urlopen",
                 return_value=_response(message),
             ),
@@ -214,7 +227,7 @@ class QwenClientTests(unittest.TestCase):
     def test_allow_tools_true_includes_tools(self) -> None:
         with (
             mock.patch.object(
-                llm.urllib.request,
+                llm_transport.urllib.request,
                 "urlopen",
                 return_value=_response({"content": "answer"}),
             ) as urlopen,
@@ -232,7 +245,7 @@ class QwenClientTests(unittest.TestCase):
         ]
         with (
             mock.patch.object(
-                llm.urllib.request,
+                llm_transport.urllib.request,
                 "urlopen",
                 return_value=_response({"content": "  concise answer  "}),
             ) as urlopen,
@@ -243,12 +256,13 @@ class QwenClientTests(unittest.TestCase):
         self.assertEqual(answer, "concise answer")
         self.assertIsNone(session)
         request = urlopen.call_args.args[0]
-        settings = load_backend_settings()
-        self.assertEqual(request.full_url, settings.llm_endpoint)
+        self.assertEqual(request.full_url, self._settings.llm_endpoint)
         self.assertEqual(request.get_header("Content-type"), "application/json")
-        self.assertEqual(urlopen.call_args.kwargs["timeout"], 60)
+        self.assertEqual(
+            urlopen.call_args.kwargs["timeout"], self._settings.llm_timeout
+        )
         payload = json.loads(request.data)
-        self.assertEqual(payload["model"], settings.llm_model)
+        self.assertEqual(payload["model"], self._settings.llm_model)
         system_prompt = payload["messages"][0]["content"]
         self.assertIn(
             'respond only with "I\'ve finished working on <identifier>"',
@@ -281,7 +295,7 @@ class QwenClientTests(unittest.TestCase):
 
         with (
             mock.patch.object(
-                llm.urllib.request,
+                llm_transport.urllib.request,
                 "urlopen",
                 side_effect=[
                     _response({"content": None, "tool_calls": [tool_call]}),
@@ -323,7 +337,51 @@ class QwenClientTests(unittest.TestCase):
             },
         )
 
+    def test_cursor_tool_failure_keeps_diagnostics_out_of_model_context(self) -> None:
+        tool_call = {
+            "id": "call-1",
+            "function": {
+                "name": "cursor",
+                "arguments": json.dumps({"task": "fix it", "action": "submit"}),
+            },
+        }
+        output = io.StringIO()
+        with (
+            mock.patch.object(
+                llm_transport.urllib.request,
+                "urlopen",
+                side_effect=[
+                    _response({"content": None, "tool_calls": [tool_call]}),
+                    _response({"content": "The tool failed safely."}),
+                ],
+            ) as urlopen,
+            mock.patch.object(
+                llm,
+                "cursor_turn",
+                side_effect=HarnessError(
+                    "stderr Authorization: Bearer cursor-tool-secret"
+                ),
+            ),
+            redirect_stdout(output),
+        ):
+            answer, session = llm.qwen_turn("please fix it", allow_tools=True)
+
+        self.assertEqual((answer, session), ("The tool failed safely.", None))
+        second_request = urlopen.call_args_list[1].args[0]
+        second_payload = json.loads(second_request.data)
+        self.assertEqual(
+            second_payload["messages"][-1]["content"],
+            llm.CURSOR_TOOL_FAILURE,
+        )
+        self.assertNotIn("cursor-tool-secret", json.dumps(second_payload))
+        self.assertNotIn("cursor-tool-secret", output.getvalue())
+        self.assertIn("[REDACTED]", output.getvalue())
+
     def test_rejected_tool_result_cannot_be_rewritten_as_started(self) -> None:
+        result = AssistantResponse(
+            spoken_text="Two tickets were rejected.",
+            display_text="Ticket starts: #92: rejected; #93: rejected.",
+        )
         tool_call = {
             "id": "call-1",
             "function": {
@@ -335,20 +393,17 @@ class QwenClientTests(unittest.TestCase):
         }
         with (
             mock.patch.object(
-                llm.urllib.request,
+                llm_transport.urllib.request,
                 "urlopen",
                 side_effect=[
                     _response({"content": None, "tool_calls": [tool_call]}),
                     _response({"content": "I've submitted both issues."}),
                 ],
-            ),
+            ) as urlopen,
             mock.patch.object(
                 llm,
                 "cursor_turn",
-                return_value=(
-                    "Ticket starts: #92: rejected; #93: rejected.",
-                    None,
-                ),
+                return_value=(result, None),
             ) as cursor_turn,
             mock.patch.object(llm, "notify") as notify,
             redirect_stdout(io.StringIO()),
@@ -361,6 +416,9 @@ class QwenClientTests(unittest.TestCase):
         self.assertEqual((answer, session), (llm.TOOL_FREE_ACTION_RECOVERY, None))
         cursor_turn.assert_called_once()
         notify.assert_not_called()
+        second_request = urlopen.call_args_list[1].args[0]
+        second_payload = json.loads(second_request.data)
+        self.assertEqual(second_payload["messages"][-1]["content"], result.display_text)
 
     def test_retries_without_replaying_malformed_tool_arguments(self) -> None:
         malformed_call = {
@@ -373,7 +431,7 @@ class QwenClientTests(unittest.TestCase):
         }
         with (
             mock.patch.object(
-                llm.urllib.request,
+                llm_transport.urllib.request,
                 "urlopen",
                 side_effect=[
                     _response({"content": None, "tool_calls": [malformed_call]}),
@@ -409,7 +467,7 @@ class QwenClientTests(unittest.TestCase):
         }
         with (
             mock.patch.object(
-                llm.urllib.request,
+                llm_transport.urllib.request,
                 "urlopen",
                 side_effect=[
                     _response(malformed_message),
@@ -443,7 +501,7 @@ class QwenClientTests(unittest.TestCase):
         }
         with (
             mock.patch.object(
-                llm.urllib.request,
+                llm_transport.urllib.request,
                 "urlopen",
                 side_effect=[
                     _response({"content": None, "tool_calls": [tool_call]}),
@@ -493,7 +551,9 @@ class QwenClientTests(unittest.TestCase):
         for response in responses:
             with (
                 self.subTest(response=response.getvalue()),
-                mock.patch.object(llm.urllib.request, "urlopen", return_value=response),
+                mock.patch.object(
+                    llm_transport.urllib.request, "urlopen", return_value=response
+                ),
                 redirect_stdout(io.StringIO()),
                 self.assertRaises(HarnessError),
             ):
@@ -502,7 +562,7 @@ class QwenClientTests(unittest.TestCase):
     def test_wraps_http_transport_errors(self) -> None:
         with (
             mock.patch.object(
-                llm.urllib.request,
+                llm_transport.urllib.request,
                 "urlopen",
                 side_effect=urllib.error.URLError("connection refused"),
             ),
@@ -520,7 +580,7 @@ class QwenClientTests(unittest.TestCase):
         )
         with (
             mock.patch.object(
-                llm.urllib.request,
+                llm_transport.urllib.request,
                 "urlopen",
                 side_effect=error,
             ),
@@ -537,12 +597,16 @@ class QwenClientTests(unittest.TestCase):
             llm_timeout=17,
         )
         with (
-            mock.patch.object(llm, "load_backend_settings", return_value=settings),
             mock.patch.object(
-                llm, "get_venice_api_key", return_value="venice-secret"
+                llm_transport,
+                "default_user_config",
+                return_value=mock.Mock(providers=settings),
+            ),
+            mock.patch.object(
+                llm_transport, "get_venice_api_key", return_value="venice-secret"
             ) as get_key,
             mock.patch.object(
-                llm.urllib.request,
+                llm_transport.urllib.request,
                 "urlopen",
                 return_value=_stream_response(
                     {"content": "hello "},
@@ -574,10 +638,16 @@ class QwenClientTests(unittest.TestCase):
             llm_model="zai-org-glm-5-2",
         )
         with (
-            mock.patch.object(llm, "load_backend_settings", return_value=settings),
-            mock.patch.object(llm, "get_venice_api_key", return_value="secret"),
             mock.patch.object(
-                llm.urllib.request,
+                llm_transport,
+                "default_user_config",
+                return_value=mock.Mock(providers=settings),
+            ),
+            mock.patch.object(
+                llm_transport, "get_venice_api_key", return_value="secret"
+            ),
+            mock.patch.object(
+                llm_transport.urllib.request,
                 "urlopen",
                 side_effect=[
                     _stream_response(
@@ -632,10 +702,16 @@ class QwenClientTests(unittest.TestCase):
             llm_model="zai-org-glm-5-2",
         )
         with (
-            mock.patch.object(llm, "load_backend_settings", return_value=settings),
-            mock.patch.object(llm, "get_venice_api_key", return_value="secret"),
             mock.patch.object(
-                llm.urllib.request,
+                llm_transport,
+                "default_user_config",
+                return_value=mock.Mock(providers=settings),
+            ),
+            mock.patch.object(
+                llm_transport, "get_venice_api_key", return_value="secret"
+            ),
+            mock.patch.object(
+                llm_transport.urllib.request,
                 "urlopen",
                 return_value=_stream_response(
                     {"content": "Submitting a Cursor job for all three tickets."}
@@ -662,10 +738,16 @@ class QwenClientTests(unittest.TestCase):
         tool_arguments = '{"task":"fix it","action":"submit"}'
         output = io.StringIO()
         with (
-            mock.patch.object(llm, "load_backend_settings", return_value=settings),
-            mock.patch.object(llm, "get_venice_api_key", return_value="secret"),
             mock.patch.object(
-                llm.urllib.request,
+                llm_transport,
+                "default_user_config",
+                return_value=mock.Mock(providers=settings),
+            ),
+            mock.patch.object(
+                llm_transport, "get_venice_api_key", return_value="secret"
+            ),
+            mock.patch.object(
+                llm_transport.urllib.request,
                 "urlopen",
                 side_effect=[
                     _stream_response(
@@ -724,7 +806,7 @@ class QwenClientTests(unittest.TestCase):
         )
         chunks: list[str] = []
 
-        message = llm._streamed_message(response, chunks.append)
+        message = llm_transport.streamed_message(response, chunks.append)
 
         self.assertEqual(message["content"], "Speaking already. ")
         tool_calls = message["tool_calls"]
@@ -740,10 +822,16 @@ class QwenClientTests(unittest.TestCase):
             llm_model="zai-org-glm-5-2",
         )
         with (
-            mock.patch.object(llm, "load_backend_settings", return_value=settings),
-            mock.patch.object(llm, "get_venice_api_key", return_value="secret"),
             mock.patch.object(
-                llm.urllib.request,
+                llm_transport,
+                "default_user_config",
+                return_value=mock.Mock(providers=settings),
+            ),
+            mock.patch.object(
+                llm_transport, "get_venice_api_key", return_value="secret"
+            ),
+            mock.patch.object(
+                llm_transport.urllib.request,
                 "urlopen",
                 side_effect=[
                     _stream_response(
@@ -785,15 +873,15 @@ class QwenClientTests(unittest.TestCase):
     def test_venice_surfaces_stream_errors_and_empty_streams(self) -> None:
         error = io.BytesIO(b'data: {"error": "model unavailable"}\n\n')
         with self.assertRaisesRegex(HarnessError, "model unavailable"):
-            llm._streamed_message(error, None)
+            llm_transport.streamed_message(error, None)
 
         malformed = io.BytesIO(b"data: []\n\n")
         with self.assertRaisesRegex(HarnessError, "malformed streaming event"):
-            llm._streamed_message(malformed, None)
+            llm_transport.streamed_message(malformed, None)
 
         empty = io.BytesIO(b"data: [DONE]\n\n")
         with self.assertRaisesRegex(HarnessError, "empty streaming response"):
-            llm._streamed_message(empty, None)
+            llm_transport.streamed_message(empty, None)
 
     def test_venice_rejects_malformed_streamed_tool_index(self) -> None:
         response = _stream_response(
@@ -808,7 +896,7 @@ class QwenClientTests(unittest.TestCase):
         )
 
         with self.assertRaisesRegex(HarnessError, "malformed streaming tool calls"):
-            llm._streamed_message(response, None)
+            llm_transport.streamed_message(response, None)
 
 
 if __name__ == "__main__":

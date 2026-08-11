@@ -7,8 +7,10 @@ from local_voice_harness import browser_context, desktop
 from local_voice_harness.context_fragment import ContextFragment
 from local_voice_harness.focused_app_context import FocusedAppContext
 from local_voice_harness.integrations import github
-from local_voice_harness.integrations import registry as context_providers
-from local_voice_harness.user_config import IntegrationSettings
+from local_voice_harness.integrations.registry import IntegrationRegistry
+from local_voice_harness.user_config import IntegrationSettings, default_user_config
+
+USER_CONFIG = default_user_config()
 
 GITHUB_DISABLED = IntegrationSettings(
     github_enabled=False,
@@ -120,7 +122,11 @@ class BrowserDispatchTests(unittest.TestCase):
                 browser_context, "focused_app_context", return_value=None
             ),
         ):
-            context = browser_context.request_context("work on this")
+            context = browser_context.request_context(
+                "work on this",
+                platform=USER_CONFIG.platform,
+                integrations=USER_CONFIG.integrations,
+            )
 
         self.assertEqual(context.focused_repository, "example/project")
         self.assertEqual(context.focused_issue, "example/project#42")
@@ -153,7 +159,11 @@ class BrowserDispatchTests(unittest.TestCase):
                 browser_context, "focused_app_context", return_value=None
             ),
         ):
-            context = browser_context.request_context("check out this PR")
+            context = browser_context.request_context(
+                "check out this PR",
+                platform=USER_CONFIG.platform,
+                integrations=USER_CONFIG.integrations,
+            )
 
         self.assertEqual(context.github_repository, "example/project")
         self.assertEqual(context.github_pull_request, 7)
@@ -177,7 +187,9 @@ class BrowserDispatchTests(unittest.TestCase):
             ),
         ):
             context = browser_context.request_context(
-                "work on spoken/project#7 instead"
+                "work on spoken/project#7 instead",
+                platform=USER_CONFIG.platform,
+                integrations=USER_CONFIG.integrations,
             )
 
         self.assertEqual(context.focused_issue, "spoken/project#7")
@@ -207,7 +219,11 @@ class BrowserDispatchTests(unittest.TestCase):
                 browser_context, "focused_app_context", return_value=None
             ),
         ):
-            context = browser_context.request_context("work on this ticket")
+            context = browser_context.request_context(
+                "work on this ticket",
+                platform=USER_CONFIG.platform,
+                integrations=USER_CONFIG.integrations,
+            )
 
         self.assertEqual(context.focused_issue, "ENG-123")
         self.assertEqual(context.external_issue_reference, "ENG-123")
@@ -236,7 +252,11 @@ class BrowserDispatchTests(unittest.TestCase):
                 browser_context, "focused_app_context", return_value=None
             ),
         ):
-            context = browser_context.request_context("work on issues 4 and 7")
+            context = browser_context.request_context(
+                "work on issues 4 and 7",
+                platform=USER_CONFIG.platform,
+                integrations=USER_CONFIG.integrations,
+            )
 
         self.assertEqual(context.issue_scope, "ENG")
         self.assertEqual(context.issue_scope_source, "linear")
@@ -266,9 +286,13 @@ class BrowserDispatchTests(unittest.TestCase):
                 browser_context, "focused_app_context", return_value=None
             ),
         ):
-            context = browser_context.request_context("work on issues 4 and 7")
+            context = browser_context.request_context(
+                "work on issues 4 and 7",
+                platform=USER_CONFIG.platform,
+                integrations=USER_CONFIG.integrations,
+            )
 
-        focused_herdr.assert_called_once_with()
+        focused_herdr.assert_called_once_with(USER_CONFIG.integrations)
         self.assertEqual(context.github_repository, "example/project")
         self.assertEqual(context.issue_scope, "example/project")
         self.assertEqual(context.issue_scope_source, "github")
@@ -299,7 +323,11 @@ class BrowserDispatchTests(unittest.TestCase):
                 browser_context, "focused_app_context", return_value=None
             ),
         ):
-            context = browser_context.request_context("work on issues 4 and 7")
+            context = browser_context.request_context(
+                "work on issues 4 and 7",
+                platform=USER_CONFIG.platform,
+                integrations=USER_CONFIG.integrations,
+            )
 
         focused_herdr.assert_not_called()
         self.assertEqual(context.issue_scope, "browser/project")
@@ -312,6 +340,13 @@ class BrowserDispatchTests(unittest.TestCase):
         herdr_client.focused_checkout.return_value = checkout
         github_client = mock.Mock()
         github_client.repository_for_checkout.return_value = "example/project"
+        integrations = IntegrationRegistry(
+            settings=USER_CONFIG.integrations,
+            factories=(),
+            github_client=lambda: github_client,
+            herdr_client=lambda: herdr_client,
+            platform=USER_CONFIG.platform,
+        )
         fragment = ContextFragment(
             source="github",
             text="Repository context",
@@ -322,50 +357,41 @@ class BrowserDispatchTests(unittest.TestCase):
                 browser_context, "integration_enabled", return_value=True
             ),
             mock.patch.object(
-                browser_context, "HerdrClient", return_value=herdr_client
-            ),
-            mock.patch.object(
-                browser_context._github,
-                "GitHubClient",
-                return_value=github_client,
-            ),
-            mock.patch.object(
                 browser_context, "capture_context", return_value=fragment
             ) as capture,
         ):
-            self.assertIs(browser_context.focused_herdr_github_context(), fragment)
+            self.assertIs(
+                browser_context.focused_herdr_github_context(integrations),
+                fragment,
+            )
 
         github_client.repository_for_checkout.assert_called_once_with(checkout)
-        capture.assert_called_once_with("https://github.com/example/project/issues")
+        capture.assert_called_once_with(
+            "https://github.com/example/project/issues", integrations
+        )
 
     def test_focused_herdr_context_fails_closed(self) -> None:
-        with (
-            mock.patch.object(
-                browser_context, "integration_enabled", return_value=False
-            ),
-            mock.patch.object(browser_context, "HerdrClient") as herdr_client,
-        ):
-            self.assertIsNone(browser_context.focused_herdr_github_context())
-        herdr_client.assert_not_called()
+        self.assertIsNone(browser_context.focused_herdr_github_context(GITHUB_DISABLED))
 
+        integrations = IntegrationRegistry(
+            settings=USER_CONFIG.integrations,
+            factories=(),
+            github_client=mock.Mock(),
+            herdr_client=mock.Mock(side_effect=RuntimeError("unavailable")),
+            platform=USER_CONFIG.platform,
+        )
         with (
             mock.patch.object(
                 browser_context, "integration_enabled", return_value=True
             ),
-            mock.patch.object(
-                browser_context, "HerdrClient", side_effect=RuntimeError("unavailable")
-            ),
         ):
-            self.assertIsNone(browser_context.focused_herdr_github_context())
+            self.assertIsNone(
+                browser_context.focused_herdr_github_context(integrations)
+            )
 
     def test_disabled_github_never_parses_or_calls_cli(self) -> None:
         url = "https://github.com/example/project/issues/42"
         with (
-            mock.patch.object(
-                context_providers,
-                "_integration_settings",
-                return_value=GITHUB_DISABLED,
-            ),
             mock.patch.object(browser_context, "focused_firefox_url", return_value=url),
             mock.patch.object(
                 browser_context, "focused_app_context", return_value=None
@@ -374,7 +400,11 @@ class BrowserDispatchTests(unittest.TestCase):
             mock.patch.object(github, "_github_url") as parse_url,
             mock.patch.object(github.GitHubClient, "_run") as run,
         ):
-            context = browser_context.request_context("work on example/project#42")
+            context = browser_context.request_context(
+                "work on example/project#42",
+                platform=USER_CONFIG.platform,
+                integrations=GITHUB_DISABLED,
+            )
 
         self.assertEqual(context.text, "work on example/project#42")
         self.assertIsNone(context.focused_repository)
@@ -397,7 +427,11 @@ class BrowserDispatchTests(unittest.TestCase):
                 browser_context, "focused_app_context", return_value=None
             ),
         ):
-            context = browser_context.request_context("ordinary request")
+            context = browser_context.request_context(
+                "ordinary request",
+                platform=USER_CONFIG.platform,
+                integrations=USER_CONFIG.integrations,
+            )
 
         self.assertEqual(context.text, "ordinary request")
 
@@ -421,7 +455,11 @@ class FocusedAppRequestContextTests(unittest.TestCase):
                 browser_context, "focused_app_context", return_value=captured
             ),
         ):
-            context = browser_context.request_context("fix this code")
+            context = browser_context.request_context(
+                "fix this code",
+                platform=USER_CONFIG.platform,
+                integrations=USER_CONFIG.integrations,
+            )
 
         self.assertEqual(context.focused_app_class, "cursor")
         self.assertEqual(context.focused_app_sources, ("selection",))
@@ -449,7 +487,11 @@ class FocusedAppRequestContextTests(unittest.TestCase):
                 side_effect=RuntimeError("capture blew up"),
             ),
         ):
-            context = browser_context.request_context("work on this")
+            context = browser_context.request_context(
+                "work on this",
+                platform=USER_CONFIG.platform,
+                integrations=USER_CONFIG.integrations,
+            )
 
         self.assertIn("GitHub context", context.text)
         self.assertIsNone(context.focused_app_context)

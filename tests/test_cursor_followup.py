@@ -28,6 +28,7 @@ from local_voice_harness.integrations.herdr import (
     HerdrClient,
     HerdrError,
 )
+from local_voice_harness.responses import as_assistant_response
 
 
 @pytest.fixture
@@ -108,6 +109,8 @@ def _build_child(parent: CursorJob, child_id: str = "bbbbbbbbbbbb") -> CursorJob
             worktree_branch=parent.worktree_branch,
             worktree_path=parent.worktree_path,
             worktree_provision_state="ready",
+            harness_kind=parent.harness_kind,
+            issue_provider=parent.issue_provider,
         )
     )
 
@@ -383,10 +386,13 @@ def test_start_follow_up_checks_capability_before_creating_child(
     launch = mock.Mock()
     monkeypatch.setattr(service, "launch_worker", launch)
     monkeypatch.setattr(
-        service, "resolve_issue_reference", lambda _reference: "ENG-123"
+        service,
+        "resolve_issue_reference",
+        lambda _reference, *_args, **_kwargs: "ENG-123",
     )
+    monkeypatch.setattr(service, "require_issue_provider", lambda *_args: None)
 
-    def reject(_reference: str) -> None:
+    def reject(_reference: str, *_args: object, **_kwargs: object) -> None:
         raise HarnessError("Linear MCP requires authentication")
 
     monkeypatch.setattr(service, "require_issue_capabilities", reject)
@@ -413,7 +419,7 @@ def test_cursor_turn_follow_up_reports_busy(store: JobStore, tmp_path: Path) -> 
     )
 
     assert result.session_id is None
-    assert "busy" in result.text.lower()
+    assert "busy" in as_assistant_response(result.text).display_text.lower()
 
 
 def test_cursor_turn_follow_up_reports_unavailable_for_stale_source(
@@ -431,7 +437,7 @@ def test_cursor_turn_follow_up_reports_unavailable_for_stale_source(
     )
 
     assert result.session_id is None
-    assert "follow up" in result.text.lower()
+    assert "follow up" in as_assistant_response(result.text).display_text.lower()
 
 
 def test_cursor_turn_follow_up_reports_unavailable_for_missing_parent(
@@ -447,7 +453,9 @@ def test_cursor_turn_follow_up_reports_unavailable_for_missing_parent(
     )
 
     assert result.session_id is None
-    assert "no longer follow up" in result.text.lower()
+    assert (
+        "no longer follow up" in as_assistant_response(result.text).display_text.lower()
+    )
 
 
 def test_cursor_turn_follow_up_reports_unavailable_for_quarantined_parent(
@@ -466,13 +474,15 @@ def test_cursor_turn_follow_up_reports_unavailable_for_quarantined_parent(
         )
 
     assert result.session_id is None
-    assert "no longer follow up" in result.text.lower()
+    assert (
+        "no longer follow up" in as_assistant_response(result.text).display_text.lower()
+    )
 
 
 def test_cursor_turn_follow_up_without_source_is_graceful(store: JobStore) -> None:
     result = cursor_turn(CursorTurnRequest("review the changes", action="follow_up"))
     assert result.session_id is None
-    assert "recent completed" in result.text.lower()
+    assert "recent completed" in as_assistant_response(result.text).display_text.lower()
 
 
 class _FakeHerdr:

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import io
+import os
 import tempfile
 import threading
+import time
 import unittest
 import wave
 from pathlib import Path
@@ -10,6 +12,7 @@ from unittest import mock
 
 from local_voice_harness import vad
 from local_voice_harness.errors import HarnessError
+from local_voice_harness.user_config import default_user_config
 
 
 def _settings(
@@ -37,22 +40,14 @@ def _process(frames: list[bytes]) -> mock.Mock:
 
 class VadSettingsTests(unittest.TestCase):
     def test_defaults_are_suitable_for_dictation(self) -> None:
-        settings = vad.VadCaptureSettings.from_environment({})
+        settings = vad.VadCaptureSettings.from_dictation(
+            default_user_config().dictation
+        )
 
         self.assertEqual(settings.end_silence_ms, 900)
         self.assertEqual(settings.max_seconds, 120)
         self.assertEqual(settings.minimum_rms, 1100)
         self.assertEqual(settings.start_speech_frames, 3)
-
-    def test_invalid_values_are_rejected(self) -> None:
-        for name, value in (
-            ("DICTATION_VAD_END_SILENCE_MS", "0"),
-            ("DICTATION_VAD_MAX_SECONDS", "forever"),
-            ("DICTATION_VAD_MIN_SPEECH_RMS", "-1"),
-            ("DICTATION_VAD_START_SPEECH_FRAMES", "1.5"),
-        ):
-            with self.subTest(name=name), self.assertRaises(HarnessError):
-                vad.VadCaptureSettings.from_environment({name: value})
 
 
 class _FakeSamples:
@@ -192,6 +187,37 @@ class VadCaptureTests(unittest.TestCase):
                 detector=mock.Mock(is_speech=mock.Mock(return_value=False)),
                 stop_requested=stop_requested,
             )
+
+        process.send_signal.assert_called_once()
+
+    def test_stop_during_stalled_pipe_read_cleans_up_microphone(self) -> None:
+        read_fd, write_fd = os.pipe()
+        process = mock.Mock()
+        process.stdout = os.fdopen(read_fd, "rb", buffering=0)
+        process.stderr = io.BytesIO()
+        process.poll.return_value = None
+        stop_requested = threading.Event()
+
+        def request_stop_after_delay() -> None:
+            time.sleep(0.05)
+            stop_requested.set()
+
+        try:
+            with (
+                tempfile.TemporaryDirectory() as temporary,
+                mock.patch.object(vad.subprocess, "Popen", return_value=process),
+                self.assertRaisesRegex(HarnessError, "cancelled"),
+            ):
+                threading.Thread(target=request_stop_after_delay, daemon=True).start()
+                vad.capture_vad_audio(
+                    Path(temporary) / "capture.wav",
+                    source="",
+                    settings=_settings(),
+                    detector=mock.Mock(is_speech=mock.Mock(return_value=False)),
+                    stop_requested=stop_requested,
+                )
+        finally:
+            os.close(write_fd)
 
         process.send_signal.assert_called_once()
 

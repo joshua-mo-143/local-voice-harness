@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import collections
 import contextlib
+import fcntl
+import hashlib
+import json
 import os
 import re
 import signal
@@ -23,9 +26,6 @@ from ..agents.service import recover_jobs
 from ..browser_context import request_context
 from ..components import start_components, stop_components
 from ..config import (
-    CURSOR_FOLLOWUP_ENABLED,
-    CURSOR_FOLLOWUP_WINDOW_SECONDS,
-    DEFAULT_SOURCE,
     DICTATION_PID_PATH,
     DICTATION_RECORDER_LOG,
     DICTATION_STATE_DIR,
@@ -36,9 +36,9 @@ from ..config import (
     RECORDER_LOG,
     RECORDING_LOCK,
     STATE_DIR,
+    WAKE_LOCK,
     WAKE_PID_PATH,
     WAV_PATH,
-    load_backend_settings,
 )
 from ..cursor import questions as cursor_questions
 from ..cursor import service as cursor_service
@@ -64,7 +64,15 @@ from ..cursor.delivery import (
     renew_delivery as renew_claim,
 )
 from ..cursor.store import JobStore
+from ..diagnostic_safety import (
+    DAEMON_FAILURE,
+    PLAYBACK_FAILURE,
+    RECORDING_FAILURE,
+    VOICE_REQUEST_FAILURE,
+    redact_diagnostic,
+)
 from ..errors import HarnessError
+from ..integrations.registry import IntegrationRegistry, build_integration_registry
 from ..intent import (
     NON_ACTIONABLE_SUBMIT_RESPONSE,
     ForkIntent,
@@ -75,10 +83,13 @@ from ..intent import (
 )
 from ..llm import qwen_turn
 from ..notifications import notify
-from ..questions import AnswerProvenance, question_control, question_prompt
+from ..process import ProcessHandle, process_identity
+from ..questions import AnswerProvenance, question_control
+from ..responses import AssistantResponse, ResponseLike, as_assistant_response
 from ..stt.client import transcribe
 from ..ticket_targets import MISSING_ISSUE_SCOPE_RESPONSE, extract_ticket_targets
 from ..tts.queue import PlaybackQueue, PlaybackRequest
+from ..user_config import UserConfig, load_user_config
 from ..vad import FRAME_BYTES, FRAME_MS, SAMPLE_RATE, SpeechDetector
 
 RECORDING_PATHS = recorder.RecorderPaths(
@@ -96,22 +107,9 @@ CURSOR_STORE = JobStore(JOBS_DIR, LEGACY_JOBS_DIR)
 END_SILENCE_MS = 720
 MAX_UTTERANCE_SECONDS = 15
 CONVERSATION_TIMEOUT_SECONDS = 60
-WAKE_THRESHOLD = float(os.environ.get("VOICE_HARNESS_WAKE_THRESHOLD", "0.55"))
-MIN_SPEECH_RMS = float(os.environ.get("VOICE_HARNESS_MIN_SPEECH_RMS", "1100"))
-SOURCE = os.environ.get("VOICE_HARNESS_SOURCE", DEFAULT_SOURCE)
 PRE_ROLL_FRAMES = 25
 MICROPHONE_START_ATTEMPTS = 30
 MICROPHONE_RETRY_SECONDS = 1
-BARGE_IN_MODE = os.environ.get("VOICE_HARNESS_BARGE_IN_MODE", "wake").strip().lower()
-BARGE_IN_SPEECH_FRAMES = max(
-    1, int(os.environ.get("VOICE_HARNESS_BARGE_IN_SPEECH_FRAMES", "5"))
-)
-PLAYBACK_QUIET_FRAMES = max(
-    1, int(os.environ.get("VOICE_HARNESS_PLAYBACK_QUIET_FRAMES", "4"))
-)
-PLAYBACK_QUIET_TIMEOUT_SECONDS = max(
-    0.0, float(os.environ.get("VOICE_HARNESS_PLAYBACK_QUIET_TIMEOUT_SECONDS", "2"))
-)
 
 
 def acknowledge_delivery(job_id: str, token: str) -> bool:
@@ -134,8 +132,13 @@ def release_deliveries(claims: DeliveryClaims) -> None:
     release_claims(CURSOR_STORE, claims)
 
 
-def pending_results() -> list[DeliveryClaim]:
-    return cursor_service.pending_results(limit=DELIVERY_WINDOW)
+def pending_results(
+    integrations: IntegrationRegistry | None = None,
+) -> list[DeliveryClaim]:
+    return cursor_service.pending_results(
+        limit=DELIVERY_WINDOW,
+        integrations=integrations,
+    )
 
 
 class _DeliveryLeaseGuard:
@@ -225,6 +228,10 @@ CLOSE_PATTERN = re.compile(
     r"\b(?:goodbye|stop listening|go to sleep|end conversation)\b", re.IGNORECASE
 )
 END_CONVERSATION_RESPONSE = "Okay, I'll be here if you need me."
+RECENT_DETAILS_UNAVAILABLE = (
+    "I no longer have details for that recent announcement. "
+    "Ask for the job by name or ID."
+)
 
 
 @dataclass
@@ -244,6 +251,7 @@ class CompletedFollowup:
     job_id: str
     completed_at: float | None
     expires_at: float
+    display_fingerprint: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -256,19 +264,28 @@ class PendingQuestionSnapshot:
 
 
 def log(message: str) -> None:
-    print(f"[voice-harness-wake] {message}", file=sys.stderr, flush=True)
+    print(
+        f"[voice-harness-wake] {redact_diagnostic(message)}",
+        file=sys.stderr,
+        flush=True,
+    )
+
+
+def _display_fingerprint(display_text: str) -> str:
+    return hashlib.sha256(display_text.encode("utf-8")).hexdigest()
 
 
 class WakeConversationDaemon:
-    def __init__(self) -> None:
+    def __init__(self, user_config: UserConfig) -> None:
         import numpy as np
         import openwakeword
         from openwakeword.model import Model
 
-        if BARGE_IN_MODE not in {"wake", "vad", "off"}:
-            raise HarnessError(
-                "VOICE_HARNESS_BARGE_IN_MODE must be 'wake', 'vad', or 'off'"
-            )
+        self.user_config = user_config
+        self.audio = user_config.audio
+        self.platform = user_config.platform
+        self.providers = user_config.providers
+        self.integrations = build_integration_registry(user_config)
         self.np = np
         module_path = openwakeword.__file__
         if module_path is None:
@@ -282,7 +299,7 @@ class WakeConversationDaemon:
             vad_threshold=0.0,
         )
         self.wake_key = next(iter(self.wake_model.models))
-        self.speech_detector = SpeechDetector(minimum_rms=MIN_SPEECH_RMS)
+        self.speech_detector = SpeechDetector(minimum_rms=self.audio.min_speech_rms)
         self.pre_roll: collections.deque[bytes] = collections.deque(
             maxlen=PRE_ROLL_FRAMES
         )
@@ -299,7 +316,7 @@ class WakeConversationDaemon:
         self.activation_thread: threading.Thread | None = None
         self.activation_error: Exception | None = None
         self.component_lock = threading.Lock()
-        self.playback_queue = PlaybackQueue()
+        self.playback_queue = PlaybackQueue(self.audio)
 
     def is_speech(self, frame: bytes) -> bool:
         return self.speech_detector.is_speech(frame)
@@ -322,8 +339,8 @@ class WakeConversationDaemon:
 
     def start_microphone(self) -> None:
         command = ["pw-record", "--raw"]
-        if SOURCE:
-            command.extend(("--target", SOURCE))
+        if self.audio.source:
+            command.extend(("--target", self.audio.source))
         command.extend(("--channels=1", "--rate=16000", "--format=s16", "-"))
         for attempt in range(1, MICROPHONE_START_ATTEMPTS + 1):
             self.microphone = subprocess.Popen(
@@ -336,7 +353,8 @@ class WakeConversationDaemon:
             time.sleep(0.2)
             if self.microphone.poll() is None:
                 log(
-                    f"listening for Hey Jarvis on {SOURCE or 'PipeWire default source'}"
+                    "listening for Hey Jarvis on "
+                    f"{self.audio.source or 'PipeWire default source'}"
                 )
                 return
 
@@ -421,7 +439,7 @@ class WakeConversationDaemon:
         except HarnessError as exc:
             message = f"wake recording suppressed: {exc}"
             log(message)
-            notify(message)
+            notify(RECORDING_FAILURE, error=True)
             return None
 
     def begin_activation(self) -> None:
@@ -432,11 +450,12 @@ class WakeConversationDaemon:
         def activate() -> None:
             try:
                 with self.component_lock:
-                    start_components()
-                    if load_backend_settings().llm_provider == "local":
+                    start_components(self.providers)
+                    if self.providers.llm_provider == "local":
                         qwen_turn(
                             "Reply with only OK. Do not call a tool.",
                             allow_tools=False,
+                            settings=self.providers,
                         )
                     log("LLM tool graph and TTS backend are warm")
             except Exception as exc:
@@ -450,7 +469,7 @@ class WakeConversationDaemon:
     def ensure_components(self) -> None:
         if self.activation_thread is None:
             with self.component_lock:
-                start_components()
+                start_components(self.providers)
             return
         self.activation_thread.join(timeout=60)
         if self.activation_thread.is_alive():
@@ -478,8 +497,9 @@ class WakeConversationDaemon:
 
     def end_conversation(self) -> BargeIn | None:
         """Speak a brief farewell, then close unless the user barges in."""
-        print(f"Assistant: {END_CONVERSATION_RESPONSE}", flush=True)
-        _playback, interruption = self.play_response(END_CONVERSATION_RESPONSE)
+        response = as_assistant_response(END_CONVERSATION_RESPONSE)
+        print(f"Assistant: {response.display_text}", flush=True)
+        _playback, interruption = self.play_response(response)
         if interruption is not None:
             return interruption
         self.close_conversation("assistant ended the conversation")
@@ -491,13 +511,13 @@ class WakeConversationDaemon:
             return
         quiet = 0
         max_frames = max(
-            PLAYBACK_QUIET_FRAMES,
-            int(PLAYBACK_QUIET_TIMEOUT_SECONDS * 1000 / FRAME_MS),
+            self.audio.playback_quiet_frames,
+            int(self.audio.playback_quiet_timeout_seconds * 1000 / FRAME_MS),
         )
         for _ in range(max_frames):
             frame = self.read_frame()
             quiet = quiet + 1 if not self.is_speech(frame) else 0
-            if quiet >= PLAYBACK_QUIET_FRAMES:
+            if quiet >= self.audio.playback_quiet_frames:
                 break
         self.pre_roll.clear()
 
@@ -510,7 +530,7 @@ class WakeConversationDaemon:
         speech_streak = 0
         interruption: BargeIn | None = None
         wake_barge_enabled = SPOKEN_WAKE_PATTERN.search(response) is None
-        if BARGE_IN_MODE == "wake" and not wake_barge_enabled:
+        if self.audio.barge_in_mode == "wake" and not wake_barge_enabled:
             log(
                 "wake barge-in suppressed because the response contains the wake phrase"
             )
@@ -519,21 +539,21 @@ class WakeConversationDaemon:
             nonlocal speech_streak, interruption
             frame = self.read_frame()
             self.pre_roll.append(frame)
-            if BARGE_IN_MODE == "off":
+            if self.audio.barge_in_mode == "off":
                 return False
-            if BARGE_IN_MODE == "vad":
+            if self.audio.barge_in_mode == "vad":
                 speech_streak = speech_streak + 1 if self.is_speech(frame) else 0
-                detected = speech_streak >= BARGE_IN_SPEECH_FRAMES
+                detected = speech_streak >= self.audio.barge_in_speech_frames
                 woke = False
             else:
                 samples = self.np.frombuffer(frame, dtype="<i2")
                 score = float(self.wake_model.predict(samples).get(self.wake_key, 0.0))
-                detected = wake_barge_enabled and score >= WAKE_THRESHOLD
+                detected = wake_barge_enabled and score >= self.audio.wake_threshold
                 woke = True
             if detected:
                 interruption = BargeIn(initial=list(self.pre_roll), woke=woke)
                 self.pre_roll.clear()
-                log(f"barge-in detected ({BARGE_IN_MODE})")
+                log(f"barge-in detected ({self.audio.barge_in_mode})")
                 return True
             return False
 
@@ -570,8 +590,11 @@ class WakeConversationDaemon:
             self.wait_for_playback_quiet()
         return batch, interruption
 
-    def play_response(self, response: str) -> tuple[dict[str, object], BargeIn | None]:
-        self.playback_queue.enqueue(PlaybackRequest(text=response))
+    def play_response(
+        self, response: ResponseLike
+    ) -> tuple[dict[str, object], BargeIn | None]:
+        spoken_text = as_assistant_response(response).spoken_text
+        self.playback_queue.enqueue(PlaybackRequest(text=spoken_text))
         finished: set[int] = set()
 
         def finish_job(
@@ -584,7 +607,7 @@ class WakeConversationDaemon:
             finished.add(id(request))
 
         batch, interruption = self._drain_playback_queue(
-            response,
+            spoken_text,
             on_played=finish_job,
         )
         for playback, interrupted, request in batch:
@@ -682,37 +705,23 @@ class WakeConversationDaemon:
         }
         return response, next_cursor_session, playback, interruption
 
-    def _job_response_text(self, job: CursorJob) -> str:
-        if job.status == JobStatus.COMPLETED:
-            return f"Cursor finished. {str(job.result or '').strip()}"
-        if job.status == JobStatus.AWAITING_USER:
-            pending = cursor_questions.current(job)
-            text = (
-                question_prompt(pending)
-                if pending is not None
-                else str(job.question or job.result or "").strip()
-            )
-            return "Cursor needs clarification. " + text
-        if job.status == JobStatus.BLOCKED:
-            return str(
-                job.result or f"Cursor agent {job.herdr_target or ''} needs attention."
-            ).strip()
-        if job.status == JobStatus.CANCELLED:
-            return str(job.result or "Cursor job was cancelled.").strip()
-        return f"Cursor job failed. {str(job.error or 'Unknown error').strip()}"
+    def _job_response(self, job: CursorJob) -> AssistantResponse:
+        return cursor_service.render_job_announcement(job)
 
     def _enqueue_job_announcement(self, claim: DeliveryClaim) -> None:
         job = claim.job
         job_id = job.id
-        response = self._job_response_text(job)
-        log(f"job {job_id} completion queued: {response}")
-        print(f"Assistant: {response}", flush=True)
+        response = self._job_response(job)
+        log(f"job {job_id} completion queued: {response.display_text}")
+        print(f"Assistant: {response.display_text}", flush=True)
         self.playback_queue.enqueue(
             PlaybackRequest(
-                text=response,
+                text=response.spoken_text,
                 job_id=job_id,
                 delivery_token=claim.token,
                 job_status=job.status.value,
+                job_completed_at=job.completed_at,
+                display_fingerprint=_display_fingerprint(response.display_text),
             )
         )
 
@@ -722,6 +731,8 @@ class WakeConversationDaemon:
         job_id: str,
         job_status: str,
         played_text: str,
+        job_completed_at: float | None = None,
+        display_fingerprint: str | None = None,
     ) -> None:
         if played_text:
             self.history.append({"role": "assistant", "content": played_text})
@@ -733,19 +744,29 @@ class WakeConversationDaemon:
             # up the clarification slot and take the completed slot atomically.
             if self.cursor_session == job_id:
                 self.cursor_session = None
-            self._remember_completed_job(job_id)
+            self._remember_completed_job(
+                job_id,
+                expected_completed_at=job_completed_at,
+                display_fingerprint=display_fingerprint,
+            )
         self.conversation_deadline = time.monotonic() + CONVERSATION_TIMEOUT_SECONDS
         self.awaiting_followup = True
         notify("Listening for a follow-up…")
 
-    def _remember_completed_job(self, job_id: str) -> None:
+    def _remember_completed_job(
+        self,
+        job_id: str,
+        *,
+        expected_completed_at: float | None = None,
+        display_fingerprint: str | None = None,
+    ) -> None:
         """Install the most recently played completed job as follow-up context.
 
         Called only after a successful, uninterrupted announcement was
         acknowledged, so the reference reflects work the user just heard about.
         The last successfully announced completion wins.
         """
-        if not CURSOR_FOLLOWUP_ENABLED:
+        if not self.platform.cursor_followup_enabled:
             return
         try:
             job = CURSOR_STORE.get(job_id)
@@ -754,10 +775,18 @@ class WakeConversationDaemon:
         except Exception as exc:  # noqa: BLE001 - never let context tracking crash a turn
             log(f"follow-up context skipped for {job_id}: {type(exc).__name__}: {exc}")
             return
+        if (
+            expected_completed_at is not None
+            and job.completed_at != expected_completed_at
+        ):
+            return
         self.completed_followup = CompletedFollowup(
             job_id=job_id,
             completed_at=job.completed_at,
-            expires_at=time.monotonic() + CURSOR_FOLLOWUP_WINDOW_SECONDS,
+            expires_at=(
+                time.monotonic() + self.platform.cursor_followup_window_seconds
+            ),
+            display_fingerprint=display_fingerprint,
         )
         log(f"follow-up context retained for completed job {job_id}")
 
@@ -770,6 +799,38 @@ class WakeConversationDaemon:
             self.completed_followup = None
             return None
         return followup
+
+    def _recent_completion_details(
+        self,
+        followup: CompletedFollowup,
+    ) -> AssistantResponse:
+        if self.completed_followup is not followup:
+            return AssistantResponse.from_text(RECENT_DETAILS_UNAVAILABLE)
+        try:
+            job = CURSOR_STORE.get(followup.job_id)
+        except Exception as exc:  # noqa: BLE001 - retrieval must fail closed
+            log(
+                "recent completion details unavailable for "
+                f"{followup.job_id}: {type(exc).__name__}: {exc}"
+            )
+            self.completed_followup = None
+            return AssistantResponse.from_text(RECENT_DETAILS_UNAVAILABLE)
+        if (
+            job.status != JobStatus.COMPLETED
+            or job.completed_at != followup.completed_at
+            or followup.display_fingerprint is None
+        ):
+            self.completed_followup = None
+            return AssistantResponse.from_text(RECENT_DETAILS_UNAVAILABLE)
+        rendered = cursor_service.render_job_announcement(job)
+        if _display_fingerprint(rendered.display_text) != followup.display_fingerprint:
+            self.completed_followup = None
+            return AssistantResponse.from_text(RECENT_DETAILS_UNAVAILABLE)
+        self.completed_followup = None
+        return AssistantResponse(
+            spoken_text="I've displayed the details from that completed Cursor job.",
+            display_text=rendered.display_text,
+        )
 
     def _pending_cursor_question(self) -> PendingQuestionSnapshot | None:
         """Load one immutable question snapshot for routing and answer fencing."""
@@ -821,6 +882,8 @@ class WakeConversationDaemon:
             job_id=job_id,
             job_status=str(request.job_status or ""),
             played_text=played_text,
+            job_completed_at=request.job_completed_at,
+            display_fingerprint=request.display_fingerprint,
         )
 
     def _play_pending_announcements(self) -> BargeIn | None:
@@ -852,7 +915,7 @@ class WakeConversationDaemon:
         try:
             lease_guard.start()
             with self.component_lock:
-                start_components()
+                start_components(self.providers)
                 lease_guard.maintain()
                 self.playback_queue.start_prefetch(limit=DELIVERY_WINDOW)
             batch, interruption = self._drain_playback_queue(
@@ -886,7 +949,7 @@ class WakeConversationDaemon:
                 ):
                     release_delivery(request.job_id, request.delivery_token)
             log(f"queued playback failed: {type(exc).__name__}: {exc}")
-            notify(str(exc) or type(exc).__name__, error=True)
+            notify(PLAYBACK_FAILURE, error=True)
             return None
         finally:
             try:
@@ -943,7 +1006,11 @@ class WakeConversationDaemon:
             streamed_playback = False
             playback: dict[str, object] = {}
             interruption: BargeIn | None = None
-            context = request_context(text)
+            context = request_context(
+                text,
+                platform=self.platform,
+                integrations=self.integrations,
+            )
             active_completed = self._active_completed_followup()
             pending = self._pending_cursor_question()
             route = route_intent(
@@ -953,6 +1020,7 @@ class WakeConversationDaemon:
                 pending_question=pending.text if pending is not None else None,
                 clarification_kind=pending.owner if pending is not None else None,
                 recent_completion=active_completed is not None,
+                settings=self.providers,
             )
             if pending is not None and question_control(text) is not None:
                 route = IntentRoute(Intent.AGENT_REPLY, "high")
@@ -992,6 +1060,7 @@ class WakeConversationDaemon:
                         action="list",
                     ),
                     delivery_claims=delivery_claims,
+                    integrations=self.integrations,
                 )
             elif route.actionable and route.intent == Intent.AGENT_CANCEL:
                 response, next_cursor_session = cursor_turn(
@@ -1003,6 +1072,7 @@ class WakeConversationDaemon:
                         reference=text,
                     ),
                     delivery_claims=delivery_claims,
+                    integrations=self.integrations,
                 )
             elif route.actionable and route.intent == Intent.AGENT_STATUS:
                 response, next_cursor_session = cursor_turn(
@@ -1014,6 +1084,7 @@ class WakeConversationDaemon:
                         reference=text,
                     ),
                     delivery_claims=delivery_claims,
+                    integrations=self.integrations,
                 )
             elif route.actionable and route.intent in {
                 Intent.AGENT_DISMISS,
@@ -1051,6 +1122,7 @@ class WakeConversationDaemon:
                         ),
                     ),
                     delivery_claims=delivery_claims,
+                    integrations=self.integrations,
                 )
             elif (
                 route.actionable
@@ -1073,6 +1145,7 @@ class WakeConversationDaemon:
                         answer_provenance=AnswerProvenance.USER_VOICE,
                     ),
                     delivery_claims=delivery_claims,
+                    integrations=self.integrations,
                 )
             elif route.actionable and route.intent == Intent.AGENT_SUBMIT:
                 # Explicit new work invalidates any retained completed-job slot.
@@ -1088,6 +1161,7 @@ class WakeConversationDaemon:
                         **github_arguments,
                     ),
                     delivery_claims=delivery_claims,
+                    integrations=self.integrations,
                 )
             elif route.intent == Intent.AGENT_SUBMIT:
                 response = NON_ACTIONABLE_SUBMIT_RESPONSE
@@ -1096,6 +1170,16 @@ class WakeConversationDaemon:
                     "I can't open pull requests. I can review the changes or run "
                     "the tests in that checkout instead."
                 )
+            elif route.intent == Intent.AGENT_DETAILS:
+                current_completed = self._active_completed_followup()
+                if (
+                    self.cursor_session is not None
+                    or current_completed is None
+                    or current_completed is not active_completed
+                ):
+                    response = RECENT_DETAILS_UNAVAILABLE
+                else:
+                    response = self._recent_completion_details(current_completed)
             elif route.actionable and route.intent == Intent.AGENT_FOLLOWUP:
                 current_completed = self._active_completed_followup()
                 if (
@@ -1128,11 +1212,12 @@ class WakeConversationDaemon:
                             on_follow_up_started=consume_completed_followup,
                         ),
                         delivery_claims=delivery_claims,
+                        integrations=self.integrations,
                     )
             else:
                 # The authoritative router handles every mutating action above.
                 # Conversation fallback is always tool-free.
-                if load_backend_settings().llm_provider == "venice":
+                if self.providers.llm_provider == "venice":
                     (
                         response,
                         next_cursor_session,
@@ -1148,6 +1233,7 @@ class WakeConversationDaemon:
                             delivery_claims=delivery_claims,
                             on_text_chunk=on_text_chunk,
                             allow_tools=False,
+                            settings=self.providers,
                         )
                     )
                     streamed_playback = True
@@ -1160,17 +1246,19 @@ class WakeConversationDaemon:
                         trusted_utterance=text,
                         delivery_claims=delivery_claims,
                         allow_tools=False,
+                        settings=self.providers,
                     )
                 remember_response = True
-            print(f"Assistant: {response}", flush=True)
+            rendered_response = as_assistant_response(response)
+            print(f"Assistant: {rendered_response.display_text}", flush=True)
             cursor_session_before_playback = self.cursor_session
             if not streamed_playback:
-                playback, interruption = self.play_response(response)
+                playback, interruption = self.play_response(rendered_response)
             if remember_response:
                 played_text = (
                     str(playback.get("played_text") or "").strip()
                     if playback.get("interrupted")
-                    else response
+                    else rendered_response.spoken_text
                 )
                 next_history.append({"role": "user", "content": text})
                 if played_text:
@@ -1181,9 +1269,20 @@ class WakeConversationDaemon:
                 self.history = next_history
                 return interruption
             acknowledged = acknowledge_deliveries(delivery_claims)
-            for claim in acknowledged:
-                if claim.job.status == JobStatus.COMPLETED:
-                    self._remember_completed_job(claim.job.id)
+            completed_claims = [
+                claim
+                for claim in acknowledged
+                if claim.job.status == JobStatus.COMPLETED
+            ]
+            if len(completed_claims) == 1:
+                completed = completed_claims[0].job
+                self._remember_completed_job(
+                    completed.id,
+                    expected_completed_at=completed.completed_at,
+                    display_fingerprint=_display_fingerprint(
+                        rendered_response.display_text
+                    ),
+                )
             if self.cursor_session == cursor_session_before_playback:
                 self.cursor_session = next_cursor_session
             self.history = next_history
@@ -1193,7 +1292,7 @@ class WakeConversationDaemon:
         except Exception as exc:
             release_deliveries(delivery_claims)
             log(f"turn failed: {type(exc).__name__}: {exc}")
-            notify(str(exc) or type(exc).__name__, error=True)
+            notify(VOICE_REQUEST_FAILURE, error=True)
             self.awaiting_followup = False
             if not had_active_conversation:
                 self.history.clear()
@@ -1206,11 +1305,11 @@ class WakeConversationDaemon:
         return None
 
     def run(self) -> None:
-        recover_jobs()
+        recover_jobs(integrations=self.integrations)
         self.start_microphone()
         speech_streak = 0
         while self.running:
-            for job in pending_results():
+            for job in pending_results(self.integrations):
                 self._enqueue_job_announcement(job)
             if len(self.playback_queue) > 0:
                 self.continue_after_barge_in(self._play_pending_announcements())
@@ -1255,7 +1354,7 @@ class WakeConversationDaemon:
                 continue
             samples = self.np.frombuffer(frame, dtype="<i2")
             score = float(self.wake_model.predict(samples).get(self.wake_key, 0.0))
-            if score >= WAKE_THRESHOLD and now - self.last_wake >= 2.0:
+            if score >= self.audio.wake_threshold and now - self.last_wake >= 2.0:
                 self.last_wake = now
                 log(f"wake detected: score={score:.3f}")
                 initial = list(self.pre_roll)
@@ -1283,21 +1382,68 @@ class WakeConversationDaemon:
                 self.microphone.wait(timeout=2)
 
 
+def _read_wake_state() -> tuple[int, str] | None:
+    try:
+        raw = WAKE_PID_PATH.read_text().strip()
+    except OSError:
+        return None
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(value, dict):
+        return None
+    pid = value.get("pid")
+    start = value.get("process_start")
+    if isinstance(pid, bool) or not isinstance(pid, int) or pid <= 0:
+        return None
+    if not isinstance(start, str) or not start:
+        return None
+    return pid, start
+
+
 def request_listen() -> None:
     """Ask a running wake daemon to start a conversation without the wake word."""
+    state = _read_wake_state()
+    if state is None:
+        raise HarnessError("wake daemon is not running")
+    pid, start = state
+    handle = ProcessHandle.open(pid, expected_start=start)
+    if handle is None:
+        raise HarnessError("wake daemon is not running")
     try:
-        pid = int(WAKE_PID_PATH.read_text().strip())
-    except (OSError, ValueError) as exc:
-        raise HarnessError("wake daemon is not running") from exc
-    try:
-        os.kill(pid, signal.SIGUSR1)
+        handle.send_signal(signal.SIGUSR1)
     except ProcessLookupError as exc:
         raise HarnessError("wake daemon is not running") from exc
+    finally:
+        handle.close()
+
+
+def _acquire_wake_singleton() -> int:
+    WAKE_LOCK.parent.mkdir(parents=True, exist_ok=True)
+    descriptor = os.open(WAKE_LOCK, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError as exc:
+        os.close(descriptor)
+        raise HarnessError("wake daemon is already running") from exc
+    return descriptor
 
 
 def _write_pidfile() -> None:
+    identity = process_identity(os.getpid())
+    if identity is None:
+        raise HarnessError("could not establish wake daemon process identity")
     WAKE_PID_PATH.parent.mkdir(parents=True, exist_ok=True)
-    WAKE_PID_PATH.write_text(str(os.getpid()))
+    temporary = WAKE_PID_PATH.with_suffix(".tmp")
+    temporary.write_text(
+        json.dumps(
+            {"pid": os.getpid(), "process_start": identity}, separators=(",", ":")
+        )
+        + "\n"
+    )
+    temporary.chmod(0o600)
+    os.replace(temporary, WAKE_PID_PATH)
 
 
 def _remove_pidfile() -> None:
@@ -1309,7 +1455,8 @@ def main() -> None:
     if "--check" in sys.argv[1:]:
         print("voice-harness-wake: ok")
         return
-    daemon = WakeConversationDaemon()
+    singleton = _acquire_wake_singleton()
+    daemon = WakeConversationDaemon(load_user_config())
 
     def handle_signal(_signum: int, _frame: object) -> None:
         daemon.stop()
@@ -1326,11 +1473,13 @@ def main() -> None:
     except Exception as exc:
         if daemon.running:
             log(f"fatal: {type(exc).__name__}: {exc}")
-            notify(str(exc) or type(exc).__name__, error=True)
+            notify(DAEMON_FAILURE, error=True)
             raise
     finally:
         daemon.stop()
         _remove_pidfile()
+        fcntl.flock(singleton, fcntl.LOCK_UN)
+        os.close(singleton)
 
 
 if __name__ == "__main__":

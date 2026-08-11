@@ -1,0 +1,73 @@
+{
+  "captured_stages": [
+    "transcript_normalization",
+    "context_selection",
+    "ticket_extraction",
+    "intent_routing",
+    "response_rendering"
+  ],
+  "context": {
+    "external_issue_reference": null,
+    "external_issue_source": null,
+    "focused_app_class": "cursor",
+    "focused_app_sources": [
+      "selection"
+    ],
+    "focused_issue": null,
+    "focused_repository": "example/project",
+    "github_issue": null,
+    "github_pull_request": null,
+    "github_repository": "example/project",
+    "issue_scope": "example/project",
+    "issue_scope_source": "github",
+    "sources": [
+      "github",
+      "focused_app"
+    ]
+  },
+  "omitted_inputs": [
+    "audio",
+    "external_context_bodies",
+    "model_payloads"
+  ],
+  "response": {
+    "display_text": "Ready to submit example/project#12 and example/project#18.",
+    "spoken_text": "Two jobs are ready."
+  },
+  "route": {
+    "confidence": "high",
+    "intent": "cursor_submit"
+  },
+  "ticket_extraction": {
+    "references": [
+      {
+        "canonical": "example/project#12",
+        "error": null,
+        "position": 36,
+        "raw": "12",
+        "scoped": true,
+        "source": "github"
+      },
+      {
+        "canonical": "example/project#18",
+        "error": null,
+        "position": 43,
+        "raw": "18",
+        "scoped": true,
+        "source": "github"
+      }
+    ],
+    "requested_count": 2
+  },
+  "transcript": {
+    "normalized": "Please ask Cursor to work on issues 12 and 18",
+    "raw": "Please ask Cursa to work on issues 12 and 18",
+    "replacements": [
+      {
+        "spoken": "Cursa",
+        "written": "Cursor"
+      }
+    ]
+  },
+  "version": 1
+}

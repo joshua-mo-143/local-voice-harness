@@ -3,12 +3,12 @@ from __future__ import annotations
 import contextlib
 import io
 import json
-import os
 import tempfile
 import threading
 import time
 import unittest
 from contextlib import redirect_stdout
+from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
@@ -44,47 +44,39 @@ class SpeechToTextClientTests(unittest.TestCase):
             stt_server.resolve_backend("invalid")
 
     def test_resolve_model_name_maps_legacy_whisper_default_to_parakeet(self) -> None:
-        with mock.patch.dict(
-            os.environ, {"DICTATION_MODEL": "large-v3-turbo"}, clear=True
-        ):
-            self.assertEqual(
-                stt_server.resolve_model_name("parakeet"),
-                stt_server.PARAKEET_DEFAULT_MODEL,
-            )
+        self.assertEqual(
+            stt_server.resolve_model_name("parakeet", "large-v3-turbo"),
+            stt_server.PARAKEET_DEFAULT_MODEL,
+        )
 
     def test_resolve_model_name_honors_explicit_parakeet_model(self) -> None:
-        with mock.patch.dict(
-            os.environ,
-            {"DICTATION_MODEL": "nemo-parakeet-tdt-0.6b-v3"},
-            clear=True,
-        ):
-            self.assertEqual(
-                stt_server.resolve_model_name("parakeet"),
-                "nemo-parakeet-tdt-0.6b-v3",
-            )
+        self.assertEqual(
+            stt_server.resolve_model_name("parakeet", "nemo-parakeet-tdt-0.6b-v3"),
+            "nemo-parakeet-tdt-0.6b-v3",
+        )
 
     def test_resolve_quantization_defaults_to_int8_for_parakeet(self) -> None:
-        with mock.patch.dict(os.environ, {}, clear=True):
-            self.assertEqual(stt_server.resolve_quantization("parakeet"), "int8")
+        self.assertEqual(stt_server.resolve_quantization("parakeet"), "int8")
 
     def test_resolve_quantization_can_be_disabled(self) -> None:
-        with mock.patch.dict(
-            os.environ, {"DICTATION_QUANTIZATION": "none"}, clear=True
-        ):
-            self.assertIsNone(stt_server.resolve_quantization("parakeet"))
+        self.assertIsNone(stt_server.resolve_quantization("parakeet", "none"))
 
     def test_load_transcriber_builds_parakeet_backend(self) -> None:
         instance = mock.Mock()
         instance.transcribe.return_value = " hello "
-        with (
-            mock.patch.object(stt_server, "BACKEND", "parakeet"),
-            mock.patch.object(stt_server, "MODEL_NAME", "nemo-parakeet-tdt-0.6b-v2"),
-            mock.patch.object(stt_server, "QUANTIZATION", "int8"),
-            mock.patch.object(
-                stt_server, "ParakeetTranscriber", return_value=instance
-            ) as parakeet_cls,
-        ):
-            transcriber = stt_server.load_transcriber()
+        settings = stt_server.STTRuntimeSettings(
+            backend="parakeet",
+            model_name="nemo-parakeet-tdt-0.6b-v2",
+            quantization="int8",
+            compute_type="float16",
+            language=None,
+            prompt="prompt",
+            replacements={},
+        )
+        with mock.patch.object(
+            stt_server, "ParakeetTranscriber", return_value=instance
+        ) as parakeet_cls:
+            transcriber = stt_server.load_transcriber(settings)
 
         parakeet_cls.assert_called_once_with(
             "nemo-parakeet-tdt-0.6b-v2",
@@ -369,12 +361,13 @@ class TextToSpeechClientTests(unittest.TestCase):
             mock.patch.object(
                 tts_client.uuid, "uuid4", return_value=mock.Mock(hex="request-id")
             ),
-            mock.patch.dict(
-                os.environ, {"VOICE_HARNESS_VOICE": "/tmp/voice.wav"}, clear=True
-            ),
             redirect_stdout(output),
         ):
-            result = tts_client.synthesize_and_play("hello")
+            settings = replace(
+                tts_client.default_user_config().audio,
+                voice="/tmp/voice.wav",
+            )
+            result = tts_client.synthesize_and_play("hello", settings)
 
         payload = request.call_args.args[1]
         self.assertTrue(payload.endswith(b"\n"))

@@ -1,20 +1,26 @@
 from __future__ import annotations
 
-import fcntl
 import json
-import os
+import logging
 import re
-import shutil
 import subprocess
-import uuid
-from collections.abc import Callable, Iterator
-from contextlib import contextmanager
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
+from enum import StrEnum
 from pathlib import Path
+from typing import NoReturn
 from urllib.parse import SplitResult, urlsplit
 
-from ..config import GITHUB_ROOT, REPOSITORY_ROOT
 from ..context_fragment import ContextFragment
+from ..diagnostic_safety import redact_diagnostic
+from ..local_git import (
+    ExpectedRemote,
+    LocalGitError,
+    LocalGitOperationAmbiguous,
+    LocalGitRepository,
+    remote_identity,
+)
+from ..process import run_command
 
 REPOSITORY = re.compile(
     r"^(?P<owner>[A-Za-z0-9](?:[A-Za-z0-9-]{0,38}))/"
@@ -58,6 +64,7 @@ MAX_COMMENT_CHARS = 800
 MAX_COMMENTS = 5
 PROVIDER_NAME = "github"
 Checkpoint = Callable[[], None]
+_LOGGER = logging.getLogger(__name__)
 
 
 class GitHubError(RuntimeError):
@@ -66,6 +73,102 @@ class GitHubError(RuntimeError):
 
 class GitHubOperationAmbiguous(GitHubError):
     pass
+
+
+class GitHubIssueLookupReason(StrEnum):
+    NOT_FOUND_OR_INACCESSIBLE = "not_found_or_inaccessible"
+    UNAUTHORIZED = "unauthorized"
+    TRANSIENT = "transient"
+    UNKNOWN = "unknown"
+
+
+class GitHubIssueLookupError(GitHubError):
+    """A classified issue lookup failure with a safe spoken message."""
+
+    def __init__(
+        self,
+        reason: GitHubIssueLookupReason,
+        diagnostic: str,
+    ) -> None:
+        self.reason = reason
+        self.diagnostic = _redact_diagnostic(diagnostic)
+        super().__init__(self.voice_message)
+
+    @property
+    def voice_message(self) -> str:
+        if self.reason == GitHubIssueLookupReason.NOT_FOUND_OR_INACCESSIBLE:
+            return "I couldn't find or access that GitHub issue."
+        if self.reason == GitHubIssueLookupReason.UNAUTHORIZED:
+            return "I couldn't access that GitHub issue because GitHub authorization is required."
+        if self.reason == GitHubIssueLookupReason.TRANSIENT:
+            return "GitHub is temporarily unavailable while checking that issue."
+        if "malformed issue metadata" in self.diagnostic.casefold():
+            return "I couldn't verify that GitHub issue: malformed issue metadata."
+        return "I couldn't verify that GitHub issue."
+
+
+def _redact_diagnostic(value: str) -> str:
+    """Remove credentials and authorization values before diagnostics are logged."""
+    return redact_diagnostic(value)
+
+
+def _classify_issue_lookup(detail: str) -> GitHubIssueLookupReason:
+    normalized = detail.casefold()
+    if any(
+        marker in normalized
+        for marker in (
+            "authentication required",
+            "not logged in",
+            "gh auth login",
+            "unauthorized",
+            "bad credentials",
+            "http 401",
+            "status 401",
+            "http 403",
+            "status 403",
+            "permission denied",
+        )
+    ):
+        return GitHubIssueLookupReason.UNAUTHORIZED
+    if any(
+        marker in normalized
+        for marker in (
+            "could not resolve to an issue",
+            "issue not found",
+            "issue does not exist",
+            "http 404",
+            "status 404",
+            "not found",
+        )
+    ):
+        return GitHubIssueLookupReason.NOT_FOUND_OR_INACCESSIBLE
+    if any(
+        marker in normalized
+        for marker in (
+            "timed out",
+            "timeout",
+            "http 429",
+            "http 500",
+            "http 502",
+            "http 503",
+            "http 504",
+            "connection",
+            "temporarily unavailable",
+            "rate limit",
+        )
+    ):
+        return GitHubIssueLookupReason.TRANSIENT
+    return GitHubIssueLookupReason.UNKNOWN
+
+
+def _issue_lookup_error(detail: str) -> GitHubIssueLookupError:
+    error = GitHubIssueLookupError(_classify_issue_lookup(detail), detail)
+    _LOGGER.error(
+        "GitHub issue lookup failed: reason=%s diagnostic=%s",
+        error.reason.value,
+        error.diagnostic,
+    )
+    return error
 
 
 @dataclass(frozen=True)
@@ -108,6 +211,27 @@ class GitHubPullRequest:
 
 
 @dataclass(frozen=True)
+class GitHubForkPlan:
+    source: GitHubRepository
+    login: str
+    target: str
+
+
+@dataclass(frozen=True)
+class GitHubPullRequestCheckoutInputs:
+    remote_url: str
+    head_ref: str
+    head_oid: str
+
+
+@dataclass(frozen=True)
+class GitHubPullRequestPlan:
+    source: GitHubRepository
+    pull_request: GitHubPullRequest
+    checkout: GitHubPullRequestCheckoutInputs
+
+
+@dataclass(frozen=True)
 class ProvisionedRepository:
     source: GitHubRepository
     fork: GitHubRepository
@@ -135,13 +259,22 @@ class GitHubClient:
         *,
         gh_executable: str = "gh",
         git_executable: str = "git",
-        clone_root: Path = GITHUB_ROOT,
-        allowed_root: Path = REPOSITORY_ROOT,
+        clone_root: Path | None = None,
+        allowed_root: Path | None = None,
+        timeout: float = 30,
+        local_git: LocalGitRepository | None = None,
     ) -> None:
         self.gh_executable = gh_executable
         self.git_executable = git_executable
-        self.clone_root = clone_root.expanduser().resolve()
-        self.allowed_root = allowed_root.expanduser().resolve()
+        self.clone_root = (clone_root or Path.home() / "src").expanduser().resolve()
+        self.allowed_root = (allowed_root or Path.home()).expanduser().resolve()
+        self.timeout = timeout
+        self.local_git = local_git or LocalGitRepository(
+            git_executable=git_executable,
+            clone_root=self.clone_root,
+            allowed_root=self.allowed_root,
+            lock_name=".voice-harness-github.lock",
+        )
 
     @staticmethod
     def validate_repository(value: str) -> str:
@@ -155,23 +288,23 @@ class GitHubClient:
         self,
         command: list[str],
         *,
-        timeout: float = 30,
+        timeout: float | None = None,
         check: bool = True,
         cwd: Path | None = None,
     ) -> subprocess.CompletedProcess[str]:
         try:
-            process = subprocess.run(
+            process = run_command(
                 command,
-                capture_output=True,
-                text=True,
-                timeout=timeout,
-                check=False,
-                cwd=str(cwd) if cwd is not None else None,
+                timeout=self.timeout if timeout is None else timeout,
+                cwd=cwd,
             )
         except OSError as exc:
             raise GitHubError(f"GitHub command failed: {exc}") from exc
         except subprocess.TimeoutExpired as exc:
-            raise GitHubOperationAmbiguous(f"GitHub command timed out: {exc}") from exc
+            raise GitHubOperationAmbiguous(
+                "GitHub command timed out; its outcome is ambiguous because an "
+                f"external side effect may already have occurred: {exc}"
+            ) from exc
         if check and process.returncode:
             detail = process.stderr.strip() or process.stdout.strip()
             raise GitHubError(
@@ -251,25 +384,36 @@ class GitHubClient:
         if issue.number <= 0:
             raise GitHubError("GitHub issue number must be positive")
         repository = self.validate_repository(issue.name_with_owner)
-        process = self._run(
-            [
-                self.gh_executable,
-                "issue",
-                "view",
-                str(issue.number),
-                "--repo",
-                repository,
-                "--json",
-                "number,title,state,author,labels,body,comments,url",
-            ],
-            timeout=15,
-        )
+        try:
+            process = self._run(
+                [
+                    self.gh_executable,
+                    "issue",
+                    "view",
+                    str(issue.number),
+                    "--repo",
+                    repository,
+                    "--json",
+                    "number,title,state,author,labels,body,comments,url",
+                ],
+                timeout=15,
+                check=False,
+            )
+        except GitHubError as exc:
+            raise _issue_lookup_error(str(exc)) from exc
+        if process.returncode:
+            detail = process.stderr.strip() or process.stdout.strip()
+            raise _issue_lookup_error(
+                detail or f"issue lookup exited with status {process.returncode}"
+            )
         try:
             value = json.loads(process.stdout)
         except json.JSONDecodeError as exc:
-            raise GitHubError("GitHub returned malformed issue metadata") from exc
+            raise _issue_lookup_error(
+                "GitHub returned malformed issue metadata"
+            ) from exc
         if not isinstance(value, dict):
-            raise GitHubError("GitHub returned malformed issue metadata")
+            raise _issue_lookup_error("GitHub returned malformed issue metadata")
         return value
 
     def repository_context_details(self, repository: str) -> dict[str, object]:
@@ -309,7 +453,8 @@ class GitHubClient:
                 repository,
                 "--json",
                 "number,title,state,author,labels,body,comments,url,"
-                "isDraft,baseRefName,headRefName,additions,deletions,changedFiles",
+                "isDraft,baseRefName,headRefName,headRefOid,"
+                "additions,deletions,changedFiles",
             ],
             timeout=5,
         )
@@ -409,26 +554,6 @@ class GitHubClient:
             )
         return fork
 
-    @staticmethod
-    def _remote_repository(remote: str) -> str | None:
-        value = remote.strip().removesuffix(".git")
-        if value.startswith("git@github.com:"):
-            return value.removeprefix("git@github.com:")
-        parsed = urlsplit(value)
-        if (
-            parsed.scheme in {"http", "https", "ssh"}
-            and parsed.hostname
-            and parsed.hostname.casefold() == "github.com"
-        ):
-            return parsed.path.strip("/").removeprefix("git/")
-        return None
-
-    def _git(self, checkout: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
-        return self._run(
-            [self.git_executable, "-C", str(checkout), *arguments],
-            timeout=60,
-        )
-
     def repository_for_checkout(self, checkout: Path) -> str:
         """Return the validated GitHub origin for an allowed local checkout."""
 
@@ -439,137 +564,45 @@ class GitHubClient:
             raise GitHubError(
                 "Git checkout is outside the configured project root"
             ) from exc
-        if resolved == self.allowed_root or not (resolved / ".git").exists():
+        if resolved == self.allowed_root:
             raise GitHubError(f"{resolved} is not an allowed Git repository")
-        remote = self._git(resolved, "remote", "get-url", "origin").stdout.strip()
-        repository = self._remote_repository(remote)
-        if repository is None:
-            raise GitHubError("Git origin is not a GitHub repository")
-        return self.validate_repository(repository)
-
-    def _verify_checkout(self, checkout: Path, expected: GitHubRepository) -> None:
-        if not (checkout / ".git").exists():
-            raise GitHubError(f"{checkout} exists but is not a Git repository")
-        origin = self._git(checkout, "remote", "get-url", "origin").stdout
-        actual = self._remote_repository(origin)
-        if actual is None or actual.casefold() != expected.name_with_owner.casefold():
-            raise GitHubError(
-                f"{checkout} exists but its origin is not {expected.name_with_owner}"
-            )
-
-    def _ensure_upstream(
-        self, checkout: Path, source: GitHubRepository, fork: GitHubRepository
-    ) -> None:
-        if source.name_with_owner.casefold() == fork.name_with_owner.casefold():
-            return
-        current = self._run(
-            [
-                self.git_executable,
-                "-C",
-                str(checkout),
-                "remote",
-                "get-url",
-                "upstream",
-            ],
-            check=False,
-        )
-        action = "set-url" if current.returncode == 0 else "add"
-        self._git(checkout, "remote", action, "upstream", source.url)
-
-    @contextmanager
-    def _provisioning_lock(
-        self, checkpoint: Checkpoint | None = None
-    ) -> Iterator[None]:
         try:
-            self.clone_root.relative_to(self.allowed_root)
-        except ValueError as exc:
-            raise GitHubError(
-                "VOICE_HARNESS_GITHUB_ROOT must be inside VOICE_HARNESS_PROJECT_ROOT"
-            ) from exc
-        if checkpoint is not None:
-            checkpoint()
-        self.clone_root.mkdir(mode=0o700, parents=True, exist_ok=True)
-        if checkpoint is not None:
-            checkpoint()
-        lock_path = self.clone_root / ".voice-harness-github.lock"
-        if checkpoint is not None:
-            checkpoint()
-        with lock_path.open("a+b") as lock:
-            if checkpoint is not None:
-                checkpoint()
-            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
-            try:
-                if checkpoint is not None:
-                    checkpoint()
-                yield
-            finally:
-                fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+            self.local_git.verify_checkout(resolved)
+            remote = self.local_git.git(
+                resolved, "remote", "get-url", "origin"
+            ).stdout.strip()
+        except LocalGitError as exc:
+            self._raise_local_git_error(exc)
+        identity = remote_identity(remote)
+        prefix = "github.com/"
+        if identity is None or not identity.startswith(prefix):
+            raise GitHubError("Git origin is not a GitHub repository")
+        return self.validate_repository(identity.removeprefix(prefix))
 
-    def _materialize_clone(
-        self,
-        *,
-        owner: str,
-        repository_name: str,
-        clone_source: str,
-        verify: GitHubRepository,
-        finalize: Callable[[Path], None] | None = None,
-        checkpoint: Checkpoint | None = None,
-    ) -> Path:
-        destination = self.clone_root / owner / repository_name
-        with self._provisioning_lock(checkpoint):
-            if checkpoint is not None:
-                checkpoint()
-            destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-            if checkpoint is not None:
-                checkpoint()
-            resolved_parent = destination.parent.resolve()
-            try:
-                resolved_parent.relative_to(self.clone_root)
-            except ValueError as exc:
-                raise GitHubError("GitHub clone destination escapes its root") from exc
-            if destination.exists():
-                self._verify_checkout(destination, verify)
-                if finalize is not None:
-                    if checkpoint is not None:
-                        checkpoint()
-                    finalize(destination)
-                    if checkpoint is not None:
-                        checkpoint()
-                return destination.resolve()
-            temporary = destination.parent / (
-                f".{repository_name}.clone-{uuid.uuid4().hex}"
+    @staticmethod
+    def _expected_remote(repository: GitHubRepository) -> ExpectedRemote:
+        if not _github_url(repository.url):
+            raise GitHubError(
+                f"GitHub returned an invalid clone URL for {repository.name_with_owner}"
             )
-            try:
-                if checkpoint is not None:
-                    checkpoint()
-                self._run(
-                    [
-                        self.gh_executable,
-                        "repo",
-                        "clone",
-                        clone_source,
-                        str(temporary),
-                    ],
-                    timeout=300,
-                )
-                if checkpoint is not None:
-                    checkpoint()
-                self._verify_checkout(temporary, verify)
-                if finalize is not None:
-                    if checkpoint is not None:
-                        checkpoint()
-                    finalize(temporary)
-                    if checkpoint is not None:
-                        checkpoint()
-                if checkpoint is not None:
-                    checkpoint()
-                os.replace(temporary, destination)
-                if checkpoint is not None:
-                    checkpoint()
-            finally:
-                if temporary.exists():
-                    shutil.rmtree(temporary)
-            return destination.resolve()
+        try:
+            expected = ExpectedRemote.from_url(repository.url)
+        except LocalGitError as exc:
+            raise GitHubError(
+                f"GitHub returned an invalid clone URL for {repository.name_with_owner}"
+            ) from exc
+        identity = f"github.com/{repository.name_with_owner.casefold()}"
+        if expected.identity != identity:
+            raise GitHubError(
+                f"GitHub returned an invalid clone URL for {repository.name_with_owner}"
+            )
+        return expected
+
+    @staticmethod
+    def _raise_local_git_error(exc: LocalGitError) -> NoReturn:
+        if isinstance(exc, LocalGitOperationAmbiguous):
+            raise GitHubOperationAmbiguous(str(exc)) from exc
+        raise GitHubError(str(exc)) from exc
 
     def ensure_clone(
         self,
@@ -581,24 +614,26 @@ class GitHubClient:
         source_owner, repository_name = source.name_with_owner.split("/", 1)
 
         def finalize(checkout: Path) -> None:
-            self._ensure_upstream(checkout, source, fork)
+            if source.name_with_owner.casefold() != fork.name_with_owner.casefold():
+                self.local_git.ensure_remote(checkout, "upstream", source.url)
 
-        if checkpoint is None:
-            return self._materialize_clone(
-                owner=source_owner,
-                repository_name=repository_name,
-                clone_source=fork.name_with_owner,
-                verify=fork,
+        try:
+            return self.local_git.materialize(
+                Path(source_owner) / repository_name,
+                clone_url=fork.url,
+                clone_command=(
+                    self.gh_executable,
+                    "repo",
+                    "clone",
+                    fork.name_with_owner,
+                ),
+                expected=self._expected_remote(fork),
+                expected_label=fork.name_with_owner,
                 finalize=finalize,
+                checkpoint=checkpoint,
             )
-        return self._materialize_clone(
-            owner=source_owner,
-            repository_name=repository_name,
-            clone_source=fork.name_with_owner,
-            verify=fork,
-            finalize=finalize,
-            checkpoint=checkpoint,
-        )
+        except LocalGitError as exc:
+            self._raise_local_git_error(exc)
 
     def ensure_repository_clone(
         self,
@@ -607,31 +642,34 @@ class GitHubClient:
         checkpoint: Checkpoint | None = None,
     ) -> Path:
         source_owner, repository_name = source.name_with_owner.split("/", 1)
-        if checkpoint is None:
-            return self._materialize_clone(
-                owner=source_owner,
-                repository_name=repository_name,
-                clone_source=source.name_with_owner,
-                verify=source,
+        try:
+            return self.local_git.materialize(
+                Path(source_owner) / repository_name,
+                clone_url=source.url,
+                clone_command=(
+                    self.gh_executable,
+                    "repo",
+                    "clone",
+                    source.name_with_owner,
+                ),
+                expected=self._expected_remote(source),
+                expected_label=source.name_with_owner,
+                checkpoint=checkpoint,
             )
-        return self._materialize_clone(
-            owner=source_owner,
-            repository_name=repository_name,
-            clone_source=source.name_with_owner,
-            verify=source,
-            checkpoint=checkpoint,
-        )
+        except LocalGitError as exc:
+            self._raise_local_git_error(exc)
 
     def find_repository_checkout(
         self, source: GitHubRepository, candidates: list[Path]
     ) -> Path | None:
-        for candidate in candidates:
-            try:
-                self._verify_checkout(candidate.resolve(), source)
-            except GitHubError:
-                continue
-            return candidate.resolve()
-        return None
+        try:
+            return self.local_git.find_checkout(
+                candidates,
+                self._expected_remote(source),
+                expected_label=source.name_with_owner,
+            )
+        except LocalGitError as exc:
+            self._raise_local_git_error(exc)
 
     def provision_issue(
         self,
@@ -692,8 +730,10 @@ class GitHubClient:
         )
         if checkpoint is not None:
             checkpoint()
-        head = self._git(checkout, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
-        return head or None
+        try:
+            return self.local_git.current_branch(checkout)
+        except LocalGitError as exc:
+            self._raise_local_git_error(exc)
 
     def provision_public_fork(
         self,
@@ -988,13 +1028,311 @@ def _canonical_repository(repository: str, details: dict[str, object] | None) ->
     return canonical if canonical.casefold() == repository.casefold() else repository
 
 
+_GITHUB_STATE_VERSION = 1
+_GITHUB_STATE_SECTIONS: dict[str, dict[str, str]] = {
+    "repository": {"name": "github_repository"},
+    "issue": {
+        "number": "github_issue",
+        "url": "github_issue_url",
+        "context": "github_issue_context",
+    },
+    "pull_request": {
+        "number": "github_pull_request",
+        "worktree_state": "pull_request_worktree_state",
+        "branch": "pull_request_branch",
+        "worktree_error": "pull_request_worktree_error",
+        "remote_url": "pull_request_remote_url",
+        "head_ref": "pull_request_head_ref",
+        "head_oid": "pull_request_head_oid",
+    },
+    "fork": {
+        "requested": "fork_requested",
+        "confirmed": "fork_confirmed",
+        "committed": "fork_committed",
+        "exists": "fork_exists",
+        "dispatch_exited": "fork_dispatch_exited",
+        "committed_at": "fork_committed_at",
+        "operation_state": "fork_operation_state",
+        "operation_source": "fork_operation_source",
+        "operation_source_url": "fork_operation_source_url",
+        "operation_source_parent": "fork_operation_source_parent",
+        "operation_source_default_branch": "fork_operation_source_default_branch",
+        "operation_source_private": "fork_operation_source_private",
+        "operation_login": "fork_operation_login",
+        "operation_target": "fork_operation_target",
+        "repository": "fork_repository",
+        "reconcile_attempts": "fork_reconcile_attempts",
+        "absent_observations": "fork_absent_observations",
+        "next_reconcile_at": "fork_next_reconcile_at",
+        "last_reconciled_at": "fork_last_reconciled_at",
+        "confirmed_absent_at": "fork_confirmed_absent_at",
+        "automatic_reconcile_stopped_at": "fork_automatic_reconcile_stopped_at",
+        "retained_at": "fork_retained_at",
+    },
+}
+GITHUB_PROVIDER_STATE_FIELDS = frozenset(
+    field for section in _GITHUB_STATE_SECTIONS.values() for field in section.values()
+)
+
+
+def load_github_provider_state(state: Mapping[str, object]) -> dict[str, object]:
+    """Convert legacy flat or nested v1 GitHub provider state to flat fields."""
+
+    if not isinstance(state, Mapping):
+        raise GitHubError("GitHub provider state must be an object")
+    values = dict(state)
+    if not values:
+        return {}
+    if "version" not in values:
+        unsupported = set(values) - GITHUB_PROVIDER_STATE_FIELDS
+        if unsupported:
+            field = sorted(unsupported)[0]
+            raise GitHubError(
+                f"GitHub provider state contains unsupported field {field}"
+            )
+        return values
+    if values.get("version") != _GITHUB_STATE_VERSION:
+        raise GitHubError("unsupported GitHub provider state version")
+    unsupported_sections = set(values) - {"version", *_GITHUB_STATE_SECTIONS}
+    if unsupported_sections:
+        section = sorted(unsupported_sections)[0]
+        raise GitHubError(
+            f"GitHub provider state contains unsupported section {section}"
+        )
+    flattened: dict[str, object] = {}
+    for section_name, fields in _GITHUB_STATE_SECTIONS.items():
+        section_value = values.get(section_name, {})
+        if not isinstance(section_value, Mapping):
+            raise GitHubError(
+                f"GitHub provider state {section_name} section must be an object"
+            )
+        section = dict(section_value)
+        unsupported = set(section) - set(fields)
+        if unsupported:
+            field = sorted(unsupported)[0]
+            raise GitHubError(
+                f"GitHub provider state {section_name} contains unsupported field {field}"
+            )
+        for name, value in section.items():
+            flattened[fields[name]] = value
+    return flattened
+
+
+def dump_github_provider_state(state: Mapping[str, object]) -> dict[str, object]:
+    """Serialize GitHub provider fields as clearly nested durable v1 state."""
+
+    flat = load_github_provider_state(state)
+    serialized: dict[str, object] = {"version": _GITHUB_STATE_VERSION}
+    for section_name, fields in _GITHUB_STATE_SECTIONS.items():
+        section = {name: flat[field] for name, field in fields.items() if field in flat}
+        if section:
+            serialized[section_name] = section
+    return serialized
+
+
 class GitHubProvider:
     """Built-in context provider for GitHub repositories, issues, and PRs."""
 
     name = PROVIDER_NAME
 
-    def __init__(self, client: GitHubClient | None = None) -> None:
-        self._client = client or GitHubClient()
+    def __init__(self, client: GitHubClient) -> None:
+        self._client = client
+
+    @staticmethod
+    def load_state(state: Mapping[str, object]) -> dict[str, object]:
+        return load_github_provider_state(state)
+
+    @staticmethod
+    def dump_state(state: Mapping[str, object]) -> dict[str, object]:
+        return dump_github_provider_state(state)
+
+    def resolve_repository(
+        self, repository: str, *, public: bool = False
+    ) -> GitHubRepository:
+        if public:
+            return self._client.inspect_public_repository(repository)
+        return self._client.inspect_repository(repository)
+
+    @property
+    def local_git(self) -> LocalGitRepository:
+        """Return the generic local-repository boundary configured for this provider."""
+
+        return self._client.local_git
+
+    def provision_issue(
+        self,
+        issue: GitHubIssue,
+        *,
+        candidates: list[Path] | None = None,
+        checkpoint: Checkpoint | None = None,
+    ) -> ProvisionedIssue:
+        return self._client.provision_issue(
+            issue,
+            candidates=candidates,
+            checkpoint=checkpoint,
+        )
+
+    def resolve_issue(self, issue: GitHubIssue) -> dict[str, object]:
+        """Validate and resolve current forge metadata for an issue."""
+
+        return self._client.issue_details(issue)
+
+    def materialize_repository(
+        self,
+        source: GitHubRepository,
+        *,
+        checkpoint: Checkpoint | None = None,
+    ) -> Path:
+        return self._client.ensure_repository_clone(source, checkpoint=checkpoint)
+
+    def materialize_fork(
+        self,
+        plan: GitHubForkPlan,
+        fork: GitHubRepository,
+        *,
+        checkpoint: Checkpoint | None = None,
+    ) -> Path:
+        self.validate_fork_plan(
+            plan,
+            materialized_repository=fork.name_with_owner,
+        )
+        return self._client.ensure_clone(plan.source, fork, checkpoint=checkpoint)
+
+    def plan_fork(self, repository: str) -> GitHubForkPlan:
+        source, login, target = self._client.prepare_public_fork(repository)
+        plan = GitHubForkPlan(source=source, login=login, target=target)
+        self.validate_fork_plan(plan)
+        return plan
+
+    def validate_fork_plan(
+        self,
+        plan: GitHubForkPlan,
+        *,
+        materialized_repository: str | None = None,
+    ) -> None:
+        source = GitHubClient.validate_repository(plan.source.name_with_owner)
+        if plan.source.is_private:
+            raise GitHubError("the focused GitHub repository is private")
+        try:
+            source_remote = ExpectedRemote.from_url(plan.source.url)
+        except LocalGitError as exc:
+            raise GitHubError("GitHub fork source URL is invalid") from exc
+        if source_remote.identity != f"github.com/{source.casefold()}":
+            raise GitHubError("GitHub fork source URL does not match its repository")
+        if re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})", plan.login) is None:
+            raise GitHubError("GitHub fork plan has an invalid login")
+        source_owner, repository_name = source.split("/", 1)
+        expected_target = (
+            source
+            if source_owner.casefold() == plan.login.casefold()
+            else f"{plan.login}/{repository_name}"
+        )
+        target = GitHubClient.validate_repository(plan.target)
+        if target.casefold() != expected_target.casefold():
+            raise GitHubError("GitHub fork plan has an invalid target")
+        if (
+            materialized_repository is not None
+            and GitHubClient.validate_repository(materialized_repository).casefold()
+            != target.casefold()
+        ):
+            raise GitHubError(
+                "persisted GitHub fork repository does not match its target"
+            )
+
+    def refresh_fork_plan(self, plan: GitHubForkPlan) -> GitHubForkPlan:
+        """Re-resolve persisted source metadata before trusting fork relationships."""
+
+        source = self.resolve_repository(plan.source.name_with_owner, public=True)
+        if source.name_with_owner.casefold() != plan.source.name_with_owner.casefold():
+            raise GitHubError("GitHub fork source identity changed unexpectedly")
+        refreshed = GitHubForkPlan(
+            source=source,
+            login=plan.login,
+            target=plan.target,
+        )
+        self.validate_fork_plan(refreshed)
+        return refreshed
+
+    def observe_fork(self, plan: GitHubForkPlan) -> GitHubRepository | None:
+        plan = self.refresh_fork_plan(plan)
+        return self._client.reconcile_fork(plan.source, plan.target)
+
+    def submit_fork(
+        self,
+        plan: GitHubForkPlan,
+        *,
+        confirmed: bool,
+        checkpoint: Checkpoint | None = None,
+        before_submit: Callable[[], None] | None = None,
+    ) -> GitHubRepository:
+        if not confirmed:
+            raise GitHubError("GitHub fork creation requires explicit confirmation")
+        self.validate_fork_plan(plan)
+        return self._client.ensure_fork(
+            plan.source,
+            plan.login,
+            checkpoint=checkpoint,
+            before_submit=before_submit,
+        )
+
+    def pull_request_checkout_inputs(
+        self,
+        source: GitHubRepository,
+        pull_request: GitHubPullRequest,
+        details: Mapping[str, object],
+    ) -> GitHubPullRequestCheckoutInputs:
+        if pull_request.number <= 0:
+            raise GitHubError("GitHub pull request number must be positive")
+        if pull_request.name_with_owner.casefold() != source.name_with_owner.casefold():
+            raise GitHubError("pull request does not belong to the resolved repository")
+        head_oid = str(details.get("headRefOid") or "")
+        inputs = GitHubPullRequestCheckoutInputs(
+            remote_url=source.url,
+            head_ref=f"refs/pull/{pull_request.number}/head",
+            head_oid=head_oid.lower(),
+        )
+        self.validate_pull_request_checkout_inputs(
+            source.name_with_owner,
+            pull_request.number,
+            inputs,
+        )
+        return inputs
+
+    def validate_pull_request_checkout_inputs(
+        self,
+        repository: str,
+        number: int,
+        inputs: GitHubPullRequestCheckoutInputs,
+    ) -> None:
+        """Reject persisted checkout metadata that no longer proves GitHub identity."""
+
+        repository = GitHubClient.validate_repository(repository)
+        try:
+            expected = ExpectedRemote.from_url(inputs.remote_url)
+        except LocalGitError as exc:
+            raise GitHubError("GitHub pull-request remote URL is invalid") from exc
+        if expected.identity != f"github.com/{repository.casefold()}":
+            raise GitHubError(
+                "GitHub pull-request remote does not match its repository"
+            )
+        if inputs.head_ref != f"refs/pull/{number}/head":
+            raise GitHubError("GitHub pull-request ref does not match its number")
+        if re.fullmatch(r"[0-9a-f]{40}", inputs.head_oid) is None:
+            raise GitHubError("GitHub returned an invalid pull request head OID")
+
+    def plan_pull_request(self, repository: str, number: int) -> GitHubPullRequestPlan:
+        if number <= 0:
+            raise GitHubError("GitHub pull request number must be positive")
+        source = self.resolve_repository(repository)
+        owner, name = source.name_with_owner.split("/", 1)
+        pull_request = GitHubPullRequest(owner, name, number)
+        details = self._client.pull_request_details(pull_request)
+        checkout = self.pull_request_checkout_inputs(source, pull_request, details)
+        return GitHubPullRequestPlan(
+            source=source,
+            pull_request=pull_request,
+            checkout=checkout,
+        )
 
     def matches(self, url: str) -> bool:
         return _github_url(url)

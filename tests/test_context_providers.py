@@ -1,11 +1,17 @@
 from __future__ import annotations
 
 import unittest
+from dataclasses import replace
+from pathlib import Path
 from unittest import mock
 
 from local_voice_harness.context_fragment import ContextFragment, ContextProvider
 from local_voice_harness.integrations import registry as context_providers
-from local_voice_harness.user_config import IntegrationSettings, UserConfigurationError
+from local_voice_harness.user_config import (
+    IntegrationSettings,
+    UserConfigurationError,
+    default_user_config,
+)
 
 URL = "https://example.test/thing/42"
 
@@ -57,21 +63,68 @@ class RegistryTests(unittest.TestCase):
         providers = context_providers.available_context_providers()
         self.assertEqual(tuple(provider.name for provider in providers), ("github",))
 
-    def test_malformed_config_falls_back_to_disabled_defaults(self) -> None:
-        factory = mock.Mock(return_value=_StubProvider())
+    def test_malformed_config_fails_before_constructing_providers(self) -> None:
+        factory = mock.Mock()
         with (
             mock.patch.object(
                 context_providers,
-                "_INTEGRATION_FACTORIES",
-                (("zendesk_enabled", factory),),
+                "load_user_config",
+                side_effect=UserConfigurationError("invalid config"),
             ),
             mock.patch.object(
                 context_providers,
-                "load_user_config",
-                side_effect=UserConfigurationError("bad config"),
+                "_INTEGRATION_FACTORIES",
+                (("github_enabled", factory),),
             ),
         ):
-            self.assertEqual(context_providers.available_context_providers(), ())
+            with self.assertRaisesRegex(UserConfigurationError, "invalid config"):
+                context_providers.available_context_providers()
+
+        factory.assert_not_called()
+
+    def test_configured_factories_share_the_startup_snapshot(self) -> None:
+        config = default_user_config(Path("/home/example"))
+        config = replace(
+            config,
+            platform=replace(
+                config.platform,
+                project_root=Path("/repositories"),
+                github_root=Path("/repositories/github"),
+                herdr_worktree_root=Path("/worktrees"),
+                gh_bin=Path("/tools/gh"),
+                git_bin=Path("/tools/git"),
+                herdr_bin=Path("/tools/herdr"),
+                github_timeout_seconds=12,
+                herdr_timeout_seconds=7,
+            ),
+        )
+
+        registry = context_providers.build_integration_registry(config)
+        github = registry.github_client()
+        herdr = registry.herdr_client()
+
+        self.assertEqual(github.gh_executable, "/tools/gh")
+        self.assertEqual(github.git_executable, "/tools/git")
+        self.assertEqual(github.allowed_root, Path("/repositories"))
+        self.assertEqual(github.clone_root, Path("/repositories/github"))
+        self.assertEqual(github.timeout, 12)
+        self.assertEqual(herdr.executable, "/tools/herdr")
+        self.assertEqual(herdr.repository.root, Path("/repositories"))
+        self.assertEqual(herdr.workspace.worktree_root, Path("/worktrees"))
+        self.assertEqual(herdr.timeout, 7)
+
+    def test_disabled_github_does_not_construct_client(self) -> None:
+        config = replace(
+            default_user_config(Path("/home/example")),
+            integrations=IntegrationSettings(github_enabled=False),
+        )
+        registry = context_providers.build_integration_registry(config)
+        factory = mock.Mock()
+        registry = replace(
+            registry,
+            factories=(("github_enabled", factory),),
+        )
+        self.assertEqual(context_providers.available_context_providers(registry), ())
         factory.assert_not_called()
 
 

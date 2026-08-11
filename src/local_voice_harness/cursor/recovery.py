@@ -8,8 +8,15 @@ from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import cast
 
+from ..diagnostic_safety import redact_diagnostic
 from ..errors import HarnessError
-from ..integrations.github import GitHubClient, GitHubError, GitHubRepository
+from ..integrations.github import (
+    GitHubClient,
+    GitHubError,
+    GitHubForkPlan,
+    GitHubProvider,
+    GitHubRepository,
+)
 from ..integrations.herdr import (
     HerdrClient,
     HerdrError,
@@ -42,8 +49,18 @@ DELIVERY_RETRY_SECONDS = 5.0
 PROMPT_ABSENT_OBSERVATIONS = 2
 
 HerdrFactory = Callable[[], HerdrClient]
-GitHubFactory = Callable[[], GitHubClient]
+GitHubFactory = Callable[[], GitHubClient | GitHubProvider]
 LaunchWorker = Callable[[str], None]
+RequireIssueProvider = Callable[[str | None], None]
+
+
+def _github_provider(factory: GitHubFactory) -> GitHubProvider:
+    integration = factory()
+    return (
+        integration
+        if isinstance(integration, GitHubProvider)
+        else GitHubProvider(integration)
+    )
 
 
 def _agent_not_found(exc: HerdrError) -> bool:
@@ -256,7 +273,12 @@ def reconcile_uncertain_fork(
         )
         return
     try:
-        fork = github_factory().reconcile_fork(source, target)
+        plan = GitHubForkPlan(
+            source=source,
+            login=job.fork_operation_login or target.split("/", 1)[0],
+            target=target,
+        )
+        fork = _github_provider(github_factory).observe_fork(plan)
     except GitHubError:
         _record_reconciliation_observation(
             store,
@@ -418,6 +440,7 @@ def reconcile_prompt_and_pane_operations(
             client.ensure_server()
             agent = client.get_agent(target)
             sequence = int(agent.get("state_change_seq") or 0)
+            session = agent_session_identity(agent.get("agent_session"))
         except (HerdrError, TypeError, ValueError):
             # A failed observation carries no evidence. Keep the submit fence.
             return
@@ -428,13 +451,9 @@ def reconcile_prompt_and_pane_operations(
                 or current.prompt_operation_target != target
             ):
                 return None
-            approval_session_matches = (
-                current.plan_approval_state != "approved"
-                or agent_session_identity(agent.get("agent_session"))
-                == current.plan_approval_agent_session
-            )
             accepted = (
-                approval_session_matches
+                session is not None
+                and session == current.prompt_operation_agent_session
                 and current.prompt_baseline_sequence is not None
                 and current.prompt_baseline_sequence >= 0
                 and sequence != current.prompt_baseline_sequence
@@ -518,6 +537,34 @@ def stage_terminal_intent(
     return job._updated(**changes)
 
 
+def _infrastructure_uncertain_for_release(job: CursorJob) -> bool:
+    if job.terminal_intent_status == JobStatus.CANCELLED:
+        # User cancellation already chose teardown, but provisional dispatch and
+        # materializing checkout/fork work still need reconciliation. Prompt,
+        # agent, and pane ambiguity must not keep ticket fences up once those
+        # stronger fences are clear.
+        return bool(
+            job.agent_dispatch_state
+            in {"dispatching", "ambiguous", "failed_observing", "manual_required"}
+            or job.fork_operation_state
+            in {"submitted", "ambiguous", "failed_observing"}
+            or job.worktree_provision_state
+            in {"dispatching", "ambiguous", "failed_observing"}
+            or job.participant_creation_state
+            in {"submitting", "ambiguous", "manual_required"}
+        )
+    return bool(
+        job.agent_dispatch_state
+        in {"dispatching", "ambiguous", "failed_observing", "manual_required"}
+        or job.prompt_operation_state in {"submitting", "ambiguous"}
+        or job.fork_operation_state in {"submitted", "ambiguous", "failed_observing"}
+        or job.worktree_provision_state
+        in {"dispatching", "ambiguous", "failed_observing"}
+        or job.participant_creation_state
+        in {"submitting", "ambiguous", "manual_required"}
+    )
+
+
 def cancel_target_and_release(
     store: JobStore,
     job_id: str,
@@ -570,18 +617,11 @@ def cancel_target_and_release(
             or job.target_release_token != release_token
         ):
             return None
-        infrastructure_uncertain = (
-            job.agent_dispatch_state
-            in {"dispatching", "ambiguous", "failed_observing", "manual_required"}
-            or job.prompt_operation_state in {"submitting", "ambiguous"}
-            or job.fork_operation_state
-            in {"submitted", "ambiguous", "failed_observing"}
-            or job.worktree_provision_state
-            in {"dispatching", "ambiguous", "failed_observing"}
-            or job.participant_creation_state
-            in {"submitting", "ambiguous", "manual_required"}
-        )
-        if interrupted and worker_stopped and not infrastructure_uncertain:
+        if (
+            interrupted
+            and worker_stopped
+            and not _infrastructure_uncertain_for_release(job)
+        ):
             if job.terminal_intent_status is not None:
                 terminal = job.terminal_intent_status
                 completed_at = job.terminal_intent_completed_at or time.time()
@@ -621,6 +661,7 @@ def cancel_target_and_release(
                     prompt_operation_phase=None,
                     prompt_operation_turn=None,
                     prompt_operation_target=None,
+                    prompt_operation_agent_session=None,
                     prompt_baseline_sequence=None,
                     participant_creation_state="none",
                     participant_creation_participant=None,
@@ -883,6 +924,7 @@ def _reconcile_interactive_questionnaire(
                 prompt_operation_phase=None,
                 prompt_operation_turn=None,
                 prompt_operation_target=None,
+                prompt_operation_agent_session=None,
                 prompt_baseline_sequence=None,
                 worker_pid=None,
                 worker_boot_id=None,
@@ -915,6 +957,7 @@ def recover_jobs(
     get_boot_identity: Callable[[], str | None] = boot_identity,
     get_process_identity: Callable[[int], str | None] = process_identity,
     inspect_legacy_worker: LegacyWorkerInspector = inspect_and_stop_legacy_worker,
+    require_issue_provider: RequireIssueProvider | None = None,
     now: float | None = None,
 ) -> None:
     if store.maintenance_active() is True:
@@ -987,6 +1030,37 @@ def recover_jobs(
             herdr_factory=herdr_factory,
             is_worker_alive=is_worker_alive,
         )
+    provider_errors: dict[str, str] = {}
+    if require_issue_provider is not None:
+        for existing in store.list():
+            if (
+                existing.status
+                not in {
+                    JobStatus.QUEUED,
+                    JobStatus.ROUTING,
+                    JobStatus.RUNNING,
+                    JobStatus.RECONCILING,
+                    JobStatus.BLOCKED,
+                }
+                or is_worker_alive(existing)
+                or existing.has_uncertain_operation()
+                or existing.manual_reconcile_operation
+                or existing.worktree_provision_state
+                in {"quarantined", "manual_required"}
+                or existing.pull_request_worktree_state == "quarantined"
+            ):
+                continue
+            try:
+                require_issue_provider(existing.issue_provider)
+            except Exception as exc:  # noqa: BLE001 - persisted as a job failure
+                detail = redact_diagnostic(
+                    str(exc) or type(exc).__name__,
+                    limit=360,
+                )
+                provider_errors[existing.id] = (
+                    f"Selected issue provider {existing.issue_provider!r} is "
+                    f"unavailable: {detail}"
+                )[:500]
     for existing in store.list():
         if (
             existing.status
@@ -1030,11 +1104,7 @@ def recover_jobs(
                     get_process_identity=get_process_identity,
                 )
                 and not is_worker_alive(job)
-                and not job.has_uncertain_operation()
-                and not (
-                    job.agent_dispatch_state == "manual_required"
-                    and bool(job.herdr_target)
-                )
+                and not _infrastructure_uncertain_for_release(job)
             )
             release_token = job.target_release_token
             owner_pid = job.target_release_owner_pid
@@ -1078,6 +1148,22 @@ def recover_jobs(
                         worker_token=None,
                     )
                 return None
+            provider_error = provider_errors.get(job.id)
+            if provider_error is not None:
+                failed = stage_terminal_intent(
+                    job,
+                    JobStatus.FAILED,
+                    now=recovered_at,
+                    result=provider_error,
+                    error=provider_error,
+                    clear_worker=True,
+                )
+                release = (
+                    failed.id,
+                    failed.herdr_target or "",
+                    failed.target_release_token or "",
+                )
+                return failed
             if job.status == JobStatus.BLOCKED:
                 if (
                     job.delivered

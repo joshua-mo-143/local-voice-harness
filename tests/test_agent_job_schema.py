@@ -41,7 +41,15 @@ def test_v8_cursor_fixture_migrates_to_structured_agent_schema() -> None:
     assert record["implementer_target"] == "cursor-agent-61"
     assert record["harness_state"] == fixture("agent-v9.json")["harness_state"]
     assert record["checkout_state"] == fixture("agent-v9.json")["checkout_state"]
-    assert record["provider_state"] == fixture("agent-v9.json")["provider_state"]
+    assert record["provider_state"] == {
+        "github": {
+            "version": 1,
+            "repository": {"name": "owner/project"},
+            "issue": {"number": 61},
+            "fork": {"requested": False},
+        },
+        "linear": {"issue_key": "VOICE-61"},
+    }
 
 
 def test_v9_agent_fixture_loads_with_legacy_recovery_accessors() -> None:
@@ -56,6 +64,30 @@ def test_v9_agent_fixture_loads_with_legacy_recovery_accessors() -> None:
     assert job.repository == "/repo"
     assert job.worktree_path == "/repo-worktree"
     assert job.issue_key == "VOICE-61"
+
+
+def test_v12_github_state_migrates_losslessly_to_provider_owned_state() -> None:
+    job = AgentJob.from_dict(fixture("agent-v12-github.json"))
+
+    assert job.loaded_schema_version == 12
+    assert job.schema_version == CURRENT_SCHEMA_VERSION
+    assert job.fork_operation_state == "submitted"
+    assert job.fork_committed
+    assert job.fork_operation_login == "me"
+    assert job.fork_operation_target == "me/project"
+    assert job.pull_request_worktree_state == "quarantined"
+    assert job.worktree_path == "/repo-worktree"
+    provider_state = job.to_record()["provider_state"]
+    assert isinstance(provider_state, dict)
+    github = provider_state["github"]
+    assert isinstance(github, dict)
+    assert github["version"] == 1
+    fork = github["fork"]
+    pull_request = github["pull_request"]
+    assert isinstance(fork, dict)
+    assert isinstance(pull_request, dict)
+    assert fork["operation_state"] == "submitted"
+    assert pull_request["worktree_state"] == "quarantined"
 
 
 def test_v9_structured_record_requires_harness_kind() -> None:
@@ -86,6 +118,59 @@ def test_new_job_record_has_no_cursor_or_herdr_core_fields() -> None:
     assert "github_repository" not in record
     assert isinstance(record["harness_state"], dict)
     assert isinstance(record["provider_state"], dict)
+
+
+@pytest.mark.parametrize(
+    ("identity", "expected"),
+    [
+        ({"issue_key": "ENG-42"}, "linear"),
+        (
+            {
+                "github_repository": "owner/project",
+                "github_issue": 42,
+            },
+            "github",
+        ),
+        ({}, None),
+    ],
+)
+def test_v12_records_infer_and_persist_issue_provider(
+    identity: dict[str, object],
+    expected: str | None,
+) -> None:
+    job = AgentJob.from_dict(
+        {
+            "id": "abcdef123456",
+            "schema_version": 12,
+            "revision": 0,
+            "request": "migrate provider identity",
+            "status": "queued",
+            "created_at": 1,
+            "queued_at": 1,
+            "delivered": False,
+            **identity,
+        }
+    )
+
+    assert job.loaded_schema_version == 12
+    assert job.issue_provider == expected
+    assert job.to_record()["issue_provider"] == expected
+
+
+def test_issue_provider_is_immutable_across_transitions() -> None:
+    job = AgentJob.new(
+        NewAgentJob(
+            id="abcdef123456",
+            request="keep provider",
+            created_at=1,
+            foreground_until=0,
+            issue_key="ENG-42",
+            issue_provider="linear",
+        )
+    )
+
+    with pytest.raises(AgentJobValidationError, match="issue_provider"):
+        job.evolve(issue_provider="other")
 
 
 def test_legacy_directory_import_rewrites_v8_record(tmp_path: Path) -> None:

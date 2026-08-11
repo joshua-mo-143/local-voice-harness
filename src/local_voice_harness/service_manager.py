@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.resources
 import subprocess
+from dataclasses import dataclass
 
 from .config import (
     PROJECT_ROOT,
@@ -11,8 +12,29 @@ from .config import (
     SYSTEMD_USER_DIR,
 )
 from .errors import HarnessError
-from .integrations.herdr import HerdrClient, HerdrError
+from .integrations.herdr import HerdrError
+from .integrations.registry import IntegrationRegistry, build_integration_registry
 from .service_units import audit_installed
+from .user_config import UserConfig, load_user_config
+
+
+@dataclass(frozen=True)
+class ServiceManagementSnapshot:
+    """One resolved configuration and client registry for a management action."""
+
+    config: UserConfig
+    registry: IntegrationRegistry
+
+    @classmethod
+    def load(cls) -> ServiceManagementSnapshot:
+        config = load_user_config()
+        return cls(config=config, registry=build_integration_registry(config))
+
+
+def _resolved(
+    snapshot: ServiceManagementSnapshot | None,
+) -> ServiceManagementSnapshot:
+    return snapshot if snapshot is not None else ServiceManagementSnapshot.load()
 
 
 def systemctl(*arguments: str, check: bool = True) -> subprocess.CompletedProcess[str]:
@@ -34,7 +56,13 @@ def unit_text(name: str) -> str:
     return resource.read_text()
 
 
-def install_services(*, force: bool, replace_dictation: bool = False) -> None:
+def install_services(
+    *,
+    force: bool,
+    replace_dictation: bool = False,
+    snapshot: ServiceManagementSnapshot | None = None,
+) -> None:
+    _resolved(snapshot)
     SYSTEMD_USER_DIR.mkdir(mode=0o755, parents=True, exist_ok=True)
     for name in SERVICE_FILES:
         destination = SYSTEMD_USER_DIR / name
@@ -65,55 +93,66 @@ def install_services(*, force: bool, replace_dictation: bool = False) -> None:
     print("Installed voice harness services. Run `voice-harness services start`.")
 
 
-def audit_services() -> int:
+def audit_services(snapshot: ServiceManagementSnapshot | None = None) -> int:
     """Read effective installed units and runtime state without changing them."""
 
-    return audit_installed()
+    resolved = _resolved(snapshot)
+    return audit_installed(config=resolved.config)
 
 
-def start_services() -> None:
+def start_services(snapshot: ServiceManagementSnapshot | None = None) -> None:
+    _resolved(snapshot)
     systemctl("start", *START_SERVICES)
     print("Voice harness listener started.")
 
 
-def stop_herdr() -> None:
-    client = HerdrClient()
+def stop_herdr(snapshot: ServiceManagementSnapshot | None = None) -> None:
+    resolved = _resolved(snapshot)
+    client = resolved.registry.herdr_client()
     if not client.is_running():
         return
-    process = subprocess.run(
-        [client.executable, "server", "stop"],
-        capture_output=True,
-        text=True,
-        check=False,
-    )
+    process = client.run("server", "stop", check=False)
     if process.returncode:
         raise HarnessError(
             process.stderr.strip() or process.stdout.strip() or "Herdr stop failed"
         )
 
 
-def stop_services(*, include_herdr: bool) -> None:
+def stop_services(
+    *,
+    include_herdr: bool,
+    snapshot: ServiceManagementSnapshot | None = None,
+) -> None:
+    resolved = _resolved(snapshot)
     systemctl("stop", *STOP_SERVICES, check=False)
     if include_herdr:
-        stop_herdr()
+        stop_herdr(resolved)
     print(
         "Voice harness services stopped"
         + (" including Herdr." if include_herdr else "; Herdr was left running.")
     )
 
 
-def restart_services(*, include_herdr: bool) -> None:
-    stop_services(include_herdr=include_herdr)
-    start_services()
+def restart_services(
+    *,
+    include_herdr: bool,
+    snapshot: ServiceManagementSnapshot | None = None,
+) -> None:
+    resolved = _resolved(snapshot)
+    stop_services(include_herdr=include_herdr, snapshot=resolved)
+    start_services(resolved)
 
 
-def status() -> None:
+def status(snapshot: ServiceManagementSnapshot | None = None) -> None:
+    resolved = _resolved(snapshot)
     rows = []
     for name in SERVICE_FILES:
         process = systemctl("is-active", name, check=False)
         rows.append((name, process.stdout.strip() or "inactive"))
     try:
-        herdr_state = "running" if HerdrClient().is_running() else "stopped"
+        herdr_state = (
+            "running" if resolved.registry.herdr_client().is_running() else "stopped"
+        )
     except HerdrError:
         herdr_state = "unavailable"
     width = max(len(name) for name, _state in rows)
@@ -132,8 +171,13 @@ def logs(*, follow: bool, lines: int) -> None:
     raise SystemExit(subprocess.run(command, check=False).returncode)
 
 
-def uninstall_services(*, include_herdr: bool) -> None:
-    stop_services(include_herdr=include_herdr)
+def uninstall_services(
+    *,
+    include_herdr: bool,
+    snapshot: ServiceManagementSnapshot | None = None,
+) -> None:
+    resolved = _resolved(snapshot)
+    stop_services(include_herdr=include_herdr, snapshot=resolved)
     systemctl("disable", *START_SERVICES, check=False)
     for name in SERVICE_FILES:
         destination = SYSTEMD_USER_DIR / name

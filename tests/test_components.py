@@ -38,7 +38,9 @@ class ComponentReadinessTests(unittest.TestCase):
             {}, path=Path("/nonexistent/backends.toml")
         )
         patcher = mock.patch.object(
-            components, "load_backend_settings", return_value=self.settings
+            components,
+            "default_user_config",
+            return_value=mock.Mock(providers=self.settings),
         )
         patcher.start()
         self.addCleanup(patcher.stop)
@@ -114,7 +116,9 @@ class ComponentReadinessTests(unittest.TestCase):
         )
         with (
             mock.patch.object(
-                components, "load_backend_settings", return_value=settings
+                components,
+                "default_user_config",
+                return_value=mock.Mock(providers=settings),
             ),
             mock.patch.object(
                 components,
@@ -135,7 +139,9 @@ class ComponentReadinessTests(unittest.TestCase):
         )
         with (
             mock.patch.object(
-                components, "load_backend_settings", return_value=settings
+                components,
+                "default_user_config",
+                return_value=mock.Mock(providers=settings),
             ),
             mock.patch.object(
                 components, "get_venice_api_key", return_value="secret"

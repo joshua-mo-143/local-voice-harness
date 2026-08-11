@@ -1,12 +1,14 @@
 from __future__ import annotations
 
+import inspect
 import json
 import sys
 from collections import Counter
 from collections.abc import Callable, Iterable, Sequence
 from typing import TextIO
 
-from .checks import ALL_CHECKS, Check
+from ..diagnostic_safety import redact_diagnostic
+from .checks import ALL_CHECKS, Check, DiagnosticSnapshot
 from .model import (
     PROBLEM_SEVERITIES,
     SEVERITY_RANK,
@@ -24,24 +26,33 @@ _SEVERITY_LABELS: dict[Severity, str] = {
 }
 
 
-def run_diagnostics(checks: Sequence[Check] = ALL_CHECKS) -> list[CheckResult]:
+def run_diagnostics(
+    checks: Sequence[Check] = ALL_CHECKS,
+    *,
+    snapshot: DiagnosticSnapshot | None = None,
+) -> list[CheckResult]:
     """Run every check, converting any crash into a FATAL result.
 
     The harness must remain diagnosable even when services or sockets are down,
     so no individual check is allowed to abort the whole run.
     """
 
+    resolved = snapshot if snapshot is not None else DiagnosticSnapshot.load()
     results: list[CheckResult] = []
     for check in checks:
         try:
-            produced = check()
+            produced = (
+                check() if not inspect.signature(check).parameters else check(resolved)
+            )
         except Exception as exc:  # never let one check crash the doctor
             results.append(
                 CheckResult(
                     name=getattr(check, "__name__", "unknown-check"),
                     category="internal",
                     severity=Severity.FATAL,
-                    detail=f"diagnostic check raised {type(exc).__name__}: {exc}",
+                    detail=redact_diagnostic(
+                        f"diagnostic check raised {type(exc).__name__}: {exc}"
+                    ),
                 )
             )
             continue
@@ -131,7 +142,10 @@ def apply_repairs(
         try:
             message = repair.action()
         except Exception as exc:  # a failed repair must not crash the doctor
-            print(f"  repair failed for {result.name}: {exc}", file=out)
+            print(
+                f"  repair failed for {result.name}: {redact_diagnostic(exc)}",
+                file=out,
+            )
             continue
         print(f"  repaired {result.name}: {message}", file=out)
 

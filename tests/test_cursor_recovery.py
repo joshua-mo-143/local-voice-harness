@@ -129,6 +129,73 @@ class CursorRecoveryTests(unittest.TestCase):
 
         self.assertEqual(launches, ["123456789abc"])
 
+    def test_restart_launch_retains_admitted_provider_and_harness(self) -> None:
+        self.create(
+            {
+                "id": "123456789abc",
+                "status": "queued",
+                "request": "test",
+                "created_at": 1,
+                "queued_at": 1,
+                "delivered": False,
+                "issue_key": "ENG-42",
+                "issue_provider": "linear",
+            }
+        )
+        launched: list[tuple[str | None, str]] = []
+
+        def launch(job_id: str) -> None:
+            job = self.store.get(job_id)
+            launched.append((job.issue_provider, job.harness_kind.value))
+
+        recover_jobs(
+            self.store,
+            launch_worker=launch,
+            require_issue_provider=lambda name: self.assertEqual(name, "linear"),
+            now=100,
+        )
+
+        self.assertEqual(launched, [("linear", "cursor")])
+        current = self.store.get("123456789abc")
+        self.assertEqual(current.issue_provider, "linear")
+        self.assertEqual(current.harness_kind.value, "cursor")
+
+    def test_recovery_durably_fails_when_selected_provider_is_unavailable(
+        self,
+    ) -> None:
+        self.create(
+            {
+                "id": "123456789abc",
+                "status": "queued",
+                "request": "test",
+                "created_at": 1,
+                "queued_at": 1,
+                "delivered": False,
+                "issue_key": "ENG-42",
+                "issue_provider": "linear",
+            }
+        )
+        launch = mock.Mock()
+
+        def unavailable(_name: str | None) -> None:
+            raise ValueError("selected issue provider 'linear' is unavailable")
+
+        recover_jobs(
+            self.store,
+            launch_worker=launch,
+            require_issue_provider=unavailable,
+            now=100,
+        )
+
+        launch.assert_not_called()
+        failed = self.store.get("123456789abc")
+        self.assertEqual(failed.status, JobStatus.FAILED)
+        self.assertFalse(failed.delivered)
+        self.assertEqual(failed.issue_provider, "linear")
+        self.assertIn(
+            "Selected issue provider 'linear' is unavailable", failed.error or ""
+        )
+
     def test_unsafe_live_legacy_worker_blocks_duplicate_launch(self) -> None:
         self.create(
             {
@@ -246,6 +313,12 @@ class CursorRecoveryTests(unittest.TestCase):
         herdr.get_agent.side_effect = HerdrError("observe", code="operation_timeout")
         herdr.run_json.side_effect = HerdrError("observe", code="operation_timeout")
         github = mock.Mock()
+        github.inspect_public_repository.return_value = GitHubRepository(
+            "source/project",
+            "https://github.com/source/project",
+            False,
+            "main",
+        )
         github.reconcile_fork.side_effect = GitHubError("observe")
         launch = mock.Mock()
 
@@ -291,6 +364,12 @@ class CursorRecoveryTests(unittest.TestCase):
             "source/project",
         )
         github = mock.Mock()
+        github.inspect_public_repository.return_value = GitHubRepository(
+            "source/project",
+            "https://github.com/source/project",
+            False,
+            "main",
+        )
         github.reconcile_fork.side_effect = [None, None, None, None, None, visible]
 
         for observed_at in (100.0, 105.0, 115.0, 135.0, 175.0):
@@ -624,6 +703,7 @@ class CursorRecoveryTests(unittest.TestCase):
                 "prompt_operation_phase": "classifying",
                 "prompt_operation_turn": 1,
                 "prompt_operation_target": "planner",
+                "prompt_operation_agent_session": "planner-session",
                 "prompt_baseline_sequence": 7,
             }
         )
@@ -642,7 +722,10 @@ class CursorRecoveryTests(unittest.TestCase):
         )
 
         visible = mock.Mock()
-        visible.get_agent.return_value = {"state_change_seq": 8}
+        visible.get_agent.return_value = {
+            "state_change_seq": 8,
+            "agent_session": "planner-session",
+        }
         reconcile_prompt_and_pane_operations(
             self.store,
             self.store.get("123456789abc"),
@@ -706,6 +789,7 @@ class CursorRecoveryTests(unittest.TestCase):
                 prompt_operation_phase="implementing",
                 prompt_operation_turn=4,
                 prompt_operation_target="planner",
+                prompt_operation_agent_session="original-session",
                 prompt_baseline_sequence=7,
             ),
         )
@@ -827,6 +911,71 @@ class CursorRecoveryTests(unittest.TestCase):
                 self.assertIsNone(completed.herdr_target)
                 for participant in WorkflowParticipant:
                     self.assertIsNone(completed.participant_target(participant))
+
+    def test_terminal_intent_with_ambiguous_prompt_releases_ticket_fences(
+        self,
+    ) -> None:
+        job = self.create(
+            {
+                "id": "123456789abc",
+                "status": "running",
+                "request": "work on issue 56",
+                "created_at": 1,
+                "delivered": False,
+                "github_repository": "Example/Project",
+                "github_issue": 56,
+                "herdr_target": "planner-agent",
+                "planner_target": "planner-agent",
+                "active_participant": "planner",
+                "agent_dispatch_state": "ready",
+                "worker_token": "worker-token",
+                "worker_pid": 42,
+                "worker_boot_id": "boot",
+                "worker_process_start": "start",
+            }
+        )
+
+        def terminalize(current: CursorJob) -> CursorJob:
+            return stage_terminal_intent(
+                current,
+                JobStatus.CANCELLED,
+                now=10,
+                result="Cursor job 123456789abc was cancelled.",
+                clear_worker=True,
+            )
+
+        staged = self.store.update(job.id, terminalize)
+        assert staged is not None and staged.target_release_token
+
+        def mark_prompt_ambiguous(current: CursorJob) -> CursorJob:
+            return current.evolve(
+                prompt_operation_state="ambiguous",
+                prompt_operation_phase="planning",
+                prompt_operation_turn=1,
+                prompt_operation_target="planner-agent",
+                prompt_baseline_sequence=0,
+                manual_reconcile_operation="prompt",
+                manual_reconcile_token="manual-token",
+                manual_reconcile_required_at=10,
+            )
+
+        staged = self.store.update(job.id, mark_prompt_ambiguous)
+        assert staged is not None and staged.target_release_token
+
+        cancel_target_and_release(
+            self.store,
+            job.id,
+            "planner-agent",
+            staged.target_release_token,
+            herdr_factory=mock.Mock(),
+        )
+
+        released = self.store.get(job.id)
+        self.assertEqual(released.status, JobStatus.CANCELLED)
+        self.assertFalse(released.target_release_pending)
+        self.assertFalse(released.cancellation_reconciliation_pending)
+        self.assertIsNone(released.manual_reconcile_operation)
+        self.assertEqual(released.prompt_operation_state, "none")
 
 
 if __name__ == "__main__":

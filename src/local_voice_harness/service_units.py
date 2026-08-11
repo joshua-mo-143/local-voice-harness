@@ -17,13 +17,13 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from .config import (
-    DEFAULT_LLM_MODEL,
     PROJECT_ROOT,
     RUNTIME,
     SERVICE_FILES,
     STT_SOCKET,
     TTS_SOCKET,
 )
+from .user_config import UserConfig, load_user_config
 
 SOURCE_RELATIVE = Path("systemd/user")
 PACKAGED_RELATIVE = ("data", "systemd")
@@ -81,6 +81,7 @@ SERVICE_SECURITY_POLICY = {
         "MemoryMax": "6G",
     },
     "voice-harness-llm.service": {
+        "WorkingDirectory": INSTALL_ROOT,
         "TimeoutStopSec": "15",
         "PrivateTmp": "true",
         "ProtectHome": "read-only",
@@ -142,7 +143,7 @@ EXPECTED_EXECUTABLES = {
     "dictation.service": (
         "%h/local-voice-harness/.venv-dictation/bin/voice-harness-dictation"
     ),
-    "voice-harness-llm.service": "/usr/sbin/llama-server",
+    "voice-harness-llm.service": ("%h/local-voice-harness/.venv/bin/voice-harness-llm"),
     "voice-harness-tts.service": ("%h/chatterbox-audition/.venv/bin/voice-harness-tts"),
     "voice-harness-wake.service": (
         "%h/local-voice-harness/.venv/bin/voice-harness-wake"
@@ -150,21 +151,12 @@ EXPECTED_EXECUTABLES = {
 }
 EXPECTED_EXECSTART = {
     "dictation.service": EXPECTED_EXECUTABLES["dictation.service"],
-    "voice-harness-llm.service": (
-        "/usr/sbin/llama-server "
-        "--model %h/local-voice-harness/models/Qwen3.5-4B-Q4_K_M.gguf "
-        "--alias qwen3.5-4b --host 127.0.0.1 --port 8090 --ctx-size 8192 "
-        "--parallel 1 --n-gpu-layers 99 --device CUDA0 --flash-attn on "
-        "--jinja --reasoning off --reasoning-budget 0"
-    ),
+    "voice-harness-llm.service": EXPECTED_EXECUTABLES["voice-harness-llm.service"],
     "voice-harness-tts.service": EXPECTED_EXECUTABLES["voice-harness-tts.service"],
     "voice-harness-wake.service": EXPECTED_EXECUTABLES["voice-harness-wake.service"],
 }
 REQUIRED_ENVIRONMENT = {
     "dictation.service": {
-        "DICTATION_BACKEND": "parakeet",
-        "DICTATION_MODEL": "nemo-parakeet-tdt-0.6b-v2",
-        "DICTATION_QUANTIZATION": "int8",
         "DICTATION_SOCKET": "%t/dictation.sock",
         "CUDA_CACHE_PATH": "%t/dictation/cuda-cache",
         "HF_HOME": "%h/.cache/huggingface",
@@ -185,31 +177,7 @@ OPTIONAL_ENVIRONMENT_POLICY: dict[str, dict[str, str]] = {
     "dictation.service": {},
     "voice-harness-llm.service": {},
     "voice-harness-tts.service": {},
-    "voice-harness-wake.service": {
-        "VOICE_HARNESS_SOURCE": "nonempty",
-        "VOICE_HARNESS_VOICE": "absolute_path",
-        "VOICE_HARNESS_WAKE_THRESHOLD": "probability",
-        "VOICE_HARNESS_MIN_SPEECH_RMS": "nonnegative_float",
-        "VOICE_HARNESS_BARGE_IN_MODE": "barge_in_mode",
-        "VOICE_HARNESS_BARGE_IN_SPEECH_FRAMES": "positive_int",
-        "VOICE_HARNESS_PLAYBACK_QUIET_FRAMES": "positive_int",
-        "VOICE_HARNESS_PLAYBACK_QUIET_TIMEOUT_SECONDS": "nonnegative_float",
-        "VOICE_HARNESS_PLAYBACK_LATENCY": "duration",
-        "VOICE_HARNESS_CURSOR_FOREGROUND_SECONDS": "nonnegative_float",
-        "VOICE_HARNESS_CURSOR_AGENT_INACTIVITY_SECONDS": "positive_float",
-        "VOICE_HARNESS_CURSOR_AGENT_MAX_RUNTIME_SECONDS": "positive_float",
-        "VOICE_HARNESS_AGENT_JOB_START_CONCURRENCY": "positive_int",
-        "VOICE_HARNESS_CURSOR_FOLLOWUP": "flag",
-        "VOICE_HARNESS_CURSOR_FOLLOWUP_WINDOW_SECONDS": "nonnegative_float",
-        "VOICE_HARNESS_HERDR_BIN": "absolute_path",
-        "VOICE_HARNESS_PROJECT_ROOT": "absolute_path",
-        "VOICE_HARNESS_GITHUB_ROOT": "absolute_path",
-        "VOICE_HARNESS_FOCUSED_APP_CONTEXT": "nonempty",
-        "VOICE_HARNESS_FOCUSED_APP_DENY": "text",
-        "VOICE_HARNESS_FOCUSED_APP_MAX_CHARS": "positive_int",
-        "DICTATION_INJECT": "dictation_inject",
-        "DICTATION_REPLACEMENTS": "text",
-    },
+    "voice-harness-wake.service": {},
 }
 SERVICE_OWNED_ENVIRONMENT: dict[str, set[str]] = {
     "dictation.service": set(),
@@ -411,45 +379,26 @@ def consistency_errors(project_root: Path = PROJECT_ROOT) -> list[str]:
     """Validate service paths and model defaults against package configuration/docs."""
 
     source_dir = project_root / SOURCE_RELATIVE
-    installation_docs = (project_root / "docs" / "installation.md").read_text()
-    configuration_docs = (project_root / "docs" / "configuration.md").read_text()
     metadata = tomllib.loads((project_root / "pyproject.toml").read_text())
     extras = metadata["project"]["optional-dependencies"]
     errors: list[str] = []
 
     llm = (source_dir / "voice-harness-llm.service").read_text()
-    llm_command = _directive(llm, "ExecStart", section="Service") or ""
-    model_match = re.search(r"(?:^|\s)--model\s+(\S+)", llm_command)
-    alias_match = re.search(r"(?:^|\s)--alias\s+(\S+)", llm_command)
-    if model_match is None:
-        errors.append("voice-harness-llm.service has no --model path")
-    else:
-        model_path = model_match.group(1)
-        expected_prefix = f"{INSTALL_ROOT}/models/"
-        if not model_path.startswith(expected_prefix):
-            errors.append(f"LLM model path must be below {expected_prefix}")
-        documented_path = model_path.replace("%h", "~", 1)
-        if documented_path not in installation_docs:
-            errors.append(
-                f"installation guide does not document LLM model path {documented_path}"
-            )
-    if alias_match is None or alias_match.group(1) != DEFAULT_LLM_MODEL:
-        errors.append(
-            f"LLM service alias must match configured default {DEFAULT_LLM_MODEL}"
-        )
+    if "--model" in (_directive(llm, "ExecStart", section="Service") or ""):
+        errors.append("LLM service must defer model and device choices to its launcher")
 
     dictation = (source_dir / "dictation.service").read_text()
-    backend = _environment_values(dictation, "DICTATION_BACKEND")
-    model = _environment_values(dictation, "DICTATION_MODEL")
-    if backend != ["parakeet"]:
-        errors.append("dictation service default backend must be parakeet")
-    if len(model) != 1:
-        errors.append("dictation service has no default model")
-    elif model[0] not in configuration_docs:
-        errors.append(
-            "configuration reference does not document dictation model default "
-            f"{model[0]}"
-        )
+    for variable in (
+        "DICTATION_BACKEND",
+        "DICTATION_MODEL",
+        "DICTATION_LANGUAGE",
+        "DICTATION_COMPUTE",
+        "DICTATION_QUANTIZATION",
+    ):
+        if _environment_values(dictation, variable):
+            errors.append(
+                f"dictation service must defer {variable} to the typed launcher"
+            )
     if not any(
         str(item).startswith("onnx-asr") for item in extras.get("dictation", [])
     ):
@@ -457,6 +406,7 @@ def consistency_errors(project_root: Path = PROJECT_ROOT) -> list[str]:
 
     for name in (
         "dictation.service",
+        "voice-harness-llm.service",
         "voice-harness-tts.service",
         "voice-harness-wake.service",
     ):
@@ -530,12 +480,6 @@ def security_errors(project_root: Path = PROJECT_ROOT) -> list[str]:
                     f"{runtime_directory}"
                 )
 
-    llm = (source_dir / "voice-harness-llm.service").read_text()
-    llm_command = _directive(llm, "ExecStart", section="Service") or ""
-    if not re.search(r"(?:^|\s)--host\s+127\.0\.0\.1(?:\s|$)", llm_command):
-        errors.append("voice-harness-llm.service must bind to IPv4 loopback")
-    if not re.search(r"(?:^|\s)--port\s+8090(?:\s|$)", llm_command):
-        errors.append("voice-harness-llm.service must use the documented port 8090")
     tts = (source_dir / "voice-harness-tts.service").read_text()
     if _environment_values(tts, "VOICE_HARNESS_TTS_SOCKET"):
         errors.append("voice-harness-tts.service must use the fixed compatible socket")
@@ -898,9 +842,11 @@ def audit_installed(
     service_names: Iterable[str] = SERVICE_FILES,
     *,
     systemctl: str = "systemctl",
+    config: UserConfig | None = None,
 ) -> int:
     """Read effective installed units and state without changing the user manager."""
 
+    resolved_config = config if config is not None else load_user_config()
     errors: list[str] = []
     for name in service_names:
         cat = subprocess.run(
@@ -1024,8 +970,13 @@ def audit_installed(
                 f"{name}: unhealthy state ActiveState={active} Result={result}"
             )
         try:
-            if int(restarts) >= int(COMMON_SECURITY_POLICY["StartLimitBurst"]):
-                errors.append(f"{name}: restart count {restarts} reached rate limit")
+            restart_count = int(restarts)
+            if restart_count >= int(
+                COMMON_SECURITY_POLICY["StartLimitBurst"]
+            ) and active in {"activating", "failed"}:
+                errors.append(
+                    f"{name}: restart count {restarts} indicates an active crash loop"
+                )
         except ValueError:
             errors.append(f"{name}: invalid NRestarts={restarts!r}")
         print(
@@ -1035,6 +986,12 @@ def audit_installed(
             f"tasks={properties.get('TasksCurrent', 'unknown')}"
         )
 
+    print(
+        "configuration: "
+        f"llm={resolved_config.providers.llm_provider} "
+        f"tts={resolved_config.providers.tts_provider} "
+        f"cuda={resolved_config.compute.cuda_device}"
+    )
     for error in errors:
         print(f"error: {error}", file=sys.stderr)
     return 1 if errors else 0

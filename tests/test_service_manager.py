@@ -7,15 +7,53 @@ import sys
 import tempfile
 import tomllib
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
-from local_voice_harness import cli, config, service_manager
+from local_voice_harness import cli, llm_launcher, service_manager
 from local_voice_harness.config import START_SERVICES
+from local_voice_harness.integrations.registry import build_integration_registry
 from local_voice_harness.stt import server as stt_server
+from local_voice_harness.user_config import default_user_config
+
+
+def _snapshot():
+    config = default_user_config()
+    return service_manager.ServiceManagementSnapshot(
+        config,
+        build_integration_registry(config),
+    )
 
 
 class ServiceManagementTests(unittest.TestCase):
+    def test_restart_reuses_one_service_management_snapshot(self) -> None:
+        snapshot = _snapshot()
+        with (
+            mock.patch.object(
+                service_manager.ServiceManagementSnapshot,
+                "load",
+                return_value=snapshot,
+            ) as load,
+            mock.patch.object(service_manager, "systemctl"),
+        ):
+            service_manager.restart_services(include_herdr=False)
+
+        load.assert_called_once_with()
+
+    def test_stop_herdr_uses_configured_snapshot_client(self) -> None:
+        snapshot = _snapshot()
+        client = mock.Mock(executable="/opt/herdr", timeout=17)
+        client.is_running.return_value = True
+        client.run.return_value = subprocess.CompletedProcess([], 0, "", "")
+        configured = replace(
+            snapshot,
+            registry=replace(snapshot.registry, herdr_client=lambda: client),
+        )
+        service_manager.stop_herdr(configured)
+
+        client.run.assert_called_once_with("server", "stop", check=False)
+
     def test_start_uses_only_always_on_services(self) -> None:
         with mock.patch.object(service_manager, "systemctl") as systemctl:
             service_manager.start_services()
@@ -71,8 +109,11 @@ class ServiceManagementTests(unittest.TestCase):
         self.assertTrue(install.force)
         self.assertTrue(install.replace_dictation)
 
-        with mock.patch.object(service_manager, "audit_installed", return_value=0):
+        with mock.patch.object(
+            service_manager, "audit_installed", return_value=0
+        ) as audit_installed:
             self.assertEqual(service_manager.audit_services(), 0)
+        audit_installed.assert_called_once_with(config=mock.ANY)
         with (
             mock.patch.object(cli, "audit_services", return_value=0) as audit,
             self.assertRaises(SystemExit) as exited,
@@ -116,19 +157,29 @@ class ServiceManagementTests(unittest.TestCase):
                     source.read_text(), service_manager.unit_text(source.name)
                 )
 
-    def test_llm_model_matches_service_and_documentation(self) -> None:
+    def test_llm_unit_defers_model_and_device_to_typed_launcher(self) -> None:
         project_root = service_manager.PROJECT_ROOT
         unit = (project_root / "systemd/user/voice-harness-llm.service").read_text()
         installation = (project_root / "docs/installation.md").read_text()
-        match = re.search(r"--model \S*/(?P<filename>\S+\.gguf)\b", unit)
+        snapshot = default_user_config()
+        configured = replace(
+            snapshot,
+            providers=replace(snapshot.providers, llm_model="configured-model"),
+            compute=replace(snapshot.compute, cuda_device="CUDA7"),
+        )
+        with mock.patch.object(
+            llm_launcher, "load_user_config", return_value=configured
+        ):
+            command = llm_launcher.command()
 
-        self.assertIsNotNone(match)
-        assert match is not None
-        filename = match.group("filename")
-        self.assertIn(f"--alias {config.LLM_MODEL}", unit)
+        self.assertNotIn("--model", unit)
+        self.assertNotIn("--device", unit)
+        self.assertIn("voice-harness-llm", unit)
+        self.assertEqual(command[command.index("--alias") + 1], "configured-model")
+        self.assertEqual(command[command.index("--device") + 1], "CUDA7")
         self.assertEqual(
             set(re.findall(r"Qwen3\.5-[A-Za-z0-9_.-]+\.gguf", installation)),
-            {filename},
+            {llm_launcher.MODEL_FILE.name},
         )
 
     def test_dictation_defaults_have_documented_installable_backends(self) -> None:
@@ -138,10 +189,12 @@ class ServiceManagementTests(unittest.TestCase):
         metadata = tomllib.loads((project_root / "pyproject.toml").read_text())
         extras = metadata["project"]["optional-dependencies"]
 
-        self.assertIn("Environment=DICTATION_BACKEND=parakeet", unit)
-        self.assertIn(
-            f"Environment=DICTATION_MODEL={stt_server.PARAKEET_DEFAULT_MODEL}",
-            unit,
+        self.assertNotIn("Environment=DICTATION_BACKEND", unit)
+        self.assertNotIn("Environment=DICTATION_MODEL", unit)
+        defaults = default_user_config()
+        self.assertEqual(defaults.compute.dictation_backend, "parakeet")
+        self.assertEqual(
+            defaults.compute.dictation_model, stt_server.PARAKEET_DEFAULT_MODEL
         )
         self.assertIn(stt_server.PARAKEET_DEFAULT_MODEL, configuration)
         self.assertTrue(
@@ -159,6 +212,7 @@ class ServiceManagementTests(unittest.TestCase):
             "voice-harness",
             "voice-harness-wake",
             "voice-harness-dictation",
+            "voice-harness-llm",
             "voice-harness-tts",
             "voice-harness-cursor-worker",
         }
@@ -179,6 +233,7 @@ class ServiceManagementTests(unittest.TestCase):
             "voice-harness": ["--help"],
             "voice-harness-wake": ["--check"],
             "voice-harness-dictation": ["--check"],
+            "voice-harness-llm": ["--check"],
             "voice-harness-tts": ["--check"],
             "voice-harness-cursor-worker": ["--help"],
         }

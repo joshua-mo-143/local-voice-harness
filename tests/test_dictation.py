@@ -5,11 +5,14 @@ import tempfile
 import threading
 import unittest
 from contextlib import redirect_stdout
+from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
 from local_voice_harness import cli, config, dictation, recording
+from local_voice_harness.desktop import Window
 from local_voice_harness.errors import HarnessError, NoSpeechError
+from local_voice_harness.user_config import default_user_config
 
 
 class DictationTests(unittest.TestCase):
@@ -36,7 +39,7 @@ class DictationTests(unittest.TestCase):
             cli.dispatch(cli.parser().parse_args(["end"]))
 
         transcribe.assert_called_once_with(generation)
-        respond.assert_called_once_with("hello")
+        respond.assert_called_once_with("hello", user_config=mock.ANY)
 
     def test_manual_transcribe_retries_explicit_pending_generation(self) -> None:
         generation = Path(
@@ -78,11 +81,13 @@ class DictationTests(unittest.TestCase):
             mock.patch.object(recording.recorder, "start_recording") as start_manual,
             mock.patch.object(recording, "notify"),
         ):
-            recording.start_recording()
+            audio = replace(default_user_config().audio, source="injected-microphone")
+            recording.start_recording(audio)
         self.assertEqual(
             start_manual.call_args.kwargs["conflicts"],
             (recording.DICTATION_PATHS,),
         )
+        self.assertEqual(start_manual.call_args.kwargs["source"], "injected-microphone")
 
     def test_toggle_starts_when_idle(self) -> None:
         with (
@@ -136,7 +141,7 @@ class DictationTests(unittest.TestCase):
             mock.patch.object(dictation, "socket_ready", return_value=True),
             mock.patch.object(
                 dictation.VadCaptureSettings,
-                "from_environment",
+                "from_dictation",
                 return_value=settings,
             ),
             mock.patch.object(dictation, "SpeechDetector") as detector,
@@ -188,7 +193,7 @@ class DictationTests(unittest.TestCase):
             mock.patch.object(dictation, "socket_ready", return_value=True),
             mock.patch.object(
                 dictation.VadCaptureSettings,
-                "from_environment",
+                "from_dictation",
                 return_value=mock.Mock(minimum_rms=1100),
             ),
             mock.patch.object(dictation, "SpeechDetector"),
@@ -243,7 +248,7 @@ class DictationTests(unittest.TestCase):
                 mock.patch.object(dictation, "socket_ready", return_value=True),
                 mock.patch.object(
                     dictation.VadCaptureSettings,
-                    "from_environment",
+                    "from_dictation",
                     return_value=mock.Mock(minimum_rms=1100),
                 ),
                 mock.patch.object(dictation, "SpeechDetector"),
@@ -299,12 +304,12 @@ class DictationTests(unittest.TestCase):
         transcribe.assert_called_once_with(generation)
 
     def test_runelite_dictation_is_rejected(self) -> None:
+        desktop = mock.Mock()
+        desktop.active_window.return_value = Window(
+            "1", "net-runelite-client-runelite", 10
+        )
         with (
-            mock.patch.object(
-                dictation,
-                "_active_window_class",
-                return_value="net-runelite-client-runelite",
-            ),
+            mock.patch.object(dictation, "get_desktop", return_value=desktop),
             self.assertRaisesRegex(HarnessError, "disabled for RuneLite"),
         ):
             dictation.inject("buying fish")
@@ -313,8 +318,8 @@ class DictationTests(unittest.TestCase):
         with (
             mock.patch.object(
                 dictation,
-                "_active_window_class",
-                return_value="net-runelite-client-runelite",
+                "_active_window",
+                return_value=Window("1", "net-runelite-client-runelite", 10),
             ),
             mock.patch.object(dictation, "socket_ready") as socket_ready,
             self.assertRaisesRegex(HarnessError, "disabled for RuneLite"),
@@ -324,61 +329,66 @@ class DictationTests(unittest.TestCase):
 
     def test_stdout_injection(self) -> None:
         output = io.StringIO()
+        settings = replace(default_user_config().dictation, inject="stdout")
         with (
-            mock.patch.dict("os.environ", {"DICTATION_INJECT": "stdout"}),
             mock.patch.object(dictation, "_ensure_dictation_allowed"),
             redirect_stdout(output),
         ):
-            dictation.inject("hello world")
+            dictation.inject("hello world", settings)
         self.assertEqual(output.getvalue(), "hello world\n")
 
     def test_invalid_injection_mode_is_rejected(self) -> None:
+        settings = replace(default_user_config().dictation, inject="invalid")
         with (
-            mock.patch.dict("os.environ", {"DICTATION_INJECT": "invalid"}),
             mock.patch.object(dictation, "_ensure_dictation_allowed"),
             self.assertRaises(HarnessError),
         ):
-            dictation.inject("hello")
+            dictation.inject("hello", settings)
 
     def test_copy_uses_desktop_clipboard(self) -> None:
         desktop = mock.Mock()
+        desktop.active_window.return_value = Window("42", "firefox", 10)
         desktop.write_clipboard.return_value = True
-        with (
-            mock.patch.object(dictation, "get_desktop", return_value=desktop),
-        ):
-            dictation._copy_to_clipboard("hello")
+        window = Window("42", "firefox", 10)
+        dictation._copy_to_clipboard(desktop, window, "hello")
         desktop.write_clipboard.assert_called_once_with("hello")
 
     def test_clipboard_failure_is_reported(self) -> None:
         desktop = mock.Mock()
+        desktop.active_window.return_value = Window("42", "firefox", 10)
         desktop.write_clipboard.return_value = False
-        with (
-            mock.patch.object(dictation, "get_desktop", return_value=desktop),
-            self.assertRaisesRegex(HarnessError, "could not copy"),
-        ):
-            dictation._copy_to_clipboard("hello")
+        window = Window("42", "firefox", 10)
+        with self.assertRaisesRegex(HarnessError, "could not copy"):
+            dictation._copy_to_clipboard(desktop, window, "hello")
 
     def test_auto_injection_pastes_after_copying_to_clipboard(self) -> None:
         operations: list[tuple[str, object]] = []
+        window = Window("42", "firefox", 10)
         desktop = mock.Mock()
+        desktop.active_window.return_value = window
         desktop.has_clipboard.return_value = True
+        desktop.read_clipboard.side_effect = [
+            (True, "previous"),
+            (True, "hello"),
+        ]
+        desktop.write_clipboard.return_value = True
         with (
             mock.patch.dict("os.environ", {"DICTATION_INJECT": "auto"}),
-            mock.patch.object(dictation, "_ensure_dictation_allowed"),
             mock.patch.object(dictation, "_send_to_herdr", return_value=False),
-            mock.patch.object(
-                dictation, "_active_window_class", return_value="firefox"
-            ),
             mock.patch.object(dictation, "get_desktop", return_value=desktop),
             mock.patch.object(
                 dictation,
                 "_copy_to_clipboard",
-                side_effect=lambda text: operations.append(("copy", text)),
+                side_effect=lambda _desktop, _window, text: operations.append(
+                    ("copy", text)
+                ),
             ),
             mock.patch.object(
                 dictation,
                 "_send_key",
-                side_effect=lambda key: operations.append(("key", key)),
+                side_effect=lambda _desktop, _window, key: operations.append(
+                    ("key", key)
+                ),
             ),
             mock.patch.object(dictation.time, "sleep"),
         ):
@@ -390,27 +400,29 @@ class DictationTests(unittest.TestCase):
                 ("key", "ctrl+v"),
             ],
         )
+        desktop.write_clipboard.assert_called_with("previous")
 
     def test_wayland_terminal_uses_ctrl_shift_v(self) -> None:
+        window = Window("42", "foot", 10)
         desktop = mock.Mock()
+        desktop.active_window.return_value = window
         desktop.has_clipboard.return_value = True
+        desktop.read_clipboard.return_value = (False, "")
+        desktop.write_clipboard.return_value = True
+        settings = replace(default_user_config().dictation, inject="paste")
         with (
-            mock.patch.dict("os.environ", {"DICTATION_INJECT": "paste"}),
-            mock.patch.object(dictation, "_ensure_dictation_allowed"),
             mock.patch.object(dictation, "_send_to_herdr", return_value=False),
-            mock.patch.object(dictation, "_active_window_class", return_value="foot"),
             mock.patch.object(dictation, "get_desktop", return_value=desktop),
             mock.patch.object(dictation, "_copy_to_clipboard"),
             mock.patch.object(dictation, "_send_key") as send_key,
             mock.patch.object(dictation.time, "sleep"),
         ):
-            dictation.inject("hello")
-        send_key.assert_called_once_with("ctrl+shift+v")
+            dictation.inject("hello", settings)
+        send_key.assert_called_once_with(desktop, window, "ctrl+shift+v")
 
     def test_unsupported_wayland_session_is_reported(self) -> None:
         with (
             mock.patch.dict("os.environ", {"DICTATION_INJECT": "paste"}),
-            mock.patch.object(dictation, "_ensure_dictation_allowed"),
             mock.patch.object(dictation, "_send_to_herdr", return_value=False),
             mock.patch.object(dictation, "get_desktop", return_value=None),
             self.assertRaisesRegex(HarnessError, "Hyprland, and Sway"),
@@ -420,7 +432,6 @@ class DictationTests(unittest.TestCase):
     def test_auto_injection_keeps_native_herdr_path(self) -> None:
         with (
             mock.patch.dict("os.environ", {"DICTATION_INJECT": "auto"}),
-            mock.patch.object(dictation, "_ensure_dictation_allowed"),
             mock.patch.object(dictation, "_send_to_herdr", return_value=True) as send,
             mock.patch.object(dictation, "_copy_to_clipboard") as copy,
             mock.patch.object(dictation, "_send_key") as send_key,
@@ -431,6 +442,85 @@ class DictationTests(unittest.TestCase):
         copy.assert_not_called()
         send_key.assert_not_called()
         type_text.assert_not_called()
+
+    def test_focus_change_before_copy_cancels_paste(self) -> None:
+        window = Window("42", "firefox", 10)
+        other = Window("99", "foot", 11)
+        desktop = mock.Mock()
+        desktop.active_window.side_effect = [window, other]
+        desktop.has_clipboard.return_value = True
+        desktop.read_clipboard.return_value = (True, "previous")
+        with (
+            mock.patch.dict("os.environ", {"DICTATION_INJECT": "paste"}),
+            mock.patch.object(dictation, "_send_to_herdr", return_value=False),
+            mock.patch.object(dictation, "get_desktop", return_value=desktop),
+            mock.patch.object(dictation, "_send_key") as send_key,
+            self.assertRaisesRegex(HarnessError, "focused window changed"),
+        ):
+            dictation.inject("hello")
+        desktop.write_clipboard.assert_not_called()
+        send_key.assert_not_called()
+
+    def test_focus_change_after_copy_cancels_paste_and_restores_clipboard(
+        self,
+    ) -> None:
+        window = Window("42", "firefox", 10)
+        other = Window("99", "foot", 11)
+        desktop = mock.Mock()
+        desktop.active_window.side_effect = [window, window, other]
+        desktop.has_clipboard.return_value = True
+        desktop.read_clipboard.side_effect = [
+            (True, "previous"),
+            (True, "hello"),
+        ]
+        desktop.write_clipboard.return_value = True
+        with (
+            mock.patch.dict("os.environ", {"DICTATION_INJECT": "paste"}),
+            mock.patch.object(dictation, "_send_to_herdr", return_value=False),
+            mock.patch.object(dictation, "get_desktop", return_value=desktop),
+            mock.patch.object(dictation.time, "sleep"),
+            self.assertRaisesRegex(HarnessError, "focused window changed"),
+        ):
+            dictation.inject("hello")
+
+        desktop.send_key.assert_not_called()
+        desktop.write_clipboard.assert_any_call("hello")
+        desktop.write_clipboard.assert_called_with("previous")
+
+    def test_focus_change_before_type_cancels_typing(self) -> None:
+        window = Window("42", "alacritty", 10)
+        other = Window("99", "foot", 11)
+        desktop = mock.Mock()
+        desktop.active_window.side_effect = [window, other]
+        desktop.has_clipboard.return_value = False
+        with (
+            mock.patch.dict("os.environ", {"DICTATION_INJECT": "type"}),
+            mock.patch.object(dictation, "_send_to_herdr", return_value=False),
+            mock.patch.object(dictation, "get_desktop", return_value=desktop),
+            mock.patch.object(dictation.time, "sleep"),
+            self.assertRaisesRegex(HarnessError, "focused window changed"),
+        ):
+            dictation.inject("hello")
+        desktop.type_text.assert_not_called()
+
+    def test_allowed_to_denied_focus_change_cannot_bypass_policy(self) -> None:
+        allowed = Window("42", "firefox", 10)
+        denied = Window("99", "net-runelite-client-runelite", 11)
+        desktop = mock.Mock()
+        desktop.active_window.side_effect = [allowed, allowed, denied]
+        desktop.has_clipboard.return_value = True
+        desktop.read_clipboard.side_effect = [(False, ""), (True, "buying fish")]
+        desktop.write_clipboard.return_value = True
+        with (
+            mock.patch.dict("os.environ", {"DICTATION_INJECT": "paste"}),
+            mock.patch.object(dictation, "_send_to_herdr", return_value=False),
+            mock.patch.object(dictation, "get_desktop", return_value=desktop),
+            mock.patch.object(dictation.time, "sleep"),
+            self.assertRaisesRegex(HarnessError, "focused window changed"),
+        ):
+            dictation.inject("buying fish")
+        desktop.send_key.assert_not_called()
+        desktop.write_clipboard.assert_called_with("")
 
 
 if __name__ == "__main__":

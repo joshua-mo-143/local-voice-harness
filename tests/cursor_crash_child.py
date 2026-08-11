@@ -93,7 +93,7 @@ class PersistentHerdr(HerdrClient):
     def __init__(self, effects: PersistentEffects) -> None:
         self.effects = effects
 
-    def ensure_server(self, timeout: float = 15) -> None:
+    def ensure_server(self, timeout: float | None = None) -> None:
         return None
 
     def get_agent(self, target: str) -> dict[str, Any]:
@@ -119,6 +119,14 @@ class PersistentHerdr(HerdrClient):
 class PersistentGitHub(GitHubClient):
     def __init__(self, effects: PersistentEffects) -> None:
         self.effects = effects
+
+    def inspect_public_repository(self, repository: str) -> GitHubRepository:
+        return GitHubRepository(
+            name_with_owner=repository,
+            url=f"https://github.com/{repository}",
+            is_private=False,
+            default_branch="main",
+        )
 
     def reconcile_fork(
         self, source: GitHubRepository, target_name: str
@@ -161,6 +169,7 @@ class PromptHerdr(PersistentHerdr):
         before_agent: Callable[[dict[str, Any]], None] | None = None,
         after_submit: Callable[[dict[str, Any]], None] | None = None,
         active_marker: str | None = None,
+        allow_interactive_plan_boundary: bool = False,
         allow_enter_fallback: bool = True,
     ) -> PromptOutcome:
         del (
@@ -172,6 +181,7 @@ class PromptHerdr(PersistentHerdr):
             before_agent,
             after_submit,
             active_marker,
+            allow_interactive_plan_boundary,
             allow_enter_fallback,
         )
         if before_submit is None or accepted is None:
@@ -461,6 +471,7 @@ def _run_effect(root: Path, effect: str, point: str) -> None:
                     "workspace_id": "workspace-1",
                     "cwd": str(checkout.resolve()),
                     "state_change_seq": 7,
+                    "agent_session": "planner-session",
                 },
             )
         client = PromptHerdr(effects, kill)

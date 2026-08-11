@@ -6,7 +6,7 @@ import unittest
 from dataclasses import replace
 from unittest import mock
 
-from local_voice_harness import intent
+from local_voice_harness import intent, llm_transport
 from local_voice_harness.browser_context import RequestContext
 from local_voice_harness.config import CURSOR_PATTERN, load_backend_settings
 from local_voice_harness.credentials import CredentialError
@@ -48,7 +48,7 @@ class IntentRouterTests(unittest.TestCase):
             focused_issue="example/project#42",
         )
         with mock.patch.object(
-            intent.urllib.request,
+            llm_transport.urllib.request,
             "urlopen",
             return_value=_response("cursor_submit"),
         ) as urlopen:
@@ -80,10 +80,14 @@ class IntentRouterTests(unittest.TestCase):
             llm_timeout=11,
         )
         with (
-            mock.patch.object(intent, "load_backend_settings", return_value=settings),
-            mock.patch.object(intent, "get_venice_api_key") as get_key,
             mock.patch.object(
-                intent.urllib.request,
+                llm_transport,
+                "default_user_config",
+                return_value=mock.Mock(providers=settings),
+            ),
+            mock.patch.object(llm_transport, "get_venice_api_key") as get_key,
+            mock.patch.object(
+                llm_transport.urllib.request,
                 "urlopen",
                 return_value=_response("conversation"),
             ) as urlopen,
@@ -111,12 +115,16 @@ class IntentRouterTests(unittest.TestCase):
             llm_timeout=17,
         )
         with (
-            mock.patch.object(intent, "load_backend_settings", return_value=settings),
             mock.patch.object(
-                intent, "get_venice_api_key", return_value="venice-secret"
+                llm_transport,
+                "default_user_config",
+                return_value=mock.Mock(providers=settings),
+            ),
+            mock.patch.object(
+                llm_transport, "get_venice_api_key", return_value="venice-secret"
             ) as get_key,
             mock.patch.object(
-                intent.urllib.request,
+                llm_transport.urllib.request,
                 "urlopen",
                 return_value=_response("cursor_submit"),
             ) as urlopen,
@@ -145,7 +153,7 @@ class IntentRouterTests(unittest.TestCase):
             with (
                 self.subTest(route=route_name, confidence=confidence),
                 mock.patch.object(
-                    intent.urllib.request,
+                    llm_transport.urllib.request,
                     "urlopen",
                     return_value=_response(route_name, confidence),
                 ),
@@ -165,7 +173,7 @@ class IntentRouterTests(unittest.TestCase):
             with (
                 self.subTest(response=response),
                 mock.patch.object(
-                    intent.urllib.request,
+                    llm_transport.urllib.request,
                     "urlopen",
                     return_value=return_value,
                     side_effect=side_effect,
@@ -177,13 +185,17 @@ class IntentRouterTests(unittest.TestCase):
     def test_missing_venice_credentials_fall_back_safely(self) -> None:
         settings = replace(load_backend_settings({}), llm_provider="venice")
         with (
-            mock.patch.object(intent, "load_backend_settings", return_value=settings),
             mock.patch.object(
-                intent,
+                llm_transport,
+                "default_user_config",
+                return_value=mock.Mock(providers=settings),
+            ),
+            mock.patch.object(
+                llm_transport,
                 "get_venice_api_key",
                 side_effect=CredentialError("missing"),
             ),
-            mock.patch.object(intent.urllib.request, "urlopen") as urlopen,
+            mock.patch.object(llm_transport.urllib.request, "urlopen") as urlopen,
         ):
             route = intent.route_intent("request", RequestContext("request"))
 
@@ -198,12 +210,16 @@ class IntentRouterTests(unittest.TestCase):
             llm_timeout=17,
         )
         with (
-            mock.patch.object(intent, "load_backend_settings", return_value=settings),
             mock.patch.object(
-                intent, "get_venice_api_key", return_value="secret-token"
+                llm_transport,
+                "default_user_config",
+                return_value=mock.Mock(providers=settings),
             ),
             mock.patch.object(
-                intent.urllib.request,
+                llm_transport, "get_venice_api_key", return_value="secret-token"
+            ),
+            mock.patch.object(
+                llm_transport.urllib.request,
                 "urlopen",
                 return_value=_response("conversation"),
             ) as urlopen,
@@ -231,7 +247,7 @@ class InboxIntentTests(unittest.TestCase):
             with (
                 self.subTest(intent=name),
                 mock.patch.object(
-                    intent.urllib.request,
+                    llm_transport.urllib.request,
                     "urlopen",
                     return_value=_response(name),
                 ),
@@ -247,11 +263,12 @@ class FollowUpIntentTests(unittest.TestCase):
             "enum"
         ]
         self.assertIn("cursor_followup", enum)
+        self.assertIn("cursor_details", enum)
         self.assertIn("cursor_pr_unsupported", enum)
 
     def test_recent_completion_flag_is_forwarded(self) -> None:
         with mock.patch.object(
-            intent.urllib.request,
+            llm_transport.urllib.request,
             "urlopen",
             return_value=_response("cursor_followup"),
         ) as urlopen:
@@ -269,7 +286,7 @@ class FollowUpIntentTests(unittest.TestCase):
 
     def test_recent_completion_defaults_to_false(self) -> None:
         with mock.patch.object(
-            intent.urllib.request,
+            llm_transport.urllib.request,
             "urlopen",
             return_value=_response("conversation"),
         ) as urlopen:
@@ -281,7 +298,7 @@ class FollowUpIntentTests(unittest.TestCase):
 
     def test_pending_clarification_suppresses_completed_context(self) -> None:
         with mock.patch.object(
-            intent.urllib.request,
+            llm_transport.urllib.request,
             "urlopen",
             return_value=_response("cursor_reply"),
         ) as urlopen:
@@ -306,7 +323,7 @@ class FollowUpIntentTests(unittest.TestCase):
 
     def test_pr_unsupported_is_actionable(self) -> None:
         with mock.patch.object(
-            intent.urllib.request,
+            llm_transport.urllib.request,
             "urlopen",
             return_value=_response("cursor_pr_unsupported"),
         ):
@@ -324,7 +341,7 @@ class EndConversationIntentTests(unittest.TestCase):
 
     def test_end_conversation_is_actionable_at_high_confidence(self) -> None:
         with mock.patch.object(
-            intent.urllib.request,
+            llm_transport.urllib.request,
             "urlopen",
             return_value=_response("end_conversation"),
         ):
@@ -335,7 +352,7 @@ class EndConversationIntentTests(unittest.TestCase):
 
     def test_end_conversation_needs_high_confidence(self) -> None:
         with mock.patch.object(
-            intent.urllib.request,
+            llm_transport.urllib.request,
             "urlopen",
             return_value=_response("end_conversation", "medium"),
         ):

@@ -5,6 +5,7 @@ import subprocess
 import tempfile
 import time
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 from unittest import mock
@@ -12,7 +13,7 @@ from unittest import mock
 from local_voice_harness.cursor import service
 from local_voice_harness.errors import HarnessError
 from local_voice_harness.integrations import linear, registry
-from local_voice_harness.user_config import IntegrationSettings
+from local_voice_harness.user_config import IntegrationSettings, default_user_config
 
 DISABLED = IntegrationSettings(linear_enabled=False)
 ENABLED = IntegrationSettings(linear_enabled=True)
@@ -74,21 +75,24 @@ class LinearEnablementTests(unittest.TestCase):
         self.assertIsNone(fragment.issue_reference)
         self.assertIn("identifiers must come from the user's request", fragment.text)
 
-    def test_disabled_explicit_issue_key_is_not_persisted(self) -> None:
+    def test_disabled_explicit_issue_key_is_rejected_before_persistence(self) -> None:
         with (
-            mock.patch.object(registry, "_integration_settings", return_value=DISABLED),
             mock.patch.object(service, "_job_store") as store,
             mock.patch.object(service, "launch_worker"),
+            self.assertRaisesRegex(HarnessError, "provider is unavailable"),
         ):
-            service.start_job("work on this ticket", issue_key="ENG-123")
+            service.start_job(
+                "work on this ticket",
+                issue_key="ENG-123",
+                integrations=registry.build_integration_registry(
+                    replace(default_user_config(), integrations=DISABLED)
+                ),
+            )
 
-        created = store.return_value.create.call_args.args[0]
-        self.assertIsNone(created.issue_key)
-        self.assertNotEqual(created.speakable_label, "ENG-123")
+        store.return_value.create.assert_not_called()
 
     def test_missing_capability_rejects_job_before_persistence(self) -> None:
         with (
-            mock.patch.object(registry, "_integration_settings", return_value=ENABLED),
             mock.patch.object(
                 linear.LinearIntegration,
                 "capability_status",
@@ -102,7 +106,12 @@ class LinearEnablementTests(unittest.TestCase):
             with self.assertRaisesRegex(
                 HarnessError, "cursor-mcp unavailable.*configure Cursor MCP"
             ):
-                service.start_job("work on API-42")
+                service.start_job(
+                    "work on API-42",
+                    integrations=registry.build_integration_registry(
+                        replace(default_user_config(), integrations=ENABLED)
+                    ),
+                )
 
         store.return_value.create.assert_not_called()
         launch.assert_not_called()

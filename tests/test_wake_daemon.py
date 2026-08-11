@@ -8,11 +8,13 @@ import os
 import tempfile
 import threading
 import time
+import types
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
-from local_voice_harness import llm, recorder
+from local_voice_harness import llm, llm_transport, recorder
 from local_voice_harness.browser_context import RequestContext
 from local_voice_harness.cursor import service as cursor_service
 from local_voice_harness.cursor.delivery import DeliveryClaim
@@ -20,15 +22,19 @@ from local_voice_harness.cursor.model import CursorJob, JobStatus
 from local_voice_harness.cursor.service import CursorTurnRequest
 from local_voice_harness.cursor.store import JobStore
 from local_voice_harness.errors import HarnessError
+from local_voice_harness.integrations.registry import build_integration_registry
 from local_voice_harness.intent import Intent, IntentRoute
 from local_voice_harness.questions import AnswerProvenance
+from local_voice_harness.responses import AssistantResponse
 from local_voice_harness.tts.queue import PlaybackQueue, PlaybackRequest
+from local_voice_harness.user_config import default_user_config, load_user_config
 from local_voice_harness.wake import daemon as wake_daemon
 from local_voice_harness.wake.daemon import WakeConversationDaemon
 
 AUDIO_GENERATION = Path(
     "/runtime/voice-harness/recordings/request-0123456789abcdef0123456789abcdef.wav"
 )
+USER_CONFIG = default_user_config()
 
 
 def _playback_batch(
@@ -96,6 +102,11 @@ def _delivery_claim(
 def _bare_daemon() -> WakeConversationDaemon:
     """Build a daemon without running __init__ (which loads the wake model/VAD)."""
     instance = WakeConversationDaemon.__new__(WakeConversationDaemon)
+    instance.user_config = USER_CONFIG
+    instance.audio = USER_CONFIG.audio
+    instance.platform = USER_CONFIG.platform
+    instance.providers = USER_CONFIG.providers
+    instance.integrations = build_integration_registry(USER_CONFIG)
     instance.history = []
     instance.cursor_session = None
     instance.completed_followup = None
@@ -113,6 +124,50 @@ def _bare_daemon() -> WakeConversationDaemon:
     instance.pre_roll = collections.deque(maxlen=wake_daemon.PRE_ROLL_FRAMES)
     instance.wake_model = mock.Mock()
     return instance
+
+
+class StartupConfigSnapshotTests(unittest.TestCase):
+    def test_restart_observes_file_change_without_mutating_running_daemon(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "config.toml"
+            path.write_text('[audio]\nsource = "startup-microphone"\n')
+            startup = load_user_config(
+                {}, path=path, backends_path=Path(os.devnull), home=Path(temporary)
+            )
+
+            openwakeword = types.ModuleType("openwakeword")
+            openwakeword.__file__ = "/tmp/openwakeword/__init__.py"
+            model_module = types.ModuleType("openwakeword.model")
+            wake_model = mock.Mock(models={"hey_jarvis": object()})
+            model_module.Model = mock.Mock(return_value=wake_model)  # type: ignore[attr-defined]
+            numpy = types.ModuleType("numpy")
+
+            with (
+                mock.patch.dict(
+                    "sys.modules",
+                    {
+                        "numpy": numpy,
+                        "openwakeword": openwakeword,
+                        "openwakeword.model": model_module,
+                    },
+                ),
+                mock.patch.object(wake_daemon, "SpeechDetector"),
+            ):
+                running = WakeConversationDaemon(startup)
+                path.write_text('[audio]\nsource = "restarted-microphone"\n')
+                restarted = WakeConversationDaemon(
+                    load_user_config(
+                        {},
+                        path=path,
+                        backends_path=Path(os.devnull),
+                        home=Path(temporary),
+                    )
+                )
+
+        self.assertEqual(running.audio.source, "startup-microphone")
+        self.assertEqual(restarted.audio.source, "restarted-microphone")
 
 
 class MicrophoneStartupTests(unittest.TestCase):
@@ -175,6 +230,44 @@ class StripWakePrefixTests(unittest.TestCase):
 
 
 class ProcessUtteranceTests(unittest.TestCase):
+    def test_response_channels_are_selected_at_wake_boundary(self) -> None:
+        daemon = _bare_daemon()
+        output = io.StringIO()
+        response = AssistantResponse(
+            spoken_text="The job started.",
+            display_text="Started job 123456789abc in /tmp/example.",
+        )
+        with (
+            mock.patch.object(wake_daemon, "transcribe", return_value="start it"),
+            mock.patch.object(wake_daemon, "start_components"),
+            mock.patch.object(
+                wake_daemon,
+                "request_context",
+                return_value=RequestContext("start it"),
+            ),
+            mock.patch.object(
+                wake_daemon,
+                "route_intent",
+                return_value=IntentRoute(Intent.CONVERSATION, "high"),
+            ),
+            mock.patch.object(
+                wake_daemon, "qwen_turn", return_value=(response, None)
+            ) as qwen,
+            mock.patch.object(
+                daemon,
+                "play_response",
+                return_value=({"played_text": response.spoken_text}, None),
+            ) as play,
+            mock.patch.object(wake_daemon, "notify"),
+            contextlib.redirect_stdout(output),
+        ):
+            daemon.process_utterance(AUDIO_GENERATION, woke=False)
+
+        self.assertIn(f"Assistant: {response.display_text}", output.getvalue())
+        self.assertNotIn(response.spoken_text, output.getvalue())
+        play.assert_called_once_with(response)
+        qwen.assert_called_once()
+
     def test_completed_turn_enables_followup(self) -> None:
         daemon = _bare_daemon()
         with (
@@ -211,6 +304,7 @@ class ProcessUtteranceTests(unittest.TestCase):
             trusted_utterance="what time is it",
             delivery_claims=mock.ANY,
             allow_tools=False,
+            settings=daemon.providers,
         )
         transcribe.assert_called_once_with(AUDIO_GENERATION)
         self.assertTrue(
@@ -247,7 +341,7 @@ class ProcessUtteranceTests(unittest.TestCase):
             mock.patch.object(
                 wake_daemon,
                 "request_context",
-                side_effect=lambda text: RequestContext(text),
+                side_effect=lambda text, **_settings: RequestContext(text),
             ),
             mock.patch.object(
                 wake_daemon,
@@ -279,7 +373,7 @@ class ProcessUtteranceTests(unittest.TestCase):
             mock.patch.object(
                 wake_daemon,
                 "request_context",
-                side_effect=lambda text: RequestContext(text),
+                side_effect=lambda text, **_settings: RequestContext(text),
             ),
             mock.patch.object(
                 wake_daemon,
@@ -300,6 +394,7 @@ class ProcessUtteranceTests(unittest.TestCase):
 
     def test_venice_turn_streams_sentence_chunks_to_playback(self) -> None:
         daemon = _bare_daemon()
+        daemon.providers = replace(daemon.providers, llm_provider="venice")
         played_requests: list[str] = []
 
         def streamed_turn(
@@ -346,9 +441,6 @@ class ProcessUtteranceTests(unittest.TestCase):
             ),
             mock.patch.object(wake_daemon, "start_components"),
             mock.patch.object(
-                wake_daemon, "load_backend_settings"
-            ) as load_backend_settings,
-            mock.patch.object(
                 wake_daemon, "qwen_turn", side_effect=streamed_turn
             ) as qwen_turn,
             mock.patch.object(daemon, "_drain_playback_queue", side_effect=drain),
@@ -364,7 +456,6 @@ class ProcessUtteranceTests(unittest.TestCase):
             ),
             mock.patch.object(wake_daemon, "notify"),
         ):
-            load_backend_settings.return_value.llm_provider = "venice"
             daemon.process_utterance(AUDIO_GENERATION, woke=False)
 
         self.assertEqual(played_requests, ["First sentence.", "Second sentence."])
@@ -476,7 +567,7 @@ class ProcessUtteranceTests(unittest.TestCase):
             mock.patch.object(
                 wake_daemon,
                 "request_context",
-                side_effect=lambda text: RequestContext(text),
+                side_effect=lambda text, **_settings: RequestContext(text),
             ),
             mock.patch.object(
                 wake_daemon,
@@ -503,6 +594,7 @@ class ProcessUtteranceTests(unittest.TestCase):
                 context_repository=None,
             ),
             delivery_claims=mock.ANY,
+            integrations=mock.ANY,
         )
         qwen_turn.assert_not_called()
 
@@ -560,6 +652,7 @@ class ProcessUtteranceTests(unittest.TestCase):
                 answer_provenance=AnswerProvenance.USER_VOICE,
             ),
             delivery_claims=mock.ANY,
+            integrations=mock.ANY,
         )
         qwen_turn.assert_not_called()
 
@@ -662,6 +755,7 @@ class ProcessUtteranceTests(unittest.TestCase):
                 issue_key="APP-43",
             ),
             delivery_claims=mock.ANY,
+            integrations=mock.ANY,
         )
         qwen_turn.assert_not_called()
 
@@ -728,7 +822,9 @@ class ProcessUtteranceTests(unittest.TestCase):
 
         cursor_turn.assert_not_called()
         qwen_turn.assert_not_called()
-        play.assert_called_once_with(wake_daemon.MISSING_ISSUE_SCOPE_RESPONSE)
+        play.assert_called_once_with(
+            AssistantResponse.from_text(wake_daemon.MISSING_ISSUE_SCOPE_RESPONSE)
+        )
 
     def test_failed_fresh_turn_stops_components(self) -> None:
         daemon = _bare_daemon()
@@ -743,7 +839,7 @@ class ProcessUtteranceTests(unittest.TestCase):
             mock.patch.object(
                 wake_daemon,
                 "request_context",
-                side_effect=lambda text: RequestContext(text),
+                side_effect=lambda text, **_settings: RequestContext(text),
             ),
             mock.patch.object(
                 wake_daemon,
@@ -773,7 +869,7 @@ class ProcessUtteranceTests(unittest.TestCase):
             mock.patch.object(
                 wake_daemon,
                 "request_context",
-                side_effect=lambda text: RequestContext(text),
+                side_effect=lambda text, **_settings: RequestContext(text),
             ),
             mock.patch.object(
                 wake_daemon,
@@ -800,6 +896,7 @@ class ProcessUtteranceTests(unittest.TestCase):
             trusted_utterance: str,
             delivery_claims: list[DeliveryClaim],
             allow_tools: bool = True,
+            settings: object | None = None,
         ) -> tuple[str, None]:
             self.assertEqual(trusted_utterance, "question")
             delivery_claims.append(
@@ -814,7 +911,7 @@ class ProcessUtteranceTests(unittest.TestCase):
             mock.patch.object(
                 wake_daemon,
                 "request_context",
-                side_effect=lambda text: RequestContext(text),
+                side_effect=lambda text, **_settings: RequestContext(text),
             ),
             mock.patch.object(
                 wake_daemon,
@@ -849,7 +946,7 @@ class InboxIntentRoutingTests(unittest.TestCase):
             mock.patch.object(
                 wake_daemon,
                 "request_context",
-                side_effect=lambda text: RequestContext(text),
+                side_effect=lambda text, **_settings: RequestContext(text),
             ),
             mock.patch.object(
                 wake_daemon,
@@ -872,6 +969,7 @@ class InboxIntentRoutingTests(unittest.TestCase):
         cursor_turn.assert_called_once_with(
             CursorTurnRequest("", None, action="list"),
             delivery_claims=mock.ANY,
+            integrations=mock.ANY,
         )
         qwen_turn.assert_not_called()
 
@@ -886,7 +984,7 @@ class InboxIntentRoutingTests(unittest.TestCase):
             mock.patch.object(
                 wake_daemon,
                 "request_context",
-                side_effect=lambda text: RequestContext(text),
+                side_effect=lambda text, **_settings: RequestContext(text),
             ),
             mock.patch.object(
                 wake_daemon,
@@ -915,6 +1013,7 @@ class InboxIntentRoutingTests(unittest.TestCase):
                 reference="dismiss the bug fix",
             ),
             delivery_claims=mock.ANY,
+            integrations=mock.ANY,
         )
         qwen_turn.assert_not_called()
 
@@ -953,14 +1052,63 @@ class AnnounceJobTests(unittest.TestCase):
             },
         )
 
-        response = daemon._job_response_text(claim.job)
+        response = daemon._job_response(claim.job)
 
         self.assertEqual(
-            response,
-            "Cursor needs clarification. What should authorize irreversible "
+            response.spoken_text,
+            "Cursor needs clarification for test. What should authorize irreversible "
             "audio deletion? Option 1 is Successful server send completion. "
             "Option 2 is Explicit client acknowledgment. Please choose one.",
         )
+        self.assertIn(
+            "Cursor job aaaaaaaaaaaa (test) needs clarification", response.display_text
+        )
+        self.assertIn("Option 2", response.display_text)
+
+    def test_job_announcement_queues_only_spoken_and_prints_display(self) -> None:
+        daemon = _bare_daemon()
+        claim = _delivery_claim(
+            "job2",
+            "completed",
+            result="Changed /srv/example/config.toml at commit abc123.",
+        )
+        response = daemon._job_response(claim.job)
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            daemon._enqueue_job_announcement(claim)
+
+        self.assertEqual(
+            output.getvalue(),
+            f"Assistant: {response.display_text}\n",
+        )
+        self.assertEqual(daemon.playback_queue.queued_text(), response.spoken_text)
+        self.assertNotIn("/srv/example", daemon.playback_queue.queued_text())
+        self.assertIn("/srv/example", response.display_text)
+        with daemon.playback_queue._lock:
+            queued_request = daemon.playback_queue._items[0][0]
+        self.assertEqual(queued_request.job_completed_at, claim.job.completed_at)
+        self.assertEqual(
+            queued_request.display_fingerprint,
+            wake_daemon._display_fingerprint(response.display_text),
+        )
+
+    def test_display_failure_does_not_queue_or_acknowledge_delivery(self) -> None:
+        daemon = _bare_daemon()
+        claim = _delivery_claim("job2", "completed", result="done")
+
+        class BrokenDisplay(io.StringIO):
+            def write(self, _value: str) -> int:
+                raise OSError("display unavailable")
+
+        with (
+            contextlib.redirect_stdout(BrokenDisplay()),
+            mock.patch.object(wake_daemon, "acknowledge_delivery") as acknowledge,
+            self.assertRaisesRegex(OSError, "display unavailable"),
+        ):
+            daemon._enqueue_job_announcement(claim)
+
+        acknowledge.assert_not_called()
+        self.assertEqual(len(daemon.playback_queue), 0)
 
     def test_play_response_finalizes_queued_job_announcements(self) -> None:
         daemon = _bare_daemon()
@@ -984,6 +1132,23 @@ class AnnounceJobTests(unittest.TestCase):
 
         acknowledge.assert_called_once_with("job1", "claim")
         self.assertEqual(daemon.cursor_session, "job1")
+
+    def test_play_response_queues_only_the_spoken_channel(self) -> None:
+        daemon = _bare_daemon()
+        response = AssistantResponse(
+            spoken_text="The job failed.",
+            display_text="Job 123 failed in /tmp/example; inspect the logs.",
+        )
+        with mock.patch.object(
+            daemon,
+            "_drain_playback_queue",
+            return_value=([], None),
+        ) as drain:
+            daemon.play_response(response)
+
+        drain.assert_called_once_with(response.spoken_text, on_played=mock.ANY)
+        self.assertEqual(daemon.playback_queue.queued_text(), response.spoken_text)
+        self.assertNotIn(response.display_text, daemon.playback_queue.queued_text())
 
     def test_awaiting_user_job_enables_followup(self) -> None:
         daemon = _bare_daemon()
@@ -1052,6 +1217,7 @@ class AnnounceJobTests(unittest.TestCase):
 
     def test_playback_failure_releases_delivery_without_acknowledging(self) -> None:
         daemon = _bare_daemon()
+        errors = io.StringIO()
         with (
             mock.patch.object(wake_daemon, "acknowledge_delivery") as acknowledge,
             mock.patch.object(wake_daemon, "release_delivery") as release,
@@ -1060,9 +1226,10 @@ class AnnounceJobTests(unittest.TestCase):
             mock.patch.object(
                 daemon,
                 "_drain_playback_queue",
-                side_effect=RuntimeError("speaker unavailable"),
+                side_effect=RuntimeError("speaker unavailable token=playback-secret"),
             ),
-            mock.patch.object(wake_daemon, "notify"),
+            mock.patch.object(wake_daemon, "notify") as notify,
+            contextlib.redirect_stderr(errors),
         ):
             daemon._enqueue_job_announcement(
                 _delivery_claim("job2", "completed", result="done")
@@ -1072,6 +1239,9 @@ class AnnounceJobTests(unittest.TestCase):
         acknowledge.assert_not_called()
         release.assert_called_once_with("bbbbbbbbbbbb", "claim")
         self.assertEqual(len(daemon.playback_queue), 0)
+        notify.assert_called_once_with(wake_daemon.PLAYBACK_FAILURE, error=True)
+        self.assertNotIn("playback-secret", errors.getvalue())
+        self.assertIn("[REDACTED]", errors.getvalue())
 
     def test_truncated_queue_stream_releases_without_acknowledging(self) -> None:
         daemon = _bare_daemon()
@@ -1163,6 +1333,30 @@ class AnnounceJobTests(unittest.TestCase):
         acknowledge.assert_called_once_with("bbbbbbbbbbbb", "claim")
         release.assert_called_once_with("bbbbbbbbbbbb", "claim")
         self.assertFalse(daemon.awaiting_followup)
+        self.assertIsNone(daemon.completed_followup)
+
+    def test_interrupted_announcement_does_not_install_recent_details(self) -> None:
+        daemon = _bare_daemon()
+        request = PlaybackRequest(
+            text="Cursor finished issue 42.",
+            job_id="bbbbbbbbbbbb",
+            delivery_token="claim",
+            job_status="completed",
+            job_completed_at=1,
+            display_fingerprint="fingerprint",
+        )
+        with (
+            mock.patch.object(wake_daemon, "release_delivery") as release,
+            mock.patch.object(wake_daemon.CURSOR_STORE, "get") as get,
+        ):
+            daemon._finish_job_playback(
+                request,
+                {"played_text": ""},
+                interrupted=True,
+            )
+
+        release.assert_called_once_with("bbbbbbbbbbbb", "claim")
+        get.assert_not_called()
         self.assertIsNone(daemon.completed_followup)
 
     def test_active_announcement_renews_its_delivery_lease(self) -> None:
@@ -1309,7 +1503,7 @@ class AnnounceJobTests(unittest.TestCase):
             mock.patch.object(
                 wake_daemon,
                 "start_components",
-                side_effect=lambda: events.append("components-ready"),
+                side_effect=lambda _settings: events.append("components-ready"),
             ),
             mock.patch(
                 "local_voice_harness.tts.queue.PrefetchHandle",
@@ -1449,6 +1643,7 @@ class ComponentSynchronizationTests(unittest.TestCase):
             llm_endpoint="http://127.0.0.1:8090/v1/chat/completions",
             llm_timeout=1,
         )
+        daemon.providers = settings
         response = io.BytesIO(
             json.dumps(
                 {
@@ -1481,13 +1676,7 @@ class ComponentSynchronizationTests(unittest.TestCase):
         with (
             mock.patch.object(wake_daemon, "start_components"),
             mock.patch.object(
-                wake_daemon,
-                "load_backend_settings",
-                return_value=settings,
-            ),
-            mock.patch.object(llm, "load_backend_settings", return_value=settings),
-            mock.patch.object(
-                llm.urllib.request,
+                llm_transport.urllib.request,
                 "urlopen",
                 return_value=response,
             ) as urlopen,
@@ -1524,7 +1713,7 @@ class ComponentSynchronizationTests(unittest.TestCase):
             mock.patch.object(
                 wake_daemon,
                 "start_components",
-                side_effect=lambda: events.append("started"),
+                side_effect=lambda _settings: events.append("started"),
             ),
             mock.patch.object(
                 wake_daemon,
@@ -1546,12 +1735,14 @@ class ComponentSynchronizationTests(unittest.TestCase):
         qwen_turn.assert_called_once_with(
             "Reply with only OK. Do not call a tool.",
             allow_tools=False,
+            settings=daemon.providers,
         )
 
 
 class PlaybackBargeInTests(unittest.TestCase):
     def test_wake_word_cancels_playback_and_preserves_preroll(self) -> None:
         daemon = _bare_daemon()
+        daemon.audio = replace(daemon.audio, barge_in_mode="wake")
         daemon.np = mock.Mock()  # type: ignore[reportAttributeAccessIssue]
         daemon.np.frombuffer.return_value = object()
         daemon.wake_key = "hey_jarvis"
@@ -1575,10 +1766,7 @@ class PlaybackBargeInTests(unittest.TestCase):
                 )
             ]
 
-        with (
-            mock.patch.object(wake_daemon, "BARGE_IN_MODE", "wake"),
-            mock.patch.object(daemon.playback_queue, "drain", side_effect=fake_drain),
-        ):
+        with mock.patch.object(daemon.playback_queue, "drain", side_effect=fake_drain):
             result, interruption = daemon.play_response("A harmless response.")
 
         self.assertTrue(result["interrupted"])
@@ -1589,6 +1777,9 @@ class PlaybackBargeInTests(unittest.TestCase):
 
     def test_vad_requires_configured_sustained_speech(self) -> None:
         daemon = _bare_daemon()
+        daemon.audio = replace(
+            daemon.audio, barge_in_mode="vad", barge_in_speech_frames=3
+        )
         daemon.read_frame = mock.Mock(return_value=b"speech")  # type: ignore[method-assign]
         daemon.is_speech = mock.Mock(return_value=True)  # type: ignore[method-assign]
 
@@ -1605,11 +1796,7 @@ class PlaybackBargeInTests(unittest.TestCase):
                 )
             ]
 
-        with (
-            mock.patch.object(wake_daemon, "BARGE_IN_MODE", "vad"),
-            mock.patch.object(wake_daemon, "BARGE_IN_SPEECH_FRAMES", 3),
-            mock.patch.object(daemon.playback_queue, "drain", side_effect=fake_drain),
-        ):
+        with mock.patch.object(daemon.playback_queue, "drain", side_effect=fake_drain):
             _, interruption = daemon.play_response("response")
 
         self.assertIsNotNone(interruption)
@@ -1619,6 +1806,7 @@ class PlaybackBargeInTests(unittest.TestCase):
 
     def test_off_mode_drains_frames_without_acoustic_cancellation(self) -> None:
         daemon = _bare_daemon()
+        daemon.audio = replace(daemon.audio, barge_in_mode="off")
         daemon.read_frame = mock.Mock(return_value=b"speaker echo")  # type: ignore[method-assign]
 
         def fake_drain(
@@ -1636,7 +1824,6 @@ class PlaybackBargeInTests(unittest.TestCase):
             ]
 
         with (
-            mock.patch.object(wake_daemon, "BARGE_IN_MODE", "off"),
             mock.patch.object(daemon.playback_queue, "drain", side_effect=fake_drain),
             mock.patch.object(daemon, "wait_for_playback_quiet") as quiet,
         ):
@@ -1648,6 +1835,7 @@ class PlaybackBargeInTests(unittest.TestCase):
 
     def test_response_wake_phrase_cannot_trigger_itself(self) -> None:
         daemon = _bare_daemon()
+        daemon.audio = replace(daemon.audio, barge_in_mode="wake")
         daemon.np = mock.Mock()  # type: ignore[reportAttributeAccessIssue]
         daemon.np.frombuffer.return_value = object()
         daemon.wake_key = "hey_jarvis"
@@ -1667,7 +1855,6 @@ class PlaybackBargeInTests(unittest.TestCase):
             ]
 
         with (
-            mock.patch.object(wake_daemon, "BARGE_IN_MODE", "wake"),
             mock.patch.object(daemon.playback_queue, "drain", side_effect=fake_drain),
             mock.patch.object(daemon, "wait_for_playback_quiet"),
             mock.patch.object(wake_daemon, "log"),
@@ -1678,6 +1865,11 @@ class PlaybackBargeInTests(unittest.TestCase):
 
     def test_quiet_gate_clears_echo_before_followup_rearms(self) -> None:
         daemon = _bare_daemon()
+        daemon.audio = replace(
+            daemon.audio,
+            playback_quiet_frames=2,
+            playback_quiet_timeout_seconds=1,
+        )
         daemon.microphone = mock.Mock()
         daemon.microphone.poll.return_value = None
         daemon.pre_roll.extend([b"old"])
@@ -1686,11 +1878,7 @@ class PlaybackBargeInTests(unittest.TestCase):
         )
         daemon.is_speech = lambda frame: frame == b"speech"  # type: ignore[method-assign]
 
-        with (
-            mock.patch.object(wake_daemon, "PLAYBACK_QUIET_FRAMES", 2),
-            mock.patch.object(wake_daemon, "PLAYBACK_QUIET_TIMEOUT_SECONDS", 1),
-        ):
-            daemon.wait_for_playback_quiet()
+        daemon.wait_for_playback_quiet()
 
         self.assertEqual(daemon.read_frame.call_count, 3)
         self.assertEqual(list(daemon.pre_roll), [])
@@ -1709,7 +1897,7 @@ class InterruptedTurnTests(unittest.TestCase):
             mock.patch.object(
                 wake_daemon,
                 "request_context",
-                side_effect=lambda text: RequestContext(text),
+                side_effect=lambda text, **_settings: RequestContext(text),
             ),
             mock.patch.object(
                 wake_daemon,
@@ -1822,7 +2010,11 @@ class InterruptedTurnTests(unittest.TestCase):
             ],
         )
         self.assertEqual(len(daemon.playback_queue), 0)
-        self.assertIn("Hey Jarvis, second", drain.call_args.args[0])
+        self.assertEqual(
+            drain.call_args.args[0],
+            "Cursor finished test. Cursor finished test.",
+        )
+        self.assertNotIn("Hey Jarvis, second", drain.call_args.args[0])
 
 
 class WakeRecordingHandoffTests(unittest.TestCase):
@@ -1897,7 +2089,7 @@ class WakeRecordingHandoffTests(unittest.TestCase):
             daemon.np = mock.Mock()  # type: ignore[assignment]
             daemon.wake_key = "wake"
             daemon.wake_model.predict.side_effect = [
-                {"wake": wake_daemon.WAKE_THRESHOLD + 0.1},
+                {"wake": daemon.audio.wake_threshold + 0.1},
                 {"wake": 0.0},
             ]
             reads = 0
@@ -2076,14 +2268,23 @@ class ForceListenTests(unittest.TestCase):
     def test_request_listen_signals_the_recorded_pid(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             pid_path = Path(temporary) / "wake.pid"
-            pid_path.write_text("4321")
+            pid_path.write_text(
+                json.dumps({"pid": 4321, "process_start": "daemon-start"})
+            )
+            handle = mock.Mock()
             with (
                 mock.patch.object(wake_daemon, "WAKE_PID_PATH", pid_path),
-                mock.patch.object(wake_daemon.os, "kill") as kill,
+                mock.patch.object(
+                    wake_daemon.ProcessHandle,
+                    "open",
+                    return_value=handle,
+                ) as open_handle,
             ):
                 wake_daemon.request_listen()
 
-        kill.assert_called_once_with(4321, wake_daemon.signal.SIGUSR1)
+        open_handle.assert_called_once_with(4321, expected_start="daemon-start")
+        handle.send_signal.assert_called_once_with(wake_daemon.signal.SIGUSR1)
+        handle.close.assert_called_once()
 
     def test_request_listen_reports_a_stopped_daemon(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -2097,22 +2298,63 @@ class ForceListenTests(unittest.TestCase):
     def test_request_listen_reports_a_dead_pid(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             pid_path = Path(temporary) / "wake.pid"
-            pid_path.write_text("4321")
+            pid_path.write_text(
+                json.dumps({"pid": 4321, "process_start": "daemon-start"})
+            )
             with (
                 mock.patch.object(wake_daemon, "WAKE_PID_PATH", pid_path),
-                mock.patch.object(
-                    wake_daemon.os, "kill", side_effect=ProcessLookupError
-                ),
+                mock.patch.object(wake_daemon.ProcessHandle, "open", return_value=None),
                 self.assertRaisesRegex(HarnessError, "not running"),
             ):
                 wake_daemon.request_listen()
 
+    def test_request_listen_rejects_pid_reuse_without_signalling(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            pid_path = Path(temporary) / "wake.pid"
+            pid_path.write_text(
+                json.dumps({"pid": 4321, "process_start": "original-start"})
+            )
+            with (
+                mock.patch.object(wake_daemon, "WAKE_PID_PATH", pid_path),
+                mock.patch.object(
+                    wake_daemon.ProcessHandle, "open", return_value=None
+                ) as open_handle,
+                self.assertRaisesRegex(HarnessError, "not running"),
+            ):
+                wake_daemon.request_listen()
+
+        open_handle.assert_called_once_with(4321, expected_start="original-start")
+
+    def test_main_rejects_duplicate_daemon_startup(self) -> None:
+        with (
+            mock.patch.object(
+                wake_daemon,
+                "_acquire_wake_singleton",
+                side_effect=HarnessError("wake daemon is already running"),
+            ),
+            mock.patch.object(wake_daemon, "WakeConversationDaemon"),
+            self.assertRaisesRegex(HarnessError, "already running"),
+        ):
+            wake_daemon.main()
+
 
 class CompletedFollowupContextTests(unittest.TestCase):
+    def _completed_context(
+        self,
+        job: CursorJob,
+    ) -> wake_daemon.CompletedFollowup:
+        response = wake_daemon.cursor_service.render_job_announcement(job)
+        return wake_daemon.CompletedFollowup(
+            job_id=job.id,
+            completed_at=job.completed_at,
+            expires_at=time.monotonic() + 60,
+            display_fingerprint=wake_daemon._display_fingerprint(response.display_text),
+        )
+
     def test_completed_announcement_installs_context(self) -> None:
         daemon = _bare_daemon()
+        daemon.platform = replace(daemon.platform, cursor_followup_enabled=True)
         with (
-            mock.patch.object(wake_daemon, "CURSOR_FOLLOWUP_ENABLED", True),
             mock.patch.object(
                 wake_daemon.CURSOR_STORE,
                 "get",
@@ -2131,12 +2373,14 @@ class CompletedFollowupContextTests(unittest.TestCase):
 
     def test_foreground_completion_installs_context_after_playback(self) -> None:
         daemon = _bare_daemon()
+        daemon.platform = replace(daemon.platform, cursor_followup_enabled=True)
         claim = _delivery_claim("job2", "completed", result="done")
 
         def finish_in_foreground(
             _request: CursorTurnRequest,
             *,
             delivery_claims: list[DeliveryClaim],
+            integrations: object,
         ) -> tuple[str, None]:
             delivery_claims.append(claim)
             return "done", None
@@ -2149,14 +2393,13 @@ class CompletedFollowupContextTests(unittest.TestCase):
             return acknowledged
 
         with (
-            mock.patch.object(wake_daemon, "CURSOR_FOLLOWUP_ENABLED", True),
             mock.patch.object(wake_daemon.CURSOR_STORE, "get", return_value=claim.job),
             mock.patch.object(wake_daemon, "transcribe", return_value="do the task"),
             mock.patch.object(wake_daemon, "start_components"),
             mock.patch.object(
                 wake_daemon,
                 "request_context",
-                side_effect=lambda text: RequestContext(text),
+                side_effect=lambda text, **_settings: RequestContext(text),
             ),
             mock.patch.object(
                 wake_daemon,
@@ -2184,8 +2427,8 @@ class CompletedFollowupContextTests(unittest.TestCase):
 
     def test_kill_switch_disables_context(self) -> None:
         daemon = _bare_daemon()
+        daemon.platform = replace(daemon.platform, cursor_followup_enabled=False)
         with (
-            mock.patch.object(wake_daemon, "CURSOR_FOLLOWUP_ENABLED", False),
             mock.patch.object(wake_daemon.CURSOR_STORE, "get") as get,
             mock.patch.object(wake_daemon, "notify"),
         ):
@@ -2198,9 +2441,9 @@ class CompletedFollowupContextTests(unittest.TestCase):
 
     def test_awaiting_job_completion_swaps_slots(self) -> None:
         daemon = _bare_daemon()
+        daemon.platform = replace(daemon.platform, cursor_followup_enabled=True)
         daemon.cursor_session = "bbbbbbbbbbbb"
         with (
-            mock.patch.object(wake_daemon, "CURSOR_FOLLOWUP_ENABLED", True),
             mock.patch.object(
                 wake_daemon.CURSOR_STORE,
                 "get",
@@ -2225,6 +2468,74 @@ class CompletedFollowupContextTests(unittest.TestCase):
         )
         self.assertIsNone(daemon._active_completed_followup())
         self.assertIsNone(daemon.completed_followup)
+
+    def test_recent_details_return_exact_display_rendering_and_consume_context(
+        self,
+    ) -> None:
+        daemon = _bare_daemon()
+        job = _delivery_claim(
+            "job2",
+            "completed",
+            result="Changed /srv/example/config.toml.",
+        ).job
+        context = self._completed_context(job)
+        daemon.completed_followup = context
+        expected = wake_daemon.cursor_service.render_job_announcement(job)
+        with mock.patch.object(wake_daemon.CURSOR_STORE, "get", return_value=job):
+            response = daemon._recent_completion_details(context)
+
+        self.assertEqual(response.display_text, expected.display_text)
+        self.assertNotEqual(response.spoken_text, expected.display_text)
+        self.assertIsNone(daemon.completed_followup)
+
+    def test_recent_details_fail_closed_when_job_identity_no_longer_matches(
+        self,
+    ) -> None:
+        daemon = _bare_daemon()
+        job = _delivery_claim("job2", "completed", result="done").job
+        context = self._completed_context(job)
+        context.completed_at = 999
+        daemon.completed_followup = context
+        with mock.patch.object(wake_daemon.CURSOR_STORE, "get", return_value=job):
+            response = daemon._recent_completion_details(context)
+
+        self.assertEqual(response.display_text, wake_daemon.RECENT_DETAILS_UNAVAILABLE)
+        self.assertIsNone(daemon.completed_followup)
+
+    def test_recent_details_fail_closed_when_rendering_changed(self) -> None:
+        daemon = _bare_daemon()
+        announced = _delivery_claim("job2", "completed", result="original").job
+        changed = announced.evolve(result="different")
+        context = self._completed_context(announced)
+        daemon.completed_followup = context
+        with mock.patch.object(wake_daemon.CURSOR_STORE, "get", return_value=changed):
+            response = daemon._recent_completion_details(context)
+
+        self.assertEqual(response.display_text, wake_daemon.RECENT_DETAILS_UNAVAILABLE)
+        self.assertIsNone(daemon.completed_followup)
+
+    def test_newer_completed_announcement_supersedes_retained_context(self) -> None:
+        daemon = _bare_daemon()
+        daemon.platform = replace(daemon.platform, cursor_followup_enabled=True)
+        first = _delivery_claim("job1", "completed", result="first").job
+        second = _delivery_claim("job2", "completed", result="second").job
+        with mock.patch.object(
+            wake_daemon.CURSOR_STORE,
+            "get",
+            side_effect=[first, second],
+        ):
+            for job in (first, second):
+                display = wake_daemon.cursor_service.render_job_announcement(
+                    job
+                ).display_text
+                daemon._remember_completed_job(
+                    job.id,
+                    expected_completed_at=job.completed_at,
+                    display_fingerprint=wake_daemon._display_fingerprint(display),
+                )
+
+        assert daemon.completed_followup is not None
+        self.assertEqual(daemon.completed_followup.job_id, second.id)
 
     def _run_route(
         self,
@@ -2253,7 +2564,7 @@ class CompletedFollowupContextTests(unittest.TestCase):
             mock.patch.object(
                 wake_daemon,
                 "request_context",
-                side_effect=lambda text: RequestContext(text),
+                side_effect=lambda text, **_settings: RequestContext(text),
             ),
             mock.patch.object(wake_daemon, "route_intent", side_effect=routed),
             mock.patch.object(wake_daemon, "cursor_turn", cursor_turn),
@@ -2287,6 +2598,21 @@ class CompletedFollowupContextTests(unittest.TestCase):
         self.assertEqual(request.action, "follow_up")
         self.assertEqual(request.job_id, "bbbbbbbbbbbb")
         self.assertEqual(request.expected_completed_at, 9.0)
+        self.assertIsNone(daemon.completed_followup)
+
+    def test_details_route_reads_snapshot_without_starting_tools(self) -> None:
+        daemon = _bare_daemon()
+        job = _delivery_claim("job2", "completed", result="full details").job
+        daemon.completed_followup = self._completed_context(job)
+        with mock.patch.object(wake_daemon.CURSOR_STORE, "get", return_value=job):
+            cursor_turn = self._run_route(
+                daemon,
+                IntentRoute(Intent.CURSOR_DETAILS, "high"),
+                transcript="tell me more",
+            )
+
+        cursor_turn.assert_not_called()
+        self._last_qwen.assert_not_called()
         self.assertIsNone(daemon.completed_followup)
 
     def test_followup_route_without_context_declines_without_tools(self) -> None:

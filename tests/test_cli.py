@@ -1,13 +1,20 @@
 from __future__ import annotations
 
+import contextlib
+import io
 import json
 import unittest
 from pathlib import Path
 from unittest import mock
 
 from local_voice_harness import cli
+from local_voice_harness.browser_context import RequestContext
 from local_voice_harness.cursor.service import CursorTurnRequest, CursorTurnResult
 from local_voice_harness.cursor.store import QuarantineEvidence
+from local_voice_harness.diagnostic_safety import COMMAND_FAILURE
+from local_voice_harness.intent import Intent, IntentRoute
+from local_voice_harness.responses import AssistantResponse
+from local_voice_harness.transcript import TranscriptReplacement
 from local_voice_harness.user_config import PlanApprovalMode, PlanApprovalPreferences
 
 
@@ -71,6 +78,24 @@ class JobsCliTests(unittest.TestCase):
                 reference="use the api repo",
             ),
         )
+
+    def test_jobs_command_prints_only_display_channel(self) -> None:
+        args = cli.parser().parse_args(["jobs", "status"])
+        response = AssistantResponse(
+            spoken_text="The job failed.",
+            display_text="Job 123 failed during setup.",
+        )
+        with (
+            mock.patch.object(
+                cli,
+                "cursor_turn",
+                return_value=CursorTurnResult(response, None),
+            ),
+            mock.patch("builtins.print") as output,
+        ):
+            cli.dispatch(args)
+
+        output.assert_called_once_with(response.display_text)
 
 
 class PlanApprovalCliTests(unittest.TestCase):
@@ -291,6 +316,87 @@ class ListenCliTests(unittest.TestCase):
         request_listen.assert_called_once_with()
 
 
+class ConfigCliTests(unittest.TestCase):
+    def test_config_show_prints_rendered_configuration(self) -> None:
+        args = cli.parser().parse_args(["config", "show"])
+        with (
+            mock.patch.object(
+                cli,
+                "show_config",
+                return_value="[audio]\nwake_threshold = 0.55\n",
+            ) as show_config,
+            mock.patch("builtins.print") as output,
+        ):
+            cli.dispatch(args)
+
+        show_config.assert_called_once_with(key=None, json_output=False)
+        self.assertIn("wake_threshold", output.call_args.args[0])
+
+    def test_config_set_commits_and_reports_restart(self) -> None:
+        args = cli.parser().parse_args(["config", "set", "audio.wake_threshold", "0.6"])
+        result = mock.Mock(restart_services=("voice-harness-wake.service",))
+        with (
+            mock.patch.object(
+                cli, "commit_config_change", return_value=result
+            ) as commit,
+            mock.patch.object(
+                cli,
+                "format_restart_notice",
+                return_value="Restart to apply: voice-harness-wake.service.",
+            ) as notice,
+            mock.patch("builtins.print") as output,
+        ):
+            cli.dispatch(args)
+
+        commit.assert_called_once_with({"audio.wake_threshold": "0.6"})
+        notice.assert_called_once_with(result.restart_services)
+        self.assertIn("Restart to apply", output.call_args.args[0])
+
+    def test_integrations_enable_and_doctor(self) -> None:
+        enable_args = cli.parser().parse_args(["integrations", "enable", "linear"])
+        result = mock.Mock(restart_services=())
+        with (
+            mock.patch.object(
+                cli, "set_integration_enabled", return_value=result
+            ) as enable,
+            mock.patch.object(
+                cli,
+                "format_restart_notice",
+                return_value="No running services require a restart for this change.",
+            ),
+            mock.patch("builtins.print"),
+        ):
+            cli.dispatch(enable_args)
+
+        enable.assert_called_once_with("linear", enabled=True)
+
+        doctor_args = cli.parser().parse_args(["integrations", "doctor", "--json"])
+        with (
+            mock.patch.object(
+                cli,
+                "run_integration_doctor",
+                return_value=(1, '{"name":"linear"}'),
+            ) as doctor,
+            mock.patch("builtins.print") as output,
+        ):
+            with self.assertRaises(SystemExit) as raised:
+                cli.dispatch(doctor_args)
+
+        doctor.assert_called_once_with(json_output=True)
+        self.assertEqual(raised.exception.code, 1)
+        self.assertIn("linear", output.call_args.args[0])
+
+    def test_setup_defaults_runs_non_interactively(self) -> None:
+        args = cli.parser().parse_args(["setup", "--defaults"])
+        with (
+            mock.patch.object(cli, "run_setup") as run_setup,
+            mock.patch("builtins.print"),
+        ):
+            cli.dispatch(args)
+
+        run_setup.assert_called_once_with(defaults_only=True)
+
+
 class CredentialsCliTests(unittest.TestCase):
     def test_set_prompts_without_accepting_key_as_argument(self) -> None:
         args = cli.parser().parse_args(["credentials", "set"])
@@ -315,6 +421,153 @@ class CredentialsCliTests(unittest.TestCase):
             ):
                 cli.dispatch(cli.parser().parse_args(["credentials", action]))
                 function.assert_called_once_with()
+
+
+class ReplayCliTests(unittest.TestCase):
+    def test_capture_records_semantic_decisions_without_response_by_default(
+        self,
+    ) -> None:
+        output = Path("/tmp/replay.json")
+        context = RequestContext("ask Cursor to work on issue 12")
+        route = IntentRoute(Intent.AGENT_SUBMIT, "high")
+        rules = (TranscriptReplacement("Cursa", "Cursor"),)
+        args = cli.parser().parse_args(
+            [
+                "replay",
+                "capture",
+                "--without-context",
+                "--output",
+                str(output),
+                "--intent",
+                "cursor_submit",
+                "--confidence",
+                "high",
+                "ask",
+                "Cursa",
+                "to",
+                "work",
+                "on",
+                "issue",
+                "12",
+            ]
+        )
+        with (
+            mock.patch(
+                "local_voice_harness.stt.server.transcript_replacements",
+                return_value=rules,
+            ),
+            mock.patch(
+                "local_voice_harness.transcript.normalize_transcript",
+                return_value=context.text,
+            ),
+            mock.patch.object(cli, "request_context") as request_context,
+            mock.patch.object(cli, "route_intent") as route_intent,
+            mock.patch.object(
+                cli, "capture_bundle", return_value=mock.sentinel.bundle
+            ) as capture,
+            mock.patch.object(cli, "save_bundle") as save,
+            mock.patch.object(cli, "manifest_summary", return_value="summary"),
+            mock.patch("builtins.print"),
+        ):
+            cli.dispatch(args)
+
+        request_context.assert_not_called()
+        route_intent.assert_not_called()
+        capture.assert_called_once_with(
+            "ask Cursa to work on issue 12",
+            replacements=rules,
+            context=context,
+            route=route,
+            response=None,
+        )
+        save.assert_called_once_with(mock.sentinel.bundle, output)
+
+    def test_run_prints_channels_without_invoking_tts(self) -> None:
+        args = cli.parser().parse_args(["replay", "run", "/tmp/replay.json"])
+        response = AssistantResponse("brief speech", "detailed display")
+        with (
+            mock.patch.object(cli, "load_bundle", return_value=mock.sentinel.bundle),
+            mock.patch.object(cli, "manifest_summary", return_value="summary"),
+            mock.patch.object(cli, "run_replay", return_value=response) as replay,
+            mock.patch("builtins.print") as output,
+        ):
+            cli.dispatch(args)
+
+        replay.assert_called_once_with(mock.sentinel.bundle)
+        rendered = "\n".join(str(call.args[0]) for call in output.call_args_list)
+        self.assertIn("Display: detailed display", rendered)
+        self.assertIn("Speech: brief speech", rendered)
+
+    def test_export_shows_summary_before_confirmation_and_copy(self) -> None:
+        args = cli.parser().parse_args(
+            ["replay", "export", "/tmp/source.json", "/tmp/export.json"]
+        )
+        events: list[str] = []
+        with (
+            mock.patch.object(cli, "load_bundle", return_value=mock.sentinel.bundle),
+            mock.patch.object(
+                cli,
+                "manifest_summary",
+                side_effect=lambda _bundle: events.append("summary") or "summary",
+            ),
+            mock.patch.object(
+                cli,
+                "input",
+                create=True,
+                side_effect=lambda _prompt: events.append("confirmation") or "export",
+            ),
+            mock.patch.object(
+                cli,
+                "save_bundle",
+                side_effect=lambda _bundle, _path: events.append("copy"),
+            ),
+            mock.patch("builtins.print"),
+        ):
+            cli.dispatch(args)
+
+        self.assertEqual(events, ["summary", "confirmation", "copy"])
+
+    def test_promotion_requires_manual_review_confirmation(self) -> None:
+        args = cli.parser().parse_args(
+            ["replay", "promote", "/tmp/source.json", "/tmp/fixture.json"]
+        )
+        bundle = mock.Mock()
+        bundle.to_dict.return_value = {"version": 1, "transcript": {"raw": "review me"}}
+        with (
+            mock.patch.object(cli, "load_bundle", return_value=bundle),
+            mock.patch.object(cli, "manifest_summary", return_value="summary"),
+            mock.patch.object(cli, "input", create=True, return_value="no"),
+            mock.patch.object(cli, "save_bundle") as save,
+            mock.patch("builtins.print") as output,
+        ):
+            cli.dispatch(args)
+
+        save.assert_not_called()
+        displayed = "\n".join(str(call.args[0]) for call in output.call_args_list)
+        self.assertIn("review me", displayed)
+
+
+class MainFailureTests(unittest.TestCase):
+    def test_failure_uses_semantic_notification_and_redacted_diagnostic_log(
+        self,
+    ) -> None:
+        error = RuntimeError("Authorization: Bearer cli-secret")
+        stderr = io.StringIO()
+        with (
+            mock.patch.object(cli, "parser") as parser,
+            mock.patch.object(cli, "dispatch", side_effect=error),
+            mock.patch.object(cli, "notify") as notify,
+            contextlib.redirect_stderr(stderr),
+            self.assertRaises(SystemExit),
+        ):
+            parser.return_value.parse_args.return_value = mock.sentinel.args
+            cli.main()
+
+        output = stderr.getvalue()
+        self.assertNotIn("cli-secret", output)
+        self.assertIn("[REDACTED]", output)
+        self.assertIn(COMMAND_FAILURE, output)
+        notify.assert_called_once_with(COMMAND_FAILURE, error=True)
 
 
 if __name__ == "__main__":

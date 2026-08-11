@@ -12,16 +12,17 @@ from .config import (
     LLM_HEALTH,
     STATE_DIR,
     TTS_SOCKET,
-    load_backend_settings,
+    BackendSettings,
 )
 from .credentials import CredentialError, get_venice_api_key
 from .errors import HarnessError
 from .ipc import socket_ready
+from .user_config import default_user_config
 
 
-def llm_ready() -> bool:
-    settings = load_backend_settings()
-    if settings.llm_provider == "venice":
+def llm_ready(settings: BackendSettings | None = None) -> bool:
+    resolved = settings or default_user_config().providers
+    if resolved.llm_provider == "venice":
         try:
             get_venice_api_key()
         except CredentialError:
@@ -45,12 +46,14 @@ def component_usage() -> Iterator[None]:
             fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
 
 
-def start_components(timeout: float = 30.0) -> None:
-    settings = load_backend_settings()
-    if "venice" in (settings.llm_provider, settings.tts_provider):
+def start_components(
+    settings: BackendSettings | None = None, timeout: float = 30.0
+) -> None:
+    resolved = settings or default_user_config().providers
+    if "venice" in (resolved.llm_provider, resolved.tts_provider):
         get_venice_api_key()
     services = ["voice-harness-tts.service"]
-    if settings.llm_provider == "local":
+    if resolved.llm_provider == "local":
         services.insert(0, "voice-harness-llm.service")
     subprocess.run(
         ["systemctl", "--user", "start", *services],
@@ -60,7 +63,7 @@ def start_components(timeout: float = 30.0) -> None:
     llm_is_ready = False
     tts_is_ready = False
     while time.monotonic() < deadline:
-        llm_is_ready = settings.llm_provider == "venice" or llm_ready()
+        llm_is_ready = resolved.llm_provider == "venice" or llm_ready(resolved)
         tts_is_ready = socket_ready(TTS_SOCKET) if llm_is_ready else False
         if llm_is_ready and tts_is_ready:
             return

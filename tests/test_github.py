@@ -11,9 +11,13 @@ from local_voice_harness.integrations.github import (
     GitHubClient,
     GitHubError,
     GitHubIssue,
+    GitHubIssueLookupError,
+    GitHubIssueLookupReason,
+    GitHubOperationAmbiguous,
     GitHubPullRequest,
     GitHubRepository,
 )
+from local_voice_harness.local_git import LocalGitOperationAmbiguous
 
 
 def _completed(
@@ -42,7 +46,7 @@ class GitHubClientTests(unittest.TestCase):
         client = GitHubClient()
         with (
             mock.patch(
-                "local_voice_harness.integrations.github.subprocess.run",
+                "local_voice_harness.integrations.github.run_command",
                 side_effect=OSError("missing"),
             ),
             self.assertRaisesRegex(GitHubError, "missing"),
@@ -51,27 +55,41 @@ class GitHubClientTests(unittest.TestCase):
 
         with (
             mock.patch(
-                "local_voice_harness.integrations.github.subprocess.run",
+                "local_voice_harness.integrations.github.run_command",
                 side_effect=subprocess.TimeoutExpired(["gh"], 1),
             ),
-            self.assertRaisesRegex(GitHubError, "timed out"),
+            self.assertRaisesRegex(
+                GitHubOperationAmbiguous,
+                "outcome is ambiguous.*external side effect",
+            ) as raised,
         ):
             client._run(["gh", "status"])
+        self.assertIsInstance(raised.exception.__cause__, subprocess.TimeoutExpired)
 
         failed = _completed(stdout="fallback error", returncode=2)
         with (
             mock.patch(
-                "local_voice_harness.integrations.github.subprocess.run",
+                "local_voice_harness.integrations.github.run_command",
                 return_value=failed,
             ),
             self.assertRaisesRegex(GitHubError, "fallback error"),
         ):
             client._run(["gh", "status"])
         with mock.patch(
-            "local_voice_harness.integrations.github.subprocess.run",
+            "local_voice_harness.integrations.github.run_command",
             return_value=failed,
         ):
             self.assertIs(client._run(["gh", "status"], check=False), failed)
+
+    def test_configured_timeout_is_the_generic_command_default(self) -> None:
+        client = GitHubClient(timeout=42)
+        with mock.patch(
+            "local_voice_harness.integrations.github.run_command",
+            return_value=_completed(),
+        ) as run:
+            client._run(["gh", "status"])
+
+        self.assertEqual(run.call_args.kwargs["timeout"], 42)
 
     def test_repository_identity_validation_rejects_paths(self) -> None:
         self.assertEqual(
@@ -213,6 +231,51 @@ class GitHubClientTests(unittest.TestCase):
         self.assertEqual(issue.reference, "example/project#42")
         self.assertEqual(issue.url, "https://github.com/example/project/issues/42")
 
+    def test_issue_lookup_failure_is_classified_and_voice_safe(self) -> None:
+        client = GitHubClient()
+        issue = GitHubIssue(
+            "very-long-owner-name",
+            "private-repository-with-a-long-name",
+            42,
+        )
+        raw = (
+            "GraphQL: Could not resolve to an Issue with the number 42. "
+            "Authorization: Bearer ghp_secret-value"
+        )
+        with mock.patch.object(
+            client,
+            "_run",
+            return_value=_completed(stderr=raw, returncode=1),
+        ):
+            with self.assertRaises(GitHubIssueLookupError) as raised:
+                client.issue_details(issue)
+
+        error = raised.exception
+        self.assertEqual(
+            error.reason,
+            GitHubIssueLookupReason.NOT_FOUND_OR_INACCESSIBLE,
+        )
+        self.assertEqual(
+            str(error),
+            "I couldn't find or access that GitHub issue.",
+        )
+        self.assertNotIn("very-long-owner", str(error))
+        self.assertNotIn("ghp_secret-value", error.diagnostic)
+        self.assertIn("Could not resolve to an Issue", error.diagnostic)
+
+    def test_issue_lookup_unknown_failure_has_safe_fallback(self) -> None:
+        client = GitHubClient()
+        with mock.patch.object(
+            client,
+            "_run",
+            return_value=_completed(stderr="new GraphQL failure", returncode=1),
+        ):
+            with self.assertRaises(GitHubIssueLookupError) as raised:
+                client.issue_details(GitHubIssue("example", "project", 42))
+
+        self.assertEqual(raised.exception.reason, GitHubIssueLookupReason.UNKNOWN)
+        self.assertEqual(str(raised.exception), "I couldn't verify that GitHub issue.")
+
     def test_context_metadata_is_read_through_gh(self) -> None:
         client = GitHubClient()
         repository_details = {"nameWithOwner": "example/project"}
@@ -242,6 +305,7 @@ class GitHubClientTests(unittest.TestCase):
             run.call_args_list[1].args[0][:6],
             ["gh", "pr", "view", "7", "--repo", "example/project"],
         )
+        self.assertIn("headRefOid", run.call_args_list[1].args[0][-1])
 
     def test_context_metadata_rejects_invalid_responses(self) -> None:
         client = GitHubClient()
@@ -306,7 +370,7 @@ class GitHubClientTests(unittest.TestCase):
         run.assert_not_called()
 
     def test_creates_missing_fork_without_cloning(self) -> None:
-        client = GitHubClient()
+        client = GitHubClient(timeout=7)
         source = _repository("source/project")
         fork = _repository("me/project", parent="source/project")
         events: list[str] = []
@@ -346,37 +410,50 @@ class GitHubClientTests(unittest.TestCase):
             client.provision_public_fork("source/project", confirmed=False)
         inspect.assert_not_called()
 
-    def test_clone_uses_temporary_owner_qualified_destination(self) -> None:
+    def test_clone_delegates_owner_qualified_materialization(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             allowed = Path(temporary)
             root = allowed / "src"
             client = GitHubClient(clone_root=root, allowed_root=allowed)
             source = _repository("source/project")
             fork = _repository("me/project", parent="source/project")
-            commands: list[list[str]] = []
+            checkout = (root / "source" / "project").resolve()
 
-            def run(
-                command: list[str], *, timeout: float = 30, check: bool = True
-            ) -> subprocess.CompletedProcess[str]:
-                commands.append(command)
-                if command[1:3] == ["repo", "clone"]:
-                    Path(command[-1]).mkdir(parents=True)
-                return _completed()
+            def materialize(_relative: Path, **kwargs: object) -> Path:
+                finalize = kwargs["finalize"]
+                assert callable(finalize)
+                finalize(checkout)
+                return checkout
 
             with (
-                mock.patch.object(client, "_run", side_effect=run),
-                mock.patch.object(client, "_verify_checkout") as verify,
-                mock.patch.object(client, "_ensure_upstream") as upstream,
+                mock.patch.object(
+                    client.local_git,
+                    "materialize",
+                    side_effect=materialize,
+                ) as clone,
+                mock.patch.object(
+                    client.local_git,
+                    "ensure_remote",
+                ) as upstream,
             ):
                 checkout = client.ensure_clone(source, fork)
 
             self.assertEqual(checkout, (root / "source" / "project").resolve())
-            self.assertTrue(checkout.is_dir())
-            clone = next(command for command in commands if "clone" in command)
-            self.assertEqual(clone[:4], ["gh", "repo", "clone", "me/project"])
-            self.assertTrue(Path(clone[-1]).name.startswith(".project.clone-"))
-            verify.assert_called_once()
-            upstream.assert_called_once()
+            self.assertEqual(clone.call_args.args[0], Path("source/project"))
+            self.assertEqual(clone.call_args.kwargs["clone_url"], fork.url)
+            self.assertEqual(
+                clone.call_args.kwargs["clone_command"],
+                ("gh", "repo", "clone", fork.name_with_owner),
+            )
+            self.assertEqual(
+                clone.call_args.kwargs["expected"].identity,
+                "github.com/me/project",
+            )
+            upstream.assert_called_once_with(
+                checkout,
+                "upstream",
+                source.url,
+            )
 
     def test_clone_root_must_remain_inside_allowed_root(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -393,37 +470,50 @@ class GitHubClientTests(unittest.TestCase):
                 )
             self.assertFalse(outside.exists())
 
+    def test_clone_rejects_remote_url_with_wrong_identity(self) -> None:
+        client = GitHubClient()
+        source = GitHubRepository(
+            "source/project",
+            "https://example.com/source/project",
+            False,
+            "main",
+        )
+        with (
+            mock.patch.object(client.local_git, "materialize") as materialize,
+            self.assertRaisesRegex(GitHubError, "invalid clone URL"),
+        ):
+            client.ensure_repository_clone(source)
+        materialize.assert_not_called()
+
     def test_repository_clone_uses_source_origin_without_upstream(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             allowed = Path(temporary)
             root = allowed / "src"
             client = GitHubClient(clone_root=root, allowed_root=allowed)
             source = _repository("source/project")
-            commands: list[list[str]] = []
-
-            def run(
-                command: list[str],
-                *,
-                timeout: float = 30,
-                check: bool = True,
-                cwd: Path | None = None,
-            ) -> subprocess.CompletedProcess[str]:
-                commands.append(command)
-                if command[1:3] == ["repo", "clone"]:
-                    Path(command[-1]).mkdir(parents=True)
-                return _completed()
+            expected_checkout = (root / "source" / "project").resolve()
 
             with (
-                mock.patch.object(client, "_run", side_effect=run),
-                mock.patch.object(client, "_verify_checkout") as verify,
-                mock.patch.object(client, "_ensure_upstream") as upstream,
+                mock.patch.object(
+                    client.local_git,
+                    "materialize",
+                    return_value=expected_checkout,
+                ) as clone,
+                mock.patch.object(
+                    client.local_git,
+                    "ensure_remote",
+                ) as upstream,
             ):
                 checkout = client.ensure_repository_clone(source)
 
-            self.assertEqual(checkout, (root / "source" / "project").resolve())
-            clone = next(command for command in commands if "clone" in command)
-            self.assertEqual(clone[:4], ["gh", "repo", "clone", "source/project"])
-            verify.assert_called_once()
+            self.assertEqual(checkout, expected_checkout)
+            self.assertEqual(clone.call_args.args[0], Path("source/project"))
+            self.assertEqual(clone.call_args.kwargs["clone_url"], source.url)
+            self.assertEqual(
+                clone.call_args.kwargs["clone_command"],
+                ("gh", "repo", "clone", source.name_with_owner),
+            )
+            self.assertNotIn("finalize", clone.call_args.kwargs)
             upstream.assert_not_called()
 
     def test_provision_pull_request_leaves_shared_clone_unchanged(self) -> None:
@@ -470,12 +560,20 @@ class GitHubClientTests(unittest.TestCase):
                 return _completed()
             return _completed("feature/cache\n")
 
-        with mock.patch.object(client, "_run", side_effect=run):
+        with (
+            mock.patch.object(client, "_run", side_effect=run),
+            mock.patch.object(
+                client.local_git,
+                "current_branch",
+                return_value="feature/cache",
+            ) as current_branch,
+        ):
             branch = client.checkout_pull_request(
                 checkout, 42, branch="voice/github-pr-123456789abc"
             )
 
         self.assertEqual(branch, "feature/cache")
+        current_branch.assert_called_once_with(checkout)
         pr_command, pr_cwd = next(call for call in calls if "checkout" in call[0])
         self.assertEqual(
             pr_command,
@@ -491,35 +589,26 @@ class GitHubClientTests(unittest.TestCase):
         )
         self.assertEqual(pr_cwd, checkout)
 
-    def test_remote_repository_supports_https_and_ssh(self) -> None:
-        self.assertEqual(
-            GitHubClient._remote_repository("https://github.com/example/project.git"),
-            "example/project",
-        )
-        self.assertEqual(
-            GitHubClient._remote_repository("git@github.com:example/project.git"),
-            "example/project",
-        )
-        self.assertIsNone(
-            GitHubClient._remote_repository("https://example.com/example/project")
-        )
-
     def test_repository_for_checkout_reads_and_validates_github_origin(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             checkout = root / "project"
             (checkout / ".git").mkdir(parents=True)
             client = GitHubClient(allowed_root=root)
-            with mock.patch.object(
-                client,
-                "_git",
-                return_value=_completed("git@github.com:Example/Project.git\n"),
-            ) as git:
+            with (
+                mock.patch.object(client.local_git, "verify_checkout") as verify,
+                mock.patch.object(
+                    client.local_git,
+                    "git",
+                    return_value=_completed("git@github.com:Example/Project.git\n"),
+                ) as git,
+            ):
                 self.assertEqual(
                     client.repository_for_checkout(checkout),
-                    "Example/Project",
+                    "example/project",
                 )
 
+        verify.assert_called_once_with(checkout.resolve())
         git.assert_called_once_with(checkout.resolve(), "remote", "get-url", "origin")
 
     def test_repository_for_checkout_rejects_invalid_checkout_or_remote(self) -> None:
@@ -528,14 +617,14 @@ class GitHubClientTests(unittest.TestCase):
             checkout = root / "project"
             checkout.mkdir()
             client = GitHubClient(allowed_root=root)
-            with self.assertRaisesRegex(GitHubError, "not an allowed Git repository"):
+            with self.assertRaisesRegex(GitHubError, "not a Git repository"):
                 client.repository_for_checkout(checkout)
 
             (checkout / ".git").mkdir()
             with (
                 mock.patch.object(
-                    client,
-                    "_git",
+                    client.local_git,
+                    "git",
                     return_value=_completed("https://example.com/owner/project\n"),
                 ),
                 self.assertRaisesRegex(GitHubError, "not a GitHub repository"),
@@ -546,48 +635,24 @@ class GitHubClientTests(unittest.TestCase):
             with self.assertRaisesRegex(GitHubError, "outside"):
                 client.repository_for_checkout(outside)
 
-    def test_checkout_verification_and_upstream_configuration(self) -> None:
+    def test_local_git_ambiguous_failure_is_preserved(self) -> None:
         client = GitHubClient()
-        repository = _repository("source/project")
-        fork = _repository("me/project", parent="source/project")
-        with tempfile.TemporaryDirectory() as temporary:
-            checkout = Path(temporary)
-            with self.assertRaisesRegex(GitHubError, "not a Git repository"):
-                client._verify_checkout(checkout, repository)
-            (checkout / ".git").mkdir()
-
-            with mock.patch.object(
-                client,
-                "_git",
-                return_value=_completed("git@github.com:source/project.git\n"),
-            ):
-                client._verify_checkout(checkout, repository)
-            with (
-                mock.patch.object(
-                    client,
-                    "_git",
-                    return_value=_completed("https://github.com/other/project.git\n"),
-                ),
-                self.assertRaisesRegex(GitHubError, "origin is not"),
-            ):
-                client._verify_checkout(checkout, repository)
-
-            with mock.patch.object(client, "_run") as run:
-                client._ensure_upstream(checkout, repository, repository)
-            run.assert_not_called()
-
-            for returncode, action in ((1, "add"), (0, "set-url")):
-                with (
-                    self.subTest(action=action),
-                    mock.patch.object(
-                        client, "_run", return_value=_completed(returncode=returncode)
-                    ),
-                    mock.patch.object(client, "_git") as git,
-                ):
-                    client._ensure_upstream(checkout, repository, fork)
-                git.assert_called_once_with(
-                    checkout, "remote", action, "upstream", repository.url
-                )
+        with (
+            mock.patch.object(
+                client.local_git,
+                "materialize",
+                side_effect=LocalGitOperationAmbiguous("ambiguous clone"),
+            ),
+            self.assertRaisesRegex(
+                GitHubOperationAmbiguous,
+                "ambiguous clone",
+            ) as raised,
+        ):
+            client.ensure_repository_clone(_repository("source/project"))
+        self.assertIsInstance(
+            raised.exception.__cause__,
+            LocalGitOperationAmbiguous,
+        )
 
 
 if __name__ == "__main__":
