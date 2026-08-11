@@ -11,7 +11,6 @@ from pathlib import Path
 from typing import NoReturn
 from urllib.parse import SplitResult, urlsplit
 
-from ..config import GITHUB_ROOT, REPOSITORY_ROOT
 from ..context_fragment import ContextFragment
 from ..diagnostic_safety import redact_diagnostic
 from ..local_git import (
@@ -238,14 +237,16 @@ class GitHubClient:
         *,
         gh_executable: str = "gh",
         git_executable: str = "git",
-        clone_root: Path = GITHUB_ROOT,
-        allowed_root: Path = REPOSITORY_ROOT,
+        clone_root: Path | None = None,
+        allowed_root: Path | None = None,
+        timeout: float = 30,
         local_git: LocalGitRepository | None = None,
     ) -> None:
         self.gh_executable = gh_executable
         self.git_executable = git_executable
-        self.clone_root = clone_root.expanduser().resolve()
-        self.allowed_root = allowed_root.expanduser().resolve()
+        self.clone_root = (clone_root or Path.home() / "src").expanduser().resolve()
+        self.allowed_root = (allowed_root or Path.home()).expanduser().resolve()
+        self.timeout = timeout
         self.local_git = local_git or LocalGitRepository(
             git_executable=git_executable,
             clone_root=self.clone_root,
@@ -265,14 +266,14 @@ class GitHubClient:
         self,
         command: list[str],
         *,
-        timeout: float = 30,
+        timeout: float | None = None,
         check: bool = True,
         cwd: Path | None = None,
     ) -> subprocess.CompletedProcess[str]:
         try:
             process = run_command(
                 command,
-                timeout=timeout,
+                timeout=self.timeout if timeout is None else timeout,
                 cwd=cwd,
             )
         except OSError as exc:
@@ -984,8 +985,8 @@ class GitHubProvider:
 
     name = PROVIDER_NAME
 
-    def __init__(self, client: GitHubClient | None = None) -> None:
-        self._client = client or GitHubClient()
+    def __init__(self, client: GitHubClient) -> None:
+        self._client = client
 
     def matches(self, url: str) -> bool:
         return _github_url(url)

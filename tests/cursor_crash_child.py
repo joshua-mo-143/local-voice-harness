@@ -93,7 +93,7 @@ class PersistentHerdr(HerdrClient):
     def __init__(self, effects: PersistentEffects) -> None:
         self.effects = effects
 
-    def ensure_server(self, timeout: float = 15) -> None:
+    def ensure_server(self, timeout: float | None = None) -> None:
         return None
 
     def get_agent(self, target: str) -> dict[str, Any]:

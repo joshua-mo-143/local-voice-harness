@@ -346,10 +346,40 @@ _CONFIG_FIELDS: dict[str, ConfigField] = {
         attribute="github_root",
         services=(_WAKE_SERVICE,),
     ),
+    "platform.herdr_worktree_root": _field(
+        parse=_parse_path,
+        section="platform",
+        attribute="herdr_worktree_root",
+        services=(_WAKE_SERVICE,),
+    ),
+    "platform.gh_bin": _field(
+        parse=_parse_path,
+        section="platform",
+        attribute="gh_bin",
+        services=(_WAKE_SERVICE,),
+    ),
+    "platform.git_bin": _field(
+        parse=_parse_path,
+        section="platform",
+        attribute="git_bin",
+        services=(_WAKE_SERVICE,),
+    ),
     "platform.herdr_bin": _field(
         parse=_parse_path,
         section="platform",
         attribute="herdr_bin",
+        services=(_WAKE_SERVICE,),
+    ),
+    "platform.github_timeout_seconds": _field(
+        parse=_parse_float,
+        section="platform",
+        attribute="github_timeout_seconds",
+        services=(_WAKE_SERVICE,),
+    ),
+    "platform.herdr_timeout_seconds": _field(
+        parse=_parse_float,
+        section="platform",
+        attribute="herdr_timeout_seconds",
         services=(_WAKE_SERVICE,),
     ),
     "platform.focused_app_context": _field(

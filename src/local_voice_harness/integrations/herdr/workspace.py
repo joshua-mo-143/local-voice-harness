@@ -8,8 +8,6 @@ from pathlib import Path
 from typing import Any
 
 from .types import (
-    HERDR_WORKTREE_ROOT,
-    HOME_ROOT,
     SETTLED,
     AgentSelection,
     BeforePaneSubmit,
@@ -30,8 +28,20 @@ from .types import (
 class HerdrWorkspace:
     """Workspace, pane, worktree, and target reservation management."""
 
-    def __init__(self, operations: HerdrOperations) -> None:
+    def __init__(
+        self,
+        operations: HerdrOperations,
+        *,
+        repository_root: Path | None = None,
+        worktree_root: Path | None = None,
+    ) -> None:
         self._operations = operations
+        self.repository_root = (repository_root or Path.home()).expanduser().resolve()
+        self.worktree_root = (
+            (worktree_root or Path.home() / ".herdr" / "worktrees")
+            .expanduser()
+            .resolve()
+        )
 
     def list_workspaces(self) -> list[dict[str, Any]]:
         return list(self._operations.list_workspaces())
@@ -105,15 +115,14 @@ class HerdrWorkspace:
                 return workspace
         return None
 
-    @staticmethod
-    def planned_worktree_path(repository: Path, branch: str) -> Path:
+    def planned_worktree_path(self, repository: Path, branch: str) -> Path:
         repository = repository.resolve()
         repository_key = hashlib.sha256(str(repository).encode()).hexdigest()[:8]
         repository_directory = (
             f"{normalize_name(repository.name) or 'repository'}-{repository_key}"
         )
         branch_directory = normalize_name(branch) or "worktree"
-        return (HERDR_WORKTREE_ROOT / repository_directory / branch_directory).resolve()
+        return (self.worktree_root / repository_directory / branch_directory).resolve()
 
     def new_pane(
         self,
@@ -475,13 +484,13 @@ class HerdrWorkspace:
         )
         workspace_id = str(workspace.get("workspace_id") or "") if workspace else None
         pane, workspace_id = self._operations.new_pane(
-            HOME_ROOT,
+            self.repository_root,
             "voice-router",
             workspace_id or None,
             checkpoint=checkpoint,
         )
         return self._operations.start_agent(
-            HOME_ROOT,
+            self.repository_root,
             "router",
             pane,
             workspace_id,

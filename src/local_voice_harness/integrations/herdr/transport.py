@@ -5,14 +5,15 @@ import subprocess
 import time
 from typing import Any
 
-from .types import HERDR_BIN, HERDR_UNIT, HerdrError
+from .types import HERDR_UNIT, HerdrError
 
 
 class HerdrTransport:
     """Low-level Herdr CLI transport."""
 
-    def __init__(self, executable: str = HERDR_BIN) -> None:
+    def __init__(self, executable: str, *, timeout: float) -> None:
         self.executable = executable
+        self.timeout = timeout
 
     def command(self, *args: str) -> list[str]:
         return [self.executable, *args]
@@ -35,14 +36,14 @@ class HerdrTransport:
         return result
 
     def run(
-        self, *args: str, timeout: float = 30, check: bool = True
+        self, *args: str, timeout: float | None = None, check: bool = True
     ) -> subprocess.CompletedProcess[str]:
         try:
             process = subprocess.run(
                 self.command(*args),
                 capture_output=True,
                 text=True,
-                timeout=timeout,
+                timeout=self.timeout if timeout is None else timeout,
                 check=False,
             )
         except OSError as exc:
@@ -62,17 +63,18 @@ class HerdrTransport:
             raise HerdrError(text or f"Herdr exited with status {process.returncode}")
         return process
 
-    def run_json(self, *args: str, timeout: float = 30) -> dict[str, Any]:
+    def run_json(self, *args: str, timeout: float | None = None) -> dict[str, Any]:
         return self.decode(self.run(*args, timeout=timeout).stdout)
 
-    def run_text(self, *args: str, timeout: float = 30) -> str:
+    def run_text(self, *args: str, timeout: float | None = None) -> str:
         return self.run(*args, timeout=timeout).stdout
 
     def is_running(self) -> bool:
         process = self.run("status", "server", check=False)
         return process.returncode == 0 and "status: running" in process.stdout
 
-    def ensure_server(self, timeout: float = 15) -> None:
+    def ensure_server(self, timeout: float | None = None) -> None:
+        timeout = self.timeout if timeout is None else timeout
         if self.is_running():
             return
         subprocess.run(

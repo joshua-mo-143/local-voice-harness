@@ -3,7 +3,9 @@ from __future__ import annotations
 import argparse
 
 from ..config import JOBS_DIR, LEGACY_JOBS_DIR
-from .provisioning import run_claimed_worker
+from ..integrations.registry import build_integration_registry
+from ..user_config import load_user_config
+from .provisioning import ClientFactories, run_claimed_worker
 from .store import JobStore
 from .worker_lifecycle import run_worker
 
@@ -13,11 +15,17 @@ def main() -> None:
     parser.add_argument("job_id")
     parser.add_argument("--claim")
     args = parser.parse_args()
+    registry = build_integration_registry(load_user_config())
+    factories = ClientFactories(
+        herdr=registry.herdr_client,
+        github=registry.github_client,
+        integrations=registry,
+    )
     run_worker(
         JobStore(JOBS_DIR, LEGACY_JOBS_DIR),
         args.job_id,
         args.claim,
-        run_claimed_worker,
+        lambda context: run_claimed_worker(context, factories),
     )
 
 

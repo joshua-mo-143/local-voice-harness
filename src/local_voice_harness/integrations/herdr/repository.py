@@ -9,7 +9,6 @@ from ...local_git import (
 )
 from ..rofi import choose_repository, confirm_clone
 from .types import (
-    HOME_ROOT,
     Checkpoint,
     HerdrError,
     HerdrOperations,
@@ -21,16 +20,16 @@ from .types import (
 class HerdrRepository:
     """Local repository discovery, resolution, and cloning."""
 
-    def __init__(self, operations: HerdrOperations) -> None:
+    def __init__(self, operations: HerdrOperations, root: Path | None = None) -> None:
         self._operations = operations
+        self.root = (root or Path.home()).expanduser().resolve()
 
-    @staticmethod
-    def allowed_repository(path: Path) -> bool:
+    def allowed_repository(self, path: Path) -> bool:
         try:
-            path.relative_to(HOME_ROOT)
+            path.relative_to(self.root)
         except ValueError:
             return False
-        return path != HOME_ROOT and (path / ".git").exists()
+        return path != self.root and (path / ".git").exists()
 
     def repository_roots(self) -> list[Path]:
         roots: dict[str, Path] = {}
@@ -41,7 +40,7 @@ class HerdrRepository:
                 if self.allowed_repository(path):
                     roots[str(path)] = path
         try:
-            children = HOME_ROOT.iterdir()
+            children = self.root.iterdir()
         except OSError:
             children = []
         for child in children:
@@ -96,14 +95,14 @@ class HerdrRepository:
         name = repository_name_from_url(url)
         if name is None:
             raise HerdrError("Only Git HTTPS and SSH repository URLs are supported")
-        destination = (HOME_ROOT / name).resolve()
-        if destination.parent != HOME_ROOT:
+        destination = (self.root / name).resolve()
+        if destination.parent != self.root:
             raise HerdrError(
                 "Repository destination is outside the configured project root"
             )
         local_git = LocalGitRepository(
-            clone_root=HOME_ROOT,
-            allowed_root=HOME_ROOT,
+            clone_root=self.root,
+            allowed_root=self.root,
             lock_name=".voice-harness-repository.lock",
         )
         try:

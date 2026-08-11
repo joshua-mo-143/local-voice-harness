@@ -90,7 +90,7 @@ WORKFLOW_PLAN[token]: <bounded multiline implementation plan>
             self.assertIs(client.ensure_router(set()), selection)
 
         start_agent.assert_called_once_with(
-            herdr.HOME_ROOT,
+            client.workspace.repository_root,
             "router",
             "pane",
             "workspace",
@@ -153,7 +153,7 @@ WORKFLOW_PLAN[token]: <bounded multiline implementation plan>
     def test_confirmed_rofi_url_is_cloned_under_project_root(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            client = herdr.HerdrClient("herdr")
+            client = herdr.HerdrClient("herdr", repository_root=root)
 
             def clone(
                 command: list[str], **_kwargs: object
@@ -164,14 +164,6 @@ WORKFLOW_PLAN[token]: <bounded multiline implementation plan>
                 return subprocess.CompletedProcess(command, 0, "", "")
 
             with (
-                mock.patch(
-                    "local_voice_harness.integrations.herdr.repository.HOME_ROOT",
-                    root,
-                ),
-                mock.patch(
-                    "local_voice_harness.integrations.herdr.types.HOME_ROOT",
-                    root,
-                ),
                 mock.patch(
                     "local_voice_harness.integrations.herdr.repository.choose_repository",
                     return_value="https://github.com/example/project.git",
@@ -199,12 +191,8 @@ WORKFLOW_PLAN[token]: <bounded multiline implementation plan>
     def test_clone_timeout_reports_ambiguous_outcome(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            client = herdr.HerdrClient("herdr")
+            client = herdr.HerdrClient("herdr", repository_root=root)
             with (
-                mock.patch(
-                    "local_voice_harness.integrations.herdr.repository.HOME_ROOT",
-                    root,
-                ),
                 mock.patch(
                     "local_voice_harness.local_git.run_command",
                     side_effect=subprocess.TimeoutExpired(["git", "clone"], 300),
@@ -251,6 +239,17 @@ WORKFLOW_PLAN[token]: <bounded multiline implementation plan>
             client.ensure_server(timeout=1)
         commands = [call.args[0] for call in run.call_args_list]
         self.assertTrue(any(command[0] == "systemd-run" for command in commands))
+
+    def test_server_timeout_override_is_optional(self) -> None:
+        client = herdr.HerdrClient("herdr", timeout=9)
+        with mock.patch.object(client.transport, "ensure_server") as ensure_server:
+            client.ensure_server()
+            client.ensure_server(timeout=2)
+
+        self.assertEqual(
+            ensure_server.call_args_list,
+            [mock.call(timeout=None), mock.call(timeout=2)],
+        )
 
     def test_agent_name_stays_within_herdr_limit_for_long_label(self) -> None:
         client = herdr.HerdrClient("herdr")

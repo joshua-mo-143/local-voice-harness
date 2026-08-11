@@ -28,6 +28,8 @@ from ..integrations.herdr import (
     normalize_name,
 )
 from ..integrations.registry import (
+    IntegrationRegistry,
+    build_integration_registry,
     prompt_instructions,
     require_issue_capabilities,
     resolve_issue_reference,
@@ -45,6 +47,7 @@ from ..user_config import (
     PlanApprovalMode,
     PlanApprovalPreferences,
     UserConfigurationError,
+    default_user_config,
     load_plan_approval_preferences,
     record_explicit_plan_approval,
 )
@@ -86,8 +89,9 @@ WorkerCancelled = worker_lifecycle.WorkerCancelled
 
 @dataclass(frozen=True, slots=True)
 class ClientFactories:
-    herdr: Callable[[], HerdrClient] = HerdrClient
-    github: Callable[[], GitHubClient] = GitHubClient
+    herdr: Callable[[], HerdrClient]
+    github: Callable[[], GitHubClient]
+    integrations: IntegrationRegistry | None = None
 
 
 class ReservationConflict(Exception):
@@ -2371,7 +2375,9 @@ def _run_tiered_workflow(
     checkpoint: Callable[[], None],
     *,
     initial_output: tuple[str, str] | None = None,
+    integrations: IntegrationRegistry | None = None,
 ) -> None:
+    registry = integrations or build_integration_registry(default_user_config())
     pending_output = initial_output
     while True:
         checkpoint()
@@ -2415,8 +2421,8 @@ def _run_tiered_workflow(
                 return
             job = next_turn
             token = job.turn_token or ""
-        active_issue_key = resolve_issue_reference(job.issue_key)
-        integration_instructions = prompt_instructions(active_issue_key)
+        active_issue_key = resolve_issue_reference(job.issue_key, registry)
+        integration_instructions = prompt_instructions(active_issue_key, registry)
         if phase == WorkflowPhase.CLASSIFYING:
             prompt = classification_prompt(
                 job.request,
@@ -2615,7 +2621,14 @@ def run_claimed_worker(  # pyright: ignore[reportGeneralTypeIssues]
     context: worker_lifecycle.WorkerContext,
     factories: ClientFactories | None = None,
 ) -> None:
-    clients = factories or ClientFactories(HerdrClient, GitHubClient)
+    if factories is None:
+        registry = build_integration_registry(default_user_config())
+        clients = ClientFactories(HerdrClient, GitHubClient, registry)
+    else:
+        clients = factories
+        registry = clients.integrations or build_integration_registry(
+            default_user_config()
+        )
     store = context.store
     job_id = context.job.id
     job = context.job
@@ -2631,9 +2644,9 @@ def run_claimed_worker(  # pyright: ignore[reportGeneralTypeIssues]
             checkpoint()
             _resume_plan_approval_completion(store, job, worker_token)
             return
-        active_issue_key = resolve_issue_reference(job.issue_key)
+        active_issue_key = resolve_issue_reference(job.issue_key, registry)
         if active_issue_key:
-            require_issue_capabilities(active_issue_key)
+            require_issue_capabilities(active_issue_key, registry)
         client = clients.herdr()
         checkpoint()
         client.ensure_server()
@@ -2666,6 +2679,7 @@ def run_claimed_worker(  # pyright: ignore[reportGeneralTypeIssues]
                 worker_token,
                 client,
                 checkpoint,
+                integrations=registry,
             )
             return
 
@@ -3059,6 +3073,7 @@ def run_claimed_worker(  # pyright: ignore[reportGeneralTypeIssues]
                     token=f"{job_id}-route",
                     reserved=reserved_targets(store, job_id),
                     checkpoint=checkpoint,
+                    integrations=registry,
                 )
                 if routed is not None:
                     repository, _confidence, reason = routed
@@ -3281,6 +3296,7 @@ def run_claimed_worker(  # pyright: ignore[reportGeneralTypeIssues]
             worker_token,
             client,
             checkpoint,
+            integrations=registry,
         )
     except WorkerCancelled:
         return

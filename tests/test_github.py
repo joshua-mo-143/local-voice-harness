@@ -81,6 +81,16 @@ class GitHubClientTests(unittest.TestCase):
         ):
             self.assertIs(client._run(["gh", "status"], check=False), failed)
 
+    def test_configured_timeout_is_the_generic_command_default(self) -> None:
+        client = GitHubClient(timeout=42)
+        with mock.patch(
+            "local_voice_harness.integrations.github.run_command",
+            return_value=_completed(),
+        ) as run:
+            client._run(["gh", "status"])
+
+        self.assertEqual(run.call_args.kwargs["timeout"], 42)
+
     def test_repository_identity_validation_rejects_paths(self) -> None:
         self.assertEqual(
             GitHubClient.validate_repository("Example/project.git"),
@@ -359,7 +369,7 @@ class GitHubClientTests(unittest.TestCase):
         run.assert_not_called()
 
     def test_creates_missing_fork_without_cloning(self) -> None:
-        client = GitHubClient()
+        client = GitHubClient(timeout=7)
         source = _repository("source/project")
         fork = _repository("me/project", parent="source/project")
         events: list[str] = []

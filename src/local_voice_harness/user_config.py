@@ -82,7 +82,12 @@ _DICTATION_KEYS = (
 _PLATFORM_KEYS = (
     "project_root",
     "github_root",
+    "herdr_worktree_root",
+    "gh_bin",
+    "git_bin",
     "herdr_bin",
+    "github_timeout_seconds",
+    "herdr_timeout_seconds",
     "focused_app_context",
     "focused_app_deny_classes",
     "focused_app_max_chars",
@@ -206,7 +211,12 @@ class PlatformSettings:
 
     project_root: Path
     github_root: Path
+    herdr_worktree_root: Path
+    gh_bin: Path
+    git_bin: Path
     herdr_bin: Path
+    github_timeout_seconds: float = 30.0
+    herdr_timeout_seconds: float = 30.0
     focused_app_context_enabled: bool = True
     focused_app_deny_classes: tuple[str, ...] = config.DEFAULT_FOCUSED_APP_DENY_CLASSES
     focused_app_max_chars: int = 12_000
@@ -768,7 +778,7 @@ def _load_platform(
     home: Path,
 ) -> PlatformSettings:
     _reject_unknown(section, _PLATFORM_KEYS, label="[platform]")
-    return PlatformSettings(
+    settings = PlatformSettings(
         project_root=_as_path(
             _resolve(
                 environment, "VOICE_HARNESS_PROJECT_ROOT", section, "project_root", home
@@ -785,6 +795,36 @@ def _load_platform(
             ),
             label="platform.github_root",
         ),
+        herdr_worktree_root=_as_path(
+            _resolve(
+                environment,
+                "VOICE_HARNESS_HERDR_WORKTREE_ROOT",
+                section,
+                "herdr_worktree_root",
+                home / ".herdr" / "worktrees",
+            ),
+            label="platform.herdr_worktree_root",
+        ),
+        gh_bin=_as_path(
+            _resolve(
+                environment,
+                "VOICE_HARNESS_GH_BIN",
+                section,
+                "gh_bin",
+                Path("gh"),
+            ),
+            label="platform.gh_bin",
+        ),
+        git_bin=_as_path(
+            _resolve(
+                environment,
+                "VOICE_HARNESS_GIT_BIN",
+                section,
+                "git_bin",
+                Path("git"),
+            ),
+            label="platform.git_bin",
+        ),
         herdr_bin=_as_path(
             _resolve(
                 environment,
@@ -794,6 +834,26 @@ def _load_platform(
                 home / ".local" / "bin" / "herdr",
             ),
             label="platform.herdr_bin",
+        ),
+        github_timeout_seconds=_as_positive_float(
+            _resolve(
+                environment,
+                "VOICE_HARNESS_GITHUB_TIMEOUT_SECONDS",
+                section,
+                "github_timeout_seconds",
+                30,
+            ),
+            label="platform.github_timeout_seconds",
+        ),
+        herdr_timeout_seconds=_as_positive_float(
+            _resolve(
+                environment,
+                "VOICE_HARNESS_HERDR_TIMEOUT_SECONDS",
+                section,
+                "herdr_timeout_seconds",
+                30,
+            ),
+            label="platform.herdr_timeout_seconds",
         ),
         focused_app_context_enabled=_as_bool(
             _resolve(
@@ -886,6 +946,21 @@ def _load_platform(
             label="platform.agent_job_start_concurrency",
         ),
     )
+    for label, path in (
+        ("platform.project_root", settings.project_root),
+        ("platform.github_root", settings.github_root),
+        ("platform.herdr_worktree_root", settings.herdr_worktree_root),
+        ("platform.herdr_bin", settings.herdr_bin),
+    ):
+        if not path.is_absolute():
+            raise UserConfigurationError(f"{label} must be an absolute path")
+    try:
+        settings.github_root.resolve().relative_to(settings.project_root.resolve())
+    except ValueError as exc:
+        raise UserConfigurationError(
+            "platform.github_root must be inside platform.project_root"
+        ) from exc
+    return settings
 
 
 def _load_providers(
@@ -1082,7 +1157,12 @@ def render_user_config(user_config: UserConfig) -> str:
         {
             "project_root": str(platform.project_root),
             "github_root": str(platform.github_root),
+            "herdr_worktree_root": str(platform.herdr_worktree_root),
+            "gh_bin": str(platform.gh_bin),
+            "git_bin": str(platform.git_bin),
             "herdr_bin": str(platform.herdr_bin),
+            "github_timeout_seconds": platform.github_timeout_seconds,
+            "herdr_timeout_seconds": platform.herdr_timeout_seconds,
             "focused_app_context": platform.focused_app_context_enabled,
             "focused_app_deny_classes": list(platform.focused_app_deny_classes),
             "focused_app_max_chars": platform.focused_app_max_chars,

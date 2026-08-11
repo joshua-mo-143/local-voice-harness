@@ -9,7 +9,8 @@ from .context_providers import capture_context, capture_text_context
 from .desktop import DesktopError, get_desktop
 from .focused_app_context import focused_app_context
 from .integrations import github as _github
-from .user_config import IntegrationSettings, PlatformSettings
+from .integrations.registry import RegistryInput
+from .user_config import PlatformSettings
 
 GitHubIssue = _github.GitHubIssue
 GitHubPullRequest = _github.GitHubPullRequest
@@ -127,7 +128,7 @@ def request_context(
     text: str,
     *,
     platform: PlatformSettings,
-    integrations: IntegrationSettings,
+    integrations: RegistryInput,
 ) -> RequestContext:
     context: ContextFragment | None = None
     try:

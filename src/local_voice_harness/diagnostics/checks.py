@@ -26,7 +26,7 @@ from ..config import (
 )
 from ..credentials import CredentialError, get_venice_api_key
 from ..errors import HarnessError
-from ..integrations.herdr import HERDR_BIN, HerdrClient, HerdrError
+from ..integrations.herdr import HerdrClient, HerdrError
 from ..integrations.registry import capability_statuses
 from ..ipc import socket_ready
 from ..process import capability_diagnostics
@@ -922,7 +922,8 @@ def check_cursor_jobs() -> list[CheckResult]:
 
 
 def check_herdr() -> list[CheckResult]:
-    if _which(HERDR_BIN) is None and not Path(HERDR_BIN).exists():
+    herdr_bin = "herdr"
+    if _which(herdr_bin) is None and not Path(herdr_bin).exists():
         return []
     try:
         running = HerdrClient().is_running()

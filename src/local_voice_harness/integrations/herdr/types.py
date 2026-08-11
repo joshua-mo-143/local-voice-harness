@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import os
 import re
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -9,19 +8,7 @@ from pathlib import Path
 from typing import Any, Protocol
 from urllib.parse import urlsplit
 
-from ...config import REPOSITORY_ROOT
-
-HERDR_BIN = os.environ.get(
-    "VOICE_HARNESS_HERDR_BIN", str(Path.home() / ".local/bin/herdr")
-)
 HERDR_UNIT = "voice-harness-herdr.service"
-HERDR_WORKTREE_ROOT = Path(
-    os.environ.get(
-        "VOICE_HARNESS_HERDR_WORKTREE_ROOT",
-        str(Path.home() / ".herdr/worktrees"),
-    )
-).expanduser()
-HOME_ROOT = REPOSITORY_ROOT
 SETTLED = {"idle", "done"}
 OBSERVABLE_AGENT_STATES = SETTLED | {"blocked", "unknown"}
 AGENT_COMPLETION_POLL_SECONDS = 1.0
@@ -47,7 +34,7 @@ PlanParticipant = Callable[[str, str, str | None], None]
 
 
 class HerdrOperations(Protocol):
-    def run_json(self, *args: str, timeout: float = 30) -> dict[str, Any]: ...
+    def run_json(self, *args: str, timeout: float | None = None) -> dict[str, Any]: ...
 
     def list_agents(self) -> list[dict[str, Any]]: ...
 

@@ -22,6 +22,7 @@ from local_voice_harness.cursor.model import CursorJob, JobStatus
 from local_voice_harness.cursor.service import CursorTurnRequest
 from local_voice_harness.cursor.store import JobStore
 from local_voice_harness.errors import HarnessError
+from local_voice_harness.integrations.registry import build_integration_registry
 from local_voice_harness.intent import Intent, IntentRoute
 from local_voice_harness.questions import AnswerProvenance
 from local_voice_harness.responses import AssistantResponse
@@ -105,7 +106,7 @@ def _bare_daemon() -> WakeConversationDaemon:
     instance.audio = USER_CONFIG.audio
     instance.platform = USER_CONFIG.platform
     instance.providers = USER_CONFIG.providers
-    instance.integrations = USER_CONFIG.integrations
+    instance.integrations = build_integration_registry(USER_CONFIG)
     instance.history = []
     instance.cursor_session = None
     instance.completed_followup = None
@@ -593,6 +594,7 @@ class ProcessUtteranceTests(unittest.TestCase):
                 context_repository=None,
             ),
             delivery_claims=mock.ANY,
+            integrations=mock.ANY,
         )
         qwen_turn.assert_not_called()
 
@@ -650,6 +652,7 @@ class ProcessUtteranceTests(unittest.TestCase):
                 answer_provenance=AnswerProvenance.USER_VOICE,
             ),
             delivery_claims=mock.ANY,
+            integrations=mock.ANY,
         )
         qwen_turn.assert_not_called()
 
@@ -752,6 +755,7 @@ class ProcessUtteranceTests(unittest.TestCase):
                 issue_key="APP-43",
             ),
             delivery_claims=mock.ANY,
+            integrations=mock.ANY,
         )
         qwen_turn.assert_not_called()
 
@@ -965,6 +969,7 @@ class InboxIntentRoutingTests(unittest.TestCase):
         cursor_turn.assert_called_once_with(
             CursorTurnRequest("", None, action="list"),
             delivery_claims=mock.ANY,
+            integrations=mock.ANY,
         )
         qwen_turn.assert_not_called()
 
@@ -1008,6 +1013,7 @@ class InboxIntentRoutingTests(unittest.TestCase):
                 reference="dismiss the bug fix",
             ),
             delivery_claims=mock.ANY,
+            integrations=mock.ANY,
         )
         qwen_turn.assert_not_called()
 
@@ -2374,6 +2380,7 @@ class CompletedFollowupContextTests(unittest.TestCase):
             _request: CursorTurnRequest,
             *,
             delivery_claims: list[DeliveryClaim],
+            integrations: object,
         ) -> tuple[str, None]:
             delivery_claims.append(claim)
             return "done", None
