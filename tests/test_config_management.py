@@ -149,6 +149,23 @@ class ConfigManagementTests(unittest.TestCase):
             self.assertIn("github", names)
             self.assertNotIn("zendesk", names)
 
+    def test_config_paths_honor_xdg_config_home(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            paths = config_management.config_paths(
+                {"XDG_CONFIG_HOME": str(root / "cfg")},
+                home=self.HOME,
+            )
+
+        self.assertEqual(
+            paths.config,
+            root / "cfg" / "voice-harness" / "config.toml",
+        )
+        self.assertEqual(
+            paths.backend_env,
+            root / "cfg" / "dictation" / "backend.env",
+        )
+
     def test_setup_defaults_is_non_interactive(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

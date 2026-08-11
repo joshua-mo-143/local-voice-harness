@@ -9,6 +9,9 @@ usage() {
 Usage:
   scripts/dev.sh text <request>
   scripts/dev.sh wake
+  scripts/dev.sh setup [--defaults]
+  scripts/dev.sh config <show|set|reset> ...
+  scripts/dev.sh integrations <list|enable|disable|doctor> ...
 EOF
 }
 
@@ -28,6 +31,9 @@ case "$command" in
       exit 2
     fi
     ;;
+  setup|config|integrations)
+    shift
+    ;;
   *)
     usage
     exit 2
@@ -43,6 +49,10 @@ mkdir -p -- "$XDG_CONFIG_HOME" "$XDG_STATE_HOME"
 
 if [[ "$command" == "text" ]]; then
   exec uv run --project "$PROJECT_DIR" voice-harness text "$@"
+fi
+
+if [[ "$command" == "setup" || "$command" == "config" || "$command" == "integrations" ]]; then
+  exec uv run --project "$PROJECT_DIR" voice-harness "$command" "$@"
 fi
 
 if systemctl --user is-active --quiet voice-harness-wake.service; then

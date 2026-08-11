@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
 
-from .config import PROJECT_ROOT, SERVICE_FILES, backend_config_path
+from .config import PROJECT_ROOT, SERVICE_FILES, backend_config_path, xdg_config_home
 from .credentials import CredentialError, get_venice_api_key
 from .integrations.registry import capability_statuses
 from .user_config import (
@@ -359,17 +360,31 @@ _CONFIG_FIELDS: dict[str, ConfigField] = {
 }
 
 
+def _resolved_environment(
+    environment: Mapping[str, str] | None,
+) -> Mapping[str, str]:
+    return os.environ if environment is None else environment
+
+
+def _file_environment(
+    environment: Mapping[str, str] | None,
+) -> Mapping[str, str]:
+    return {} if environment is None else environment
+
+
 def config_paths(
     environment: Mapping[str, str] | None = None,
     *,
     home: Path | None = None,
 ) -> ConfigPaths:
     resolved_home = home or Path.home()
-    env = {} if environment is None else environment
+    env = _resolved_environment(environment)
     return ConfigPaths(
         config=user_config_path(env, home=resolved_home),
         backends=backend_config_path(env, home=resolved_home),
-        backend_env=resolved_home / ".config" / "dictation" / "backend.env",
+        backend_env=xdg_config_home(env, home=resolved_home)
+        / "dictation"
+        / "backend.env",
         home=resolved_home,
     )
 
@@ -378,7 +393,7 @@ def load_managed_config(
     paths: ConfigPaths,
     environment: Mapping[str, str] | None = None,
 ) -> UserConfig:
-    env = {} if environment is None else environment
+    env = _file_environment(environment)
     return load_user_config(
         env,
         path=paths.config,
@@ -394,7 +409,7 @@ def validate_managed_config(
 ) -> UserConfig:
     """Validate ``config`` by round-tripping through a temporary write."""
 
-    env = {} if environment is None else environment
+    env = _file_environment(environment)
     temporary = paths.config.with_suffix(".validate.tmp")
     write_user_config(config, temporary)
     try:
@@ -487,7 +502,7 @@ def commit_config_change(
     environment: Mapping[str, str] | None = None,
 ) -> ConfigChangeResult:
     resolved_paths = paths or config_paths(environment)
-    env = {} if environment is None else environment
+    env = _file_environment(environment)
     current = load_managed_config(resolved_paths, env)
     updated = apply_config_values(current, assignments)
     validated = validate_managed_config(updated, resolved_paths, env)
@@ -510,7 +525,7 @@ def show_config(
     environment: Mapping[str, str] | None = None,
 ) -> str:
     resolved_paths = paths or config_paths(environment)
-    config = load_managed_config(resolved_paths, environment or {})
+    config = load_managed_config(resolved_paths, _file_environment(environment))
     if key is not None:
         normalized = key.strip().casefold()
         field = _CONFIG_FIELDS.get(normalized)
@@ -538,7 +553,7 @@ def reset_config(
     environment: Mapping[str, str] | None = None,
 ) -> ConfigChangeResult:
     resolved_paths = paths or config_paths(environment)
-    env = {} if environment is None else environment
+    env = _file_environment(environment)
     defaults = default_user_config(home=resolved_paths.home)
     current = load_managed_config(resolved_paths, env)
     if section is None:
@@ -750,7 +765,10 @@ def list_integrations(
     paths: ConfigPaths | None = None,
     environment: Mapping[str, str] | None = None,
 ) -> str:
-    config = load_managed_config(paths or config_paths(environment), environment or {})
+    config = load_managed_config(
+        paths or config_paths(environment),
+        _file_environment(environment),
+    )
     rows = [
         {
             "name": name,
@@ -891,7 +909,10 @@ def run_integration_doctor(
     paths: ConfigPaths | None = None,
     environment: Mapping[str, str] | None = None,
 ) -> tuple[int, str]:
-    config = load_managed_config(paths or config_paths(environment), environment or {})
+    config = load_managed_config(
+        paths or config_paths(environment),
+        _file_environment(environment),
+    )
     diagnostics = integration_diagnostics(config.integrations)
     output = format_integration_diagnostics(diagnostics, json_output=json_output)
     return (0 if all(item.ok for item in diagnostics) else 1, output)
