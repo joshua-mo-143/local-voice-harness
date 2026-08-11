@@ -106,6 +106,16 @@ def _write_json(handler: socketserver.StreamRequestHandler, value: object) -> No
     handler.wfile.flush()
 
 
+def _write_response(
+    handler: socketserver.StreamRequestHandler,
+    value: object,
+) -> None:
+    try:
+        _write_json(handler, value)
+    except (BrokenPipeError, ConnectionResetError):
+        pass
+
+
 def _request_text(request: dict[str, object]) -> str:
     text = str(request.get("text", "")).strip()
     if not text:
@@ -439,7 +449,7 @@ class RequestHandler(socketserver.StreamRequestHandler):
         try:
             line = self.rfile.readline(64 * 1024)
             if not line:
-                _write_json(self, {"ok": True, "ready": True})
+                _write_response(self, {"ok": True, "ready": True})
                 return
             request = json.loads(line)
             if request.get("op") == "cancel":
@@ -453,7 +463,7 @@ class RequestHandler(socketserver.StreamRequestHandler):
                     "cancelled": _cancel_stream(request_id),
                     "request_id": request_id,
                 }
-                _write_json(self, response)
+                _write_response(self, response)
                 return
             if request.get("stream"):
                 _stream_response(self, request)
@@ -481,10 +491,7 @@ class RequestHandler(socketserver.StreamRequestHandler):
             diagnostic = redact_diagnostic(f"{type(exc).__name__}: {exc}")
             log(f"request failed: {diagnostic}")
             response = {"ok": False, "error": diagnostic}
-        try:
-            _write_json(self, response)
-        except (BrokenPipeError, ConnectionResetError):
-            pass
+        _write_response(self, response)
 
 
 class Server(socketserver.ThreadingUnixStreamServer):
