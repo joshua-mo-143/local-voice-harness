@@ -35,6 +35,7 @@ from .intent import (
 )
 from .ipc import socket_ready
 from .llm import qwen_response
+from .responses import as_assistant_response
 from .ticket_targets import MISSING_ISSUE_SCOPE_RESPONSE, extract_ticket_targets
 from .tts.client import stream_and_play
 from .vocabulary import resolve_aliases
@@ -146,8 +147,9 @@ def respond(text: str) -> None:
                     delivery_claims=delivery_claims,
                     allow_tools=False,
                 )
-            print(f"Assistant: {response}")
-            stream_and_play(response)
+            rendered_response = as_assistant_response(response)
+            print(f"Assistant: {rendered_response.display_text}")
+            stream_and_play(rendered_response.spoken_text)
             acknowledge_deliveries(delivery_claims)
         except Exception:
             release_deliveries(delivery_claims)

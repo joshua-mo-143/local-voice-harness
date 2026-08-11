@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import contextlib
+import io
 import unittest
 from unittest import mock
 
@@ -7,6 +9,7 @@ from local_voice_harness import app
 from local_voice_harness.browser_context import RequestContext
 from local_voice_harness.cursor.service import CursorTurnRequest
 from local_voice_harness.intent import Intent, IntentRoute
+from local_voice_harness.responses import AssistantResponse
 
 
 class ForegroundDeliveryTests(unittest.TestCase):
@@ -82,6 +85,33 @@ class ForegroundDeliveryTests(unittest.TestCase):
 
 
 class AppContextTests(unittest.TestCase):
+    def test_response_channels_are_selected_at_foreground_boundary(self) -> None:
+        output = io.StringIO()
+        response = AssistantResponse(
+            spoken_text="The job started.",
+            display_text="Started job 123456789abc in /tmp/example.",
+        )
+        with (
+            mock.patch.object(app, "start_components"),
+            mock.patch.object(
+                app, "request_context", return_value=RequestContext("start it")
+            ),
+            mock.patch.object(
+                app,
+                "route_intent",
+                return_value=IntentRoute(Intent.CONVERSATION, "high"),
+            ),
+            mock.patch.object(app, "qwen_response", return_value=response) as qwen,
+            mock.patch.object(app, "stream_and_play") as play,
+            contextlib.redirect_stdout(output),
+        ):
+            app.respond("start it")
+
+        self.assertIn(f"Assistant: {response.display_text}", output.getvalue())
+        self.assertNotIn(response.spoken_text, output.getvalue())
+        play.assert_called_once_with(response.spoken_text)
+        qwen.assert_called_once()
+
     def test_manual_cursor_request_includes_focused_context(self) -> None:
         with (
             mock.patch.object(app, "start_components"),

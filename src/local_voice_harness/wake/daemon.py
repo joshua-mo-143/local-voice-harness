@@ -80,6 +80,7 @@ from ..llm import qwen_turn
 from ..notifications import notify
 from ..process import ProcessHandle, process_identity
 from ..questions import AnswerProvenance, question_control, question_prompt
+from ..responses import ResponseLike, as_assistant_response
 from ..stt.client import transcribe
 from ..ticket_targets import MISSING_ISSUE_SCOPE_RESPONSE, extract_ticket_targets
 from ..tts.queue import PlaybackQueue, PlaybackRequest
@@ -482,8 +483,9 @@ class WakeConversationDaemon:
 
     def end_conversation(self) -> BargeIn | None:
         """Speak a brief farewell, then close unless the user barges in."""
-        print(f"Assistant: {END_CONVERSATION_RESPONSE}", flush=True)
-        _playback, interruption = self.play_response(END_CONVERSATION_RESPONSE)
+        response = as_assistant_response(END_CONVERSATION_RESPONSE)
+        print(f"Assistant: {response.display_text}", flush=True)
+        _playback, interruption = self.play_response(response)
         if interruption is not None:
             return interruption
         self.close_conversation("assistant ended the conversation")
@@ -574,8 +576,11 @@ class WakeConversationDaemon:
             self.wait_for_playback_quiet()
         return batch, interruption
 
-    def play_response(self, response: str) -> tuple[dict[str, object], BargeIn | None]:
-        self.playback_queue.enqueue(PlaybackRequest(text=response))
+    def play_response(
+        self, response: ResponseLike
+    ) -> tuple[dict[str, object], BargeIn | None]:
+        spoken_text = as_assistant_response(response).spoken_text
+        self.playback_queue.enqueue(PlaybackRequest(text=spoken_text))
         finished: set[int] = set()
 
         def finish_job(
@@ -588,7 +593,7 @@ class WakeConversationDaemon:
             finished.add(id(request))
 
         batch, interruption = self._drain_playback_queue(
-            response,
+            spoken_text,
             on_played=finish_job,
         )
         for playback, interrupted, request in batch:
@@ -1166,15 +1171,16 @@ class WakeConversationDaemon:
                         allow_tools=False,
                     )
                 remember_response = True
-            print(f"Assistant: {response}", flush=True)
+            rendered_response = as_assistant_response(response)
+            print(f"Assistant: {rendered_response.display_text}", flush=True)
             cursor_session_before_playback = self.cursor_session
             if not streamed_playback:
-                playback, interruption = self.play_response(response)
+                playback, interruption = self.play_response(rendered_response)
             if remember_response:
                 played_text = (
                     str(playback.get("played_text") or "").strip()
                     if playback.get("interrupted")
-                    else response
+                    else rendered_response.spoken_text
                 )
                 next_history.append({"role": "user", "content": text})
                 if played_text:
