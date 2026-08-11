@@ -518,6 +518,34 @@ def stage_terminal_intent(
     return job._updated(**changes)
 
 
+def _infrastructure_uncertain_for_release(job: CursorJob) -> bool:
+    if job.terminal_intent_status == JobStatus.CANCELLED:
+        # User cancellation already chose teardown, but provisional dispatch and
+        # materializing checkout/fork work still need reconciliation. Prompt,
+        # agent, and pane ambiguity must not keep ticket fences up once those
+        # stronger fences are clear.
+        return bool(
+            job.agent_dispatch_state
+            in {"dispatching", "ambiguous", "failed_observing", "manual_required"}
+            or job.fork_operation_state
+            in {"submitted", "ambiguous", "failed_observing"}
+            or job.worktree_provision_state
+            in {"dispatching", "ambiguous", "failed_observing"}
+            or job.participant_creation_state
+            in {"submitting", "ambiguous", "manual_required"}
+        )
+    return bool(
+        job.agent_dispatch_state
+        in {"dispatching", "ambiguous", "failed_observing", "manual_required"}
+        or job.prompt_operation_state in {"submitting", "ambiguous"}
+        or job.fork_operation_state in {"submitted", "ambiguous", "failed_observing"}
+        or job.worktree_provision_state
+        in {"dispatching", "ambiguous", "failed_observing"}
+        or job.participant_creation_state
+        in {"submitting", "ambiguous", "manual_required"}
+    )
+
+
 def cancel_target_and_release(
     store: JobStore,
     job_id: str,
@@ -570,18 +598,11 @@ def cancel_target_and_release(
             or job.target_release_token != release_token
         ):
             return None
-        infrastructure_uncertain = (
-            job.agent_dispatch_state
-            in {"dispatching", "ambiguous", "failed_observing", "manual_required"}
-            or job.prompt_operation_state in {"submitting", "ambiguous"}
-            or job.fork_operation_state
-            in {"submitted", "ambiguous", "failed_observing"}
-            or job.worktree_provision_state
-            in {"dispatching", "ambiguous", "failed_observing"}
-            or job.participant_creation_state
-            in {"submitting", "ambiguous", "manual_required"}
-        )
-        if interrupted and worker_stopped and not infrastructure_uncertain:
+        if (
+            interrupted
+            and worker_stopped
+            and not _infrastructure_uncertain_for_release(job)
+        ):
             if job.terminal_intent_status is not None:
                 terminal = job.terminal_intent_status
                 completed_at = job.terminal_intent_completed_at or time.time()
@@ -1030,11 +1051,7 @@ def recover_jobs(
                     get_process_identity=get_process_identity,
                 )
                 and not is_worker_alive(job)
-                and not job.has_uncertain_operation()
-                and not (
-                    job.agent_dispatch_state == "manual_required"
-                    and bool(job.herdr_target)
-                )
+                and not _infrastructure_uncertain_for_release(job)
             )
             release_token = job.target_release_token
             owner_pid = job.target_release_owner_pid
