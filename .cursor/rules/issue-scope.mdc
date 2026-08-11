@@ -1,0 +1,18 @@
+---
+description: Keep issues reviewable and split large efforts into dependent GitHub issues
+alwaysApply: true
+---
+
+# Issue Scope
+
+- Implement only the issue's stated outcome and acceptance criteria. Do not absorb adjacent cleanup, refactors, or features unless they are required for correctness.
+- If newly discovered work is independently valuable, capture it as a separate follow-up issue instead of expanding the current issue.
+- Keep each issue small enough to produce one focused, reviewable pull request with a clear verification plan.
+- When an issue contains multiple independently deliverable outcomes, treat it as an epic rather than a single implementation issue:
+  1. Create or convert a tracking issue in this repository to the `Epic` issue type when available.
+  2. Add the epic to the repository's GitHub Project when one is configured.
+  3. Split the work into narrowly scoped child issues with explicit acceptance criteria.
+  4. Represent sequencing with GitHub issue dependency links (`blocked by` / `blocking`), not prose alone.
+  5. Link every child issue to the epic and keep the epic focused on coordination and status.
+- Do not start all child work through the epic itself. Implement and close each child through its own issue and pull request.
+- If issue types, Projects, or dependency links are unavailable, use a tracking issue with a task list and explicit cross-links, and report the limitation.
