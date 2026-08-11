@@ -44,6 +44,7 @@ class ConfigChangeResult:
     config: UserConfig
     changed_keys: tuple[str, ...]
     restart_services: tuple[str, ...]
+    legacy_backup: Path | None = None
 
 
 Parser = Callable[[str], object]
@@ -569,19 +570,42 @@ def commit_config_change(
     *,
     paths: ConfigPaths | None = None,
     environment: Mapping[str, str] | None = None,
+    migrate_legacy_backends: bool = False,
 ) -> ConfigChangeResult:
     resolved_paths = paths or config_paths(environment)
     env = _file_environment(environment)
     current = load_managed_config(resolved_paths, env)
     updated = apply_config_values(current, assignments)
-    validated = validate_managed_config(updated, resolved_paths, env)
-    write_user_config(validated, resolved_paths.config)
+    legacy_backup = (
+        _legacy_backup_path(resolved_paths.backends)
+        if migrate_legacy_backends and resolved_paths.backends.is_file()
+        else None
+    )
+    if legacy_backup is not None:
+        resolved_paths.backends.replace(legacy_backup)
+    try:
+        validated = validate_managed_config(updated, resolved_paths, env)
+        write_user_config(validated, resolved_paths.config)
+    except BaseException:
+        if legacy_backup is not None:
+            legacy_backup.replace(resolved_paths.backends)
+        raise
     restart = active_services(restart_services_for_keys(validated, tuple(assignments)))
     return ConfigChangeResult(
         config=validated,
         changed_keys=tuple(assignments),
         restart_services=restart,
+        legacy_backup=legacy_backup,
     )
+
+
+def _legacy_backup_path(path: Path) -> Path:
+    candidate = path.with_name(f"{path.name}.migrated")
+    index = 1
+    while candidate.exists():
+        candidate = path.with_name(f"{path.name}.migrated.{index}")
+        index += 1
+    return candidate
 
 
 def show_config(
@@ -732,17 +756,31 @@ def _available_dictation_backends() -> tuple[str, ...]:
 def run_setup(
     *,
     defaults_only: bool = False,
+    profile: str | None = None,
     paths: ConfigPaths | None = None,
     environment: Mapping[str, str] | None = None,
     input_fn: Callable[[str], str] = input,
     print_fn: Callable[[str], None] = print,
 ) -> ConfigChangeResult:
+    if defaults_only and profile is not None:
+        raise UserConfigurationError("--defaults and --profile cannot be combined")
+    if profile not in (None, "showcase"):
+        raise UserConfigurationError(f"unknown setup profile: {profile}")
+
     resolved_paths = paths or config_paths(environment)
     llm_options = _available_llm_providers()
     tts_options = _available_tts_providers()
     dictation_options = _available_dictation_backends()
 
-    if defaults_only:
+    if profile == "showcase":
+        llm_provider = "venice"
+        tts_provider = "venice"
+        dictation_backend = "parakeet"
+        github_enabled = True
+        zendesk_enabled = False
+        linear_enabled = False
+        wake_threshold = "0.55"
+    elif defaults_only:
         llm_provider = "local"
         tts_provider = "local"
         dictation_backend = dictation_options[0]
@@ -812,9 +850,17 @@ def run_setup(
         "audio.wake_threshold": wake_threshold,
     }
     result = commit_config_change(
-        assignments, paths=resolved_paths, environment=environment
+        assignments,
+        paths=resolved_paths,
+        environment=environment,
+        migrate_legacy_backends=profile == "showcase",
     )
     print_fn("Wrote unified configuration.")
+    if result.legacy_backup is not None:
+        print_fn(
+            "Migrated legacy provider settings to the unified configuration; "
+            f"backup: {result.legacy_backup}"
+        )
     print_fn(format_restart_notice(result.restart_services))
     if llm_provider == "venice" or tts_provider == "venice":
         print_fn(

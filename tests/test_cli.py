@@ -394,7 +394,14 @@ class ConfigCliTests(unittest.TestCase):
         ):
             cli.dispatch(args)
 
-        run_setup.assert_called_once_with(defaults_only=True)
+        run_setup.assert_called_once_with(defaults_only=True, profile=None)
+
+    def test_setup_showcase_profile_dispatches_non_interactively(self) -> None:
+        args = cli.parser().parse_args(["setup", "--profile", "showcase"])
+        with mock.patch.object(cli, "run_setup") as run_setup:
+            cli.dispatch(args)
+
+        run_setup.assert_called_once_with(defaults_only=False, profile="showcase")
 
 
 class CredentialsCliTests(unittest.TestCase):

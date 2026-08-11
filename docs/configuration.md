@@ -164,6 +164,7 @@ files are removed.
 ```console
 voice-harness setup
 voice-harness setup --defaults
+voice-harness setup --profile showcase
 voice-harness config show
 voice-harness config show audio.wake_threshold
 voice-harness config set providers.llm.provider venice
@@ -177,10 +178,15 @@ voice-harness integrations doctor
 
 `setup` walks through provider, integration, audio, and compute choices that are
 supported on the current machine. Use `--defaults` for a non-interactive first
-write. `config set` accepts dotted keys such as `audio.wake_threshold`,
-`compute.dictation_backend`, and `platform.cursor_followup`. After a change, the
-CLI reports which installed services are currently running and need a restart,
-for example `voice-harness-wake.service` or `dictation.service`.
+write with local providers. Use `--profile showcase` for a non-interactive
+Venice LLM/TTS configuration with local Parakeet dictation. The showcase profile
+migrates an existing `backends.toml` into the unified configuration and retains
+the original as `backends.toml.migrated` so legacy provider values cannot
+override the selected profile. `config set` accepts dotted keys such as
+`audio.wake_threshold`, `compute.dictation_backend`, and
+`platform.cursor_followup`. After a change, the CLI reports which installed
+services are currently running and need a restart, for example
+`voice-harness-wake.service` or `dictation.service`.
 
 `integrations doctor` inspects only enabled integrations. Linear uses the MCP
 capability check; GitHub reports `gh` authentication when GitHub is enabled;

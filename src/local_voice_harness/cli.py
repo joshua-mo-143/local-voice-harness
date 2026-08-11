@@ -108,10 +108,16 @@ def parser() -> argparse.ArgumentParser:
         "setup",
         help="interactive first-run configuration for providers, integrations, and audio",
     )
-    setup.add_argument(
+    setup_mode = setup.add_mutually_exclusive_group()
+    setup_mode.add_argument(
         "--defaults",
         action="store_true",
         help="write recommended defaults without prompting",
+    )
+    setup_mode.add_argument(
+        "--profile",
+        choices=("showcase",),
+        help="write a non-interactive provider profile",
     )
 
     config = commands.add_parser(
@@ -678,7 +684,7 @@ def dispatch(args: argparse.Namespace) -> None:
     elif args.command == "status":
         status()
     elif args.command == "setup":
-        run_setup(defaults_only=args.defaults)
+        run_setup(defaults_only=args.defaults, profile=args.profile)
     elif args.command == "config":
         if args.config_command == "show":
             print(show_config(key=args.key, json_output=args.json_output))
