@@ -38,6 +38,7 @@ from .llm import qwen_response
 from .responses import as_assistant_response
 from .ticket_targets import MISSING_ISSUE_SCOPE_RESPONSE, extract_ticket_targets
 from .tts.client import stream_and_play
+from .user_config import UserConfig, load_user_config
 from .vocabulary import resolve_aliases
 
 CURSOR_STORE = JobStore(JOBS_DIR, LEGACY_JOBS_DIR)
@@ -59,7 +60,9 @@ def release_deliveries(claims: DeliveryClaims) -> None:
     release_claims(CURSOR_STORE, claims)
 
 
-def respond(text: str) -> None:
+def respond(text: str, *, user_config: UserConfig | None = None) -> None:
+    """Handle one foreground request from one immutable startup snapshot."""
+    settings = user_config if user_config is not None else load_user_config()
     text = text.strip()
     if not text:
         raise HarnessError("request text is empty")
@@ -69,7 +72,11 @@ def respond(text: str) -> None:
         try:
             start_components()
             print(f"You: {text}")
-            context = request_context(text)
+            context = request_context(
+                text,
+                platform=settings.platform,
+                integrations=settings.integrations,
+            )
             if CURSOR_PATTERN.search(text):
                 route = IntentRoute(Intent.AGENT_SUBMIT, "high")
             else:

@@ -13,12 +13,12 @@ Supported context sources and their size limits:
 * ``git_diff`` -- the uncommitted ``git diff`` for the repository that contains
   the focused window's working directory. Bounded by :data:`MAX_GIT_DIFF_CHARS`.
 
-The capture is fenced by policy (:data:`~local_voice_harness.config.FOCUSED_APP_DENY_CLASSES`),
-fails closed (omits context) whenever focus changes mid-capture, the compositor
-is unsupported, a source exceeds its size limit, or anything raises. Captured
-content is always labelled as untrusted external input and is never treated as
-instructions. There is intentionally no screenshot, OCR, or continuous
-monitoring here -- only explicit, bounded pulls.
+The capture is fenced by the injected platform policy, fails closed (omits
+context) whenever focus changes mid-capture, the compositor is unsupported, a
+source exceeds its size limit, or anything raises. Captured content is always
+labelled as untrusted external input and is never treated as instructions.
+There is intentionally no screenshot, OCR, or continuous monitoring here --
+only explicit, bounded pulls.
 """
 
 from __future__ import annotations
@@ -31,12 +31,8 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from .config import (
-    FOCUSED_APP_CONTEXT_ENABLED,
-    FOCUSED_APP_DENY_CLASSES,
-    MAX_FOCUSED_APP_CONTEXT_CHARS,
-)
 from .desktop import Desktop, DesktopError, Window, get_desktop
+from .user_config import PlatformSettings
 
 MAX_SELECTION_CHARS = 4_000
 MAX_GIT_DIFF_CHARS = 8_000
@@ -124,9 +120,11 @@ def _source_kind(window_class: str) -> str | None:
     return None
 
 
-def _is_denied(window_class: str) -> bool:
+def _is_denied(window_class: str, settings: PlatformSettings) -> bool:
     lowered = window_class.casefold()
-    return any(denied and denied in lowered for denied in FOCUSED_APP_DENY_CLASSES)
+    return any(
+        denied and denied in lowered for denied in settings.focused_app_deny_classes
+    )
 
 
 def _within_limit(value: str | None, limit: int) -> str | None:
@@ -251,8 +249,10 @@ def _combine(blocks: list[tuple[str, str]], cap: int) -> tuple[str, tuple[str, .
     return "\n\n".join(kept_blocks), tuple(kept_tags)
 
 
-def _collect(utterance: str) -> FocusedAppContext | None:
-    if not FOCUSED_APP_CONTEXT_ENABLED or not wants_focused_app_context(utterance):
+def _collect(utterance: str, settings: PlatformSettings) -> FocusedAppContext | None:
+    if not settings.focused_app_context_enabled or not wants_focused_app_context(
+        utterance
+    ):
         return None
     desktop = get_desktop()
     if desktop is None:
@@ -261,7 +261,7 @@ def _collect(utterance: str) -> FocusedAppContext | None:
     if window is None:
         return None
     window_class = window.window_class
-    if _is_denied(window_class):
+    if _is_denied(window_class, settings):
         return None
     source_kind = _source_kind(window_class)
     if source_kind is None:
@@ -281,15 +281,17 @@ def _collect(utterance: str) -> FocusedAppContext | None:
             blocks.append(("git_diff", _git_diff_block(root, diff)))
     if not blocks:
         return None
-    text, sources = _combine(blocks, MAX_FOCUSED_APP_CONTEXT_CHARS)
+    text, sources = _combine(blocks, settings.focused_app_max_chars)
     if not text or not sources:
         return None
     return FocusedAppContext(text=text, app_class=window_class, sources=sources)
 
 
-def focused_app_context(utterance: str) -> FocusedAppContext | None:
+def focused_app_context(
+    utterance: str, settings: PlatformSettings
+) -> FocusedAppContext | None:
     """Capture bounded focused-app context, never raising to the caller."""
     try:
-        return _collect(utterance)
+        return _collect(utterance, settings)
     except Exception:
         return None

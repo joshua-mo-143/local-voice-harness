@@ -2,10 +2,14 @@ from __future__ import annotations
 
 import subprocess
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
 from local_voice_harness import desktop, focused_app_context
+from local_voice_harness.user_config import default_user_config
+
+PLATFORM = default_user_config().platform
 
 
 def completed(
@@ -55,13 +59,13 @@ class SourceClassificationTests(unittest.TestCase):
         self.assertIsNone(focused_app_context._source_kind(""))
 
     def test_deny_list_matches_substrings(self) -> None:
-        with mock.patch.object(
-            focused_app_context,
-            "FOCUSED_APP_DENY_CLASSES",
-            ("keepassxc", "1password"),
-        ):
-            self.assertTrue(focused_app_context._is_denied("org.keepassxc.keepassxc"))
-            self.assertFalse(focused_app_context._is_denied("cursor"))
+        settings = replace(
+            PLATFORM, focused_app_deny_classes=("keepassxc", "1password")
+        )
+        self.assertTrue(
+            focused_app_context._is_denied("org.keepassxc.keepassxc", settings)
+        )
+        self.assertFalse(focused_app_context._is_denied("cursor", settings))
 
 
 class SelectionCaptureTests(unittest.TestCase):
@@ -283,7 +287,7 @@ class CollectTests(unittest.TestCase):
                 focused_app_context, "_git_diff", return_value="diff --git a b"
             ),
         ):
-            context = focused_app_context.focused_app_context("fix this code")
+            context = focused_app_context.focused_app_context("fix this code", PLATFORM)
 
         self.assertIsNotNone(context)
         assert context is not None
@@ -300,7 +304,7 @@ class CollectTests(unittest.TestCase):
             focused_app_context, "get_desktop", return_value=backend
         ):
             self.assertIsNone(
-                focused_app_context.focused_app_context("work on this task")
+                focused_app_context.focused_app_context("work on this task", PLATFORM)
             )
         backend.active_window.assert_not_called()
 
@@ -309,15 +313,13 @@ class CollectTests(unittest.TestCase):
         backend = self._backend(window)
         with (
             mock.patch.object(focused_app_context, "get_desktop", return_value=backend),
-            mock.patch.object(
-                focused_app_context,
-                "FOCUSED_APP_DENY_CLASSES",
-                ("keepassxc",),
-            ),
             mock.patch.object(focused_app_context, "_capture_selection") as capture,
         ):
             self.assertIsNone(
-                focused_app_context.focused_app_context("explain this error")
+                focused_app_context.focused_app_context(
+                    "explain this error",
+                    replace(PLATFORM, focused_app_deny_classes=("keepassxc",)),
+                )
             )
         capture.assert_not_called()
 
@@ -329,26 +331,24 @@ class CollectTests(unittest.TestCase):
             mock.patch.object(focused_app_context, "_capture_selection") as capture,
         ):
             self.assertIsNone(
-                focused_app_context.focused_app_context("explain this error")
+                focused_app_context.focused_app_context("explain this error", PLATFORM)
             )
         capture.assert_not_called()
 
     def test_disabled_by_configuration(self) -> None:
-        with (
-            mock.patch.object(
-                focused_app_context, "FOCUSED_APP_CONTEXT_ENABLED", False
-            ),
-            mock.patch.object(focused_app_context, "get_desktop") as get_desktop,
-        ):
+        with mock.patch.object(focused_app_context, "get_desktop") as get_desktop:
             self.assertIsNone(
-                focused_app_context.focused_app_context("explain this error")
+                focused_app_context.focused_app_context(
+                    "explain this error",
+                    replace(PLATFORM, focused_app_context_enabled=False),
+                )
             )
         get_desktop.assert_not_called()
 
     def test_unsupported_compositor_omits_context(self) -> None:
         with mock.patch.object(focused_app_context, "get_desktop", return_value=None):
             self.assertIsNone(
-                focused_app_context.focused_app_context("explain this error")
+                focused_app_context.focused_app_context("explain this error", PLATFORM)
             )
 
     def test_no_capturable_sources_returns_none(self) -> None:
@@ -364,7 +364,7 @@ class CollectTests(unittest.TestCase):
             ),
         ):
             self.assertIsNone(
-                focused_app_context.focused_app_context("explain this error")
+                focused_app_context.focused_app_context("explain this error", PLATFORM)
             )
 
     def test_capture_failure_never_raises(self) -> None:
@@ -374,7 +374,7 @@ class CollectTests(unittest.TestCase):
             side_effect=RuntimeError("desktop unavailable"),
         ):
             self.assertIsNone(
-                focused_app_context.focused_app_context("explain this error")
+                focused_app_context.focused_app_context("explain this error", PLATFORM)
             )
 
     def test_oversize_git_diff_is_omitted(self) -> None:
@@ -393,7 +393,9 @@ class CollectTests(unittest.TestCase):
             ),
             mock.patch.object(focused_app_context, "_git_diff", return_value=oversize),
         ):
-            self.assertIsNone(focused_app_context.focused_app_context("fix this code"))
+            self.assertIsNone(
+                focused_app_context.focused_app_context("fix this code", PLATFORM)
+            )
 
 
 if __name__ == "__main__":

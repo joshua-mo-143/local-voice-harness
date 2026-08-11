@@ -29,7 +29,9 @@ class ForegroundDeliveryTests(unittest.TestCase):
         with (
             mock.patch.object(app, "start_components"),
             mock.patch.object(
-                app, "request_context", side_effect=lambda text: RequestContext(text)
+                app,
+                "request_context",
+                side_effect=lambda text, **_settings: RequestContext(text),
             ),
             mock.patch.object(app, "route_intent") as route_intent,
             mock.patch.object(app, "cursor_turn", side_effect=cursor_turn),
@@ -64,7 +66,9 @@ class ForegroundDeliveryTests(unittest.TestCase):
         with (
             mock.patch.object(app, "start_components"),
             mock.patch.object(
-                app, "request_context", side_effect=lambda text: RequestContext(text)
+                app,
+                "request_context",
+                side_effect=lambda text, **_settings: RequestContext(text),
             ),
             mock.patch.object(app, "route_intent") as route_intent,
             mock.patch.object(app, "cursor_turn", side_effect=cursor_turn),
@@ -132,7 +136,11 @@ class AppContextTests(unittest.TestCase):
             app.respond("ask Cursor to fix this")
 
         route_intent.assert_not_called()
-        enrich.assert_called_once_with("ask Cursor to fix this")
+        enrich.assert_called_once_with(
+            "ask Cursor to fix this",
+            platform=mock.ANY,
+            integrations=mock.ANY,
+        )
         cursor_turn.assert_called_once_with(
             CursorTurnRequest(
                 "ask Cursor to fix this\n\ncontext",
@@ -226,7 +234,9 @@ class AppContextTests(unittest.TestCase):
         with (
             mock.patch.object(app, "start_components"),
             mock.patch.object(
-                app, "request_context", side_effect=lambda text: RequestContext(text)
+                app,
+                "request_context",
+                side_effect=lambda text, **_settings: RequestContext(text),
             ),
             mock.patch.object(
                 app,
@@ -461,7 +471,9 @@ class CursorFastPathTests(unittest.TestCase):
         with (
             mock.patch.object(app, "start_components"),
             mock.patch.object(
-                app, "request_context", side_effect=lambda text: RequestContext(text)
+                app,
+                "request_context",
+                side_effect=lambda text, **_settings: RequestContext(text),
             ),
             mock.patch.object(app, "route_intent") as route_intent,
             mock.patch.object(

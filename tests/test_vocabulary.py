@@ -331,7 +331,9 @@ class RoutingPrepassTests(unittest.TestCase):
             mock.patch.object(
                 app,
                 "request_context",
-                side_effect=lambda text: captured.append(text) or RequestContext(text),
+                side_effect=lambda text, **_settings: (
+                    captured.append(text) or RequestContext(text)
+                ),
             ),
             mock.patch.object(
                 app,
