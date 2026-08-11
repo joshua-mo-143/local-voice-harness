@@ -828,6 +828,71 @@ class CursorRecoveryTests(unittest.TestCase):
                 for participant in WorkflowParticipant:
                     self.assertIsNone(completed.participant_target(participant))
 
+    def test_terminal_intent_with_ambiguous_prompt_releases_ticket_fences(
+        self,
+    ) -> None:
+        job = self.create(
+            {
+                "id": "123456789abc",
+                "status": "running",
+                "request": "work on issue 56",
+                "created_at": 1,
+                "delivered": False,
+                "github_repository": "Example/Project",
+                "github_issue": 56,
+                "herdr_target": "planner-agent",
+                "planner_target": "planner-agent",
+                "active_participant": "planner",
+                "agent_dispatch_state": "ready",
+                "worker_token": "worker-token",
+                "worker_pid": 42,
+                "worker_boot_id": "boot",
+                "worker_process_start": "start",
+            }
+        )
+
+        def terminalize(current: CursorJob) -> CursorJob:
+            return stage_terminal_intent(
+                current,
+                JobStatus.CANCELLED,
+                now=10,
+                result="Cursor job 123456789abc was cancelled.",
+                clear_worker=True,
+            )
+
+        staged = self.store.update(job.id, terminalize)
+        assert staged is not None and staged.target_release_token
+
+        def mark_prompt_ambiguous(current: CursorJob) -> CursorJob:
+            return current.evolve(
+                prompt_operation_state="ambiguous",
+                prompt_operation_phase="planning",
+                prompt_operation_turn=1,
+                prompt_operation_target="planner-agent",
+                prompt_baseline_sequence=0,
+                manual_reconcile_operation="prompt",
+                manual_reconcile_token="manual-token",
+                manual_reconcile_required_at=10,
+            )
+
+        staged = self.store.update(job.id, mark_prompt_ambiguous)
+        assert staged is not None and staged.target_release_token
+
+        cancel_target_and_release(
+            self.store,
+            job.id,
+            "planner-agent",
+            staged.target_release_token,
+            herdr_factory=mock.Mock(),
+        )
+
+        released = self.store.get(job.id)
+        self.assertEqual(released.status, JobStatus.CANCELLED)
+        self.assertFalse(released.target_release_pending)
+        self.assertFalse(released.cancellation_reconciliation_pending)
+        self.assertIsNone(released.manual_reconcile_operation)
+        self.assertEqual(released.prompt_operation_state, "none")
+
 
 if __name__ == "__main__":
     unittest.main()
