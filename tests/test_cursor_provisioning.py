@@ -28,13 +28,13 @@ from local_voice_harness.integrations.github import (
     GitHubIssue,
     GitHubRepository,
     ProvisionedIssue,
-    ProvisionedPullRequest,
 )
 from local_voice_harness.integrations.herdr import (
     AgentSelection,
     HerdrError,
     PromptOutcome,
 )
+from local_voice_harness.local_git import LocalGitRefChanged
 
 
 class _ProvisioningTestAdapter:
@@ -1699,10 +1699,12 @@ class CursorJobStateTests(unittest.TestCase):
             }
         )
         github = mock.Mock()
-        github.provision_pull_request.return_value = ProvisionedPullRequest(
-            source, repository, 42
+        github.inspect_repository.return_value = source
+        github.pull_request_details.return_value = {"headRefOid": "a" * 40}
+        github.ensure_repository_clone.return_value = repository
+        github.local_git.checkout_remote_ref.return_value = (
+            "voice/github-pr-123456789abc"
         )
-        github.checkout_pull_request.return_value = "voice/github-pr-123456789abc"
         client = mock.Mock()
         client.ensure_agent.return_value = AgentSelection(
             "agent",
@@ -1720,8 +1722,12 @@ class CursorJobStateTests(unittest.TestCase):
         ):
             service.run_worker("123456789abc")
 
-        github.provision_pull_request.assert_called_once_with(
-            "source/project", 42, checkpoint=mock.ANY
+        self.assertEqual(
+            github.inspect_repository.call_args_list,
+            [mock.call("source/project"), mock.call("source/project")],
+        )
+        github.ensure_repository_clone.assert_called_once_with(
+            source, checkpoint=mock.ANY
         )
         client.ensure_agent.assert_called_once_with(
             repository,
@@ -1743,10 +1749,12 @@ class CursorJobStateTests(unittest.TestCase):
             pane_accepted=mock.ANY,
             participant_name=None,
         )
-        github.checkout_pull_request.assert_called_once_with(
+        github.local_git.checkout_remote_ref.assert_called_once_with(
             worktree,
-            42,
+            remote_url="https://github.com/source/project",
+            remote_ref="refs/pull/42/head",
             branch="voice/github-pr-123456789abc",
+            expected_oid="a" * 40,
             checkpoint=mock.ANY,
         )
         updated = jobs.read_job("123456789abc")
@@ -1784,14 +1792,159 @@ class CursorJobStateTests(unittest.TestCase):
                 jobs.read_job("123456789abc"),
             )
 
-        github.checkout_pull_request.assert_not_called()
+        github.local_git.checkout_remote_ref.assert_not_called()
         updated = jobs.read_job("123456789abc")
         self.assertEqual(updated["pull_request_worktree_state"], "quarantined")
+
+    def test_legacy_pull_request_job_resolves_and_persists_checkout_inputs(
+        self,
+    ) -> None:
+        repository = Path(self.temporary.name) / "source" / "project"
+        worktree = Path(self.temporary.name) / "worktrees" / "legacy-pr"
+        worktree.mkdir(parents=True)
+        (worktree / ".git").write_text("gitdir: shared\n")
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "status": "routing",
+                "worker_token": "worker",
+                "worker_pid": 42,
+                "worker_process_start": "worker-start",
+                "repository": str(repository),
+                "worktree_path": str(worktree),
+                "github_repository": "source/project",
+                "github_pull_request": 42,
+                "worktree_branch": "voice/github-pr-123456789abc",
+                "pull_request_worktree_state": "provisioning",
+            }
+        )
+        source = GitHubRepository(
+            "source/project",
+            "https://github.com/source/project",
+            False,
+            "main",
+        )
+        github = mock.Mock()
+        github.inspect_repository.return_value = source
+        github.pull_request_details.return_value = {"headRefOid": "a" * 40}
+        github.local_git.checkout_remote_ref.return_value = (
+            "voice/github-pr-123456789abc"
+        )
+
+        with mock.patch.object(jobs, "GitHubClient", return_value=github):
+            jobs._prepare_pull_request_checkout(
+                "123456789abc",
+                "worker",
+                jobs.read_job("123456789abc"),
+            )
+
+        updated = jobs.read_job("123456789abc")
+        self.assertEqual(
+            updated["pull_request_remote_url"],
+            "https://github.com/source/project",
+        )
+        self.assertEqual(updated["pull_request_head_ref"], "refs/pull/42/head")
+        self.assertEqual(updated["pull_request_head_oid"], "a" * 40)
+        self.assertEqual(updated["pull_request_worktree_state"], "ready")
+
+    def test_pull_request_head_move_is_re_resolved_once_before_quarantine(
+        self,
+    ) -> None:
+        repository = Path(self.temporary.name) / "source" / "project"
+        worktree = Path(self.temporary.name) / "worktrees" / "moving-pr"
+        worktree.mkdir(parents=True)
+        (worktree / ".git").write_text("gitdir: shared\n")
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "status": "routing",
+                "worker_token": "worker",
+                "worker_pid": 42,
+                "worker_process_start": "worker-start",
+                "repository": str(repository),
+                "worktree_path": str(worktree),
+                "github_repository": "source/project",
+                "github_pull_request": 42,
+                "worktree_branch": "voice/github-pr-123456789abc",
+                "pull_request_worktree_state": "provisioning",
+            }
+        )
+        source = GitHubRepository(
+            "source/project",
+            "https://github.com/source/project",
+            False,
+            "main",
+        )
+        github = mock.Mock()
+        github.inspect_repository.return_value = source
+        github.pull_request_details.side_effect = [
+            {"headRefOid": "a" * 40},
+            {"headRefOid": "b" * 40},
+        ]
+        github.local_git.checkout_remote_ref.side_effect = [
+            LocalGitRefChanged("head moved"),
+            "voice/github-pr-123456789abc",
+        ]
+
+        with mock.patch.object(jobs, "GitHubClient", return_value=github):
+            jobs._prepare_pull_request_checkout(
+                "123456789abc",
+                "worker",
+                jobs.read_job("123456789abc"),
+            )
+
+        updated = jobs.read_job("123456789abc")
+        self.assertEqual(updated["pull_request_head_oid"], "b" * 40)
+        self.assertEqual(updated["pull_request_worktree_state"], "ready")
+        self.assertEqual(github.local_git.checkout_remote_ref.call_count, 2)
+
+    def test_pull_request_checkout_rejects_non_voice_branch_before_mutation(
+        self,
+    ) -> None:
+        repository = Path(self.temporary.name) / "source" / "project"
+        worktree = Path(self.temporary.name) / "worktrees" / "unsafe-pr"
+        worktree.mkdir(parents=True)
+        (worktree / ".git").write_text("gitdir: shared\n")
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "status": "routing",
+                "worker_token": "worker",
+                "worker_pid": 42,
+                "worker_process_start": "worker-start",
+                "repository": str(repository),
+                "worktree_path": str(worktree),
+                "github_repository": "source/project",
+                "github_pull_request": 42,
+                "worktree_branch": "main",
+                "pull_request_worktree_state": "provisioning",
+                "pull_request_remote_url": "https://github.com/source/project",
+                "pull_request_head_ref": "refs/pull/42/head",
+                "pull_request_head_oid": "a" * 40,
+            }
+        )
+        github = mock.Mock()
+
+        with (
+            mock.patch.object(jobs, "GitHubClient", return_value=github),
+            self.assertRaisesRegex(jobs.HarnessError, "invalid voice"),
+        ):
+            jobs._prepare_pull_request_checkout(
+                "123456789abc",
+                "worker",
+                jobs.read_job("123456789abc"),
+            )
+
+        github.local_git.checkout_remote_ref.assert_not_called()
+        self.assertEqual(
+            jobs.read_job("123456789abc")["pull_request_worktree_state"],
+            "quarantined",
+        )
 
     def test_concurrent_pull_requests_prepare_distinct_worktrees(self) -> None:
         repository = Path(self.temporary.name) / "source" / "project"
         barrier = threading.Barrier(2)
-        calls: list[tuple[Path, int, str]] = []
+        calls: list[tuple[Path, str, str]] = []
         for job_id, number in (("aaaaaaaaaaaa", 41), ("bbbbbbbbbbbb", 42)):
             worktree = Path(self.temporary.name) / "worktrees" / job_id
             worktree.mkdir(parents=True)
@@ -1805,19 +1958,36 @@ class CursorJobStateTests(unittest.TestCase):
                     "worker_process_start": f"start-{job_id}",
                     "repository": str(repository),
                     "worktree_path": str(worktree),
+                    "github_repository": "source/project",
                     "github_pull_request": number,
                     "worktree_branch": f"voice/github-pr-{job_id}",
                     "pull_request_worktree_state": "provisioning",
+                    "pull_request_remote_url": "https://github.com/source/project",
+                    "pull_request_head_ref": f"refs/pull/{number}/head",
+                    "pull_request_head_oid": "a" * 40,
                 }
             )
         github = mock.Mock()
+        github.inspect_repository.return_value = GitHubRepository(
+            "source/project",
+            "https://github.com/source/project",
+            False,
+            "main",
+        )
+        github.pull_request_details.return_value = {"headRefOid": "a" * 40}
 
-        def checkout(path: Path, number: int, *, branch: str) -> str:
-            calls.append((path, number, branch))
+        def checkout(
+            path: Path,
+            *,
+            remote_ref: str,
+            branch: str,
+            **_kwargs: object,
+        ) -> str:
+            calls.append((path, remote_ref, branch))
             barrier.wait()
             return branch
 
-        github.checkout_pull_request.side_effect = checkout
+        github.local_git.checkout_remote_ref.side_effect = checkout
 
         def prepare(job_id: str) -> None:
             jobs._prepare_pull_request_checkout(
@@ -1836,8 +2006,8 @@ class CursorJobStateTests(unittest.TestCase):
             for thread in threads:
                 thread.join()
 
-        self.assertEqual(len({path for path, _number, _branch in calls}), 2)
-        self.assertEqual(len({branch for _path, _number, branch in calls}), 2)
+        self.assertEqual(len({path for path, _ref, _branch in calls}), 2)
+        self.assertEqual(len({branch for _path, _ref, branch in calls}), 2)
         self.assertTrue(
             all(
                 jobs.read_job(job_id)["pull_request_worktree_state"] == "ready"
@@ -2009,6 +2179,7 @@ class CursorJobStateTests(unittest.TestCase):
         )
         github = mock.Mock()
         github.prepare_public_fork.return_value = (source, "me", "me/project")
+        github.inspect_public_repository.return_value = source
         github.reconcile_fork.return_value = fork
         github.ensure_clone.return_value = repository
         client = mock.Mock()
@@ -2029,6 +2200,7 @@ class CursorJobStateTests(unittest.TestCase):
             service.run_worker("123456789abc")
 
         github.reconcile_fork.assert_called_once_with(source, "me/project")
+        github.prepare_public_fork.assert_not_called()
         github.ensure_fork.assert_not_called()
         github.ensure_clone.assert_called_once_with(source, fork, checkpoint=mock.ANY)
 
@@ -3245,16 +3417,16 @@ class CursorJobStateTests(unittest.TestCase):
         entered = threading.Event()
         release = threading.Event()
         github = mock.Mock()
-        github.provision_pull_request.return_value = ProvisionedPullRequest(
-            source, repository, 42
-        )
+        github.inspect_repository.return_value = source
+        github.pull_request_details.return_value = {"headRefOid": "a" * 40}
+        github.ensure_repository_clone.return_value = repository
 
         def checkout(*_args: object, **_kwargs: object) -> str:
             entered.set()
             self.assertTrue(release.wait(2))
             return "voice/github-pr-123456789abc"
 
-        github.checkout_pull_request.side_effect = checkout
+        github.local_git.checkout_remote_ref.side_effect = checkout
         selection = AgentSelection(
             "agent",
             "pane",
@@ -3722,6 +3894,12 @@ class CursorJobStateTests(unittest.TestCase):
             }
         )
         github = mock.Mock()
+        github.inspect_public_repository.return_value = GitHubRepository(
+            "source/project",
+            "https://github.com/source/project",
+            False,
+            "main",
+        )
         github.reconcile_fork.return_value = None
         with mock.patch.object(jobs, "GitHubClient", return_value=github):
             for now in (100, 105, 115):
@@ -3763,6 +3941,7 @@ class CursorJobStateTests(unittest.TestCase):
             }
         )
         github = mock.Mock()
+        github.inspect_public_repository.return_value = source
         github.reconcile_fork.side_effect = [None, fork]
         with mock.patch.object(jobs, "GitHubClient", return_value=github):
             with mock.patch("time.time", return_value=100):
@@ -3871,6 +4050,12 @@ class CursorJobStateTests(unittest.TestCase):
             }
         )
         github = mock.Mock()
+        github.inspect_public_repository.return_value = GitHubRepository(
+            "source/project",
+            "https://github.com/source/project",
+            False,
+            "main",
+        )
         github.reconcile_fork.return_value = None
         client = mock.Mock()
         with (

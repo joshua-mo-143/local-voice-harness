@@ -13,9 +13,12 @@ from ..errors import HarnessError
 from ..integrations.github import (
     GitHubClient,
     GitHubError,
+    GitHubForkPlan,
     GitHubIssue,
     GitHubIssueLookupError,
     GitHubOperationAmbiguous,
+    GitHubProvider,
+    GitHubPullRequestCheckoutInputs,
     GitHubRepository,
 )
 from ..integrations.herdr import (
@@ -36,6 +39,7 @@ from ..integrations.registry import (
     resolve_issue_reference,
     route_issue_repository,
 )
+from ..local_git import LocalGitRefChanged
 from ..questions import (
     PromptOperationState,
     QuestionError,
@@ -91,8 +95,19 @@ WorkerCancelled = worker_lifecycle.WorkerCancelled
 @dataclass(frozen=True, slots=True)
 class ClientFactories:
     herdr: Callable[[], HerdrClient]
-    github: Callable[[], GitHubClient]
+    github: Callable[[], GitHubClient | GitHubProvider]
     integrations: IntegrationRegistry | None = None
+
+
+def _github_provider(
+    factory: Callable[[], GitHubClient | GitHubProvider],
+) -> GitHubProvider:
+    integration = factory()
+    return (
+        integration
+        if isinstance(integration, GitHubProvider)
+        else GitHubProvider(integration)
+    )
 
 
 class ReservationConflict(Exception):
@@ -674,9 +689,10 @@ def _worker_block(
 
 def _pull_request_branch(job: CursorJob) -> str:
     configured = job.worktree_branch or ""
-    if configured:
-        return configured
-    return f"voice/github-pr-{job.id}"
+    branch = configured or f"voice/github-pr-{job.id}"
+    if not re.fullmatch(r"voice/[a-z0-9][a-z0-9._/-]{0,100}", branch):
+        raise HarnessError("invalid voice pull-request branch")
+    return branch
 
 
 def _prepare_pull_request_checkout(
@@ -686,7 +702,7 @@ def _prepare_pull_request_checkout(
     job: CursorJob,
     checkpoint: Callable[[], None] | None = None,
     *,
-    github_factory: Callable[[], GitHubClient] | None = None,
+    github_factory: Callable[[], GitHubClient | GitHubProvider] | None = None,
 ) -> CursorJob | None:
     if not job.github_pull_request:
         return job
@@ -695,9 +711,9 @@ def _prepare_pull_request_checkout(
     repository = Path(job.repository or "").resolve()
     checkout_value = job.worktree_path or ""
     checkout = Path(checkout_value).resolve() if checkout_value else repository
-    branch = _pull_request_branch(job)
     number = job.github_pull_request
     try:
+        branch = _pull_request_branch(job)
         if checkout == repository:
             raise HarnessError(
                 "refusing to check out a pull request in the shared repository clone"
@@ -706,15 +722,70 @@ def _prepare_pull_request_checkout(
             raise HarnessError("pull-request worktree is missing or invalid")
         if checkpoint is not None:
             checkpoint()
-        github = (github_factory or GitHubClient)()
-        if checkpoint is None:
-            checked_out_branch = github.checkout_pull_request(
-                checkout, number, branch=branch
+        github = _github_provider(github_factory or GitHubClient)
+        if not job.github_repository:
+            raise HarnessError("pull-request repository metadata is missing")
+        repository_name = job.github_repository
+        checked_out_branch: str | None = None
+        for attempt in range(2):
+            plan = github.plan_pull_request(repository_name, number)
+            source_name = plan.source.name_with_owner
+            remote_url = plan.checkout.remote_url
+            head_ref = plan.checkout.head_ref
+            head_oid = plan.checkout.head_oid
+
+            def refresh_checkout_inputs(
+                current: CursorJob,
+                source_name: str = source_name,
+                remote_url: str = remote_url,
+                head_ref: str = head_ref,
+                head_oid: str = head_oid,
+            ) -> CursorJob:
+                return current.evolve(
+                    github_repository=source_name,
+                    pull_request_remote_url=remote_url,
+                    pull_request_head_ref=head_ref,
+                    pull_request_head_oid=head_oid,
+                )
+
+            refreshed = _worker_change(
+                store,
+                job_id,
+                token,
+                {JobStatus.ROUTING},
+                refresh_checkout_inputs,
             )
-        else:
-            checked_out_branch = github.checkout_pull_request(
-                checkout, number, branch=branch, checkpoint=checkpoint
+            if refreshed is None:
+                return None
+            job = refreshed
+            if checkpoint is not None:
+                checkpoint()
+            inputs = GitHubPullRequestCheckoutInputs(
+                remote_url=job.pull_request_remote_url or "",
+                head_ref=job.pull_request_head_ref or "",
+                head_oid=job.pull_request_head_oid or "",
             )
+            github.validate_pull_request_checkout_inputs(
+                job.github_repository or "",
+                number,
+                inputs,
+            )
+            try:
+                checked_out_branch = github.local_git.checkout_remote_ref(
+                    checkout,
+                    remote_url=inputs.remote_url,
+                    remote_ref=inputs.head_ref,
+                    branch=branch,
+                    expected_oid=inputs.head_oid,
+                    checkpoint=checkpoint,
+                )
+            except LocalGitRefChanged:
+                if attempt == 0:
+                    if checkpoint is not None:
+                        checkpoint()
+                    continue
+                raise
+            break
         if checkpoint is not None:
             checkpoint()
     except Exception as exc:
@@ -974,6 +1045,33 @@ def _begin_fork_operation(
         )
 
     return _worker_change(store, job_id, token, {JobStatus.ROUTING}, begin)
+
+
+def _persisted_fork_plan(job: CursorJob) -> GitHubForkPlan | None:
+    if job.fork_operation_state is None:
+        return None
+    source_name = job.fork_operation_source or ""
+    source_url = job.fork_operation_source_url or ""
+    target = job.fork_operation_target or ""
+    if not all((source_name, source_url, target)):
+        raise HarnessError("persisted GitHub fork operation is incomplete")
+    login = job.fork_operation_login or target.split("/", 1)[0]
+    if (
+        job.github_repository
+        and job.github_repository.casefold() != source_name.casefold()
+    ):
+        raise HarnessError("persisted GitHub fork source does not match the job")
+    return GitHubForkPlan(
+        source=GitHubRepository(
+            name_with_owner=source_name,
+            url=source_url,
+            is_private=job.fork_operation_source_private,
+            default_branch=job.fork_operation_source_default_branch or "",
+            parent=job.fork_operation_source_parent,
+        ),
+        login=login,
+        target=target,
+    )
 
 
 def _mark_fork_dispatching(store: JobStore, job_id: str, token: str) -> None:
@@ -2891,18 +2989,24 @@ def run_claimed_worker(  # pyright: ignore[reportGeneralTypeIssues]
                     )
                     return
                 checkpoint()
-                provisioned_pr = clients.github().provision_pull_request(
-                    github_repository, number, checkpoint=checkpoint
+                github = _github_provider(clients.github)
+                pull_request_plan = github.plan_pull_request(github_repository, number)
+                checkpoint()
+                repository = github.materialize_repository(
+                    pull_request_plan.source,
+                    checkpoint=checkpoint,
                 )
                 checkpoint()
-                repository = provisioned_pr.checkout
                 issue_key = None
 
                 def record_pull_request(current: CursorJob) -> CursorJob:
                     return current.evolve(
-                        github_repository=provisioned_pr.source.name_with_owner,
-                        repository=str(provisioned_pr.checkout),
+                        github_repository=pull_request_plan.source.name_with_owner,
+                        repository=str(repository),
                         pull_request_worktree_state="provisioning",
+                        pull_request_remote_url=pull_request_plan.checkout.remote_url,
+                        pull_request_head_ref=pull_request_plan.checkout.head_ref,
+                        pull_request_head_oid=pull_request_plan.checkout.head_oid,
                     )
 
                 updated = _worker_change(
@@ -2937,18 +3041,35 @@ def run_claimed_worker(  # pyright: ignore[reportGeneralTypeIssues]
                         clarification_kind="fork_confirmation",
                     )
                     return
-                github = clients.github()
+                github = _github_provider(clients.github)
                 checkpoint()
-                source, login, fork_target = github.prepare_public_fork(
-                    github_repository
-                )
+                fork_plan = _persisted_fork_plan(job)
+                if fork_plan is None:
+                    fork_plan = github.plan_fork(github_repository)
+                else:
+                    fork_plan = github.refresh_fork_plan(fork_plan)
+                    github.validate_fork_plan(
+                        fork_plan,
+                        materialized_repository=(
+                            job.fork_repository
+                            if job.fork_operation_state == "exists"
+                            else None
+                        ),
+                    )
+                source = fork_plan.source
+                login = fork_plan.login
+                fork_target = fork_plan.target
                 checkpoint()
                 if job.fork_operation_state == "exists" and job.fork_repository:
-                    fork = github.reconcile_fork(source, fork_target)
+                    fork = github.observe_fork(fork_plan)
                     if fork is None:
                         raise HarnessError(
                             "reconciled GitHub fork is no longer observable"
                         )
+                elif job.fork_operation_state not in {None, "planned"}:
+                    raise HarnessError(
+                        "GitHub fork operation requires reconciliation before retry"
+                    )
                 else:
                     updated = _begin_fork_operation(
                         store, job_id, worker_token, source, login, fork_target
@@ -2957,9 +3078,9 @@ def run_claimed_worker(  # pyright: ignore[reportGeneralTypeIssues]
                         return
                     job = updated
                     try:
-                        fork = github.ensure_fork(
-                            source,
-                            login,
+                        fork = github.submit_fork(
+                            fork_plan,
+                            confirmed=job.fork_confirmed,
                             checkpoint=checkpoint,
                             before_submit=lambda: _mark_fork_dispatching(
                                 store, job_id, worker_token
@@ -2971,9 +3092,7 @@ def run_claimed_worker(  # pyright: ignore[reportGeneralTypeIssues]
                         current = store.get(job_id)
                         was_submitted = current.fork_operation_state == "submitted"
                         visible = (
-                            github.reconcile_fork(source, fork_target)
-                            if was_submitted
-                            else None
+                            github.observe_fork(fork_plan) if was_submitted else None
                         )
                         _settle_fork_operation(
                             store,
@@ -2999,7 +3118,11 @@ def run_claimed_worker(  # pyright: ignore[reportGeneralTypeIssues]
                 checkpoint()
                 if job.status != JobStatus.ROUTING:
                     raise WorkerCancelled
-                checkout = github.ensure_clone(source, fork, checkpoint=checkpoint)
+                checkout = github.materialize_fork(
+                    fork_plan,
+                    fork,
+                    checkpoint=checkpoint,
+                )
                 checkpoint()
                 repository = checkout
 
@@ -3033,12 +3156,12 @@ def run_claimed_worker(  # pyright: ignore[reportGeneralTypeIssues]
                 checkpoint()
                 repositories = client.repository_roots()
                 checkpoint()
-                github = clients.github()
+                github = _github_provider(clients.github)
                 issue = GitHubIssue(owner, repository_name, number)
                 # The preflight may have happened long ago; verify the issue
                 # again so a vanished or newly inaccessible issue fails with
                 # the same classified, voice-safe error.
-                github.issue_details(issue)
+                github.resolve_issue(issue)
                 checkpoint()
                 provisioned_issue = github.provision_issue(
                     issue,
