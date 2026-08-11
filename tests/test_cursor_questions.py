@@ -643,7 +643,10 @@ def test_protected_answer_requires_explicit_request_provenance(
     assert "direct user answer" in as_assistant_response(rejected.text).display_text
     assert store.get("aaaaaaaaaaaa").status == JobStatus.AWAITING_USER
 
-    with mock.patch.object(service, "launch_worker") as launch:
+    with (
+        mock.patch.object(service, "launch_worker") as launch,
+        mock.patch.object(service, "_await_foreground") as foreground,
+    ):
         cursor_turn(
             CursorTurnRequest(
                 "allow broad access",
@@ -653,6 +656,7 @@ def test_protected_answer_requires_explicit_request_provenance(
             )
         )
     launch.assert_called_once()
+    foreground.assert_called_once_with("aaaaaaaaaaaa", None)
 
 
 def test_unknown_question_owner_fails_closed(store: JobStore) -> None:
