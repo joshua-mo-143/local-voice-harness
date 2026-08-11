@@ -310,7 +310,7 @@ class WakeConversationDaemon:
         self.activation_thread: threading.Thread | None = None
         self.activation_error: Exception | None = None
         self.component_lock = threading.Lock()
-        self.playback_queue = PlaybackQueue()
+        self.playback_queue = PlaybackQueue(self.audio)
 
     def is_speech(self, frame: bytes) -> bool:
         return self.speech_detector.is_speech(frame)
@@ -444,11 +444,12 @@ class WakeConversationDaemon:
         def activate() -> None:
             try:
                 with self.component_lock:
-                    start_components()
+                    start_components(self.providers)
                     if self.providers.llm_provider == "local":
                         qwen_turn(
                             "Reply with only OK. Do not call a tool.",
                             allow_tools=False,
+                            settings=self.providers,
                         )
                     log("LLM tool graph and TTS backend are warm")
             except Exception as exc:
@@ -462,7 +463,7 @@ class WakeConversationDaemon:
     def ensure_components(self) -> None:
         if self.activation_thread is None:
             with self.component_lock:
-                start_components()
+                start_components(self.providers)
             return
         self.activation_thread.join(timeout=60)
         if self.activation_thread.is_alive():
@@ -908,7 +909,7 @@ class WakeConversationDaemon:
         try:
             lease_guard.start()
             with self.component_lock:
-                start_components()
+                start_components(self.providers)
                 lease_guard.maintain()
                 self.playback_queue.start_prefetch(limit=DELIVERY_WINDOW)
             batch, interruption = self._drain_playback_queue(
@@ -1013,6 +1014,7 @@ class WakeConversationDaemon:
                 pending_question=pending.text if pending is not None else None,
                 clarification_kind=pending.owner if pending is not None else None,
                 recent_completion=active_completed is not None,
+                settings=self.providers,
             )
             if pending is not None and question_control(text) is not None:
                 route = IntentRoute(Intent.AGENT_REPLY, "high")
@@ -1218,6 +1220,7 @@ class WakeConversationDaemon:
                             delivery_claims=delivery_claims,
                             on_text_chunk=on_text_chunk,
                             allow_tools=False,
+                            settings=self.providers,
                         )
                     )
                     streamed_playback = True
@@ -1230,6 +1233,7 @@ class WakeConversationDaemon:
                         trusted_utterance=text,
                         delivery_claims=delivery_claims,
                         allow_tools=False,
+                        settings=self.providers,
                     )
                 remember_response = True
             rendered_response = as_assistant_response(response)

@@ -6,7 +6,7 @@ from dataclasses import dataclass
 from enum import StrEnum
 
 from .browser_context import RequestContext
-from .config import BackendConfigurationError
+from .config import BackendConfigurationError, BackendSettings
 from .errors import HarnessError
 from .llm_transport import ChatCompletionRequest, LlmTransport
 
@@ -218,9 +218,10 @@ def route_intent(
     pending_question: str | None = None,
     clarification_kind: str | None = None,
     recent_completion: bool = False,
+    settings: BackendSettings | None = None,
 ) -> IntentRoute:
     try:
-        transport = LlmTransport.from_settings()
+        transport = LlmTransport.from_settings(settings)
         message = transport.chat_completion(
             ChatCompletionRequest(
                 messages=[

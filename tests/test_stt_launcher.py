@@ -10,6 +10,32 @@ from local_voice_harness.stt import launcher
 
 
 class DictationLauncherTests(unittest.TestCase):
+    def test_legacy_systemd_selector_defaults_are_resolver_baselines(self) -> None:
+        environment = {
+            "INVOCATION_ID": "service-start",
+            **launcher.LEGACY_UNIT_DEFAULTS,
+            "DICTATION_LANGUAGE": "en",
+        }
+
+        resolved = launcher.resolver_environment(environment)
+
+        self.assertNotIn("DICTATION_BACKEND", resolved)
+        self.assertNotIn("DICTATION_MODEL", resolved)
+        self.assertNotIn("DICTATION_QUANTIZATION", resolved)
+        self.assertEqual(resolved["DICTATION_LANGUAGE"], "en")
+
+    def test_explicit_nondefault_environment_override_is_preserved(self) -> None:
+        resolved = launcher.resolver_environment(
+            {
+                "INVOCATION_ID": "service-start",
+                "DICTATION_BACKEND": "whisper",
+                "DICTATION_MODEL": "large-v3-turbo",
+            }
+        )
+
+        self.assertEqual(resolved["DICTATION_BACKEND"], "whisper")
+        self.assertEqual(resolved["DICTATION_MODEL"], "large-v3-turbo")
+
     def test_backend_environment_accepts_only_documented_selectors(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "backend.env"

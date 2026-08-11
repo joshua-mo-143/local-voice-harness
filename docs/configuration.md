@@ -1,16 +1,16 @@
 # Configuration
 
-Only the variables marked “wake drop-in” may be added to
+Only the variables marked “environment override” may be added to
 `voice-harness-wake.service` with `systemctl --user edit`. The installed-unit audit
 rejects other extra variables and every `EnvironmentFile` on every shipped service.
-Dictation backend selectors belong in `~/.config/dictation/backend.env`, which the
-launcher parses through its separate allowlist.
+`backends.toml` and `~/.config/dictation/backend.env` remain supported only as
+legacy inputs to the unified resolver.
 
 ## Unified configuration (`config.toml`)
 
 `~/.config/voice-harness/config.toml` provides one validated, typed model for
-user-facing defaults across five sections: `providers`, `integrations`,
-`compute`, `audio`, and `platform`. The file is optional. When it is absent, or a
+user-facing defaults across six sections: `providers`, `integrations`,
+`compute`, `audio`, `dictation`, and `platform`. The file is optional. When it is absent, or a
 key is omitted, built-in defaults apply, so existing installations that rely only
 on `backends.toml` and environment variables keep working unchanged.
 
@@ -18,7 +18,7 @@ Values are resolved with a fixed precedence, from lowest to highest:
 
 1. built-in defaults
 2. `config.toml`
-3. `backends.toml` (providers only, for backward compatibility)
+3. legacy `backends.toml` provider values and `backend.env` dictation selectors
 4. environment variables
 
 In other words, an environment override always wins, and a legacy `backends.toml`
@@ -52,6 +52,12 @@ wake_threshold = 0.55
 barge_in_mode = "wake"
 playback_latency = "100ms"
 
+[dictation]
+inject = "auto"
+prompt = "Technical software engineering dictation."
+replacements = "herder:herdr;cursa:Cursor"
+vad_end_silence_ms = 900
+
 [platform]
 focused_app_context = true
 cursor_followup = true
@@ -84,33 +90,37 @@ Credentials are never read from or written to `config.toml`; a Venice API key in
 any section is rejected. Store it with `voice-harness credentials set` instead, as
 described under [AI backends](#ai-backends).
 
-Malformed, invalid-encoding, and unreadable `config.toml` or `backends.toml` files
-fail with an error that identifies the source path. Runtime capability discovery
-does not replace such failures with defaults, because that could silently enable
-or disable an integration. Failures from an individual provider while capturing
-optional context remain isolated from configuration loading failures.
+Malformed, invalid-encoding, and unreadable `config.toml`, `backends.toml`, or
+legacy `backend.env` files fail with an error that identifies the source path (and
+line for environment assignments). Runtime capability discovery does not replace
+such failures with defaults, because that could silently enable or disable an
+integration. Failures from an individual provider while capturing optional context
+remain isolated from configuration loading failures.
 
 ## Runtime lifecycle
 
 Runtime configuration uses a process-start snapshot. Each migrated composition
 root resolves `UserConfig` once, then injects its immutable typed sections into
 the process's consumers. Editing `config.toml`, a documented legacy input, or an
-environment override does not mutate an already running process. Restart every
+environment override does not mutate an already running process. LLM routing and
+conversation calls, STT startup, TTS serving, playback, dictation injection, audio
+capture, and VAD all use the injected snapshot. Restart every
 affected foreground process, service, or detached worker to apply the change;
 the configuration commands report affected active services.
 
 There is no general configuration hot reload. The vocabulary store is the
 documented exception: the dictation service reads it for each transcription, so
-vocabulary edits apply without a restart. Runtime migration is staged; consumers
-not yet migrated continue to use the legacy channels described below until their
-tracking children in the runtime configuration epic are complete.
+vocabulary edits apply without a restart. Legacy backend files are read only by
+the resolver; provider and speech runtime consumers do not parse them
+independently.
 
 ## Configuration commands
 
 Use the CLI to inspect or persist unified settings in `config.toml`. Values are
-validated before every write, persisted atomically with owner-only permissions,
-and dictation compute selectors are mirrored into
-`~/.config/dictation/backend.env` so a service restart picks them up.
+validated before every write and persisted atomically with owner-only permissions.
+These commands never create or update legacy `backends.toml` or `backend.env`
+files. Existing legacy values continue to participate in resolution until those
+files are removed.
 
 ```console
 voice-harness setup
@@ -156,9 +166,11 @@ voice-harness integrations doctor
 
 ## AI backends
 
-LLM and TTS providers are selected independently in
-`~/.config/voice-harness/backends.toml`. Both default to `local`; use `venice` for
-either hosted backend:
+LLM and TTS providers are selected independently in `[providers.llm]` and
+`[providers.tts]` in `config.toml`. Both default to `local`; use `venice` for
+either hosted backend. Existing values in
+`~/.config/voice-harness/backends.toml` continue to override `config.toml` until
+that legacy file is removed:
 
 ```toml
 [llm]
@@ -241,17 +253,19 @@ voice-harness plan-approval ask
 | `VOICE_HARNESS_FOCUSED_APP_CONTEXT` | Enable focused editor/terminal context capture | `1` | Wake drop-in |
 | `VOICE_HARNESS_FOCUSED_APP_DENY` | Comma-separated denied focused window classes | Password managers, RuneLite | Wake drop-in |
 | `VOICE_HARNESS_FOCUSED_APP_MAX_CHARS` | Positive combined focused-app context character cap | `12000` | Wake drop-in |
+| `DICTATION_SOURCE` | Dictation PipeWire source, independently overriding `audio.source` | `audio.source` | Environment override |
 | `DICTATION_INJECT` | Focused-window insertion mode (`auto`, `paste`, `type`, or `stdout`) | `auto` | Wake drop-in |
+| `DICTATION_PROMPT` | Initial Whisper transcription prompt | Technical dictation prompt | Environment override |
 | `DICTATION_REPLACEMENTS` | Semicolon-separated STT corrections | Cursor/Herdr defaults | Wake drop-in |
-| `DICTATION_VAD_END_SILENCE_MS` | Positive silence duration that finishes VAD dictation | `900` | Calling environment |
-| `DICTATION_VAD_START_SPEECH_FRAMES` | Consecutive 80 ms speech frames required to start an utterance | `3` | Calling environment |
-| `DICTATION_VAD_MAX_SECONDS` | Positive maximum duration of each VAD utterance | `120` | Calling environment |
-| `DICTATION_VAD_MIN_SPEECH_RMS` | Non-negative VAD speech energy gate | `1100` | Calling environment |
-| `DICTATION_BACKEND` | Dictation engine (`parakeet` or `whisper`) | `parakeet` | `backend.env` |
-| `DICTATION_MODEL` | Backend model | `nemo-parakeet-tdt-0.6b-v2` | `backend.env` |
-| `DICTATION_QUANTIZATION` | Parakeet ONNX quantization (`none` disables it) | `int8` | `backend.env` |
-| `DICTATION_COMPUTE` | faster-whisper compute type | `float16` | `backend.env` |
-| `DICTATION_LANGUAGE` | Spoken language to transcribe (`en`, `zh`, `english`, `chinese`, or `auto`) | `auto` | `backend.env` |
+| `DICTATION_VAD_END_SILENCE_MS` | Positive silence duration that finishes VAD dictation | `900` | Environment override |
+| `DICTATION_VAD_START_SPEECH_FRAMES` | Consecutive 80 ms speech frames required to start an utterance | `3` | Environment override |
+| `DICTATION_VAD_MAX_SECONDS` | Positive maximum duration of each VAD utterance | `120` | Environment override |
+| `DICTATION_VAD_MIN_SPEECH_RMS` | Non-negative VAD speech energy gate | `1100` | Environment override |
+| `DICTATION_BACKEND` | Dictation engine (`parakeet` or `whisper`) | `parakeet` | Environment override; legacy `backend.env` input |
+| `DICTATION_MODEL` | Backend model | `nemo-parakeet-tdt-0.6b-v2` | Environment override; legacy `backend.env` input |
+| `DICTATION_QUANTIZATION` | Parakeet ONNX quantization (`none` disables it) | `int8` | Environment override; legacy `backend.env` input |
+| `DICTATION_COMPUTE` | faster-whisper compute type | `float16` | Environment override; legacy `backend.env` input |
+| `DICTATION_LANGUAGE` | Spoken language to transcribe (`en`, `zh`, `english`, `chinese`, or `auto`) | `auto` | Environment override; legacy `backend.env` input |
 
 `VOICE_HARNESS_PROJECT_ROOT` can narrow repository discovery to another directory.
 `VOICE_HARNESS_GITHUB_ROOT` must resolve inside it. Forks are cloned to

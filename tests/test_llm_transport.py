@@ -99,33 +99,21 @@ class LlmTransportContractTests(unittest.TestCase):
 
     def test_from_settings_resolves_venice_credentials(self) -> None:
         settings = replace(load_backend_settings({}), llm_provider="venice")
-        with (
-            mock.patch(
-                "local_voice_harness.llm_transport.load_backend_settings",
-                return_value=settings,
-            ),
-            mock.patch(
-                "local_voice_harness.llm_transport.get_venice_api_key",
-                return_value="resolved-key",
-            ) as get_key,
-        ):
-            transport = LlmTransport.from_settings()
+        with mock.patch(
+            "local_voice_harness.llm_transport.get_venice_api_key",
+            return_value="resolved-key",
+        ) as get_key:
+            transport = LlmTransport.from_settings(settings)
 
         self.assertEqual(transport.config.api_key, "resolved-key")
         get_key.assert_called_once_with()
 
     def test_from_settings_skips_credentials_for_local_provider(self) -> None:
         settings = replace(load_backend_settings({}), llm_provider="local")
-        with (
-            mock.patch(
-                "local_voice_harness.llm_transport.load_backend_settings",
-                return_value=settings,
-            ),
-            mock.patch(
-                "local_voice_harness.llm_transport.get_venice_api_key"
-            ) as get_key,
-        ):
-            transport = LlmTransport.from_settings()
+        with mock.patch(
+            "local_voice_harness.llm_transport.get_venice_api_key"
+        ) as get_key:
+            transport = LlmTransport.from_settings(settings)
 
         self.assertIsNone(transport.config.api_key)
         get_key.assert_not_called()
@@ -332,16 +320,12 @@ class LlmTransportContractTests(unittest.TestCase):
         settings = replace(load_backend_settings({}), llm_provider="venice")
         with (
             mock.patch(
-                "local_voice_harness.llm_transport.load_backend_settings",
-                return_value=settings,
-            ),
-            mock.patch(
                 "local_voice_harness.llm_transport.get_venice_api_key",
                 side_effect=CredentialError("missing"),
             ),
             self.assertRaises(CredentialError),
         ):
-            LlmTransport.from_settings()
+            LlmTransport.from_settings(settings)
 
     def test_explicit_stream_override(self) -> None:
         transport = self._transport(provider="local")

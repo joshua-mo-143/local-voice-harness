@@ -8,10 +8,11 @@ import urllib.request
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 
-from .config import BackendSettings, load_backend_settings
+from .config import BackendSettings
 from .credentials import get_venice_api_key
 from .diagnostic_safety import redact_diagnostic, redact_fields
 from .errors import HarnessError
+from .user_config import default_user_config
 
 _SENTENCE = re.compile(r'^(.+?[.!?]["\']?)(?:\s+)', re.DOTALL)
 
@@ -176,7 +177,7 @@ class LlmTransport:
 
     @classmethod
     def from_settings(cls, settings: BackendSettings | None = None) -> LlmTransport:
-        resolved = settings or load_backend_settings()
+        resolved = settings or default_user_config().providers
         api_key = get_venice_api_key() if resolved.llm_provider == "venice" else None
         return cls(
             LlmTransportConfig(

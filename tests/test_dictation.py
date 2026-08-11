@@ -141,7 +141,7 @@ class DictationTests(unittest.TestCase):
             mock.patch.object(dictation, "socket_ready", return_value=True),
             mock.patch.object(
                 dictation.VadCaptureSettings,
-                "from_environment",
+                "from_dictation",
                 return_value=settings,
             ),
             mock.patch.object(dictation, "SpeechDetector") as detector,
@@ -193,7 +193,7 @@ class DictationTests(unittest.TestCase):
             mock.patch.object(dictation, "socket_ready", return_value=True),
             mock.patch.object(
                 dictation.VadCaptureSettings,
-                "from_environment",
+                "from_dictation",
                 return_value=mock.Mock(minimum_rms=1100),
             ),
             mock.patch.object(dictation, "SpeechDetector"),
@@ -248,7 +248,7 @@ class DictationTests(unittest.TestCase):
                 mock.patch.object(dictation, "socket_ready", return_value=True),
                 mock.patch.object(
                     dictation.VadCaptureSettings,
-                    "from_environment",
+                    "from_dictation",
                     return_value=mock.Mock(minimum_rms=1100),
                 ),
                 mock.patch.object(dictation, "SpeechDetector"),
@@ -329,21 +329,21 @@ class DictationTests(unittest.TestCase):
 
     def test_stdout_injection(self) -> None:
         output = io.StringIO()
+        settings = replace(default_user_config().dictation, inject="stdout")
         with (
-            mock.patch.dict("os.environ", {"DICTATION_INJECT": "stdout"}),
             mock.patch.object(dictation, "_ensure_dictation_allowed"),
             redirect_stdout(output),
         ):
-            dictation.inject("hello world")
+            dictation.inject("hello world", settings)
         self.assertEqual(output.getvalue(), "hello world\n")
 
     def test_invalid_injection_mode_is_rejected(self) -> None:
+        settings = replace(default_user_config().dictation, inject="invalid")
         with (
-            mock.patch.dict("os.environ", {"DICTATION_INJECT": "invalid"}),
             mock.patch.object(dictation, "_ensure_dictation_allowed"),
             self.assertRaises(HarnessError),
         ):
-            dictation.inject("hello")
+            dictation.inject("hello", settings)
 
     def test_copy_uses_desktop_clipboard(self) -> None:
         desktop = mock.Mock()
@@ -409,15 +409,15 @@ class DictationTests(unittest.TestCase):
         desktop.has_clipboard.return_value = True
         desktop.read_clipboard.return_value = (False, "")
         desktop.write_clipboard.return_value = True
+        settings = replace(default_user_config().dictation, inject="paste")
         with (
-            mock.patch.dict("os.environ", {"DICTATION_INJECT": "paste"}),
             mock.patch.object(dictation, "_send_to_herdr", return_value=False),
             mock.patch.object(dictation, "get_desktop", return_value=desktop),
             mock.patch.object(dictation, "_copy_to_clipboard"),
             mock.patch.object(dictation, "_send_key") as send_key,
             mock.patch.object(dictation.time, "sleep"),
         ):
-            dictation.inject("hello")
+            dictation.inject("hello", settings)
         send_key.assert_called_once_with(desktop, window, "ctrl+shift+v")
 
     def test_unsupported_wayland_session_is_reported(self) -> None:

@@ -41,7 +41,7 @@ When resolving text, longer alias phrases are matched before shorter ones so the
 most specific alias wins. In the STT correction layer the precedence is:
 
 1. user vocabulary replacements (highest),
-2. ``DICTATION_REPLACEMENTS`` environment entries,
+2. the process-start ``dictation.replacements`` snapshot,
 3. built-in defaults.
 
 An alias phrase may map to exactly one canonical target. Adding a replacement or

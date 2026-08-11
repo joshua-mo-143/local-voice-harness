@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import os
 import shutil
 import signal
 import subprocess
@@ -11,7 +10,6 @@ from pathlib import Path
 
 from . import config, recorder
 from .config import (
-    DEFAULT_SOURCE,
     DICTATION_PID_PATH,
     DICTATION_RECORDER_LOG,
     DICTATION_STATE_DIR,
@@ -24,6 +22,11 @@ from .errors import HarnessError, NoSpeechError
 from .ipc import socket_ready
 from .notifications import notify
 from .stt.client import transcribe
+from .user_config import (
+    DictationSettings,
+    UserConfig,
+    default_user_config,
+)
 from .vad import SpeechDetector, VadCaptureSettings, capture_vad_audio
 
 TERMINAL_CLASSES = (
@@ -63,15 +66,12 @@ def recording_active() -> bool:
     return recorder.recording_active(PATHS)
 
 
-def start_recording() -> None:
+def start_recording(settings: DictationSettings | None = None) -> None:
     _ensure_dictation_allowed()
-    source = os.environ.get(
-        "DICTATION_SOURCE",
-        os.environ.get("VOICE_HARNESS_SOURCE", DEFAULT_SOURCE),
-    )
+    dictation = settings or default_user_config().dictation
     recorder.start_recording(
         PATHS,
-        source=source,
+        source=dictation.source,
         ready=lambda: socket_ready(STT_SOCKET),
         conflicts=(MANUAL_PATHS,),
     )
@@ -232,8 +232,8 @@ def _restore_clipboard(
         pass
 
 
-def inject(text: str) -> None:
-    mode = os.environ.get("DICTATION_INJECT", "auto").lower()
+def inject(text: str, settings: DictationSettings | None = None) -> None:
+    mode = (settings or default_user_config().dictation).inject
     if mode not in INJECT_MODES:
         raise HarnessError(
             f"invalid DICTATION_INJECT mode {mode!r}; "
@@ -292,11 +292,19 @@ def inject(text: str) -> None:
             )
 
 
-def transcribe_and_type(audio_path: Path) -> None:
-    inject(transcribe(audio_path))
+def transcribe_and_type(
+    audio_path: Path, settings: DictationSettings | None = None
+) -> None:
+    text = transcribe(audio_path)
+    if settings is None:
+        inject(text)
+    else:
+        inject(text, settings)
 
 
-def run_vad() -> None:
+def run_vad(
+    dictation_settings: DictationSettings | None = None,
+) -> None:
     if recorder.request_vad_stop(PATHS):
         notify("Stopping always-on VAD dictation…")
         print("stopping")
@@ -305,7 +313,8 @@ def run_vad() -> None:
     _ensure_dictation_allowed()
     if not socket_ready(STT_SOCKET):
         raise HarnessError("STT is stopped or still loading")
-    settings = VadCaptureSettings.from_environment()
+    dictation = dictation_settings or default_user_config().dictation
+    settings = VadCaptureSettings.from_dictation(dictation)
     detector = SpeechDetector(minimum_rms=settings.minimum_rms)
     stop_requested = threading.Event()
     previous_terminate = signal.getsignal(signal.SIGTERM)
@@ -318,17 +327,13 @@ def run_vad() -> None:
     try:
         recorder.claim_current_process(PATHS, mode="vad", conflicts=(MANUAL_PATHS,))
         claimed = True
-        source = os.environ.get(
-            "DICTATION_SOURCE",
-            os.environ.get("VOICE_HARNESS_SOURCE", DEFAULT_SOURCE),
-        )
         notify("Always-on VAD dictation enabled")
         print("listening")
         while not stop_requested.is_set():
             try:
                 capture_vad_audio(
                     PATHS.audio,
-                    source=source,
+                    source=dictation.source,
                     settings=settings,
                     detector=detector,
                     stop_requested=stop_requested,
@@ -345,7 +350,10 @@ def run_vad() -> None:
             notify("Transcribing…")
             _ensure_dictation_allowed()
             try:
-                transcribe_and_type(generation)
+                if dictation_settings is None:
+                    transcribe_and_type(generation)
+                else:
+                    transcribe_and_type(generation, dictation)
             except NoSpeechError:
                 print("no speech detected; listening")
     finally:
@@ -354,29 +362,47 @@ def run_vad() -> None:
         signal.signal(signal.SIGTERM, previous_terminate)
 
 
-def run(command: str) -> None:
+def run(command: str, user_config: UserConfig | None = None) -> None:
+    snapshot = user_config or default_user_config()
+    dictation = snapshot.dictation if user_config is not None else None
+
+    def begin() -> None:
+        if dictation is None:
+            start_recording()
+        else:
+            start_recording(dictation)
+
+    def deliver(audio_path: Path) -> None:
+        if dictation is None:
+            transcribe_and_type(audio_path)
+        else:
+            transcribe_and_type(audio_path, dictation)
+
     if command == "begin":
-        start_recording()
+        begin()
     elif command == "end":
         audio_path = stop_recording()
         _ensure_dictation_allowed()
-        transcribe_and_type(audio_path)
+        deliver(audio_path)
     elif command == "toggle":
         if recording_active():
             audio_path = stop_recording()
             _ensure_dictation_allowed()
-            transcribe_and_type(audio_path)
+            deliver(audio_path)
         else:
-            start_recording()
+            begin()
     elif command == "transcribe":
         _ensure_dictation_allowed()
         audio_path = recorder.handoff_recording(
             PATHS, active_message="cannot transcribe while dictation is recording"
         )
-        transcribe_and_type(audio_path)
+        deliver(audio_path)
     elif command == "cancel":
         cancel_recording()
     elif command == "vad":
-        run_vad()
+        if dictation is None:
+            run_vad()
+        else:
+            run_vad(dictation)
     else:
         raise HarnessError(f"unknown dictation command: {command}")

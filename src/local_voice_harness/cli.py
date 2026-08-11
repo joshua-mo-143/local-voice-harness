@@ -670,7 +670,7 @@ def dispatch(args: argparse.Namespace) -> None:
         )
         respond(transcribe(audio_path), user_config=user_config)
     elif args.command == "dictate":
-        run_dictation(args.dictation_command)
+        run_dictation(args.dictation_command, load_user_config())
     elif args.command == "text":
         user_config = load_user_config()
         respond(" ".join(args.text), user_config=user_config)

@@ -12,6 +12,7 @@ from unittest import mock
 
 from local_voice_harness import vad
 from local_voice_harness.errors import HarnessError
+from local_voice_harness.user_config import default_user_config
 
 
 def _settings(
@@ -39,22 +40,14 @@ def _process(frames: list[bytes]) -> mock.Mock:
 
 class VadSettingsTests(unittest.TestCase):
     def test_defaults_are_suitable_for_dictation(self) -> None:
-        settings = vad.VadCaptureSettings.from_environment({})
+        settings = vad.VadCaptureSettings.from_dictation(
+            default_user_config().dictation
+        )
 
         self.assertEqual(settings.end_silence_ms, 900)
         self.assertEqual(settings.max_seconds, 120)
         self.assertEqual(settings.minimum_rms, 1100)
         self.assertEqual(settings.start_speech_frames, 3)
-
-    def test_invalid_values_are_rejected(self) -> None:
-        for name, value in (
-            ("DICTATION_VAD_END_SILENCE_MS", "0"),
-            ("DICTATION_VAD_MAX_SECONDS", "forever"),
-            ("DICTATION_VAD_MIN_SPEECH_RMS", "-1"),
-            ("DICTATION_VAD_START_SPEECH_FRAMES", "1.5"),
-        ):
-            with self.subTest(name=name), self.assertRaises(HarnessError):
-                vad.VadCaptureSettings.from_environment({name: value})
 
 
 class _FakeSamples:

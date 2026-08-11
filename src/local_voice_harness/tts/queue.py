@@ -3,7 +3,6 @@ from __future__ import annotations
 import collections
 import contextlib
 import json
-import os
 import select
 import shutil
 import socket
@@ -18,7 +17,8 @@ from pathlib import Path
 
 from ..errors import HarnessError
 from ..ipc import unix_request
-from .client import PLAYBACK_LATENCY, playback_slot
+from ..user_config import AudioSettings, default_user_config
+from .client import playback_slot
 from .stream import STREAM_POLL_SECONDS, STREAM_TIMEOUT_SECONDS, TTSStreamParser
 
 PREFETCH_JOIN_SECONDS = 3.0
@@ -49,8 +49,9 @@ class PlaybackRequest:
 
 
 class PrefetchHandle:
-    def __init__(self, text: str) -> None:
+    def __init__(self, text: str, settings: AudioSettings | None = None) -> None:
         self.text = text
+        self.audio = settings or default_user_config().audio
         self.request_id = uuid.uuid4().hex
         self._event = threading.Event()
         self._result: PrefetchedUtterance | None = None
@@ -78,6 +79,7 @@ class PrefetchHandle:
                 register_socket=self._register_socket,
                 submit_request=self._submit_request,
                 clear_socket=self._clear_socket,
+                settings=self.audio,
             )
         except BaseException as exc:
             self.cancel()
@@ -209,6 +211,7 @@ def _prefetch_utterance(
     register_socket: Callable[[socket.socket], None],
     submit_request: Callable[[socket.socket, bytes], None],
     clear_socket: Callable[[socket.socket], None],
+    settings: AudioSettings | None = None,
 ) -> PrefetchedUtterance:
     from ..config import TTS_SOCKET
 
@@ -226,7 +229,7 @@ def _prefetch_utterance(
         stream_socket.setblocking(True)
         request = {
             "text": text,
-            "voice": os.environ.get("VOICE_HARNESS_VOICE", ""),
+            "voice": (settings or default_user_config().audio).voice,
             "stream": True,
             "request_id": request_id,
         }
@@ -264,7 +267,10 @@ def _prefetch_utterance(
         # Chunk files live under stream-{request_id}; playback owns cleanup after play.
 
 
-def _open_playback(sample_rate: int) -> subprocess.Popen[bytes]:
+def _open_playback(
+    sample_rate: int, settings: AudioSettings | None = None
+) -> subprocess.Popen[bytes]:
+    audio = settings or default_user_config().audio
     return subprocess.Popen(
         [
             "pw-play",
@@ -272,7 +278,7 @@ def _open_playback(sample_rate: int) -> subprocess.Popen[bytes]:
             "--channels=1",
             f"--rate={sample_rate}",
             "--format=s16",
-            f"--latency={PLAYBACK_LATENCY}",
+            f"--latency={audio.playback_latency}",
             "-",
         ],
         stdin=subprocess.PIPE,
@@ -362,7 +368,8 @@ def play_prefetched(
 
 
 class PlaybackQueue:
-    def __init__(self) -> None:
+    def __init__(self, settings: AudioSettings | None = None) -> None:
+        self._audio = settings
         self._items: collections.deque[
             tuple[PlaybackRequest, PrefetchHandle | None]
         ] = collections.deque()
@@ -381,7 +388,12 @@ class PlaybackQueue:
                 if active >= limit:
                     break
                 if handle is None:
-                    self._items[index] = (request, PrefetchHandle(request.text))
+                    created = (
+                        PrefetchHandle(request.text, self._audio)
+                        if self._audio is not None
+                        else PrefetchHandle(request.text)
+                    )
+                    self._items[index] = (request, created)
                     active += 1
 
     def __len__(self) -> int:
@@ -430,7 +442,11 @@ class PlaybackQueue:
                             break
                         request, handle = self._items[0]
                         if handle is None:
-                            handle = PrefetchHandle(request.text)
+                            handle = (
+                                PrefetchHandle(request.text, self._audio)
+                                if self._audio is not None
+                                else PrefetchHandle(request.text)
+                            )
                             self._items[0] = (request, handle)
                     try:
                         prefetched = handle.wait(
@@ -465,7 +481,7 @@ class PlaybackQueue:
                     try:
                         if process is None:
                             sample_rate = prefetched.sample_rate
-                            process = _open_playback(sample_rate)
+                            process = _open_playback(sample_rate, self._audio)
                         if process.stdin is None:
                             raise HarnessError("pw-play stdin is unavailable")
                         for index, output in enumerate(prefetched.chunks):

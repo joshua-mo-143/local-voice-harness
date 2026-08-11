@@ -303,6 +303,7 @@ class ProcessUtteranceTests(unittest.TestCase):
             trusted_utterance="what time is it",
             delivery_claims=mock.ANY,
             allow_tools=False,
+            settings=daemon.providers,
         )
         transcribe.assert_called_once_with(AUDIO_GENERATION)
         self.assertTrue(
@@ -891,6 +892,7 @@ class ProcessUtteranceTests(unittest.TestCase):
             trusted_utterance: str,
             delivery_claims: list[DeliveryClaim],
             allow_tools: bool = True,
+            settings: object | None = None,
         ) -> tuple[str, None]:
             self.assertEqual(trusted_utterance, "question")
             delivery_claims.append(
@@ -1495,7 +1497,7 @@ class AnnounceJobTests(unittest.TestCase):
             mock.patch.object(
                 wake_daemon,
                 "start_components",
-                side_effect=lambda: events.append("components-ready"),
+                side_effect=lambda _settings: events.append("components-ready"),
             ),
             mock.patch(
                 "local_voice_harness.tts.queue.PrefetchHandle",
@@ -1635,6 +1637,7 @@ class ComponentSynchronizationTests(unittest.TestCase):
             llm_endpoint="http://127.0.0.1:8090/v1/chat/completions",
             llm_timeout=1,
         )
+        daemon.providers = settings
         response = io.BytesIO(
             json.dumps(
                 {
@@ -1666,9 +1669,6 @@ class ComponentSynchronizationTests(unittest.TestCase):
 
         with (
             mock.patch.object(wake_daemon, "start_components"),
-            mock.patch.object(
-                llm_transport, "load_backend_settings", return_value=settings
-            ),
             mock.patch.object(
                 llm_transport.urllib.request,
                 "urlopen",
@@ -1707,7 +1707,7 @@ class ComponentSynchronizationTests(unittest.TestCase):
             mock.patch.object(
                 wake_daemon,
                 "start_components",
-                side_effect=lambda: events.append("started"),
+                side_effect=lambda _settings: events.append("started"),
             ),
             mock.patch.object(
                 wake_daemon,
@@ -1729,6 +1729,7 @@ class ComponentSynchronizationTests(unittest.TestCase):
         qwen_turn.assert_called_once_with(
             "Reply with only OK. Do not call a tool.",
             allow_tools=False,
+            settings=daemon.providers,
         )
 
 
