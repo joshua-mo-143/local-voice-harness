@@ -88,6 +88,55 @@ This section is the foundation for later configuration and integration
 management; runtime services continue to read the environment variables and files
 described below until they are migrated.
 
+## Configuration commands
+
+Use the CLI to inspect or persist unified settings in `config.toml`. Values are
+validated before every write, persisted atomically with owner-only permissions,
+and dictation compute selectors are mirrored into
+`~/.config/dictation/backend.env` so a service restart picks them up.
+
+```console
+voice-harness setup
+voice-harness setup --defaults
+voice-harness config show
+voice-harness config show audio.wake_threshold
+voice-harness config set providers.llm.provider venice
+voice-harness config set integrations.linear true
+voice-harness config reset --section audio
+voice-harness integrations list
+voice-harness integrations enable linear
+voice-harness integrations disable zendesk
+voice-harness integrations doctor
+```
+
+`setup` walks through provider, integration, audio, and compute choices that are
+supported on the current machine. Use `--defaults` for a non-interactive first
+write. `config set` accepts dotted keys such as `audio.wake_threshold`,
+`compute.dictation_backend`, and `platform.cursor_followup`. After a change, the
+CLI reports which installed services are currently running and need a restart,
+for example `voice-harness-wake.service` or `dictation.service`.
+
+`integrations doctor` inspects only enabled integrations. Linear uses the MCP
+capability check; GitHub reports `gh` authentication when GitHub is enabled;
+Zendesk confirms that browser capture is active.
+
+Common examples:
+
+```console
+# Hosted LLM/TTS with local dictation
+voice-harness config set providers.llm.provider venice
+voice-harness config set providers.tts.provider venice
+voice-harness credentials set
+
+# Tighter wake sensitivity and faster playback drain
+voice-harness config set audio.wake_threshold 0.65
+voice-harness config set audio.playback_quiet_timeout_seconds 1.5
+
+# Enable optional ticket context providers
+voice-harness integrations enable linear
+voice-harness integrations doctor
+```
+
 ## AI backends
 
 LLM and TTS providers are selected independently in

@@ -15,6 +15,16 @@ from .agents.service import (
 from .agents.service import agent_turn as cursor_turn
 from .agents.store import QuarantineEvidence
 from .app import respond, status
+from .config_management import (
+    commit_config_change,
+    format_restart_notice,
+    list_integrations,
+    reset_config,
+    run_integration_doctor,
+    run_setup,
+    set_integration_enabled,
+    show_config,
+)
 from .credentials import (
     delete_venice_api_key,
     get_venice_api_key,
@@ -79,6 +89,75 @@ def parser() -> argparse.ArgumentParser:
     text = commands.add_parser("text")
     text.add_argument("text", nargs="+")
     commands.add_parser("status")
+    setup = commands.add_parser(
+        "setup",
+        help="interactive first-run configuration for providers, integrations, and audio",
+    )
+    setup.add_argument(
+        "--defaults",
+        action="store_true",
+        help="write recommended defaults without prompting",
+    )
+
+    config = commands.add_parser(
+        "config", help="inspect or update unified configuration"
+    )
+    config_commands = config.add_subparsers(dest="config_command", required=True)
+    config_show = config_commands.add_parser("show", help="print stored configuration")
+    config_show.add_argument("key", nargs="?", help="optional dotted configuration key")
+    config_show.add_argument(
+        "--json",
+        action="store_true",
+        dest="json_output",
+        help="emit machine-readable output",
+    )
+    config_set = config_commands.add_parser(
+        "set", help="validate and persist one setting"
+    )
+    config_set.add_argument("key", help="dotted configuration key")
+    config_set.add_argument("value", help="new value")
+    config_reset = config_commands.add_parser(
+        "reset", help="restore defaults for one section or the whole file"
+    )
+    config_reset.add_argument(
+        "--section",
+        choices=("providers", "integrations", "compute", "audio", "platform"),
+        help="reset only one section",
+    )
+
+    integrations = commands.add_parser(
+        "integrations", help="manage optional context and routing integrations"
+    )
+    integration_commands = integrations.add_subparsers(
+        dest="integration_command", required=True
+    )
+    integration_list = integration_commands.add_parser(
+        "list", help="show which integrations are enabled"
+    )
+    integration_list.add_argument(
+        "--json",
+        action="store_true",
+        dest="json_output",
+        help="emit machine-readable output",
+    )
+    integration_enable = integration_commands.add_parser(
+        "enable", help="enable one integration"
+    )
+    integration_enable.add_argument("name")
+    integration_disable = integration_commands.add_parser(
+        "disable", help="disable one integration"
+    )
+    integration_disable.add_argument("name")
+    integration_doctor = integration_commands.add_parser(
+        "doctor", help="inspect enabled integrations only"
+    )
+    integration_doctor.add_argument(
+        "--json",
+        action="store_true",
+        dest="json_output",
+        help="emit machine-readable diagnostics",
+    )
+
     plan_approval = commands.add_parser(
         "plan-approval",
         help="inspect or disable automatic Cursor plan approval",
@@ -422,6 +501,31 @@ def dispatch(args: argparse.Namespace) -> None:
         respond(" ".join(args.text))
     elif args.command == "status":
         status()
+    elif args.command == "setup":
+        run_setup(defaults_only=args.defaults)
+    elif args.command == "config":
+        if args.config_command == "show":
+            print(show_config(key=args.key, json_output=args.json_output))
+        elif args.config_command == "set":
+            result = commit_config_change({args.key: args.value})
+            print(format_restart_notice(result.restart_services))
+        else:
+            result = reset_config(section=args.section)
+            print(format_restart_notice(result.restart_services))
+    elif args.command == "integrations":
+        if args.integration_command == "list":
+            print(list_integrations(json_output=args.json_output))
+        elif args.integration_command == "enable":
+            result = set_integration_enabled(args.name, enabled=True)
+            print(format_restart_notice(result.restart_services))
+        elif args.integration_command == "disable":
+            result = set_integration_enabled(args.name, enabled=False)
+            print(format_restart_notice(result.restart_services))
+        else:
+            exit_code, output = run_integration_doctor(json_output=args.json_output)
+            print(output)
+            if exit_code:
+                raise SystemExit(exit_code)
     elif args.command == "plan-approval":
         preferences = (
             set_plan_approval_mode(PlanApprovalMode.ASK)

@@ -7,6 +7,9 @@ configuration and durable state to ignored paths in the checkout:
 
 ```fish
 scripts/dev.sh text "What is two plus two?"
+scripts/dev.sh setup --defaults
+scripts/dev.sh config show audio.wake_threshold
+scripts/dev.sh integrations list
 ```
 
 The launcher sets `XDG_CONFIG_HOME` to `.dev/config` and `XDG_STATE_HOME` to
@@ -38,8 +41,9 @@ Before starting, `scripts/dev.sh wake` checks
 `voice-harness-wake.service`. It refuses to run when that unit is active and prints
 the stop and restore commands; it also refuses to run if the service state cannot
 be checked safely. The launcher never stops, restarts, edits, or installs a service.
-Its command surface is intentionally limited to `text` and `wake`, so it does not
-expose service or credential management.
+Its command surface is intentionally limited to `text`, `wake`, and the branch-local
+configuration helpers (`setup`, `config`, and `integrations`), so it does not expose
+service or credential management.
 
 This is branch testing isolation, not a complete runtime profile:
 
