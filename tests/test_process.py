@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import os
 import signal
+import subprocess
+import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -90,6 +93,62 @@ class ProcessHandleTests(unittest.TestCase):
             [call.args[1] for call in send.call_args_list],
             [signal.SIGTERM, signal.SIGKILL],
         )
+
+
+class CommandProcessGroupTests(unittest.TestCase):
+    def test_command_runs_as_new_session_leader(self) -> None:
+        completed = process.run_command(
+            [
+                sys.executable,
+                "-c",
+                "import os; print(os.getpid() == os.getsid(0))",
+            ],
+            timeout=2,
+        )
+
+        self.assertEqual(completed.returncode, 0)
+        self.assertEqual(completed.stdout.strip(), "True")
+
+    def test_timeout_stops_child_that_survives_its_parent(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            marker = root / "late-mutation"
+            child_pid_path = root / "child-pid"
+            child_code = (
+                "import signal, sys, time; "
+                "from pathlib import Path; "
+                "signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+                "time.sleep(0.5); "
+                "Path(sys.argv[1]).write_text('mutated')"
+            )
+            parent_code = (
+                "import subprocess, sys, time; "
+                "from pathlib import Path; "
+                "child = subprocess.Popen([sys.executable, '-c', sys.argv[1], "
+                "sys.argv[2]]); "
+                "Path(sys.argv[3]).write_text(str(child.pid)); "
+                "time.sleep(10)"
+            )
+
+            with self.assertRaises(subprocess.TimeoutExpired):
+                process.run_command(
+                    [
+                        sys.executable,
+                        "-c",
+                        parent_code,
+                        child_code,
+                        str(marker),
+                        str(child_pid_path),
+                    ],
+                    timeout=0.1,
+                    terminate_grace=0.05,
+                )
+
+            child_pid = int(child_pid_path.read_text())
+            with self.assertRaises(ProcessLookupError):
+                os.kill(child_pid, 0)
+            time.sleep(0.6)
+            self.assertFalse(marker.exists())
 
 
 class WakeStateTests(unittest.TestCase):

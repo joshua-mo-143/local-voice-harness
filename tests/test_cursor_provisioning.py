@@ -2911,7 +2911,7 @@ class CursorJobStateTests(unittest.TestCase):
             mock.patch.object(jobs, "HerdrClient", return_value=client),
             mock.patch.object(jobs, "_stop_worker", return_value=False),
             mock.patch(
-                "local_voice_harness.integrations.herdr.repository.subprocess.run",
+                "local_voice_harness.integrations.herdr.repository.run_command",
                 side_effect=AssertionError("real service operation attempted"),
             ) as service_operation,
         ):

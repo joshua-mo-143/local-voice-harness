@@ -4,6 +4,7 @@ import subprocess
 import tempfile
 from pathlib import Path
 
+from ...process import run_command
 from ..rofi import choose_repository, confirm_clone
 from .types import (
     HOME_ROOT,
@@ -115,12 +116,9 @@ class HerdrRepository:
                 staging = Path(temporary) / name
                 if checkpoint is not None:
                     checkpoint()
-                process = subprocess.run(
+                process = run_command(
                     ["git", "clone", "--", url, str(staging)],
-                    capture_output=True,
-                    text=True,
                     timeout=300,
-                    check=False,
                 )
                 if checkpoint is not None:
                     checkpoint()
@@ -138,7 +136,13 @@ class HerdrRepository:
                     checkpoint()
         except HerdrError:
             raise
-        except (OSError, subprocess.TimeoutExpired) as exc:
+        except subprocess.TimeoutExpired as exc:
+            raise HerdrError(
+                "Could not clone repository: command timed out; "
+                "the clone outcome is ambiguous",
+                code="repository_clone_ambiguous",
+            ) from exc
+        except OSError as exc:
             raise HerdrError(f"Could not clone repository: {exc}") from exc
         return destination
 
