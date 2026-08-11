@@ -60,6 +60,7 @@ class HerdrSession:
         before_agent: PromptBoundary | None = None,
         after_submit: PromptBoundary | None = None,
         active_marker: str | None = None,
+        allow_interactive_plan_boundary: bool = False,
         allow_enter_fallback: bool = True,
     ) -> PromptOutcome:
         started_at = time.monotonic()
@@ -109,6 +110,29 @@ class HerdrSession:
         )
         acceptance_recorded = False
         observed_acceptance = False
+        interactive_plan_boundary = False
+
+        def expected_interactive_plan_boundary(agent: dict[str, Any]) -> bool:
+            if (
+                not allow_interactive_plan_boundary
+                or active_marker != "WORKFLOW_PLAN"
+                or str(agent.get("agent_status") or "") not in {"working", "blocked"}
+            ):
+                return False
+            output = self._client.run_text(
+                "agent",
+                "read",
+                target,
+                "--source",
+                "recent-unwrapped",
+                "--lines",
+                "160",
+            )
+            return bool(
+                extract_marker(output, "WORKFLOW_PLAN", token)
+                and not extract_marker(output, "VOICE_QUESTION", token)
+            )
+
         try:
             if after_submit is not None:
                 after_submit(before)
@@ -133,10 +157,12 @@ class HerdrSession:
             if checkpoint is not None:
                 checkpoint()
             if current.get("interactive_ready") is False:
-                raise HerdrError(
-                    f"Herdr agent {target} opened an interactive questionnaire",
-                    code="interactive_questionnaire",
-                )
+                interactive_plan_boundary = expected_interactive_plan_boundary(current)
+                if not interactive_plan_boundary:
+                    raise HerdrError(
+                        f"Herdr agent {target} opened an interactive questionnaire",
+                        code="interactive_questionnaire",
+                    )
             if (
                 current.get("state_change_seq") == before.get("state_change_seq")
                 and current.get("agent_status") in SETTLED
@@ -151,7 +177,7 @@ class HerdrSession:
                 accepted()
                 acceptance_recorded = True
             deadline = time.monotonic() + AGENT_PROMPT_WAIT_SECONDS + 5
-            while process.poll() is None:
+            while process.poll() is None and not interactive_plan_boundary:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     break
@@ -176,10 +202,17 @@ class HerdrSession:
                         != before.get("state_change_seq")
                     )
                     if current.get("interactive_ready") is False:
-                        raise HerdrError(
-                            f"Herdr agent {target} opened an interactive questionnaire",
-                            code="interactive_questionnaire",
-                        ) from None
+                        interactive_plan_boundary = expected_interactive_plan_boundary(
+                            current
+                        )
+                        if not interactive_plan_boundary:
+                            raise HerdrError(
+                                f"Herdr agent {target} opened an interactive "
+                                "questionnaire",
+                                code="interactive_questionnaire",
+                            ) from None
+            if interactive_plan_boundary and process.poll() is None:
+                process.kill()
             stdout, stderr = process.communicate(timeout=AGENT_PROMPT_WAIT_SECONDS + 5)
             if checkpoint is not None:
                 checkpoint()
@@ -187,7 +220,9 @@ class HerdrSession:
             process.kill()
             process.wait()
             raise
-        if process.returncode:
+        if interactive_plan_boundary:
+            pass
+        elif process.returncode:
             try:
                 self._client.decode(stdout or stderr)
             except HerdrError as exc:
@@ -233,6 +268,7 @@ class HerdrSession:
             checkpoint=checkpoint,
             expected_agent_session=expected_agent_session,
             active_marker=active_marker,
+            allow_interactive_plan_boundary=allow_interactive_plan_boundary,
         )
 
     def wait_for_stable_completion(
@@ -247,6 +283,7 @@ class HerdrSession:
         checkpoint: Checkpoint | None = None,
         expected_agent_session: str | None = None,
         active_marker: str | None = None,
+        allow_interactive_plan_boundary: bool = False,
     ) -> PromptOutcome:
         """Wait for stable completion or an opt-in active marker boundary."""
 
@@ -310,7 +347,14 @@ class HerdrSession:
             boundary = (
                 extract_marker(output, active_marker, token) if active_marker else None
             )
-            if agent.get("interactive_ready") is False:
+            expected_plan_boundary = bool(
+                allow_interactive_plan_boundary
+                and active_marker == "WORKFLOW_PLAN"
+                and boundary
+                and not question
+                and status in {"working", "blocked"}
+            )
+            if agent.get("interactive_ready") is False and not expected_plan_boundary:
                 raise HerdrError(
                     f"Herdr agent {target} opened an interactive questionnaire",
                     code="interactive_questionnaire",

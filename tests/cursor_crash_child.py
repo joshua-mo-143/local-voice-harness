@@ -161,6 +161,7 @@ class PromptHerdr(PersistentHerdr):
         before_agent: Callable[[dict[str, Any]], None] | None = None,
         after_submit: Callable[[dict[str, Any]], None] | None = None,
         active_marker: str | None = None,
+        allow_interactive_plan_boundary: bool = False,
         allow_enter_fallback: bool = True,
     ) -> PromptOutcome:
         del (
@@ -172,6 +173,7 @@ class PromptHerdr(PersistentHerdr):
             before_agent,
             after_submit,
             active_marker,
+            allow_interactive_plan_boundary,
             allow_enter_fallback,
         )
         if before_submit is None or accepted is None:
@@ -461,6 +463,7 @@ def _run_effect(root: Path, effect: str, point: str) -> None:
                     "workspace_id": "workspace-1",
                     "cwd": str(checkout.resolve()),
                     "state_change_seq": 7,
+                    "agent_session": "planner-session",
                 },
             )
         client = PromptHerdr(effects, kill)

@@ -312,6 +312,7 @@ _STRING_FIELDS = frozenset(
         "prompt_operation_state",
         "prompt_operation_phase",
         "prompt_operation_target",
+        "prompt_operation_agent_session",
         "participant_creation_state",
         "participant_creation_participant",
         "participant_creation_target",
@@ -1694,6 +1695,10 @@ class AgentJob:
     @property
     def prompt_operation_target(self) -> str | None:
         return self._optional_string("prompt_operation_target")
+
+    @property
+    def prompt_operation_agent_session(self) -> str | None:
+        return self._optional_string("prompt_operation_agent_session")
 
     @property
     def participant_creation_state(self) -> str:

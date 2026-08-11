@@ -71,7 +71,6 @@ from .model import (
 from .prompts import (
     classification_prompt,
     implementation_prompt,
-    plan_approval_prompt,
     planning_prompt,
     review_prompt,
     revision_prompt,
@@ -1406,6 +1405,7 @@ def _begin_phase_turn(
             prompt_operation_phase=None,
             prompt_operation_turn=None,
             prompt_operation_target=None,
+            prompt_operation_agent_session=None,
             prompt_baseline_sequence=None,
         )
 
@@ -1595,15 +1595,6 @@ def _advance_workflow_output(
             )
             return None
         if decision == "approve":
-            planner_target = job.participant_target(WorkflowParticipant.PLANNER)
-            if not planner_target:
-                _workflow_block(
-                    store,
-                    job.id,
-                    worker_token,
-                    "The approved plan has no live Plan Mode agent.",
-                )
-                return None
             plan = store.read_artifact(job.id, job.plan_artifact, kind="plan")
             auto_approval = _auto_plan_approval_allowed(
                 job,
@@ -1617,8 +1608,6 @@ def _advance_workflow_output(
                 if auto_approval:
                     return current.evolve(
                         workflow_phase=WorkflowPhase.IMPLEMENTING.value,
-                        active_participant=WorkflowParticipant.PLANNER.value,
-                        herdr_target=planner_target,
                         review_artifact=reference,
                         prompt_operation_state="none",
                         review_approved=True,
@@ -1632,7 +1621,8 @@ def _advance_workflow_output(
                     current,
                     QuestionSpec(
                         "The reviewed implementation plan is ready. Should I "
-                        "approve Cursor's Build step and start implementation? "
+                        "approve it and start implementation in a fresh Agent-mode "
+                        "session? "
                         "Say yes to implement it, or no to cancel this job.",
                         sensitivity=QuestionSensitivity.ARCHITECTURE,
                     ),
@@ -2098,14 +2088,9 @@ def _execute_phase_prompt(
             baseline = int(raw_baseline) if isinstance(raw_baseline, int | str) else 0
         except (TypeError, ValueError) as exc:
             raise HarnessError("Herdr returned an invalid prompt sequence") from exc
-        if job.plan_approval_state == "approved" and (
-            baseline != job.plan_approval_state_change_sequence
-            or agent_session_identity(baseline_agent.get("agent_session"))
-            != job.plan_approval_agent_session
-        ):
-            raise HarnessError(
-                "Cursor Plan Mode boundary changed before approval submission"
-            )
+        baseline_session = agent_session_identity(baseline_agent.get("agent_session"))
+        if baseline_session is None:
+            raise HarnessError("Herdr returned no agent session for prompt fencing")
 
         def plan_prompt(current: CursorJob) -> CursorJob:
             if (
@@ -2119,6 +2104,7 @@ def _execute_phase_prompt(
                 prompt_operation_phase=phase.value,
                 prompt_operation_turn=current.turn,
                 prompt_operation_target=target,
+                prompt_operation_agent_session=baseline_session,
                 prompt_baseline_sequence=baseline,
                 continuation=(
                     False
@@ -2144,13 +2130,10 @@ def _execute_phase_prompt(
         observed = client.get_agent(target)
         checkpoint()
         sequence = int(observed.get("state_change_seq") or 0)
-        approval_session_matches = (
-            job.plan_approval_state != "approved"
-            or agent_session_identity(observed.get("agent_session"))
-            == job.plan_approval_agent_session
-        )
+        observed_session = agent_session_identity(observed.get("agent_session"))
         if (
-            approval_session_matches
+            observed_session == job.prompt_operation_agent_session
+            and observed_session is not None
             and job.prompt_baseline_sequence is not None
             and job.prompt_baseline_sequence >= 0
             and sequence != job.prompt_baseline_sequence
@@ -2213,17 +2196,14 @@ def _execute_phase_prompt(
                 target,
                 token=job.turn_token or "",
                 checkpoint=checkpoint,
-                expected_agent_session=(
-                    job.plan_approval_agent_session
-                    if phase == WorkflowPhase.IMPLEMENTING
-                    and job.plan_approval_source in {"auto", "explicit"}
-                    else None
-                ),
+                expected_agent_session=job.prompt_operation_agent_session,
                 active_marker=(
                     "WORKFLOW_PLAN"
                     if phase in {WorkflowPhase.PLANNING, WorkflowPhase.REVISING}
                     else None
                 ),
+                allow_interactive_plan_boundary=phase
+                in {WorkflowPhase.PLANNING, WorkflowPhase.REVISING},
             )
             completion = (outcome.output, outcome.status)
             if phase in {WorkflowPhase.PLANNING, WorkflowPhase.REVISING}:
@@ -2273,18 +2253,6 @@ def _execute_phase_prompt(
         raise HarnessError(f"invalid durable prompt state {state}")
 
     operation_baseline = job.prompt_baseline_sequence
-
-    def before_agent(agent: dict[str, object]) -> None:
-        if job.plan_approval_state != "approved":
-            return
-        if (
-            agent_session_identity(agent.get("agent_session"))
-            != job.plan_approval_agent_session
-            or _state_change_sequence(agent) != job.plan_approval_state_change_sequence
-        ):
-            raise HarnessError(
-                "Cursor Plan Mode boundary changed before approval submission"
-            )
 
     def before_submit(observed_baseline: int) -> None:
         if observed_baseline != operation_baseline:
@@ -2339,18 +2307,14 @@ def _execute_phase_prompt(
             baseline_sequence=job.prompt_baseline_sequence,
             before_submit=before_submit,
             accepted=accepted,
-            before_agent=before_agent,
-            expected_agent_session=(
-                job.plan_approval_agent_session
-                if job.plan_approval_state == "approved"
-                else None
-            ),
+            expected_agent_session=job.prompt_operation_agent_session,
             active_marker=(
                 "WORKFLOW_PLAN"
                 if phase in {WorkflowPhase.PLANNING, WorkflowPhase.REVISING}
                 else None
             ),
-            allow_enter_fallback=job.plan_approval_state != "approved",
+            allow_interactive_plan_boundary=phase
+            in {WorkflowPhase.PLANNING, WorkflowPhase.REVISING},
         )
     except HerdrError as exc:
         if exc.code == "interactive_questionnaire":
@@ -2436,11 +2400,7 @@ def _run_tiered_workflow(
             WorkflowParticipant.REVIEWER
             if phase == WorkflowPhase.REVIEWING
             else (
-                (
-                    WorkflowParticipant.PLANNER
-                    if job.plan_approval_state in {"approved", "observed"}
-                    else WorkflowParticipant.IMPLEMENTER
-                )
+                WorkflowParticipant.IMPLEMENTER
                 if phase == WorkflowPhase.IMPLEMENTING
                 else WorkflowParticipant.PLANNER
             )
@@ -2510,29 +2470,16 @@ def _run_tiered_workflow(
             issue_reference = job.issue_key or (
                 f"issue {job.github_issue}" if job.github_issue else None
             )
-            if job.plan_approval_state in {"approved", "observed"}:
-                if plan is None:
-                    raise HarnessError("plan approval requires a durable plan")
-                prompt = plan_approval_prompt(
-                    _prompt_request(job),
-                    token,
-                    plan=plan,
-                    github_issue_context=job.github_issue_context,
-                    classification_reason=job.workflow_classification_reason,
-                    issue_reference=issue_reference,
-                    integration_instructions=integration_instructions,
-                )
-            else:
-                prompt = implementation_prompt(
-                    _prompt_request(job),
-                    token,
-                    plan=plan,
-                    continuation=job.continuation or bool(job.continuation_answer),
-                    github_issue_context=job.github_issue_context,
-                    classification_reason=job.workflow_classification_reason,
-                    issue_reference=issue_reference,
-                    integration_instructions=integration_instructions,
-                )
+            prompt = implementation_prompt(
+                _prompt_request(job),
+                token,
+                plan=plan,
+                continuation=job.continuation or bool(job.continuation_answer),
+                github_issue_context=job.github_issue_context,
+                classification_reason=job.workflow_classification_reason,
+                issue_reference=issue_reference,
+                integration_instructions=integration_instructions,
+            )
         else:
             raise HarnessError(f"unsupported workflow phase {phase.value}")
         pending_output = _execute_phase_prompt(

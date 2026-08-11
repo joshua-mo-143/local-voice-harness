@@ -418,6 +418,7 @@ def reconcile_prompt_and_pane_operations(
             client.ensure_server()
             agent = client.get_agent(target)
             sequence = int(agent.get("state_change_seq") or 0)
+            session = agent_session_identity(agent.get("agent_session"))
         except (HerdrError, TypeError, ValueError):
             # A failed observation carries no evidence. Keep the submit fence.
             return
@@ -428,13 +429,9 @@ def reconcile_prompt_and_pane_operations(
                 or current.prompt_operation_target != target
             ):
                 return None
-            approval_session_matches = (
-                current.plan_approval_state != "approved"
-                or agent_session_identity(agent.get("agent_session"))
-                == current.plan_approval_agent_session
-            )
             accepted = (
-                approval_session_matches
+                session is not None
+                and session == current.prompt_operation_agent_session
                 and current.prompt_baseline_sequence is not None
                 and current.prompt_baseline_sequence >= 0
                 and sequence != current.prompt_baseline_sequence
@@ -642,6 +639,7 @@ def cancel_target_and_release(
                     prompt_operation_phase=None,
                     prompt_operation_turn=None,
                     prompt_operation_target=None,
+                    prompt_operation_agent_session=None,
                     prompt_baseline_sequence=None,
                     participant_creation_state="none",
                     participant_creation_participant=None,
@@ -904,6 +902,7 @@ def _reconcile_interactive_questionnaire(
                 prompt_operation_phase=None,
                 prompt_operation_turn=None,
                 prompt_operation_target=None,
+                prompt_operation_agent_session=None,
                 prompt_baseline_sequence=None,
                 worker_pid=None,
                 worker_boot_id=None,

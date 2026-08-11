@@ -624,6 +624,7 @@ class CursorRecoveryTests(unittest.TestCase):
                 "prompt_operation_phase": "classifying",
                 "prompt_operation_turn": 1,
                 "prompt_operation_target": "planner",
+                "prompt_operation_agent_session": "planner-session",
                 "prompt_baseline_sequence": 7,
             }
         )
@@ -642,7 +643,10 @@ class CursorRecoveryTests(unittest.TestCase):
         )
 
         visible = mock.Mock()
-        visible.get_agent.return_value = {"state_change_seq": 8}
+        visible.get_agent.return_value = {
+            "state_change_seq": 8,
+            "agent_session": "planner-session",
+        }
         reconcile_prompt_and_pane_operations(
             self.store,
             self.store.get("123456789abc"),
@@ -706,6 +710,7 @@ class CursorRecoveryTests(unittest.TestCase):
                 prompt_operation_phase="implementing",
                 prompt_operation_turn=4,
                 prompt_operation_target="planner",
+                prompt_operation_agent_session="original-session",
                 prompt_baseline_sequence=7,
             ),
         )
