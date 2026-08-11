@@ -237,9 +237,9 @@ def plan_approval_prompt(
     classification_reason: str | None = None,
     integration_instructions: tuple[str, ...] = (),
 ) -> str:
-    """Approve Cursor's Plan Mode gate and bind implementation output."""
+    """Build a fresh-agent implementation prompt for an approved plan."""
 
-    return "lgtm. Implement the approved plan.\n\n" + implementation_prompt(
+    return implementation_prompt(
         text,
         token,
         plan=plan,

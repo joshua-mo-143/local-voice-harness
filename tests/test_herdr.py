@@ -612,6 +612,144 @@ WORKFLOW_PLAN[token]: <bounded multiline implementation plan>
 
         self.assertEqual(raised.exception.code, "interactive_questionnaire")
 
+    def test_expected_plan_boundary_can_be_captured_without_mode_switch(self) -> None:
+        client = herdr.HerdrClient("herdr")
+        agent = {
+            "agent_status": "blocked",
+            "state_change_seq": 7,
+            "revision": 11,
+            "agent_session": {"id": "session", "generation": 2},
+            "interactive_ready": False,
+        }
+        with (
+            mock.patch.object(client, "get_agent", return_value=agent),
+            mock.patch.object(
+                client,
+                "run_text",
+                return_value="WORKFLOW_PLAN[token]: implement safely",
+            ),
+            mock.patch(
+                "local_voice_harness.integrations.herdr.transport.time.monotonic",
+                side_effect=[0, 0, 1],
+            ),
+            mock.patch("local_voice_harness.integrations.herdr.transport.time.sleep"),
+        ):
+            outcome = client.wait_for_stable_completion(
+                "agent",
+                token="token",
+                active_marker="WORKFLOW_PLAN",
+                allow_interactive_plan_boundary=True,
+                quiet_period=1,
+            )
+
+        self.assertEqual(outcome.boundary_marker, "WORKFLOW_PLAN")
+        self.assertEqual(outcome.status, "blocked")
+        self.assertEqual(outcome.state_change_sequence, 7)
+        self.assertEqual(outcome.revision, 11)
+
+    def test_generic_questionnaire_stays_blocked_at_expected_plan_boundary(
+        self,
+    ) -> None:
+        client = herdr.HerdrClient("herdr")
+        with (
+            mock.patch.object(
+                client,
+                "get_agent",
+                return_value={
+                    "agent_status": "blocked",
+                    "state_change_seq": 7,
+                    "agent_session": "session",
+                    "interactive_ready": False,
+                },
+            ),
+            mock.patch.object(client, "run_text", return_value="Choose an option"),
+            self.assertRaises(herdr.HerdrError) as raised,
+        ):
+            client.wait_for_stable_completion(
+                "agent",
+                token="token",
+                active_marker="WORKFLOW_PLAN",
+                allow_interactive_plan_boundary=True,
+            )
+
+        self.assertEqual(raised.exception.code, "interactive_questionnaire")
+
+    def test_prompt_wait_detaches_from_expected_native_plan_boundary(self) -> None:
+        client = herdr.HerdrClient("herdr")
+        process = mock.Mock()
+        process.poll.return_value = None
+        process.communicate.return_value = ("", "")
+        outcome = herdr.PromptOutcome(
+            "blocked",
+            None,
+            None,
+            "WORKFLOW_PLAN[token]: implement safely",
+            boundary_marker="WORKFLOW_PLAN",
+            agent_session="planner-session",
+            state_change_sequence=2,
+            revision=3,
+        )
+        client.get_agent = mock.Mock(
+            side_effect=[
+                {
+                    "interactive_ready": True,
+                    "agent_status": "idle",
+                    "state_change_seq": 1,
+                    "agent_session": "planner-session",
+                },
+                {
+                    "interactive_ready": False,
+                    "agent_status": "blocked",
+                    "state_change_seq": 2,
+                    "agent_session": "planner-session",
+                },
+                {
+                    "interactive_ready": False,
+                    "agent_status": "blocked",
+                    "state_change_seq": 2,
+                    "agent_session": "planner-session",
+                },
+            ]
+        )
+        client.run_text = mock.Mock(
+            return_value="WORKFLOW_PLAN[token]: implement safely"
+        )
+        accepted = mock.Mock()
+        with (
+            mock.patch("subprocess.Popen", return_value=process),
+            mock.patch("time.sleep"),
+            mock.patch.object(
+                client.session,
+                "wait_for_stable_completion",
+                return_value=outcome,
+            ) as wait,
+        ):
+            captured = client.prompt_and_wait(
+                "planner",
+                "create a plan",
+                token="token",
+                baseline_sequence=1,
+                expected_agent_session="planner-session",
+                accepted=accepted,
+                active_marker="WORKFLOW_PLAN",
+                allow_interactive_plan_boundary=True,
+            )
+
+        self.assertEqual(captured, outcome)
+        accepted.assert_called_once_with()
+        process.kill.assert_called_once_with()
+        wait.assert_called_once_with(
+            "planner",
+            token="token",
+            inactivity_timeout=mock.ANY,
+            max_runtime=mock.ANY,
+            started_at=mock.ANY,
+            checkpoint=None,
+            expected_agent_session="planner-session",
+            active_marker="WORKFLOW_PLAN",
+            allow_interactive_plan_boundary=True,
+        )
+
     def test_prompt_wait_timeout_continues_with_stable_observer(self) -> None:
         client = herdr.HerdrClient("herdr")
         expected = herdr.PromptOutcome(

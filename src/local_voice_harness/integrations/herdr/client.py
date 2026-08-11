@@ -273,6 +273,7 @@ class HerdrClient:
         before_agent: PromptBoundary | None = None,
         after_submit: PromptBoundary | None = None,
         active_marker: str | None = None,
+        allow_interactive_plan_boundary: bool = False,
         allow_enter_fallback: bool = True,
     ) -> PromptOutcome:
         return self.session.prompt_and_wait(
@@ -289,6 +290,7 @@ class HerdrClient:
             before_agent=before_agent,
             after_submit=after_submit,
             active_marker=active_marker,
+            allow_interactive_plan_boundary=allow_interactive_plan_boundary,
             allow_enter_fallback=allow_enter_fallback,
         )
 
@@ -304,6 +306,7 @@ class HerdrClient:
         checkpoint: Checkpoint | None = None,
         expected_agent_session: str | None = None,
         active_marker: str | None = None,
+        allow_interactive_plan_boundary: bool = False,
     ) -> PromptOutcome:
         return self.session.wait_for_stable_completion(
             target,
@@ -315,6 +318,7 @@ class HerdrClient:
             checkpoint=checkpoint,
             expected_agent_session=expected_agent_session,
             active_marker=active_marker,
+            allow_interactive_plan_boundary=allow_interactive_plan_boundary,
         )
 
     def cancel_agent(self, target: str) -> None:

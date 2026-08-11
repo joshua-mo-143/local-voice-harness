@@ -93,7 +93,7 @@ class CursorPromptTests(unittest.TestCase):
         self.assertIn("Issue requires crash recovery.", prompt)
         self.assertIn("Persistence changes force high-risk.", prompt)
 
-    def test_plan_approval_prompt_approves_gate_and_binds_completion_token(
+    def test_plan_approval_prompt_binds_fresh_implementation_token(
         self,
     ) -> None:
         prompt = plan_approval_prompt(
@@ -102,7 +102,8 @@ class CursorPromptTests(unittest.TestCase):
             plan="Preserve atomic replacement.",
         )
 
-        self.assertTrue(prompt.startswith("lgtm. Implement the approved plan."))
+        self.assertTrue(prompt.startswith("Implement the following user request"))
+        self.assertNotIn("lgtm", prompt)
         self.assertIn("Implement only from this approved plan", prompt)
         self.assertIn("VOICE_SUMMARY[turn]", prompt)
         self.assertIn("WORKFLOW_PROMOTE[turn]", prompt)

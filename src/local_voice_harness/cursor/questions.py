@@ -576,8 +576,7 @@ def _workflow_review_exhausted_answer(
                 "to cancel the job."
             ),
         )
-    planner_target = job.participant_target(WorkflowParticipant.PLANNER)
-    if not planner_target or job.plan_approval_state != "boundary":
+    if job.plan_approval_state != "boundary":
         return AnswerTransition(
             None,
             message="The reviewed Plan Mode boundary is no longer available.",
@@ -589,9 +588,7 @@ def _workflow_review_exhausted_answer(
             resolution,
             context,
             continuation=False,
-            herdr_target=planner_target,
             workflow_phase=WorkflowPhase.IMPLEMENTING.value,
-            active_participant=WorkflowParticipant.PLANNER.value,
             review_approved=True,
             review_approval_source="user",
             extra_changes={
@@ -621,12 +618,10 @@ def _workflow_plan_approval_answer(
         )
     if not confirmation:
         return AnswerTransition(None, cancel=True)
-    planner_target = job.participant_target(WorkflowParticipant.PLANNER)
     if (
         job.plan_approval_state != "awaiting"
         or not job.review_approved
         or not job.plan_artifact
-        or not planner_target
     ):
         return AnswerTransition(
             None,
@@ -639,9 +634,7 @@ def _workflow_plan_approval_answer(
             resolution,
             context,
             continuation=False,
-            herdr_target=planner_target,
             workflow_phase=WorkflowPhase.IMPLEMENTING.value,
-            active_participant=WorkflowParticipant.PLANNER.value,
             extra_changes={
                 "plan_approval_state": "approved",
                 "plan_approval_source": "explicit",

@@ -427,13 +427,8 @@ class DurablePromptOperationTests(unittest.TestCase):
         client.get_agent.return_value = agent
 
         def prompt(*_args: object, **kwargs: object) -> PromptOutcome:
-            before_agent = cast(
-                Callable[[dict[str, object]], None],
-                kwargs["before_agent"],
-            )
             before_submit = cast(Callable[[int], None], kwargs["before_submit"])
             accepted = cast(Callable[[], None], kwargs["accepted"])
-            before_agent(agent)
             before_submit(7)
             accepted()
             return PromptOutcome(
@@ -471,8 +466,8 @@ class DurablePromptOperationTests(unittest.TestCase):
         self.assertEqual(current.plan_approval_state, "observed")
         self.assertTrue(current.plan_approval_counted)
         self.assertEqual(preferences.explicit_approval_count, 1)
-        self.assertFalse(
-            client.prompt_and_wait.call_args.kwargs["allow_enter_fallback"]
+        self.assertTrue(
+            client.prompt_and_wait.call_args.kwargs.get("allow_enter_fallback", True)
         )
         self.assertEqual(
             client.prompt_and_wait.call_args.kwargs["expected_agent_session"],
@@ -528,6 +523,7 @@ class DurablePromptOperationTests(unittest.TestCase):
                 prompt_operation_phase="implementing",
                 prompt_operation_turn=4,
                 prompt_operation_target="planner",
+                prompt_operation_agent_session="planner-session",
                 prompt_baseline_sequence=7,
             ),
         )
@@ -587,6 +583,7 @@ class DurablePromptOperationTests(unittest.TestCase):
                 prompt_operation_phase="implementing",
                 prompt_operation_turn=4,
                 prompt_operation_target="planner",
+                prompt_operation_agent_session="planner-session",
                 prompt_baseline_sequence=7,
             ),
         )
@@ -759,7 +756,10 @@ class DurablePromptOperationTests(unittest.TestCase):
     def test_planned_prompt_persists_submit_and_accept_boundaries(self) -> None:
         job = self.create()
         client = mock.Mock()
-        client.get_agent.return_value = {"state_change_seq": 7}
+        client.get_agent.return_value = {
+            "state_change_seq": 7,
+            "agent_session": "planner-session",
+        }
 
         def prompt(*_args: object, **kwargs: object) -> PromptOutcome:
             before_submit = cast(Callable[[int], None], kwargs["before_submit"])
@@ -790,7 +790,10 @@ class DurablePromptOperationTests(unittest.TestCase):
     def test_prompt_call_failure_is_ambiguous_even_without_callback(self) -> None:
         job = self.create()
         client = mock.Mock()
-        client.get_agent.return_value = {"state_change_seq": 7}
+        client.get_agent.return_value = {
+            "state_change_seq": 7,
+            "agent_session": "planner-session",
+        }
         client.prompt_and_wait.side_effect = HerdrError("timeout")
 
         with self.assertRaises(HerdrError):
@@ -810,7 +813,10 @@ class DurablePromptOperationTests(unittest.TestCase):
     def test_pre_submit_questionnaire_keeps_planned_prompt_retryable(self) -> None:
         job = self.create()
         client = mock.Mock()
-        client.get_agent.return_value = {"state_change_seq": 7}
+        client.get_agent.return_value = {
+            "state_change_seq": 7,
+            "agent_session": "planner-session",
+        }
         client.prompt_and_wait.side_effect = HerdrError(
             "questionnaire",
             code="interactive_questionnaire",
@@ -835,7 +841,10 @@ class DurablePromptOperationTests(unittest.TestCase):
     def test_terminal_intent_invalidates_prompt_before_submit_callback(self) -> None:
         job = self.create()
         client = mock.Mock()
-        client.get_agent.return_value = {"state_change_seq": 7}
+        client.get_agent.return_value = {
+            "state_change_seq": 7,
+            "agent_session": "planner-session",
+        }
         submitted = False
 
         def prompt(*_args: object, **kwargs: object) -> PromptOutcome:
@@ -1200,7 +1209,7 @@ class CursorJobStateTests(unittest.TestCase):
         self.assertEqual(advanced.plan_approval_state, "approved")
         self.assertEqual(advanced.plan_approval_source, "auto")
         self.assertFalse(advanced.plan_approval_counted)
-        self.assertEqual(advanced.herdr_target, "planner")
+        self.assertEqual(advanced.herdr_target, "reviewer")
 
     def test_review_approval_and_voice_question_commit_atomically(self) -> None:
         jobs.write_job(
@@ -1938,6 +1947,30 @@ class CursorJobStateTests(unittest.TestCase):
             ["ask"],
         )
 
+        with mock.patch.object(service, "launch_worker"):
+            service.reply_job("123456789abc", "yes", trusted_utterance="yes")
+        with (
+            mock.patch.object(jobs, "GitHubClient", return_value=github),
+            mock.patch.object(jobs, "HerdrClient", return_value=client),
+        ):
+            service.run_worker("123456789abc")
+
+        updated = jobs.read_job("123456789abc")
+        self.assertEqual(updated["status"], "completed")
+        self.assertEqual(
+            [call.kwargs["role"] for call in client.start_fresh_agent.call_args_list],
+            ["reviewer", "implementer"],
+        )
+        self.assertEqual(
+            [call.kwargs["mode"] for call in client.start_fresh_agent.call_args_list],
+            ["ask", None],
+        )
+        implementation_prompt_text = client.prompt_and_wait.call_args_list[-1].args[1]
+        self.assertNotIn("lgtm", implementation_prompt_text)
+        self.assertIn(
+            "Implement only from this approved plan", implementation_prompt_text
+        )
+
     def test_reconciled_fork_is_never_resubmitted(self) -> None:
         repository = Path(self.temporary.name) / "source" / "project"
         source = GitHubRepository(
@@ -2659,7 +2692,7 @@ class CursorJobStateTests(unittest.TestCase):
         client = mock.Mock()
         client.get_agent.side_effect = [
             HerdrError("not found", code="agent_not_found"),
-            {"state_change_seq": 1},
+            {"state_change_seq": 1, "agent_session": "planned-session"},
         ]
         client.start_agent.return_value = selection
         client.prompt_and_wait.return_value = PromptOutcome(
