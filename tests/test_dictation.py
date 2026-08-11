@@ -5,12 +5,14 @@ import tempfile
 import threading
 import unittest
 from contextlib import redirect_stdout
+from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
 from local_voice_harness import cli, config, dictation, recording
 from local_voice_harness.desktop import Window
 from local_voice_harness.errors import HarnessError, NoSpeechError
+from local_voice_harness.user_config import default_user_config
 
 
 class DictationTests(unittest.TestCase):
@@ -37,7 +39,7 @@ class DictationTests(unittest.TestCase):
             cli.dispatch(cli.parser().parse_args(["end"]))
 
         transcribe.assert_called_once_with(generation)
-        respond.assert_called_once_with("hello")
+        respond.assert_called_once_with("hello", user_config=mock.ANY)
 
     def test_manual_transcribe_retries_explicit_pending_generation(self) -> None:
         generation = Path(
@@ -79,11 +81,13 @@ class DictationTests(unittest.TestCase):
             mock.patch.object(recording.recorder, "start_recording") as start_manual,
             mock.patch.object(recording, "notify"),
         ):
-            recording.start_recording()
+            audio = replace(default_user_config().audio, source="injected-microphone")
+            recording.start_recording(audio)
         self.assertEqual(
             start_manual.call_args.kwargs["conflicts"],
             (recording.DICTATION_PATHS,),
         )
+        self.assertEqual(start_manual.call_args.kwargs["source"], "injected-microphone")
 
     def test_toggle_starts_when_idle(self) -> None:
         with (

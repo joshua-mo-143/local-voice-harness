@@ -26,9 +26,6 @@ from ..agents.service import recover_jobs
 from ..browser_context import request_context
 from ..components import start_components, stop_components
 from ..config import (
-    CURSOR_FOLLOWUP_ENABLED,
-    CURSOR_FOLLOWUP_WINDOW_SECONDS,
-    DEFAULT_SOURCE,
     DICTATION_PID_PATH,
     DICTATION_RECORDER_LOG,
     DICTATION_STATE_DIR,
@@ -42,7 +39,6 @@ from ..config import (
     WAKE_LOCK,
     WAKE_PID_PATH,
     WAV_PATH,
-    load_backend_settings,
 )
 from ..cursor import questions as cursor_questions
 from ..cursor import service as cursor_service
@@ -92,6 +88,7 @@ from ..responses import AssistantResponse, ResponseLike, as_assistant_response
 from ..stt.client import transcribe
 from ..ticket_targets import MISSING_ISSUE_SCOPE_RESPONSE, extract_ticket_targets
 from ..tts.queue import PlaybackQueue, PlaybackRequest
+from ..user_config import UserConfig, load_user_config
 from ..vad import FRAME_BYTES, FRAME_MS, SAMPLE_RATE, SpeechDetector
 
 RECORDING_PATHS = recorder.RecorderPaths(
@@ -109,22 +106,9 @@ CURSOR_STORE = JobStore(JOBS_DIR, LEGACY_JOBS_DIR)
 END_SILENCE_MS = 720
 MAX_UTTERANCE_SECONDS = 15
 CONVERSATION_TIMEOUT_SECONDS = 60
-WAKE_THRESHOLD = float(os.environ.get("VOICE_HARNESS_WAKE_THRESHOLD", "0.55"))
-MIN_SPEECH_RMS = float(os.environ.get("VOICE_HARNESS_MIN_SPEECH_RMS", "1100"))
-SOURCE = os.environ.get("VOICE_HARNESS_SOURCE", DEFAULT_SOURCE)
 PRE_ROLL_FRAMES = 25
 MICROPHONE_START_ATTEMPTS = 30
 MICROPHONE_RETRY_SECONDS = 1
-BARGE_IN_MODE = os.environ.get("VOICE_HARNESS_BARGE_IN_MODE", "wake").strip().lower()
-BARGE_IN_SPEECH_FRAMES = max(
-    1, int(os.environ.get("VOICE_HARNESS_BARGE_IN_SPEECH_FRAMES", "5"))
-)
-PLAYBACK_QUIET_FRAMES = max(
-    1, int(os.environ.get("VOICE_HARNESS_PLAYBACK_QUIET_FRAMES", "4"))
-)
-PLAYBACK_QUIET_TIMEOUT_SECONDS = max(
-    0.0, float(os.environ.get("VOICE_HARNESS_PLAYBACK_QUIET_TIMEOUT_SECONDS", "2"))
-)
 
 
 def acknowledge_delivery(job_id: str, token: str) -> bool:
@@ -286,15 +270,16 @@ def _display_fingerprint(display_text: str) -> str:
 
 
 class WakeConversationDaemon:
-    def __init__(self) -> None:
+    def __init__(self, user_config: UserConfig) -> None:
         import numpy as np
         import openwakeword
         from openwakeword.model import Model
 
-        if BARGE_IN_MODE not in {"wake", "vad", "off"}:
-            raise HarnessError(
-                "VOICE_HARNESS_BARGE_IN_MODE must be 'wake', 'vad', or 'off'"
-            )
+        self.user_config = user_config
+        self.audio = user_config.audio
+        self.platform = user_config.platform
+        self.providers = user_config.providers
+        self.integrations = user_config.integrations
         self.np = np
         module_path = openwakeword.__file__
         if module_path is None:
@@ -308,7 +293,7 @@ class WakeConversationDaemon:
             vad_threshold=0.0,
         )
         self.wake_key = next(iter(self.wake_model.models))
-        self.speech_detector = SpeechDetector(minimum_rms=MIN_SPEECH_RMS)
+        self.speech_detector = SpeechDetector(minimum_rms=self.audio.min_speech_rms)
         self.pre_roll: collections.deque[bytes] = collections.deque(
             maxlen=PRE_ROLL_FRAMES
         )
@@ -348,8 +333,8 @@ class WakeConversationDaemon:
 
     def start_microphone(self) -> None:
         command = ["pw-record", "--raw"]
-        if SOURCE:
-            command.extend(("--target", SOURCE))
+        if self.audio.source:
+            command.extend(("--target", self.audio.source))
         command.extend(("--channels=1", "--rate=16000", "--format=s16", "-"))
         for attempt in range(1, MICROPHONE_START_ATTEMPTS + 1):
             self.microphone = subprocess.Popen(
@@ -362,7 +347,8 @@ class WakeConversationDaemon:
             time.sleep(0.2)
             if self.microphone.poll() is None:
                 log(
-                    f"listening for Hey Jarvis on {SOURCE or 'PipeWire default source'}"
+                    "listening for Hey Jarvis on "
+                    f"{self.audio.source or 'PipeWire default source'}"
                 )
                 return
 
@@ -459,7 +445,7 @@ class WakeConversationDaemon:
             try:
                 with self.component_lock:
                     start_components()
-                    if load_backend_settings().llm_provider == "local":
+                    if self.providers.llm_provider == "local":
                         qwen_turn(
                             "Reply with only OK. Do not call a tool.",
                             allow_tools=False,
@@ -518,13 +504,13 @@ class WakeConversationDaemon:
             return
         quiet = 0
         max_frames = max(
-            PLAYBACK_QUIET_FRAMES,
-            int(PLAYBACK_QUIET_TIMEOUT_SECONDS * 1000 / FRAME_MS),
+            self.audio.playback_quiet_frames,
+            int(self.audio.playback_quiet_timeout_seconds * 1000 / FRAME_MS),
         )
         for _ in range(max_frames):
             frame = self.read_frame()
             quiet = quiet + 1 if not self.is_speech(frame) else 0
-            if quiet >= PLAYBACK_QUIET_FRAMES:
+            if quiet >= self.audio.playback_quiet_frames:
                 break
         self.pre_roll.clear()
 
@@ -537,7 +523,7 @@ class WakeConversationDaemon:
         speech_streak = 0
         interruption: BargeIn | None = None
         wake_barge_enabled = SPOKEN_WAKE_PATTERN.search(response) is None
-        if BARGE_IN_MODE == "wake" and not wake_barge_enabled:
+        if self.audio.barge_in_mode == "wake" and not wake_barge_enabled:
             log(
                 "wake barge-in suppressed because the response contains the wake phrase"
             )
@@ -546,21 +532,21 @@ class WakeConversationDaemon:
             nonlocal speech_streak, interruption
             frame = self.read_frame()
             self.pre_roll.append(frame)
-            if BARGE_IN_MODE == "off":
+            if self.audio.barge_in_mode == "off":
                 return False
-            if BARGE_IN_MODE == "vad":
+            if self.audio.barge_in_mode == "vad":
                 speech_streak = speech_streak + 1 if self.is_speech(frame) else 0
-                detected = speech_streak >= BARGE_IN_SPEECH_FRAMES
+                detected = speech_streak >= self.audio.barge_in_speech_frames
                 woke = False
             else:
                 samples = self.np.frombuffer(frame, dtype="<i2")
                 score = float(self.wake_model.predict(samples).get(self.wake_key, 0.0))
-                detected = wake_barge_enabled and score >= WAKE_THRESHOLD
+                detected = wake_barge_enabled and score >= self.audio.wake_threshold
                 woke = True
             if detected:
                 interruption = BargeIn(initial=list(self.pre_roll), woke=woke)
                 self.pre_roll.clear()
-                log(f"barge-in detected ({BARGE_IN_MODE})")
+                log(f"barge-in detected ({self.audio.barge_in_mode})")
                 return True
             return False
 
@@ -773,7 +759,7 @@ class WakeConversationDaemon:
         acknowledged, so the reference reflects work the user just heard about.
         The last successfully announced completion wins.
         """
-        if not CURSOR_FOLLOWUP_ENABLED:
+        if not self.platform.cursor_followup_enabled:
             return
         try:
             job = CURSOR_STORE.get(job_id)
@@ -790,7 +776,9 @@ class WakeConversationDaemon:
         self.completed_followup = CompletedFollowup(
             job_id=job_id,
             completed_at=job.completed_at,
-            expires_at=time.monotonic() + CURSOR_FOLLOWUP_WINDOW_SECONDS,
+            expires_at=(
+                time.monotonic() + self.platform.cursor_followup_window_seconds
+            ),
             display_fingerprint=display_fingerprint,
         )
         log(f"follow-up context retained for completed job {job_id}")
@@ -1011,7 +999,11 @@ class WakeConversationDaemon:
             streamed_playback = False
             playback: dict[str, object] = {}
             interruption: BargeIn | None = None
-            context = request_context(text)
+            context = request_context(
+                text,
+                platform=self.platform,
+                integrations=self.integrations,
+            )
             active_completed = self._active_completed_followup()
             pending = self._pending_cursor_question()
             route = route_intent(
@@ -1210,7 +1202,7 @@ class WakeConversationDaemon:
             else:
                 # The authoritative router handles every mutating action above.
                 # Conversation fallback is always tool-free.
-                if load_backend_settings().llm_provider == "venice":
+                if self.providers.llm_provider == "venice":
                     (
                         response,
                         next_cursor_session,
@@ -1345,7 +1337,7 @@ class WakeConversationDaemon:
                 continue
             samples = self.np.frombuffer(frame, dtype="<i2")
             score = float(self.wake_model.predict(samples).get(self.wake_key, 0.0))
-            if score >= WAKE_THRESHOLD and now - self.last_wake >= 2.0:
+            if score >= self.audio.wake_threshold and now - self.last_wake >= 2.0:
                 self.last_wake = now
                 log(f"wake detected: score={score:.3f}")
                 initial = list(self.pre_roll)
@@ -1447,7 +1439,7 @@ def main() -> None:
         print("voice-harness-wake: ok")
         return
     singleton = _acquire_wake_singleton()
-    daemon = WakeConversationDaemon()
+    daemon = WakeConversationDaemon(load_user_config())
 
     def handle_signal(_signum: int, _frame: object) -> None:
         daemon.stop()

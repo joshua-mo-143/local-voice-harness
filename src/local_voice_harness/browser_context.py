@@ -9,6 +9,7 @@ from .context_providers import capture_context, capture_text_context
 from .desktop import DesktopError, get_desktop
 from .focused_app_context import focused_app_context
 from .integrations import github as _github
+from .user_config import IntegrationSettings, PlatformSettings
 
 GitHubIssue = _github.GitHubIssue
 GitHubPullRequest = _github.GitHubPullRequest
@@ -122,19 +123,24 @@ def focused_browser_context() -> ContextFragment | None:
     return capture_context(url) if url is not None else None
 
 
-def request_context(text: str) -> RequestContext:
+def request_context(
+    text: str,
+    *,
+    platform: PlatformSettings,
+    integrations: IntegrationSettings,
+) -> RequestContext:
     context: ContextFragment | None = None
     try:
-        context = capture_text_context(text)
+        context = capture_text_context(text, integrations)
         if context is None:
             url = focused_firefox_url()
             if url is not None:
-                context = capture_context(url)
+                context = capture_context(url, integrations)
     except Exception:
         context = None
 
     try:
-        app_context = focused_app_context(text)
+        app_context = focused_app_context(text, platform)
     except Exception:
         app_context = None
 

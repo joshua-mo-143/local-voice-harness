@@ -8,7 +8,9 @@ import os
 import tempfile
 import threading
 import time
+import types
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
@@ -24,12 +26,14 @@ from local_voice_harness.intent import Intent, IntentRoute
 from local_voice_harness.questions import AnswerProvenance
 from local_voice_harness.responses import AssistantResponse
 from local_voice_harness.tts.queue import PlaybackQueue, PlaybackRequest
+from local_voice_harness.user_config import default_user_config, load_user_config
 from local_voice_harness.wake import daemon as wake_daemon
 from local_voice_harness.wake.daemon import WakeConversationDaemon
 
 AUDIO_GENERATION = Path(
     "/runtime/voice-harness/recordings/request-0123456789abcdef0123456789abcdef.wav"
 )
+USER_CONFIG = default_user_config()
 
 
 def _playback_batch(
@@ -97,6 +101,11 @@ def _delivery_claim(
 def _bare_daemon() -> WakeConversationDaemon:
     """Build a daemon without running __init__ (which loads the wake model/VAD)."""
     instance = WakeConversationDaemon.__new__(WakeConversationDaemon)
+    instance.user_config = USER_CONFIG
+    instance.audio = USER_CONFIG.audio
+    instance.platform = USER_CONFIG.platform
+    instance.providers = USER_CONFIG.providers
+    instance.integrations = USER_CONFIG.integrations
     instance.history = []
     instance.cursor_session = None
     instance.completed_followup = None
@@ -114,6 +123,50 @@ def _bare_daemon() -> WakeConversationDaemon:
     instance.pre_roll = collections.deque(maxlen=wake_daemon.PRE_ROLL_FRAMES)
     instance.wake_model = mock.Mock()
     return instance
+
+
+class StartupConfigSnapshotTests(unittest.TestCase):
+    def test_restart_observes_file_change_without_mutating_running_daemon(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "config.toml"
+            path.write_text('[audio]\nsource = "startup-microphone"\n')
+            startup = load_user_config(
+                {}, path=path, backends_path=Path(os.devnull), home=Path(temporary)
+            )
+
+            openwakeword = types.ModuleType("openwakeword")
+            openwakeword.__file__ = "/tmp/openwakeword/__init__.py"
+            model_module = types.ModuleType("openwakeword.model")
+            wake_model = mock.Mock(models={"hey_jarvis": object()})
+            model_module.Model = mock.Mock(return_value=wake_model)  # type: ignore[attr-defined]
+            numpy = types.ModuleType("numpy")
+
+            with (
+                mock.patch.dict(
+                    "sys.modules",
+                    {
+                        "numpy": numpy,
+                        "openwakeword": openwakeword,
+                        "openwakeword.model": model_module,
+                    },
+                ),
+                mock.patch.object(wake_daemon, "SpeechDetector"),
+            ):
+                running = WakeConversationDaemon(startup)
+                path.write_text('[audio]\nsource = "restarted-microphone"\n')
+                restarted = WakeConversationDaemon(
+                    load_user_config(
+                        {},
+                        path=path,
+                        backends_path=Path(os.devnull),
+                        home=Path(temporary),
+                    )
+                )
+
+        self.assertEqual(running.audio.source, "startup-microphone")
+        self.assertEqual(restarted.audio.source, "restarted-microphone")
 
 
 class MicrophoneStartupTests(unittest.TestCase):
@@ -199,11 +252,6 @@ class ProcessUtteranceTests(unittest.TestCase):
             mock.patch.object(
                 wake_daemon, "qwen_turn", return_value=(response, None)
             ) as qwen,
-            mock.patch.object(
-                wake_daemon,
-                "load_backend_settings",
-                return_value=mock.Mock(llm_provider="local"),
-            ),
             mock.patch.object(
                 daemon,
                 "play_response",
@@ -291,7 +339,7 @@ class ProcessUtteranceTests(unittest.TestCase):
             mock.patch.object(
                 wake_daemon,
                 "request_context",
-                side_effect=lambda text: RequestContext(text),
+                side_effect=lambda text, **_settings: RequestContext(text),
             ),
             mock.patch.object(
                 wake_daemon,
@@ -323,7 +371,7 @@ class ProcessUtteranceTests(unittest.TestCase):
             mock.patch.object(
                 wake_daemon,
                 "request_context",
-                side_effect=lambda text: RequestContext(text),
+                side_effect=lambda text, **_settings: RequestContext(text),
             ),
             mock.patch.object(
                 wake_daemon,
@@ -344,6 +392,7 @@ class ProcessUtteranceTests(unittest.TestCase):
 
     def test_venice_turn_streams_sentence_chunks_to_playback(self) -> None:
         daemon = _bare_daemon()
+        daemon.providers = replace(daemon.providers, llm_provider="venice")
         played_requests: list[str] = []
 
         def streamed_turn(
@@ -390,9 +439,6 @@ class ProcessUtteranceTests(unittest.TestCase):
             ),
             mock.patch.object(wake_daemon, "start_components"),
             mock.patch.object(
-                wake_daemon, "load_backend_settings"
-            ) as load_backend_settings,
-            mock.patch.object(
                 wake_daemon, "qwen_turn", side_effect=streamed_turn
             ) as qwen_turn,
             mock.patch.object(daemon, "_drain_playback_queue", side_effect=drain),
@@ -408,7 +454,6 @@ class ProcessUtteranceTests(unittest.TestCase):
             ),
             mock.patch.object(wake_daemon, "notify"),
         ):
-            load_backend_settings.return_value.llm_provider = "venice"
             daemon.process_utterance(AUDIO_GENERATION, woke=False)
 
         self.assertEqual(played_requests, ["First sentence.", "Second sentence."])
@@ -520,7 +565,7 @@ class ProcessUtteranceTests(unittest.TestCase):
             mock.patch.object(
                 wake_daemon,
                 "request_context",
-                side_effect=lambda text: RequestContext(text),
+                side_effect=lambda text, **_settings: RequestContext(text),
             ),
             mock.patch.object(
                 wake_daemon,
@@ -789,7 +834,7 @@ class ProcessUtteranceTests(unittest.TestCase):
             mock.patch.object(
                 wake_daemon,
                 "request_context",
-                side_effect=lambda text: RequestContext(text),
+                side_effect=lambda text, **_settings: RequestContext(text),
             ),
             mock.patch.object(
                 wake_daemon,
@@ -819,7 +864,7 @@ class ProcessUtteranceTests(unittest.TestCase):
             mock.patch.object(
                 wake_daemon,
                 "request_context",
-                side_effect=lambda text: RequestContext(text),
+                side_effect=lambda text, **_settings: RequestContext(text),
             ),
             mock.patch.object(
                 wake_daemon,
@@ -860,7 +905,7 @@ class ProcessUtteranceTests(unittest.TestCase):
             mock.patch.object(
                 wake_daemon,
                 "request_context",
-                side_effect=lambda text: RequestContext(text),
+                side_effect=lambda text, **_settings: RequestContext(text),
             ),
             mock.patch.object(
                 wake_daemon,
@@ -895,7 +940,7 @@ class InboxIntentRoutingTests(unittest.TestCase):
             mock.patch.object(
                 wake_daemon,
                 "request_context",
-                side_effect=lambda text: RequestContext(text),
+                side_effect=lambda text, **_settings: RequestContext(text),
             ),
             mock.patch.object(
                 wake_daemon,
@@ -932,7 +977,7 @@ class InboxIntentRoutingTests(unittest.TestCase):
             mock.patch.object(
                 wake_daemon,
                 "request_context",
-                side_effect=lambda text: RequestContext(text),
+                side_effect=lambda text, **_settings: RequestContext(text),
             ),
             mock.patch.object(
                 wake_daemon,
@@ -1622,11 +1667,6 @@ class ComponentSynchronizationTests(unittest.TestCase):
         with (
             mock.patch.object(wake_daemon, "start_components"),
             mock.patch.object(
-                wake_daemon,
-                "load_backend_settings",
-                return_value=settings,
-            ),
-            mock.patch.object(
                 llm_transport, "load_backend_settings", return_value=settings
             ),
             mock.patch.object(
@@ -1695,6 +1735,7 @@ class ComponentSynchronizationTests(unittest.TestCase):
 class PlaybackBargeInTests(unittest.TestCase):
     def test_wake_word_cancels_playback_and_preserves_preroll(self) -> None:
         daemon = _bare_daemon()
+        daemon.audio = replace(daemon.audio, barge_in_mode="wake")
         daemon.np = mock.Mock()  # type: ignore[reportAttributeAccessIssue]
         daemon.np.frombuffer.return_value = object()
         daemon.wake_key = "hey_jarvis"
@@ -1718,10 +1759,7 @@ class PlaybackBargeInTests(unittest.TestCase):
                 )
             ]
 
-        with (
-            mock.patch.object(wake_daemon, "BARGE_IN_MODE", "wake"),
-            mock.patch.object(daemon.playback_queue, "drain", side_effect=fake_drain),
-        ):
+        with mock.patch.object(daemon.playback_queue, "drain", side_effect=fake_drain):
             result, interruption = daemon.play_response("A harmless response.")
 
         self.assertTrue(result["interrupted"])
@@ -1732,6 +1770,9 @@ class PlaybackBargeInTests(unittest.TestCase):
 
     def test_vad_requires_configured_sustained_speech(self) -> None:
         daemon = _bare_daemon()
+        daemon.audio = replace(
+            daemon.audio, barge_in_mode="vad", barge_in_speech_frames=3
+        )
         daemon.read_frame = mock.Mock(return_value=b"speech")  # type: ignore[method-assign]
         daemon.is_speech = mock.Mock(return_value=True)  # type: ignore[method-assign]
 
@@ -1748,11 +1789,7 @@ class PlaybackBargeInTests(unittest.TestCase):
                 )
             ]
 
-        with (
-            mock.patch.object(wake_daemon, "BARGE_IN_MODE", "vad"),
-            mock.patch.object(wake_daemon, "BARGE_IN_SPEECH_FRAMES", 3),
-            mock.patch.object(daemon.playback_queue, "drain", side_effect=fake_drain),
-        ):
+        with mock.patch.object(daemon.playback_queue, "drain", side_effect=fake_drain):
             _, interruption = daemon.play_response("response")
 
         self.assertIsNotNone(interruption)
@@ -1762,6 +1799,7 @@ class PlaybackBargeInTests(unittest.TestCase):
 
     def test_off_mode_drains_frames_without_acoustic_cancellation(self) -> None:
         daemon = _bare_daemon()
+        daemon.audio = replace(daemon.audio, barge_in_mode="off")
         daemon.read_frame = mock.Mock(return_value=b"speaker echo")  # type: ignore[method-assign]
 
         def fake_drain(
@@ -1779,7 +1817,6 @@ class PlaybackBargeInTests(unittest.TestCase):
             ]
 
         with (
-            mock.patch.object(wake_daemon, "BARGE_IN_MODE", "off"),
             mock.patch.object(daemon.playback_queue, "drain", side_effect=fake_drain),
             mock.patch.object(daemon, "wait_for_playback_quiet") as quiet,
         ):
@@ -1791,6 +1828,7 @@ class PlaybackBargeInTests(unittest.TestCase):
 
     def test_response_wake_phrase_cannot_trigger_itself(self) -> None:
         daemon = _bare_daemon()
+        daemon.audio = replace(daemon.audio, barge_in_mode="wake")
         daemon.np = mock.Mock()  # type: ignore[reportAttributeAccessIssue]
         daemon.np.frombuffer.return_value = object()
         daemon.wake_key = "hey_jarvis"
@@ -1810,7 +1848,6 @@ class PlaybackBargeInTests(unittest.TestCase):
             ]
 
         with (
-            mock.patch.object(wake_daemon, "BARGE_IN_MODE", "wake"),
             mock.patch.object(daemon.playback_queue, "drain", side_effect=fake_drain),
             mock.patch.object(daemon, "wait_for_playback_quiet"),
             mock.patch.object(wake_daemon, "log"),
@@ -1821,6 +1858,11 @@ class PlaybackBargeInTests(unittest.TestCase):
 
     def test_quiet_gate_clears_echo_before_followup_rearms(self) -> None:
         daemon = _bare_daemon()
+        daemon.audio = replace(
+            daemon.audio,
+            playback_quiet_frames=2,
+            playback_quiet_timeout_seconds=1,
+        )
         daemon.microphone = mock.Mock()
         daemon.microphone.poll.return_value = None
         daemon.pre_roll.extend([b"old"])
@@ -1829,11 +1871,7 @@ class PlaybackBargeInTests(unittest.TestCase):
         )
         daemon.is_speech = lambda frame: frame == b"speech"  # type: ignore[method-assign]
 
-        with (
-            mock.patch.object(wake_daemon, "PLAYBACK_QUIET_FRAMES", 2),
-            mock.patch.object(wake_daemon, "PLAYBACK_QUIET_TIMEOUT_SECONDS", 1),
-        ):
-            daemon.wait_for_playback_quiet()
+        daemon.wait_for_playback_quiet()
 
         self.assertEqual(daemon.read_frame.call_count, 3)
         self.assertEqual(list(daemon.pre_roll), [])
@@ -1852,7 +1890,7 @@ class InterruptedTurnTests(unittest.TestCase):
             mock.patch.object(
                 wake_daemon,
                 "request_context",
-                side_effect=lambda text: RequestContext(text),
+                side_effect=lambda text, **_settings: RequestContext(text),
             ),
             mock.patch.object(
                 wake_daemon,
@@ -2044,7 +2082,7 @@ class WakeRecordingHandoffTests(unittest.TestCase):
             daemon.np = mock.Mock()  # type: ignore[assignment]
             daemon.wake_key = "wake"
             daemon.wake_model.predict.side_effect = [
-                {"wake": wake_daemon.WAKE_THRESHOLD + 0.1},
+                {"wake": daemon.audio.wake_threshold + 0.1},
                 {"wake": 0.0},
             ]
             reads = 0
@@ -2308,8 +2346,8 @@ class CompletedFollowupContextTests(unittest.TestCase):
 
     def test_completed_announcement_installs_context(self) -> None:
         daemon = _bare_daemon()
+        daemon.platform = replace(daemon.platform, cursor_followup_enabled=True)
         with (
-            mock.patch.object(wake_daemon, "CURSOR_FOLLOWUP_ENABLED", True),
             mock.patch.object(
                 wake_daemon.CURSOR_STORE,
                 "get",
@@ -2328,6 +2366,7 @@ class CompletedFollowupContextTests(unittest.TestCase):
 
     def test_foreground_completion_installs_context_after_playback(self) -> None:
         daemon = _bare_daemon()
+        daemon.platform = replace(daemon.platform, cursor_followup_enabled=True)
         claim = _delivery_claim("job2", "completed", result="done")
 
         def finish_in_foreground(
@@ -2346,14 +2385,13 @@ class CompletedFollowupContextTests(unittest.TestCase):
             return acknowledged
 
         with (
-            mock.patch.object(wake_daemon, "CURSOR_FOLLOWUP_ENABLED", True),
             mock.patch.object(wake_daemon.CURSOR_STORE, "get", return_value=claim.job),
             mock.patch.object(wake_daemon, "transcribe", return_value="do the task"),
             mock.patch.object(wake_daemon, "start_components"),
             mock.patch.object(
                 wake_daemon,
                 "request_context",
-                side_effect=lambda text: RequestContext(text),
+                side_effect=lambda text, **_settings: RequestContext(text),
             ),
             mock.patch.object(
                 wake_daemon,
@@ -2381,8 +2419,8 @@ class CompletedFollowupContextTests(unittest.TestCase):
 
     def test_kill_switch_disables_context(self) -> None:
         daemon = _bare_daemon()
+        daemon.platform = replace(daemon.platform, cursor_followup_enabled=False)
         with (
-            mock.patch.object(wake_daemon, "CURSOR_FOLLOWUP_ENABLED", False),
             mock.patch.object(wake_daemon.CURSOR_STORE, "get") as get,
             mock.patch.object(wake_daemon, "notify"),
         ):
@@ -2395,9 +2433,9 @@ class CompletedFollowupContextTests(unittest.TestCase):
 
     def test_awaiting_job_completion_swaps_slots(self) -> None:
         daemon = _bare_daemon()
+        daemon.platform = replace(daemon.platform, cursor_followup_enabled=True)
         daemon.cursor_session = "bbbbbbbbbbbb"
         with (
-            mock.patch.object(wake_daemon, "CURSOR_FOLLOWUP_ENABLED", True),
             mock.patch.object(
                 wake_daemon.CURSOR_STORE,
                 "get",
@@ -2470,15 +2508,13 @@ class CompletedFollowupContextTests(unittest.TestCase):
 
     def test_newer_completed_announcement_supersedes_retained_context(self) -> None:
         daemon = _bare_daemon()
+        daemon.platform = replace(daemon.platform, cursor_followup_enabled=True)
         first = _delivery_claim("job1", "completed", result="first").job
         second = _delivery_claim("job2", "completed", result="second").job
-        with (
-            mock.patch.object(wake_daemon, "CURSOR_FOLLOWUP_ENABLED", True),
-            mock.patch.object(
-                wake_daemon.CURSOR_STORE,
-                "get",
-                side_effect=[first, second],
-            ),
+        with mock.patch.object(
+            wake_daemon.CURSOR_STORE,
+            "get",
+            side_effect=[first, second],
         ):
             for job in (first, second):
                 display = wake_daemon.cursor_service.render_job_announcement(
@@ -2520,7 +2556,7 @@ class CompletedFollowupContextTests(unittest.TestCase):
             mock.patch.object(
                 wake_daemon,
                 "request_context",
-                side_effect=lambda text: RequestContext(text),
+                side_effect=lambda text, **_settings: RequestContext(text),
             ),
             mock.patch.object(wake_daemon, "route_intent", side_effect=routed),
             mock.patch.object(wake_daemon, "cursor_turn", cursor_turn),

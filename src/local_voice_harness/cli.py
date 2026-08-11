@@ -69,6 +69,7 @@ from .stt.client import transcribe
 from .user_config import (
     PlanApprovalMode,
     load_plan_approval_preferences,
+    load_user_config,
     set_plan_approval_mode,
 )
 from .vocabulary import (
@@ -538,6 +539,15 @@ def _add_replay_parser(
     promote.add_argument("output", type=Path)
 
 
+def _configured_request_context(text: str) -> RequestContext:
+    settings = load_user_config()
+    return request_context(
+        text,
+        platform=settings.platform,
+        integrations=settings.integrations,
+    )
+
+
 def _capture_replay(args: argparse.Namespace) -> None:
     from .stt.server import transcript_replacements
     from .transcript import normalize_transcript
@@ -548,7 +558,7 @@ def _capture_replay(args: argparse.Namespace) -> None:
     context = (
         RequestContext(normalized)
         if args.without_context
-        else request_context(normalized)
+        else _configured_request_context(normalized)
     )
     if (args.intent is None) != (args.confidence is None):
         raise ValueError("--intent and --confidence must be provided together")
@@ -639,10 +649,11 @@ def _dispatch_replay(args: argparse.Namespace) -> None:
 
 def dispatch(args: argparse.Namespace) -> None:
     if args.command == "begin":
-        start_recording()
+        start_recording(load_user_config().audio)
     elif args.command == "end":
+        user_config = load_user_config()
         audio_path = stop_recording()
-        respond(transcribe(audio_path))
+        respond(transcribe(audio_path), user_config=user_config)
     elif args.command == "cancel":
         cancel_recording()
     elif args.command == "listen":
@@ -651,16 +662,18 @@ def dispatch(args: argparse.Namespace) -> None:
         request_listen()
         print("listening")
     elif args.command == "transcribe":
+        user_config = load_user_config()
         audio_path = (
             retry_generation(args.generation)
             if args.generation is not None
             else handoff_recording()
         )
-        respond(transcribe(audio_path))
+        respond(transcribe(audio_path), user_config=user_config)
     elif args.command == "dictate":
         run_dictation(args.dictation_command)
     elif args.command == "text":
-        respond(" ".join(args.text))
+        user_config = load_user_config()
+        respond(" ".join(args.text), user_config=user_config)
     elif args.command == "status":
         status()
     elif args.command == "setup":
