@@ -397,19 +397,30 @@ class WakeConversationDaemon:
             self.read_frame()
         self.pre_roll.clear()
 
-    def record_utterance(self, initial: list[bytes]) -> Path:
+    def record_utterance(
+        self,
+        initial: list[bytes],
+        *,
+        wait_for_fresh_speech: bool = False,
+    ) -> Path:
         frames = list(initial)
-        has_speech = any(self.is_speech(frame) for frame in frames)
+        has_speech = (
+            False
+            if wait_for_fresh_speech
+            else any(self.is_speech(frame) for frame in frames)
+        )
         silence_ms = 0
+        captured_frames = 0
         while self.running:
             frame = self.read_frame()
             frames.append(frame)
+            captured_frames += 1
             if self.is_speech(frame):
                 has_speech = True
                 silence_ms = 0
             elif has_speech:
                 silence_ms += FRAME_MS
-            duration = len(frames) * FRAME_MS / 1000
+            duration = captured_frames * FRAME_MS / 1000
             if has_speech and silence_ms >= END_SILENCE_MS:
                 break
             if duration >= MAX_UTTERANCE_SECONDS:
@@ -428,14 +439,22 @@ class WakeConversationDaemon:
             conflicts=(DICTATION_RECORDING_PATHS,),
         )
 
-    def record_utterance_safely(self, initial: list[bytes]) -> Path | None:
+    def record_utterance_safely(
+        self,
+        initial: list[bytes],
+        *,
+        wait_for_fresh_speech: bool = False,
+    ) -> Path | None:
         try:
             if recorder.any_recording_active(CAPTURE_PATHS):
                 message = "wake activation deferred while another recording is active"
                 log(message)
                 notify(message)
                 return None
-            return self.record_utterance(initial)
+            return self.record_utterance(
+                initial,
+                wait_for_fresh_speech=wait_for_fresh_speech,
+            )
         except HarnessError as exc:
             message = f"wake recording suppressed: {exc}"
             log(message)
@@ -962,7 +981,10 @@ class WakeConversationDaemon:
 
     def continue_after_barge_in(self, interruption: BargeIn | None) -> None:
         while interruption is not None and self.running:
-            audio_path = self.record_utterance_safely(interruption.initial)
+            audio_path = self.record_utterance_safely(
+                interruption.initial,
+                wait_for_fresh_speech=interruption.woke,
+            )
             if audio_path is None:
                 return
             interruption = self.process_utterance(audio_path, woke=interruption.woke)
@@ -1359,7 +1381,10 @@ class WakeConversationDaemon:
                 log(f"wake detected: score={score:.3f}")
                 initial = list(self.pre_roll)
                 self.pre_roll.clear()
-                audio_path = self.record_utterance_safely(initial)
+                audio_path = self.record_utterance_safely(
+                    initial,
+                    wait_for_fresh_speech=True,
+                )
                 if audio_path is None:
                     speech_streak = 0
                     continue
