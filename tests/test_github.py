@@ -13,6 +13,7 @@ from local_voice_harness.integrations.github import (
     GitHubIssue,
     GitHubIssueLookupError,
     GitHubIssueLookupReason,
+    GitHubOperationAmbiguous,
     GitHubPullRequest,
     GitHubRepository,
 )
@@ -44,7 +45,7 @@ class GitHubClientTests(unittest.TestCase):
         client = GitHubClient()
         with (
             mock.patch(
-                "local_voice_harness.integrations.github.subprocess.run",
+                "local_voice_harness.integrations.github.run_command",
                 side_effect=OSError("missing"),
             ),
             self.assertRaisesRegex(GitHubError, "missing"),
@@ -53,24 +54,28 @@ class GitHubClientTests(unittest.TestCase):
 
         with (
             mock.patch(
-                "local_voice_harness.integrations.github.subprocess.run",
+                "local_voice_harness.integrations.github.run_command",
                 side_effect=subprocess.TimeoutExpired(["gh"], 1),
             ),
-            self.assertRaisesRegex(GitHubError, "timed out"),
+            self.assertRaisesRegex(
+                GitHubOperationAmbiguous,
+                "outcome is ambiguous.*external side effect",
+            ) as raised,
         ):
             client._run(["gh", "status"])
+        self.assertIsInstance(raised.exception.__cause__, subprocess.TimeoutExpired)
 
         failed = _completed(stdout="fallback error", returncode=2)
         with (
             mock.patch(
-                "local_voice_harness.integrations.github.subprocess.run",
+                "local_voice_harness.integrations.github.run_command",
                 return_value=failed,
             ),
             self.assertRaisesRegex(GitHubError, "fallback error"),
         ):
             client._run(["gh", "status"])
         with mock.patch(
-            "local_voice_harness.integrations.github.subprocess.run",
+            "local_voice_harness.integrations.github.run_command",
             return_value=failed,
         ):
             self.assertIs(client._run(["gh", "status"], check=False), failed)

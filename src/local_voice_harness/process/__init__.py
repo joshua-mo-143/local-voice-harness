@@ -1,5 +1,6 @@
 """Linux process identity and safe signalling."""
 
+from .command import run_command
 from .linux import (
     ProcessCapabilities,
     ProcessHandle,
@@ -23,5 +24,6 @@ __all__ = [
     "pidfd_send",
     "process_identity",
     "process_owner_alive",
+    "run_command",
     "terminate_pidfd",
 ]
