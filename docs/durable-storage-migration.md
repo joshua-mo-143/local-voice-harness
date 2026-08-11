@@ -32,14 +32,20 @@ flowchart LR
 
 ### JSON write-surface verification
 
-The repository search covered `src/local_voice_harness/cursor/*.py` for JSON
-serialization and file writes. The result is:
+The repository-wide search covered production Python under
+`src/local_voice_harness/`, repository scripts, and service/CLI entry points
+for JSON serialization, file writes, durable-job path constants, and
+`JobStore` construction/calls. Tests were checked separately as fixtures and
+fault-injection clients, not production writers. The result is:
 
 * Job records, maintenance fences, quarantine metadata, quarantine resolution
   tombstones, and workflow-artifact sidecars are written by the private helpers
   in `cursor/store.py`.
 * `cursor/jobs.py::write_job` is a compatibility facade; it delegates to
   `JobStore.create/update` and does not write JSON itself.
+* `app.py`, `wake/daemon.py`, `cursor/worker.py`, and the agent-neutral
+  `agents/store.py` facade construct or re-export `JobStore`; they do not write
+  job JSON directly.
 * `model.py`, `recovery.py`, `provisioning.py`, `worker_lifecycle.py`, and
   `questions.py` do not write persisted JSON files. `service.py` emits two
   diagnostic `json.dumps(...)` lines to stdout only.
@@ -156,6 +162,53 @@ The model also has compatibility aliases and structured input containers
 layouts, not additional v12 fields. `schema_version` is retained by #140 for
 import parity and becomes an SQLite schema/import version, not a per-job
 compatibility mechanism after #142.
+
+### Exhaustive migration disposition
+
+During #140 all 159 persisted values remain lossless in the validated
+`payload_json` parity envelope. The list below assigns every value exactly once
+to its final #141/#142 disposition; "side table" means typed columns rather
+than a generic JSON lifecycle blob.
+
+| Final disposition | Persisted fields |
+|---|---|
+| Core `jobs` row (21) | `id`, `parent_job_id`, `harness_kind`, `revision`, `status`, `request`, `utterance`, `trusted_utterance`, `created_at`, `updated_at`, `queued_at`, `started_at`, `completed_at`, `foreground_until`, `continuation`, `continuation_answer`, `reconcile`, `agent_hint`, `context_repository`, `repository_hint`, `speakable_label` |
+| Workflow/review/approval side tables (20) | `workflow_tier`, `workflow_phase`, `workflow_classification_reason`, `workflow_turn_phase`, `active_participant`, `planner_target`, `reviewer_target`, `implementer_target`, `review_round`, `review_approved`, `review_approval_source`, `review_decision`, `plan_approval_state`, `plan_approval_id`, `plan_approval_agent_session`, `plan_approval_state_change_sequence`, `plan_approval_revision`, `plan_approval_source`, `plan_approval_counted`, `plan_approval_completion_pending` |
+| Provider and checkout side tables (27) | `issue_key`, `github_repository`, `github_issue`, `github_issue_url`, `github_issue_context`, `github_pull_request`, `pull_request_branch`, `repository`, `worktree_branch`, `worktree_path`, `worktree_workspace_id`, `worktree_root_pane_id`, `worktree_label`, `pull_request_worktree_state`, `pull_request_worktree_error`, `fork_repository`, `fork_requested`, `fork_confirmed`, `fork_exists`, `fork_committed`, `fork_committed_at`, `fork_operation_source`, `fork_operation_source_private`, `fork_operation_source_url`, `fork_operation_source_default_branch`, `fork_operation_source_parent`, `fork_operation_login` |
+| Session and worker-claim side tables (13) | `session_id`, `agent_name`, `herdr_target`, `herdr_pane_id`, `herdr_workspace_id`, `worker_token`, `worker_pid`, `worker_boot_id`, `worker_process_start`, `worker_operation`, `attempt_started_at`, `turn`, `turn_token` |
+| Provider-operation side tables (43) | `agent_dispatch_state`, `agent_dispatch_exited`, `agent_absent_observations`, `agent_reconcile_attempts`, `agent_last_reconciled_at`, `agent_next_reconcile_at`, `agent_automatic_reconcile_stopped_at`, `agent_confirmed_absent_at`, `agent_retained_at`, `fork_operation_state`, `fork_operation_target`, `fork_dispatch_exited`, `fork_absent_observations`, `fork_reconcile_attempts`, `fork_last_reconciled_at`, `fork_next_reconcile_at`, `fork_automatic_reconcile_stopped_at`, `fork_confirmed_absent_at`, `fork_retained_at`, `worktree_provision_state`, `worktree_provision_error`, `worktree_dispatch_exited`, `worktree_absent_observations`, `worktree_reconcile_attempts`, `worktree_last_reconciled_at`, `worktree_next_reconcile_at`, `worktree_automatic_reconcile_stopped_at`, `worktree_confirmed_absent_at`, `worktree_retained_at`, `worktree_manual_inspection_required`, `worktree_quarantine_acknowledged_at`, `participant_creation_state`, `participant_creation_participant`, `participant_creation_target`, `participant_creation_label`, `participant_creation_workspace_id`, `participant_creation_pane_id`, `prompt_operation_state`, `prompt_operation_phase`, `prompt_operation_turn`, `prompt_operation_target`, `prompt_baseline_sequence`, `next_reconcile_at` |
+| Question side table (4) | `question`, `voice_question`, `clarification_kind`, `interactive_questionnaire_blocked` |
+| Delivery and terminal-intent side tables (15) | `delivered`, `delivered_at`, `delivery_attempts`, `delivery_generation`, `delivery_claim_token`, `delivery_claimed_at`, `delivery_retry_at`, `announcement_dismissed`, `announcement_repeated`, `result`, `error`, `terminal_intent_status`, `terminal_intent_result`, `terminal_intent_error`, `terminal_intent_completed_at` |
+| Reconciliation and release side tables (12) | `cancellation_reconciliation_pending`, `manual_reconcile_operation`, `manual_reconcile_outcome`, `manual_reconcile_token`, `manual_reconcile_required_at`, `manual_reconcile_resolved_at`, `reconciliation_base_error`, `target_release_pending`, `target_release_token`, `target_release_owner_pid`, `target_release_owner_boot_id`, `target_release_owner_start` |
+| File-backed artifacts with SQLite metadata (2) | `plan_artifact`, `review_artifact` become foreign-key references to `artifacts`; immutable artifact bytes remain content-addressed files |
+| Import-only, then delete (2) | `schema_version` selects the one-shot importer and becomes store metadata; `phase_prompt_active` is a compatibility alias. Neither remains on the typed job after #142 |
+
+### Invalid combinations and typed replacements
+
+The following list covers the cross-field and transition checks currently
+performed by `CursorJob.from_dict`, `validate_invariants`,
+`validate_transition`, and `validate_reservations`. Primitive parsing checks
+(field type, finite number, JSON shape, and enum membership) remain adapter
+validation rather than lifecycle states.
+
+| Invalid combination rejected today | Typed-state or coordinator replacement |
+|---|---|
+| A status lacks its required payload or timestamp: queued without `queued_at`; awaiting-user without question/result; blocked/completed/cancelled without result; failed without error/result; terminal without `completed_at` | Constructors for `Queued`, `AwaitingQuestion`, and each `Terminal` result variant require their payload and timestamp; absent fields cannot be constructed |
+| Identity, creation time, parent, or harness changes; revision does not advance by one; status/workflow phase takes an illegal edge; workflow tier is downgraded | Immutable `JobIdentity` plus command-specific transition functions; coordinator CAS increments revision and transition tables expose only legal edges |
+| A follow-up changes inherited repository, branch, path, workspace, or root pane | Immutable `CheckoutSnapshot` is copied when the child and its reservation are created in one transaction |
+| Worker token/PID/boot/process-start is partial, a worker state has no complete owner, or PID is non-positive | `WorkerClaim` is either `Unclaimed` or `Claimed(token, ProcessIdentity, operation, claimed_at)`; no partial representation |
+| Delivery token and claim time are unpaired, or a delivered job retains a live claim | `Delivery = Ready | Claimed(token, claimed_at, lease, generation) | Retryable | Delivered(delivered_at)` |
+| Workflow is classified without tier/reason, simple enters planning/review, medium exceeds one review, revising remains at round two, or round is outside 0–2 | `Workflow` variants carry classification proof; tier-specific transition tables constrain phases and review-round constructors constrain range |
+| Review approval/source are unpaired; approval lacks an artifact; reviewer approval lacks an approve decision; user override is not an exhausted high-risk rejection; approved artifacts do not match the current round | `Review = Pending | Rejected | Approved(ApprovalProof, PlanArtifact, ReviewArtifact, round)` with distinct reviewer and high-risk user-override proof variants |
+| Plan approval retains proof while inactive, lacks complete proof while active, appears in the wrong phase/status, is counted without explicit acceptance, or marks completion without durable finished output | `PlanApproval = None | Boundary | Awaiting(QuestionRef, GateProof) | Approved(ApprovalProof) | Observed(ApprovalProof) | Rejected`; workflow commands control allowed embeddings |
+| A planned medium/high-risk workflow implements without current approved plan/review artifacts and plan approval | `Implementing` constructor requires an `ApprovedPlan` aggregate referencing matching immutable artifacts and approval proof |
+| Active participant target differs from the session target; participant creation lacks role/target/label or a created pane lacks workspace/pane IDs | `ParticipantCreation = None | Creating(ParticipantSpec) | Created(ParticipantSpec, PaneIdentity) | OutcomeUnknown | ManualRequired`; active participant references the created session target |
+| Prompt operation lacks phase/turn/target, or a submitting/submitted/ambiguous prompt lacks baseline sequence | `Prompt = Idle | Submitting(PromptSpec, baseline) | Submitted(PromptSpec, baseline) | OutcomeUnknown(PromptSpec, baseline) | Failed` |
+| Agent, fork, or worktree operation is uncertain without its target/spec; worktree provisioning lacks repository/branch/path | Operation variants carry their required `SessionTarget`, `ForkSpec`, or `CheckoutSpec`; uncertain outcomes retain the same operation identity |
+| Terminal intent exists outside reconciling/release-fenced state; target release owner identity is partial or remains after release | `Reconciling(TerminalIntent, TargetReleaseLease)` requires a complete process identity; confirmation transitions atomically to `Terminal` and removes the lease |
+| Manual reconciliation operation/token/state disagree; cancellation reconciliation has no uncertain operation/release fence or an incompatible status | `ManualRequired(OperationRef, token)` and `CancellationReconciling(TerminalIntent, NonEmptySet[OperationRef])` encode the fence directly |
+| Artifact reference has the wrong job/kind/round, or approved plan/review artifacts do not share the active round | `ArtifactRef(job_id, kind, round, digest)` is validated on insertion; foreign keys and the `ApprovedPlan` constructor bind matching references |
+| Two jobs reserve the same ticket, target, or worktree, including unresolved quarantine evidence | Unique reservation rows are inserted in the same transaction as the state change; quarantine owns reservation rows until hash-bound acknowledgement |
 
 ## Invariants to preserve
 
