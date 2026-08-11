@@ -44,6 +44,8 @@ class PlaybackRequest:
     job_id: str | None = None
     delivery_token: str | None = None
     job_status: str | None = None
+    job_completed_at: float | None = None
+    display_fingerprint: str | None = None
 
 
 class PrefetchHandle:

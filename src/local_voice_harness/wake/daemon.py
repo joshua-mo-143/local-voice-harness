@@ -3,6 +3,7 @@ from __future__ import annotations
 import collections
 import contextlib
 import fcntl
+import hashlib
 import json
 import os
 import re
@@ -237,6 +238,10 @@ CLOSE_PATTERN = re.compile(
     r"\b(?:goodbye|stop listening|go to sleep|end conversation)\b", re.IGNORECASE
 )
 END_CONVERSATION_RESPONSE = "Okay, I'll be here if you need me."
+RECENT_DETAILS_UNAVAILABLE = (
+    "I no longer have details for that recent announcement. "
+    "Ask for the job by name or ID."
+)
 
 
 @dataclass
@@ -256,6 +261,7 @@ class CompletedFollowup:
     job_id: str
     completed_at: float | None
     expires_at: float
+    display_fingerprint: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -273,6 +279,10 @@ def log(message: str) -> None:
         file=sys.stderr,
         flush=True,
     )
+
+
+def _display_fingerprint(display_text: str) -> str:
+    return hashlib.sha256(display_text.encode("utf-8")).hexdigest()
 
 
 class WakeConversationDaemon:
@@ -717,6 +727,8 @@ class WakeConversationDaemon:
                 job_id=job_id,
                 delivery_token=claim.token,
                 job_status=job.status.value,
+                job_completed_at=job.completed_at,
+                display_fingerprint=_display_fingerprint(response.display_text),
             )
         )
 
@@ -726,6 +738,8 @@ class WakeConversationDaemon:
         job_id: str,
         job_status: str,
         played_text: str,
+        job_completed_at: float | None = None,
+        display_fingerprint: str | None = None,
     ) -> None:
         if played_text:
             self.history.append({"role": "assistant", "content": played_text})
@@ -737,12 +751,22 @@ class WakeConversationDaemon:
             # up the clarification slot and take the completed slot atomically.
             if self.cursor_session == job_id:
                 self.cursor_session = None
-            self._remember_completed_job(job_id)
+            self._remember_completed_job(
+                job_id,
+                expected_completed_at=job_completed_at,
+                display_fingerprint=display_fingerprint,
+            )
         self.conversation_deadline = time.monotonic() + CONVERSATION_TIMEOUT_SECONDS
         self.awaiting_followup = True
         notify("Listening for a follow-up…")
 
-    def _remember_completed_job(self, job_id: str) -> None:
+    def _remember_completed_job(
+        self,
+        job_id: str,
+        *,
+        expected_completed_at: float | None = None,
+        display_fingerprint: str | None = None,
+    ) -> None:
         """Install the most recently played completed job as follow-up context.
 
         Called only after a successful, uninterrupted announcement was
@@ -758,10 +782,16 @@ class WakeConversationDaemon:
         except Exception as exc:  # noqa: BLE001 - never let context tracking crash a turn
             log(f"follow-up context skipped for {job_id}: {type(exc).__name__}: {exc}")
             return
+        if (
+            expected_completed_at is not None
+            and job.completed_at != expected_completed_at
+        ):
+            return
         self.completed_followup = CompletedFollowup(
             job_id=job_id,
             completed_at=job.completed_at,
             expires_at=time.monotonic() + CURSOR_FOLLOWUP_WINDOW_SECONDS,
+            display_fingerprint=display_fingerprint,
         )
         log(f"follow-up context retained for completed job {job_id}")
 
@@ -774,6 +804,38 @@ class WakeConversationDaemon:
             self.completed_followup = None
             return None
         return followup
+
+    def _recent_completion_details(
+        self,
+        followup: CompletedFollowup,
+    ) -> AssistantResponse:
+        if self.completed_followup is not followup:
+            return AssistantResponse.from_text(RECENT_DETAILS_UNAVAILABLE)
+        try:
+            job = CURSOR_STORE.get(followup.job_id)
+        except Exception as exc:  # noqa: BLE001 - retrieval must fail closed
+            log(
+                "recent completion details unavailable for "
+                f"{followup.job_id}: {type(exc).__name__}: {exc}"
+            )
+            self.completed_followup = None
+            return AssistantResponse.from_text(RECENT_DETAILS_UNAVAILABLE)
+        if (
+            job.status != JobStatus.COMPLETED
+            or job.completed_at != followup.completed_at
+            or followup.display_fingerprint is None
+        ):
+            self.completed_followup = None
+            return AssistantResponse.from_text(RECENT_DETAILS_UNAVAILABLE)
+        rendered = cursor_service.render_job_announcement(job)
+        if _display_fingerprint(rendered.display_text) != followup.display_fingerprint:
+            self.completed_followup = None
+            return AssistantResponse.from_text(RECENT_DETAILS_UNAVAILABLE)
+        self.completed_followup = None
+        return AssistantResponse(
+            spoken_text="I've displayed the details from that completed Cursor job.",
+            display_text=rendered.display_text,
+        )
 
     def _pending_cursor_question(self) -> PendingQuestionSnapshot | None:
         """Load one immutable question snapshot for routing and answer fencing."""
@@ -825,6 +887,8 @@ class WakeConversationDaemon:
             job_id=job_id,
             job_status=str(request.job_status or ""),
             played_text=played_text,
+            job_completed_at=request.job_completed_at,
+            display_fingerprint=request.display_fingerprint,
         )
 
     def _play_pending_announcements(self) -> BargeIn | None:
@@ -1100,6 +1164,16 @@ class WakeConversationDaemon:
                     "I can't open pull requests. I can review the changes or run "
                     "the tests in that checkout instead."
                 )
+            elif route.intent == Intent.AGENT_DETAILS:
+                current_completed = self._active_completed_followup()
+                if (
+                    self.cursor_session is not None
+                    or current_completed is None
+                    or current_completed is not active_completed
+                ):
+                    response = RECENT_DETAILS_UNAVAILABLE
+                else:
+                    response = self._recent_completion_details(current_completed)
             elif route.actionable and route.intent == Intent.AGENT_FOLLOWUP:
                 current_completed = self._active_completed_followup()
                 if (
@@ -1186,9 +1260,20 @@ class WakeConversationDaemon:
                 self.history = next_history
                 return interruption
             acknowledged = acknowledge_deliveries(delivery_claims)
-            for claim in acknowledged:
-                if claim.job.status == JobStatus.COMPLETED:
-                    self._remember_completed_job(claim.job.id)
+            completed_claims = [
+                claim
+                for claim in acknowledged
+                if claim.job.status == JobStatus.COMPLETED
+            ]
+            if len(completed_claims) == 1:
+                completed = completed_claims[0].job
+                self._remember_completed_job(
+                    completed.id,
+                    expected_completed_at=completed.completed_at,
+                    display_fingerprint=_display_fingerprint(
+                        rendered_response.display_text
+                    ),
+                )
             if self.cursor_session == cursor_session_before_playback:
                 self.cursor_session = next_cursor_session
             self.history = next_history

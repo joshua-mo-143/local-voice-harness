@@ -29,6 +29,9 @@ ROUTER_SYSTEM_PROMPT = (
     "cursor_dismiss to silence or acknowledge a job announcement, and cursor_repeat "
     "to hear a job update again. When several jobs run at once the user may name a "
     "job by its label, issue number, or short id; still classify only the action. "
+    "Use cursor_details when the user asks to see or hear more detail about the "
+    "just-announced completed result, such as 'tell me more' or 'show me the details'; "
+    "this is read-only and must not start more work. "
     "Use end_conversation when the user signals the exchange is over and nothing "
     "further is needed, for example saying goodbye, thanking you with no new "
     "request, answering that there is nothing else, or replying with only a short "
@@ -64,6 +67,7 @@ ROUTE_TOOL = {
                         "cursor_list",
                         "cursor_dismiss",
                         "cursor_repeat",
+                        "cursor_details",
                         "end_conversation",
                         "uncertain",
                     ],
@@ -91,6 +95,7 @@ class Intent(StrEnum):
     AGENT_LIST = "cursor_list"
     AGENT_DISMISS = "cursor_dismiss"
     AGENT_REPEAT = "cursor_repeat"
+    AGENT_DETAILS = "cursor_details"
     # Compatibility aliases for the original Cursor-specific intent names.
     CURSOR_SUBMIT = "cursor_submit"
     CURSOR_REPLY = "cursor_reply"
@@ -101,6 +106,7 @@ class Intent(StrEnum):
     CURSOR_LIST = "cursor_list"
     CURSOR_DISMISS = "cursor_dismiss"
     CURSOR_REPEAT = "cursor_repeat"
+    CURSOR_DETAILS = "cursor_details"
     END_CONVERSATION = "end_conversation"
     UNCERTAIN = "uncertain"
 

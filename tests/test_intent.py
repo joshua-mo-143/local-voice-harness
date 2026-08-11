@@ -255,6 +255,7 @@ class FollowUpIntentTests(unittest.TestCase):
             "enum"
         ]
         self.assertIn("cursor_followup", enum)
+        self.assertIn("cursor_details", enum)
         self.assertIn("cursor_pr_unsupported", enum)
 
     def test_recent_completion_flag_is_forwarded(self) -> None:
