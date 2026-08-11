@@ -53,6 +53,25 @@ paths. This statement is scoped to Cursor job durability; unrelated vocabulary,
 plan-preference, audio, and service configuration JSON stores remain separate
 and are not part of this migration.
 
+### Current transition ownership
+
+The existing implementation has one durable write boundary, but transition
+decisions are distributed across these callers:
+
+| Module | Transition decisions and durable responsibilities |
+|---|---|
+| `cursor/store.py` | Owns the lock, load/normalize/validate/write transaction, revision CAS, peer reservation checks, quarantine fencing, maintenance lease, delivery claim CAS, and artifact sidecars. |
+| `cursor/model.py` | Owns typed conversion, v0–v12 normalization, legal status/workflow transitions, cross-field invariants, worker ownership validation, question validation, and delivery-state evolution. |
+| `cursor/recovery.py` | Reconciles detached workers, external targets, forks, and worktrees from observations; requests state changes through `JobStore`. |
+| `cursor/service.py` | Coordinates admission, cancellation, pruning, delivery orchestration, maintenance operations, and worker launch/recovery; it does not write job JSON directly. |
+| `cursor/provisioning.py` | Coordinates fork/worktree/pane provisioning and records provider outcomes through store updates; reservation admission remains enforced by the store. |
+| `cursor/delivery.py` | Owns the claim/renew/acknowledge/release protocol and playback ordering; the store persists the claim and terminal delivery state. |
+| `cursor/worker_lifecycle.py` | Owns detached-process launch, process identity capture, checkpoints, and stop/reconcile observations; it does not decide domain transitions or write job JSON directly. |
+
+The target coordinator consolidates these decisions without changing their
+public entry points: callers submit commands or observations, and only the
+coordinator performs the resulting durable transition.
+
 ## Target state
 
 SQLite becomes authoritative for job state, reservations, claims, leases,
@@ -79,6 +98,43 @@ The coordinator should preserve externally visible statuses and at-least-once
 delivery. A crash after a transaction commits resumes from outbox rows; a crash
 after an external effect but before its observation remains `OutcomeUnknown`
 and is reconciled rather than blindly replayed.
+
+### Target lifecycle boundaries
+
+The top-level lifecycle is a sum type; fields belonging to another variant are
+not nullable alternatives on the same state:
+
+```text
+Job =
+  Queued(checkout)
+  | CheckingOut(checkout, operation)
+  | Running(session, checkout)
+  | AwaitingQuestion(session, question)
+  | AwaitingPrompt(session, prompt)
+  | Reviewing(session, review)
+  | Terminal(intent, delivery)
+  | Reconciling(intent, external_operations)
+  | Quarantined(evidence, reservations)
+```
+
+Each job owns independent submachines whose uncertainty is explicit:
+
+* `Checkout`: `Unrequested | Provisioning | Ready | Failed | Unknown |
+  ManualRequired`
+* `Session`: `Absent | Starting | Active | Stopping | AbsentUnknown |
+  | ManualRequired`
+* `Prompt`: `Idle | Submitting | Submitted | OutcomeUnknown | Failed`
+* `Question`: `None | Asked | Answered | Expired | Cancelled`
+* `Delivery`: `NotReady | Ready | Claimed | Retryable | Delivered`
+
+Commands are `Admit`, `StartCheckout`, `ReportCheckout`, `StartSession`,
+`StopSession`, `SubmitPrompt`, `AskQuestion`, `AnswerQuestion`,
+`PrepareTerminal`, `ClaimDelivery`, `AcknowledgeDelivery`, `ReleaseDelivery`,
+`Reconcile`, and `AcknowledgeQuarantine`. Provider results are observations,
+not transitions: they are accepted only when the operation idempotency key and
+expected revision match the current row. A transition atomically updates the
+top-level variant, affected submachine rows, reservations, an audit event,
+and any resulting outbox effects.
 
 ## v12 persisted-field inventory
 
@@ -140,8 +196,9 @@ for #141):
   approval fields...)` with checks for tier/phase, round range, and approval proof.
 * `questions(question_id PRIMARY KEY, job_id REFERENCES jobs, turn_token,
   owner, state, kind, sensitivity, choices_json, answer_json, asked_at,
-  answered_at)`; unique `(job_id, turn_token, question_id)` and one current
-  question per job.
+  answered_at)`; unique `(job_id, turn_token, question_id)` plus a partial
+  unique index on `(job_id)` for rows in the current `Asked` state. Answered,
+  expired, and cancelled rows remain as history.
 * `operations(operation_id PRIMARY KEY, job_id REFERENCES jobs, kind, state,
   idempotency_key UNIQUE, target, baseline_sequence, attempts, next_at,
   manual_token, outcome, observed_at)` for agent, fork, worktree, prompt, and pane.
@@ -161,8 +218,9 @@ for #141):
   metadata_path, payload_digest, error, resolved_at, resolution_reason)` plus a
   unique unresolved evidence identity. Resolution never mutates the evidence.
 * `maintenance(token PRIMARY KEY, operation, owner_pid, owner_boot_id,
-  owner_process_start, started_at, active INTEGER NOT NULL)` with at most one
-  active lease.
+  owner_process_start, started_at, lease_expires_at, active INTEGER NOT NULL)`
+  with at most one active lease; every write verifies the active lease is not
+  expired, and releasing it requires the complete owner identity tuple.
 * `outbox(effect_id PRIMARY KEY, job_id REFERENCES jobs, kind, idempotency_key
   UNIQUE, payload_json, status, attempts, next_at, lease_token, leased_at,
   completed_at, outcome_json, last_error)`; effect status must distinguish
@@ -216,13 +274,15 @@ version.
    foreign keys, WAL, and a migration lease.
 2. Inventory ordinary `*.json`, `.maintenance`, `.quarantine` payloads,
    metadata, resolution tombstones, and `.artifacts`. Do not follow symlinks.
-3. Parse each job through the existing v12 `CursorJob.from_dict` path, apply
+3. Import unresolved quarantine evidence before importing reservation-bearing
+   rows. Preserve its payload, metadata, digest, error, and resolution status.
+   Any candidate competing with unresolved evidence remains fenced.
+4. Parse each job through the existing v12 `CursorJob.from_dict` path, apply
    legacy v0–v11 normalization, verify filename/job identity, and validate
    artifacts and reservations. Import valid rows with their original revision,
-   timestamps, delivery state, worker identity, and quarantine references.
-4. Import unresolved quarantine evidence before new reservations. Preserve its
-   payload, metadata, digest, error, and resolution status. Any candidate
-   competing with unresolved evidence remains fenced.
+   timestamps, delivery state, worker identity, and quarantine references;
+   reservation insertion is rejected if it conflicts with imported unresolved
+   evidence.
 5. Import undelivered terminals without pruning or coalescing them. Preserve
    terminal intent/reconciliation rows, delivery generation, retry/claim
    metadata, questions, and result/error text. Do not mark playback delivered.
