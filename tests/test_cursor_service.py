@@ -23,6 +23,10 @@ from local_voice_harness.cursor.service import (
 )
 from local_voice_harness.cursor.store import JobStore
 from local_voice_harness.errors import HarnessError
+from local_voice_harness.integrations.github import (
+    GitHubIssueLookupError,
+    GitHubIssueLookupReason,
+)
 
 
 def test_service_request_and_result_types_are_explicit() -> None:
@@ -191,6 +195,33 @@ def test_start_jobs_reports_active_ticket_conflict_as_rejected() -> None:
     assert outcomes[0].job_id == active_job_id
     assert active_job_id in str(outcomes[0].detail)
     read.assert_not_called()
+
+
+def test_single_github_lookup_failure_does_not_include_repository_identity() -> None:
+    client = mock.Mock()
+    client.issue_details.side_effect = GitHubIssueLookupError(
+        GitHubIssueLookupReason.NOT_FOUND_OR_INACCESSIBLE,
+        "GraphQL: Could not resolve to an Issue in "
+        "very-long-owner-name/very-long-repository-name",
+    )
+    with (
+        mock.patch.object(service, "GitHubClient", return_value=client),
+        mock.patch.object(service, "integration_enabled", return_value=True),
+    ):
+        result = service.cursor_turn(
+            CursorTurnRequest(
+                "Work on issue 42",
+                utterance="Work on issue 42",
+                issue_scope="very-long-owner-name/very-long-repository-name",
+                issue_scope_source="github",
+            )
+        )
+
+    assert result.session_id is None
+    assert result.text == (
+        "Ticket starts: rejected (I couldn't find or access that GitHub issue.)."
+    )
+    assert "very-long-owner-name" not in result.text
 
 
 def test_start_job_enforces_unique_ticket_before_worker_launch() -> None:

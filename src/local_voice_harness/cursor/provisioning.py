@@ -13,6 +13,7 @@ from ..integrations.github import (
     GitHubClient,
     GitHubError,
     GitHubIssue,
+    GitHubIssueLookupError,
     GitHubOperationAmbiguous,
     GitHubRepository,
 )
@@ -539,7 +540,11 @@ def _worker_fail(
     target_may_be_active: bool = False,
 ) -> None:
     del target_may_be_active  # Terminal intent always retains the cleanup fence.
-    message = (str(exc) or type(exc).__name__)[:500]
+    message = (
+        exc.voice_message
+        if isinstance(exc, GitHubIssueLookupError)
+        else (str(exc) or type(exc).__name__)[:500]
+    )
 
     def fail(job: CursorJob) -> CursorJob:
         now = time.time()
@@ -3045,8 +3050,15 @@ def run_claimed_worker(  # pyright: ignore[reportGeneralTypeIssues]
                 checkpoint()
                 repositories = client.repository_roots()
                 checkpoint()
-                provisioned_issue = clients.github().provision_issue(
-                    GitHubIssue(owner, repository_name, number),
+                github = clients.github()
+                issue = GitHubIssue(owner, repository_name, number)
+                # The preflight may have happened long ago; verify the issue
+                # again so a vanished or newly inaccessible issue fails with
+                # the same classified, voice-safe error.
+                github.issue_details(issue)
+                checkpoint()
+                provisioned_issue = github.provision_issue(
+                    issue,
                     candidates=repositories,
                     checkpoint=checkpoint,
                 )

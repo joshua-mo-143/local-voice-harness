@@ -11,6 +11,8 @@ from local_voice_harness.integrations.github import (
     GitHubClient,
     GitHubError,
     GitHubIssue,
+    GitHubIssueLookupError,
+    GitHubIssueLookupReason,
     GitHubPullRequest,
     GitHubRepository,
 )
@@ -212,6 +214,51 @@ class GitHubClientTests(unittest.TestCase):
         )
         self.assertEqual(issue.reference, "example/project#42")
         self.assertEqual(issue.url, "https://github.com/example/project/issues/42")
+
+    def test_issue_lookup_failure_is_classified_and_voice_safe(self) -> None:
+        client = GitHubClient()
+        issue = GitHubIssue(
+            "very-long-owner-name",
+            "private-repository-with-a-long-name",
+            42,
+        )
+        raw = (
+            "GraphQL: Could not resolve to an Issue with the number 42. "
+            "Authorization: Bearer ghp_secret-value"
+        )
+        with mock.patch.object(
+            client,
+            "_run",
+            return_value=_completed(stderr=raw, returncode=1),
+        ):
+            with self.assertRaises(GitHubIssueLookupError) as raised:
+                client.issue_details(issue)
+
+        error = raised.exception
+        self.assertEqual(
+            error.reason,
+            GitHubIssueLookupReason.NOT_FOUND_OR_INACCESSIBLE,
+        )
+        self.assertEqual(
+            str(error),
+            "I couldn't find or access that GitHub issue.",
+        )
+        self.assertNotIn("very-long-owner", str(error))
+        self.assertNotIn("ghp_secret-value", error.diagnostic)
+        self.assertIn("Could not resolve to an Issue", error.diagnostic)
+
+    def test_issue_lookup_unknown_failure_has_safe_fallback(self) -> None:
+        client = GitHubClient()
+        with mock.patch.object(
+            client,
+            "_run",
+            return_value=_completed(stderr="new GraphQL failure", returncode=1),
+        ):
+            with self.assertRaises(GitHubIssueLookupError) as raised:
+                client.issue_details(GitHubIssue("example", "project", 42))
+
+        self.assertEqual(raised.exception.reason, GitHubIssueLookupReason.UNKNOWN)
+        self.assertEqual(str(raised.exception), "I couldn't verify that GitHub issue.")
 
     def test_context_metadata_is_read_through_gh(self) -> None:
         client = GitHubClient()
