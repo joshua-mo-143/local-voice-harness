@@ -79,8 +79,8 @@ from ..intent import (
 from ..llm import qwen_turn
 from ..notifications import notify
 from ..process import ProcessHandle, process_identity
-from ..questions import AnswerProvenance, question_control, question_prompt
-from ..responses import ResponseLike, as_assistant_response
+from ..questions import AnswerProvenance, question_control
+from ..responses import AssistantResponse, ResponseLike, as_assistant_response
 from ..stt.client import transcribe
 from ..ticket_targets import MISSING_ISSUE_SCOPE_RESPONSE, extract_ticket_targets
 from ..tts.queue import PlaybackQueue, PlaybackRequest
@@ -691,34 +691,18 @@ class WakeConversationDaemon:
         }
         return response, next_cursor_session, playback, interruption
 
-    def _job_response_text(self, job: CursorJob) -> str:
-        if job.status == JobStatus.COMPLETED:
-            return f"Cursor finished. {str(job.result or '').strip()}"
-        if job.status == JobStatus.AWAITING_USER:
-            pending = cursor_questions.current(job)
-            text = (
-                question_prompt(pending)
-                if pending is not None
-                else str(job.question or job.result or "").strip()
-            )
-            return "Cursor needs clarification. " + text
-        if job.status == JobStatus.BLOCKED:
-            return str(
-                job.result or f"Cursor agent {job.herdr_target or ''} needs attention."
-            ).strip()
-        if job.status == JobStatus.CANCELLED:
-            return str(job.result or "Cursor job was cancelled.").strip()
-        return f"Cursor job failed. {str(job.error or 'Unknown error').strip()}"
+    def _job_response(self, job: CursorJob) -> AssistantResponse:
+        return cursor_service.render_job_announcement(job)
 
     def _enqueue_job_announcement(self, claim: DeliveryClaim) -> None:
         job = claim.job
         job_id = job.id
-        response = self._job_response_text(job)
-        log(f"job {job_id} completion queued: {response}")
-        print(f"Assistant: {response}", flush=True)
+        response = self._job_response(job)
+        log(f"job {job_id} completion queued: {response.display_text}")
+        print(f"Assistant: {response.display_text}", flush=True)
         self.playback_queue.enqueue(
             PlaybackRequest(
-                text=response,
+                text=response.spoken_text,
                 job_id=job_id,
                 delivery_token=claim.token,
                 job_status=job.status.value,

@@ -446,6 +446,57 @@ def test_foreground_agent_failure_keeps_diagnostics_out_of_speech(
     defer.assert_called_once_with(job.id, [])
 
 
+def test_background_job_renderings_cover_each_deliverable_status() -> None:
+    def job(status: JobStatus, **changes: object) -> CursorJob:
+        values: dict[str, object] = {
+            "id": "123456789abc",
+            "request": "work on the issue",
+            "status": status.value,
+            "created_at": 1,
+            "delivered": False,
+            "speakable_label": "issue 42",
+        }
+        values.update(changes)
+        return CursorJob.from_dict(values)
+
+    completed = service.render_job_announcement(
+        job(JobStatus.COMPLETED, result="Changed /srv/config.toml.", completed_at=2)
+    )
+    awaiting = service.render_job_announcement(
+        job(JobStatus.AWAITING_USER, question="Which repo?", result="Which repo?")
+    )
+    blocked = service.render_job_announcement(
+        job(JobStatus.BLOCKED, result="Open Herdr pane 7.", completed_at=2)
+    )
+    cancelled = service.render_job_announcement(
+        job(JobStatus.CANCELLED, result="Cancelled by request.", completed_at=2)
+    )
+    failed = service.render_job_announcement(
+        job(
+            JobStatus.FAILED,
+            result="token=secret-value command failed",
+            error="token=secret-value command failed",
+            completed_at=2,
+        )
+    )
+
+    assert completed.spoken_text == "Cursor finished issue 42."
+    assert "/srv/config.toml" not in completed.spoken_text
+    assert "/srv/config.toml" in completed.display_text
+    assert awaiting.spoken_text.endswith("Which repo?")
+    assert "needs clarification" in awaiting.display_text
+    assert blocked.spoken_text == "Cursor needs attention for issue 42."
+    assert "Open Herdr pane 7." in blocked.display_text
+    assert cancelled.spoken_text == "Cursor cancelled issue 42."
+    assert "Cancelled by request." in cancelled.display_text
+    assert failed.spoken_text == "Cursor failed issue 42 during execution."
+    assert "123456789abc.log" in failed.display_text
+    assert "secret-value" not in failed.spoken_text
+    assert "secret-value" not in failed.display_text
+    for response in (completed, awaiting, blocked, cancelled, failed):
+        assert "123456789abc" in response.display_text
+
+
 def test_production_modules_do_not_import_jobs_facade() -> None:
     source_root = Path(__file__).parents[1] / "src" / "local_voice_harness"
     offenders: list[str] = []
