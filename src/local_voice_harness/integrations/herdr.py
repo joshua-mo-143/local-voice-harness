@@ -261,6 +261,33 @@ class HerdrClient:
     def list_workspaces(self) -> list[dict[str, Any]]:
         return list(self.run_json("workspace", "list").get("workspaces") or [])
 
+    def focused_checkout(self) -> Path | None:
+        """Return the checkout for exactly one focused Herdr workspace."""
+
+        try:
+            focused = [
+                workspace
+                for workspace in self.list_workspaces()
+                if isinstance(workspace, dict) and workspace.get("focused") is True
+            ]
+        except (HerdrError, TypeError):
+            return None
+        if len(focused) != 1:
+            return None
+        worktree = focused[0].get("worktree")
+        if not isinstance(worktree, dict):
+            return None
+        value = worktree.get("checkout_path")
+        if not isinstance(value, str) or not value.strip():
+            return None
+        path = Path(value).expanduser()
+        if not path.is_absolute():
+            return None
+        try:
+            return path.resolve()
+        except OSError:
+            return None
+
     def get_agent(self, target: str) -> dict[str, Any]:
         return dict(self.run_json("agent", "get", target).get("agent") or {})
 

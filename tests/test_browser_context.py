@@ -243,6 +243,121 @@ class BrowserDispatchTests(unittest.TestCase):
         self.assertIsNone(context.focused_issue)
         self.assertIsNone(context.external_issue_reference)
 
+    def test_bare_github_issues_use_focused_herdr_workspace_as_fallback(self) -> None:
+        fragment = ContextFragment(
+            source="github",
+            text="Focused Herdr GitHub repository",
+            repository_reference="example/project",
+            issue_scope="example/project",
+        )
+        with (
+            mock.patch.object(
+                browser_context, "capture_text_context", return_value=None
+            ),
+            mock.patch.object(
+                browser_context, "focused_firefox_url", return_value=None
+            ),
+            mock.patch.object(
+                browser_context,
+                "focused_herdr_github_context",
+                return_value=fragment,
+            ) as focused_herdr,
+            mock.patch.object(
+                browser_context, "focused_app_context", return_value=None
+            ),
+        ):
+            context = browser_context.request_context("work on issues 4 and 7")
+
+        focused_herdr.assert_called_once_with()
+        self.assertEqual(context.github_repository, "example/project")
+        self.assertEqual(context.issue_scope, "example/project")
+        self.assertEqual(context.issue_scope_source, "github")
+
+    def test_focused_browser_scope_takes_precedence_over_herdr(self) -> None:
+        fragment = ContextFragment(
+            source="github",
+            text="Focused browser repository",
+            repository_reference="browser/project",
+            issue_scope="browser/project",
+        )
+        with (
+            mock.patch.object(
+                browser_context, "capture_text_context", return_value=None
+            ),
+            mock.patch.object(
+                browser_context,
+                "focused_firefox_url",
+                return_value="https://github.com/browser/project/issues",
+            ),
+            mock.patch.object(
+                browser_context, "capture_context", return_value=fragment
+            ),
+            mock.patch.object(
+                browser_context, "focused_herdr_github_context"
+            ) as focused_herdr,
+            mock.patch.object(
+                browser_context, "focused_app_context", return_value=None
+            ),
+        ):
+            context = browser_context.request_context("work on issues 4 and 7")
+
+        focused_herdr.assert_not_called()
+        self.assertEqual(context.issue_scope, "browser/project")
+
+    def test_focused_herdr_context_resolves_checkout_through_github_provider(
+        self,
+    ) -> None:
+        checkout = mock.Mock()
+        herdr_client = mock.Mock()
+        herdr_client.focused_checkout.return_value = checkout
+        github_client = mock.Mock()
+        github_client.repository_for_checkout.return_value = "example/project"
+        fragment = ContextFragment(
+            source="github",
+            text="Repository context",
+            issue_scope="example/project",
+        )
+        with (
+            mock.patch.object(
+                browser_context, "integration_enabled", return_value=True
+            ),
+            mock.patch.object(
+                browser_context, "HerdrClient", return_value=herdr_client
+            ),
+            mock.patch.object(
+                browser_context._github,
+                "GitHubClient",
+                return_value=github_client,
+            ),
+            mock.patch.object(
+                browser_context, "capture_context", return_value=fragment
+            ) as capture,
+        ):
+            self.assertIs(browser_context.focused_herdr_github_context(), fragment)
+
+        github_client.repository_for_checkout.assert_called_once_with(checkout)
+        capture.assert_called_once_with("https://github.com/example/project/issues")
+
+    def test_focused_herdr_context_fails_closed(self) -> None:
+        with (
+            mock.patch.object(
+                browser_context, "integration_enabled", return_value=False
+            ),
+            mock.patch.object(browser_context, "HerdrClient") as herdr_client,
+        ):
+            self.assertIsNone(browser_context.focused_herdr_github_context())
+        herdr_client.assert_not_called()
+
+        with (
+            mock.patch.object(
+                browser_context, "integration_enabled", return_value=True
+            ),
+            mock.patch.object(
+                browser_context, "HerdrClient", side_effect=RuntimeError("unavailable")
+            ),
+        ):
+            self.assertIsNone(browser_context.focused_herdr_github_context())
+
     def test_disabled_github_never_parses_or_calls_cli(self) -> None:
         url = "https://github.com/example/project/issues/42"
         with (

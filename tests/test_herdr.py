@@ -76,6 +76,38 @@ WORKFLOW_PLAN[token]: <bounded multiline implementation plan>
             live = client.live_agents()
         self.assertEqual([agent["pane_id"] for agent in live], ["w1:p1"])
 
+    def test_focused_checkout_requires_one_valid_focused_workspace(self) -> None:
+        client = herdr.HerdrClient("herdr")
+        workspace = {
+            "focused": True,
+            "worktree": {"checkout_path": "/repo/checkout"},
+        }
+        with mock.patch.object(client, "list_workspaces", return_value=[workspace]):
+            self.assertEqual(client.focused_checkout(), Path("/repo/checkout"))
+
+        invalid_listings = (
+            [],
+            [workspace, workspace],
+            [{"focused": True}],
+            [{"focused": True, "worktree": {"checkout_path": "relative"}}],
+            ["malformed"],
+        )
+        for listing in invalid_listings:
+            with (
+                self.subTest(listing=listing),
+                mock.patch.object(client, "list_workspaces", return_value=listing),
+            ):
+                self.assertIsNone(client.focused_checkout())
+
+    def test_focused_checkout_fails_closed_when_herdr_is_unavailable(self) -> None:
+        client = herdr.HerdrClient("herdr")
+        with mock.patch.object(
+            client,
+            "list_workspaces",
+            side_effect=herdr.HerdrError("server unavailable"),
+        ):
+            self.assertIsNone(client.focused_checkout())
+
     def test_router_uses_stable_single_owner_name(self) -> None:
         client = herdr.HerdrClient("herdr")
         selection = mock.Mock()

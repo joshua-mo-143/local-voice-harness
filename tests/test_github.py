@@ -504,6 +504,48 @@ class GitHubClientTests(unittest.TestCase):
             GitHubClient._remote_repository("https://example.com/example/project")
         )
 
+    def test_repository_for_checkout_reads_and_validates_github_origin(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkout = root / "project"
+            (checkout / ".git").mkdir(parents=True)
+            client = GitHubClient(allowed_root=root)
+            with mock.patch.object(
+                client,
+                "_git",
+                return_value=_completed("git@github.com:Example/Project.git\n"),
+            ) as git:
+                self.assertEqual(
+                    client.repository_for_checkout(checkout),
+                    "Example/Project",
+                )
+
+        git.assert_called_once_with(checkout.resolve(), "remote", "get-url", "origin")
+
+    def test_repository_for_checkout_rejects_invalid_checkout_or_remote(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkout = root / "project"
+            checkout.mkdir()
+            client = GitHubClient(allowed_root=root)
+            with self.assertRaisesRegex(GitHubError, "not an allowed Git repository"):
+                client.repository_for_checkout(checkout)
+
+            (checkout / ".git").mkdir()
+            with (
+                mock.patch.object(
+                    client,
+                    "_git",
+                    return_value=_completed("https://example.com/owner/project\n"),
+                ),
+                self.assertRaisesRegex(GitHubError, "not a GitHub repository"),
+            ):
+                client.repository_for_checkout(checkout)
+
+            outside = root.parent / "outside"
+            with self.assertRaisesRegex(GitHubError, "outside"):
+                client.repository_for_checkout(outside)
+
     def test_checkout_verification_and_upstream_configuration(self) -> None:
         client = GitHubClient()
         repository = _repository("source/project")

@@ -429,6 +429,24 @@ class GitHubClient:
             timeout=60,
         )
 
+    def repository_for_checkout(self, checkout: Path) -> str:
+        """Return the validated GitHub origin for an allowed local checkout."""
+
+        resolved = checkout.expanduser().resolve()
+        try:
+            resolved.relative_to(self.allowed_root)
+        except ValueError as exc:
+            raise GitHubError(
+                "Git checkout is outside the configured project root"
+            ) from exc
+        if resolved == self.allowed_root or not (resolved / ".git").exists():
+            raise GitHubError(f"{resolved} is not an allowed Git repository")
+        remote = self._git(resolved, "remote", "get-url", "origin").stdout.strip()
+        repository = self._remote_repository(remote)
+        if repository is None:
+            raise GitHubError("Git origin is not a GitHub repository")
+        return self.validate_repository(repository)
+
     def _verify_checkout(self, checkout: Path, expected: GitHubRepository) -> None:
         if not (checkout / ".git").exists():
             raise GitHubError(f"{checkout} exists but is not a Git repository")
