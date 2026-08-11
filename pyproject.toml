@@ -100,6 +100,7 @@ skip_covered = true
 "src/local_voice_harness/cursor/service.py" = 70
 "src/local_voice_harness/integrations/github.py" = 65
 "src/local_voice_harness/integrations/herdr.py" = 50
+"src/local_voice_harness/llm_transport.py" = 85
 "src/local_voice_harness/llm.py" = 85
 "src/local_voice_harness/service_manager.py" = 35
 "src/local_voice_harness/tts/client.py" = 75

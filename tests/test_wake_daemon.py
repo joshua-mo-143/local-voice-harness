@@ -12,7 +12,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from local_voice_harness import llm, recorder
+from local_voice_harness import llm, llm_transport, recorder
 from local_voice_harness.browser_context import RequestContext
 from local_voice_harness.cursor import service as cursor_service
 from local_voice_harness.cursor.delivery import DeliveryClaim
@@ -1485,9 +1485,11 @@ class ComponentSynchronizationTests(unittest.TestCase):
                 "load_backend_settings",
                 return_value=settings,
             ),
-            mock.patch.object(llm, "load_backend_settings", return_value=settings),
             mock.patch.object(
-                llm.urllib.request,
+                llm_transport, "load_backend_settings", return_value=settings
+            ),
+            mock.patch.object(
+                llm_transport.urllib.request,
                 "urlopen",
                 return_value=response,
             ) as urlopen,
