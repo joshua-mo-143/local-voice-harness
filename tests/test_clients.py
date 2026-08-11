@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import sys
 import tempfile
 import threading
 import time
@@ -16,6 +17,7 @@ from local_voice_harness.errors import HarnessError
 from local_voice_harness.stt import client as stt_client
 from local_voice_harness.stt import server as stt_server
 from local_voice_harness.tts import client as tts_client
+from local_voice_harness.user_config import DictationDevice
 
 
 class SpeechToTextClientTests(unittest.TestCase):
@@ -66,6 +68,7 @@ class SpeechToTextClientTests(unittest.TestCase):
         instance.transcribe.return_value = " hello "
         settings = stt_server.STTRuntimeSettings(
             backend="parakeet",
+            device=DictationDevice.AUTO,
             model_name="nemo-parakeet-tdt-0.6b-v2",
             quantization="int8",
             compute_type="float16",
@@ -80,9 +83,120 @@ class SpeechToTextClientTests(unittest.TestCase):
 
         parakeet_cls.assert_called_once_with(
             "nemo-parakeet-tdt-0.6b-v2",
+            device=DictationDevice.AUTO,
             quantization="int8",
         )
         self.assertEqual(transcriber.transcribe("/tmp/audio.wav"), " hello ")
+
+    def test_parakeet_cpu_uses_only_cpu_provider_without_cuda_discovery(self) -> None:
+        onnx_asr = mock.Mock()
+        onnxruntime = mock.Mock()
+        with mock.patch.dict(
+            sys.modules,
+            {"onnx_asr": onnx_asr, "onnxruntime": onnxruntime},
+        ):
+            stt_server.ParakeetTranscriber(
+                "model",
+                device=DictationDevice.CPU,
+                quantization="int8",
+            )
+
+        onnxruntime.get_available_providers.assert_not_called()
+        self.assertEqual(
+            onnx_asr.load_model.call_args.kwargs["providers"],
+            ["CPUExecutionProvider"],
+        )
+
+    def test_parakeet_explicit_cuda_fails_when_provider_is_unavailable(self) -> None:
+        onnx_asr = mock.Mock()
+        onnxruntime = mock.Mock()
+        onnxruntime.get_available_providers.return_value = ["CPUExecutionProvider"]
+        with (
+            mock.patch.dict(
+                sys.modules,
+                {"onnx_asr": onnx_asr, "onnxruntime": onnxruntime},
+            ),
+            self.assertRaisesRegex(RuntimeError, "CUDA dictation was requested"),
+        ):
+            stt_server.ParakeetTranscriber(
+                "model",
+                device=DictationDevice.CUDA,
+                quantization="int8",
+            )
+        onnx_asr.load_model.assert_not_called()
+
+    def test_parakeet_auto_falls_back_to_cpu_provider(self) -> None:
+        onnxruntime = mock.Mock()
+        onnxruntime.get_available_providers.return_value = ["CPUExecutionProvider"]
+        with mock.patch.dict(sys.modules, {"onnxruntime": onnxruntime}):
+            device, providers = stt_server._parakeet_device(DictationDevice.AUTO)
+
+        self.assertEqual(device, "cpu")
+        self.assertEqual(providers, ["CPUExecutionProvider"])
+
+    def test_parakeet_explicit_cuda_disables_cpu_fallback(self) -> None:
+        onnxruntime = mock.Mock()
+        onnxruntime.get_available_providers.return_value = [
+            "CUDAExecutionProvider",
+            "CPUExecutionProvider",
+        ]
+        with mock.patch.dict(sys.modules, {"onnxruntime": onnxruntime}):
+            device, providers = stt_server._parakeet_device(DictationDevice.CUDA)
+
+        self.assertEqual(device, "cuda")
+        self.assertEqual(providers, ["CUDAExecutionProvider"])
+
+    def test_parakeet_auto_keeps_cpu_fallback_after_cuda(self) -> None:
+        onnxruntime = mock.Mock()
+        onnxruntime.get_available_providers.return_value = [
+            "CUDAExecutionProvider",
+            "CPUExecutionProvider",
+        ]
+        with mock.patch.dict(sys.modules, {"onnxruntime": onnxruntime}):
+            device, providers = stt_server._parakeet_device(DictationDevice.AUTO)
+
+        self.assertEqual(device, "cuda")
+        self.assertEqual(
+            providers,
+            ["CUDAExecutionProvider", "CPUExecutionProvider"],
+        )
+
+    def test_whisper_cpu_avoids_cuda_probe_and_uses_cpu_compute(self) -> None:
+        faster_whisper = mock.Mock()
+        ctranslate2 = mock.Mock()
+        with mock.patch.dict(
+            sys.modules,
+            {"faster_whisper": faster_whisper, "ctranslate2": ctranslate2},
+        ):
+            stt_server.WhisperTranscriber(
+                "model",
+                device=DictationDevice.CPU,
+                compute_type="float16",
+                language=None,
+                prompt="prompt",
+            )
+
+        ctranslate2.get_cuda_device_count.assert_not_called()
+        faster_whisper.WhisperModel.assert_called_once_with(
+            "model", device="cpu", compute_type="int8"
+        )
+
+    def test_whisper_explicit_cuda_fails_clearly_when_unavailable(self) -> None:
+        ctranslate2 = mock.Mock()
+        ctranslate2.get_cuda_device_count.return_value = 0
+        with (
+            mock.patch.dict(sys.modules, {"ctranslate2": ctranslate2}),
+            self.assertRaisesRegex(RuntimeError, "CUDA dictation was requested"),
+        ):
+            stt_server._whisper_device(DictationDevice.CUDA)
+
+    def test_whisper_auto_falls_back_to_cpu(self) -> None:
+        ctranslate2 = mock.Mock()
+        ctranslate2.get_cuda_device_count.return_value = 0
+        with mock.patch.dict(sys.modules, {"ctranslate2": ctranslate2}):
+            device = stt_server._whisper_device(DictationDevice.AUTO)
+
+        self.assertEqual(device, "cpu")
 
     def test_transcribe_sends_path_and_returns_trimmed_text(self) -> None:
         audio = Path("/tmp/request.wav")

@@ -390,6 +390,7 @@ def consistency_errors(project_root: Path = PROJECT_ROOT) -> list[str]:
     dictation = (source_dir / "dictation.service").read_text()
     for variable in (
         "DICTATION_BACKEND",
+        "DICTATION_DEVICE",
         "DICTATION_MODEL",
         "DICTATION_LANGUAGE",
         "DICTATION_COMPUTE",

@@ -13,6 +13,7 @@ from pathlib import Path
 from unittest import mock
 
 from local_voice_harness.stt import server
+from local_voice_harness.user_config import DictationDevice
 
 
 class _Transcriber(server.Transcriber):
@@ -712,6 +713,7 @@ class SpeechToTextProtocolTests(unittest.TestCase):
         order: list[str] = []
         settings = server.STTRuntimeSettings(
             backend="parakeet",
+            device=DictationDevice.AUTO,
             model_name="model",
             quantization="int8",
             compute_type="float16",

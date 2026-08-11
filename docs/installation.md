@@ -35,9 +35,10 @@ are:
 - Parakeet TDT 0.6B v2 ONNX cache: less than 1 GB.
 - Current Python environments: approximately 13 GB combined.
 
-The tested configuration uses CUDA for Parakeet and Chatterbox. Parakeet can fall
-back to ONNX Runtime's CPU provider, but CPU dictation has substantially higher
-latency. The optional faster-whisper backend and Chatterbox are configured for CUDA.
+The tested configuration uses CUDA for Parakeet and Chatterbox, but dictation can
+run independently on CPU. CPU dictation has substantially higher latency. The
+optional faster-whisper backend supports the same `auto`, `cpu`, and `cuda` device
+selection.
 
 ## External prerequisites
 
@@ -114,10 +115,24 @@ OpenWakeWord includes the `hey_jarvis_v0.1.onnx` model used by the daemon.
 ```fish
 env UV_PROJECT_ENVIRONMENT=.venv-dictation \
   uv sync --python 3.11 --extra dictation --no-dev
+voice-harness config set compute.dictation_device cpu
 ```
 
-The default backend is Parakeet TDT 0.6B v2. Its first start downloads
-`nemo-parakeet-tdt-0.6b-v2` from Hugging Face.
+This CPU profile installs `onnxruntime`, not `onnxruntime-gpu`, and resolves no
+NVIDIA Python packages. The default backend is Parakeet TDT 0.6B v2. Its first
+start downloads `nemo-parakeet-tdt-0.6b-v2` from Hugging Face.
+
+For CUDA-enabled Parakeet, select the separate profile and device:
+
+```fish
+env UV_PROJECT_ENVIRONMENT=.venv-dictation \
+  uv sync --python 3.11 --extra dictation-cuda --no-dev
+voice-harness config set compute.dictation_device cuda
+```
+
+Use `auto` with either profile to prefer CUDA when its runtime provider is
+available and otherwise fall back compatibly to CPU. Explicit `cuda` fails clearly
+at service startup when the provider or device is unavailable.
 
 To use the supported faster-whisper backend instead, install its separate extra and
 select it in the unified configuration:
@@ -127,16 +142,18 @@ env UV_PROJECT_ENVIRONMENT=.venv-dictation \
   uv sync --python 3.11 --extra dictation-whisper --no-dev
 voice-harness config set compute.dictation_backend whisper
 voice-harness config set compute.dictation_model large-v3-turbo
-voice-harness config set compute.dictation_compute float16
+voice-harness config set compute.dictation_device cpu
 ```
 
-Install either `dictation` for Parakeet or `dictation-whisper` for faster-whisper;
-the two extras are alternative backend environments, not a requirement to install
-both.
+Install `dictation` (CPU) or `dictation-cuda` for Parakeet, or
+`dictation-whisper` for faster-whisper. These are alternative backend environments,
+not a requirement to install more than one. On CPU, faster-whisper maps configured
+`float16` and `int8_float16` compute types to `int8`; CUDA keeps the configured
+compute type.
 
 Existing `~/.config/dictation/backend.env` files remain supported as
 higher-precedence legacy resolver inputs. The allowlist accepts only backend,
-model, language, compute, and quantization selectors. Socket, CUDA/Hugging Face
+device, model, language, compute, and quantization selectors. Socket, CUDA/Hugging Face
 cache, temporary, home, and XDG path variables are service-owned and cannot be
 overridden by that file. New configuration commands never create or update it.
 

@@ -15,9 +15,12 @@ nvidia-smi
 ```
 
 If dictation reports a missing Python module, ensure the installed extra matches
-`DICTATION_BACKEND`: use `dictation` for Parakeet or `dictation-whisper` for
-faster-whisper, then restart `dictation.service`. Unknown backend names are rejected
-at startup.
+the backend and device: use `dictation` for CPU Parakeet, `dictation-cuda` for
+CUDA Parakeet, or `dictation-whisper` for faster-whisper, then restart
+`dictation.service`. Unknown backend or device names are rejected at startup.
+Explicit `cuda` also fails at startup when the selected runtime cannot see a CUDA
+device. Use `voice-harness config set compute.dictation_device cpu` for a strict
+CPU path that does not probe CUDA or search NVIDIA library directories.
 
 Herdr/Cursor failures:
 

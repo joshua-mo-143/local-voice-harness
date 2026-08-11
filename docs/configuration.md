@@ -45,6 +45,7 @@ linear = false
 
 [compute]
 cuda_device = "CUDA0"
+dictation_device = "auto"
 dictation_backend = "parakeet"
 dictation_language = "auto"
 
@@ -140,7 +141,7 @@ The lifecycle policy for every `config.toml` setting is:
 | `providers.tts.provider`, `model`, `voice`, `speed`, `endpoint`, `timeout` | Wake process and TTS service | Restart `voice-harness-wake.service` and `voice-harness-tts.service` |
 | `integrations.github`, `zendesk`, `linear` | Wake process integration registry | Restart `voice-harness-wake.service` |
 | `compute.cuda_device` | Local LLM service | Restart `voice-harness-llm.service` |
-| `compute.dictation_backend`, `dictation_model`, `dictation_quantization`, `dictation_compute`, `dictation_language` | Dictation service | Restart `dictation.service` |
+| `compute.dictation_device`, `dictation_backend`, `dictation_model`, `dictation_quantization`, `dictation_compute`, `dictation_language` | Dictation service | Restart `dictation.service` |
 | Every `audio.*` setting | Wake process | Restart `voice-harness-wake.service` |
 | `dictation.prompt`, `dictation.replacements` | Dictation service | Restart `dictation.service` |
 | `dictation.source`, `dictation.inject`, `dictation.vad_end_silence_ms`, `dictation.vad_max_seconds`, `dictation.vad_min_speech_rms`, `dictation.vad_start_speech_frames` | Each foreground dictation command | Start the next command; an already-running VAD command keeps its startup snapshot |
@@ -197,6 +198,9 @@ voice-harness credentials set
 # Tighter wake sensitivity and faster playback drain
 voice-harness config set audio.wake_threshold 0.65
 voice-harness config set audio.playback_quiet_timeout_seconds 1.5
+
+# Force dictation to remain CPU-only
+voice-harness config set compute.dictation_device cpu
 
 # Enable optional ticket context providers
 voice-harness integrations enable linear
@@ -306,10 +310,20 @@ voice-harness plan-approval ask
 | `DICTATION_VAD_MAX_SECONDS` | Positive maximum duration of each VAD utterance | `120` | Environment override |
 | `DICTATION_VAD_MIN_SPEECH_RMS` | Non-negative VAD speech energy gate | `1100` | Environment override |
 | `DICTATION_BACKEND` | Dictation engine (`parakeet` or `whisper`) | `parakeet` | Environment override; legacy `backend.env` input |
+| `DICTATION_DEVICE` | Dictation compute device (`auto`, `cpu`, or `cuda`) | `auto` | Environment override; legacy `backend.env` input |
 | `DICTATION_MODEL` | Backend model | `nemo-parakeet-tdt-0.6b-v2` | Environment override; legacy `backend.env` input |
 | `DICTATION_QUANTIZATION` | Parakeet ONNX quantization (`none` disables it) | `int8` | Environment override; legacy `backend.env` input |
 | `DICTATION_COMPUTE` | faster-whisper compute type | `float16` | Environment override; legacy `backend.env` input |
 | `DICTATION_LANGUAGE` | Spoken language to transcribe (`en`, `zh`, `english`, `chinese`, or `auto`) | `auto` | Environment override; legacy `backend.env` input |
+
+`cpu` is a strict CPU path: Parakeet receives only ONNX Runtime's CPU provider,
+faster-whisper receives `device="cpu"`, incompatible half-precision Whisper compute
+types are reduced to `int8`, and startup neither searches Python NVIDIA library
+directories nor probes CUDA. `cuda` requires the selected backend to report an
+available CUDA device and fails at startup with an actionable error instead of
+silently using CPU. `auto` uses CUDA when the installed runtime exposes it and
+otherwise preserves the CPU fallback. Install the dependency profile matching the
+intended device as described in [Manual installation](installation.md#2-create-the-bundled-dictation-environment).
 
 `VOICE_HARNESS_PROJECT_ROOT` can narrow repository discovery to another directory.
 `VOICE_HARNESS_GITHUB_ROOT` must resolve inside it. Forks are cloned to

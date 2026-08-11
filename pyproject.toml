@@ -17,6 +17,10 @@ wake = [
   "webrtcvad-wheels==2.0.14",
 ]
 dictation = [
+  "onnx-asr[hub]>=0.7.0",
+  "onnxruntime>=1.20",
+]
+dictation-cuda = [
   "onnx-asr[gpu,hub]>=0.7.0",
 ]
 dictation-whisper = [
@@ -46,6 +50,14 @@ override-dependencies = [
 conflicts = [
   [
     { extra = "dictation" },
+    { extra = "dictation-cuda" },
+  ],
+  [
+    { extra = "dictation" },
+    { extra = "tts" },
+  ],
+  [
+    { extra = "dictation-cuda" },
     { extra = "tts" },
   ],
   [

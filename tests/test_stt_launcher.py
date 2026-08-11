@@ -7,7 +7,7 @@ from pathlib import Path
 from unittest import mock
 
 from local_voice_harness.stt import launcher
-from local_voice_harness.user_config import load_backend_environment
+from local_voice_harness.user_config import DictationDevice, load_backend_environment
 
 
 class DictationLauncherTests(unittest.TestCase):
@@ -43,6 +43,7 @@ class DictationLauncherTests(unittest.TestCase):
             path.write_text(
                 "# backend selection\n"
                 "DICTATION_BACKEND=whisper\n"
+                "DICTATION_DEVICE=cpu\n"
                 "DICTATION_MODEL='large-v3-turbo'\n"
                 "DICTATION_LANGUAGE=en\n"
             )
@@ -53,6 +54,7 @@ class DictationLauncherTests(unittest.TestCase):
             environment,
             {
                 "DICTATION_BACKEND": "whisper",
+                "DICTATION_DEVICE": "cpu",
                 "DICTATION_MODEL": "large-v3-turbo",
                 "DICTATION_LANGUAGE": "en",
             },
@@ -127,6 +129,24 @@ class DictationLauncherTests(unittest.TestCase):
         self.assertEqual(captured["XDG_CONFIG_HOME"], str(home / ".config"))
         self.assertNotIn("DICTATION_BACKEND", captured)
         self.assertNotIn("DICTATION_COMPUTE", captured)
+
+    def test_cpu_launch_does_not_discover_nvidia_libraries(self) -> None:
+        config = mock.Mock()
+        config.compute.dictation_device = DictationDevice.CPU
+        with (
+            mock.patch.dict(os.environ, {}, clear=True),
+            mock.patch.object(launcher, "protected_environment", return_value={}),
+            mock.patch.object(launcher, "load_user_config", return_value=config),
+            mock.patch.object(launcher, "add_nvidia_library_paths") as discover,
+            mock.patch.object(
+                launcher.os, "execve", side_effect=RuntimeError("exec inspected")
+            ),
+            mock.patch.object(launcher.sys, "argv", ["voice-harness-dictation"]),
+            self.assertRaisesRegex(RuntimeError, "exec inspected"),
+        ):
+            launcher.main()
+
+        discover.assert_not_called()
 
 
 if __name__ == "__main__":
