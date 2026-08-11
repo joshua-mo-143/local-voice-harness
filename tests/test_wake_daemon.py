@@ -22,6 +22,7 @@ from local_voice_harness.cursor.store import JobStore
 from local_voice_harness.errors import HarnessError
 from local_voice_harness.intent import Intent, IntentRoute
 from local_voice_harness.questions import AnswerProvenance
+from local_voice_harness.responses import AssistantResponse
 from local_voice_harness.tts.queue import PlaybackQueue, PlaybackRequest
 from local_voice_harness.wake import daemon as wake_daemon
 from local_voice_harness.wake.daemon import WakeConversationDaemon
@@ -175,6 +176,49 @@ class StripWakePrefixTests(unittest.TestCase):
 
 
 class ProcessUtteranceTests(unittest.TestCase):
+    def test_response_channels_are_selected_at_wake_boundary(self) -> None:
+        daemon = _bare_daemon()
+        output = io.StringIO()
+        response = AssistantResponse(
+            spoken_text="The job started.",
+            display_text="Started job 123456789abc in /tmp/example.",
+        )
+        with (
+            mock.patch.object(wake_daemon, "transcribe", return_value="start it"),
+            mock.patch.object(wake_daemon, "start_components"),
+            mock.patch.object(
+                wake_daemon,
+                "request_context",
+                return_value=RequestContext("start it"),
+            ),
+            mock.patch.object(
+                wake_daemon,
+                "route_intent",
+                return_value=IntentRoute(Intent.CONVERSATION, "high"),
+            ),
+            mock.patch.object(
+                wake_daemon, "qwen_turn", return_value=(response, None)
+            ) as qwen,
+            mock.patch.object(
+                wake_daemon,
+                "load_backend_settings",
+                return_value=mock.Mock(llm_provider="local"),
+            ),
+            mock.patch.object(
+                daemon,
+                "play_response",
+                return_value=({"played_text": response.spoken_text}, None),
+            ) as play,
+            mock.patch.object(wake_daemon, "notify"),
+            contextlib.redirect_stdout(output),
+        ):
+            daemon.process_utterance(AUDIO_GENERATION, woke=False)
+
+        self.assertIn(f"Assistant: {response.display_text}", output.getvalue())
+        self.assertNotIn(response.spoken_text, output.getvalue())
+        play.assert_called_once_with(response)
+        qwen.assert_called_once()
+
     def test_completed_turn_enables_followup(self) -> None:
         daemon = _bare_daemon()
         with (
@@ -728,7 +772,9 @@ class ProcessUtteranceTests(unittest.TestCase):
 
         cursor_turn.assert_not_called()
         qwen_turn.assert_not_called()
-        play.assert_called_once_with(wake_daemon.MISSING_ISSUE_SCOPE_RESPONSE)
+        play.assert_called_once_with(
+            AssistantResponse.from_text(wake_daemon.MISSING_ISSUE_SCOPE_RESPONSE)
+        )
 
     def test_failed_fresh_turn_stops_components(self) -> None:
         daemon = _bare_daemon()
@@ -984,6 +1030,23 @@ class AnnounceJobTests(unittest.TestCase):
 
         acknowledge.assert_called_once_with("job1", "claim")
         self.assertEqual(daemon.cursor_session, "job1")
+
+    def test_play_response_queues_only_the_spoken_channel(self) -> None:
+        daemon = _bare_daemon()
+        response = AssistantResponse(
+            spoken_text="The job failed.",
+            display_text="Job 123 failed in /tmp/example; inspect the logs.",
+        )
+        with mock.patch.object(
+            daemon,
+            "_drain_playback_queue",
+            return_value=([], None),
+        ) as drain:
+            daemon.play_response(response)
+
+        drain.assert_called_once_with(response.spoken_text, on_played=mock.ANY)
+        self.assertEqual(daemon.playback_queue.queued_text(), response.spoken_text)
+        self.assertNotIn(response.display_text, daemon.playback_queue.queued_text())
 
     def test_awaiting_user_job_enables_followup(self) -> None:
         daemon = _bare_daemon()
