@@ -539,6 +539,15 @@ def _add_replay_parser(
     promote.add_argument("output", type=Path)
 
 
+def _configured_request_context(text: str) -> RequestContext:
+    settings = load_user_config()
+    return request_context(
+        text,
+        platform=settings.platform,
+        integrations=settings.integrations,
+    )
+
+
 def _capture_replay(args: argparse.Namespace) -> None:
     from .stt.server import transcript_replacements
     from .transcript import normalize_transcript
@@ -549,7 +558,7 @@ def _capture_replay(args: argparse.Namespace) -> None:
     context = (
         RequestContext(normalized)
         if args.without_context
-        else request_context(normalized)
+        else _configured_request_context(normalized)
     )
     if (args.intent is None) != (args.confidence is None):
         raise ValueError("--intent and --confidence must be provided together")

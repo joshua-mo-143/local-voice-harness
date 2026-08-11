@@ -2508,15 +2508,13 @@ class CompletedFollowupContextTests(unittest.TestCase):
 
     def test_newer_completed_announcement_supersedes_retained_context(self) -> None:
         daemon = _bare_daemon()
+        daemon.platform = replace(daemon.platform, cursor_followup_enabled=True)
         first = _delivery_claim("job1", "completed", result="first").job
         second = _delivery_claim("job2", "completed", result="second").job
-        with (
-            mock.patch.object(wake_daemon, "CURSOR_FOLLOWUP_ENABLED", True),
-            mock.patch.object(
-                wake_daemon.CURSOR_STORE,
-                "get",
-                side_effect=[first, second],
-            ),
+        with mock.patch.object(
+            wake_daemon.CURSOR_STORE,
+            "get",
+            side_effect=[first, second],
         ):
             for job in (first, second):
                 display = wake_daemon.cursor_service.render_job_announcement(
