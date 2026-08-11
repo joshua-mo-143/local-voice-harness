@@ -67,6 +67,13 @@ from ..cursor.delivery import (
     renew_delivery as renew_claim,
 )
 from ..cursor.store import JobStore
+from ..diagnostic_safety import (
+    DAEMON_FAILURE,
+    PLAYBACK_FAILURE,
+    RECORDING_FAILURE,
+    VOICE_REQUEST_FAILURE,
+    redact_diagnostic,
+)
 from ..errors import HarnessError
 from ..intent import (
     NON_ACTIONABLE_SUBMIT_RESPONSE,
@@ -261,7 +268,11 @@ class PendingQuestionSnapshot:
 
 
 def log(message: str) -> None:
-    print(f"[voice-harness-wake] {message}", file=sys.stderr, flush=True)
+    print(
+        f"[voice-harness-wake] {redact_diagnostic(message)}",
+        file=sys.stderr,
+        flush=True,
+    )
 
 
 class WakeConversationDaemon:
@@ -426,7 +437,7 @@ class WakeConversationDaemon:
         except HarnessError as exc:
             message = f"wake recording suppressed: {exc}"
             log(message)
-            notify(message)
+            notify(RECORDING_FAILURE, error=True)
             return None
 
     def begin_activation(self) -> None:
@@ -879,7 +890,7 @@ class WakeConversationDaemon:
                 ):
                     release_delivery(request.job_id, request.delivery_token)
             log(f"queued playback failed: {type(exc).__name__}: {exc}")
-            notify(str(exc) or type(exc).__name__, error=True)
+            notify(PLAYBACK_FAILURE, error=True)
             return None
         finally:
             try:
@@ -1187,7 +1198,7 @@ class WakeConversationDaemon:
         except Exception as exc:
             release_deliveries(delivery_claims)
             log(f"turn failed: {type(exc).__name__}: {exc}")
-            notify(str(exc) or type(exc).__name__, error=True)
+            notify(VOICE_REQUEST_FAILURE, error=True)
             self.awaiting_followup = False
             if not had_active_conversation:
                 self.history.clear()
@@ -1368,7 +1379,7 @@ def main() -> None:
     except Exception as exc:
         if daemon.running:
             log(f"fatal: {type(exc).__name__}: {exc}")
-            notify(str(exc) or type(exc).__name__, error=True)
+            notify(DAEMON_FAILURE, error=True)
             raise
     finally:
         daemon.stop()

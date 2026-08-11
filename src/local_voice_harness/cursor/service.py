@@ -16,6 +16,7 @@ from ..config import (
     JOBS_DIR,
     LEGACY_JOBS_DIR,
 )
+from ..diagnostic_safety import redact_diagnostic
 from ..errors import HarnessError
 from ..integrations.github import (
     GitHubClient,
@@ -202,10 +203,11 @@ def run_worker(job_id: str, claim_token: str | None = None) -> None:
 
 def launch_worker(job_id: str) -> None:
     def prepare_failure(job: CursorJob, message: str, failed_at: float) -> CursorJob:
+        diagnostic = redact_diagnostic(message, limit=500)
         return job.evolve(
             status=JobStatus.FAILED,
-            error=message,
-            result=message,
+            error=diagnostic,
+            result="Cursor job failed to start. Check the job log for details.",
             completed_at=failed_at,
             delivered=False,
             delivery_generation=job.delivery_generation + 1,
@@ -332,8 +334,7 @@ def start_job(
 
 
 def _start_error_detail(error: BaseException) -> str:
-    detail = re.sub(r"\s+", " ", str(error) or type(error).__name__).strip()
-    return detail[:240]
+    return redact_diagnostic(str(error) or type(error).__name__, limit=240)
 
 
 def start_jobs(
@@ -442,7 +443,11 @@ def _github_target(
                 exc.voice_message,
                 github_lookup_reason=exc.reason,
             )
-        return _rejected(reference, str(exc))
+        return _rejected(
+            reference,
+            str(exc),
+            github_lookup_reason=GitHubIssueLookupReason.UNKNOWN,
+        )
 
     detail_number = details.get("number")
     if isinstance(detail_number, int) and detail_number != issue.number:
@@ -618,17 +623,25 @@ def _ticket_start_spoken(outcomes: tuple[TicketStartOutcome, ...]) -> str:
 
 
 def _ticket_display_detail(outcome: TicketStartOutcome) -> str | None:
-    if outcome.github_lookup_reason is None:
-        return outcome.detail
-    classified = {
-        GitHubIssueLookupReason.NOT_FOUND_OR_INACCESSIBLE: (
-            "issue not found or inaccessible"
-        ),
-        GitHubIssueLookupReason.UNAUTHORIZED: "GitHub authorization required",
-        GitHubIssueLookupReason.TRANSIENT: "GitHub temporarily unavailable",
-        GitHubIssueLookupReason.UNKNOWN: "GitHub issue could not be verified",
-    }
-    return classified[outcome.github_lookup_reason]
+    if outcome.github_lookup_reason is not None:
+        classified = {
+            GitHubIssueLookupReason.NOT_FOUND_OR_INACCESSIBLE: (
+                "issue not found or inaccessible"
+            ),
+            GitHubIssueLookupReason.UNAUTHORIZED: "GitHub authorization required",
+            GitHubIssueLookupReason.TRANSIENT: "GitHub temporarily unavailable",
+            GitHubIssueLookupReason.UNKNOWN: "GitHub issue could not be verified",
+        }
+        return classified[outcome.github_lookup_reason]
+    if outcome.status == "start-failed":
+        if outcome.job_id:
+            return f"job {outcome.job_id} failed to start; check its log"
+        return "job could not be started; check the harness logs"
+    if outcome.status == "rejected":
+        if outcome.job_id:
+            return f"active job {outcome.job_id} already exists"
+        return "request could not be accepted; verify the ticket reference and access"
+    return None
 
 
 def _ticket_start_summary(
@@ -1676,20 +1689,14 @@ def render_job_announcement(job: CursorJob) -> AssistantResponse:
             display_text=f"{identity} needs clarification: {question}",
         )
     if job.status == JobStatus.BLOCKED:
-        detail = str(job.result or "Open Herdr for recovery guidance.").strip()
         return AssistantResponse(
             spoken_text=f"Cursor needs attention for {label}.",
-            display_text=f"{identity} is blocked: {detail}",
+            display_text=(f"{identity} is blocked. Open Herdr for recovery guidance."),
         )
     if job.status == JobStatus.CANCELLED:
-        detail = str(job.result or "").strip()
         return AssistantResponse(
             spoken_text=f"Cursor cancelled {label}.",
-            display_text=(
-                f"{identity} was cancelled: {detail}"
-                if detail
-                else f"{identity} was cancelled."
-            ),
+            display_text=f"{identity} was cancelled.",
         )
     if job.status == JobStatus.FAILED:
         stage = _job_failure_stage(job)
@@ -1737,18 +1744,16 @@ def _await_foreground(
             return CursorTurnResult(rendered_question, job_id)
         if job.status == JobStatus.BLOCKED:
             claimed = _defer_or_acknowledge(job_id, delivery_claims)
-            result = claimed.result if claimed is not None else job.result
-            return CursorTurnResult(
-                str(result or "Cursor needs attention in Herdr"), None
-            )
+            blocked = claimed if claimed is not None else job
+            return CursorTurnResult(render_job_announcement(blocked), None)
         if job.status == JobStatus.FAILED:
             claimed = _defer_or_acknowledge(job_id, delivery_claims)
             failed = claimed if claimed is not None else job
             return CursorTurnResult(_foreground_failure_response(failed), None)
         if job.status == JobStatus.CANCELLED:
             claimed = _defer_or_acknowledge(job_id, delivery_claims)
-            result = claimed.result if claimed is not None else job.result
-            return CursorTurnResult(str(result or "Cursor job was cancelled"), None)
+            cancelled = claimed if claimed is not None else job
+            return CursorTurnResult(render_job_announcement(cancelled), None)
         time.sleep(0.1)
     _job_store().update(
         job_id,

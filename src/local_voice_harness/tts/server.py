@@ -24,6 +24,7 @@ from ..config import (
     load_backend_settings,
 )
 from ..credentials import get_venice_api_key
+from ..diagnostic_safety import redact_diagnostic
 
 SOCKET_PATH = TTS_SOCKET
 OUTPUT_ROOT = STATE_DIR
@@ -43,7 +44,11 @@ MAX_AUDIO_BYTES = 32 * 1024 * 1024
 
 
 def log(message: str) -> None:
-    print(f"[voice-harness-tts] {message}", file=sys.stderr, flush=True)
+    print(
+        f"[voice-harness-tts] {redact_diagnostic(message)}",
+        file=sys.stderr,
+        flush=True,
+    )
 
 
 def split_text(text: str, *, max_chars: int = MAX_CHUNK_CHARS) -> list[str]:
@@ -473,8 +478,9 @@ class RequestHandler(socketserver.StreamRequestHandler):
                 "realtime_factor": round(elapsed / duration, 3),
             }
         except Exception as exc:
-            log(f"request failed: {type(exc).__name__}: {exc}")
-            response = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+            diagnostic = redact_diagnostic(f"{type(exc).__name__}: {exc}")
+            log(f"request failed: {diagnostic}")
+            response = {"ok": False, "error": diagnostic}
         try:
             _write_json(self, response)
         except (BrokenPipeError, ConnectionResetError):

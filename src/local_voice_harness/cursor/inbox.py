@@ -14,7 +14,6 @@ from dataclasses import dataclass
 
 from .model import (
     ACTIVE_STATUSES,
-    TERMINAL_STATUSES,
     CursorJob,
     JobStatus,
 )
@@ -147,8 +146,12 @@ class JobSummary:
 def _detail(job: CursorJob) -> str:
     if job.status == JobStatus.AWAITING_USER:
         return _normalize(job.question or job.result or "")
-    if job.status in TERMINAL_STATUSES or job.status == JobStatus.BLOCKED:
-        return _normalize(job.error or job.result or "")
+    if job.status == JobStatus.BLOCKED:
+        return "Manual attention required in Herdr"
+    if job.status == JobStatus.FAILED:
+        return ""
+    if job.status in {JobStatus.COMPLETED, JobStatus.CANCELLED}:
+        return _normalize(job.result or "")
     tier = f"{job.workflow_tier.value} " if job.workflow_tier is not None else ""
     return f"{tier}{job.workflow_phase.value}".replace("_", " ")
 
