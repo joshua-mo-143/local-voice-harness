@@ -48,11 +48,11 @@ export XDG_STATE_HOME="$PROJECT_DIR/.dev/state"
 mkdir -p -- "$XDG_CONFIG_HOME" "$XDG_STATE_HOME"
 
 if [[ "$command" == "text" ]]; then
-  exec uv run --project "$PROJECT_DIR" voice-harness text "$@"
+  exec uv run --project "$PROJECT_DIR" --extra wake voice-harness text "$@"
 fi
 
 if [[ "$command" == "setup" || "$command" == "config" || "$command" == "integrations" ]]; then
-  exec uv run --project "$PROJECT_DIR" voice-harness "$command" "$@"
+  exec uv run --project "$PROJECT_DIR" --extra wake voice-harness "$command" "$@"
 fi
 
 if systemctl --user is-active --quiet voice-harness-wake.service; then
