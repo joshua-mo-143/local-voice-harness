@@ -215,9 +215,35 @@ class ConfigManagementTests(unittest.TestCase):
                 print_fn=lambda _message: None,
             )
 
-            self.assertEqual(result.config.providers.llm_provider, "local")
+            self.assertEqual(result.config.providers.llm_provider, "venice")
+            self.assertEqual(result.config.providers.tts_provider, "venice")
             self.assertTrue(result.config.integrations.github_enabled)
             self.assertFalse(result.config.integrations.zendesk_enabled)
+
+    def test_interactive_setup_prefers_venice(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            paths = self.paths(root)
+            with (
+                mock.patch.object(
+                    config_management,
+                    "_available_llm_providers",
+                    return_value=("local", "venice"),
+                ),
+                mock.patch.object(
+                    config_management,
+                    "_available_tts_providers",
+                    return_value=("local", "venice"),
+                ),
+            ):
+                result = config_management.run_setup(
+                    paths=paths,
+                    input_fn=lambda _prompt: "",
+                    print_fn=lambda _message: None,
+                )
+
+            self.assertEqual(result.config.providers.llm_provider, "venice")
+            self.assertEqual(result.config.providers.tts_provider, "venice")
 
     def test_showcase_profile_is_non_interactive_and_uses_venice(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

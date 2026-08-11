@@ -33,10 +33,10 @@ add these overrides: `VOICE_HARNESS_INTEGRATION_GITHUB`,
 
 ```toml
 [providers.llm]
-provider = "local"
+provider = "venice"
 
 [providers.tts]
-provider = "local"
+provider = "venice"
 
 [integrations]
 github = true
@@ -178,11 +178,10 @@ voice-harness integrations doctor
 
 `setup` walks through provider, integration, audio, and compute choices that are
 supported on the current machine. Use `--defaults` for a non-interactive first
-write with local providers. Use `--profile showcase` for a non-interactive
-Venice LLM/TTS configuration with local Parakeet dictation. The showcase profile
-migrates an existing `backends.toml` into the unified configuration and retains
-the original as `backends.toml.migrated` so legacy provider values cannot
-override the selected profile. `config set` accepts dotted keys such as
+write with Venice LLM/TTS and local Parakeet dictation. The equivalent
+`--profile showcase` also migrates an existing `backends.toml` into the unified
+configuration and retains the original as `backends.toml.migrated` so legacy
+provider values cannot override the selected profile. `config set` accepts dotted keys such as
 `audio.wake_threshold`, `compute.dictation_backend`, and
 `platform.cursor_followup`. After a change, the CLI reports which installed
 services are currently running and need a restart, for example
@@ -212,8 +211,8 @@ voice-harness integrations doctor
 ## AI backends
 
 LLM and TTS providers are selected independently in `[providers.llm]` and
-`[providers.tts]` in `config.toml`. Both default to `local`; use `venice` for
-either hosted backend. Existing values in
+`[providers.tts]` in `config.toml`. Both default to `venice`; select `local` for
+offline inference. Existing values in
 `~/.config/voice-harness/backends.toml` continue to override `config.toml` until
 that legacy file is removed:
 

@@ -772,18 +772,10 @@ def run_setup(
     tts_options = _available_tts_providers()
     dictation_options = _available_dictation_backends()
 
-    if profile == "showcase":
+    if profile == "showcase" or defaults_only:
         llm_provider = "venice"
         tts_provider = "venice"
         dictation_backend = "parakeet"
-        github_enabled = True
-        zendesk_enabled = False
-        linear_enabled = False
-        wake_threshold = "0.55"
-    elif defaults_only:
-        llm_provider = "local"
-        tts_provider = "local"
-        dictation_backend = dictation_options[0]
         github_enabled = True
         zendesk_enabled = False
         linear_enabled = False
@@ -796,13 +788,13 @@ def run_setup(
         llm_provider = _choice(
             "LLM provider",
             llm_options,
-            default="local",
+            default="venice" if "venice" in llm_options else llm_options[0],
             input_fn=input_fn,
         )
         tts_provider = _choice(
             "TTS provider",
             tts_options,
-            default="local",
+            default="venice" if "venice" in tts_options else tts_options[0],
             input_fn=input_fn,
         )
         dictation_backend = _choice(

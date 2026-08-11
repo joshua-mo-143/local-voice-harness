@@ -60,15 +60,17 @@ class ConfigPathTests(unittest.TestCase):
             Path("/custom/state/voice-harness"),
         )
 
-    def test_backend_settings_default_to_local_and_support_venice_toml(self) -> None:
+    def test_backend_settings_default_to_venice_and_support_venice_toml(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             missing = root / "missing.toml"
             defaults = config.load_backend_settings({}, path=missing, home=root)
             self.assertEqual(
-                (defaults.llm_provider, defaults.tts_provider), ("local", "local")
+                (defaults.llm_provider, defaults.tts_provider), ("venice", "venice")
             )
-            self.assertEqual(defaults.tts_speed, 1)
+            self.assertEqual(defaults.llm_model, "venice-uncensored")
+            self.assertEqual(defaults.tts_model, "tts-kokoro")
+            self.assertEqual(defaults.tts_speed, 1.25)
 
             backend_file = root / "backends.toml"
             backend_file.write_text(

@@ -407,8 +407,18 @@ class ModelAndCudaTests(unittest.TestCase):
         self.assertIs(results[0].severity, Severity.OK)
 
     def test_model_missing_is_fatal(self) -> None:
+        snapshot = _snapshot()
+        assert snapshot.config is not None
+        config = snapshot.config
+        snapshot = replace(
+            snapshot,
+            config=replace(
+                config,
+                providers=replace(config.providers, llm_provider="local"),
+            ),
+        )
         with mock.patch.object(checks, "MODEL_FILE", Path("/nonexistent/model.gguf")):
-            results = checks.check_model_file(_snapshot())
+            results = checks.check_model_file(snapshot)
         self.assertIs(results[0].severity, Severity.FATAL)
         self.assertIn("hf download", results[0].suggestion or "")
 
