@@ -7,11 +7,49 @@ from pathlib import Path
 from unittest import mock
 
 from local_voice_harness.cursor import service, worker
-from local_voice_harness.integrations.registry import build_integration_registry
+from local_voice_harness.errors import HarnessError
+from local_voice_harness.integrations.registry import (
+    IntegrationRegistry,
+    build_integration_registry,
+    issue_provider_identity,
+    resolve_issue_reference,
+)
 from local_voice_harness.user_config import default_user_config
 
 
 class IntegrationRuntimeTests(unittest.TestCase):
+    def test_explicit_provider_identity_prevents_config_rerouting(self) -> None:
+        class Provider:
+            def __init__(self, name: str) -> None:
+                self.name = name
+
+            def owns_issue_reference(self, reference: str) -> bool:
+                return reference.casefold().startswith("eng-")
+
+            def canonicalize_issue_reference(self, reference: str) -> str:
+                return reference.upper()
+
+        config = default_user_config(Path("/home/example"))
+        enabled = replace(config.integrations, linear_enabled=True)
+        startup = IntegrationRegistry(
+            enabled,
+            (("linear_enabled", lambda: Provider("linear")),),
+            mock.Mock(),
+            mock.Mock(),
+        )
+        changed = IntegrationRegistry(
+            enabled,
+            (("linear_enabled", lambda: Provider("replacement")),),
+            mock.Mock(),
+            mock.Mock(),
+        )
+
+        canonical = resolve_issue_reference("eng-42", startup)
+        self.assertEqual(canonical, "ENG-42")
+        self.assertEqual(issue_provider_identity(canonical or "", startup), "linear")
+        with self.assertRaisesRegex(HarnessError, "linear.*unavailable"):
+            resolve_issue_reference(canonical, changed, provider="linear")
+
     def test_registry_retains_its_startup_snapshot(self) -> None:
         config = default_user_config(Path("/home/example"))
         startup = replace(

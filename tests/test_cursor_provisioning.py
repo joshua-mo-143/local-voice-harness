@@ -2187,6 +2187,9 @@ class CursorJobStateTests(unittest.TestCase):
             mock.patch.object(
                 service, "resolve_issue_reference", return_value="ENG-123"
             ),
+            mock.patch.object(
+                service, "issue_provider_identity", return_value="linear"
+            ),
             mock.patch.object(service, "require_issue_capabilities"),
         ):
             job_id = service.start_job(
@@ -2198,6 +2201,7 @@ class CursorJobStateTests(unittest.TestCase):
         job = jobs.read_job(job_id)
         self.assertEqual(job["trusted_utterance"], "work on this ticket")
         self.assertEqual(job["issue_key"], "ENG-123")
+        self.assertEqual(job["issue_provider"], "linear")
         self.assertEqual(job["speakable_label"], "ENG-123")
 
     def test_worker_provisions_github_issue_and_uses_stable_worktree(self) -> None:
@@ -2517,6 +2521,7 @@ class CursorJobStateTests(unittest.TestCase):
             mock.patch.object(
                 production_jobs, "resolve_issue_reference", return_value="ENG-123"
             ),
+            mock.patch.object(production_jobs, "require_issue_provider"),
             mock.patch.object(
                 production_jobs,
                 "require_issue_capabilities",
