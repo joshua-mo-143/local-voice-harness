@@ -10,12 +10,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, replace
 from typing import Literal, NamedTuple
 
-from ..config import (
-    CURSOR_FOREGROUND_SECONDS,
-    JOB_LOGS_DIR,
-    JOBS_DIR,
-    LEGACY_JOBS_DIR,
-)
+from ..config import JOB_LOGS_DIR, JOBS_DIR, LEGACY_JOBS_DIR
 from ..diagnostic_safety import redact_diagnostic
 from ..errors import HarnessError
 from ..integrations import registry as integration_registry_module
@@ -47,7 +42,7 @@ from ..questions import (
 )
 from ..responses import AssistantResponse, ResponseLike
 from ..ticket_targets import TicketExtraction, TicketReference, extract_ticket_targets
-from ..user_config import load_user_config
+from ..user_config import PlatformSettings, default_user_config
 from . import delivery, inbox, provisioning, questions, recovery, worker_lifecycle
 from .delivery import DeliveryClaim, DeliveryClaims
 from .model import (
@@ -259,6 +254,7 @@ def start_job(
     context_repository: str | None = None,
     issue_key: str | None = None,
     foreground: bool = True,
+    foreground_seconds: float = 5.0,
     integrations: IntegrationRegistry | None = None,
 ) -> str:
     if isinstance(request, StartJobRequest):
@@ -314,9 +310,7 @@ def start_job(
             request=text,
             created_at=now,
             foreground_until=(
-                now + CURSOR_FOREGROUND_SECONDS + FOREGROUND_GRACE_SECONDS
-                if foreground
-                else 0
+                now + foreground_seconds + FOREGROUND_GRACE_SECONDS if foreground else 0
             ),
             utterance=utterance,
             trusted_utterance=spoken_text,
@@ -371,7 +365,8 @@ def _start_error_detail(error: BaseException) -> str:
 def start_jobs(
     requests: tuple[TicketJobRequest, ...],
     *,
-    concurrency: int | None = None,
+    concurrency: int = 3,
+    foreground_seconds: float = 5.0,
     integrations: IntegrationRegistry | None = None,
 ) -> tuple[TicketStartOutcome, ...]:
     """Start ordinary durable jobs concurrently without foreground waiting."""
@@ -381,7 +376,11 @@ def start_jobs(
 
     def start(request: TicketJobRequest) -> TicketStartOutcome:
         try:
-            job_id = start_job(request.request, integrations=integrations)
+            job_id = start_job(
+                request.request,
+                foreground_seconds=foreground_seconds,
+                integrations=integrations,
+            )
         except ActiveTicketConflict as exc:
             return TicketStartOutcome(
                 request.target,
@@ -412,12 +411,7 @@ def start_jobs(
             )
         return TicketStartOutcome(request.target, "accepted", job_id=job_id)
 
-    configured_concurrency = (
-        load_user_config().platform.agent_job_start_concurrency
-        if concurrency is None
-        else concurrency
-    )
-    with ThreadPoolExecutor(max_workers=max(1, configured_concurrency)) as executor:
+    with ThreadPoolExecutor(max_workers=max(1, concurrency)) as executor:
         futures = {
             executor.submit(start, request): index
             for index, request in enumerate(requests)
@@ -705,6 +699,8 @@ def _submit_extracted_targets(
     base: StartJobRequest,
     *,
     foreground: bool,
+    foreground_seconds: float,
+    concurrency: int,
     integrations: IntegrationRegistry,
 ) -> tuple[TicketStartOutcome, ...]:
     slots, prepared = _preflight_ticket_targets(
@@ -715,6 +711,8 @@ def _submit_extracted_targets(
     )
     started = start_jobs(
         tuple(request for _index, request in prepared),
+        concurrency=concurrency,
+        foreground_seconds=foreground_seconds,
         integrations=integrations,
     )
     for (index, _request), outcome in zip(prepared, started, strict=True):
@@ -731,6 +729,7 @@ def reply_job(
     expected_question_turn: str | None = None,
     answer_provenance: AnswerProvenance = AnswerProvenance.USER_TEXT,
     on_started: Callable[[], None] | None = None,
+    foreground_seconds: float = 5.0,
     integrations: IntegrationRegistry | None = None,
 ) -> str | None:
     now = time.time()
@@ -801,9 +800,7 @@ def reply_job(
             resolution,
             questions.AnswerContext(
                 now=now,
-                foreground_until=(
-                    now + CURSOR_FOREGROUND_SECONDS + FOREGROUND_GRACE_SECONDS
-                ),
+                foreground_until=(now + foreground_seconds + FOREGROUND_GRACE_SECONDS),
                 text=text,
                 trusted_text=trusted_utterance,
             ),
@@ -881,6 +878,7 @@ def start_follow_up(
     expected_completed_at: float | None = None,
     utterance: str | None = None,
     on_created: Callable[[], None] | None = None,
+    foreground_seconds: float = 5.0,
     integrations: IntegrationRegistry | None = None,
 ) -> str:
     """Create and launch a child job that reuses a completed parent's checkout."""
@@ -909,9 +907,7 @@ def start_follow_up(
                 parent_job_id=parent.id,
                 request=text,
                 created_at=now,
-                foreground_until=(
-                    now + CURSOR_FOREGROUND_SECONDS + FOREGROUND_GRACE_SECONDS
-                ),
+                foreground_until=(now + foreground_seconds + FOREGROUND_GRACE_SECONDS),
                 utterance=utterance,
                 trusted_utterance=spoken,
                 repository=parent.repository,
@@ -1522,9 +1518,11 @@ def cursor_turn(
     job_id: str | None = None,
     reference: str | None = None,
     delivery_claims: DeliveryClaims | None = None,
+    platform: PlatformSettings | None = None,
     integrations: IntegrationRegistry | None = None,
 ) -> CursorTurnResult:
     registry = _integration_registry(integrations)
+    runtime = platform or registry.platform or default_user_config().platform
     on_follow_up_started: Callable[[], None] | None = None
     on_job_started: Callable[[], None] | None = None
     expected_question_id: str | None = None
@@ -1626,6 +1624,7 @@ def cursor_turn(
             expected_question_turn=expected_question_turn,
             answer_provenance=answer_provenance,
             on_started=on_job_started,
+            foreground_seconds=runtime.cursor_foreground_seconds,
             integrations=registry,
         )
         if immediate is not None:
@@ -1649,6 +1648,7 @@ def cursor_turn(
                 expected_completed_at=expected_completed_at,
                 utterance=utterance,
                 on_created=on_follow_up_started,
+                foreground_seconds=runtime.cursor_foreground_seconds,
                 integrations=registry,
             )
             if on_job_started is not None:
@@ -1692,6 +1692,8 @@ def cursor_turn(
                 extraction,
                 base,
                 foreground=not extraction.batch_requested,
+                foreground_seconds=runtime.cursor_foreground_seconds,
+                concurrency=runtime.agent_job_start_concurrency,
                 integrations=registry,
             )
             accepted = tuple(
@@ -1702,7 +1704,11 @@ def cursor_turn(
             if extraction.batch_requested or not accepted:
                 return CursorTurnResult(_ticket_start_summary(outcomes), None)
             assert len(accepted) == 1 and accepted[0].job_id is not None
-            return _await_foreground(accepted[0].job_id, delivery_claims)
+            return _await_foreground(
+                accepted[0].job_id,
+                delivery_claims,
+                timeout=runtime.cursor_foreground_seconds,
+            )
         try:
             job_id = start_job(
                 text,
@@ -1716,13 +1722,18 @@ def cursor_turn(
                 utterance=utterance,
                 context_repository=context_repository,
                 issue_key=issue_key,
+                foreground_seconds=runtime.cursor_foreground_seconds,
                 integrations=registry,
             )
         except ActiveTicketConflict as exc:
             return CursorTurnResult(str(exc), None)
         if on_job_started is not None:
             on_job_started()
-    return _await_foreground(job_id, delivery_claims)
+    return _await_foreground(
+        job_id,
+        delivery_claims,
+        timeout=runtime.cursor_foreground_seconds,
+    )
 
 
 def _job_failure_stage(job: CursorJob) -> str:
@@ -1802,10 +1813,13 @@ def render_job_announcement(job: CursorJob) -> AssistantResponse:
 
 
 def _await_foreground(
-    job_id: str, delivery_claims: DeliveryClaims | None
+    job_id: str,
+    delivery_claims: DeliveryClaims | None,
+    *,
+    timeout: float = 5.0,
 ) -> CursorTurnResult:
     started = time.perf_counter()
-    deadline = time.monotonic() + CURSOR_FOREGROUND_SECONDS
+    deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         job = read_job(job_id)
         if job.status == JobStatus.COMPLETED:

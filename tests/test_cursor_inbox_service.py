@@ -153,7 +153,7 @@ def test_reply_without_session_resolves_single_awaiting_job(store: JobStore) -> 
         cursor_turn(CursorTurnRequest("use the api repository", action="reply"))
 
     launch.assert_called_once_with("aaaaaaaaaaaa")
-    foreground.assert_called_once_with("aaaaaaaaaaaa", None)
+    foreground.assert_called_once_with("aaaaaaaaaaaa", None, timeout=5.0)
     assert store.get("aaaaaaaaaaaa").status.value == "queued"
 
 

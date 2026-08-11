@@ -132,6 +132,27 @@ vocabulary edits apply without a restart. Legacy backend files are read only by
 the resolver; provider and speech runtime consumers do not parse them
 independently.
 
+The lifecycle policy for every `config.toml` setting is:
+
+| Settings | Snapshot owner | Apply changes by |
+| --- | --- | --- |
+| `providers.llm.provider`, `model`, `endpoint`, `timeout` | Wake process and local LLM service | Restart `voice-harness-wake.service` and `voice-harness-llm.service`; the local LLM service is stopped when the selected provider is remote |
+| `providers.tts.provider`, `model`, `voice`, `speed`, `endpoint`, `timeout` | Wake process and TTS service | Restart `voice-harness-wake.service` and `voice-harness-tts.service` |
+| `integrations.github`, `zendesk`, `linear` | Wake process integration registry | Restart `voice-harness-wake.service` |
+| `compute.cuda_device` | Local LLM service | Restart `voice-harness-llm.service` |
+| `compute.dictation_backend`, `dictation_model`, `dictation_quantization`, `dictation_compute`, `dictation_language` | Dictation service | Restart `dictation.service` |
+| Every `audio.*` setting | Wake process | Restart `voice-harness-wake.service` |
+| `dictation.prompt`, `dictation.replacements` | Dictation service | Restart `dictation.service` |
+| `dictation.source`, `dictation.inject`, `dictation.vad_end_silence_ms`, `dictation.vad_max_seconds`, `dictation.vad_min_speech_rms`, `dictation.vad_start_speech_frames` | Each foreground dictation command | Start the next command; an already-running VAD command keeps its startup snapshot |
+| Every `platform.*` setting | Wake process and each detached worker | Restart `voice-harness-wake.service`; already-admitted workers keep their snapshot, while newly started or restarted workers resolve the new value |
+
+The same lifecycle applies regardless of whether the winning value came from
+`config.toml`, a supported legacy file, or an environment override. Changing an
+environment variable outside a running process has no effect until that process
+is restarted. `voice-harness config set` reports the active systemd services from
+this matrix; command-scoped settings intentionally produce no service restart
+notice.
+
 ## Configuration commands
 
 Use the CLI to inspect or persist unified settings in `config.toml`. Values are

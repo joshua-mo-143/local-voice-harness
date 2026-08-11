@@ -710,7 +710,18 @@ class SpeechToTextProtocolTests(unittest.TestCase):
 
     def test_main_recovers_before_loading_model(self) -> None:
         order: list[str] = []
+        settings = server.STTRuntimeSettings(
+            backend="parakeet",
+            model_name="model",
+            quantization="int8",
+            compute_type="float16",
+            language=None,
+            prompt="prompt",
+            replacements={},
+        )
         with (
+            mock.patch.object(server, "load_user_config"),
+            mock.patch.object(server, "runtime_settings", return_value=settings),
             mock.patch.object(
                 server,
                 "recover_stranded_audio",
@@ -719,10 +730,12 @@ class SpeechToTextProtocolTests(unittest.TestCase):
             mock.patch.object(
                 server,
                 "load_transcriber",
-                side_effect=lambda: order.append("load") or _Transcriber(),
+                side_effect=lambda _settings: order.append("load") or _Transcriber(),
             ),
             mock.patch.object(
-                server, "serve", side_effect=lambda _model: order.append("serve")
+                server,
+                "serve",
+                side_effect=lambda _model, **_kwargs: order.append("serve"),
             ),
         ):
             server.main()

@@ -12,6 +12,7 @@ from ..context_fragment import ContextFragment, ContextProvider
 from ..errors import HarnessError
 from ..user_config import (
     IntegrationSettings,
+    PlatformSettings,
     UserConfig,
     default_user_config,
     load_user_config,
@@ -36,6 +37,7 @@ class IntegrationRegistry:
     factories: tuple[tuple[str, Callable[[], object]], ...]
     github_client: Callable[[], GitHubClient]
     herdr_client: Callable[[], HerdrClient]
+    platform: PlatformSettings | None = None
 
 
 def _github_provider(factory: Callable[[], GitHubClient]) -> GitHubProvider:
@@ -77,6 +79,7 @@ def build_integration_registry(config: UserConfig) -> IntegrationRegistry:
         factories=factories,
         github_client=github_client,
         herdr_client=herdr_client,
+        platform=platform,
     )
 
 

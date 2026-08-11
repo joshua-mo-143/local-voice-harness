@@ -7,6 +7,7 @@ from pathlib import Path
 from unittest import mock
 
 from local_voice_harness.stt import launcher
+from local_voice_harness.user_config import load_backend_environment
 
 
 class DictationLauncherTests(unittest.TestCase):
@@ -46,7 +47,7 @@ class DictationLauncherTests(unittest.TestCase):
                 "DICTATION_LANGUAGE=en\n"
             )
 
-            environment = launcher.load_backend_environment(path)
+            environment = load_backend_environment(path)
 
         self.assertEqual(
             environment,
@@ -75,9 +76,11 @@ class DictationLauncherTests(unittest.TestCase):
                 with self.assertRaisesRegex(
                     ValueError, "unsupported backend environment key"
                 ):
-                    launcher.load_backend_environment(path)
+                    load_backend_environment(path)
 
-    def test_launcher_overwrites_inherited_protected_paths_before_exec(self) -> None:
+    def test_launcher_preserves_resolver_inputs_and_overwrites_owned_paths(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             home = Path(temporary)
             config = home / ".config/dictation"
@@ -98,6 +101,7 @@ class DictationLauncherTests(unittest.TestCase):
                 key: f"/attacker/{key.casefold()}"
                 for key in launcher.PROTECTED_ENVIRONMENT_KEYS
             }
+            inherited["XDG_CONFIG_HOME"] = str(home / ".config")
             captured: dict[str, str] = {}
 
             def inspect_execve(
@@ -120,8 +124,9 @@ class DictationLauncherTests(unittest.TestCase):
 
         for key, expected in owned.items():
             self.assertEqual(captured[key], expected)
-        self.assertEqual(captured["DICTATION_BACKEND"], "whisper")
-        self.assertEqual(captured["DICTATION_COMPUTE"], "float16")
+        self.assertEqual(captured["XDG_CONFIG_HOME"], str(home / ".config"))
+        self.assertNotIn("DICTATION_BACKEND", captured)
+        self.assertNotIn("DICTATION_COMPUTE", captured)
 
 
 if __name__ == "__main__":

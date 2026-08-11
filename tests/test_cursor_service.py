@@ -368,7 +368,6 @@ def test_foreground_timeout_confirms_new_job_by_channel(
 ) -> None:
     monkeypatch.setattr(service, "JOBS_DIR", tmp_path / "jobs")
     monkeypatch.setattr(service, "LEGACY_JOBS_DIR", tmp_path / "legacy")
-    monkeypatch.setattr(service, "CURSOR_FOREGROUND_SECONDS", 0)
     job = CursorJob.from_dict(
         {
             "id": "123456789abc",
@@ -382,7 +381,7 @@ def test_foreground_timeout_confirms_new_job_by_channel(
     )
     service._job_store().create(job)
 
-    result = service._await_foreground(job.id, [])
+    result = service._await_foreground(job.id, [], timeout=0)
 
     response = as_assistant_response(result.text)
     assert result.session_id is None
@@ -435,7 +434,7 @@ def test_single_scoped_ticket_keeps_foreground_behavior() -> None:
     assert result == CursorTurnResult("working", None)
     assert len(started) == 1
     assert started[0].foreground
-    foreground.assert_called_once_with("123456789abc", None)
+    foreground.assert_called_once_with("123456789abc", None, timeout=5.0)
 
 
 def test_fanout_linear_capability_preflight_happens_before_any_start() -> None:

@@ -12,12 +12,6 @@ PACKAGE_ROOT = Path(__file__).resolve().parent
 PROJECT_ROOT = Path(
     os.environ.get("VOICE_HARNESS_ROOT", PACKAGE_ROOT.parents[1])
 ).resolve()
-REPOSITORY_ROOT = Path(
-    os.environ.get("VOICE_HARNESS_PROJECT_ROOT", Path.home())
-).resolve()
-GITHUB_ROOT = Path(
-    os.environ.get("VOICE_HARNESS_GITHUB_ROOT", Path.home() / "src")
-).resolve()
 RUNTIME = Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp"))
 RECORDING_LOCK = RUNTIME / "voice-harness-recording.lock"
 WAKE_LOCK = RUNTIME / "voice-harness-wake.lock"
@@ -331,92 +325,11 @@ STT_SOCKET = RUNTIME / "dictation.sock"
 TTS_SOCKET = RUNTIME / "voice-harness-tts.sock"
 LLM_HEALTH = "http://127.0.0.1:8090/health"
 LLM_CHAT = "http://127.0.0.1:8090/v1/chat/completions"
-DEFAULT_LLM_MODEL = "qwen3.5-4b"
-LLM_MODEL = os.environ.get("VOICE_HARNESS_LLM_MODEL", DEFAULT_LLM_MODEL)
-CURSOR_FOREGROUND_SECONDS = float(
-    os.environ.get("VOICE_HARNESS_CURSOR_FOREGROUND_SECONDS", "5")
-)
 DEFAULT_SOURCE = "alsa_input.pci-0000_00_1f.3-platform-sof_sdw.HiFi__Mic__source"
 CURSOR_PATTERN = re.compile(
     r"^\s*(?P<verb>use|ask|call)\s+(?:cursor|curser|cursa)\b", re.IGNORECASE
 )
 
-
-def _env_flag(name: str, *, default: bool) -> bool:
-    raw = os.environ.get(name)
-    if raw is None:
-        return default
-    return raw.strip().casefold() in {"1", "true", "yes", "on"}
-
-
-def _env_int(name: str, *, default: int, minimum: int) -> int:
-    try:
-        value = int(os.environ.get(name, str(default)))
-    except ValueError:
-        return default
-    return value if value >= minimum else default
-
-
-AGENT_JOB_START_CONCURRENCY = _env_int(
-    "VOICE_HARNESS_AGENT_JOB_START_CONCURRENCY",
-    default=3,
-    minimum=1,
-)
-
-
-def _env_nonnegative_float(
-    name: str,
-    *,
-    default: float,
-    environment: Mapping[str, str] = os.environ,
-) -> float:
-    raw = environment.get(name, str(default))
-    try:
-        value = float(raw)
-    except ValueError as exc:
-        raise ValueError(f"{name} must be a finite non-negative number") from exc
-    if not math.isfinite(value) or value < 0:
-        raise ValueError(f"{name} must be a finite non-negative number")
-    return value
-
-
-def _env_positive_float(
-    name: str,
-    *,
-    default: float,
-    environment: Mapping[str, str] = os.environ,
-) -> float:
-    value = _env_nonnegative_float(name, default=default, environment=environment)
-    if value <= 0:
-        raise ValueError(f"{name} must be a finite positive number")
-    return value
-
-
-CURSOR_AGENT_INACTIVITY_SECONDS = _env_positive_float(
-    "VOICE_HARNESS_CURSOR_AGENT_INACTIVITY_SECONDS",
-    default=15 * 60,
-)
-CURSOR_AGENT_MAX_RUNTIME_SECONDS = _env_positive_float(
-    "VOICE_HARNESS_CURSOR_AGENT_MAX_RUNTIME_SECONDS",
-    default=60 * 60,
-)
-
-
-def _env_classes(name: str, defaults: tuple[str, ...]) -> tuple[str, ...]:
-    raw = os.environ.get(name)
-    if raw is None:
-        return defaults
-    return tuple(
-        part for part in (piece.strip().casefold() for piece in raw.split(",")) if part
-    )
-
-
-# Focused-application context capture (GitHub issue #32). Capture only runs when
-# the trusted utterance explicitly asks for it, and is fenced by a deny-list of
-# sensitive or unsupported application window classes plus a total size cap.
-FOCUSED_APP_CONTEXT_ENABLED = _env_flag(
-    "VOICE_HARNESS_FOCUSED_APP_CONTEXT", default=True
-)
 # Substrings matched (case-insensitively) against the focused window class. Any
 # match denies capture. Defaults cover password managers, secret stores, and the
 # RuneLite client that already blocks simulated input elsewhere in the harness.
@@ -431,26 +344,6 @@ DEFAULT_FOCUSED_APP_DENY_CLASSES = (
     "seahorse",
     "polkit",
     "net-runelite-client-runelite",
-)
-FOCUSED_APP_DENY_CLASSES = _env_classes(
-    "VOICE_HARNESS_FOCUSED_APP_DENY", DEFAULT_FOCUSED_APP_DENY_CLASSES
-)
-# Upper bound on the combined, provenance-labelled focused-app context appended
-# to a routed request. Individual sources enforce their own tighter limits.
-MAX_FOCUSED_APP_CONTEXT_CHARS = _env_int(
-    "VOICE_HARNESS_FOCUSED_APP_MAX_CHARS", default=12_000, minimum=1
-)
-
-# Completed-job follow-up context (GitHub issue #follow-on-jobs). When enabled,
-# the wake daemon retains the last successfully announced completed Cursor job as
-# a bounded, one-shot follow-up target. The kill switch disables the whole
-# feature without affecting clarification replies or fresh submissions.
-CURSOR_FOLLOWUP_ENABLED = _env_flag("VOICE_HARNESS_CURSOR_FOLLOWUP", default=True)
-# Absolute lifetime of the retained completed-job reference, in seconds. It does
-# not slide when unrelated conversation extends the conversation deadline.
-CURSOR_FOLLOWUP_WINDOW_SECONDS = _env_nonnegative_float(
-    "VOICE_HARNESS_CURSOR_FOLLOWUP_WINDOW_SECONDS",
-    default=60,
 )
 
 SYSTEMD_USER_DIR = Path.home() / ".config" / "systemd" / "user"

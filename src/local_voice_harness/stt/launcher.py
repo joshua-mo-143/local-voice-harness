@@ -6,9 +6,6 @@ import site
 import sys
 from pathlib import Path
 
-from ..user_config import load_backend_environment as load_backend_environment
-from ..user_config import load_user_config
-
 PROTECTED_ENVIRONMENT_KEYS = frozenset(
     {
         "DICTATION_SOCKET",
@@ -59,26 +56,8 @@ def main() -> None:
     if "--check" in sys.argv[1:]:
         print("voice-harness-dictation: ok")
         return
-    environment = os.environ.copy()
+    environment = resolver_environment(os.environ.copy())
     owned = protected_environment()
-    snapshot = load_user_config(
-        resolver_environment(environment), home=Path(owned["HOME"])
-    )
-    compute = snapshot.compute
-    dictation = snapshot.dictation
-    environment.update(
-        {
-            "DICTATION_BACKEND": compute.dictation_backend,
-            "DICTATION_MODEL": compute.dictation_model,
-            "DICTATION_LANGUAGE": compute.dictation_language,
-            "DICTATION_COMPUTE": compute.dictation_compute,
-            "DICTATION_QUANTIZATION": compute.dictation_quantization,
-            "DICTATION_PROMPT": dictation.prompt,
-            "DICTATION_REPLACEMENTS": ";".join(
-                f"{source}:{target}" for source, target in dictation.replacements
-            ),
-        }
-    )
     environment.update(owned)
     libraries = [
         str(path)
