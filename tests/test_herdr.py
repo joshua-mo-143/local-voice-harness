@@ -218,7 +218,9 @@ WORKFLOW_PLAN[token]: <bounded multiline implementation plan>
         states = iter([False, False, True])
         completed = subprocess.CompletedProcess([], 0, "", "")
         with (
-            mock.patch.object(client.transport, "is_running", side_effect=lambda: next(states)),
+            mock.patch.object(
+                client.transport, "is_running", side_effect=lambda: next(states)
+            ),
             mock.patch("subprocess.run", return_value=completed) as run,
             mock.patch("time.sleep"),
         ):
