@@ -9,6 +9,7 @@ import sys
 import threading
 import uuid
 from abc import ABC, abstractmethod
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
@@ -20,6 +21,7 @@ from ..transcript import (
     effective_replacements,
     normalize_transcript,
 )
+from ..user_config import DEFAULT_DICTATION_REPLACEMENTS, UserConfig, load_user_config
 
 SOCKET_PATH = config.STT_SOCKET
 PROTOCOL_VERSION = 2
@@ -47,22 +49,7 @@ WHISPER_MODELS = frozenset(
 )
 PARAKEET_DEFAULT_MODEL = "nemo-parakeet-tdt-0.6b-v2"
 WHISPER_DEFAULT_MODEL = "large-v3-turbo"
-PROMPT = os.environ.get(
-    "DICTATION_PROMPT",
-    "Technical software engineering dictation that may mention Cursor, Herdr, "
-    "code, files, functions, terminals, and command-line tools.",
-)
-REPLACEMENTS = {
-    source.strip(): target.strip()
-    for entry in os.environ.get(
-        "DICTATION_REPLACEMENTS",
-        "herder:herdr;cursa:Cursor;curser:Cursor;"
-        "service:Jarvis;jarvus:Jarvis;jervis:Jarvis",
-    ).split(";")
-    if entry.strip() and ":" in entry
-    for source, target in [entry.split(":", 1)]
-    if source.strip()
-}
+REPLACEMENTS = dict(DEFAULT_DICTATION_REPLACEMENTS)
 LANGUAGE_ALIASES = {"english": "en", "chinese": "zh", "mandarin": "zh"}
 
 
@@ -84,8 +71,10 @@ def resolve_language(value: str) -> str | None:
     return LANGUAGE_ALIASES.get(normalized, normalized)
 
 
-def resolve_model_name(backend: Literal["parakeet", "whisper"]) -> str:
-    configured = os.environ.get("DICTATION_MODEL", "").strip()
+def resolve_model_name(
+    backend: Literal["parakeet", "whisper"], configured: str = ""
+) -> str:
+    configured = configured.strip()
     if backend == "parakeet":
         if not configured or configured in WHISPER_MODELS:
             return PARAKEET_DEFAULT_MODEL
@@ -93,21 +82,46 @@ def resolve_model_name(backend: Literal["parakeet", "whisper"]) -> str:
     return configured or WHISPER_DEFAULT_MODEL
 
 
-def resolve_quantization(backend: Literal["parakeet", "whisper"]) -> str | None:
+def resolve_quantization(
+    backend: Literal["parakeet", "whisper"], configured: str = "int8"
+) -> str | None:
     if backend != "parakeet":
         return None
-    value = os.environ.get("DICTATION_QUANTIZATION", "int8").strip().lower()
+    value = configured.strip().lower()
     if value in {"", "none", "off", "fp32"}:
         return None
     return value
 
 
-BACKEND = resolve_backend(os.environ.get("DICTATION_BACKEND", "parakeet"))
-MODEL_NAME = resolve_model_name(BACKEND)
-QUANTIZATION = resolve_quantization(BACKEND)
-COMPUTE_TYPE = os.environ.get("DICTATION_COMPUTE", "float16")
-LANGUAGE = resolve_language(os.environ.get("DICTATION_LANGUAGE", "auto"))
 LOCK = threading.Lock()
+
+
+@dataclass(frozen=True)
+class STTRuntimeSettings:
+    backend: Literal["parakeet", "whisper"]
+    model_name: str
+    quantization: str | None
+    compute_type: str
+    language: str | None
+    prompt: str
+    replacements: Mapping[str, str]
+
+
+def runtime_settings(config: UserConfig) -> STTRuntimeSettings:
+    """Derive the STT process snapshot from the unified typed configuration."""
+
+    backend = resolve_backend(config.compute.dictation_backend)
+    return STTRuntimeSettings(
+        backend=backend,
+        model_name=resolve_model_name(backend, config.compute.dictation_model),
+        quantization=resolve_quantization(
+            backend, config.compute.dictation_quantization
+        ),
+        compute_type=config.compute.dictation_compute,
+        language=resolve_language(config.compute.dictation_language),
+        prompt=config.dictation.prompt,
+        replacements=dict(config.dictation.replacements),
+    )
 
 
 class ProtocolError(Exception):
@@ -169,13 +183,15 @@ def _user_replacements() -> tuple[vocabulary.Replacement, ...]:
         return ()
 
 
-def transcript_replacements() -> tuple[TranscriptReplacement, ...]:
+def transcript_replacements(
+    configured: Mapping[str, str] = REPLACEMENTS,
+) -> tuple[TranscriptReplacement, ...]:
     """Return the effective rules used by the current STT configuration."""
 
-    return effective_replacements(_user_replacements(), REPLACEMENTS)
+    return effective_replacements(_user_replacements(), configured)
 
 
-def normalize(text: str) -> str:
+def normalize(text: str, configured: Mapping[str, str] = REPLACEMENTS) -> str:
     """Apply text corrections with user vocabulary taking precedence.
 
     Precedence is user vocabulary first, then the injected process-start
@@ -183,7 +199,7 @@ def normalize(text: str) -> str:
     spoken source.
     """
 
-    return normalize_transcript(text, transcript_replacements())
+    return normalize_transcript(text, transcript_replacements(configured))
 
 
 class Transcriber(ABC):
@@ -212,12 +228,20 @@ class ParakeetTranscriber(Transcriber):
 
 
 class WhisperTranscriber(Transcriber):
-    def __init__(self, model_name: str, *, compute_type: str) -> None:
+    def __init__(
+        self,
+        model_name: str,
+        *,
+        compute_type: str,
+        language: str | None,
+        prompt: str,
+    ) -> None:
         from faster_whisper import WhisperModel
 
         log(f"loading faster-whisper {model_name} on CUDA ({compute_type})")
         self._model = WhisperModel(model_name, device="cuda", compute_type=compute_type)
-        self._language = LANGUAGE
+        self._language = language
+        self._prompt = prompt
 
     def transcribe(self, audio_path: str) -> str:
         segments, _info = self._model.transcribe(
@@ -227,15 +251,22 @@ class WhisperTranscriber(Transcriber):
             beam_size=5,
             vad_filter=True,
             condition_on_previous_text=False,
-            initial_prompt=PROMPT,
+            initial_prompt=self._prompt,
         )
-        return normalize("".join(segment.text for segment in segments).strip())
+        return "".join(segment.text for segment in segments).strip()
 
 
-def load_transcriber() -> Transcriber:
-    if BACKEND == "parakeet":
-        return ParakeetTranscriber(MODEL_NAME, quantization=QUANTIZATION)
-    return WhisperTranscriber(MODEL_NAME, compute_type=COMPUTE_TYPE)
+def load_transcriber(settings: STTRuntimeSettings) -> Transcriber:
+    if settings.backend == "parakeet":
+        return ParakeetTranscriber(
+            settings.model_name, quantization=settings.quantization
+        )
+    return WhisperTranscriber(
+        settings.model_name,
+        compute_type=settings.compute_type,
+        language=settings.language,
+        prompt=settings.prompt,
+    )
 
 
 def _read_frame(connection: socket.socket) -> bytes:
@@ -682,7 +713,12 @@ def _validate_ack(frame: bytes, delivery_id: str) -> None:
         )
 
 
-def handle_connection(connection: socket.socket, transcriber: Transcriber) -> None:
+def handle_connection(
+    connection: socket.socket,
+    transcriber: Transcriber,
+    *,
+    replacements: Mapping[str, str] = REPLACEMENTS,
+) -> None:
     connection.settimeout(READ_TIMEOUT_SECONDS)
     claim: AudioClaim | None = None
     slot_acquired = False
@@ -696,7 +732,10 @@ def handle_connection(connection: socket.socket, transcriber: Transcriber) -> No
             slot_acquired = True
             try:
                 claim = _claim_audio_path(request.requested, request.paths)
-                text = normalize(transcriber.transcribe(str(claim.processing)))
+                text = normalize(
+                    transcriber.transcribe(str(claim.processing)),
+                    replacements,
+                )
             except ProtocolError:
                 raise
             except Exception as exc:
@@ -771,6 +810,7 @@ def handle_connection(connection: socket.socket, transcriber: Transcriber) -> No
 def serve(
     transcriber: Transcriber,
     *,
+    replacements: Mapping[str, str] = REPLACEMENTS,
     socket_path: Path = SOCKET_PATH,
     stop_event: threading.Event | None = None,
     ready_event: threading.Event | None = None,
@@ -782,7 +822,7 @@ def serve(
 
     def run_connection(connection: socket.socket) -> None:
         try:
-            handle_connection(connection, transcriber)
+            handle_connection(connection, transcriber, replacements=replacements)
         finally:
             slots.release()
 
@@ -820,13 +860,14 @@ def serve(
 
 
 def main() -> None:
+    settings = runtime_settings(load_user_config())
     recover_stranded_audio()
-    transcriber = load_transcriber()
+    transcriber = load_transcriber(settings)
     log(
-        f"model ready (backend={BACKEND}, model={MODEL_NAME}, "
-        f"language={LANGUAGE or 'auto-detect'})"
+        f"model ready (backend={settings.backend}, model={settings.model_name}, "
+        f"language={settings.language or 'auto-detect'})"
     )
-    serve(transcriber)
+    serve(transcriber, replacements=settings.replacements)
 
 
 if __name__ == "__main__":

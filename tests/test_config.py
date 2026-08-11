@@ -5,6 +5,7 @@ import unittest
 from pathlib import Path
 
 from local_voice_harness import config
+from local_voice_harness.user_config import load_user_config
 
 
 class ConfigPathTests(unittest.TestCase):
@@ -152,25 +153,27 @@ class ConfigPathTests(unittest.TestCase):
 
     def test_followup_window_rejects_non_finite_and_negative_values(self) -> None:
         name = "VOICE_HARNESS_CURSOR_FOLLOWUP_WINDOW_SECONDS"
-        for value in ("invalid", "-1", "nan", "inf", "-inf"):
-            with (
-                self.subTest(value=value),
-                self.assertRaisesRegex(ValueError, "finite non-negative"),
-            ):
-                config._env_nonnegative_float(
-                    name,
-                    default=60,
-                    environment={name: value},
-                )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            paths = {
+                "path": root / "config.toml",
+                "backends_path": root / "backends.toml",
+                "backend_env_path": root / "backend.env",
+                "home": root,
+            }
+            for value in ("invalid", "-1", "nan", "inf", "-inf"):
+                with (
+                    self.subTest(value=value),
+                    self.assertRaisesRegex(ValueError, "finite non-negative"),
+                ):
+                    load_user_config({name: value}, **paths)
 
-        self.assertEqual(
-            config._env_nonnegative_float(
-                name,
-                default=60,
-                environment={name: "0"},
-            ),
-            0,
-        )
+            self.assertEqual(
+                load_user_config(
+                    {name: "0"}, **paths
+                ).platform.cursor_followup_window_seconds,
+                0,
+            )
 
 
 if __name__ == "__main__":

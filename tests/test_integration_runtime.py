@@ -18,6 +18,29 @@ from local_voice_harness.user_config import default_user_config
 
 
 class IntegrationRuntimeTests(unittest.TestCase):
+    def test_cursor_turn_uses_registry_process_snapshot_for_runtime_timing(
+        self,
+    ) -> None:
+        config = default_user_config(Path("/home/example"))
+        snapshot = replace(
+            config,
+            platform=replace(config.platform, cursor_foreground_seconds=2.5),
+        )
+        registry = build_integration_registry(snapshot)
+        with (
+            mock.patch.object(service, "start_job", return_value="job-1") as start,
+            mock.patch.object(
+                service,
+                "_await_foreground",
+                return_value=service.CursorTurnResult("started", None),
+            ) as foreground,
+        ):
+            result = service.cursor_turn("implement it", integrations=registry)
+
+        self.assertEqual(result.text, "started")
+        self.assertEqual(start.call_args.kwargs["foreground_seconds"], 2.5)
+        foreground.assert_called_once_with("job-1", None, timeout=2.5)
+
     def test_explicit_provider_identity_prevents_config_rerouting(self) -> None:
         class Provider:
             def __init__(self, name: str) -> None:

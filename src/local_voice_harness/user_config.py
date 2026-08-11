@@ -2,9 +2,9 @@
 
 This module introduces a single typed model for user-facing defaults instead of
 spreading settings across ``backends.toml``, environment variables, backend
-environment files, and systemd drop-ins. It is additive: existing installations
-that rely on ``backends.toml`` and environment overrides keep working unchanged,
-and no runtime consumer is rewired here.
+environment files, and systemd drop-ins. Existing installations that rely on
+``backends.toml`` and environment overrides keep working unchanged; runtime
+composition roots consume only the resolved typed snapshot.
 
 Precedence, from lowest to highest, is::
 

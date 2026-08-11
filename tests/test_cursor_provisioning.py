@@ -2357,6 +2357,7 @@ class CursorJobStateTests(unittest.TestCase):
             utterance=None,
             context_repository=None,
             issue_key=None,
+            foreground_seconds=5.0,
             integrations=mock.ANY,
         )
         reply.assert_not_called()

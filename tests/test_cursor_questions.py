@@ -656,7 +656,7 @@ def test_protected_answer_requires_explicit_request_provenance(
             )
         )
     launch.assert_called_once()
-    foreground.assert_called_once_with("aaaaaaaaaaaa", None)
+    foreground.assert_called_once_with("aaaaaaaaaaaa", None, timeout=5.0)
 
 
 def test_unknown_question_owner_fails_closed(store: JobStore) -> None:

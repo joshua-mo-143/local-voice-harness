@@ -5,10 +5,6 @@ import subprocess
 import time
 from typing import Any, Protocol
 
-from ...config import (
-    CURSOR_AGENT_INACTIVITY_SECONDS,
-    CURSOR_AGENT_MAX_RUNTIME_SECONDS,
-)
 from .types import (
     AGENT_COMPLETION_POLL_SECONDS,
     AGENT_COMPLETION_QUIET_SECONDS,
@@ -50,8 +46,8 @@ class HerdrSession:
         text: str,
         *,
         token: str,
-        timeout: float = CURSOR_AGENT_INACTIVITY_SECONDS,
-        max_runtime: float = CURSOR_AGENT_MAX_RUNTIME_SECONDS,
+        timeout: float = 15 * 60,
+        max_runtime: float = 60 * 60,
         checkpoint: Checkpoint | None = None,
         baseline_sequence: int | None = None,
         expected_agent_session: str | None = None,
@@ -276,8 +272,8 @@ class HerdrSession:
         target: str,
         *,
         token: str,
-        inactivity_timeout: float = CURSOR_AGENT_INACTIVITY_SECONDS,
-        max_runtime: float = CURSOR_AGENT_MAX_RUNTIME_SECONDS,
+        inactivity_timeout: float = 15 * 60,
+        max_runtime: float = 60 * 60,
         quiet_period: float = AGENT_COMPLETION_QUIET_SECONDS,
         started_at: float | None = None,
         checkpoint: Checkpoint | None = None,
