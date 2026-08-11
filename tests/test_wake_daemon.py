@@ -2037,6 +2037,77 @@ class WakeRecordingHandoffTests(unittest.TestCase):
             conflicts=(wake_daemon.DICTATION_RECORDING_PATHS,),
         )
 
+    def test_wake_capture_waits_for_fresh_speech_before_end_silence(self) -> None:
+        daemon = _bare_daemon()
+        quiet = [b"quiet"] * 9
+        frames = [*quiet, b"request", *quiet]
+        daemon.read_frame = mock.Mock(side_effect=frames)  # type: ignore[method-assign]
+        daemon.is_speech = lambda frame: frame in {b"wake", b"request"}  # type: ignore[method-assign]
+
+        with mock.patch.object(
+            wake_daemon.recorder,
+            "write_audio_generation",
+            return_value=AUDIO_GENERATION,
+        ):
+            result = daemon.record_utterance(
+                [b"wake"],
+                wait_for_fresh_speech=True,
+            )
+
+        self.assertEqual(result, AUDIO_GENERATION)
+        self.assertEqual(daemon.read_frame.call_count, len(frames))
+
+    def test_capture_duration_excludes_pre_roll(self) -> None:
+        daemon = _bare_daemon()
+        daemon.is_speech = lambda _frame: False  # type: ignore[method-assign]
+        daemon.read_frame = mock.Mock(return_value=b"quiet")  # type: ignore[method-assign]
+        expected_frames = (
+            int(wake_daemon.MAX_UTTERANCE_SECONDS * 1000 / wake_daemon.FRAME_MS) + 1
+        )
+
+        with mock.patch.object(
+            wake_daemon.recorder,
+            "write_audio_generation",
+            return_value=AUDIO_GENERATION,
+        ):
+            daemon.record_utterance([b"pre-roll"] * wake_daemon.PRE_ROLL_FRAMES)
+
+        self.assertEqual(daemon.read_frame.call_count, expected_frames)
+
+    def test_run_requires_fresh_speech_after_wake_detection(self) -> None:
+        daemon = _bare_daemon()
+        daemon.np = mock.Mock()  # type: ignore[assignment]
+        daemon.wake_key = "wake"
+        daemon.wake_model.predict.return_value = {
+            "wake": daemon.audio.wake_threshold + 0.1
+        }
+        daemon.start_microphone = lambda: None  # type: ignore[method-assign]
+        daemon.read_frame = lambda: b"wake"  # type: ignore[method-assign]
+
+        def process(_audio_path: Path, *, woke: bool) -> None:
+            self.assertTrue(woke)
+            daemon.running = False
+
+        daemon.process_utterance = process  # type: ignore[method-assign]
+        with (
+            mock.patch.object(
+                daemon,
+                "record_utterance_safely",
+                return_value=AUDIO_GENERATION,
+            ) as record,
+            mock.patch.object(daemon, "begin_activation"),
+            mock.patch.object(wake_daemon, "recover_jobs"),
+            mock.patch.object(wake_daemon, "pending_results", return_value=[]),
+            mock.patch.object(wake_daemon, "log"),
+            mock.patch.object(wake_daemon, "notify"),
+        ):
+            daemon.run()
+
+        record.assert_called_once_with(
+            [b"wake"],
+            wait_for_fresh_speech=True,
+        )
+
     def test_handoff_conflict_is_suppressed_without_terminating_daemon(self) -> None:
         daemon = _bare_daemon()
         with (
@@ -2202,7 +2273,12 @@ class RunLoopFollowupTests(unittest.TestCase):
         recorded: list[list[bytes]] = []
         processed: list[tuple[Path, bool]] = []
 
-        def fake_record(initial: list[bytes]) -> Path:
+        def fake_record(
+            initial: list[bytes],
+            *,
+            wait_for_fresh_speech: bool = False,
+        ) -> Path:
+            self.assertFalse(wait_for_fresh_speech)
             recorded.append(list(initial))
             return AUDIO_GENERATION
 
@@ -2244,7 +2320,9 @@ class ForceListenTests(unittest.TestCase):
 
         daemon.start_microphone = lambda: None  # type: ignore[method-assign]
         daemon.read_frame = lambda: b"\x00\x00"  # type: ignore[method-assign]
-        daemon.record_utterance = lambda _initial: AUDIO_GENERATION  # type: ignore[method-assign]
+        daemon.record_utterance = (  # type: ignore[method-assign]
+            lambda _initial, *, wait_for_fresh_speech=False: AUDIO_GENERATION
+        )
         daemon.process_utterance = fake_process  # type: ignore[method-assign]
         daemon.begin_activation = lambda: None  # type: ignore[method-assign]
 
