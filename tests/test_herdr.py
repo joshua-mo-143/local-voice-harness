@@ -290,6 +290,8 @@ WORKFLOW_PLAN[token]: <bounded multiline implementation plan>
             "pane_id": "pane",
             "workspace_id": "workspace",
             "cwd": "/tmp/worktree",
+            "agent_session": "session",
+            "interactive_ready": True,
         }
         with (
             mock.patch.object(client, "run_json", return_value={"agent": agent}) as run,
@@ -318,6 +320,8 @@ WORKFLOW_PLAN[token]: <bounded multiline implementation plan>
             "pane_id": "pane",
             "workspace_id": "workspace",
             "cwd": "/tmp/worktree",
+            "agent_session": "session",
+            "interactive_ready": True,
         }
         with mock.patch.object(
             client, "run_json", return_value={"agent": agent}
@@ -335,6 +339,76 @@ WORKFLOW_PLAN[token]: <bounded multiline implementation plan>
             run.call_args.args[-4:],
             ("--", "--trust", "--mode", "ask"),
         )
+
+    def test_start_agent_waits_for_ready_cursor_session(self) -> None:
+        client = herdr.HerdrClient("herdr")
+        starting = {
+            "name": "planner",
+            "pane_id": "pane",
+            "workspace_id": "workspace",
+            "cwd": "/tmp/worktree",
+            "interactive_ready": True,
+        }
+        ready = {**starting, "agent_session": "session"}
+        with (
+            mock.patch.object(
+                client,
+                "run_json",
+                side_effect=[{"agent": starting}, {"agent": ready}],
+            ) as run,
+            mock.patch(
+                "local_voice_harness.integrations.herdr.workspace.time.sleep"
+            ) as sleep,
+        ):
+            selection = client.start_agent(
+                Path("/tmp/worktree"),
+                "planning",
+                "pane",
+                "workspace",
+                name="planner",
+                mode="plan",
+            )
+
+        self.assertEqual(selection.target, "planner")
+        self.assertEqual(run.call_args_list[1].args, ("agent", "get", "planner"))
+        sleep.assert_called_once_with(0.2)
+
+    def test_start_agent_fails_ambiguously_when_session_never_becomes_ready(
+        self,
+    ) -> None:
+        client = herdr.HerdrClient("herdr")
+        starting = {
+            "name": "planner",
+            "pane_id": "pane",
+            "workspace_id": "workspace",
+            "cwd": "/tmp/worktree",
+            "interactive_ready": True,
+        }
+        with (
+            mock.patch.object(
+                client,
+                "run_json",
+                side_effect=[{"agent": starting}, {"agent": starting}],
+            ),
+            mock.patch(
+                "local_voice_harness.integrations.herdr.workspace.time.monotonic",
+                side_effect=[0, 0, 16],
+            ),
+            mock.patch("local_voice_harness.integrations.herdr.workspace.time.sleep"),
+            self.assertRaisesRegex(
+                herdr.HerdrError, "did not expose a ready Cursor session"
+            ) as raised,
+        ):
+            client.start_agent(
+                Path("/tmp/worktree"),
+                "planning",
+                "pane",
+                "workspace",
+                name="planner",
+                mode="plan",
+            )
+
+        self.assertEqual(raised.exception.code, "operation_ambiguous")
 
     def test_non_linear_task_creates_requested_worktree(self) -> None:
         client = herdr.HerdrClient("herdr")
