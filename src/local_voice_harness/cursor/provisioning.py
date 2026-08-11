@@ -32,6 +32,7 @@ from ..integrations.registry import (
     build_integration_registry,
     prompt_instructions,
     require_issue_capabilities,
+    require_issue_provider,
     resolve_issue_reference,
     route_issue_repository,
 )
@@ -2421,8 +2422,16 @@ def _run_tiered_workflow(
                 return
             job = next_turn
             token = job.turn_token or ""
-        active_issue_key = resolve_issue_reference(job.issue_key, registry)
-        integration_instructions = prompt_instructions(active_issue_key, registry)
+        active_issue_key = resolve_issue_reference(
+            job.issue_key,
+            registry,
+            provider=job.issue_provider,
+        )
+        integration_instructions = prompt_instructions(
+            active_issue_key,
+            registry,
+            provider=job.issue_provider,
+        )
         if phase == WorkflowPhase.CLASSIFYING:
             prompt = classification_prompt(
                 job.request,
@@ -2644,9 +2653,18 @@ def run_claimed_worker(  # pyright: ignore[reportGeneralTypeIssues]
             checkpoint()
             _resume_plan_approval_completion(store, job, worker_token)
             return
-        active_issue_key = resolve_issue_reference(job.issue_key, registry)
+        require_issue_provider(job.issue_provider, registry)
+        active_issue_key = resolve_issue_reference(
+            job.issue_key,
+            registry,
+            provider=job.issue_provider,
+        )
         if active_issue_key:
-            require_issue_capabilities(active_issue_key, registry)
+            require_issue_capabilities(
+                active_issue_key,
+                registry,
+                provider=job.issue_provider,
+            )
         client = clients.herdr()
         checkpoint()
         client.ensure_server()
@@ -3074,6 +3092,7 @@ def run_claimed_worker(  # pyright: ignore[reportGeneralTypeIssues]
                     reserved=reserved_targets(store, job_id),
                     checkpoint=checkpoint,
                     integrations=registry,
+                    provider=job.issue_provider,
                 )
                 if routed is not None:
                     repository, _confidence, reason = routed

@@ -926,7 +926,7 @@ def _ticket_identity(job: CursorJob) -> tuple[str, ...] | None:
             str(job.github_issue),
         )
     if job.issue_key:
-        return ("linear", job.issue_key.casefold())
+        return (job.issue_provider or "legacy", job.issue_key.casefold())
     return None
 
 
@@ -1606,6 +1606,14 @@ class JobStore:
             if child.parent_job_id != parent.id:
                 raise JobValidationError(
                     "follow-up child must reference its parent job id"
+                )
+            if child.harness_kind != parent.harness_kind:
+                raise JobValidationError(
+                    "follow-up child must inherit parent harness_kind exactly"
+                )
+            if child.issue_provider != parent.issue_provider:
+                raise JobValidationError(
+                    "follow-up child must inherit parent issue_provider exactly"
                 )
             for field in (
                 "repository",

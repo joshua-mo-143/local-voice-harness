@@ -13,6 +13,7 @@ from local_voice_harness.cursor import service
 from local_voice_harness.cursor.model import (
     CURRENT_SCHEMA_VERSION,
     CursorJob,
+    HarnessKind,
     JobStatus,
     NewCursorJob,
     WorkflowPhase,
@@ -29,7 +30,9 @@ from local_voice_harness.integrations.github import (
     GitHubIssueLookupError,
     GitHubIssueLookupReason,
 )
+from local_voice_harness.integrations.registry import build_integration_registry
 from local_voice_harness.responses import AssistantResponse, as_assistant_response
+from local_voice_harness.user_config import default_user_config
 
 
 def test_service_request_and_result_types_are_explicit() -> None:
@@ -40,6 +43,29 @@ def test_service_request_and_result_types_are_explicit() -> None:
     assert start.repository == "project"
     assert turn.session_id == "123456789abc"
     assert tuple(result) == ("done", None)
+
+
+def test_admission_persists_selected_provider_and_harness(tmp_path: Path) -> None:
+    store = JobStore(tmp_path / "jobs", tmp_path / "legacy")
+    registry = build_integration_registry(default_user_config(tmp_path))
+    with (
+        mock.patch.object(service, "_job_store", return_value=store),
+        mock.patch.object(service, "launch_worker"),
+    ):
+        job_id = service.start_job(
+            "work on the issue",
+            github_repository="owner/project",
+            github_issue=42,
+            foreground=False,
+            integrations=registry,
+        )
+
+    job = store.get(job_id)
+    assert job.harness_kind == HarnessKind.CURSOR
+    assert job.issue_provider == "github"
+    persisted = json.loads(store.path(job_id).read_text())
+    assert persisted["harness_kind"] == "cursor"
+    assert persisted["issue_provider"] == "github"
 
 
 def test_submit_notifies_only_after_job_starts() -> None:

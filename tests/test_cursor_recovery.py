@@ -129,6 +129,73 @@ class CursorRecoveryTests(unittest.TestCase):
 
         self.assertEqual(launches, ["123456789abc"])
 
+    def test_restart_launch_retains_admitted_provider_and_harness(self) -> None:
+        self.create(
+            {
+                "id": "123456789abc",
+                "status": "queued",
+                "request": "test",
+                "created_at": 1,
+                "queued_at": 1,
+                "delivered": False,
+                "issue_key": "ENG-42",
+                "issue_provider": "linear",
+            }
+        )
+        launched: list[tuple[str | None, str]] = []
+
+        def launch(job_id: str) -> None:
+            job = self.store.get(job_id)
+            launched.append((job.issue_provider, job.harness_kind.value))
+
+        recover_jobs(
+            self.store,
+            launch_worker=launch,
+            require_issue_provider=lambda name: self.assertEqual(name, "linear"),
+            now=100,
+        )
+
+        self.assertEqual(launched, [("linear", "cursor")])
+        current = self.store.get("123456789abc")
+        self.assertEqual(current.issue_provider, "linear")
+        self.assertEqual(current.harness_kind.value, "cursor")
+
+    def test_recovery_durably_fails_when_selected_provider_is_unavailable(
+        self,
+    ) -> None:
+        self.create(
+            {
+                "id": "123456789abc",
+                "status": "queued",
+                "request": "test",
+                "created_at": 1,
+                "queued_at": 1,
+                "delivered": False,
+                "issue_key": "ENG-42",
+                "issue_provider": "linear",
+            }
+        )
+        launch = mock.Mock()
+
+        def unavailable(_name: str | None) -> None:
+            raise ValueError("selected issue provider 'linear' is unavailable")
+
+        recover_jobs(
+            self.store,
+            launch_worker=launch,
+            require_issue_provider=unavailable,
+            now=100,
+        )
+
+        launch.assert_not_called()
+        failed = self.store.get("123456789abc")
+        self.assertEqual(failed.status, JobStatus.FAILED)
+        self.assertFalse(failed.delivered)
+        self.assertEqual(failed.issue_provider, "linear")
+        self.assertIn(
+            "Selected issue provider 'linear' is unavailable", failed.error or ""
+        )
+
     def test_unsafe_live_legacy_worker_blocks_duplicate_launch(self) -> None:
         self.create(
             {

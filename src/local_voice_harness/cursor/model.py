@@ -10,7 +10,7 @@ from typing import Any
 
 from ..questions import Question, QuestionError
 
-CURRENT_SCHEMA_VERSION = 12
+CURRENT_SCHEMA_VERSION = 13
 LEGACY_SCHEMA_VERSIONS = frozenset(range(CURRENT_SCHEMA_VERSION))
 LEGACY_BOOT_ID = "legacy-unknown"
 
@@ -323,6 +323,7 @@ _STRING_FIELDS = frozenset(
         "terminal_intent_result",
         "terminal_intent_error",
         "harness_kind",
+        "issue_provider",
         "session_id",
     }
 )
@@ -411,6 +412,7 @@ class NewAgentJob:
     worktree_root_pane_id: str | None = None
     worktree_provision_state: str | None = None
     harness_kind: HarnessKind = HarnessKind.CURSOR
+    issue_provider: str | None = None
     session_id: str | None = None
 
 
@@ -658,7 +660,19 @@ def _advance_legacy_version(values: dict[str, object], version: int) -> None:
             values.setdefault("plan_approval_state", "none")
     elif version == 11:
         values.setdefault("plan_approval_completion_pending", False)
+    elif version == 12:
+        values.setdefault("issue_provider", _infer_legacy_issue_provider(values))
     values["schema_version"] = version + 1
+
+
+def _infer_legacy_issue_provider(values: Mapping[str, object]) -> str | None:
+    if values.get("issue_key") is not None:
+        # Historically issue_key was exclusively owned by the Linear
+        # integration. GitHub fields could also be present as captured context.
+        return "linear"
+    if values.get("github_issue") is not None:
+        return "github"
+    return None
 
 
 def migrate_job_record(raw: Mapping[str, object]) -> tuple[dict[str, object], int]:
@@ -695,6 +709,7 @@ def migrate_job_record(raw: Mapping[str, object]) -> tuple[dict[str, object], in
             values.setdefault("harness_kind", HarnessKind.CURSOR.value)
             if values.get("herdr_target") is not None:
                 values.setdefault("session_id", values["herdr_target"])
+        values.setdefault("issue_provider", _infer_legacy_issue_provider(values))
     values["schema_version"] = CURRENT_SCHEMA_VERSION
     return values, loaded_version
 
@@ -862,6 +877,7 @@ class AgentJob:
     schema_version: int
     loaded_schema_version: int
     harness_kind: HarnessKind
+    issue_provider: str | None
     session_id: str | None
     id: str
     revision: int
@@ -951,6 +967,11 @@ class AgentJob:
             harness_kind = HarnessKind(str(values.get("harness_kind") or ""))
         except ValueError as exc:
             raise JobValidationError("harness_kind has invalid value") from exc
+        issue_provider = values.get("issue_provider")
+        if issue_provider is not None and not re.fullmatch(
+            r"[a-z][a-z0-9-]*", str(issue_provider)
+        ):
+            raise JobValidationError("issue_provider has invalid value")
         try:
             workflow_phase = WorkflowPhase(
                 str(values.get("workflow_phase") or WorkflowPhase.CLASSIFYING)
@@ -1005,6 +1026,7 @@ class AgentJob:
             schema_version=CURRENT_SCHEMA_VERSION,
             loaded_schema_version=loaded_version,
             harness_kind=harness_kind,
+            issue_provider=str(issue_provider) if issue_provider is not None else None,
             session_id=(
                 str(values["session_id"])
                 if values.get("session_id") is not None
@@ -1120,6 +1142,7 @@ class AgentJob:
                 "parent_job_id": spec.parent_job_id,
                 "schema_version": CURRENT_SCHEMA_VERSION,
                 "harness_kind": spec.harness_kind.value,
+                "issue_provider": spec.issue_provider,
                 "session_id": spec.session_id,
                 "revision": 0,
                 "request": spec.request,
@@ -2008,6 +2031,20 @@ class AgentJob:
         return updated
 
     def validate_invariants(self, *, require_worker_owner: bool = False) -> None:
+        if (
+            self.github_issue is not None
+            and self.issue_key is None
+            and self.issue_provider != "github"
+        ):
+            raise JobValidationError("GitHub issue job requires github issue_provider")
+        if self.issue_key is not None and self.issue_provider is None:
+            raise JobValidationError("issue-key job requires issue_provider")
+        if self.issue_provider == "github" and self.github_issue is None:
+            raise JobValidationError(
+                "github issue_provider requires a GitHub issue identity"
+            )
+        if self.issue_provider not in {None, "github"} and self.issue_key is None:
+            raise JobValidationError("selected issue_provider requires an issue key")
         if self.revision < 0:
             raise JobValidationError("revision must not be negative")
         if self.worker_pid is not None and self.worker_pid <= 0:
@@ -2436,6 +2473,8 @@ def validate_transition(before: CursorJob, after: CursorJob) -> None:
         raise JobValidationError("Cursor job transition cannot change parent_job_id")
     if before.harness_kind != after.harness_kind:
         raise JobValidationError("agent job transition cannot change harness_kind")
+    if before.issue_provider != after.issue_provider:
+        raise JobValidationError("agent job transition cannot change issue_provider")
     if after.parent_job_id is not None:
         # A follow-up child inherits its parent's exact checkout. That identity
         # must never be substituted, removed, or reconstructed by recovery.

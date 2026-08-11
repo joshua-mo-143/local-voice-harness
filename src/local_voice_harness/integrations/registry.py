@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from ..context_fragment import ContextFragment, ContextProvider
+from ..errors import HarnessError
 from ..user_config import (
     IntegrationSettings,
     UserConfig,
@@ -185,7 +186,17 @@ def extract_issue_reference(
 def _integration_for_issue(
     reference: str,
     integrations: RegistryInput = None,
+    *,
+    provider: str | None = None,
 ) -> object | None:
+    if provider is not None:
+        integration = issue_provider(provider, integrations)
+        owns = getattr(integration, "owns_issue_reference", None)
+        if owns is None or not owns(reference):
+            raise HarnessError(
+                f"issue reference is not owned by selected provider {provider!r}"
+            )
+        return integration
     for integration in enabled_integrations(integrations):
         owns = getattr(integration, "owns_issue_reference", None)
         if owns is not None and owns(reference):
@@ -193,13 +204,54 @@ def _integration_for_issue(
     return None
 
 
+def issue_provider(
+    name: str,
+    integrations: RegistryInput = None,
+) -> object:
+    """Resolve one enabled provider by its durable canonical identity."""
+
+    expected = name.strip().casefold()
+    for integration in enabled_integrations(integrations):
+        if str(getattr(integration, "name", "")).casefold() == expected:
+            return integration
+    raise HarnessError(f"selected issue provider {name!r} is unavailable")
+
+
+def issue_provider_identity(
+    reference: str,
+    integrations: RegistryInput = None,
+) -> str | None:
+    integration = _integration_for_issue(reference, integrations)
+    if integration is None:
+        return None
+    return str(getattr(integration, "name", "")).strip().casefold() or None
+
+
+def require_issue_provider(
+    name: str | None,
+    integrations: RegistryInput = None,
+) -> None:
+    if name is None:
+        return
+    integration = issue_provider(name, integrations)
+    require = getattr(integration, "require_capabilities", None)
+    if require is not None:
+        require()
+
+
 def resolve_issue_reference(
     reference: str | None,
     integrations: RegistryInput = None,
+    *,
+    provider: str | None = None,
 ) -> str | None:
     if not reference:
         return None
-    integration = _integration_for_issue(reference, integrations)
+    integration = _integration_for_issue(
+        reference,
+        integrations,
+        provider=provider,
+    )
     if integration is None:
         return None
     canonicalize = getattr(integration, "canonicalize_issue_reference", None)
@@ -211,8 +263,14 @@ def resolve_issue_reference(
 def require_issue_capabilities(
     reference: str,
     integrations: RegistryInput = None,
+    *,
+    provider: str | None = None,
 ) -> None:
-    integration = _integration_for_issue(reference, integrations)
+    integration = _integration_for_issue(
+        reference,
+        integrations,
+        provider=provider,
+    )
     require = getattr(integration, "require_capabilities", None)
     if require is not None:
         require()
@@ -221,10 +279,16 @@ def require_issue_capabilities(
 def prompt_instructions(
     reference: str | None,
     integrations: RegistryInput = None,
+    *,
+    provider: str | None = None,
 ) -> tuple[str, ...]:
     if not reference:
         return ()
-    integration = _integration_for_issue(reference, integrations)
+    integration = _integration_for_issue(
+        reference,
+        integrations,
+        provider=provider,
+    )
     contribute = getattr(integration, "prompt_instructions", None)
     return tuple(contribute(reference)) if contribute is not None else ()
 
@@ -238,8 +302,13 @@ def route_issue_repository(
     reserved: set[str],
     checkpoint: Any = None,
     integrations: RegistryInput = None,
+    provider: str | None = None,
 ) -> tuple[Path | None, str, str] | None:
-    integration = _integration_for_issue(reference, integrations)
+    integration = _integration_for_issue(
+        reference,
+        integrations,
+        provider=provider,
+    )
     route = getattr(integration, "route_repository", None)
     if route is None:
         return None

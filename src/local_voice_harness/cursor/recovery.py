@@ -8,6 +8,7 @@ from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import cast
 
+from ..diagnostic_safety import redact_diagnostic
 from ..errors import HarnessError
 from ..integrations.github import GitHubClient, GitHubError, GitHubRepository
 from ..integrations.herdr import (
@@ -44,6 +45,7 @@ PROMPT_ABSENT_OBSERVATIONS = 2
 HerdrFactory = Callable[[], HerdrClient]
 GitHubFactory = Callable[[], GitHubClient]
 LaunchWorker = Callable[[str], None]
+RequireIssueProvider = Callable[[str | None], None]
 
 
 def _agent_not_found(exc: HerdrError) -> bool:
@@ -935,6 +937,7 @@ def recover_jobs(
     get_boot_identity: Callable[[], str | None] = boot_identity,
     get_process_identity: Callable[[int], str | None] = process_identity,
     inspect_legacy_worker: LegacyWorkerInspector = inspect_and_stop_legacy_worker,
+    require_issue_provider: RequireIssueProvider | None = None,
     now: float | None = None,
 ) -> None:
     if store.maintenance_active() is True:
@@ -1007,6 +1010,37 @@ def recover_jobs(
             herdr_factory=herdr_factory,
             is_worker_alive=is_worker_alive,
         )
+    provider_errors: dict[str, str] = {}
+    if require_issue_provider is not None:
+        for existing in store.list():
+            if (
+                existing.status
+                not in {
+                    JobStatus.QUEUED,
+                    JobStatus.ROUTING,
+                    JobStatus.RUNNING,
+                    JobStatus.RECONCILING,
+                    JobStatus.BLOCKED,
+                }
+                or is_worker_alive(existing)
+                or existing.has_uncertain_operation()
+                or existing.manual_reconcile_operation
+                or existing.worktree_provision_state
+                in {"quarantined", "manual_required"}
+                or existing.pull_request_worktree_state == "quarantined"
+            ):
+                continue
+            try:
+                require_issue_provider(existing.issue_provider)
+            except Exception as exc:  # noqa: BLE001 - persisted as a job failure
+                detail = redact_diagnostic(
+                    str(exc) or type(exc).__name__,
+                    limit=360,
+                )
+                provider_errors[existing.id] = (
+                    f"Selected issue provider {existing.issue_provider!r} is "
+                    f"unavailable: {detail}"
+                )[:500]
     for existing in store.list():
         if (
             existing.status
@@ -1094,6 +1128,22 @@ def recover_jobs(
                         worker_token=None,
                     )
                 return None
+            provider_error = provider_errors.get(job.id)
+            if provider_error is not None:
+                failed = stage_terminal_intent(
+                    job,
+                    JobStatus.FAILED,
+                    now=recovered_at,
+                    result=provider_error,
+                    error=provider_error,
+                    clear_worker=True,
+                )
+                release = (
+                    failed.id,
+                    failed.herdr_target or "",
+                    failed.target_release_token or "",
+                )
+                return failed
             if job.status == JobStatus.BLOCKED:
                 if (
                     job.delivered

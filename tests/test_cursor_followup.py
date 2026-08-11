@@ -109,6 +109,8 @@ def _build_child(parent: CursorJob, child_id: str = "bbbbbbbbbbbb") -> CursorJob
             worktree_branch=parent.worktree_branch,
             worktree_path=parent.worktree_path,
             worktree_provision_state="ready",
+            harness_kind=parent.harness_kind,
+            issue_provider=parent.issue_provider,
         )
     )
 
@@ -384,10 +386,13 @@ def test_start_follow_up_checks_capability_before_creating_child(
     launch = mock.Mock()
     monkeypatch.setattr(service, "launch_worker", launch)
     monkeypatch.setattr(
-        service, "resolve_issue_reference", lambda _reference, *_args: "ENG-123"
+        service,
+        "resolve_issue_reference",
+        lambda _reference, *_args, **_kwargs: "ENG-123",
     )
+    monkeypatch.setattr(service, "require_issue_provider", lambda *_args: None)
 
-    def reject(_reference: str, *_args: object) -> None:
+    def reject(_reference: str, *_args: object, **_kwargs: object) -> None:
         raise HarnessError("Linear MCP requires authentication")
 
     monkeypatch.setattr(service, "require_issue_capabilities", reject)

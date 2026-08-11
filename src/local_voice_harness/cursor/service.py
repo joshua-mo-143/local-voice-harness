@@ -32,7 +32,9 @@ from ..integrations.registry import (
     IntegrationRegistry,
     extract_issue_reference,
     integration_enabled,
+    issue_provider_identity,
     require_issue_capabilities,
+    require_issue_provider,
     resolve_issue_reference,
 )
 from ..questions import (
@@ -278,13 +280,28 @@ def start_job(
     job_id = uuid.uuid4().hex[:12]
     now = time.time()
     spoken_text = utterance if utterance is not None else text
-    resolved_issue_key = (
-        resolve_issue_reference(issue_key, registry)
+    candidate_issue_key = (
+        issue_key
         if issue_key is not None
         else extract_issue_reference(spoken_text, registry)
     )
+    resolved_issue_key = resolve_issue_reference(candidate_issue_key, registry)
+    issue_provider = (
+        issue_provider_identity(resolved_issue_key, registry)
+        if resolved_issue_key
+        else ("github" if github_issue is not None else None)
+    )
     if resolved_issue_key:
-        require_issue_capabilities(resolved_issue_key, registry)
+        assert issue_provider is not None
+        require_issue_capabilities(
+            resolved_issue_key,
+            registry,
+            provider=issue_provider,
+        )
+    elif issue_key is not None:
+        raise HarnessError("selected issue provider is unavailable")
+    if issue_provider == "github":
+        require_issue_provider(issue_provider, registry)
     issue_repository = (github_repository or "").strip()
     github_issue_url = (
         f"https://github.com/{issue_repository}/issues/{github_issue}"
@@ -332,6 +349,7 @@ def start_job(
             pull_request_worktree_state=("pending" if github_pull_request else None),
             agent_hint=agent,
             issue_key=resolved_issue_key,
+            issue_provider=issue_provider,
             speakable_label=inbox.build_speakable_label(
                 text,
                 issue_key=resolved_issue_key,
@@ -873,9 +891,18 @@ def start_follow_up(
     registry = _integration_registry(integrations)
 
     def build(parent: CursorJob) -> CursorJob:
-        active_issue_key = resolve_issue_reference(parent.issue_key, registry)
+        require_issue_provider(parent.issue_provider, registry)
+        active_issue_key = resolve_issue_reference(
+            parent.issue_key,
+            registry,
+            provider=parent.issue_provider,
+        )
         if active_issue_key:
-            require_issue_capabilities(active_issue_key, registry)
+            require_issue_capabilities(
+                active_issue_key,
+                registry,
+                provider=parent.issue_provider,
+            )
         return CursorJob.new(
             NewCursorJob(
                 id=child_id,
@@ -895,7 +922,9 @@ def start_follow_up(
                 worktree_workspace_id=parent.worktree_workspace_id,
                 worktree_root_pane_id=parent.worktree_root_pane_id,
                 worktree_provision_state="ready",
+                harness_kind=parent.harness_kind,
                 issue_key=parent.issue_key,
+                issue_provider=parent.issue_provider,
                 speakable_label=parent.speakable_label,
             )
         )
@@ -1099,6 +1128,7 @@ def _defer_or_acknowledge(
 
 
 def recover_jobs(*, integrations: IntegrationRegistry | None = None) -> None:
+    registry = _integration_registry(integrations)
     herdr_factory = (
         provisioning.HerdrClient if integrations is None else integrations.herdr_client
     )
@@ -1124,6 +1154,7 @@ def recover_jobs(*, integrations: IntegrationRegistry | None = None) -> None:
                 command_matches=worker_lifecycle.legacy_worker_command_matches,
             )
         ),
+        require_issue_provider=lambda name: require_issue_provider(name, registry),
     )
 
 

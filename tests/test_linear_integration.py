@@ -75,10 +75,11 @@ class LinearEnablementTests(unittest.TestCase):
         self.assertIsNone(fragment.issue_reference)
         self.assertIn("identifiers must come from the user's request", fragment.text)
 
-    def test_disabled_explicit_issue_key_is_not_persisted(self) -> None:
+    def test_disabled_explicit_issue_key_is_rejected_before_persistence(self) -> None:
         with (
             mock.patch.object(service, "_job_store") as store,
             mock.patch.object(service, "launch_worker"),
+            self.assertRaisesRegex(HarnessError, "provider is unavailable"),
         ):
             service.start_job(
                 "work on this ticket",
@@ -88,9 +89,7 @@ class LinearEnablementTests(unittest.TestCase):
                 ),
             )
 
-        created = store.return_value.create.call_args.args[0]
-        self.assertIsNone(created.issue_key)
-        self.assertNotEqual(created.speakable_label, "ENG-123")
+        store.return_value.create.assert_not_called()
 
     def test_missing_capability_rejects_job_before_persistence(self) -> None:
         with (

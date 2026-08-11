@@ -88,6 +88,59 @@ def test_new_job_record_has_no_cursor_or_herdr_core_fields() -> None:
     assert isinstance(record["provider_state"], dict)
 
 
+@pytest.mark.parametrize(
+    ("identity", "expected"),
+    [
+        ({"issue_key": "ENG-42"}, "linear"),
+        (
+            {
+                "github_repository": "owner/project",
+                "github_issue": 42,
+            },
+            "github",
+        ),
+        ({}, None),
+    ],
+)
+def test_v12_records_infer_and_persist_issue_provider(
+    identity: dict[str, object],
+    expected: str | None,
+) -> None:
+    job = AgentJob.from_dict(
+        {
+            "id": "abcdef123456",
+            "schema_version": 12,
+            "revision": 0,
+            "request": "migrate provider identity",
+            "status": "queued",
+            "created_at": 1,
+            "queued_at": 1,
+            "delivered": False,
+            **identity,
+        }
+    )
+
+    assert job.loaded_schema_version == 12
+    assert job.issue_provider == expected
+    assert job.to_record()["issue_provider"] == expected
+
+
+def test_issue_provider_is_immutable_across_transitions() -> None:
+    job = AgentJob.new(
+        NewAgentJob(
+            id="abcdef123456",
+            request="keep provider",
+            created_at=1,
+            foreground_until=0,
+            issue_key="ENG-42",
+            issue_provider="linear",
+        )
+    )
+
+    with pytest.raises(AgentJobValidationError, match="issue_provider"):
+        job.evolve(issue_provider="other")
+
+
 def test_legacy_directory_import_rewrites_v8_record(tmp_path: Path) -> None:
     legacy = tmp_path / "legacy"
     durable = tmp_path / "durable"
