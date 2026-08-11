@@ -8,6 +8,8 @@ from pathlib import Path
 from typing import Any
 
 from .types import (
+    AGENT_START_READY_POLL_SECONDS,
+    AGENT_START_READY_TIMEOUT_SECONDS,
     SETTLED,
     AgentSelection,
     BeforePaneSubmit,
@@ -21,6 +23,7 @@ from .types import (
     ReserveWorktree,
     SettleAgent,
     SettleWorktree,
+    agent_session_identity,
     normalize_name,
 )
 
@@ -237,9 +240,26 @@ class HerdrWorkspace:
                     *agent_args,
                     timeout=70,
                 )
-                selection = self.selection(
-                    dict(result.get("agent") or {}), str(checkout)
-                )
+                agent = dict(result.get("agent") or {})
+                selection = self.selection(agent, str(checkout))
+                ready_deadline = time.monotonic() + AGENT_START_READY_TIMEOUT_SECONDS
+                while (
+                    agent.get("interactive_ready") is not True
+                    or agent_session_identity(agent.get("agent_session")) is None
+                ):
+                    if time.monotonic() >= ready_deadline:
+                        raise HerdrError(
+                            f"Herdr agent {selection.target} did not expose a ready "
+                            "Cursor session after startup",
+                            code="operation_ambiguous",
+                        )
+                    if checkpoint is not None:
+                        checkpoint()
+                    time.sleep(AGENT_START_READY_POLL_SECONDS)
+                    try:
+                        agent = self._operations.get_agent(selection.target)
+                    except HerdrError:
+                        agent = {}
                 return selection
             except HerdrError as exc:
                 if exc.code != "agent_pane_busy" or time.monotonic() >= deadline:

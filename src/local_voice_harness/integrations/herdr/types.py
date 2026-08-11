@@ -14,6 +14,8 @@ OBSERVABLE_AGENT_STATES = SETTLED | {"blocked", "unknown"}
 AGENT_COMPLETION_POLL_SECONDS = 1.0
 AGENT_COMPLETION_QUIET_SECONDS = 5.0
 AGENT_PROMPT_WAIT_SECONDS = 5.0
+AGENT_START_READY_POLL_SECONDS = 0.2
+AGENT_START_READY_TIMEOUT_SECONDS = 15.0
 MAX_MARKER_BYTES = 64 * 1024
 SCP_GIT_URL = re.compile(
     r"^(?P<user>[A-Za-z0-9._-]+)@(?P<host>[A-Za-z0-9.-]+):(?P<path>[^:\s]+)$"
@@ -35,6 +37,8 @@ PlanParticipant = Callable[[str, str, str | None], None]
 
 class HerdrOperations(Protocol):
     def run_json(self, *args: str, timeout: float | None = None) -> dict[str, Any]: ...
+
+    def get_agent(self, target: str) -> dict[str, Any]: ...
 
     def list_agents(self) -> list[dict[str, Any]]: ...
 
