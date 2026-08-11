@@ -11,6 +11,10 @@ from local_voice_harness.browser_context import RequestContext
 from local_voice_harness.config import CURSOR_PATTERN, load_backend_settings
 from local_voice_harness.credentials import CredentialError
 
+LOCAL_SETTINGS = load_backend_settings(
+    {"VOICE_HARNESS_LLM_PROVIDER": "local"},
+)
+
 
 def _response(route: str, confidence: str = "high") -> io.BytesIO:
     return io.BytesIO(
@@ -40,7 +44,18 @@ def _response(route: str, confidence: str = "high") -> io.BytesIO:
     )
 
 
-class IntentRouterTests(unittest.TestCase):
+class LocalRouterTestCase(unittest.TestCase):
+    def setUp(self) -> None:
+        patcher = mock.patch.object(
+            llm_transport,
+            "default_user_config",
+            return_value=mock.Mock(providers=LOCAL_SETTINGS),
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+
+class IntentRouterTests(LocalRouterTestCase):
     def test_sends_bounded_context_to_forced_router_tool(self) -> None:
         context = RequestContext(
             text="work on this\n\nuntrusted issue body",
@@ -233,7 +248,7 @@ class IntentRouterTests(unittest.TestCase):
         self.assertEqual(json.loads(request.data)["model"], "venice-model")
 
 
-class InboxIntentTests(unittest.TestCase):
+class InboxIntentTests(LocalRouterTestCase):
     def test_route_tool_exposes_inbox_intents(self) -> None:
         enum = intent.ROUTE_TOOL["function"]["parameters"]["properties"]["intent"][
             "enum"
@@ -257,7 +272,7 @@ class InboxIntentTests(unittest.TestCase):
                 self.assertEqual(route.intent, intent.Intent(name))
 
 
-class FollowUpIntentTests(unittest.TestCase):
+class FollowUpIntentTests(LocalRouterTestCase):
     def test_route_tool_exposes_follow_up_intents(self) -> None:
         enum = intent.ROUTE_TOOL["function"]["parameters"]["properties"]["intent"][
             "enum"
@@ -332,7 +347,7 @@ class FollowUpIntentTests(unittest.TestCase):
         self.assertEqual(route.intent, intent.Intent.CURSOR_PR_UNSUPPORTED)
 
 
-class EndConversationIntentTests(unittest.TestCase):
+class EndConversationIntentTests(LocalRouterTestCase):
     def test_route_tool_exposes_end_conversation(self) -> None:
         enum = intent.ROUTE_TOOL["function"]["parameters"]["properties"]["intent"][
             "enum"
