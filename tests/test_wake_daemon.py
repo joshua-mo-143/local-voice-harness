@@ -1031,6 +1031,13 @@ class AnnounceJobTests(unittest.TestCase):
         self.assertEqual(daemon.playback_queue.queued_text(), response.spoken_text)
         self.assertNotIn("/srv/example", daemon.playback_queue.queued_text())
         self.assertIn("/srv/example", response.display_text)
+        with daemon.playback_queue._lock:
+            queued_request = daemon.playback_queue._items[0][0]
+        self.assertEqual(queued_request.job_completed_at, claim.job.completed_at)
+        self.assertEqual(
+            queued_request.display_fingerprint,
+            wake_daemon._display_fingerprint(response.display_text),
+        )
 
     def test_display_failure_does_not_queue_or_acknowledge_delivery(self) -> None:
         daemon = _bare_daemon()
@@ -1273,6 +1280,30 @@ class AnnounceJobTests(unittest.TestCase):
         acknowledge.assert_called_once_with("bbbbbbbbbbbb", "claim")
         release.assert_called_once_with("bbbbbbbbbbbb", "claim")
         self.assertFalse(daemon.awaiting_followup)
+        self.assertIsNone(daemon.completed_followup)
+
+    def test_interrupted_announcement_does_not_install_recent_details(self) -> None:
+        daemon = _bare_daemon()
+        request = PlaybackRequest(
+            text="Cursor finished issue 42.",
+            job_id="bbbbbbbbbbbb",
+            delivery_token="claim",
+            job_status="completed",
+            job_completed_at=1,
+            display_fingerprint="fingerprint",
+        )
+        with (
+            mock.patch.object(wake_daemon, "release_delivery") as release,
+            mock.patch.object(wake_daemon.CURSOR_STORE, "get") as get,
+        ):
+            daemon._finish_job_playback(
+                request,
+                {"played_text": ""},
+                interrupted=True,
+            )
+
+        release.assert_called_once_with("bbbbbbbbbbbb", "claim")
+        get.assert_not_called()
         self.assertIsNone(daemon.completed_followup)
 
     def test_active_announcement_renews_its_delivery_lease(self) -> None:
@@ -2263,6 +2294,18 @@ class ForceListenTests(unittest.TestCase):
 
 
 class CompletedFollowupContextTests(unittest.TestCase):
+    def _completed_context(
+        self,
+        job: CursorJob,
+    ) -> wake_daemon.CompletedFollowup:
+        response = wake_daemon.cursor_service.render_job_announcement(job)
+        return wake_daemon.CompletedFollowup(
+            job_id=job.id,
+            completed_at=job.completed_at,
+            expires_at=time.monotonic() + 60,
+            display_fingerprint=wake_daemon._display_fingerprint(response.display_text),
+        )
+
     def test_completed_announcement_installs_context(self) -> None:
         daemon = _bare_daemon()
         with (
@@ -2380,6 +2423,76 @@ class CompletedFollowupContextTests(unittest.TestCase):
         self.assertIsNone(daemon._active_completed_followup())
         self.assertIsNone(daemon.completed_followup)
 
+    def test_recent_details_return_exact_display_rendering_and_consume_context(
+        self,
+    ) -> None:
+        daemon = _bare_daemon()
+        job = _delivery_claim(
+            "job2",
+            "completed",
+            result="Changed /srv/example/config.toml.",
+        ).job
+        context = self._completed_context(job)
+        daemon.completed_followup = context
+        expected = wake_daemon.cursor_service.render_job_announcement(job)
+        with mock.patch.object(wake_daemon.CURSOR_STORE, "get", return_value=job):
+            response = daemon._recent_completion_details(context)
+
+        self.assertEqual(response.display_text, expected.display_text)
+        self.assertNotEqual(response.spoken_text, expected.display_text)
+        self.assertIsNone(daemon.completed_followup)
+
+    def test_recent_details_fail_closed_when_job_identity_no_longer_matches(
+        self,
+    ) -> None:
+        daemon = _bare_daemon()
+        job = _delivery_claim("job2", "completed", result="done").job
+        context = self._completed_context(job)
+        context.completed_at = 999
+        daemon.completed_followup = context
+        with mock.patch.object(wake_daemon.CURSOR_STORE, "get", return_value=job):
+            response = daemon._recent_completion_details(context)
+
+        self.assertEqual(response.display_text, wake_daemon.RECENT_DETAILS_UNAVAILABLE)
+        self.assertIsNone(daemon.completed_followup)
+
+    def test_recent_details_fail_closed_when_rendering_changed(self) -> None:
+        daemon = _bare_daemon()
+        announced = _delivery_claim("job2", "completed", result="original").job
+        changed = announced.evolve(result="different")
+        context = self._completed_context(announced)
+        daemon.completed_followup = context
+        with mock.patch.object(wake_daemon.CURSOR_STORE, "get", return_value=changed):
+            response = daemon._recent_completion_details(context)
+
+        self.assertEqual(response.display_text, wake_daemon.RECENT_DETAILS_UNAVAILABLE)
+        self.assertIsNone(daemon.completed_followup)
+
+    def test_newer_completed_announcement_supersedes_retained_context(self) -> None:
+        daemon = _bare_daemon()
+        first = _delivery_claim("job1", "completed", result="first").job
+        second = _delivery_claim("job2", "completed", result="second").job
+        with (
+            mock.patch.object(wake_daemon, "CURSOR_FOLLOWUP_ENABLED", True),
+            mock.patch.object(
+                wake_daemon.CURSOR_STORE,
+                "get",
+                side_effect=[first, second],
+            ),
+        ):
+            for job in (first, second):
+                display = wake_daemon.cursor_service.render_job_announcement(
+                    job
+                ).display_text
+                daemon._remember_completed_job(
+                    job.id,
+                    expected_completed_at=job.completed_at,
+                    display_fingerprint=wake_daemon._display_fingerprint(display),
+                )
+
+        assert daemon.completed_followup is not None
+        self.assertEqual(daemon.completed_followup.job_id, second.id)
+
     def _run_route(
         self,
         daemon: WakeConversationDaemon,
@@ -2441,6 +2554,21 @@ class CompletedFollowupContextTests(unittest.TestCase):
         self.assertEqual(request.action, "follow_up")
         self.assertEqual(request.job_id, "bbbbbbbbbbbb")
         self.assertEqual(request.expected_completed_at, 9.0)
+        self.assertIsNone(daemon.completed_followup)
+
+    def test_details_route_reads_snapshot_without_starting_tools(self) -> None:
+        daemon = _bare_daemon()
+        job = _delivery_claim("job2", "completed", result="full details").job
+        daemon.completed_followup = self._completed_context(job)
+        with mock.patch.object(wake_daemon.CURSOR_STORE, "get", return_value=job):
+            cursor_turn = self._run_route(
+                daemon,
+                IntentRoute(Intent.CURSOR_DETAILS, "high"),
+                transcript="tell me more",
+            )
+
+        cursor_turn.assert_not_called()
+        self._last_qwen.assert_not_called()
         self.assertIsNone(daemon.completed_followup)
 
     def test_followup_route_without_context_declines_without_tools(self) -> None:
