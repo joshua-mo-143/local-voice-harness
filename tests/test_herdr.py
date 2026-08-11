@@ -181,7 +181,7 @@ WORKFLOW_PLAN[token]: <bounded multiline implementation plan>
                     return_value=True,
                 ),
                 mock.patch(
-                    "local_voice_harness.integrations.herdr.repository.run_command",
+                    "local_voice_harness.local_git.run_command",
                     side_effect=clone,
                 ) as run,
             ):
@@ -194,7 +194,7 @@ WORKFLOW_PLAN[token]: <bounded multiline implementation plan>
                 command[:4],
                 ["git", "clone", "--", "https://github.com/example/project.git"],
             )
-            self.assertEqual(Path(command[-1]).name, "project")
+            self.assertTrue(Path(command[-1]).name.startswith(".project.clone-"))
 
     def test_clone_timeout_reports_ambiguous_outcome(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -206,7 +206,7 @@ WORKFLOW_PLAN[token]: <bounded multiline implementation plan>
                     root,
                 ),
                 mock.patch(
-                    "local_voice_harness.integrations.herdr.repository.run_command",
+                    "local_voice_harness.local_git.run_command",
                     side_effect=subprocess.TimeoutExpired(["git", "clone"], 300),
                 ),
                 self.assertRaisesRegex(

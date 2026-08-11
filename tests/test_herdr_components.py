@@ -130,7 +130,7 @@ class HerdrComponentBoundaryTests(unittest.TestCase):
                     return_value=True,
                 ),
                 mock.patch(
-                    "local_voice_harness.integrations.herdr.repository.run_command",
+                    "local_voice_harness.local_git.run_command",
                     side_effect=clone,
                 ),
             ):

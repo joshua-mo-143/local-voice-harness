@@ -1,23 +1,25 @@
 from __future__ import annotations
 
-import fcntl
 import json
 import logging
-import os
 import re
-import shutil
 import subprocess
-import uuid
-from collections.abc import Callable, Iterator
-from contextlib import contextmanager
+from collections.abc import Callable
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
+from typing import NoReturn
 from urllib.parse import SplitResult, urlsplit
 
 from ..config import GITHUB_ROOT, REPOSITORY_ROOT
 from ..context_fragment import ContextFragment
 from ..diagnostic_safety import redact_diagnostic
+from ..local_git import (
+    ExpectedRemote,
+    LocalGitError,
+    LocalGitOperationAmbiguous,
+    LocalGitRepository,
+)
 from ..process import run_command
 
 REPOSITORY = re.compile(
@@ -238,11 +240,18 @@ class GitHubClient:
         git_executable: str = "git",
         clone_root: Path = GITHUB_ROOT,
         allowed_root: Path = REPOSITORY_ROOT,
+        local_git: LocalGitRepository | None = None,
     ) -> None:
         self.gh_executable = gh_executable
         self.git_executable = git_executable
         self.clone_root = clone_root.expanduser().resolve()
         self.allowed_root = allowed_root.expanduser().resolve()
+        self.local_git = local_git or LocalGitRepository(
+            git_executable=git_executable,
+            clone_root=self.clone_root,
+            allowed_root=self.allowed_root,
+            lock_name=".voice-harness-github.lock",
+        )
 
     @staticmethod
     def validate_repository(value: str) -> str:
@@ -522,148 +531,29 @@ class GitHubClient:
         return fork
 
     @staticmethod
-    def _remote_repository(remote: str) -> str | None:
-        value = remote.strip().removesuffix(".git")
-        if value.startswith("git@github.com:"):
-            return value.removeprefix("git@github.com:")
-        parsed = urlsplit(value)
-        if (
-            parsed.scheme in {"http", "https", "ssh"}
-            and parsed.hostname
-            and parsed.hostname.casefold() == "github.com"
-        ):
-            return parsed.path.strip("/").removeprefix("git/")
-        return None
-
-    def _git(self, checkout: Path, *arguments: str) -> subprocess.CompletedProcess[str]:
-        return self._run(
-            [self.git_executable, "-C", str(checkout), *arguments],
-            timeout=60,
-        )
-
-    def _verify_checkout(self, checkout: Path, expected: GitHubRepository) -> None:
-        if not (checkout / ".git").exists():
-            raise GitHubError(f"{checkout} exists but is not a Git repository")
-        origin = self._git(checkout, "remote", "get-url", "origin").stdout
-        actual = self._remote_repository(origin)
-        if actual is None or actual.casefold() != expected.name_with_owner.casefold():
+    def _expected_remote(repository: GitHubRepository) -> ExpectedRemote:
+        if not _github_url(repository.url):
             raise GitHubError(
-                f"{checkout} exists but its origin is not {expected.name_with_owner}"
+                f"GitHub returned an invalid clone URL for {repository.name_with_owner}"
             )
-
-    def _ensure_upstream(
-        self, checkout: Path, source: GitHubRepository, fork: GitHubRepository
-    ) -> None:
-        if source.name_with_owner.casefold() == fork.name_with_owner.casefold():
-            return
-        current = self._run(
-            [
-                self.git_executable,
-                "-C",
-                str(checkout),
-                "remote",
-                "get-url",
-                "upstream",
-            ],
-            check=False,
-        )
-        action = "set-url" if current.returncode == 0 else "add"
-        self._git(checkout, "remote", action, "upstream", source.url)
-
-    @contextmanager
-    def _provisioning_lock(
-        self, checkpoint: Checkpoint | None = None
-    ) -> Iterator[None]:
         try:
-            self.clone_root.relative_to(self.allowed_root)
-        except ValueError as exc:
+            expected = ExpectedRemote.from_url(repository.url)
+        except LocalGitError as exc:
             raise GitHubError(
-                "VOICE_HARNESS_GITHUB_ROOT must be inside VOICE_HARNESS_PROJECT_ROOT"
+                f"GitHub returned an invalid clone URL for {repository.name_with_owner}"
             ) from exc
-        if checkpoint is not None:
-            checkpoint()
-        self.clone_root.mkdir(mode=0o700, parents=True, exist_ok=True)
-        if checkpoint is not None:
-            checkpoint()
-        lock_path = self.clone_root / ".voice-harness-github.lock"
-        if checkpoint is not None:
-            checkpoint()
-        with lock_path.open("a+b") as lock:
-            if checkpoint is not None:
-                checkpoint()
-            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
-            try:
-                if checkpoint is not None:
-                    checkpoint()
-                yield
-            finally:
-                fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
-
-    def _materialize_clone(
-        self,
-        *,
-        owner: str,
-        repository_name: str,
-        clone_source: str,
-        verify: GitHubRepository,
-        finalize: Callable[[Path], None] | None = None,
-        checkpoint: Checkpoint | None = None,
-    ) -> Path:
-        destination = self.clone_root / owner / repository_name
-        with self._provisioning_lock(checkpoint):
-            if checkpoint is not None:
-                checkpoint()
-            destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-            if checkpoint is not None:
-                checkpoint()
-            resolved_parent = destination.parent.resolve()
-            try:
-                resolved_parent.relative_to(self.clone_root)
-            except ValueError as exc:
-                raise GitHubError("GitHub clone destination escapes its root") from exc
-            if destination.exists():
-                self._verify_checkout(destination, verify)
-                if finalize is not None:
-                    if checkpoint is not None:
-                        checkpoint()
-                    finalize(destination)
-                    if checkpoint is not None:
-                        checkpoint()
-                return destination.resolve()
-            temporary = destination.parent / (
-                f".{repository_name}.clone-{uuid.uuid4().hex}"
+        identity = f"github.com/{repository.name_with_owner.casefold()}"
+        if expected.identity != identity:
+            raise GitHubError(
+                f"GitHub returned an invalid clone URL for {repository.name_with_owner}"
             )
-            try:
-                if checkpoint is not None:
-                    checkpoint()
-                self._run(
-                    [
-                        self.gh_executable,
-                        "repo",
-                        "clone",
-                        clone_source,
-                        str(temporary),
-                    ],
-                    timeout=300,
-                )
-                if checkpoint is not None:
-                    checkpoint()
-                self._verify_checkout(temporary, verify)
-                if finalize is not None:
-                    if checkpoint is not None:
-                        checkpoint()
-                    finalize(temporary)
-                    if checkpoint is not None:
-                        checkpoint()
-                if checkpoint is not None:
-                    checkpoint()
-                os.replace(temporary, destination)
-                if checkpoint is not None:
-                    checkpoint()
-            finally:
-                if temporary.exists():
-                    shutil.rmtree(temporary)
-            return destination.resolve()
+        return expected
+
+    @staticmethod
+    def _raise_local_git_error(exc: LocalGitError) -> NoReturn:
+        if isinstance(exc, LocalGitOperationAmbiguous):
+            raise GitHubOperationAmbiguous(str(exc)) from exc
+        raise GitHubError(str(exc)) from exc
 
     def ensure_clone(
         self,
@@ -675,24 +565,26 @@ class GitHubClient:
         source_owner, repository_name = source.name_with_owner.split("/", 1)
 
         def finalize(checkout: Path) -> None:
-            self._ensure_upstream(checkout, source, fork)
+            if source.name_with_owner.casefold() != fork.name_with_owner.casefold():
+                self.local_git.ensure_remote(checkout, "upstream", source.url)
 
-        if checkpoint is None:
-            return self._materialize_clone(
-                owner=source_owner,
-                repository_name=repository_name,
-                clone_source=fork.name_with_owner,
-                verify=fork,
+        try:
+            return self.local_git.materialize(
+                Path(source_owner) / repository_name,
+                clone_url=fork.url,
+                clone_command=(
+                    self.gh_executable,
+                    "repo",
+                    "clone",
+                    fork.name_with_owner,
+                ),
+                expected=self._expected_remote(fork),
+                expected_label=fork.name_with_owner,
                 finalize=finalize,
+                checkpoint=checkpoint,
             )
-        return self._materialize_clone(
-            owner=source_owner,
-            repository_name=repository_name,
-            clone_source=fork.name_with_owner,
-            verify=fork,
-            finalize=finalize,
-            checkpoint=checkpoint,
-        )
+        except LocalGitError as exc:
+            self._raise_local_git_error(exc)
 
     def ensure_repository_clone(
         self,
@@ -701,31 +593,34 @@ class GitHubClient:
         checkpoint: Checkpoint | None = None,
     ) -> Path:
         source_owner, repository_name = source.name_with_owner.split("/", 1)
-        if checkpoint is None:
-            return self._materialize_clone(
-                owner=source_owner,
-                repository_name=repository_name,
-                clone_source=source.name_with_owner,
-                verify=source,
+        try:
+            return self.local_git.materialize(
+                Path(source_owner) / repository_name,
+                clone_url=source.url,
+                clone_command=(
+                    self.gh_executable,
+                    "repo",
+                    "clone",
+                    source.name_with_owner,
+                ),
+                expected=self._expected_remote(source),
+                expected_label=source.name_with_owner,
+                checkpoint=checkpoint,
             )
-        return self._materialize_clone(
-            owner=source_owner,
-            repository_name=repository_name,
-            clone_source=source.name_with_owner,
-            verify=source,
-            checkpoint=checkpoint,
-        )
+        except LocalGitError as exc:
+            self._raise_local_git_error(exc)
 
     def find_repository_checkout(
         self, source: GitHubRepository, candidates: list[Path]
     ) -> Path | None:
-        for candidate in candidates:
-            try:
-                self._verify_checkout(candidate.resolve(), source)
-            except GitHubError:
-                continue
-            return candidate.resolve()
-        return None
+        try:
+            return self.local_git.find_checkout(
+                candidates,
+                self._expected_remote(source),
+                expected_label=source.name_with_owner,
+            )
+        except LocalGitError as exc:
+            self._raise_local_git_error(exc)
 
     def provision_issue(
         self,
@@ -786,8 +681,10 @@ class GitHubClient:
         )
         if checkpoint is not None:
             checkpoint()
-        head = self._git(checkout, "rev-parse", "--abbrev-ref", "HEAD").stdout.strip()
-        return head or None
+        try:
+            return self.local_git.current_branch(checkout)
+        except LocalGitError as exc:
+            self._raise_local_git_error(exc)
 
     def provision_public_fork(
         self,
