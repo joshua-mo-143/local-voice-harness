@@ -4,6 +4,7 @@ import json
 import stat
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
@@ -141,6 +142,21 @@ class ConfigManagementTests(unittest.TestCase):
             notice = config_management.format_restart_notice(result.restart_services)
             self.assertIn("voice-harness-wake.service", notice)
             self.assertNotIn("dictation.service", notice)
+
+    def test_switching_to_venice_still_stops_an_active_local_llm(self) -> None:
+        config = config_management.default_user_config()
+        config = replace(
+            config,
+            providers=replace(config.providers, llm_provider="venice"),
+        )
+
+        services = config_management.restart_services_for_keys(
+            config, ["providers.llm.provider"]
+        )
+
+        self.assertIn("voice-harness-llm.service", services)
+        notice = config_management.format_restart_notice(services)
+        self.assertIn("active on-demand services restart on their next use", notice)
 
     def test_integration_doctor_inspects_enabled_integrations_only(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

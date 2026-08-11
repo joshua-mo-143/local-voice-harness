@@ -74,7 +74,6 @@ class ServiceUnitValidationTests(unittest.TestCase):
             llm_path = source / "voice-harness-llm.service"
             llm_path.write_text(
                 llm_path.read_text()
-                .replace("--host 127.0.0.1", "--host 0.0.0.0")
                 .replace("MemoryMax=8G", "MemoryMax=infinity")
                 .replace(
                     "ProtectSystem=strict",
@@ -98,10 +97,6 @@ class ServiceUnitValidationTests(unittest.TestCase):
         self.assertIn(
             "voice-harness-llm.service must not set compatibility-sensitive "
             "SystemCallFilter",
-            errors,
-        )
-        self.assertIn(
-            "voice-harness-llm.service must bind to IPv4 loopback",
             errors,
         )
 
@@ -171,8 +166,7 @@ class ServiceUnitValidationTests(unittest.TestCase):
         self.assertTrue(
             all(
                 not variables
-                for name, variables in service_units.OPTIONAL_ENVIRONMENT_POLICY.items()
-                if name != "voice-harness-wake.service"
+                for variables in service_units.OPTIONAL_ENVIRONMENT_POLICY.values()
             )
         )
         configuration = (
@@ -365,9 +359,9 @@ class ServiceUnitValidationTests(unittest.TestCase):
                 {"capture_output": True, "text": True, "check": False},
             )
             expected_commands = (
-                Path("/usr/sbin/llama-server"),
                 Path.home()
                 / "local-voice-harness/.venv-dictation/bin/voice-harness-dictation",
+                Path.home() / "local-voice-harness/.venv/bin/voice-harness-llm",
                 Path.home() / "local-voice-harness/.venv/bin/voice-harness-wake",
                 Path.home() / "chatterbox-audition/.venv/bin/voice-harness-tts",
             )
@@ -545,6 +539,47 @@ class ServiceUnitValidationTests(unittest.TestCase):
         )
         self.assertIn("--property=EnvironmentFiles", run.call_args_list[1].args[0])
 
+    def test_installed_audit_treats_healthy_restart_history_as_observational(
+        self,
+    ) -> None:
+        name = "voice-harness-llm.service"
+        completed = self.audit_fixture(
+            name,
+            service_units.REQUIRED_ENVIRONMENT[name],
+            property_overrides={
+                "ActiveState": "active",
+                "SubState": "running",
+                "NRestarts": "5",
+            },
+        )
+        with (
+            mock.patch.object(service_units.subprocess, "run", side_effect=completed),
+            mock.patch("builtins.print"),
+        ):
+            result = service_units.audit_installed([name])
+
+        self.assertEqual(result, 0)
+
+    def test_installed_audit_rejects_active_restart_loop(self) -> None:
+        name = "voice-harness-llm.service"
+        completed = self.audit_fixture(
+            name,
+            service_units.REQUIRED_ENVIRONMENT[name],
+            property_overrides={
+                "ActiveState": "activating",
+                "SubState": "auto-restart",
+                "NRestarts": "5",
+            },
+        )
+        with (
+            mock.patch.object(service_units.subprocess, "run", side_effect=completed),
+            mock.patch("builtins.print") as output,
+        ):
+            result = service_units.audit_installed([name])
+
+        self.assertEqual(result, 1)
+        self.assertIn("active crash loop", " ".join(map(str, output.call_args_list)))
+
     def audit_fixture(
         self,
         name: str,
@@ -614,7 +649,7 @@ class ServiceUnitValidationTests(unittest.TestCase):
                 )
                 self.assertTrue(any("EnvironmentFiles" in item for item in messages))
 
-    def test_installed_audit_accepts_documented_wake_overrides(self) -> None:
+    def test_installed_audit_rejects_user_choices_owned_by_config_toml(self) -> None:
         name = "voice-harness-wake.service"
         environment = {
             **service_units.REQUIRED_ENVIRONMENT[name],
@@ -642,7 +677,7 @@ class ServiceUnitValidationTests(unittest.TestCase):
         ):
             result = service_units.audit_installed([name])
 
-        self.assertEqual(result, 0)
+        self.assertEqual(result, 1)
 
     def test_installed_audit_rejects_unknown_and_protected_wake_overrides(
         self,

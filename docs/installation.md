@@ -342,6 +342,12 @@ voice-harness services audit
 means the effective installed unit or a drop-in still differs from the shipped
 policy; do not treat installation as complete.
 
+The shipped units do not embed user-selected providers, models, CUDA devices,
+dictation selectors, or wake/integration settings. The dictation and local-LLM
+launchers resolve those values from the same typed `config.toml` model at process
+start. Keep service drop-ins limited to operational policy; the audit rejects
+user-choice `Environment=` overrides and all `EnvironmentFile=` directives.
+
 Qwen and Chatterbox are intentionally not enabled at login. The wake daemon starts
 them on demand and stops them when a conversation closes. It also stops them after a
 failed turn when no earlier conversation remains active. Manual text turns hold a

@@ -5,6 +5,7 @@ import json
 import subprocess
 import time
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
@@ -18,6 +19,10 @@ from local_voice_harness.diagnostics.model import (
     Severity,
 )
 from local_voice_harness.integrations.linear import CapabilityStatus
+from local_voice_harness.user_config import (
+    UserConfigurationError,
+    default_user_config,
+)
 
 
 def _result(severity: Severity, name: str = "x", **kwargs: object) -> CheckResult:
@@ -35,6 +40,14 @@ def _completed(
 ) -> subprocess.CompletedProcess[str]:
     return subprocess.CompletedProcess(
         args=["stub"], returncode=returncode, stdout=stdout, stderr=stderr
+    )
+
+
+def _snapshot():
+    config = default_user_config()
+    return checks.DiagnosticSnapshot(
+        config=config,
+        registry=checks.build_integration_registry(config),
     )
 
 
@@ -66,6 +79,15 @@ class RunnerTests(unittest.TestCase):
         self.assertIs(results[0].severity, Severity.FATAL)
         self.assertIn("kaboom", results[0].detail)
 
+    def test_run_diagnostics_redacts_crash_details(self) -> None:
+        def boom() -> list[CheckResult]:
+            raise RuntimeError("token=supersecretvalue")
+
+        results = runner.run_diagnostics([boom])
+
+        self.assertNotIn("supersecretvalue", results[0].detail)
+        self.assertIn("[REDACTED]", results[0].detail)
+
     def test_run_diagnostics_aggregates_all_checks(self) -> None:
         results = runner.run_diagnostics(
             [
@@ -74,6 +96,61 @@ class RunnerTests(unittest.TestCase):
             ]
         )
         self.assertEqual([r.name for r in results], ["a", "b"])
+
+    def test_run_diagnostics_resolves_one_snapshot_for_every_check(self) -> None:
+        snapshot = _snapshot()
+        observed: list[checks.DiagnosticSnapshot] = []
+
+        def observe(value: checks.DiagnosticSnapshot) -> list[CheckResult]:
+            observed.append(value)
+            return []
+
+        with mock.patch.object(
+            checks.DiagnosticSnapshot, "load", return_value=snapshot
+        ) as load:
+            runner.run_diagnostics([observe, observe])
+
+        load.assert_called_once_with()
+        self.assertEqual(observed, [snapshot, snapshot])
+
+    def test_malformed_config_is_one_direct_fatal_beside_independent_checks(
+        self,
+    ) -> None:
+        snapshot = checks.DiagnosticSnapshot(
+            config=None,
+            registry=None,
+            error=UserConfigurationError("bad config.toml"),
+        )
+        results = runner.run_diagnostics(
+            [
+                checks.check_backend_configuration,
+                lambda _snapshot: [_result(Severity.OK, "independent")],
+                checks.check_model_file,
+                checks.check_optional_integrations,
+            ],
+            snapshot=snapshot,
+        )
+
+        self.assertEqual(
+            [result.name for result in results],
+            ["configuration:user", "independent"],
+        )
+        self.assertIn("bad config.toml", results[0].detail)
+
+    def test_malformed_config_diagnostic_is_redacted(self) -> None:
+        snapshot = checks.DiagnosticSnapshot(
+            config=None,
+            registry=None,
+            error=UserConfigurationError("bad config.toml: token=supersecretvalue"),
+        )
+
+        results = runner.run_diagnostics(
+            [checks.check_backend_configuration],
+            snapshot=snapshot,
+        )
+
+        self.assertNotIn("supersecretvalue", results[0].detail)
+        self.assertIn("[REDACTED]", results[0].detail)
 
     def test_render_json_reports_summary_and_health(self) -> None:
         results = [_result(Severity.FATAL, "a"), _result(Severity.OK, "b")]
@@ -148,6 +225,20 @@ class ApplyRepairTests(unittest.TestCase):
             out=out,
         )
         self.assertIn("repair failed for svc: nope", out.getvalue())
+
+    def test_failed_repair_redacts_diagnostic(self) -> None:
+        def action() -> str:
+            raise RuntimeError("password=supersecretvalue")
+
+        out = io.StringIO()
+        runner.apply_repairs(
+            [_result(Severity.FATAL, "svc", repair=Repair("fix", action))],
+            confirm=lambda _prompt: True,
+            out=out,
+        )
+
+        self.assertNotIn("supersecretvalue", out.getvalue())
+        self.assertIn("[REDACTED]", out.getvalue())
 
     def test_ok_results_with_repair_are_ignored(self) -> None:
         ran: list[str] = []
@@ -231,6 +322,30 @@ class ExecutableCheckTests(unittest.TestCase):
             results = checks.check_required_executables()
         self.assertTrue(all(r.severity is Severity.OK for r in results))
 
+    def test_executable_checks_use_configured_client_paths(self) -> None:
+        config = default_user_config()
+        configured = replace(
+            config,
+            platform=replace(
+                config.platform,
+                herdr_bin=Path("/opt/herdr"),
+                gh_bin=Path("/opt/gh"),
+            ),
+        )
+        snapshot = checks.DiagnosticSnapshot(
+            configured,
+            checks.build_integration_registry(configured),
+        )
+
+        with mock.patch.object(
+            checks, "_which", return_value="/configured/tool"
+        ) as which:
+            checks.check_required_executables(snapshot)
+            checks.check_optional_executables(snapshot)
+
+        self.assertIn(mock.call("/opt/herdr"), which.call_args_list)
+        self.assertIn(mock.call("/opt/gh"), which.call_args_list)
+
     def test_missing_optional_executable_is_warning(self) -> None:
         with mock.patch.object(checks, "_which", return_value=None):
             results = checks.check_optional_executables()
@@ -288,12 +403,12 @@ class ModelAndCudaTests(unittest.TestCase):
             model = Path(temporary) / "model.gguf"
             model.write_bytes(b"0" * 1024)
             with mock.patch.object(checks, "MODEL_FILE", model):
-                results = checks.check_model_file()
+                results = checks.check_model_file(_snapshot())
         self.assertIs(results[0].severity, Severity.OK)
 
     def test_model_missing_is_fatal(self) -> None:
         with mock.patch.object(checks, "MODEL_FILE", Path("/nonexistent/model.gguf")):
-            results = checks.check_model_file()
+            results = checks.check_model_file(_snapshot())
         self.assertIs(results[0].severity, Severity.FATAL)
         self.assertIn("hf download", results[0].suggestion or "")
 
@@ -691,39 +806,96 @@ class CursorJobTests(unittest.TestCase):
 
 
 class IntegrationCheckTests(unittest.TestCase):
+    def test_herdr_uses_configured_snapshot_client_and_path(self) -> None:
+        config = default_user_config()
+        configured = replace(
+            config,
+            platform=replace(config.platform, herdr_bin=Path("/opt/herdr")),
+        )
+        client = mock.Mock()
+        client.is_running.return_value = True
+        registry = replace(
+            checks.build_integration_registry(configured),
+            herdr_client=lambda: client,
+        )
+        snapshot = checks.DiagnosticSnapshot(configured, registry)
+
+        with mock.patch.object(checks, "_which", return_value="/opt/herdr") as which:
+            results = checks.check_herdr(snapshot)
+
+        which.assert_called_once_with("/opt/herdr")
+        client.is_running.assert_called_once_with()
+        self.assertIs(results[0].severity, Severity.OK)
+
+    def test_github_auth_uses_configured_executable_and_timeout(self) -> None:
+        config = default_user_config()
+        configured = replace(
+            config,
+            platform=replace(
+                config.platform,
+                gh_bin=Path("/opt/gh"),
+                github_timeout_seconds=17,
+            ),
+        )
+        snapshot = checks.DiagnosticSnapshot(
+            configured,
+            checks.build_integration_registry(configured),
+        )
+        with (
+            mock.patch.object(checks, "_which", return_value="/opt/gh"),
+            mock.patch.object(
+                checks, "_run", return_value=_completed(0, "logged in")
+            ) as run,
+        ):
+            results = checks.check_github_auth(snapshot)
+
+        run.assert_called_once_with(["/opt/gh", "auth", "status"], timeout=17)
+        self.assertIs(results[0].severity, Severity.OK)
+
     def test_herdr_absent_binary_is_skipped(self) -> None:
         with (
             mock.patch.object(checks, "_which", return_value=None),
             mock.patch.object(Path, "exists", return_value=False),
         ):
-            self.assertEqual(checks.check_herdr(), [])
+            self.assertEqual(checks.check_herdr(_snapshot()), [])
 
     def test_herdr_running_is_ok(self) -> None:
-        with (
-            mock.patch.object(checks, "_which", return_value="/usr/bin/herdr"),
-            mock.patch.object(checks.HerdrClient, "is_running", return_value=True),
-        ):
-            results = checks.check_herdr()
+        snapshot = _snapshot()
+        client = mock.Mock()
+        client.is_running.return_value = True
+        assert snapshot.registry is not None
+        snapshot = replace(
+            snapshot,
+            registry=replace(snapshot.registry, herdr_client=lambda: client),
+        )
+        with mock.patch.object(checks, "_which", return_value="/usr/bin/herdr"):
+            results = checks.check_herdr(snapshot)
         self.assertIs(results[0].severity, Severity.OK)
 
     def test_herdr_stopped_is_warning(self) -> None:
-        with (
-            mock.patch.object(checks, "_which", return_value="/usr/bin/herdr"),
-            mock.patch.object(checks.HerdrClient, "is_running", return_value=False),
-        ):
-            results = checks.check_herdr()
+        snapshot = _snapshot()
+        client = mock.Mock()
+        client.is_running.return_value = False
+        assert snapshot.registry is not None
+        snapshot = replace(
+            snapshot,
+            registry=replace(snapshot.registry, herdr_client=lambda: client),
+        )
+        with mock.patch.object(checks, "_which", return_value="/usr/bin/herdr"):
+            results = checks.check_herdr(snapshot)
         self.assertIs(results[0].severity, Severity.WARNING)
 
     def test_herdr_error_is_warning(self) -> None:
-        with (
-            mock.patch.object(checks, "_which", return_value="/usr/bin/herdr"),
-            mock.patch.object(
-                checks.HerdrClient,
-                "is_running",
-                side_effect=checks.HerdrError("bad"),
-            ),
-        ):
-            results = checks.check_herdr()
+        snapshot = _snapshot()
+        client = mock.Mock()
+        client.is_running.side_effect = checks.HerdrError("bad")
+        assert snapshot.registry is not None
+        snapshot = replace(
+            snapshot,
+            registry=replace(snapshot.registry, herdr_client=lambda: client),
+        )
+        with mock.patch.object(checks, "_which", return_value="/usr/bin/herdr"):
+            results = checks.check_herdr(snapshot)
         self.assertIs(results[0].severity, Severity.WARNING)
 
     def test_cursor_cli_absent_is_skipped(self) -> None:

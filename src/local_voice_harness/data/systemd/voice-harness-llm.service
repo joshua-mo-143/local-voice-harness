@@ -6,7 +6,8 @@ StartLimitBurst=5
 
 [Service]
 Type=simple
-ExecStart=/usr/sbin/llama-server --model %h/local-voice-harness/models/Qwen3.5-4B-Q4_K_M.gguf --alias qwen3.5-4b --host 127.0.0.1 --port 8090 --ctx-size 8192 --parallel 1 --n-gpu-layers 99 --device CUDA0 --flash-attn on --jinja --reasoning off --reasoning-budget 0
+WorkingDirectory=%h/local-voice-harness
+ExecStart=%h/local-voice-harness/.venv/bin/voice-harness-llm
 Environment=CUDA_CACHE_PATH=%t/voice-harness-llm/cuda-cache
 RuntimeDirectory=voice-harness-llm
 RuntimeDirectoryMode=0700
