@@ -35,6 +35,7 @@ from .credentials import (
 from .diagnostic_safety import COMMAND_FAILURE, log_diagnostic
 from .diagnostics import doctor
 from .dictation import run as run_dictation
+from .integrations.registry import build_integration_registry
 from .intent import Intent, IntentRoute, route_intent
 from .notifications import notify
 from .recording import (
@@ -544,7 +545,7 @@ def _configured_request_context(text: str) -> RequestContext:
     return request_context(
         text,
         platform=settings.platform,
-        integrations=settings.integrations,
+        integrations=build_integration_registry(settings),
     )
 
 
