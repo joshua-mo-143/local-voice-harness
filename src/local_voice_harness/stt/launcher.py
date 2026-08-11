@@ -2,20 +2,13 @@ from __future__ import annotations
 
 import os
 import pwd
-import shlex
 import site
 import sys
 from pathlib import Path
 
-BACKEND_ENVIRONMENT_KEYS = frozenset(
-    {
-        "DICTATION_BACKEND",
-        "DICTATION_MODEL",
-        "DICTATION_LANGUAGE",
-        "DICTATION_COMPUTE",
-        "DICTATION_QUANTIZATION",
-    }
-)
+from ..user_config import load_backend_environment as load_backend_environment
+from ..user_config import load_user_config
+
 PROTECTED_ENVIRONMENT_KEYS = frozenset(
     {
         "DICTATION_SOCKET",
@@ -27,27 +20,11 @@ PROTECTED_ENVIRONMENT_KEYS = frozenset(
         "XDG_RUNTIME_DIR",
     }
 )
-
-
-def load_backend_environment(path: Path) -> dict[str, str]:
-    """Parse only documented backend selectors from backend.env."""
-
-    if not path.exists():
-        return {}
-    environment: dict[str, str] = {}
-    for line_number, raw_line in enumerate(path.read_text().splitlines(), start=1):
-        fields = shlex.split(raw_line, comments=True, posix=True)
-        if not fields:
-            continue
-        if len(fields) != 1 or "=" not in fields[0]:
-            raise ValueError(f"{path}:{line_number}: invalid environment assignment")
-        key, value = fields[0].split("=", 1)
-        if key not in BACKEND_ENVIRONMENT_KEYS:
-            raise ValueError(
-                f"{path}:{line_number}: unsupported backend environment key {key!r}"
-            )
-        environment[key] = value
-    return environment
+LEGACY_UNIT_DEFAULTS = {
+    "DICTATION_BACKEND": "parakeet",
+    "DICTATION_MODEL": "nemo-parakeet-tdt-0.6b-v2",
+    "DICTATION_QUANTIZATION": "int8",
+}
 
 
 def protected_environment(*, uid: int | None = None) -> dict[str, str]:
@@ -67,14 +44,41 @@ def protected_environment(*, uid: int | None = None) -> dict[str, str]:
     }
 
 
+def resolver_environment(environment: dict[str, str]) -> dict[str, str]:
+    """Demote selector defaults embedded in previously installed systemd units."""
+
+    resolved = environment.copy()
+    if resolved.get("INVOCATION_ID"):
+        for key, default in LEGACY_UNIT_DEFAULTS.items():
+            if resolved.get(key) == default:
+                resolved.pop(key)
+    return resolved
+
+
 def main() -> None:
     if "--check" in sys.argv[1:]:
         print("voice-harness-dictation: ok")
         return
     environment = os.environ.copy()
     owned = protected_environment()
-    backend_file = Path(owned["HOME"]) / ".config/dictation/backend.env"
-    environment.update(load_backend_environment(backend_file))
+    snapshot = load_user_config(
+        resolver_environment(environment), home=Path(owned["HOME"])
+    )
+    compute = snapshot.compute
+    dictation = snapshot.dictation
+    environment.update(
+        {
+            "DICTATION_BACKEND": compute.dictation_backend,
+            "DICTATION_MODEL": compute.dictation_model,
+            "DICTATION_LANGUAGE": compute.dictation_language,
+            "DICTATION_COMPUTE": compute.dictation_compute,
+            "DICTATION_QUANTIZATION": compute.dictation_quantization,
+            "DICTATION_PROMPT": dictation.prompt,
+            "DICTATION_REPLACEMENTS": ";".join(
+                f"{source}:{target}" for source, target in dictation.replacements
+            ),
+        }
+    )
     environment.update(owned)
     libraries = [
         str(path)

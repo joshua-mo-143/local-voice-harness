@@ -82,6 +82,88 @@ class UserConfigPrecedenceTests(unittest.TestCase):
             self.assertEqual(with_env.providers.llm_model, "env-model")
             self.assertEqual(with_env.audio.wake_threshold, 0.9)
 
+    def test_backend_env_overrides_config_and_environment_overrides_legacy(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config_path = root / "config.toml"
+            backend_env = root / "backend.env"
+            config_path.write_text(
+                '[compute]\ndictation_backend = "parakeet"\n'
+                'dictation_model = "config-model"\n'
+            )
+            backend_env.write_text(
+                "DICTATION_BACKEND=whisper\nDICTATION_MODEL=legacy-model\n"
+            )
+
+            legacy = user_config.load_user_config(
+                {},
+                path=config_path,
+                backends_path=root / "missing.toml",
+                backend_env_path=backend_env,
+                home=self.HOME,
+            )
+            overridden = user_config.load_user_config(
+                {
+                    "DICTATION_BACKEND": "parakeet",
+                    "DICTATION_MODEL": "environment-model",
+                },
+                path=config_path,
+                backends_path=root / "missing.toml",
+                backend_env_path=backend_env,
+                home=self.HOME,
+            )
+
+        self.assertEqual(legacy.compute.dictation_backend, "whisper")
+        self.assertEqual(legacy.compute.dictation_model, "legacy-model")
+        self.assertEqual(overridden.compute.dictation_backend, "parakeet")
+        self.assertEqual(overridden.compute.dictation_model, "environment-model")
+
+    def test_dictation_settings_use_typed_config_and_environment_overrides(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            path = root / "config.toml"
+            path.write_text(
+                "[dictation]\n"
+                'source = "config-source"\n'
+                'inject = "paste"\n'
+                'prompt = "config prompt"\n'
+                'replacements = "spoken:written"\n'
+                "vad_end_silence_ms = 750\n"
+            )
+            config = user_config.load_user_config(
+                {
+                    "DICTATION_INJECT": "stdout",
+                    "DICTATION_PROMPT": "environment prompt",
+                },
+                path=path,
+                backends_path=root / "missing.toml",
+                backend_env_path=root / "missing.env",
+                home=self.HOME,
+            )
+
+        self.assertEqual(config.dictation.source, "config-source")
+        self.assertEqual(config.dictation.inject, "stdout")
+        self.assertEqual(config.dictation.prompt, "environment prompt")
+        self.assertEqual(config.dictation.replacements, (("spoken", "written"),))
+        self.assertEqual(config.dictation.vad_end_silence_ms, 750)
+
+    def test_empty_legacy_replacements_disable_static_corrections(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            config = user_config.load_user_config(
+                {"DICTATION_REPLACEMENTS": ""},
+                path=root / "missing.toml",
+                backends_path=root / "missing-backends.toml",
+                backend_env_path=root / "missing.env",
+                home=self.HOME,
+            )
+
+        self.assertEqual(config.dictation.replacements, ())
+
     def test_config_file_overrides_defaults_for_non_provider_sections(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -132,6 +214,31 @@ class UserConfigPrecedenceTests(unittest.TestCase):
             )
 
         self.assertEqual(config.audio.wake_threshold, 0.7)
+
+    def test_running_snapshot_retains_values_and_restart_observes_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            path = root / "config.toml"
+            path.write_text('[providers.llm]\nmodel = "startup-model"\n')
+            running = user_config.load_user_config(
+                {},
+                path=path,
+                backends_path=root / "missing.toml",
+                backend_env_path=root / "missing.env",
+                home=self.HOME,
+            )
+
+            path.write_text('[providers.llm]\nmodel = "restart-model"\n')
+            restarted = user_config.load_user_config(
+                {},
+                path=path,
+                backends_path=root / "missing.toml",
+                backend_env_path=root / "missing.env",
+                home=self.HOME,
+            )
+
+        self.assertEqual(running.providers.llm_model, "startup-model")
+        self.assertEqual(restarted.providers.llm_model, "restart-model")
 
     def test_integration_environment_override(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -206,6 +313,37 @@ class UserConfigValidationTests(unittest.TestCase):
         with self.assertRaisesRegex(UserConfigurationError, "off, vad, wake"):
             self._load('[audio]\nbarge_in_mode = "loud"\n')
 
+    def test_empty_dictation_compute_values_are_rejected(self) -> None:
+        for key in (
+            "dictation_model",
+            "dictation_quantization",
+            "dictation_compute",
+            "dictation_language",
+        ):
+            with (
+                self.subTest(key=key),
+                self.assertRaises(UserConfigurationError),
+            ):
+                self._load(f'[compute]\n{key} = ""\n')
+
+    def test_empty_legacy_dictation_compute_value_is_rejected(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            backend_env = root / "backend.env"
+            backend_env.write_text("DICTATION_MODEL=\n")
+
+            with self.assertRaisesRegex(
+                UserConfigurationError,
+                "compute.dictation_model must not be empty",
+            ):
+                user_config.load_user_config(
+                    {},
+                    path=root / "missing.toml",
+                    backends_path=root / "missing-backends.toml",
+                    backend_env_path=backend_env,
+                    home=self.HOME,
+                )
+
     def test_invalid_playback_latency_is_rejected(self) -> None:
         with self.assertRaisesRegex(UserConfigurationError, "us, ms, or s"):
             self._load('[audio]\nplayback_latency = "fast"\n')
@@ -265,6 +403,42 @@ class UserConfigValidationTests(unittest.TestCase):
                     {},
                     path=root / "missing.toml",
                     backends_path=backends_path,
+                    home=self.HOME,
+                )
+
+    def test_malformed_backend_environment_names_source_line(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            backend_env = root / "backend.env"
+            backend_env.write_text("DICTATION_MODEL='unterminated\n")
+
+            with self.assertRaisesRegex(
+                UserConfigurationError,
+                rf"{backend_env}:1: invalid environment assignment",
+            ):
+                user_config.load_user_config(
+                    {},
+                    path=root / "missing.toml",
+                    backends_path=root / "missing-backends.toml",
+                    backend_env_path=backend_env,
+                    home=self.HOME,
+                )
+
+    def test_backend_environment_rejects_unknown_keys(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            backend_env = root / "backend.env"
+            backend_env.write_text("LD_PRELOAD=/tmp/attack.so\n")
+
+            with self.assertRaisesRegex(
+                UserConfigurationError,
+                "unsupported backend environment key",
+            ):
+                user_config.load_user_config(
+                    {},
+                    path=root / "missing.toml",
+                    backends_path=root / "missing-backends.toml",
+                    backend_env_path=backend_env,
                     home=self.HOME,
                 )
 

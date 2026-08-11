@@ -85,7 +85,9 @@ class QwenClientTests(unittest.TestCase):
     def setUp(self) -> None:
         self._settings = replace(load_backend_settings({}), llm_provider="local")
         self._settings_patch = mock.patch.object(
-            llm_transport, "load_backend_settings", return_value=self._settings
+            llm_transport,
+            "default_user_config",
+            return_value=mock.Mock(providers=self._settings),
         )
         self._settings_patch.start()
 
@@ -596,7 +598,9 @@ class QwenClientTests(unittest.TestCase):
         )
         with (
             mock.patch.object(
-                llm_transport, "load_backend_settings", return_value=settings
+                llm_transport,
+                "default_user_config",
+                return_value=mock.Mock(providers=settings),
             ),
             mock.patch.object(
                 llm_transport, "get_venice_api_key", return_value="venice-secret"
@@ -635,7 +639,9 @@ class QwenClientTests(unittest.TestCase):
         )
         with (
             mock.patch.object(
-                llm_transport, "load_backend_settings", return_value=settings
+                llm_transport,
+                "default_user_config",
+                return_value=mock.Mock(providers=settings),
             ),
             mock.patch.object(
                 llm_transport, "get_venice_api_key", return_value="secret"
@@ -697,7 +703,9 @@ class QwenClientTests(unittest.TestCase):
         )
         with (
             mock.patch.object(
-                llm_transport, "load_backend_settings", return_value=settings
+                llm_transport,
+                "default_user_config",
+                return_value=mock.Mock(providers=settings),
             ),
             mock.patch.object(
                 llm_transport, "get_venice_api_key", return_value="secret"
@@ -731,7 +739,9 @@ class QwenClientTests(unittest.TestCase):
         output = io.StringIO()
         with (
             mock.patch.object(
-                llm_transport, "load_backend_settings", return_value=settings
+                llm_transport,
+                "default_user_config",
+                return_value=mock.Mock(providers=settings),
             ),
             mock.patch.object(
                 llm_transport, "get_venice_api_key", return_value="secret"
@@ -813,7 +823,9 @@ class QwenClientTests(unittest.TestCase):
         )
         with (
             mock.patch.object(
-                llm_transport, "load_backend_settings", return_value=settings
+                llm_transport,
+                "default_user_config",
+                return_value=mock.Mock(providers=settings),
             ),
             mock.patch.object(
                 llm_transport, "get_venice_api_key", return_value="secret"

@@ -14,7 +14,6 @@ from .config import PROJECT_ROOT, SERVICE_FILES, backend_config_path, xdg_config
 from .credentials import CredentialError, get_venice_api_key
 from .integrations.registry import capability_statuses
 from .user_config import (
-    ComputeSettings,
     IntegrationSettings,
     UserConfig,
     UserConfigurationError,
@@ -25,13 +24,6 @@ from .user_config import (
     write_user_config,
 )
 
-_BACKEND_ENV_KEYS = (
-    ("dictation_backend", "DICTATION_BACKEND"),
-    ("dictation_model", "DICTATION_MODEL"),
-    ("dictation_quantization", "DICTATION_QUANTIZATION"),
-    ("dictation_compute", "DICTATION_COMPUTE"),
-    ("dictation_language", "DICTATION_LANGUAGE"),
-)
 _INTEGRATION_NAMES = ("github", "zendesk", "linear")
 _WAKE_SERVICE = "voice-harness-wake.service"
 _LLM_SERVICE = "voice-harness-llm.service"
@@ -102,6 +94,15 @@ def _parse_classes(value: str) -> tuple[str, ...]:
     if not parts:
         raise UserConfigurationError("expected at least one window class")
     return parts
+
+
+def _parse_replacements(value: str) -> tuple[tuple[str, str], ...]:
+    entries = tuple(
+        tuple(entry.split(":", 1))
+        for entry in value.split(";")
+        if entry.strip() and ":" in entry
+    )
+    return tuple((source.strip(), target.strip()) for source, target in entries)
 
 
 def _replace_providers(config: UserConfig, **changes: object) -> UserConfig:
@@ -285,6 +286,54 @@ _CONFIG_FIELDS: dict[str, ConfigField] = {
         attribute="playback_latency",
         services=(_WAKE_SERVICE,),
     ),
+    "dictation.source": _field(
+        parse=_parse_str,
+        section="dictation",
+        attribute="source",
+        services=(),
+    ),
+    "dictation.inject": _field(
+        parse=_parse_str,
+        section="dictation",
+        attribute="inject",
+        services=(),
+    ),
+    "dictation.prompt": _field(
+        parse=_parse_str,
+        section="dictation",
+        attribute="prompt",
+        services=(_DICTATION_SERVICE,),
+    ),
+    "dictation.replacements": _field(
+        parse=_parse_replacements,
+        section="dictation",
+        attribute="replacements",
+        services=(_DICTATION_SERVICE,),
+    ),
+    "dictation.vad_end_silence_ms": _field(
+        parse=_parse_float,
+        section="dictation",
+        attribute="vad_end_silence_ms",
+        services=(),
+    ),
+    "dictation.vad_max_seconds": _field(
+        parse=_parse_float,
+        section="dictation",
+        attribute="vad_max_seconds",
+        services=(),
+    ),
+    "dictation.vad_min_speech_rms": _field(
+        parse=_parse_float,
+        section="dictation",
+        attribute="vad_min_speech_rms",
+        services=(),
+    ),
+    "dictation.vad_start_speech_frames": _field(
+        parse=_parse_int,
+        section="dictation",
+        attribute="vad_start_speech_frames",
+        services=(),
+    ),
     "platform.project_root": _field(
         parse=_parse_path,
         section="platform",
@@ -398,6 +447,7 @@ def load_managed_config(
         env,
         path=paths.config,
         backends_path=paths.backends,
+        backend_env_path=paths.backend_env,
         home=paths.home,
     )
 
@@ -417,21 +467,11 @@ def validate_managed_config(
             env,
             path=temporary,
             backends_path=paths.backends,
+            backend_env_path=Path(os.devnull),
             home=paths.home,
         )
     finally:
         temporary.unlink(missing_ok=True)
-
-
-def sync_backend_environment(compute: ComputeSettings, path: Path) -> None:
-    """Mirror compute selectors into dictation's backend.env."""
-
-    path.parent.mkdir(parents=True, exist_ok=True)
-    lines = [
-        f"{environment_key}={getattr(compute, attribute)}"
-        for attribute, environment_key in _BACKEND_ENV_KEYS
-    ]
-    path.write_text("\n".join(lines) + "\n")
 
 
 def restart_services_for_keys(
@@ -507,8 +547,6 @@ def commit_config_change(
     updated = apply_config_values(current, assignments)
     validated = validate_managed_config(updated, resolved_paths, env)
     write_user_config(validated, resolved_paths.config)
-    if any(key.casefold().startswith("compute.") for key in assignments):
-        sync_backend_environment(validated.compute, resolved_paths.backend_env)
     restart = active_services(restart_services_for_keys(validated, tuple(assignments)))
     return ConfigChangeResult(
         config=validated,
@@ -566,10 +604,12 @@ def reset_config(
             "integrations",
             "compute",
             "audio",
+            "dictation",
             "platform",
         }:
             raise UserConfigurationError(
-                "section must be one of: providers, integrations, compute, audio, platform"
+                "section must be one of: providers, integrations, compute, audio, "
+                "dictation, platform"
             )
         replacements: dict[str, str] = {}
         for name in _CONFIG_FIELDS:
@@ -582,8 +622,6 @@ def reset_config(
         validated = validate_managed_config(updated, resolved_paths, env)
         changed = tuple(replacements)
     write_user_config(validated, resolved_paths.config)
-    if section in {None, "compute"}:
-        sync_backend_environment(validated.compute, resolved_paths.backend_env)
     restart = active_services(restart_services_for_keys(validated, changed))
     return ConfigChangeResult(
         config=validated,
@@ -606,6 +644,8 @@ def _format_scalar(value: object) -> str:
     if isinstance(value, Path):
         return str(value)
     if isinstance(value, tuple):
+        if all(isinstance(item, tuple) and len(item) == 2 for item in value):
+            return ";".join(f"{item[0]}:{item[1]}" for item in value)
         return ",".join(str(item) for item in value)
     return str(value)
 

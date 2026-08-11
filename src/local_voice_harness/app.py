@@ -70,7 +70,7 @@ def respond(text: str, *, user_config: UserConfig | None = None) -> None:
     delivery_claims: DeliveryClaims = []
     with component_usage():
         try:
-            start_components()
+            start_components(settings.providers)
             print(f"You: {text}")
             context = request_context(
                 text,
@@ -80,7 +80,7 @@ def respond(text: str, *, user_config: UserConfig | None = None) -> None:
             if CURSOR_PATTERN.search(text):
                 route = IntentRoute(Intent.AGENT_SUBMIT, "high")
             else:
-                route = route_intent(text, context)
+                route = route_intent(text, context, settings=settings.providers)
             fork_requested = decide_fork_intent(text) == ForkIntent.AFFIRMATIVE
             github_arguments = (
                 {
@@ -153,10 +153,11 @@ def respond(text: str, *, user_config: UserConfig | None = None) -> None:
                     trusted_utterance=text,
                     delivery_claims=delivery_claims,
                     allow_tools=False,
+                    settings=settings.providers,
                 )
             rendered_response = as_assistant_response(response)
             print(f"Assistant: {rendered_response.display_text}")
-            stream_and_play(rendered_response.spoken_text)
+            stream_and_play(rendered_response.spoken_text, settings=settings.audio)
             acknowledge_deliveries(delivery_claims)
         except Exception:
             release_deliveries(delivery_claims)

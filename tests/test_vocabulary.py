@@ -346,7 +346,9 @@ class RoutingPrepassTests(unittest.TestCase):
             app.respond("summarize the harness repo readme")
 
         self.assertEqual(captured, ["summarize owner/harness readme"])
-        route_intent.assert_called_once_with("summarize owner/harness readme", mock.ANY)
+        route_intent.assert_called_once_with(
+            "summarize owner/harness readme", mock.ANY, settings=mock.ANY
+        )
 
 
 class VocabularyCliTests(unittest.TestCase):

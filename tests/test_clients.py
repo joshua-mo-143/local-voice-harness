@@ -9,6 +9,7 @@ import threading
 import time
 import unittest
 from contextlib import redirect_stdout
+from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
@@ -369,12 +370,13 @@ class TextToSpeechClientTests(unittest.TestCase):
             mock.patch.object(
                 tts_client.uuid, "uuid4", return_value=mock.Mock(hex="request-id")
             ),
-            mock.patch.dict(
-                os.environ, {"VOICE_HARNESS_VOICE": "/tmp/voice.wav"}, clear=True
-            ),
             redirect_stdout(output),
         ):
-            result = tts_client.synthesize_and_play("hello")
+            settings = replace(
+                tts_client.default_user_config().audio,
+                voice="/tmp/voice.wav",
+            )
+            result = tts_client.synthesize_and_play("hello", settings)
 
         payload = request.call_args.args[1]
         self.assertTrue(payload.endswith(b"\n"))

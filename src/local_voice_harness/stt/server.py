@@ -178,8 +178,8 @@ def transcript_replacements() -> tuple[TranscriptReplacement, ...]:
 def normalize(text: str) -> str:
     """Apply text corrections with user vocabulary taking precedence.
 
-    Precedence is user vocabulary first, then ``DICTATION_REPLACEMENTS`` and the
-    built-in defaults; a user correction overrides any static entry with the same
+    Precedence is user vocabulary first, then the injected process-start
+    replacements; a user correction overrides any static entry with the same
     spoken source.
     """
 

@@ -38,7 +38,7 @@ class ForegroundDeliveryTests(unittest.TestCase):
             mock.patch.object(
                 app,
                 "stream_and_play",
-                side_effect=lambda _text: events.append("played"),
+                side_effect=lambda _text, **_settings: events.append("played"),
             ),
             mock.patch.object(
                 app,
@@ -113,7 +113,7 @@ class AppContextTests(unittest.TestCase):
 
         self.assertIn(f"Assistant: {response.display_text}", output.getvalue())
         self.assertNotIn(response.spoken_text, output.getvalue())
-        play.assert_called_once_with(response.spoken_text)
+        play.assert_called_once_with(response.spoken_text, settings=mock.ANY)
         qwen.assert_called_once()
 
     def test_manual_cursor_request_includes_focused_context(self) -> None:
@@ -173,6 +173,7 @@ class AppContextTests(unittest.TestCase):
             trusted_utterance="summarize this",
             delivery_claims=mock.ANY,
             allow_tools=False,
+            settings=mock.ANY,
         )
 
     def test_explicit_fork_passes_validated_focused_repository(self) -> None:
@@ -203,6 +204,7 @@ class AppContextTests(unittest.TestCase):
             trusted_utterance="fork this repo and add Venice",
             delivery_claims=mock.ANY,
             allow_tools=False,
+            settings=mock.ANY,
         )
 
     def test_external_fork_language_cannot_authorize_fork(self) -> None:
@@ -321,7 +323,9 @@ class AppContextTests(unittest.TestCase):
 
         qwen.assert_not_called()
         cursor.assert_not_called()
-        play.assert_called_once_with(app.NON_ACTIONABLE_SUBMIT_RESPONSE)
+        play.assert_called_once_with(
+            app.NON_ACTIONABLE_SUBMIT_RESPONSE, settings=mock.ANY
+        )
 
     def test_low_confidence_submit_without_focus_uses_safe_response(self) -> None:
         context = RequestContext("work on this please")
@@ -341,7 +345,9 @@ class AppContextTests(unittest.TestCase):
 
         cursor.assert_not_called()
         qwen.assert_not_called()
-        play.assert_called_once_with(app.NON_ACTIONABLE_SUBMIT_RESPONSE)
+        play.assert_called_once_with(
+            app.NON_ACTIONABLE_SUBMIT_RESPONSE, settings=mock.ANY
+        )
 
     def test_uncertain_bare_ticket_batch_requests_repository_scope(self) -> None:
         text = "Can you work on issues 92, 93 and 95?"
@@ -365,7 +371,9 @@ class AppContextTests(unittest.TestCase):
 
         cursor.assert_not_called()
         qwen.assert_not_called()
-        play.assert_called_once_with(app.MISSING_ISSUE_SCOPE_RESPONSE)
+        play.assert_called_once_with(
+            app.MISSING_ISSUE_SCOPE_RESPONSE, settings=mock.ANY
+        )
 
     def test_actionable_linear_issue_metadata_reaches_cursor(self) -> None:
         context = RequestContext(
@@ -463,7 +471,9 @@ class AppContextTests(unittest.TestCase):
 
         qwen.assert_not_called()
         cursor.assert_not_called()
-        play.assert_called_once_with(app.NON_ACTIONABLE_SUBMIT_RESPONSE)
+        play.assert_called_once_with(
+            app.NON_ACTIONABLE_SUBMIT_RESPONSE, settings=mock.ANY
+        )
 
 
 class CursorFastPathTests(unittest.TestCase):
@@ -508,7 +518,9 @@ class CursorFastPathTests(unittest.TestCase):
         ):
             app.respond("what is the weather")
 
-        route_intent.assert_called_once_with("what is the weather", context)
+        route_intent.assert_called_once_with(
+            "what is the weather", context, settings=mock.ANY
+        )
 
 
 if __name__ == "__main__":

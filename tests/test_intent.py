@@ -81,7 +81,9 @@ class IntentRouterTests(unittest.TestCase):
         )
         with (
             mock.patch.object(
-                llm_transport, "load_backend_settings", return_value=settings
+                llm_transport,
+                "default_user_config",
+                return_value=mock.Mock(providers=settings),
             ),
             mock.patch.object(llm_transport, "get_venice_api_key") as get_key,
             mock.patch.object(
@@ -114,7 +116,9 @@ class IntentRouterTests(unittest.TestCase):
         )
         with (
             mock.patch.object(
-                llm_transport, "load_backend_settings", return_value=settings
+                llm_transport,
+                "default_user_config",
+                return_value=mock.Mock(providers=settings),
             ),
             mock.patch.object(
                 llm_transport, "get_venice_api_key", return_value="venice-secret"
@@ -182,7 +186,9 @@ class IntentRouterTests(unittest.TestCase):
         settings = replace(load_backend_settings({}), llm_provider="venice")
         with (
             mock.patch.object(
-                llm_transport, "load_backend_settings", return_value=settings
+                llm_transport,
+                "default_user_config",
+                return_value=mock.Mock(providers=settings),
             ),
             mock.patch.object(
                 llm_transport,
@@ -205,7 +211,9 @@ class IntentRouterTests(unittest.TestCase):
         )
         with (
             mock.patch.object(
-                llm_transport, "load_backend_settings", return_value=settings
+                llm_transport,
+                "default_user_config",
+                return_value=mock.Mock(providers=settings),
             ),
             mock.patch.object(
                 llm_transport, "get_venice_api_key", return_value="secret-token"

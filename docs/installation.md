@@ -120,27 +120,25 @@ The default backend is Parakeet TDT 0.6B v2. Its first start downloads
 `nemo-parakeet-tdt-0.6b-v2` from Hugging Face.
 
 To use the supported faster-whisper backend instead, install its separate extra and
-select it in the service environment file:
+select it in the unified configuration:
 
 ```fish
 env UV_PROJECT_ENVIRONMENT=.venv-dictation \
   uv sync --python 3.11 --extra dictation-whisper --no-dev
-mkdir -p "$HOME/.config/dictation"
-printf '%s\n' \
-  'DICTATION_BACKEND=whisper' \
-  'DICTATION_MODEL=large-v3-turbo' \
-  'DICTATION_COMPUTE=float16' \
-  >"$HOME/.config/dictation/backend.env"
+voice-harness config set compute.dictation_backend whisper
+voice-harness config set compute.dictation_model large-v3-turbo
+voice-harness config set compute.dictation_compute float16
 ```
 
 Install either `dictation` for Parakeet or `dictation-whisper` for faster-whisper;
 the two extras are alternative backend environments, not a requirement to install
 both.
 
-The launcher reads `backend.env` itself and accepts only backend, model, language,
-compute, and quantization selectors. Socket, CUDA/Hugging Face cache, temporary,
-home, and XDG path variables are service-owned and cannot be overridden by that
-file.
+Existing `~/.config/dictation/backend.env` files remain supported as
+higher-precedence legacy resolver inputs. The allowlist accepts only backend,
+model, language, compute, and quantization selectors. Socket, CUDA/Hugging Face
+cache, temporary, home, and XDG path variables are service-owned and cannot be
+overridden by that file. New configuration commands never create or update it.
 
 ## 3. Create the Chatterbox environment
 

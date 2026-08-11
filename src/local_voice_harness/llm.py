@@ -7,6 +7,7 @@ from collections.abc import Callable, Mapping, Sequence
 from .agents.delivery import AgentDeliveryClaims as DeliveryClaims
 from .agents.service import AgentTurnRequest as CursorTurnRequest
 from .agents.service import agent_turn as cursor_turn
+from .config import BackendSettings
 from .diagnostic_safety import (
     CURSOR_TOOL_FAILURE,
     redact_diagnostic,
@@ -181,8 +182,9 @@ def qwen_turn(
     delivery_claims: DeliveryClaims | None = None,
     on_text_chunk: Callable[[str], None] | None = None,
     allow_tools: bool = False,
+    settings: BackendSettings | None = None,
 ) -> tuple[str, str | None]:
-    transport = LlmTransport.from_settings()
+    transport = LlmTransport.from_settings(settings)
     system_prompt = SYSTEM_PROMPT if allow_tools else TOOL_FREE_SYSTEM_PROMPT
     if cursor_session and allow_tools:
         system_prompt += (
@@ -363,6 +365,7 @@ def qwen_response(
     trusted_utterance: str | None = None,
     delivery_claims: DeliveryClaims | None = None,
     allow_tools: bool = False,
+    settings: BackendSettings | None = None,
 ) -> str:
     return qwen_turn(
         text,
@@ -375,4 +378,5 @@ def qwen_response(
         trusted_utterance=trusted_utterance,
         delivery_claims=delivery_claims,
         allow_tools=allow_tools,
+        settings=settings,
     )[0]

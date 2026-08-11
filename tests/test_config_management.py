@@ -36,10 +36,15 @@ class ConfigManagementTests(unittest.TestCase):
 
             self.assertFalse(paths.config.exists())
 
-    def test_set_writes_owner_only_config_and_syncs_backend_env(self) -> None:
+    def test_set_writes_owner_only_config_without_touching_legacy_backend_env(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             paths = self.paths(root)
+            paths.backend_env.parent.mkdir(parents=True)
+            legacy = "DICTATION_MODEL=legacy-model\n"
+            paths.backend_env.write_text(legacy)
 
             result = config_management.commit_config_change(
                 {
@@ -52,7 +57,24 @@ class ConfigManagementTests(unittest.TestCase):
             self.assertEqual(result.config.audio.wake_threshold, 0.42)
             self.assertEqual(result.config.compute.dictation_backend, "whisper")
             self.assertEqual(stat.S_IMODE(paths.config.stat().st_mode), 0o600)
-            self.assertIn("DICTATION_BACKEND=whisper", paths.backend_env.read_text())
+            self.assertEqual(paths.backend_env.read_text(), legacy)
+
+    def test_reset_does_not_create_or_update_legacy_backend_env(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            paths = self.paths(root)
+            config_management.commit_config_change(
+                {"compute.dictation_backend": "whisper"},
+                paths=paths,
+            )
+            self.assertFalse(paths.backend_env.exists())
+
+            paths.backend_env.parent.mkdir(parents=True)
+            legacy = "DICTATION_BACKEND=whisper\n"
+            paths.backend_env.write_text(legacy)
+            config_management.reset_config(section="compute", paths=paths)
+
+            self.assertEqual(paths.backend_env.read_text(), legacy)
 
     def test_show_single_key_and_json(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

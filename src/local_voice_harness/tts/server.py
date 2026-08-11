@@ -21,10 +21,10 @@ from ..config import (
     STATE_DIR,
     TTS_SOCKET,
     BackendSettings,
-    load_backend_settings,
 )
 from ..credentials import get_venice_api_key
 from ..diagnostic_safety import redact_diagnostic
+from ..user_config import default_user_config, load_user_config
 
 SOCKET_PATH = TTS_SOCKET
 OUTPUT_ROOT = STATE_DIR
@@ -142,7 +142,7 @@ def _generate(text: str, voice: Path | None) -> tuple[Any, float]:
 
 
 def _settings() -> BackendSettings:
-    return SETTINGS or load_backend_settings()
+    return SETTINGS or default_user_config().providers
 
 
 def _venice_api_key() -> str:
@@ -496,7 +496,7 @@ def main() -> None:
     if "--check" in sys.argv[1:]:
         print("voice-harness-tts: ok")
         return
-    SETTINGS = load_backend_settings()
+    SETTINGS = load_user_config().providers
     if SETTINGS.tts_provider == "local":
         import torch
         from chatterbox.tts_turbo import ChatterboxTurboTTS
