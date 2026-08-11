@@ -96,7 +96,7 @@ class Desktop(Protocol):
 
     def send_key(self, key: str, *, window: Window | None = None) -> bool: ...
 
-    def type_text(self, text: str) -> None: ...
+    def type_text(self, text: str, *, window: Window | None = None) -> None: ...
 
 
 class X11Desktop:
@@ -151,10 +151,21 @@ class X11Desktop:
         process = _run(command)
         return process is not None and process.returncode == 0
 
-    def type_text(self, text: str) -> None:
+    def type_text(self, text: str, *, window: Window | None = None) -> None:
         if shutil.which("xdotool") is None:
             raise DesktopError("xdotool is required to insert recognized text")
-        process = _run(["xdotool", "type", "--clearmodifiers", "--", text])
+        command = ["xdotool", "type", "--clearmodifiers", "--", text]
+        if window is not None:
+            command = [
+                "xdotool",
+                "type",
+                "--window",
+                window.token,
+                "--clearmodifiers",
+                "--",
+                text,
+            ]
+        process = _run(command)
         if process is None or process.returncode:
             raise DesktopError(
                 "could not insert recognized text into the active window"
@@ -200,9 +211,13 @@ class WaylandDesktop:
         process = _run(command)
         return process is not None and process.returncode == 0
 
-    def type_text(self, text: str) -> None:
+    def type_text(self, text: str, *, window: Window | None = None) -> None:
         if shutil.which("wtype") is None:
             raise DesktopError("wtype is required to insert recognized text")
+        if window is not None and self.active_window() != window:
+            raise DesktopError(
+                "could not insert recognized text into the active window"
+            )
         process = _run(["wtype", "-"], input_text=text)
         if process is None or process.returncode:
             raise DesktopError(
