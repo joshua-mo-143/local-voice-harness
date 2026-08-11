@@ -170,13 +170,13 @@ def backend_settings_from_tables(
 
     llm_provider = _provider(
         _backend_value(
-            llm, "provider", "local", environment, "VOICE_HARNESS_LLM_PROVIDER"
+            llm, "provider", "venice", environment, "VOICE_HARNESS_LLM_PROVIDER"
         ),
         label="LLM",
     )
     tts_provider = _provider(
         _backend_value(
-            tts, "provider", "local", environment, "VOICE_HARNESS_TTS_PROVIDER"
+            tts, "provider", "venice", environment, "VOICE_HARNESS_TTS_PROVIDER"
         ),
         label="TTS",
     )

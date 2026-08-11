@@ -164,7 +164,11 @@ class ServiceManagementTests(unittest.TestCase):
         snapshot = default_user_config()
         configured = replace(
             snapshot,
-            providers=replace(snapshot.providers, llm_model="configured-model"),
+            providers=replace(
+                snapshot.providers,
+                llm_provider="local",
+                llm_model="configured-model",
+            ),
             compute=replace(snapshot.compute, cuda_device="CUDA7"),
         )
         with mock.patch.object(

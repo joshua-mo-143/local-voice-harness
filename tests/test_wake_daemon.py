@@ -16,6 +16,7 @@ from unittest import mock
 
 from local_voice_harness import llm, llm_transport, recorder
 from local_voice_harness.browser_context import RequestContext
+from local_voice_harness.config import load_backend_settings
 from local_voice_harness.cursor import service as cursor_service
 from local_voice_harness.cursor.delivery import DeliveryClaim
 from local_voice_harness.cursor.model import CursorJob, JobStatus
@@ -34,7 +35,17 @@ from local_voice_harness.wake.daemon import WakeConversationDaemon
 AUDIO_GENERATION = Path(
     "/runtime/voice-harness/recordings/request-0123456789abcdef0123456789abcdef.wav"
 )
-USER_CONFIG = default_user_config()
+_DEFAULT_CONFIG = default_user_config()
+USER_CONFIG = replace(
+    _DEFAULT_CONFIG,
+    providers=load_backend_settings(
+        {
+            "VOICE_HARNESS_LLM_PROVIDER": "local",
+            "VOICE_HARNESS_TTS_PROVIDER": "local",
+        },
+        path=Path(os.devnull),
+    ),
+)
 
 
 def _playback_batch(

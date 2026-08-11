@@ -41,6 +41,10 @@ class ServerStreamingTests(unittest.TestCase):
     def test_cancellation_stops_before_the_next_model_call(self) -> None:
         handler = mock.Mock()
         handler.wfile = io.BytesIO()
+        settings = load_backend_settings(
+            {"VOICE_HARNESS_TTS_PROVIDER": "local"},
+            path=Path("/nonexistent/backends.toml"),
+        )
         fake_soundfile = types.SimpleNamespace(
             write=lambda path, audio, rate, subtype: Path(path).write_bytes(b"wav")
         )
@@ -54,6 +58,7 @@ class ServerStreamingTests(unittest.TestCase):
         with (
             tempfile.TemporaryDirectory() as temporary,
             mock.patch.object(server, "OUTPUT_ROOT", Path(temporary)),
+            mock.patch.object(server, "SETTINGS", settings),
             mock.patch.object(server, "MODEL", types.SimpleNamespace(sr=24_000)),
             mock.patch.object(
                 server, "_generate", return_value=([0.0] * 2_400, 0.1)

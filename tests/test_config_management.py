@@ -217,9 +217,121 @@ class ConfigManagementTests(unittest.TestCase):
                 print_fn=lambda _message: None,
             )
 
-            self.assertEqual(result.config.providers.llm_provider, "local")
+            self.assertEqual(result.config.providers.llm_provider, "venice")
+            self.assertEqual(result.config.providers.tts_provider, "venice")
             self.assertTrue(result.config.integrations.github_enabled)
             self.assertFalse(result.config.integrations.zendesk_enabled)
+
+    def test_interactive_setup_prefers_venice(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            paths = self.paths(root)
+            with (
+                mock.patch.object(
+                    config_management,
+                    "_available_llm_providers",
+                    return_value=("local", "venice"),
+                ),
+                mock.patch.object(
+                    config_management,
+                    "_available_tts_providers",
+                    return_value=("local", "venice"),
+                ),
+            ):
+                result = config_management.run_setup(
+                    paths=paths,
+                    input_fn=lambda _prompt: "",
+                    print_fn=lambda _message: None,
+                )
+
+            self.assertEqual(result.config.providers.llm_provider, "venice")
+            self.assertEqual(result.config.providers.tts_provider, "venice")
+
+    def test_showcase_profile_is_non_interactive_and_uses_venice(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            paths = self.paths(root)
+
+            result = config_management.run_setup(
+                profile="showcase",
+                paths=paths,
+                input_fn=mock.Mock(side_effect=AssertionError("unexpected prompt")),
+                print_fn=lambda _message: None,
+            )
+
+            self.assertEqual(result.config.providers.llm_provider, "venice")
+            self.assertEqual(result.config.providers.tts_provider, "venice")
+            self.assertEqual(result.config.compute.dictation_backend, "parakeet")
+            self.assertTrue(result.config.integrations.github_enabled)
+            self.assertFalse(result.config.integrations.zendesk_enabled)
+            self.assertFalse(result.config.integrations.linear_enabled)
+
+    def test_showcase_profile_migrates_legacy_provider_config_once(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            paths = self.paths(root)
+            paths.backends.parent.mkdir(parents=True)
+            paths.backends.write_text(
+                "[llm]\n"
+                'provider = "local"\n'
+                'model = "legacy-model"\n'
+                "\n"
+                "[tts]\n"
+                'provider = "local"\n'
+            )
+            output: list[str] = []
+
+            first = config_management.run_setup(
+                profile="showcase",
+                paths=paths,
+                print_fn=output.append,
+            )
+            second = config_management.run_setup(
+                profile="showcase",
+                paths=paths,
+                print_fn=lambda _message: None,
+            )
+
+            backup = paths.backends.with_name("backends.toml.migrated")
+            self.assertFalse(paths.backends.exists())
+            self.assertTrue(backup.is_file())
+            self.assertEqual(first.legacy_backup, backup)
+            self.assertIsNone(second.legacy_backup)
+            self.assertEqual(first.config.providers.llm_provider, "venice")
+            self.assertEqual(first.config.providers.tts_provider, "venice")
+            self.assertEqual(first.config.providers.llm_model, "legacy-model")
+            self.assertEqual(
+                config_management.load_managed_config(paths).providers.llm_provider,
+                "venice",
+            )
+            self.assertTrue(any(str(backup) in message for message in output))
+
+    def test_showcase_profile_restores_legacy_config_when_write_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            paths = self.paths(root)
+            paths.backends.parent.mkdir(parents=True)
+            legacy = '[llm]\nprovider = "local"\n'
+            paths.backends.write_text(legacy)
+
+            with (
+                mock.patch.object(
+                    config_management,
+                    "validate_managed_config",
+                    side_effect=OSError("write failed"),
+                ),
+                self.assertRaisesRegex(OSError, "write failed"),
+            ):
+                config_management.run_setup(
+                    profile="showcase",
+                    paths=paths,
+                    print_fn=lambda _message: None,
+                )
+
+            self.assertEqual(paths.backends.read_text(), legacy)
+            self.assertFalse(
+                paths.backends.with_name("backends.toml.migrated").exists()
+            )
 
 
 if __name__ == "__main__":

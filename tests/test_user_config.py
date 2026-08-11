@@ -26,11 +26,11 @@ class UserConfigDefaultsTests(unittest.TestCase):
         self.assertFalse(config.integrations.zendesk_enabled)
         self.assertFalse(config.integrations.linear_enabled)
 
-    def test_defaults_use_local_providers_and_standard_paths(self) -> None:
+    def test_defaults_use_venice_providers_and_standard_paths(self) -> None:
         config = user_config.default_user_config(home=self.HOME)
 
-        self.assertEqual(config.providers.llm_provider, "local")
-        self.assertEqual(config.providers.tts_provider, "local")
+        self.assertEqual(config.providers.llm_provider, "venice")
+        self.assertEqual(config.providers.tts_provider, "venice")
         self.assertEqual(config.audio.wake_threshold, 0.55)
         self.assertEqual(config.compute.dictation_backend, "parakeet")
         self.assertIs(config.compute.dictation_device, user_config.DictationDevice.AUTO)

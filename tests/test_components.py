@@ -35,7 +35,11 @@ class _HTTPResponse:
 class ComponentReadinessTests(unittest.TestCase):
     def setUp(self) -> None:
         self.settings = load_backend_settings(
-            {}, path=Path("/nonexistent/backends.toml")
+            {
+                "VOICE_HARNESS_LLM_PROVIDER": "local",
+                "VOICE_HARNESS_TTS_PROVIDER": "local",
+            },
+            path=Path("/nonexistent/backends.toml"),
         )
         patcher = mock.patch.object(
             components,
