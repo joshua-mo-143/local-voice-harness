@@ -9,7 +9,7 @@ from pathlib import Path
 from unittest import mock
 
 from local_voice_harness import config_management
-from local_voice_harness.user_config import UserConfigurationError
+from local_voice_harness.user_config import DictationDevice, UserConfigurationError
 
 
 class ConfigManagementTests(unittest.TestCase):
@@ -51,12 +51,14 @@ class ConfigManagementTests(unittest.TestCase):
                 {
                     "audio.wake_threshold": "0.42",
                     "compute.dictation_backend": "whisper",
+                    "compute.dictation_device": "cpu",
                 },
                 paths=paths,
             )
 
             self.assertEqual(result.config.audio.wake_threshold, 0.42)
             self.assertEqual(result.config.compute.dictation_backend, "whisper")
+            self.assertIs(result.config.compute.dictation_device, DictationDevice.CPU)
             self.assertEqual(stat.S_IMODE(paths.config.stat().st_mode), 0o600)
             self.assertEqual(paths.backend_env.read_text(), legacy)
 

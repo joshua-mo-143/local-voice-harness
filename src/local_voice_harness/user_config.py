@@ -52,6 +52,7 @@ _TTS_KEYS = ("provider", "model", "voice", "speed", "endpoint", "timeout")
 _INTEGRATION_KEYS = ("github", "zendesk", "linear")
 _COMPUTE_KEYS = (
     "cuda_device",
+    "dictation_device",
     "dictation_backend",
     "dictation_model",
     "dictation_quantization",
@@ -103,6 +104,7 @@ _TRUTHY = {"1", "true", "yes", "on"}
 _FALSY = {"0", "false", "no", "off"}
 _BARGE_IN_MODES = {"wake", "vad", "off"}
 _DICTATION_BACKENDS = {"parakeet", "whisper"}
+_DICTATION_DEVICES = {"auto", "cpu", "cuda"}
 _DICTATION_LANGUAGES = {"en", "zh", "english", "chinese", "auto"}
 _DICTATION_INJECT_MODES = {"auto", "paste", "type", "stdout"}
 _PLAYBACK_LATENCY = re.compile(r"^\d+(?:\.\d+)?(?:us|ms|s)$")
@@ -119,6 +121,14 @@ class PlanApprovalMode(StrEnum):
 
     ASK = "ask"
     AUTO = "auto"
+
+
+class DictationDevice(StrEnum):
+    """Compute device selected for local speech recognition."""
+
+    AUTO = "auto"
+    CPU = "cpu"
+    CUDA = "cuda"
 
 
 @dataclass(frozen=True)
@@ -155,6 +165,7 @@ class ComputeSettings:
     """GPU device and dictation compute selectors."""
 
     cuda_device: str = "CUDA0"
+    dictation_device: DictationDevice = DictationDevice.AUTO
     dictation_backend: str = "parakeet"
     dictation_model: str = "nemo-parakeet-tdt-0.6b-v2"
     dictation_quantization: str = "int8"
@@ -428,6 +439,7 @@ def load_backend_environment(path: Path) -> dict[str, str]:
     environment: dict[str, str] = {}
     allowed = {
         "DICTATION_BACKEND",
+        "DICTATION_DEVICE",
         "DICTATION_MODEL",
         "DICTATION_LANGUAGE",
         "DICTATION_COMPUTE",
@@ -524,6 +536,20 @@ def _load_compute(
                 "CUDA0",
             ),
             label="compute.cuda_device",
+        ),
+        dictation_device=DictationDevice(
+            _as_choice(
+                _resolve_legacy(
+                    environment,
+                    legacy,
+                    "DICTATION_DEVICE",
+                    section,
+                    "dictation_device",
+                    DictationDevice.AUTO,
+                ),
+                _DICTATION_DEVICES,
+                label="compute.dictation_device",
+            )
         ),
         dictation_backend=_as_choice(
             _resolve_legacy(
@@ -1116,6 +1142,7 @@ def render_user_config(user_config: UserConfig) -> str:
         "compute",
         {
             "cuda_device": compute.cuda_device,
+            "dictation_device": compute.dictation_device,
             "dictation_backend": compute.dictation_backend,
             "dictation_model": compute.dictation_model,
             "dictation_quantization": compute.dictation_quantization,

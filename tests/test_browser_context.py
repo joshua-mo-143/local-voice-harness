@@ -287,7 +287,7 @@ class BrowserDispatchTests(unittest.TestCase):
             ),
         ):
             context = browser_context.request_context(
-                "work on issues 4 and 7",
+                "work on issues sixty six and sixty seven",
                 platform=USER_CONFIG.platform,
                 integrations=USER_CONFIG.integrations,
             )

@@ -33,6 +33,7 @@ class UserConfigDefaultsTests(unittest.TestCase):
         self.assertEqual(config.providers.tts_provider, "venice")
         self.assertEqual(config.audio.wake_threshold, 0.55)
         self.assertEqual(config.compute.dictation_backend, "parakeet")
+        self.assertIs(config.compute.dictation_device, user_config.DictationDevice.AUTO)
         self.assertEqual(config.platform.project_root, self.HOME)
         self.assertEqual(config.platform.github_root, self.HOME / "src")
         self.assertEqual(
@@ -99,10 +100,13 @@ class UserConfigPrecedenceTests(unittest.TestCase):
             backend_env = root / "backend.env"
             config_path.write_text(
                 '[compute]\ndictation_backend = "parakeet"\n'
+                'dictation_device = "cpu"\n'
                 'dictation_model = "config-model"\n'
             )
             backend_env.write_text(
-                "DICTATION_BACKEND=whisper\nDICTATION_MODEL=legacy-model\n"
+                "DICTATION_BACKEND=whisper\n"
+                "DICTATION_DEVICE=cuda\n"
+                "DICTATION_MODEL=legacy-model\n"
             )
 
             legacy = user_config.load_user_config(
@@ -115,6 +119,7 @@ class UserConfigPrecedenceTests(unittest.TestCase):
             overridden = user_config.load_user_config(
                 {
                     "DICTATION_BACKEND": "parakeet",
+                    "DICTATION_DEVICE": "auto",
                     "DICTATION_MODEL": "environment-model",
                 },
                 path=config_path,
@@ -124,8 +129,12 @@ class UserConfigPrecedenceTests(unittest.TestCase):
             )
 
         self.assertEqual(legacy.compute.dictation_backend, "whisper")
+        self.assertIs(legacy.compute.dictation_device, user_config.DictationDevice.CUDA)
         self.assertEqual(legacy.compute.dictation_model, "legacy-model")
         self.assertEqual(overridden.compute.dictation_backend, "parakeet")
+        self.assertIs(
+            overridden.compute.dictation_device, user_config.DictationDevice.AUTO
+        )
         self.assertEqual(overridden.compute.dictation_model, "environment-model")
 
     def test_dictation_settings_use_typed_config_and_environment_overrides(
@@ -355,6 +364,7 @@ class UserConfigValidationTests(unittest.TestCase):
 
     def test_empty_dictation_compute_values_are_rejected(self) -> None:
         for key in (
+            "dictation_device",
             "dictation_model",
             "dictation_quantization",
             "dictation_compute",
@@ -365,6 +375,10 @@ class UserConfigValidationTests(unittest.TestCase):
                 self.assertRaises(UserConfigurationError),
             ):
                 self._load(f'[compute]\n{key} = ""\n')
+
+    def test_invalid_dictation_device_is_rejected(self) -> None:
+        with self.assertRaisesRegex(UserConfigurationError, "auto, cpu, cuda"):
+            self._load('[compute]\ndictation_device = "vulkan"\n')
 
     def test_empty_legacy_dictation_compute_value_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

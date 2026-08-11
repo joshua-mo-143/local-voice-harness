@@ -190,6 +190,7 @@ class ServiceManagementTests(unittest.TestCase):
         project_root = service_manager.PROJECT_ROOT
         unit = (project_root / "systemd/user/dictation.service").read_text()
         configuration = (project_root / "docs/configuration.md").read_text()
+        installer = (project_root / "scripts/install.sh").read_text()
         metadata = tomllib.loads((project_root / "pyproject.toml").read_text())
         extras = metadata["project"]["optional-dependencies"]
 
@@ -203,6 +204,25 @@ class ServiceManagementTests(unittest.TestCase):
         self.assertIn(stt_server.PARAKEET_DEFAULT_MODEL, configuration)
         self.assertTrue(
             any(dependency.startswith("onnx-asr") for dependency in extras["dictation"])
+        )
+        self.assertTrue(
+            any(
+                dependency.startswith("onnx-asr")
+                for dependency in extras["dictation-cuda"]
+            )
+        )
+        self.assertIn("--extra dictation-cuda", installer)
+        self.assertTrue(
+            any(
+                dependency.startswith("onnxruntime")
+                for dependency in extras["dictation"]
+            )
+        )
+        self.assertFalse(
+            any(
+                "gpu" in dependency.casefold() or "nvidia" in dependency.casefold()
+                for dependency in extras["dictation"]
+            )
         )
         self.assertTrue(
             any(

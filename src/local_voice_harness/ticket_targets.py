@@ -40,12 +40,47 @@ _LINEAR_REFERENCE = re.compile(
     r"(?P<number>\d+)(?![A-Za-z0-9])",
     re.IGNORECASE,
 )
-_SCOPED_LIST = re.compile(
-    r"\b(?:issues?|tickets?)\s+"
-    r"(?P<items>#?\d+(?:(?:\s*,\s*(?:and\s+)?|\s+(?:and|&)\s+)#?\d+)*)",
+_SCOPED_PREFIX = re.compile(r"\b(?:issues?|tickets?)\s+", re.IGNORECASE)
+_NUMBER_AT = re.compile(r"#?\d+")
+_NUMBER_WORD_AT = re.compile(
+    r"(?:zero|one|two|three|four|five|six|seven|eight|nine|ten|eleven|"
+    r"twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|"
+    r"nineteen|twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety|"
+    r"hundred|thousand|and)\b",
     re.IGNORECASE,
 )
-_NUMBER = re.compile(r"#?\d+")
+_SMALL_NUMBER_WORDS = {
+    "zero": 0,
+    "one": 1,
+    "two": 2,
+    "three": 3,
+    "four": 4,
+    "five": 5,
+    "six": 6,
+    "seven": 7,
+    "eight": 8,
+    "nine": 9,
+    "ten": 10,
+    "eleven": 11,
+    "twelve": 12,
+    "thirteen": 13,
+    "fourteen": 14,
+    "fifteen": 15,
+    "sixteen": 16,
+    "seventeen": 17,
+    "eighteen": 18,
+    "nineteen": 19,
+}
+_TENS_NUMBER_WORDS = {
+    "twenty": 20,
+    "thirty": 30,
+    "forty": 40,
+    "fifty": 50,
+    "sixty": 60,
+    "seventy": 70,
+    "eighty": 80,
+    "ninety": 90,
+}
 _LINEAR_TEAM = re.compile(r"^[A-Za-z][A-Za-z0-9]+$")
 
 
@@ -54,6 +89,104 @@ def _overlaps(start: int, end: int, spans: list[tuple[int, int]]) -> bool:
         start < existing_end and end > existing_start
         for existing_start, existing_end in spans
     )
+
+
+def _spoken_number_at(text: str, start: int) -> tuple[int, int] | None:
+    """Parse a bounded English cardinal number beginning at ``start``."""
+
+    position = start
+    end = start
+    total = 0
+    group = 0
+    last: str | None = None
+    consumed = False
+    used_thousand = False
+    while match := _NUMBER_WORD_AT.match(text, position):
+        word = match.group(0).casefold()
+        if word in _SMALL_NUMBER_WORDS:
+            if last not in {None, "tens", "hundred", "scale", "and"}:
+                break
+            group += _SMALL_NUMBER_WORDS[word]
+            last = "small"
+        elif word in _TENS_NUMBER_WORDS:
+            if last not in {None, "hundred", "scale", "and"}:
+                break
+            group += _TENS_NUMBER_WORDS[word]
+            last = "tens"
+        elif word == "hundred":
+            if last != "small" or not 1 <= group <= 9:
+                break
+            group *= 100
+            last = "hundred"
+        elif word == "thousand":
+            if not 1 <= group <= 999 or used_thousand:
+                break
+            total += group * 1_000
+            group = 0
+            last = "scale"
+            used_thousand = True
+        else:
+            separator_end = match.end()
+            next_start = separator_end
+            whitespace = re.match(r"[\s-]+", text[next_start:])
+            if whitespace is not None:
+                next_start += whitespace.end()
+            next_word = _NUMBER_WORD_AT.match(text, next_start)
+            if (
+                last not in {"hundred", "scale"}
+                or next_word is None
+                or next_word.group(0).casefold()
+                not in {*_SMALL_NUMBER_WORDS, *_TENS_NUMBER_WORDS}
+            ):
+                break
+            last = "and"
+
+        consumed = True
+        end = match.end()
+        separator = re.match(r"[\s-]+", text[end:])
+        if separator is None:
+            break
+        position = end + separator.end()
+
+    return (total + group, end) if consumed else None
+
+
+def _scoped_items(text: str) -> list[tuple[str, int, int, int]]:
+    """Return raw text, position, end, and value for scoped ticket lists."""
+
+    items: list[tuple[str, int, int, int]] = []
+    for prefix in _SCOPED_PREFIX.finditer(text):
+        position = prefix.end()
+        while True:
+            digit = _NUMBER_AT.match(text, position)
+            spoken = None if digit is not None else _spoken_number_at(text, position)
+            if digit is not None:
+                end = digit.end()
+                value = int(digit.group(0).removeprefix("#"))
+            elif spoken is not None:
+                value, end = spoken
+            else:
+                break
+            items.append((text[position:end], position, end, value))
+            position = end
+
+            spaces = re.match(r"\s*", text[position:])
+            assert spaces is not None
+            position += spaces.end()
+            if position < len(text) and text[position] == ",":
+                position += 1
+                spaces = re.match(r"\s*", text[position:])
+                assert spaces is not None
+                position += spaces.end()
+                conjunction = re.match(r"and\b\s*", text[position:], re.IGNORECASE)
+                if conjunction is not None:
+                    position += conjunction.end()
+                continue
+            conjunction = re.match(r"(?:and\b|&)\s*", text[position:], re.IGNORECASE)
+            if conjunction is None:
+                break
+            position += conjunction.end()
+    return items
 
 
 @dataclass(frozen=True, slots=True)
@@ -234,23 +367,18 @@ def extract_ticket_targets(
         )
         specific_spans.append(match.span())
 
-    for issue_list in _SCOPED_LIST.finditer(text):
-        items_start = issue_list.start("items")
-        for match in _NUMBER.finditer(issue_list.group("items")):
-            start = items_start + match.start()
-            end = items_start + match.end()
-            if _overlaps(start, end, specific_spans):
-                continue
-            raw = match.group(0)
-            candidates.append(
-                _scoped_reference(
-                    raw,
-                    start,
-                    raw.removeprefix("#"),
-                    scope_source=scope_source,
-                    scope=scope,
-                )
+    for raw, start, end, number in _scoped_items(text):
+        if _overlaps(start, end, specific_spans):
+            continue
+        candidates.append(
+            _scoped_reference(
+                raw,
+                start,
+                str(number),
+                scope_source=scope_source,
+                scope=scope,
             )
+        )
 
     candidates.sort(key=lambda candidate: candidate.position)
     unique: list[TicketReference] = []

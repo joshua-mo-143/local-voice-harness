@@ -6,6 +6,8 @@ import site
 import sys
 from pathlib import Path
 
+from ..user_config import DictationDevice, load_user_config
+
 PROTECTED_ENVIRONMENT_KEYS = frozenset(
     {
         "DICTATION_SOCKET",
@@ -52,13 +54,9 @@ def resolver_environment(environment: dict[str, str]) -> dict[str, str]:
     return resolved
 
 
-def main() -> None:
-    if "--check" in sys.argv[1:]:
-        print("voice-harness-dictation: ok")
-        return
-    environment = resolver_environment(os.environ.copy())
-    owned = protected_environment()
-    environment.update(owned)
+def add_nvidia_library_paths(environment: dict[str, str]) -> None:
+    """Expose wheel-provided CUDA libraries without changing CPU-only launches."""
+
     libraries = [
         str(path)
         for packages in map(Path, site.getsitepackages())
@@ -70,6 +68,18 @@ def main() -> None:
         environment["LD_LIBRARY_PATH"] = ":".join(
             [*libraries, *([existing] if existing else [])]
         )
+
+
+def main() -> None:
+    if "--check" in sys.argv[1:]:
+        print("voice-harness-dictation: ok")
+        return
+    environment = resolver_environment(os.environ.copy())
+    owned = protected_environment()
+    environment.update(owned)
+    device = load_user_config(environment).compute.dictation_device
+    if device is not DictationDevice.CPU:
+        add_nvidia_library_paths(environment)
     os.execve(
         sys.executable,
         [sys.executable, "-m", "local_voice_harness.stt.server"],

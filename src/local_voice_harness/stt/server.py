@@ -21,7 +21,12 @@ from ..transcript import (
     effective_replacements,
     normalize_transcript,
 )
-from ..user_config import DEFAULT_DICTATION_REPLACEMENTS, UserConfig, load_user_config
+from ..user_config import (
+    DEFAULT_DICTATION_REPLACEMENTS,
+    DictationDevice,
+    UserConfig,
+    load_user_config,
+)
 
 SOCKET_PATH = config.STT_SOCKET
 PROTOCOL_VERSION = 2
@@ -99,6 +104,7 @@ LOCK = threading.Lock()
 @dataclass(frozen=True)
 class STTRuntimeSettings:
     backend: Literal["parakeet", "whisper"]
+    device: DictationDevice
     model_name: str
     quantization: str | None
     compute_type: str
@@ -113,6 +119,7 @@ def runtime_settings(config: UserConfig) -> STTRuntimeSettings:
     backend = resolve_backend(config.compute.dictation_backend)
     return STTRuntimeSettings(
         backend=backend,
+        device=config.compute.dictation_device,
         model_name=resolve_model_name(backend, config.compute.dictation_model),
         quantization=resolve_quantization(
             backend, config.compute.dictation_quantization
@@ -208,13 +215,52 @@ class Transcriber(ABC):
         raise NotImplementedError
 
 
+def _parakeet_device(
+    requested: DictationDevice,
+) -> tuple[Literal["cpu", "cuda"], list[str]]:
+    if requested is DictationDevice.CPU:
+        return "cpu", ["CPUExecutionProvider"]
+
+    try:
+        import onnxruntime
+
+        cuda_available = (
+            "CUDAExecutionProvider" in onnxruntime.get_available_providers()
+        )
+    except Exception as exc:
+        if requested is DictationDevice.CUDA:
+            raise RuntimeError(
+                "CUDA dictation was requested, but ONNX Runtime could not inspect "
+                "CUDA providers; install the dictation-cuda dependency profile "
+                "and verify the NVIDIA driver"
+            ) from exc
+        raise
+    if requested is DictationDevice.CUDA and not cuda_available:
+        raise RuntimeError(
+            "CUDA dictation was requested, but ONNX Runtime's "
+            "CUDAExecutionProvider is unavailable; install the dictation-cuda "
+            "dependency profile and verify the NVIDIA driver"
+        )
+    if requested is DictationDevice.CUDA:
+        return "cuda", ["CUDAExecutionProvider"]
+    if cuda_available:
+        return "cuda", ["CUDAExecutionProvider", "CPUExecutionProvider"]
+    return "cpu", ["CPUExecutionProvider"]
+
+
 class ParakeetTranscriber(Transcriber):
-    def __init__(self, model_name: str, *, quantization: str | None) -> None:
+    def __init__(
+        self,
+        model_name: str,
+        *,
+        device: DictationDevice,
+        quantization: str | None,
+    ) -> None:
+        resolved_device, providers = _parakeet_device(device)
         import onnx_asr
 
-        providers = ["CUDAExecutionProvider", "CPUExecutionProvider"]
         log(
-            f"loading Parakeet {model_name} on CUDA"
+            f"loading Parakeet {model_name} on {resolved_device.upper()}"
             + (f" ({quantization})" if quantization else "")
         )
         self._model = onnx_asr.load_model(
@@ -232,14 +278,24 @@ class WhisperTranscriber(Transcriber):
         self,
         model_name: str,
         *,
+        device: DictationDevice,
         compute_type: str,
         language: str | None,
         prompt: str,
     ) -> None:
+        resolved_device = _whisper_device(device)
+        resolved_compute = _whisper_compute_type(resolved_device, compute_type)
         from faster_whisper import WhisperModel
 
-        log(f"loading faster-whisper {model_name} on CUDA ({compute_type})")
-        self._model = WhisperModel(model_name, device="cuda", compute_type=compute_type)
+        log(
+            f"loading faster-whisper {model_name} on "
+            f"{resolved_device.upper()} ({resolved_compute})"
+        )
+        self._model = WhisperModel(
+            model_name,
+            device=resolved_device,
+            compute_type=resolved_compute,
+        )
         self._language = language
         self._prompt = prompt
 
@@ -256,13 +312,42 @@ class WhisperTranscriber(Transcriber):
         return "".join(segment.text for segment in segments).strip()
 
 
+def _whisper_device(
+    requested: DictationDevice,
+) -> Literal["cpu", "cuda"]:
+    if requested is DictationDevice.CPU:
+        return "cpu"
+
+    try:
+        import ctranslate2
+
+        cuda_available = ctranslate2.get_cuda_device_count() > 0
+    except Exception:
+        cuda_available = False
+    if requested is DictationDevice.CUDA and not cuda_available:
+        raise RuntimeError(
+            "CUDA dictation was requested, but faster-whisper cannot access a "
+            "CUDA device; verify the NVIDIA driver and CUDA libraries"
+        )
+    return "cuda" if cuda_available else "cpu"
+
+
+def _whisper_compute_type(device: Literal["cpu", "cuda"], configured: str) -> str:
+    if device == "cpu" and configured.strip().lower() in {"float16", "int8_float16"}:
+        return "int8"
+    return configured
+
+
 def load_transcriber(settings: STTRuntimeSettings) -> Transcriber:
     if settings.backend == "parakeet":
         return ParakeetTranscriber(
-            settings.model_name, quantization=settings.quantization
+            settings.model_name,
+            device=settings.device,
+            quantization=settings.quantization,
         )
     return WhisperTranscriber(
         settings.model_name,
+        device=settings.device,
         compute_type=settings.compute_type,
         language=settings.language,
         prompt=settings.prompt,
