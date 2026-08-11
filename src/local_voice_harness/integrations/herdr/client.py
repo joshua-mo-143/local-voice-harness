@@ -3,16 +3,11 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
-from ...config import (
-    CURSOR_AGENT_INACTIVITY_SECONDS,
-    CURSOR_AGENT_MAX_RUNTIME_SECONDS,
-)
 from .repository import HerdrRepository
 from .session import HerdrSession
 from .transport import HerdrTransport
 from .types import (
     AGENT_COMPLETION_QUIET_SECONDS,
-    HERDR_BIN,
     AgentSelection,
     BeforePaneSubmit,
     BeforePromptSubmit,
@@ -34,12 +29,34 @@ from .workspace import HerdrWorkspace
 class HerdrClient:
     """Facade composing Herdr transport, workspace, and repository components."""
 
-    def __init__(self, executable: str = HERDR_BIN) -> None:
-        self.transport = HerdrTransport(executable)
+    def __init__(
+        self,
+        executable: str = "herdr",
+        *,
+        repository_root: Path | None = None,
+        worktree_root: Path | None = None,
+        timeout: float = 30,
+        agent_inactivity_timeout: float = 15 * 60,
+        agent_max_runtime: float = 60 * 60,
+    ) -> None:
+        root = (repository_root or Path.home()).expanduser().resolve()
+        worktrees = (
+            (worktree_root or Path.home() / ".herdr" / "worktrees")
+            .expanduser()
+            .resolve()
+        )
+        self.transport = HerdrTransport(executable, timeout=timeout)
         self.executable = executable
+        self.timeout = timeout
+        self.agent_inactivity_timeout = agent_inactivity_timeout
+        self.agent_max_runtime = agent_max_runtime
         self.session = HerdrSession(self)
-        self.repository = HerdrRepository(self)
-        self.workspace = HerdrWorkspace(self)
+        self.repository = HerdrRepository(self, root)
+        self.workspace = HerdrWorkspace(
+            self,
+            repository_root=root,
+            worktree_root=worktrees,
+        )
 
     def command(self, *args: str) -> list[str]:
         return self.transport.command(*args)
@@ -48,19 +65,19 @@ class HerdrClient:
     def decode(text: str) -> dict[str, Any]:
         return HerdrTransport.decode(text)
 
-    def run(self, *args: str, timeout: float = 30, check: bool = True):
+    def run(self, *args: str, timeout: float | None = None, check: bool = True):
         return self.transport.run(*args, timeout=timeout, check=check)
 
-    def run_json(self, *args: str, timeout: float = 30) -> dict[str, Any]:
+    def run_json(self, *args: str, timeout: float | None = None) -> dict[str, Any]:
         return self.transport.run_json(*args, timeout=timeout)
 
-    def run_text(self, *args: str, timeout: float = 30) -> str:
+    def run_text(self, *args: str, timeout: float | None = None) -> str:
         return self.transport.run_text(*args, timeout=timeout)
 
     def is_running(self) -> bool:
         return self.transport.is_running()
 
-    def ensure_server(self, timeout: float = 15) -> None:
+    def ensure_server(self, timeout: float | None = None) -> None:
         self.transport.ensure_server(timeout=timeout)
 
     def list_agents(self) -> list[dict[str, Any]]:
@@ -74,9 +91,8 @@ class HerdrClient:
     def get_agent(self, target: str) -> dict[str, Any]:
         return dict(self.run_json("agent", "get", target).get("agent") or {})
 
-    @staticmethod
-    def allowed_repository(path: Path) -> bool:
-        return HerdrRepository.allowed_repository(path)
+    def allowed_repository(self, path: Path) -> bool:
+        return self.repository.allowed_repository(path)
 
     def repository_roots(self) -> list[Path]:
         return self.repository.repository_roots()
@@ -132,9 +148,8 @@ class HerdrClient:
     def workspace_for(self, checkout: Path) -> dict[str, Any] | None:
         return HerdrWorkspace.workspace_for(self.workspace, checkout)
 
-    @staticmethod
-    def planned_worktree_path(repository: Path, branch: str) -> Path:
-        return HerdrWorkspace.planned_worktree_path(repository, branch)
+    def planned_worktree_path(self, repository: Path, branch: str) -> Path:
+        return self.workspace.planned_worktree_path(repository, branch)
 
     def new_pane(
         self,
@@ -263,8 +278,8 @@ class HerdrClient:
         text: str,
         *,
         token: str,
-        timeout: float = CURSOR_AGENT_INACTIVITY_SECONDS,
-        max_runtime: float = CURSOR_AGENT_MAX_RUNTIME_SECONDS,
+        timeout: float = -1,
+        max_runtime: float = -1,
         checkpoint: Checkpoint | None = None,
         baseline_sequence: int | None = None,
         expected_agent_session: str | None = None,
@@ -280,8 +295,8 @@ class HerdrClient:
             target,
             text,
             token=token,
-            timeout=timeout,
-            max_runtime=max_runtime,
+            timeout=self.agent_inactivity_timeout if timeout < 0 else timeout,
+            max_runtime=self.agent_max_runtime if max_runtime < 0 else max_runtime,
             checkpoint=checkpoint,
             baseline_sequence=baseline_sequence,
             expected_agent_session=expected_agent_session,
@@ -299,8 +314,8 @@ class HerdrClient:
         target: str,
         *,
         token: str,
-        inactivity_timeout: float = CURSOR_AGENT_INACTIVITY_SECONDS,
-        max_runtime: float = CURSOR_AGENT_MAX_RUNTIME_SECONDS,
+        inactivity_timeout: float = -1,
+        max_runtime: float = -1,
         quiet_period: float = AGENT_COMPLETION_QUIET_SECONDS,
         started_at: float | None = None,
         checkpoint: Checkpoint | None = None,
@@ -311,8 +326,12 @@ class HerdrClient:
         return self.session.wait_for_stable_completion(
             target,
             token=token,
-            inactivity_timeout=inactivity_timeout,
-            max_runtime=max_runtime,
+            inactivity_timeout=(
+                self.agent_inactivity_timeout
+                if inactivity_timeout < 0
+                else inactivity_timeout
+            ),
+            max_runtime=self.agent_max_runtime if max_runtime < 0 else max_runtime,
             quiet_period=quiet_period,
             started_at=started_at,
             checkpoint=checkpoint,

@@ -72,6 +72,7 @@ from ..diagnostic_safety import (
     redact_diagnostic,
 )
 from ..errors import HarnessError
+from ..integrations.registry import IntegrationRegistry, build_integration_registry
 from ..intent import (
     NON_ACTIONABLE_SUBMIT_RESPONSE,
     ForkIntent,
@@ -131,8 +132,13 @@ def release_deliveries(claims: DeliveryClaims) -> None:
     release_claims(CURSOR_STORE, claims)
 
 
-def pending_results() -> list[DeliveryClaim]:
-    return cursor_service.pending_results(limit=DELIVERY_WINDOW)
+def pending_results(
+    integrations: IntegrationRegistry | None = None,
+) -> list[DeliveryClaim]:
+    return cursor_service.pending_results(
+        limit=DELIVERY_WINDOW,
+        integrations=integrations,
+    )
 
 
 class _DeliveryLeaseGuard:
@@ -279,7 +285,7 @@ class WakeConversationDaemon:
         self.audio = user_config.audio
         self.platform = user_config.platform
         self.providers = user_config.providers
-        self.integrations = user_config.integrations
+        self.integrations = build_integration_registry(user_config)
         self.np = np
         module_path = openwakeword.__file__
         if module_path is None:
@@ -1054,6 +1060,7 @@ class WakeConversationDaemon:
                         action="list",
                     ),
                     delivery_claims=delivery_claims,
+                    integrations=self.integrations,
                 )
             elif route.actionable and route.intent == Intent.AGENT_CANCEL:
                 response, next_cursor_session = cursor_turn(
@@ -1065,6 +1072,7 @@ class WakeConversationDaemon:
                         reference=text,
                     ),
                     delivery_claims=delivery_claims,
+                    integrations=self.integrations,
                 )
             elif route.actionable and route.intent == Intent.AGENT_STATUS:
                 response, next_cursor_session = cursor_turn(
@@ -1076,6 +1084,7 @@ class WakeConversationDaemon:
                         reference=text,
                     ),
                     delivery_claims=delivery_claims,
+                    integrations=self.integrations,
                 )
             elif route.actionable and route.intent in {
                 Intent.AGENT_DISMISS,
@@ -1113,6 +1122,7 @@ class WakeConversationDaemon:
                         ),
                     ),
                     delivery_claims=delivery_claims,
+                    integrations=self.integrations,
                 )
             elif (
                 route.actionable
@@ -1135,6 +1145,7 @@ class WakeConversationDaemon:
                         answer_provenance=AnswerProvenance.USER_VOICE,
                     ),
                     delivery_claims=delivery_claims,
+                    integrations=self.integrations,
                 )
             elif route.actionable and route.intent == Intent.AGENT_SUBMIT:
                 # Explicit new work invalidates any retained completed-job slot.
@@ -1150,6 +1161,7 @@ class WakeConversationDaemon:
                         **github_arguments,
                     ),
                     delivery_claims=delivery_claims,
+                    integrations=self.integrations,
                 )
             elif route.intent == Intent.AGENT_SUBMIT:
                 response = NON_ACTIONABLE_SUBMIT_RESPONSE
@@ -1200,6 +1212,7 @@ class WakeConversationDaemon:
                             on_follow_up_started=consume_completed_followup,
                         ),
                         delivery_claims=delivery_claims,
+                        integrations=self.integrations,
                     )
             else:
                 # The authoritative router handles every mutating action above.
@@ -1292,11 +1305,11 @@ class WakeConversationDaemon:
         return None
 
     def run(self) -> None:
-        recover_jobs()
+        recover_jobs(integrations=self.integrations)
         self.start_microphone()
         speech_streak = 0
         while self.running:
-            for job in pending_results():
+            for job in pending_results(self.integrations):
                 self._enqueue_job_announcement(job)
             if len(self.playback_queue) > 0:
                 self.continue_after_barge_in(self._play_pending_announcements())

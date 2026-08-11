@@ -36,8 +36,16 @@ class UserConfigDefaultsTests(unittest.TestCase):
         self.assertEqual(config.platform.project_root, self.HOME)
         self.assertEqual(config.platform.github_root, self.HOME / "src")
         self.assertEqual(
+            config.platform.herdr_worktree_root,
+            self.HOME / ".herdr" / "worktrees",
+        )
+        self.assertEqual(config.platform.gh_bin, Path("gh"))
+        self.assertEqual(config.platform.git_bin, Path("git"))
+        self.assertEqual(
             config.platform.herdr_bin, self.HOME / ".local" / "bin" / "herdr"
         )
+        self.assertEqual(config.platform.github_timeout_seconds, 30)
+        self.assertEqual(config.platform.herdr_timeout_seconds, 30)
         self.assertEqual(config.platform.cursor_agent_inactivity_seconds, 900)
         self.assertEqual(config.platform.cursor_agent_max_runtime_seconds, 3600)
         self.assertEqual(config.platform.agent_job_start_concurrency, 3)
@@ -269,6 +277,38 @@ class UserConfigPrecedenceTests(unittest.TestCase):
         self.assertEqual(config.platform.cursor_agent_max_runtime_seconds, 600)
         self.assertEqual(config.platform.agent_job_start_concurrency, 5)
 
+    def test_integration_client_paths_and_timeouts_are_typed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            path = root / "config.toml"
+            path.write_text(
+                "[platform]\n"
+                'project_root = "/repositories"\n'
+                'github_root = "/repositories/github"\n'
+                'herdr_worktree_root = "/worktrees"\n'
+                'gh_bin = "/tools/gh"\n'
+                'git_bin = "/tools/git"\n'
+                'herdr_bin = "/tools/herdr"\n'
+                "github_timeout_seconds = 12.5\n"
+                "herdr_timeout_seconds = 8\n"
+            )
+            config = user_config.load_user_config(
+                {},
+                path=path,
+                backends_path=root / "missing.toml",
+                backend_env_path=root / "missing.env",
+                home=self.HOME,
+            )
+
+        self.assertEqual(config.platform.project_root, Path("/repositories"))
+        self.assertEqual(config.platform.github_root, Path("/repositories/github"))
+        self.assertEqual(config.platform.herdr_worktree_root, Path("/worktrees"))
+        self.assertEqual(config.platform.gh_bin, Path("/tools/gh"))
+        self.assertEqual(config.platform.git_bin, Path("/tools/git"))
+        self.assertEqual(config.platform.herdr_bin, Path("/tools/herdr"))
+        self.assertEqual(config.platform.github_timeout_seconds, 12.5)
+        self.assertEqual(config.platform.herdr_timeout_seconds, 8)
+
 
 class UserConfigValidationTests(unittest.TestCase):
     HOME = Path("/home/example")
@@ -355,6 +395,16 @@ class UserConfigValidationTests(unittest.TestCase):
     def test_non_positive_cursor_watchdog_is_rejected(self) -> None:
         with self.assertRaisesRegex(UserConfigurationError, "positive number"):
             self._load("[platform]\ncursor_agent_inactivity_seconds = 0\n")
+
+    def test_non_positive_integration_timeout_is_rejected(self) -> None:
+        with self.assertRaisesRegex(UserConfigurationError, "positive number"):
+            self._load("[platform]\ngithub_timeout_seconds = 0\n")
+
+    def test_github_root_outside_project_root_is_rejected(self) -> None:
+        with self.assertRaisesRegex(UserConfigurationError, "must be inside"):
+            self._load(
+                '[platform]\nproject_root = "/repositories"\ngithub_root = "/outside"\n'
+            )
 
     def test_non_positive_agent_job_start_concurrency_is_rejected(self) -> None:
         with self.assertRaisesRegex(UserConfigurationError, "positive integer"):

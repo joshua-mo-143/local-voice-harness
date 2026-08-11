@@ -384,10 +384,10 @@ def test_start_follow_up_checks_capability_before_creating_child(
     launch = mock.Mock()
     monkeypatch.setattr(service, "launch_worker", launch)
     monkeypatch.setattr(
-        service, "resolve_issue_reference", lambda _reference: "ENG-123"
+        service, "resolve_issue_reference", lambda _reference, *_args: "ENG-123"
     )
 
-    def reject(_reference: str) -> None:
+    def reject(_reference: str, *_args: object) -> None:
         raise HarnessError("Linear MCP requires authentication")
 
     monkeypatch.setattr(service, "require_issue_capabilities", reject)

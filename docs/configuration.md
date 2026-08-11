@@ -59,6 +59,14 @@ replacements = "herder:herdr;cursa:Cursor"
 vad_end_silence_ms = 900
 
 [platform]
+project_root = "/home/example"
+github_root = "/home/example/src"
+herdr_worktree_root = "/home/example/.herdr/worktrees"
+gh_bin = "gh"
+git_bin = "git"
+herdr_bin = "/home/example/.local/bin/herdr"
+github_timeout_seconds = 30
+herdr_timeout_seconds = 30
 focused_app_context = true
 cursor_followup = true
 cursor_agent_inactivity_seconds = 900
@@ -104,7 +112,10 @@ root resolves `UserConfig` once, then injects its immutable typed sections into
 the process's consumers. Editing `config.toml`, a documented legacy input, or an
 environment override does not mutate an already running process. LLM routing and
 conversation calls, STT startup, TTS serving, playback, dictation injection, audio
-capture, and VAD all use the injected snapshot. Restart every
+capture, VAD, the integration registry, and configured GitHub and Herdr client
+factories all use the injected snapshot. Detached workers resolve one snapshot at
+worker startup; durable provider identity across later restarts is handled
+separately. Restart every
 affected foreground process, service, or detached worker to apply the change;
 the configuration commands report affected active services.
 
@@ -248,6 +259,11 @@ voice-harness plan-approval ask
 | `VOICE_HARNESS_CURSOR_FOLLOWUP` | Enable completed-job follow-up context (kill switch) | `1` | Wake drop-in |
 | `VOICE_HARNESS_CURSOR_FOLLOWUP_WINDOW_SECONDS` | Finite, non-negative absolute lifetime of the retained completed-job reference | `60` | Wake drop-in |
 | `VOICE_HARNESS_HERDR_BIN` | Absolute Herdr executable path | `~/.local/bin/herdr` | Wake drop-in |
+| `VOICE_HARNESS_HERDR_WORKTREE_ROOT` | Root for Herdr-created worktrees | `~/.herdr/worktrees` | Wake drop-in |
+| `VOICE_HARNESS_GH_BIN` | GitHub CLI executable | `gh` | Wake drop-in |
+| `VOICE_HARNESS_GIT_BIN` | Git executable used for GitHub checkouts | `git` | Wake drop-in |
+| `VOICE_HARNESS_GITHUB_TIMEOUT_SECONDS` | Positive default for GitHub commands without an operation-specific timeout | `30` | Wake drop-in |
+| `VOICE_HARNESS_HERDR_TIMEOUT_SECONDS` | Positive Herdr command and startup timeout | `30` | Wake drop-in |
 | `VOICE_HARNESS_PROJECT_ROOT` | Absolute allowed root for inferred repositories | Home directory | Wake drop-in |
 | `VOICE_HARNESS_GITHUB_ROOT` | Absolute fork-clone root inside the project root | `~/src` | Wake drop-in |
 | `VOICE_HARNESS_FOCUSED_APP_CONTEXT` | Enable focused editor/terminal context capture | `1` | Wake drop-in |

@@ -7,7 +7,7 @@ import time
 import uuid
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Literal, NamedTuple
 
 from ..config import (
@@ -18,6 +18,7 @@ from ..config import (
 )
 from ..diagnostic_safety import redact_diagnostic
 from ..errors import HarnessError
+from ..integrations import registry as integration_registry_module
 from ..integrations.github import (
     GitHubClient,
     GitHubError,
@@ -28,6 +29,7 @@ from ..integrations.github import (
     github_issue_from_url,
 )
 from ..integrations.registry import (
+    IntegrationRegistry,
     extract_issue_reference,
     integration_enabled,
     require_issue_capabilities,
@@ -151,6 +153,15 @@ def _job_store() -> JobStore:
     return JobStore(JOBS_DIR, LEGACY_JOBS_DIR)
 
 
+def _integration_registry(
+    registry: IntegrationRegistry | None,
+) -> IntegrationRegistry:
+    if registry is not None:
+        return registry
+    defaults = integration_registry_module._registry(None)
+    return replace(defaults, github_client=GitHubClient)
+
+
 def read_job(job_id: str) -> CursorJob:
     return _job_store().get(job_id)
 
@@ -246,6 +257,7 @@ def start_job(
     context_repository: str | None = None,
     issue_key: str | None = None,
     foreground: bool = True,
+    integrations: IntegrationRegistry | None = None,
 ) -> str:
     if isinstance(request, StartJobRequest):
         text = request.text
@@ -262,16 +274,17 @@ def start_job(
         foreground = request.foreground
     else:
         text = request
+    registry = _integration_registry(integrations)
     job_id = uuid.uuid4().hex[:12]
     now = time.time()
     spoken_text = utterance if utterance is not None else text
     resolved_issue_key = (
-        resolve_issue_reference(issue_key)
+        resolve_issue_reference(issue_key, registry)
         if issue_key is not None
-        else extract_issue_reference(spoken_text)
+        else extract_issue_reference(spoken_text, registry)
     )
     if resolved_issue_key:
-        require_issue_capabilities(resolved_issue_key)
+        require_issue_capabilities(resolved_issue_key, registry)
     issue_repository = (github_repository or "").strip()
     github_issue_url = (
         f"https://github.com/{issue_repository}/issues/{github_issue}"
@@ -341,6 +354,7 @@ def start_jobs(
     requests: tuple[TicketJobRequest, ...],
     *,
     concurrency: int | None = None,
+    integrations: IntegrationRegistry | None = None,
 ) -> tuple[TicketStartOutcome, ...]:
     """Start ordinary durable jobs concurrently without foreground waiting."""
     if not requests:
@@ -349,7 +363,7 @@ def start_jobs(
 
     def start(request: TicketJobRequest) -> TicketStartOutcome:
         try:
-            job_id = start_job(request.request)
+            job_id = start_job(request.request, integrations=integrations)
         except ActiveTicketConflict as exc:
             return TicketStartOutcome(
                 request.target,
@@ -486,8 +500,9 @@ def _linear_target(
     base: StartJobRequest,
     *,
     foreground: bool,
+    integrations: IntegrationRegistry,
 ) -> TicketJobRequest | TicketStartOutcome:
-    canonical = resolve_issue_reference(reference.canonical)
+    canonical = resolve_issue_reference(reference.canonical, integrations)
     if canonical is None:
         return _rejected(
             reference,
@@ -512,6 +527,7 @@ def _preflight_ticket_targets(
     base: StartJobRequest,
     *,
     foreground: bool,
+    integrations: IntegrationRegistry,
 ) -> tuple[
     list[TicketStartOutcome | None],
     list[tuple[int, TicketJobRequest]],
@@ -519,8 +535,8 @@ def _preflight_ticket_targets(
     """Validate every unique reference before returning any startable child."""
     slots: list[TicketStartOutcome | None] = [None] * len(extraction.references)
     prepared: list[tuple[int, TicketJobRequest]] = []
-    github_client = GitHubClient()
-    github_available = integration_enabled("github")
+    github_available = integration_enabled("github", integrations)
+    github_client = integrations.github_client() if github_available else None
     linear_capability_error: str | None = None
     linear_capability_checked = False
 
@@ -533,27 +549,32 @@ def _preflight_ticket_targets(
             continue
         if reference.source == "github":
             candidate: TicketJobRequest | TicketStartOutcome
-            candidate = (
-                _github_target(
+            if github_available:
+                assert github_client is not None
+                candidate = _github_target(
                     reference,
                     base,
                     github_client,
                     foreground=foreground,
                 )
-                if github_available
-                else _rejected(reference, "GitHub integration is disabled")
-            )
+            else:
+                candidate = _rejected(reference, "GitHub integration is disabled")
         else:
             if not linear_capability_checked:
                 try:
-                    require_issue_capabilities(reference.canonical)
+                    require_issue_capabilities(reference.canonical, integrations)
                 except HarnessError as exc:
                     linear_capability_error = str(exc)
                 linear_capability_checked = True
             candidate = (
                 _rejected(reference, linear_capability_error)
                 if linear_capability_error is not None
-                else _linear_target(reference, base, foreground=foreground)
+                else _linear_target(
+                    reference,
+                    base,
+                    foreground=foreground,
+                    integrations=integrations,
+                )
             )
         if isinstance(candidate, TicketStartOutcome):
             slots[index] = candidate
@@ -666,13 +687,18 @@ def _submit_extracted_targets(
     base: StartJobRequest,
     *,
     foreground: bool,
+    integrations: IntegrationRegistry,
 ) -> tuple[TicketStartOutcome, ...]:
     slots, prepared = _preflight_ticket_targets(
         extraction,
         base,
         foreground=foreground,
+        integrations=integrations,
     )
-    started = start_jobs(tuple(request for _index, request in prepared))
+    started = start_jobs(
+        tuple(request for _index, request in prepared),
+        integrations=integrations,
+    )
     for (index, _request), outcome in zip(prepared, started, strict=True):
         slots[index] = outcome
     return tuple(outcome for outcome in slots if outcome is not None)
@@ -687,6 +713,7 @@ def reply_job(
     expected_question_turn: str | None = None,
     answer_provenance: AnswerProvenance = AnswerProvenance.USER_TEXT,
     on_started: Callable[[], None] | None = None,
+    integrations: IntegrationRegistry | None = None,
 ) -> str | None:
     now = time.time()
     should_launch = False
@@ -809,6 +836,7 @@ def reply_job(
                 job_id,
                 updated.herdr_target or "",
                 updated.target_release_token or "",
+                integrations=integrations,
             )
         return None
     if should_complete:
@@ -818,6 +846,7 @@ def reply_job(
                 job_id,
                 updated.herdr_target or "",
                 updated.target_release_token or "",
+                integrations=integrations,
             )
         return immediate
     if should_launch:
@@ -834,17 +863,19 @@ def start_follow_up(
     expected_completed_at: float | None = None,
     utterance: str | None = None,
     on_created: Callable[[], None] | None = None,
+    integrations: IntegrationRegistry | None = None,
 ) -> str:
     """Create and launch a child job that reuses a completed parent's checkout."""
     now = time.time()
     child_id = uuid.uuid4().hex[:12]
     spoken = utterance if utterance is not None else text
     store = _job_store()
+    registry = _integration_registry(integrations)
 
     def build(parent: CursorJob) -> CursorJob:
-        active_issue_key = resolve_issue_reference(parent.issue_key)
+        active_issue_key = resolve_issue_reference(parent.issue_key, registry)
         if active_issue_key:
-            require_issue_capabilities(active_issue_key)
+            require_issue_capabilities(active_issue_key, registry)
         return CursorJob.new(
             NewCursorJob(
                 id=child_id,
@@ -884,18 +915,26 @@ def _cancel_target_and_release(
     release_token: str,
     *,
     worker_stopped: bool = True,
+    integrations: IntegrationRegistry | None = None,
 ) -> None:
+    herdr_factory = (
+        provisioning.HerdrClient if integrations is None else integrations.herdr_client
+    )
     recovery.cancel_target_and_release(
         _job_store(),
         job_id,
         target,
         release_token,
         worker_stopped=worker_stopped,
-        herdr_factory=provisioning.HerdrClient,
+        herdr_factory=herdr_factory,
     )
 
 
-def cancel_job(job_id: str) -> str:
+def cancel_job(
+    job_id: str,
+    *,
+    integrations: IntegrationRegistry | None = None,
+) -> str:
     initial = read_job(job_id)
     legacy_worker_stopped = False
     if initial.status in WORKER_STATUSES and worker_lifecycle.has_legacy_worker_claim(
@@ -957,6 +996,7 @@ def cancel_job(job_id: str) -> str:
             target,
             updated.target_release_token or "",
             worker_stopped=worker_stopped,
+            integrations=integrations,
         )
     current = read_job(job_id)
     return (
@@ -1058,12 +1098,20 @@ def _defer_or_acknowledge(
     return claimed.job
 
 
-def recover_jobs() -> None:
+def recover_jobs(*, integrations: IntegrationRegistry | None = None) -> None:
+    herdr_factory = (
+        provisioning.HerdrClient if integrations is None else integrations.herdr_client
+    )
+    github_factory = (
+        provisioning.GitHubClient
+        if integrations is None
+        else integrations.github_client
+    )
     recovery.recover_jobs(
         _job_store(),
         launch_worker=launch_worker,
-        herdr_factory=provisioning.HerdrClient,
-        github_factory=provisioning.GitHubClient,
+        herdr_factory=herdr_factory,
+        github_factory=github_factory,
         is_worker_alive=_worker_is_alive,
         stop_owned_worker=_stop_worker,
         stop_unfenced_worker=lambda _store, job_id: _stop_legacy_worker(job_id),
@@ -1079,8 +1127,12 @@ def recover_jobs() -> None:
     )
 
 
-def pending_results(*, limit: int = delivery.DELIVERY_WINDOW) -> list[DeliveryClaim]:
-    recover_jobs()
+def pending_results(
+    *,
+    limit: int = delivery.DELIVERY_WINDOW,
+    integrations: IntegrationRegistry | None = None,
+) -> list[DeliveryClaim]:
+    recover_jobs(integrations=integrations)
     return delivery.pending_deliveries(_job_store(), limit=limit)
 
 
@@ -1157,7 +1209,7 @@ def acknowledge_quarantine_reservations(job_id: str, *, reason: str) -> str:
     )
 
 
-def nuke_jobs() -> str:
+def nuke_jobs(*, integrations: IntegrationRegistry | None = None) -> str:
     """Fence claims, drain workers, and delete only fully reconciled jobs."""
     store = _job_store()
     owner_pid = os.getpid()
@@ -1336,6 +1388,7 @@ def nuke_jobs() -> str:
                 current.herdr_target or "",
                 current.target_release_token or "",
                 worker_stopped=True,
+                integrations=integrations,
             )
 
         if stop_failures:
@@ -1438,7 +1491,9 @@ def cursor_turn(
     job_id: str | None = None,
     reference: str | None = None,
     delivery_claims: DeliveryClaims | None = None,
+    integrations: IntegrationRegistry | None = None,
 ) -> CursorTurnResult:
+    registry = _integration_registry(integrations)
     on_follow_up_started: Callable[[], None] | None = None
     on_job_started: Callable[[], None] | None = None
     expected_question_id: str | None = None
@@ -1498,7 +1553,7 @@ def cursor_turn(
         if resolved.clarification is not None:
             return CursorTurnResult(resolved.clarification, session_id)
         assert resolved.job_id is not None
-        result = cancel_job(resolved.job_id)
+        result = cancel_job(resolved.job_id, integrations=registry)
         _defer_or_acknowledge(resolved.job_id, delivery_claims)
         return CursorTurnResult(result, None)
     if action in {"dismiss", "repeat"}:
@@ -1540,6 +1595,7 @@ def cursor_turn(
             expected_question_turn=expected_question_turn,
             answer_provenance=answer_provenance,
             on_started=on_job_started,
+            integrations=registry,
         )
         if immediate is not None:
             pending = questions.current(read_job(reply_id))
@@ -1562,6 +1618,7 @@ def cursor_turn(
                 expected_completed_at=expected_completed_at,
                 utterance=utterance,
                 on_created=on_follow_up_started,
+                integrations=registry,
             )
             if on_job_started is not None:
                 on_job_started()
@@ -1604,6 +1661,7 @@ def cursor_turn(
                 extraction,
                 base,
                 foreground=not extraction.batch_requested,
+                integrations=registry,
             )
             accepted = tuple(
                 outcome for outcome in outcomes if outcome.status == "accepted"
@@ -1627,6 +1685,7 @@ def cursor_turn(
                 utterance=utterance,
                 context_repository=context_repository,
                 issue_key=issue_key,
+                integrations=registry,
             )
         except ActiveTicketConflict as exc:
             return CursorTurnResult(str(exc), None)

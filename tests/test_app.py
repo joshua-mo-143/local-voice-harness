@@ -20,6 +20,7 @@ class ForegroundDeliveryTests(unittest.TestCase):
             request: CursorTurnRequest,
             *,
             delivery_claims: list[tuple[str, str]],
+            integrations: object,
         ) -> tuple[str, None]:
             self.assertEqual(request.utterance, "Use Cursor to inspect this repository")
             self.assertIsNone(request.context_repository)
@@ -57,6 +58,7 @@ class ForegroundDeliveryTests(unittest.TestCase):
             request: CursorTurnRequest,
             *,
             delivery_claims: list[tuple[str, str]],
+            integrations: object,
         ) -> tuple[str, None]:
             self.assertEqual(request.utterance, "Use Cursor to inspect this repository")
             self.assertIsNone(request.context_repository)
@@ -148,6 +150,7 @@ class AppContextTests(unittest.TestCase):
                 context_repository="example/project",
             ),
             delivery_claims=mock.ANY,
+            integrations=mock.ANY,
         )
 
     def test_manual_conversation_includes_focused_context(self) -> None:
@@ -294,6 +297,7 @@ class AppContextTests(unittest.TestCase):
                 github_pull_request=None,
             ),
             delivery_claims=mock.ANY,
+            integrations=mock.ANY,
         )
 
     def test_focused_github_issue_does_not_submit_at_low_confidence(self) -> None:
@@ -405,6 +409,7 @@ class AppContextTests(unittest.TestCase):
                 issue_key="ENG-123",
             ),
             delivery_claims=mock.ANY,
+            integrations=mock.ANY,
         )
 
     def test_issue_list_scope_reaches_cursor_submission(self) -> None:
@@ -444,6 +449,7 @@ class AppContextTests(unittest.TestCase):
                 github_pull_request=None,
             ),
             delivery_claims=mock.ANY,
+            integrations=mock.ANY,
         )
 
     def test_focused_linear_issue_does_not_submit_at_low_confidence(self) -> None:
@@ -501,6 +507,7 @@ class CursorFastPathTests(unittest.TestCase):
                 context_repository=None,
             ),
             delivery_claims=mock.ANY,
+            integrations=mock.ANY,
         )
 
     def test_non_cursor_utterance_uses_router(self) -> None:

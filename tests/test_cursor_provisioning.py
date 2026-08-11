@@ -1621,6 +1621,7 @@ class CursorJobStateTests(unittest.TestCase):
             "123456789abc",
             "planner",
             updated.target_release_token,
+            integrations=None,
         )
         launch.assert_not_called()
 
@@ -2352,6 +2353,7 @@ class CursorJobStateTests(unittest.TestCase):
             utterance=None,
             context_repository=None,
             issue_key=None,
+            integrations=mock.ANY,
         )
         reply.assert_not_called()
         self.assertEqual(result, "done")

@@ -96,7 +96,7 @@ def test_fanout_preflights_every_target_before_bounded_background_starts() -> No
             "url": f"https://github.com/example/project/issues/{number}",
         }
 
-    def start(request: StartJobRequest) -> str:
+    def start(request: StartJobRequest, **_kwargs: object) -> str:
         assert events[:3] == ["preflight-1", "preflight-2", "preflight-3"]
         assert not request.foreground
         assert request.github_issue in {1, 3}
@@ -148,7 +148,7 @@ def test_start_jobs_enforces_bound_and_preserves_outcome_order() -> None:
     active = 0
     maximum = 0
 
-    def start(request: StartJobRequest) -> str:
+    def start(request: StartJobRequest, **_kwargs: object) -> str:
         nonlocal active, maximum
         with lock:
             active += 1
@@ -382,7 +382,7 @@ def test_single_scoped_ticket_keeps_foreground_behavior() -> None:
     }
     started: list[StartJobRequest] = []
 
-    def start(request: StartJobRequest) -> str:
+    def start(request: StartJobRequest, **_kwargs: object) -> str:
         started.append(request)
         return "123456789abc"
 
@@ -415,14 +415,14 @@ def test_single_scoped_ticket_keeps_foreground_behavior() -> None:
 def test_fanout_linear_capability_preflight_happens_before_any_start() -> None:
     events: list[str] = []
 
-    def require(reference: str) -> None:
+    def require(reference: str, *_args: object) -> None:
         events.append(f"capability-{reference}")
 
-    def resolve(reference: str | None) -> str | None:
+    def resolve(reference: str | None, *_args: object) -> str | None:
         events.append(f"resolve-{reference}")
         return reference
 
-    def start(request: StartJobRequest) -> str:
+    def start(request: StartJobRequest, **_kwargs: object) -> str:
         assert events[:3] == [
             "capability-ENG-1",
             "resolve-ENG-1",

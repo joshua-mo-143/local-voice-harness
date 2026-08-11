@@ -7,7 +7,6 @@ from pathlib import Path
 from unittest import mock
 
 from local_voice_harness.integrations.herdr import (
-    HOME_ROOT,
     AgentSelection,
     HerdrClient,
     HerdrRepository,
@@ -97,7 +96,7 @@ class HerdrComponentBoundaryTests(unittest.TestCase):
     def test_facade_delegates_repository_clone_to_repository_component(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            client = HerdrClient("herdr")
+            client = HerdrClient("herdr", repository_root=root)
 
             def clone(
                 command: list[str], **_kwargs: object
@@ -108,14 +107,6 @@ class HerdrComponentBoundaryTests(unittest.TestCase):
                 return subprocess.CompletedProcess(command, 0, "", "")
 
             with (
-                mock.patch(
-                    "local_voice_harness.integrations.herdr.repository.HOME_ROOT",
-                    root,
-                ),
-                mock.patch(
-                    "local_voice_harness.integrations.herdr.types.HOME_ROOT",
-                    root,
-                ),
                 mock.patch.object(
                     client.repository,
                     "choose_or_clone_repository",
@@ -214,11 +205,12 @@ class HerdrComponentBoundaryTests(unittest.TestCase):
         )
 
     def test_router_workspace_is_not_a_transport_concern(self) -> None:
+        root = Path("/repositories")
         selection = AgentSelection(
             "voice-router",
             "pane",
             "workspace",
-            str(HOME_ROOT),
+            str(root),
             "voice-router",
             None,
         )
@@ -227,14 +219,14 @@ class HerdrComponentBoundaryTests(unittest.TestCase):
         operations.list_workspaces.return_value = []
         operations.new_pane.return_value = ("pane", "workspace")
         operations.start_agent.return_value = selection
-        workspace = HerdrWorkspace(operations)
+        workspace = HerdrWorkspace(operations, repository_root=root)
         self.assertIs(
             workspace.ensure_router(set()),
             selection,
         )
 
         operations.start_agent.assert_called_once_with(
-            HOME_ROOT,
+            root,
             "router",
             "pane",
             "workspace",
