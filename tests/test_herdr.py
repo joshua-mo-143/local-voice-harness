@@ -181,7 +181,7 @@ WORKFLOW_PLAN[token]: <bounded multiline implementation plan>
                     return_value=True,
                 ),
                 mock.patch(
-                    "local_voice_harness.integrations.herdr.repository.subprocess.run",
+                    "local_voice_harness.integrations.herdr.repository.run_command",
                     side_effect=clone,
                 ) as run,
             ):
@@ -195,6 +195,30 @@ WORKFLOW_PLAN[token]: <bounded multiline implementation plan>
                 ["git", "clone", "--", "https://github.com/example/project.git"],
             )
             self.assertEqual(Path(command[-1]).name, "project")
+
+    def test_clone_timeout_reports_ambiguous_outcome(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            client = herdr.HerdrClient("herdr")
+            with (
+                mock.patch(
+                    "local_voice_harness.integrations.herdr.repository.HOME_ROOT",
+                    root,
+                ),
+                mock.patch(
+                    "local_voice_harness.integrations.herdr.repository.run_command",
+                    side_effect=subprocess.TimeoutExpired(["git", "clone"], 300),
+                ),
+                self.assertRaisesRegex(
+                    herdr.HerdrError,
+                    "timed out; the clone outcome is ambiguous",
+                ) as raised,
+            ):
+                client.repository.clone_repository(
+                    "https://github.com/example/project.git"
+                )
+
+            self.assertEqual(raised.exception.code, "repository_clone_ambiguous")
 
     def test_cancelled_rofi_clone_returns_spoken_fallback_reason(self) -> None:
         client = herdr.HerdrClient("herdr")
