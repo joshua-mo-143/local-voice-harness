@@ -315,6 +315,7 @@ def durable_state_dir(
 
 DURABLE_STATE_DIR = durable_state_dir()
 JOBS_DIR = DURABLE_STATE_DIR / "jobs"
+REPLAY_DIR = DURABLE_STATE_DIR / "replays"
 VOCABULARY_PATH = vocabulary_path()
 WAV_PATH = STATE_DIR / "request.wav"
 PID_PATH = STATE_DIR / "recording.pid"

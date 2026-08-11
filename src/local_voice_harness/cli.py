@@ -15,6 +15,8 @@ from .agents.service import (
 from .agents.service import agent_turn as cursor_turn
 from .agents.store import QuarantineEvidence
 from .app import respond, status
+from .browser_context import RequestContext, request_context
+from .config import CURSOR_PATTERN, REPLAY_DIR
 from .config_management import (
     commit_config_change,
     format_restart_notice,
@@ -33,6 +35,7 @@ from .credentials import (
 from .diagnostic_safety import COMMAND_FAILURE, log_diagnostic
 from .diagnostics import doctor
 from .dictation import run as run_dictation
+from .intent import Intent, IntentRoute, route_intent
 from .notifications import notify
 from .recording import (
     cancel_recording,
@@ -41,7 +44,15 @@ from .recording import (
     start_recording,
     stop_recording,
 )
-from .responses import as_assistant_response
+from .replay import (
+    capture_bundle,
+    default_bundle_path,
+    load_bundle,
+    manifest_summary,
+    run_replay,
+    save_bundle,
+)
+from .responses import AssistantResponse, as_assistant_response
 from .service_manager import (
     audit_services,
     install_services,
@@ -284,6 +295,7 @@ def parser() -> argparse.ArgumentParser:
     uninstall.add_argument("--include-herdr", action="store_true")
 
     _add_vocabulary_parser(commands)
+    _add_replay_parser(commands)
 
     return root
 
@@ -478,6 +490,153 @@ def _dispatch_vocabulary(args: argparse.Namespace) -> None:
         import_entries(args.path, replace=args.replace)
 
 
+def _add_replay_parser(
+    commands: argparse._SubParsersAction[argparse.ArgumentParser],
+) -> None:
+    replay = commands.add_parser(
+        "replay", help="capture and run side-effect-free semantic voice replays"
+    )
+    replay_commands = replay.add_subparsers(dest="replay_command", required=True)
+
+    capture = replay_commands.add_parser(
+        "capture", help="capture bounded semantic inputs and decisions"
+    )
+    capture.add_argument("text", nargs="+", help="raw transcript to capture")
+    capture.add_argument("--output", type=Path)
+    capture.add_argument(
+        "--without-context",
+        action="store_true",
+        help="record an explicit empty context decision",
+    )
+    capture.add_argument("--spoken-response")
+    capture.add_argument("--display-response")
+    capture.add_argument(
+        "--intent",
+        choices=sorted({intent.value for intent in Intent}),
+        help="inject an observed router decision instead of calling the router",
+    )
+    capture.add_argument(
+        "--confidence",
+        choices=("high", "medium", "low"),
+        help="confidence paired with --intent",
+    )
+
+    for name in ("run", "inspect"):
+        command = replay_commands.add_parser(name)
+        command.add_argument("path", type=Path)
+
+    export = replay_commands.add_parser(
+        "export", help="review a summary before copying a portable bundle"
+    )
+    export.add_argument("path", type=Path)
+    export.add_argument("output", type=Path)
+
+    promote = replay_commands.add_parser(
+        "promote", help="manually review and copy a bundle as a test fixture"
+    )
+    promote.add_argument("path", type=Path)
+    promote.add_argument("output", type=Path)
+
+
+def _capture_replay(args: argparse.Namespace) -> None:
+    from .stt.server import transcript_replacements
+    from .transcript import normalize_transcript
+
+    raw = " ".join(args.text).strip()
+    replacements = transcript_replacements()
+    normalized = normalize_transcript(raw, replacements)
+    context = (
+        RequestContext(normalized)
+        if args.without_context
+        else request_context(normalized)
+    )
+    if (args.intent is None) != (args.confidence is None):
+        raise ValueError("--intent and --confidence must be provided together")
+    if args.intent is not None:
+        route = IntentRoute(Intent(args.intent), args.confidence)
+    elif CURSOR_PATTERN.search(normalized):
+        route = IntentRoute(Intent.AGENT_SUBMIT, "high")
+    else:
+        route = route_intent(normalized, context)
+    if args.display_response is not None and args.spoken_response is None:
+        raise ValueError("--display-response requires --spoken-response")
+    response = (
+        AssistantResponse(
+            args.spoken_response,
+            args.display_response or args.spoken_response,
+        )
+        if args.spoken_response is not None
+        else None
+    )
+    bundle = capture_bundle(
+        raw,
+        replacements=replacements,
+        context=context,
+        route=route,
+        response=response,
+    )
+    output = args.output or default_bundle_path(REPLAY_DIR)
+    print(manifest_summary(bundle))
+    save_bundle(bundle, output)
+    print(f"Captured replay: {output}")
+
+
+def _copy_replay_after_review(
+    source: Path,
+    output: Path,
+    *,
+    confirmation: str,
+    purpose: str,
+    show_contents: bool = False,
+) -> None:
+    bundle = load_bundle(source)
+    print(manifest_summary(bundle))
+    if show_contents:
+        print("Complete bounded bundle for manual content review:")
+        print(
+            json.dumps(bundle.to_dict(), indent=2, sort_keys=True, ensure_ascii=False)
+        )
+    answer = input(
+        f"Type '{confirmation}' after reviewing the displayed replay: "
+    ).strip()
+    if answer != confirmation:
+        print(f"Aborted. Replay was not {purpose}.")
+        return
+    save_bundle(bundle, output)
+    print(f"Replay {purpose}: {output}")
+
+
+def _dispatch_replay(args: argparse.Namespace) -> None:
+    if args.replay_command == "capture":
+        _capture_replay(args)
+        return
+    if args.replay_command == "export":
+        _copy_replay_after_review(
+            args.path, args.output, confirmation="export", purpose="exported"
+        )
+        return
+    if args.replay_command == "promote":
+        _copy_replay_after_review(
+            args.path,
+            args.output,
+            confirmation="reviewed",
+            purpose="promoted",
+            show_contents=True,
+        )
+        return
+    bundle = load_bundle(args.path)
+    print(manifest_summary(bundle))
+    if args.replay_command == "inspect":
+        return
+    response = run_replay(bundle)
+    print("Verified deterministic stages: transcript normalization, ticket extraction.")
+    print("Injected recorded decisions: context selection, intent routing.")
+    if response is not None:
+        print("Injected recorded response rendering; no TTS was invoked.")
+        print(f"Display: {response.display_text}")
+        print(f"Speech: {response.spoken_text}")
+
+
 def dispatch(args: argparse.Namespace) -> None:
     if args.command == "begin":
         start_recording()
@@ -559,6 +718,8 @@ def dispatch(args: argparse.Namespace) -> None:
             print("Venice API key deleted from the desktop Secret Service")
     elif args.command == "vocabulary":
         _dispatch_vocabulary(args)
+    elif args.command == "replay":
+        _dispatch_replay(args)
     elif args.service_command == "install":
         install_services(force=args.force, replace_dictation=args.replace_dictation)
     elif args.service_command == "start":
