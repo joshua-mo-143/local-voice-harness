@@ -999,14 +999,56 @@ class AnnounceJobTests(unittest.TestCase):
             },
         )
 
-        response = daemon._job_response_text(claim.job)
+        response = daemon._job_response(claim.job)
 
         self.assertEqual(
-            response,
-            "Cursor needs clarification. What should authorize irreversible "
+            response.spoken_text,
+            "Cursor needs clarification for test. What should authorize irreversible "
             "audio deletion? Option 1 is Successful server send completion. "
             "Option 2 is Explicit client acknowledgment. Please choose one.",
         )
+        self.assertIn(
+            "Cursor job aaaaaaaaaaaa (test) needs clarification", response.display_text
+        )
+        self.assertIn("Option 2", response.display_text)
+
+    def test_job_announcement_queues_only_spoken_and_prints_display(self) -> None:
+        daemon = _bare_daemon()
+        claim = _delivery_claim(
+            "job2",
+            "completed",
+            result="Changed /srv/example/config.toml at commit abc123.",
+        )
+        response = daemon._job_response(claim.job)
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output):
+            daemon._enqueue_job_announcement(claim)
+
+        self.assertEqual(
+            output.getvalue(),
+            f"Assistant: {response.display_text}\n",
+        )
+        self.assertEqual(daemon.playback_queue.queued_text(), response.spoken_text)
+        self.assertNotIn("/srv/example", daemon.playback_queue.queued_text())
+        self.assertIn("/srv/example", response.display_text)
+
+    def test_display_failure_does_not_queue_or_acknowledge_delivery(self) -> None:
+        daemon = _bare_daemon()
+        claim = _delivery_claim("job2", "completed", result="done")
+
+        class BrokenDisplay(io.StringIO):
+            def write(self, _value: str) -> int:
+                raise OSError("display unavailable")
+
+        with (
+            contextlib.redirect_stdout(BrokenDisplay()),
+            mock.patch.object(wake_daemon, "acknowledge_delivery") as acknowledge,
+            self.assertRaisesRegex(OSError, "display unavailable"),
+        ):
+            daemon._enqueue_job_announcement(claim)
+
+        acknowledge.assert_not_called()
+        self.assertEqual(len(daemon.playback_queue), 0)
 
     def test_play_response_finalizes_queued_job_announcements(self) -> None:
         daemon = _bare_daemon()
@@ -1887,7 +1929,11 @@ class InterruptedTurnTests(unittest.TestCase):
             ],
         )
         self.assertEqual(len(daemon.playback_queue), 0)
-        self.assertIn("Hey Jarvis, second", drain.call_args.args[0])
+        self.assertEqual(
+            drain.call_args.args[0],
+            "Cursor finished test. Cursor finished test.",
+        )
+        self.assertNotIn("Hey Jarvis, second", drain.call_args.args[0])
 
 
 class WakeRecordingHandoffTests(unittest.TestCase):

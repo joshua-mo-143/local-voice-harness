@@ -1649,6 +1649,61 @@ def _foreground_failure_response(job: CursorJob) -> AssistantResponse:
     )
 
 
+def render_job_announcement(job: CursorJob) -> AssistantResponse:
+    """Render one claimed job snapshot for background display and speech."""
+
+    label = inbox.speakable_label_for(job)
+    identity = f"Cursor job {job.id} ({label})"
+    if job.status == JobStatus.COMPLETED:
+        detail = str(job.result or "").strip()
+        return AssistantResponse(
+            spoken_text=f"Cursor finished {label}.",
+            display_text=(
+                f"{identity} completed: {detail}"
+                if detail
+                else f"{identity} completed."
+            ),
+        )
+    if job.status == JobStatus.AWAITING_USER:
+        pending = questions.current(job)
+        question = (
+            question_prompt(pending)
+            if pending is not None
+            else str(job.question or job.result or "").strip()
+        )
+        return AssistantResponse(
+            spoken_text=f"Cursor needs clarification for {label}. {question}",
+            display_text=f"{identity} needs clarification: {question}",
+        )
+    if job.status == JobStatus.BLOCKED:
+        detail = str(job.result or "Open Herdr for recovery guidance.").strip()
+        return AssistantResponse(
+            spoken_text=f"Cursor needs attention for {label}.",
+            display_text=f"{identity} is blocked: {detail}",
+        )
+    if job.status == JobStatus.CANCELLED:
+        detail = str(job.result or "").strip()
+        return AssistantResponse(
+            spoken_text=f"Cursor cancelled {label}.",
+            display_text=(
+                f"{identity} was cancelled: {detail}"
+                if detail
+                else f"{identity} was cancelled."
+            ),
+        )
+    if job.status == JobStatus.FAILED:
+        stage = _job_failure_stage(job)
+        log_path = JOB_LOGS_DIR / f"{job.id}.log"
+        return AssistantResponse(
+            spoken_text=f"Cursor failed {label} during {stage}.",
+            display_text=(
+                f"{identity} failed during {stage}. "
+                f"Inspect {log_path} for diagnostic details before retrying."
+            ),
+        )
+    raise ValueError(f"{job.status.value} job cannot be announced")
+
+
 def _await_foreground(
     job_id: str, delivery_claims: DeliveryClaims | None
 ) -> CursorTurnResult:
