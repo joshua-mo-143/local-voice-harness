@@ -55,20 +55,26 @@ class ProcessHandleTests(unittest.TestCase):
     def test_open_accepts_matching_owner(self) -> None:
         from local_voice_harness.process import linux as process_linux
 
-        with (
-            mock.patch.object(
-                process_linux,
-                "capabilities",
-                return_value=process.ProcessCapabilities(True, True, True, True),
-            ),
-            mock.patch.object(os, "pidfd_open", return_value=7),
-            mock.patch.object(process_linux, "process_identity", return_value="start"),
-        ):
-            handle = process.ProcessHandle.open(42, expected_start="start")
+        read_fd, write_fd = os.pipe()
+        try:
+            with (
+                mock.patch.object(
+                    process_linux,
+                    "capabilities",
+                    return_value=process.ProcessCapabilities(True, True, True, True),
+                ),
+                mock.patch.object(os, "pidfd_open", return_value=read_fd),
+                mock.patch.object(
+                    process_linux, "process_identity", return_value="start"
+                ),
+            ):
+                handle = process.ProcessHandle.open(42, expected_start="start")
 
-        assert handle is not None
-        self.assertEqual(handle.pid, 42)
-        handle.close()
+            assert handle is not None
+            self.assertEqual(handle.pid, 42)
+            handle.close()
+        finally:
+            os.close(write_fd)
 
     def test_terminate_pidfd_escalates_to_sigkill(self) -> None:
         from local_voice_harness.process import linux as process_linux
