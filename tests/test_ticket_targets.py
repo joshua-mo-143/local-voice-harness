@@ -19,6 +19,42 @@ def test_scoped_github_numbers_preserve_order_and_deduplicate() -> None:
     assert all(reference.scoped for reference in extraction.references)
 
 
+def test_spoken_scoped_github_numbers_are_extracted() -> None:
+    extraction = extract_ticket_targets(
+        "Can you work on issues sixty six and sixty-seven?",
+        scope_source="github",
+        scope="Example/Project",
+    )
+
+    assert extraction.requested_count == 2
+    assert [reference.canonical for reference in extraction.references] == [
+        "Example/Project#66",
+        "Example/Project#67",
+    ]
+
+
+def test_spoken_hundreds_distinguish_internal_and_list_conjunctions() -> None:
+    extraction = extract_ticket_targets(
+        "Work on issues one hundred and fifty, two hundred and seven, "
+        "and one thousand two hundred and thirty-four",
+        scope_source="github",
+        scope="example/project",
+    )
+
+    assert [reference.canonical for reference in extraction.references] == [
+        "example/project#150",
+        "example/project#207",
+        "example/project#1234",
+    ]
+
+
+def test_spoken_bare_batch_without_scope_is_rejected() -> None:
+    extraction = extract_ticket_targets("Work on issues sixty six and sixty seven")
+
+    assert extraction.batch_requested
+    assert extraction.has_unresolved_scope
+
+
 def test_scoped_linear_numbers_use_canonical_team_key() -> None:
     extraction = extract_ticket_targets(
         "Work on tickets #7 and 9",
