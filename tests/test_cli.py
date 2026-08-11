@@ -8,6 +8,7 @@ from unittest import mock
 from local_voice_harness import cli
 from local_voice_harness.cursor.service import CursorTurnRequest, CursorTurnResult
 from local_voice_harness.cursor.store import QuarantineEvidence
+from local_voice_harness.responses import AssistantResponse
 from local_voice_harness.user_config import PlanApprovalMode, PlanApprovalPreferences
 
 
@@ -71,6 +72,24 @@ class JobsCliTests(unittest.TestCase):
                 reference="use the api repo",
             ),
         )
+
+    def test_jobs_command_prints_only_display_channel(self) -> None:
+        args = cli.parser().parse_args(["jobs", "status"])
+        response = AssistantResponse(
+            spoken_text="The job failed.",
+            display_text="Job 123 failed during setup.",
+        )
+        with (
+            mock.patch.object(
+                cli,
+                "cursor_turn",
+                return_value=CursorTurnResult(response, None),
+            ),
+            mock.patch("builtins.print") as output,
+        ):
+            cli.dispatch(args)
+
+        output.assert_called_once_with(response.display_text)
 
 
 class PlanApprovalCliTests(unittest.TestCase):

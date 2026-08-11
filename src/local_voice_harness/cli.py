@@ -40,6 +40,7 @@ from .recording import (
     start_recording,
     stop_recording,
 )
+from .responses import as_assistant_response
 from .service_manager import (
     audit_services,
     install_services,
@@ -310,7 +311,8 @@ def run_job_command(args: argparse.Namespace) -> None:
             action=args.jobs_command,
             reference=reference,
         )
-    print(cursor_turn(request).text)
+    response = as_assistant_response(cursor_turn(request).text)
+    print(response.display_text)
 
 
 def _print_quarantine_evidence(record: QuarantineEvidence) -> None:

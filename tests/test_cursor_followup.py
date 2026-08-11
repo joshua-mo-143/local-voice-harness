@@ -28,6 +28,7 @@ from local_voice_harness.integrations.herdr import (
     HerdrClient,
     HerdrError,
 )
+from local_voice_harness.responses import as_assistant_response
 
 
 @pytest.fixture
@@ -413,7 +414,7 @@ def test_cursor_turn_follow_up_reports_busy(store: JobStore, tmp_path: Path) -> 
     )
 
     assert result.session_id is None
-    assert "busy" in result.text.lower()
+    assert "busy" in as_assistant_response(result.text).display_text.lower()
 
 
 def test_cursor_turn_follow_up_reports_unavailable_for_stale_source(
@@ -431,7 +432,7 @@ def test_cursor_turn_follow_up_reports_unavailable_for_stale_source(
     )
 
     assert result.session_id is None
-    assert "follow up" in result.text.lower()
+    assert "follow up" in as_assistant_response(result.text).display_text.lower()
 
 
 def test_cursor_turn_follow_up_reports_unavailable_for_missing_parent(
@@ -447,7 +448,9 @@ def test_cursor_turn_follow_up_reports_unavailable_for_missing_parent(
     )
 
     assert result.session_id is None
-    assert "no longer follow up" in result.text.lower()
+    assert (
+        "no longer follow up" in as_assistant_response(result.text).display_text.lower()
+    )
 
 
 def test_cursor_turn_follow_up_reports_unavailable_for_quarantined_parent(
@@ -466,13 +469,15 @@ def test_cursor_turn_follow_up_reports_unavailable_for_quarantined_parent(
         )
 
     assert result.session_id is None
-    assert "no longer follow up" in result.text.lower()
+    assert (
+        "no longer follow up" in as_assistant_response(result.text).display_text.lower()
+    )
 
 
 def test_cursor_turn_follow_up_without_source_is_graceful(store: JobStore) -> None:
     result = cursor_turn(CursorTurnRequest("review the changes", action="follow_up"))
     assert result.session_id is None
-    assert "recent completed" in result.text.lower()
+    assert "recent completed" in as_assistant_response(result.text).display_text.lower()
 
 
 class _FakeHerdr:

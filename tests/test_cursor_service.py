@@ -13,7 +13,9 @@ from local_voice_harness.cursor import service
 from local_voice_harness.cursor.model import (
     CURRENT_SCHEMA_VERSION,
     CursorJob,
+    JobStatus,
     NewCursorJob,
+    WorkflowPhase,
 )
 from local_voice_harness.cursor.service import (
     CursorTurnRequest,
@@ -27,6 +29,7 @@ from local_voice_harness.integrations.github import (
     GitHubIssueLookupError,
     GitHubIssueLookupReason,
 )
+from local_voice_harness.responses import AssistantResponse, as_assistant_response
 
 
 def test_service_request_and_result_types_are_explicit() -> None:
@@ -121,14 +124,20 @@ def test_fanout_preflights_every_target_before_bounded_background_starts() -> No
         )
 
     assert result.session_id is None
-    assert result.text.index("example/project#1: accepted") < result.text.index(
+    response = as_assistant_response(result.text)
+    assert response.display_text.index(
+        "example/project#1: accepted"
+    ) < response.display_text.index("example/project#2: rejected")
+    assert response.display_text.index(
         "example/project#2: rejected"
+    ) < response.display_text.index("example/project#3: start-failed")
+    assert "job-one" in response.display_text
+    assert "job deletion maintenance is active" in response.display_text
+    assert response.spoken_text == (
+        "One job started; one ticket rejected; one job failed to start."
     )
-    assert result.text.index("example/project#2: rejected") < result.text.index(
-        "example/project#3: start-failed"
-    )
-    assert "job-one" in result.text
-    assert "job deletion maintenance is active" in result.text
+    assert "job-one" not in response.spoken_text
+    assert "job deletion maintenance is active" not in response.spoken_text
     foreground.assert_not_called()
 
 
@@ -197,7 +206,7 @@ def test_start_jobs_reports_active_ticket_conflict_as_rejected() -> None:
     read.assert_not_called()
 
 
-def test_single_github_lookup_failure_does_not_include_repository_identity() -> None:
+def test_single_github_lookup_failure_renders_target_by_channel() -> None:
     client = mock.Mock()
     client.issue_details.side_effect = GitHubIssueLookupError(
         GitHubIssueLookupReason.NOT_FOUND_OR_INACCESSIBLE,
@@ -218,10 +227,14 @@ def test_single_github_lookup_failure_does_not_include_repository_identity() -> 
         )
 
     assert result.session_id is None
-    assert result.text == (
-        "Ticket starts: rejected (I couldn't find or access that GitHub issue.)."
+    assert isinstance(result.text, AssistantResponse)
+    assert result.text.spoken_text == ("I couldn't find or access GitHub issue 42.")
+    assert result.text.display_text == (
+        "Ticket starts: very-long-owner-name/very-long-repository-name#42: "
+        "rejected (issue not found or inaccessible)."
     )
-    assert "very-long-owner-name" not in result.text
+    assert "very-long-owner-name" not in result.text.spoken_text
+    assert "GraphQL" not in result.text.display_text
 
 
 def test_start_job_enforces_unique_ticket_before_worker_launch() -> None:
@@ -393,8 +406,44 @@ def test_fanout_linear_capability_preflight_happens_before_any_start() -> None:
             )
         )
 
-    assert result.text.startswith("Ticket starts: ENG-1: accepted")
-    assert "ENG-2: accepted" in result.text
+    response = as_assistant_response(result.text)
+    assert response.display_text.startswith("Ticket starts: ENG-1: accepted")
+    assert "ENG-2: accepted" in response.display_text
+    assert response.spoken_text == "Two jobs started."
+
+
+def test_foreground_agent_failure_keeps_diagnostics_out_of_speech(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    job = mock.Mock(spec=CursorJob)
+    job.id = "123456789abc"
+    job.status = JobStatus.FAILED
+    job.error = "token=secret-value repository command failed"
+    job.worktree_provision_state = "failed"
+    job.agent_dispatch_state = None
+    job.workflow_phase = WorkflowPhase.FINISHED
+    monkeypatch.setattr(service, "JOB_LOGS_DIR", tmp_path / "logs")
+    with (
+        mock.patch.object(service, "read_job", return_value=job),
+        mock.patch.object(
+            service,
+            "_defer_or_acknowledge",
+            return_value=job,
+        ) as defer,
+    ):
+        result = service._await_foreground(job.id, [])
+
+    response = as_assistant_response(result.text)
+    assert response.spoken_text == ("The Cursor job failed during repository setup.")
+    assert response.display_text == (
+        f"Cursor job {job.id} failed during repository setup. "
+        f"Inspect {tmp_path / 'logs' / f'{job.id}.log'} for diagnostic details "
+        "before retrying."
+    )
+    assert "secret-value" not in response.spoken_text
+    assert "secret-value" not in response.display_text
+    defer.assert_called_once_with(job.id, [])
 
 
 def test_production_modules_do_not_import_jobs_facade() -> None:
