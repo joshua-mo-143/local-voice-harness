@@ -15,6 +15,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
+from ..integrations.github import GitHubError, load_github_provider_state
 from .model import (
     ACTIVE_STATUSES,
     CURRENT_SCHEMA_VERSION,
@@ -291,7 +292,12 @@ def _quarantine_may_reserve(
     harness_state = _mapping_field(raw, "harness_state")
     checkout_state = _mapping_field(raw, "checkout_state")
     provider_state = _mapping_field(raw, "provider_state")
-    github_state = _mapping_field(provider_state, "github")
+    try:
+        github_state = load_github_provider_state(
+            _mapping_field(provider_state, "github")
+        )
+    except GitHubError:
+        return True
     if status in {item.value for item in TERMINAL_STATUSES}:
         uncertain = any(
             str(value or "")

@@ -41,7 +41,15 @@ def test_v8_cursor_fixture_migrates_to_structured_agent_schema() -> None:
     assert record["implementer_target"] == "cursor-agent-61"
     assert record["harness_state"] == fixture("agent-v9.json")["harness_state"]
     assert record["checkout_state"] == fixture("agent-v9.json")["checkout_state"]
-    assert record["provider_state"] == fixture("agent-v9.json")["provider_state"]
+    assert record["provider_state"] == {
+        "github": {
+            "version": 1,
+            "repository": {"name": "owner/project"},
+            "issue": {"number": 61},
+            "fork": {"requested": False},
+        },
+        "linear": {"issue_key": "VOICE-61"},
+    }
 
 
 def test_v9_agent_fixture_loads_with_legacy_recovery_accessors() -> None:
@@ -56,6 +64,30 @@ def test_v9_agent_fixture_loads_with_legacy_recovery_accessors() -> None:
     assert job.repository == "/repo"
     assert job.worktree_path == "/repo-worktree"
     assert job.issue_key == "VOICE-61"
+
+
+def test_v12_github_state_migrates_losslessly_to_provider_owned_state() -> None:
+    job = AgentJob.from_dict(fixture("agent-v12-github.json"))
+
+    assert job.loaded_schema_version == 12
+    assert job.schema_version == CURRENT_SCHEMA_VERSION
+    assert job.fork_operation_state == "submitted"
+    assert job.fork_committed
+    assert job.fork_operation_login == "me"
+    assert job.fork_operation_target == "me/project"
+    assert job.pull_request_worktree_state == "quarantined"
+    assert job.worktree_path == "/repo-worktree"
+    provider_state = job.to_record()["provider_state"]
+    assert isinstance(provider_state, dict)
+    github = provider_state["github"]
+    assert isinstance(github, dict)
+    assert github["version"] == 1
+    fork = github["fork"]
+    pull_request = github["pull_request"]
+    assert isinstance(fork, dict)
+    assert isinstance(pull_request, dict)
+    assert fork["operation_state"] == "submitted"
+    assert pull_request["worktree_state"] == "quarantined"
 
 
 def test_v9_structured_record_requires_harness_kind() -> None:

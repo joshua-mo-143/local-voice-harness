@@ -95,6 +95,195 @@ class LocalGitRepositoryTests(unittest.TestCase):
                 commands,
             )
 
+    def test_checkout_remote_ref_verifies_oid_before_switching_branch(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkout = root / "project"
+            (checkout / ".git").mkdir(parents=True)
+            repository = LocalGitRepository(clone_root=root, allowed_root=root)
+            oid = "a" * 40
+            responses = [
+                _completed("https://github.com/source/project\n"),
+                _completed(),
+                _completed(),
+                _completed(f"{oid}\n"),
+                _completed(),
+                _completed(f"{oid}\n"),
+                _completed("voice/github-pr-job\n"),
+            ]
+
+            with mock.patch(
+                "local_voice_harness.local_git.run_command",
+                side_effect=responses,
+            ) as run:
+                branch = repository.checkout_remote_ref(
+                    checkout,
+                    remote_url="https://github.com/source/project",
+                    remote_ref="refs/pull/42/head",
+                    branch="voice/github-pr-job",
+                    expected_oid=oid,
+                )
+
+            self.assertEqual(branch, "voice/github-pr-job")
+            commands = [call.args[0] for call in run.call_args_list]
+            self.assertIn(
+                [
+                    "git",
+                    "-C",
+                    str(checkout),
+                    "fetch",
+                    "--force",
+                    "--no-tags",
+                    "--",
+                    "https://github.com/source/project",
+                    "refs/pull/42/head",
+                ],
+                commands,
+            )
+            self.assertIn(
+                [
+                    "git",
+                    "-C",
+                    str(checkout),
+                    "checkout",
+                    "-B",
+                    "voice/github-pr-job",
+                    "FETCH_HEAD",
+                ],
+                commands,
+            )
+
+    def test_checkout_remote_ref_refuses_metadata_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkout = root / "project"
+            (checkout / ".git").mkdir(parents=True)
+            repository = LocalGitRepository(clone_root=root, allowed_root=root)
+
+            with mock.patch(
+                "local_voice_harness.local_git.run_command",
+                side_effect=[
+                    _completed("https://github.com/source/project\n"),
+                    _completed(),
+                    _completed(),
+                    _completed(f"{'b' * 40}\n"),
+                ],
+            ) as run:
+                with self.assertRaisesRegex(LocalGitError, "does not match"):
+                    repository.checkout_remote_ref(
+                        checkout,
+                        remote_url="https://github.com/source/project",
+                        remote_ref="refs/pull/42/head",
+                        branch="voice/github-pr-job",
+                        expected_oid="a" * 40,
+                    )
+
+            self.assertFalse(
+                any("checkout" in call.args[0] for call in run.call_args_list)
+            )
+
+    def test_checkout_remote_ref_must_be_inside_allowed_root(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            allowed = root / "allowed"
+            checkout = root / "outside"
+            (checkout / ".git").mkdir(parents=True)
+            repository = LocalGitRepository(
+                clone_root=allowed / "src",
+                allowed_root=allowed,
+            )
+
+            with self.assertRaisesRegex(LocalGitError, "escapes"):
+                repository.checkout_remote_ref(
+                    checkout,
+                    remote_url="https://github.com/source/project",
+                    remote_ref="refs/pull/42/head",
+                    branch="voice/github-pr-job",
+                    expected_oid="a" * 40,
+                )
+
+    def test_checkout_remote_ref_rejects_invalid_inputs_before_fetch(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkout = root / "project"
+            (checkout / ".git").mkdir(parents=True)
+            repository = LocalGitRepository(clone_root=root, allowed_root=root)
+            invalid = (
+                ("file:///tmp/project", "refs/pull/42/head", "a" * 40),
+                (
+                    "https://github.com/source/project",
+                    "refs/pull/42 bad/head",
+                    "a" * 40,
+                ),
+                (
+                    "https://github.com/source/project",
+                    "refs/pull/42/head",
+                    "not-an-oid",
+                ),
+            )
+            for remote_url, remote_ref, expected_oid in invalid:
+                with (
+                    self.subTest(remote_ref=remote_ref),
+                    self.assertRaises(LocalGitError),
+                ):
+                    repository.checkout_remote_ref(
+                        checkout,
+                        branch="voice/github-pr-job",
+                        remote_url=remote_url,
+                        remote_ref=remote_ref,
+                        expected_oid=expected_oid,
+                    )
+
+    def test_checkout_remote_ref_detects_post_checkout_oid_change(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkout = root / "project"
+            (checkout / ".git").mkdir(parents=True)
+            repository = LocalGitRepository(clone_root=root, allowed_root=root)
+            oid = "a" * 40
+
+            with mock.patch(
+                "local_voice_harness.local_git.run_command",
+                side_effect=[
+                    _completed("https://github.com/source/project\n"),
+                    _completed(),
+                    _completed(),
+                    _completed(f"{oid}\n"),
+                    _completed(),
+                    _completed(f"{'b' * 40}\n"),
+                ],
+            ):
+                with self.assertRaisesRegex(LocalGitError, "changed unexpectedly"):
+                    repository.checkout_remote_ref(
+                        checkout,
+                        remote_url="https://github.com/source/project",
+                        remote_ref="refs/pull/42/head",
+                        branch="voice/github-pr-job",
+                        expected_oid=oid,
+                    )
+
+    def test_checkout_remote_ref_rejects_wrong_repository_origin(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkout = root / "project"
+            (checkout / ".git").mkdir(parents=True)
+            repository = LocalGitRepository(clone_root=root, allowed_root=root)
+
+            with mock.patch(
+                "local_voice_harness.local_git.run_command",
+                return_value=_completed("https://github.com/other/project\n"),
+            ) as run:
+                with self.assertRaisesRegex(LocalGitError, "origin"):
+                    repository.checkout_remote_ref(
+                        checkout,
+                        remote_url="https://github.com/source/project",
+                        remote_ref="refs/pull/42/head",
+                        branch="voice/github-pr-job",
+                        expected_oid="a" * 40,
+                    )
+
+            self.assertEqual(run.call_count, 1)
+
     def test_materialize_is_contained_temporary_verified_and_atomic(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             allowed = Path(temporary)

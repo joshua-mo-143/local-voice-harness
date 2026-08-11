@@ -120,6 +120,14 @@ class PersistentGitHub(GitHubClient):
     def __init__(self, effects: PersistentEffects) -> None:
         self.effects = effects
 
+    def inspect_public_repository(self, repository: str) -> GitHubRepository:
+        return GitHubRepository(
+            name_with_owner=repository,
+            url=f"https://github.com/{repository}",
+            is_private=False,
+            default_branch="main",
+        )
+
     def reconcile_fork(
         self, source: GitHubRepository, target_name: str
     ) -> GitHubRepository | None:

@@ -20,6 +20,7 @@ from ..integrations.github import (
     GitHubIssue,
     GitHubIssueLookupError,
     GitHubIssueLookupReason,
+    GitHubProvider,
     format_issue_context,
     github_issue_from_url,
 )
@@ -448,7 +449,7 @@ def _rejected(
 def _github_target(
     reference: TicketReference,
     base: StartJobRequest,
-    client: GitHubClient,
+    provider: GitHubProvider,
     *,
     foreground: bool,
 ) -> TicketJobRequest | TicketStartOutcome:
@@ -461,7 +462,7 @@ def _github_target(
         return _rejected(reference, "GitHub issue reference is invalid")
     issue = GitHubIssue(owner, name, int(number_text))
     try:
-        details = client.issue_details(issue)
+        details = provider.resolve_issue(issue)
     except GitHubError as exc:
         if isinstance(exc, GitHubIssueLookupError):
             return _rejected(
@@ -548,7 +549,9 @@ def _preflight_ticket_targets(
     slots: list[TicketStartOutcome | None] = [None] * len(extraction.references)
     prepared: list[tuple[int, TicketJobRequest]] = []
     github_available = integration_enabled("github", integrations)
-    github_client = integrations.github_client() if github_available else None
+    github_provider = (
+        GitHubProvider(integrations.github_client()) if github_available else None
+    )
     linear_capability_error: str | None = None
     linear_capability_checked = False
 
@@ -562,11 +565,11 @@ def _preflight_ticket_targets(
         if reference.source == "github":
             candidate: TicketJobRequest | TicketStartOutcome
             if github_available:
-                assert github_client is not None
+                assert github_provider is not None
                 candidate = _github_target(
                     reference,
                     base,
-                    github_client,
+                    github_provider,
                     foreground=foreground,
                 )
             else:

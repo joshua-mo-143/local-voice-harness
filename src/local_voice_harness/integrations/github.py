@@ -4,7 +4,7 @@ import json
 import logging
 import re
 import subprocess
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
@@ -207,6 +207,27 @@ class GitHubPullRequest:
     @property
     def name_with_owner(self) -> str:
         return f"{self.owner}/{self.repository}"
+
+
+@dataclass(frozen=True)
+class GitHubForkPlan:
+    source: GitHubRepository
+    login: str
+    target: str
+
+
+@dataclass(frozen=True)
+class GitHubPullRequestCheckoutInputs:
+    remote_url: str
+    head_ref: str
+    head_oid: str
+
+
+@dataclass(frozen=True)
+class GitHubPullRequestPlan:
+    source: GitHubRepository
+    pull_request: GitHubPullRequest
+    checkout: GitHubPullRequestCheckoutInputs
 
 
 @dataclass(frozen=True)
@@ -431,7 +452,8 @@ class GitHubClient:
                 repository,
                 "--json",
                 "number,title,state,author,labels,body,comments,url,"
-                "isDraft,baseRefName,headRefName,additions,deletions,changedFiles",
+                "isDraft,baseRefName,headRefName,headRefOid,"
+                "additions,deletions,changedFiles",
             ],
             timeout=5,
         )
@@ -980,6 +1002,108 @@ def _canonical_repository(repository: str, details: dict[str, object] | None) ->
     return canonical if canonical.casefold() == repository.casefold() else repository
 
 
+_GITHUB_STATE_VERSION = 1
+_GITHUB_STATE_SECTIONS: dict[str, dict[str, str]] = {
+    "repository": {"name": "github_repository"},
+    "issue": {
+        "number": "github_issue",
+        "url": "github_issue_url",
+        "context": "github_issue_context",
+    },
+    "pull_request": {
+        "number": "github_pull_request",
+        "worktree_state": "pull_request_worktree_state",
+        "branch": "pull_request_branch",
+        "worktree_error": "pull_request_worktree_error",
+        "remote_url": "pull_request_remote_url",
+        "head_ref": "pull_request_head_ref",
+        "head_oid": "pull_request_head_oid",
+    },
+    "fork": {
+        "requested": "fork_requested",
+        "confirmed": "fork_confirmed",
+        "committed": "fork_committed",
+        "exists": "fork_exists",
+        "dispatch_exited": "fork_dispatch_exited",
+        "committed_at": "fork_committed_at",
+        "operation_state": "fork_operation_state",
+        "operation_source": "fork_operation_source",
+        "operation_source_url": "fork_operation_source_url",
+        "operation_source_parent": "fork_operation_source_parent",
+        "operation_source_default_branch": "fork_operation_source_default_branch",
+        "operation_source_private": "fork_operation_source_private",
+        "operation_login": "fork_operation_login",
+        "operation_target": "fork_operation_target",
+        "repository": "fork_repository",
+        "reconcile_attempts": "fork_reconcile_attempts",
+        "absent_observations": "fork_absent_observations",
+        "next_reconcile_at": "fork_next_reconcile_at",
+        "last_reconciled_at": "fork_last_reconciled_at",
+        "confirmed_absent_at": "fork_confirmed_absent_at",
+        "automatic_reconcile_stopped_at": "fork_automatic_reconcile_stopped_at",
+        "retained_at": "fork_retained_at",
+    },
+}
+GITHUB_PROVIDER_STATE_FIELDS = frozenset(
+    field for section in _GITHUB_STATE_SECTIONS.values() for field in section.values()
+)
+
+
+def load_github_provider_state(state: Mapping[str, object]) -> dict[str, object]:
+    """Convert legacy flat or nested v1 GitHub provider state to flat fields."""
+
+    if not isinstance(state, Mapping):
+        raise GitHubError("GitHub provider state must be an object")
+    values = dict(state)
+    if not values:
+        return {}
+    if "version" not in values:
+        unsupported = set(values) - GITHUB_PROVIDER_STATE_FIELDS
+        if unsupported:
+            field = sorted(unsupported)[0]
+            raise GitHubError(
+                f"GitHub provider state contains unsupported field {field}"
+            )
+        return values
+    if values.get("version") != _GITHUB_STATE_VERSION:
+        raise GitHubError("unsupported GitHub provider state version")
+    unsupported_sections = set(values) - {"version", *_GITHUB_STATE_SECTIONS}
+    if unsupported_sections:
+        section = sorted(unsupported_sections)[0]
+        raise GitHubError(
+            f"GitHub provider state contains unsupported section {section}"
+        )
+    flattened: dict[str, object] = {}
+    for section_name, fields in _GITHUB_STATE_SECTIONS.items():
+        section_value = values.get(section_name, {})
+        if not isinstance(section_value, Mapping):
+            raise GitHubError(
+                f"GitHub provider state {section_name} section must be an object"
+            )
+        section = dict(section_value)
+        unsupported = set(section) - set(fields)
+        if unsupported:
+            field = sorted(unsupported)[0]
+            raise GitHubError(
+                f"GitHub provider state {section_name} contains unsupported field {field}"
+            )
+        for name, value in section.items():
+            flattened[fields[name]] = value
+    return flattened
+
+
+def dump_github_provider_state(state: Mapping[str, object]) -> dict[str, object]:
+    """Serialize GitHub provider fields as clearly nested durable v1 state."""
+
+    flat = load_github_provider_state(state)
+    serialized: dict[str, object] = {"version": _GITHUB_STATE_VERSION}
+    for section_name, fields in _GITHUB_STATE_SECTIONS.items():
+        section = {name: flat[field] for name, field in fields.items() if field in flat}
+        if section:
+            serialized[section_name] = section
+    return serialized
+
+
 class GitHubProvider:
     """Built-in context provider for GitHub repositories, issues, and PRs."""
 
@@ -987,6 +1111,202 @@ class GitHubProvider:
 
     def __init__(self, client: GitHubClient) -> None:
         self._client = client
+
+    @staticmethod
+    def load_state(state: Mapping[str, object]) -> dict[str, object]:
+        return load_github_provider_state(state)
+
+    @staticmethod
+    def dump_state(state: Mapping[str, object]) -> dict[str, object]:
+        return dump_github_provider_state(state)
+
+    def resolve_repository(
+        self, repository: str, *, public: bool = False
+    ) -> GitHubRepository:
+        if public:
+            return self._client.inspect_public_repository(repository)
+        return self._client.inspect_repository(repository)
+
+    @property
+    def local_git(self) -> LocalGitRepository:
+        """Return the generic local-repository boundary configured for this provider."""
+
+        return self._client.local_git
+
+    def provision_issue(
+        self,
+        issue: GitHubIssue,
+        *,
+        candidates: list[Path] | None = None,
+        checkpoint: Checkpoint | None = None,
+    ) -> ProvisionedIssue:
+        return self._client.provision_issue(
+            issue,
+            candidates=candidates,
+            checkpoint=checkpoint,
+        )
+
+    def resolve_issue(self, issue: GitHubIssue) -> dict[str, object]:
+        """Validate and resolve current forge metadata for an issue."""
+
+        return self._client.issue_details(issue)
+
+    def materialize_repository(
+        self,
+        source: GitHubRepository,
+        *,
+        checkpoint: Checkpoint | None = None,
+    ) -> Path:
+        return self._client.ensure_repository_clone(source, checkpoint=checkpoint)
+
+    def materialize_fork(
+        self,
+        plan: GitHubForkPlan,
+        fork: GitHubRepository,
+        *,
+        checkpoint: Checkpoint | None = None,
+    ) -> Path:
+        self.validate_fork_plan(
+            plan,
+            materialized_repository=fork.name_with_owner,
+        )
+        return self._client.ensure_clone(plan.source, fork, checkpoint=checkpoint)
+
+    def plan_fork(self, repository: str) -> GitHubForkPlan:
+        source, login, target = self._client.prepare_public_fork(repository)
+        plan = GitHubForkPlan(source=source, login=login, target=target)
+        self.validate_fork_plan(plan)
+        return plan
+
+    def validate_fork_plan(
+        self,
+        plan: GitHubForkPlan,
+        *,
+        materialized_repository: str | None = None,
+    ) -> None:
+        source = GitHubClient.validate_repository(plan.source.name_with_owner)
+        if plan.source.is_private:
+            raise GitHubError("the focused GitHub repository is private")
+        try:
+            source_remote = ExpectedRemote.from_url(plan.source.url)
+        except LocalGitError as exc:
+            raise GitHubError("GitHub fork source URL is invalid") from exc
+        if source_remote.identity != f"github.com/{source.casefold()}":
+            raise GitHubError("GitHub fork source URL does not match its repository")
+        if re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})", plan.login) is None:
+            raise GitHubError("GitHub fork plan has an invalid login")
+        source_owner, repository_name = source.split("/", 1)
+        expected_target = (
+            source
+            if source_owner.casefold() == plan.login.casefold()
+            else f"{plan.login}/{repository_name}"
+        )
+        target = GitHubClient.validate_repository(plan.target)
+        if target.casefold() != expected_target.casefold():
+            raise GitHubError("GitHub fork plan has an invalid target")
+        if (
+            materialized_repository is not None
+            and GitHubClient.validate_repository(materialized_repository).casefold()
+            != target.casefold()
+        ):
+            raise GitHubError(
+                "persisted GitHub fork repository does not match its target"
+            )
+
+    def refresh_fork_plan(self, plan: GitHubForkPlan) -> GitHubForkPlan:
+        """Re-resolve persisted source metadata before trusting fork relationships."""
+
+        source = self.resolve_repository(plan.source.name_with_owner, public=True)
+        if source.name_with_owner.casefold() != plan.source.name_with_owner.casefold():
+            raise GitHubError("GitHub fork source identity changed unexpectedly")
+        refreshed = GitHubForkPlan(
+            source=source,
+            login=plan.login,
+            target=plan.target,
+        )
+        self.validate_fork_plan(refreshed)
+        return refreshed
+
+    def observe_fork(self, plan: GitHubForkPlan) -> GitHubRepository | None:
+        plan = self.refresh_fork_plan(plan)
+        return self._client.reconcile_fork(plan.source, plan.target)
+
+    def submit_fork(
+        self,
+        plan: GitHubForkPlan,
+        *,
+        confirmed: bool,
+        checkpoint: Checkpoint | None = None,
+        before_submit: Callable[[], None] | None = None,
+    ) -> GitHubRepository:
+        if not confirmed:
+            raise GitHubError("GitHub fork creation requires explicit confirmation")
+        self.validate_fork_plan(plan)
+        return self._client.ensure_fork(
+            plan.source,
+            plan.login,
+            checkpoint=checkpoint,
+            before_submit=before_submit,
+        )
+
+    def pull_request_checkout_inputs(
+        self,
+        source: GitHubRepository,
+        pull_request: GitHubPullRequest,
+        details: Mapping[str, object],
+    ) -> GitHubPullRequestCheckoutInputs:
+        if pull_request.number <= 0:
+            raise GitHubError("GitHub pull request number must be positive")
+        if pull_request.name_with_owner.casefold() != source.name_with_owner.casefold():
+            raise GitHubError("pull request does not belong to the resolved repository")
+        head_oid = str(details.get("headRefOid") or "")
+        inputs = GitHubPullRequestCheckoutInputs(
+            remote_url=source.url,
+            head_ref=f"refs/pull/{pull_request.number}/head",
+            head_oid=head_oid.lower(),
+        )
+        self.validate_pull_request_checkout_inputs(
+            source.name_with_owner,
+            pull_request.number,
+            inputs,
+        )
+        return inputs
+
+    def validate_pull_request_checkout_inputs(
+        self,
+        repository: str,
+        number: int,
+        inputs: GitHubPullRequestCheckoutInputs,
+    ) -> None:
+        """Reject persisted checkout metadata that no longer proves GitHub identity."""
+
+        repository = GitHubClient.validate_repository(repository)
+        try:
+            expected = ExpectedRemote.from_url(inputs.remote_url)
+        except LocalGitError as exc:
+            raise GitHubError("GitHub pull-request remote URL is invalid") from exc
+        if expected.identity != f"github.com/{repository.casefold()}":
+            raise GitHubError(
+                "GitHub pull-request remote does not match its repository"
+            )
+        if inputs.head_ref != f"refs/pull/{number}/head":
+            raise GitHubError("GitHub pull-request ref does not match its number")
+        if re.fullmatch(r"[0-9a-f]{40}", inputs.head_oid) is None:
+            raise GitHubError("GitHub returned an invalid pull request head OID")
+
+    def plan_pull_request(self, repository: str, number: int) -> GitHubPullRequestPlan:
+        if number <= 0:
+            raise GitHubError("GitHub pull request number must be positive")
+        source = self.resolve_repository(repository)
+        owner, name = source.name_with_owner.split("/", 1)
+        pull_request = GitHubPullRequest(owner, name, number)
+        details = self._client.pull_request_details(pull_request)
+        checkout = self.pull_request_checkout_inputs(source, pull_request, details)
+        return GitHubPullRequestPlan(
+            source=source,
+            pull_request=pull_request,
+            checkout=checkout,
+        )
 
     def matches(self, url: str) -> bool:
         return _github_url(url)

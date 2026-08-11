@@ -8,6 +8,12 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any
 
+from ..integrations.github import (
+    GITHUB_PROVIDER_STATE_FIELDS,
+    GitHubError,
+    dump_github_provider_state,
+    load_github_provider_state,
+)
 from ..questions import Question, QuestionError
 
 CURRENT_SCHEMA_VERSION = 13
@@ -257,6 +263,9 @@ _STRING_FIELDS = frozenset(
         "pull_request_worktree_state",
         "pull_request_branch",
         "pull_request_worktree_error",
+        "pull_request_remote_url",
+        "pull_request_head_ref",
+        "pull_request_head_oid",
         "agent_hint",
         "agent_name",
         "issue_key",
@@ -520,40 +529,7 @@ _CHECKOUT_STATE_FIELDS = frozenset(
         "worktree_quarantine_acknowledged_at",
     }
 )
-_GITHUB_STATE_FIELDS = frozenset(
-    {
-        "github_repository",
-        "github_issue",
-        "github_issue_url",
-        "github_issue_context",
-        "github_pull_request",
-        "fork_requested",
-        "fork_confirmed",
-        "fork_committed",
-        "fork_exists",
-        "fork_dispatch_exited",
-        "fork_committed_at",
-        "fork_operation_state",
-        "fork_operation_source",
-        "fork_operation_source_url",
-        "fork_operation_source_parent",
-        "fork_operation_source_default_branch",
-        "fork_operation_source_private",
-        "fork_operation_login",
-        "fork_operation_target",
-        "fork_repository",
-        "fork_reconcile_attempts",
-        "fork_absent_observations",
-        "fork_next_reconcile_at",
-        "fork_last_reconciled_at",
-        "fork_confirmed_absent_at",
-        "fork_automatic_reconcile_stopped_at",
-        "fork_retained_at",
-        "pull_request_worktree_state",
-        "pull_request_branch",
-        "pull_request_worktree_error",
-    }
-)
+_GITHUB_STATE_FIELDS = GITHUB_PROVIDER_STATE_FIELDS
 _LINEAR_STATE_FIELDS = frozenset({"issue_key"})
 _CHECKOUT_ALIASES = {
     "branch": "worktree_branch",
@@ -576,9 +552,13 @@ def _flatten_structured_state(values: dict[str, object]) -> None:
     harness_state = _object_mapping(values.pop("harness_state", {}), "harness_state")
     checkout_state = _object_mapping(values.pop("checkout_state", {}), "checkout_state")
     provider_state = _object_mapping(values.pop("provider_state", {}), "provider_state")
-    github_state = _object_mapping(
+    raw_github_state = _object_mapping(
         provider_state.get("github", {}), "provider_state.github"
     )
+    try:
+        github_state = load_github_provider_state(raw_github_state)
+    except GitHubError as exc:
+        raise JobValidationError(str(exc)) from exc
     linear_state = _object_mapping(
         provider_state.get("linear", {}), "provider_state.linear"
     )
@@ -662,6 +642,8 @@ def _advance_legacy_version(values: dict[str, object], version: int) -> None:
         values.setdefault("plan_approval_completion_pending", False)
     elif version == 12:
         values.setdefault("issue_provider", _infer_legacy_issue_provider(values))
+        # The GitHub provider-state serializer independently migrates its
+        # legacy flat v12 payload to the nested provider-owned representation.
     values["schema_version"] = version + 1
 
 
@@ -750,7 +732,7 @@ def _structured_record(values: Mapping[str, object]) -> dict[str, object]:
     record["checkout_state"] = checkout_state
     provider_state: dict[str, object] = {}
     if github_state:
-        provider_state["github"] = github_state
+        provider_state["github"] = dump_github_provider_state(github_state)
     if linear_state:
         provider_state["linear"] = linear_state
     record["provider_state"] = provider_state
@@ -1595,6 +1577,18 @@ class AgentJob:
         return self._optional_string("pull_request_worktree_error")
 
     @property
+    def pull_request_remote_url(self) -> str | None:
+        return self._optional_string("pull_request_remote_url")
+
+    @property
+    def pull_request_head_ref(self) -> str | None:
+        return self._optional_string("pull_request_head_ref")
+
+    @property
+    def pull_request_head_oid(self) -> str | None:
+        return self._optional_string("pull_request_head_oid")
+
+    @property
     def agent_hint(self) -> str | None:
         return self._optional_string("agent_hint")
 
@@ -1851,6 +1845,10 @@ class AgentJob:
     @property
     def fork_operation_source_default_branch(self) -> str | None:
         return self._optional_string("fork_operation_source_default_branch")
+
+    @property
+    def fork_operation_login(self) -> str | None:
+        return self._optional_string("fork_operation_login")
 
     @property
     def fork_operation_source_private(self) -> bool:

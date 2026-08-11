@@ -31,6 +31,10 @@ class LocalGitOperationAmbiguous(LocalGitError):
     pass
 
 
+class LocalGitRefChanged(LocalGitError):
+    """A fetched moving ref no longer matches its resolved commit."""
+
+
 def remote_identity(remote: str) -> str | None:
     """Return a protocol-independent host/path identity for a Git remote."""
     value = remote.strip().removesuffix(".git")
@@ -173,6 +177,61 @@ class LocalGitRepository:
             "HEAD",
         ).stdout.strip()
         return branch or None
+
+    def checkout_remote_ref(
+        self,
+        checkout: Path,
+        *,
+        remote_url: str,
+        remote_ref: str,
+        branch: str,
+        expected_oid: str,
+        checkpoint: Checkpoint | None = None,
+    ) -> str:
+        """Fetch a validated remote ref and check out its expected commit."""
+
+        checkout = checkout.resolve()
+        try:
+            checkout.relative_to(self.allowed_root)
+        except ValueError as exc:
+            raise LocalGitError(
+                "Git checkout escapes the allowed project root"
+            ) from exc
+        expected_remote = ExpectedRemote.from_url(remote_url)
+        if not remote_ref.startswith("refs/") or any(
+            character.isspace() for character in remote_ref
+        ):
+            raise LocalGitError("pull-request remote ref is invalid")
+        if not re.fullmatch(r"[0-9a-fA-F]{40}", expected_oid):
+            raise LocalGitError("pull-request head OID is invalid")
+        self.verify_checkout(checkout, expected_remote)
+        self.git(checkout, "check-ref-format", "--branch", branch)
+        if checkpoint is not None:
+            checkpoint()
+        self.git(
+            checkout,
+            "fetch",
+            "--force",
+            "--no-tags",
+            "--",
+            remote_url,
+            remote_ref,
+            timeout=180,
+        )
+        if checkpoint is not None:
+            checkpoint()
+        fetched_oid = self.git(checkout, "rev-parse", "FETCH_HEAD").stdout.strip()
+        if fetched_oid.casefold() != expected_oid.casefold():
+            raise LocalGitRefChanged(
+                "fetched pull-request head does not match GitHub metadata"
+            )
+        self.git(checkout, "checkout", "-B", branch, "FETCH_HEAD", timeout=180)
+        if checkpoint is not None:
+            checkpoint()
+        checked_out_oid = self.git(checkout, "rev-parse", "HEAD").stdout.strip()
+        if checked_out_oid.casefold() != expected_oid.casefold():
+            raise LocalGitError("checked-out pull-request head changed unexpectedly")
+        return self.current_branch(checkout) or branch
 
     def _validate_root(self) -> None:
         try:

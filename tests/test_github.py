@@ -305,6 +305,7 @@ class GitHubClientTests(unittest.TestCase):
             run.call_args_list[1].args[0][:6],
             ["gh", "pr", "view", "7", "--repo", "example/project"],
         )
+        self.assertIn("headRefOid", run.call_args_list[1].args[0][-1])
 
     def test_context_metadata_rejects_invalid_responses(self) -> None:
         client = GitHubClient()

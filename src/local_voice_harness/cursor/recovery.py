@@ -10,7 +10,13 @@ from typing import cast
 
 from ..diagnostic_safety import redact_diagnostic
 from ..errors import HarnessError
-from ..integrations.github import GitHubClient, GitHubError, GitHubRepository
+from ..integrations.github import (
+    GitHubClient,
+    GitHubError,
+    GitHubForkPlan,
+    GitHubProvider,
+    GitHubRepository,
+)
 from ..integrations.herdr import (
     HerdrClient,
     HerdrError,
@@ -43,9 +49,18 @@ DELIVERY_RETRY_SECONDS = 5.0
 PROMPT_ABSENT_OBSERVATIONS = 2
 
 HerdrFactory = Callable[[], HerdrClient]
-GitHubFactory = Callable[[], GitHubClient]
+GitHubFactory = Callable[[], GitHubClient | GitHubProvider]
 LaunchWorker = Callable[[str], None]
 RequireIssueProvider = Callable[[str | None], None]
+
+
+def _github_provider(factory: GitHubFactory) -> GitHubProvider:
+    integration = factory()
+    return (
+        integration
+        if isinstance(integration, GitHubProvider)
+        else GitHubProvider(integration)
+    )
 
 
 def _agent_not_found(exc: HerdrError) -> bool:
@@ -258,7 +273,12 @@ def reconcile_uncertain_fork(
         )
         return
     try:
-        fork = github_factory().reconcile_fork(source, target)
+        plan = GitHubForkPlan(
+            source=source,
+            login=job.fork_operation_login or target.split("/", 1)[0],
+            target=target,
+        )
+        fork = _github_provider(github_factory).observe_fork(plan)
     except GitHubError:
         _record_reconciliation_observation(
             store,

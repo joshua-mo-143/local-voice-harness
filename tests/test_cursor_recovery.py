@@ -313,6 +313,12 @@ class CursorRecoveryTests(unittest.TestCase):
         herdr.get_agent.side_effect = HerdrError("observe", code="operation_timeout")
         herdr.run_json.side_effect = HerdrError("observe", code="operation_timeout")
         github = mock.Mock()
+        github.inspect_public_repository.return_value = GitHubRepository(
+            "source/project",
+            "https://github.com/source/project",
+            False,
+            "main",
+        )
         github.reconcile_fork.side_effect = GitHubError("observe")
         launch = mock.Mock()
 
@@ -358,6 +364,12 @@ class CursorRecoveryTests(unittest.TestCase):
             "source/project",
         )
         github = mock.Mock()
+        github.inspect_public_repository.return_value = GitHubRepository(
+            "source/project",
+            "https://github.com/source/project",
+            False,
+            "main",
+        )
         github.reconcile_fork.side_effect = [None, None, None, None, None, visible]
 
         for observed_at in (100.0, 105.0, 115.0, 135.0, 175.0):

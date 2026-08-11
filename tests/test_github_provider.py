@@ -8,9 +8,15 @@ from local_voice_harness.integrations import github
 from local_voice_harness.integrations.github import (
     GitHubClient,
     GitHubError,
+    GitHubForkPlan,
     GitHubIssue,
     GitHubProvider,
     GitHubPullRequest,
+    GitHubPullRequestCheckoutInputs,
+    GitHubPullRequestPlan,
+    GitHubRepository,
+    dump_github_provider_state,
+    load_github_provider_state,
 )
 
 
@@ -117,6 +123,147 @@ class GitHubProviderTests(unittest.TestCase):
 
     def test_satisfies_context_provider_contract(self) -> None:
         self.assertIsInstance(self.provider, ContextProvider)
+
+    def test_provider_plans_observes_and_submits_fork(self) -> None:
+        source = GitHubRepository(
+            "source/project",
+            "https://github.com/source/project",
+            False,
+            "main",
+        )
+        fork = GitHubRepository(
+            "me/project",
+            "https://github.com/me/project",
+            False,
+            "main",
+            "source/project",
+        )
+        self.client.prepare_public_fork.return_value = (source, "me", "me/project")
+        self.client.inspect_public_repository.return_value = source
+        self.client.reconcile_fork.return_value = None
+        self.client.ensure_fork.return_value = fork
+
+        plan = self.provider.plan_fork("source/project")
+
+        self.assertEqual(plan, GitHubForkPlan(source, "me", "me/project"))
+        self.assertIsNone(self.provider.observe_fork(plan))
+        self.assertEqual(self.provider.submit_fork(plan, confirmed=True), fork)
+        self.client.reconcile_fork.assert_called_once_with(source, "me/project")
+        self.client.ensure_fork.assert_called_once_with(
+            source,
+            "me",
+            checkpoint=None,
+            before_submit=None,
+        )
+
+    def test_provider_requires_confirmation_before_fork_submission(self) -> None:
+        source = GitHubRepository(
+            "source/project",
+            "https://github.com/source/project",
+            False,
+            "main",
+        )
+        plan = GitHubForkPlan(source, "me", "me/project")
+
+        with self.assertRaisesRegex(GitHubError, "confirmation"):
+            self.provider.submit_fork(plan, confirmed=False)
+
+        self.client.ensure_fork.assert_not_called()
+
+    def test_provider_rejects_inconsistent_persisted_fork_plan(self) -> None:
+        source = GitHubRepository(
+            "source/project",
+            "https://evil.example/source/project",
+            False,
+            "main",
+        )
+        with self.assertRaisesRegex(GitHubError, "source URL"):
+            self.provider.validate_fork_plan(GitHubForkPlan(source, "me", "me/project"))
+
+        source = GitHubRepository(
+            "source/project",
+            "https://github.com/source/project",
+            False,
+            "main",
+        )
+        with self.assertRaisesRegex(GitHubError, "invalid target"):
+            self.provider.validate_fork_plan(
+                GitHubForkPlan(source, "me", "other/project")
+            )
+        with self.assertRaisesRegex(GitHubError, "does not match its target"):
+            self.provider.validate_fork_plan(
+                GitHubForkPlan(source, "me", "me/project"),
+                materialized_repository="other/project",
+            )
+
+    def test_provider_plans_pull_request_checkout_inputs_without_mutation(
+        self,
+    ) -> None:
+        source = GitHubRepository(
+            "Example/Project",
+            "https://github.com/Example/Project",
+            False,
+            "main",
+        )
+        self.client.inspect_repository.return_value = source
+        self.client.pull_request_details.return_value = {
+            "number": 7,
+            "headRefOid": "a" * 40,
+        }
+
+        plan = self.provider.plan_pull_request("example/project", 7)
+
+        self.assertEqual(
+            plan,
+            GitHubPullRequestPlan(
+                source,
+                GitHubPullRequest("Example", "Project", 7),
+                GitHubPullRequestCheckoutInputs(
+                    "https://github.com/Example/Project",
+                    "refs/pull/7/head",
+                    "a" * 40,
+                ),
+            ),
+        )
+        self.client.inspect_repository.assert_called_once_with("example/project")
+        self.client.pull_request_details.assert_called_once_with(
+            GitHubPullRequest("Example", "Project", 7)
+        )
+        self.client.checkout_pull_request.assert_not_called()
+
+    def test_provider_rejects_untrusted_pr_checkout_metadata(self) -> None:
+        source = GitHubRepository(
+            "example/project",
+            "https://evil.example/example/project",
+            False,
+            "main",
+        )
+        self.client.inspect_repository.return_value = source
+        self.client.pull_request_details.return_value = {"headRefOid": "a" * 40}
+        with self.assertRaisesRegex(GitHubError, "does not match"):
+            self.provider.plan_pull_request("example/project", 7)
+
+        source = GitHubRepository(
+            "example/project",
+            "https://github.com/example/project",
+            False,
+            "main",
+        )
+        self.client.inspect_repository.return_value = source
+        self.client.pull_request_details.return_value = {"headRefOid": "not-an-oid"}
+        with self.assertRaisesRegex(GitHubError, "head OID"):
+            self.provider.plan_pull_request("example/project", 7)
+
+        with self.assertRaisesRegex(GitHubError, "does not match its number"):
+            self.provider.validate_pull_request_checkout_inputs(
+                "example/project",
+                7,
+                GitHubPullRequestCheckoutInputs(
+                    "https://github.com/example/project",
+                    "refs/pull/8/head",
+                    "a" * 40,
+                ),
+            )
 
     def test_issue_capture_returns_bounded_context_and_structured_metadata(
         self,
@@ -317,6 +464,80 @@ class GitHubProviderTests(unittest.TestCase):
         self.client.issue_details.assert_not_called()
         self.client.pull_request_details.assert_not_called()
         self.client.repository_context_details.assert_not_called()
+
+
+class GitHubProviderStateTests(unittest.TestCase):
+    def test_legacy_state_round_trips_through_nested_v1_state(self) -> None:
+        flat = {
+            "github_repository": "source/project",
+            "github_issue": 42,
+            "github_issue_url": "https://github.com/source/project/issues/42",
+            "github_issue_context": "issue context",
+            "github_pull_request": 7,
+            "pull_request_worktree_state": "ready",
+            "pull_request_branch": "voice/pr",
+            "pull_request_worktree_error": None,
+            "pull_request_remote_url": "https://github.com/source/project",
+            "pull_request_head_ref": "refs/pull/7/head",
+            "pull_request_head_oid": "a" * 40,
+            "fork_requested": True,
+            "fork_confirmed": True,
+            "fork_committed": True,
+            "fork_exists": False,
+            "fork_dispatch_exited": True,
+            "fork_committed_at": 1.5,
+            "fork_operation_state": "ambiguous",
+            "fork_operation_source": "source/project",
+            "fork_operation_source_url": "https://github.com/source/project",
+            "fork_operation_source_parent": None,
+            "fork_operation_source_default_branch": "main",
+            "fork_operation_source_private": False,
+            "fork_operation_login": "me",
+            "fork_operation_target": "me/project",
+            "fork_repository": None,
+            "fork_reconcile_attempts": 2,
+            "fork_absent_observations": 1,
+            "fork_next_reconcile_at": 3.0,
+            "fork_last_reconciled_at": 2.0,
+            "fork_confirmed_absent_at": None,
+            "fork_automatic_reconcile_stopped_at": None,
+            "fork_retained_at": None,
+        }
+
+        nested = dump_github_provider_state(flat)
+
+        self.assertEqual(nested["version"], 1)
+        self.assertEqual(
+            nested["repository"],
+            {"name": "source/project"},
+        )
+        self.assertEqual(
+            nested["pull_request"],
+            {
+                "number": 7,
+                "worktree_state": "ready",
+                "branch": "voice/pr",
+                "worktree_error": None,
+                "remote_url": "https://github.com/source/project",
+                "head_ref": "refs/pull/7/head",
+                "head_oid": "a" * 40,
+            },
+        )
+        self.assertEqual(load_github_provider_state(nested), flat)
+        self.assertEqual(
+            GitHubProvider.load_state(GitHubProvider.dump_state(flat)), flat
+        )
+
+    def test_malformed_provider_state_is_rejected(self) -> None:
+        malformed = (
+            {"unknown": True},
+            {"version": 2},
+            {"version": 1, "fork": "not-an-object"},
+            {"version": 1, "pull_request": {"unknown": True}},
+        )
+        for state in malformed:
+            with self.subTest(state=state), self.assertRaises(GitHubError):
+                load_github_provider_state(state)
 
 
 if __name__ == "__main__":
