@@ -14,6 +14,11 @@ from pathlib import Path
 from typing import Literal
 
 from .. import config, recorder, vocabulary
+from ..transcript import (
+    TranscriptReplacement,
+    effective_replacements,
+    normalize_transcript,
+)
 
 SOCKET_PATH = config.STT_SOCKET
 PROTOCOL_VERSION = 2
@@ -159,6 +164,12 @@ def _user_replacements() -> tuple[vocabulary.Replacement, ...]:
         return ()
 
 
+def transcript_replacements() -> tuple[TranscriptReplacement, ...]:
+    """Return the effective rules used by the current STT configuration."""
+
+    return effective_replacements(_user_replacements(), REPLACEMENTS)
+
+
 def normalize(text: str) -> str:
     """Apply text corrections with user vocabulary taking precedence.
 
@@ -167,20 +178,7 @@ def normalize(text: str) -> str:
     spoken source.
     """
 
-    user = _user_replacements()
-    overridden = {replacement.spoken.casefold() for replacement in user}
-    for replacement in user:
-        text = replacement.apply(text)
-    for source, target in REPLACEMENTS.items():
-        if source.casefold() in overridden:
-            continue
-        text = re.sub(
-            rf"(?<!\w){re.escape(source)}(?!\w)",
-            lambda _match, replacement=target: replacement,
-            text,
-            flags=re.IGNORECASE,
-        )
-    return text
+    return normalize_transcript(text, transcript_replacements())
 
 
 class Transcriber(ABC):

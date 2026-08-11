@@ -145,6 +145,7 @@ full command reference.
 - [Architecture](docs/architecture.md) - pipeline, background jobs, Cursor routing, runtime privacy and durability.
 - [Context capture](docs/context-capture.md) - browser and focused editor/terminal context, compositor setup.
 - [Vocabulary and entity aliases](docs/vocabulary.md) - the local transcription/routing correction store.
+- [Reproducible replay](docs/replay.md) - safe semantic capture, replay, export, and fixture review.
 - [Development](docs/development.md) - quality checks, CI matrix, observed performance.
 - [Security notes](docs/security.md) - trust model and safe-by-default behavior.
 - [Troubleshooting](docs/troubleshooting.md) - common failures and diagnostics.
