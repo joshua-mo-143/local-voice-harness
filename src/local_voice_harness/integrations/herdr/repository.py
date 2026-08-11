@@ -1,10 +1,12 @@
 from __future__ import annotations
 
-import subprocess
-import tempfile
 from pathlib import Path
 
-from ...process import run_command
+from ...local_git import (
+    LocalGitError,
+    LocalGitOperationAmbiguous,
+    LocalGitRepository,
+)
 from ..rofi import choose_repository, confirm_clone
 from .types import (
     HOME_ROOT,
@@ -99,52 +101,25 @@ class HerdrRepository:
             raise HerdrError(
                 "Repository destination is outside the configured project root"
             )
-        if destination.exists():
-            if self.allowed_repository(destination):
-                return destination
-            raise HerdrError(
-                f"{destination} already exists and is not a Git repository"
-            )
+        local_git = LocalGitRepository(
+            clone_root=HOME_ROOT,
+            allowed_root=HOME_ROOT,
+            lock_name=".voice-harness-repository.lock",
+        )
         try:
-            if checkpoint is not None:
-                checkpoint()
-            with tempfile.TemporaryDirectory(
-                dir=HOME_ROOT, prefix=f".{name}-clone-"
-            ) as temporary:
-                if checkpoint is not None:
-                    checkpoint()
-                staging = Path(temporary) / name
-                if checkpoint is not None:
-                    checkpoint()
-                process = run_command(
-                    ["git", "clone", "--", url, str(staging)],
-                    timeout=300,
-                )
-                if checkpoint is not None:
-                    checkpoint()
-                if process.returncode:
-                    message = process.stderr.strip() or process.stdout.strip()
-                    raise HerdrError(message or "Could not clone repository")
-                if not self.allowed_repository(staging):
-                    raise HerdrError(
-                        "Cloned destination is not an allowed Git repository"
-                    )
-                if checkpoint is not None:
-                    checkpoint()
-                staging.rename(destination)
-                if checkpoint is not None:
-                    checkpoint()
-        except HerdrError:
-            raise
-        except subprocess.TimeoutExpired as exc:
+            return local_git.materialize(
+                Path(name),
+                clone_url=url,
+                checkpoint=checkpoint,
+            )
+        except LocalGitOperationAmbiguous as exc:
             raise HerdrError(
                 "Could not clone repository: command timed out; "
                 "the clone outcome is ambiguous",
                 code="repository_clone_ambiguous",
             ) from exc
-        except OSError as exc:
-            raise HerdrError(f"Could not clone repository: {exc}") from exc
-        return destination
+        except LocalGitError as exc:
+            raise HerdrError(str(exc)) from exc
 
     def choose_or_clone_repository(
         self,

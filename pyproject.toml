@@ -103,6 +103,7 @@ skip_covered = true
 "src/local_voice_harness/integrations/herdr/repository.py" = 45
 "src/local_voice_harness/integrations/herdr/session.py" = 50
 "src/local_voice_harness/integrations/herdr/workspace.py" = 50
+"src/local_voice_harness/local_git.py" = 90
 "src/local_voice_harness/llm_transport.py" = 85
 "src/local_voice_harness/llm.py" = 85
 "src/local_voice_harness/service_manager.py" = 35
