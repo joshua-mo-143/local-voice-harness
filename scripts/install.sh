@@ -144,7 +144,7 @@ fi
 # --- 3. Dictation environment (Parakeet by default) -------------------------
 step "Syncing bundled dictation environment (.venv-dictation)"
 UV_PROJECT_ENVIRONMENT=.venv-dictation \
-  uv sync --python "$PYTHON_VERSION" --extra dictation --no-dev
+  uv sync --python "$PYTHON_VERSION" --extra dictation-cuda --no-dev
 
 # --- 4. TTS environment ------------------------------------------------------
 step "Syncing TTS environment"

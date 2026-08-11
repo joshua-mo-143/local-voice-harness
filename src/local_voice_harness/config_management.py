@@ -202,6 +202,12 @@ _CONFIG_FIELDS: dict[str, ConfigField] = {
         attribute="cuda_device",
         services=(_LLM_SERVICE,),
     ),
+    "compute.dictation_device": _field(
+        parse=_parse_str,
+        section="compute",
+        attribute="dictation_device",
+        services=(_DICTATION_SERVICE,),
+    ),
     "compute.dictation_backend": _field(
         parse=_parse_str,
         section="compute",

@@ -97,6 +97,7 @@ class RuntimeConfigProcessTests(unittest.TestCase):
                 'voice = "parity-voice"\n'
                 "[compute]\n"
                 'dictation_backend = "whisper"\n'
+                'dictation_device = "cpu"\n'
                 'dictation_model = "small.en"\n'
                 'dictation_quantization = "none"\n'
                 'dictation_compute = "int8_float16"\n'
@@ -107,6 +108,7 @@ class RuntimeConfigProcessTests(unittest.TestCase):
             )
             (legacy / "dictation" / "backend.env").write_text(
                 "DICTATION_BACKEND=whisper\n"
+                "DICTATION_DEVICE=cpu\n"
                 "DICTATION_MODEL=small.en\n"
                 "DICTATION_QUANTIZATION=none\n"
                 "DICTATION_COMPUTE=int8_float16\n"
@@ -116,6 +118,7 @@ class RuntimeConfigProcessTests(unittest.TestCase):
                 "VOICE_HARNESS_LLM_MODEL": "parity-model",
                 "VOICE_HARNESS_TTS_VOICE": "parity-voice",
                 "DICTATION_BACKEND": "whisper",
+                "DICTATION_DEVICE": "cpu",
                 "DICTATION_MODEL": "small.en",
                 "DICTATION_QUANTIZATION": "none",
                 "DICTATION_COMPUTE": "int8_float16",
