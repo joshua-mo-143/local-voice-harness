@@ -335,6 +335,46 @@ class QwenClientTests(unittest.TestCase):
             },
         )
 
+    def test_cursor_tool_failure_keeps_diagnostics_out_of_model_context(self) -> None:
+        tool_call = {
+            "id": "call-1",
+            "function": {
+                "name": "cursor",
+                "arguments": json.dumps({"task": "fix it", "action": "submit"}),
+            },
+        }
+        output = io.StringIO()
+        with (
+            mock.patch.object(
+                llm_transport.urllib.request,
+                "urlopen",
+                side_effect=[
+                    _response({"content": None, "tool_calls": [tool_call]}),
+                    _response({"content": "The tool failed safely."}),
+                ],
+            ) as urlopen,
+            mock.patch.object(
+                llm,
+                "cursor_turn",
+                side_effect=HarnessError(
+                    "stderr Authorization: Bearer cursor-tool-secret"
+                ),
+            ),
+            redirect_stdout(output),
+        ):
+            answer, session = llm.qwen_turn("please fix it", allow_tools=True)
+
+        self.assertEqual((answer, session), ("The tool failed safely.", None))
+        second_request = urlopen.call_args_list[1].args[0]
+        second_payload = json.loads(second_request.data)
+        self.assertEqual(
+            second_payload["messages"][-1]["content"],
+            llm.CURSOR_TOOL_FAILURE,
+        )
+        self.assertNotIn("cursor-tool-secret", json.dumps(second_payload))
+        self.assertNotIn("cursor-tool-secret", output.getvalue())
+        self.assertIn("[REDACTED]", output.getvalue())
+
     def test_rejected_tool_result_cannot_be_rewritten_as_started(self) -> None:
         result = AssistantResponse(
             spoken_text="Two tickets were rejected.",

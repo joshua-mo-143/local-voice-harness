@@ -8,6 +8,7 @@ from collections.abc import Callable, Mapping, Set
 from dataclasses import dataclass
 from pathlib import Path
 
+from ..diagnostic_safety import redact_diagnostic
 from ..errors import HarnessError
 from ..integrations.github import (
     GitHubClient,
@@ -540,10 +541,11 @@ def _worker_fail(
     target_may_be_active: bool = False,
 ) -> None:
     del target_may_be_active  # Terminal intent always retains the cleanup fence.
-    message = (
+    diagnostic = redact_diagnostic(str(exc) or type(exc).__name__, limit=500)
+    result = (
         exc.voice_message
         if isinstance(exc, GitHubIssueLookupError)
-        else (str(exc) or type(exc).__name__)[:500]
+        else "Cursor job failed. Check the job log for diagnostic details."
     )
 
     def fail(job: CursorJob) -> CursorJob:
@@ -552,8 +554,8 @@ def _worker_fail(
             job,
             JobStatus.FAILED,
             now=now,
-            result=message,
-            error=message,
+            result=result,
+            error=diagnostic,
         )
 
     def guarded(job: CursorJob) -> CursorJob | None:
@@ -652,12 +654,14 @@ def _worker_block(
     message: str,
 ) -> None:
     blocked_at = time.time()
+    diagnostic = redact_diagnostic(message, limit=500)
 
     def block(job: CursorJob) -> CursorJob:
         return job.evolve_for_delivery(
             now=blocked_at,
             status=JobStatus.BLOCKED,
-            result=message[:500],
+            result="Cursor needs manual attention in Herdr.",
+            error=diagnostic,
             completed_at=blocked_at,
         )
 
@@ -710,7 +714,7 @@ def _prepare_pull_request_checkout(
         if checkpoint is not None:
             checkpoint()
     except Exception as exc:
-        message = (str(exc) or type(exc).__name__)[:500]
+        message = redact_diagnostic(str(exc) or type(exc).__name__, limit=500)
 
         def quarantine(current: CursorJob) -> CursorJob:
             return current.evolve(

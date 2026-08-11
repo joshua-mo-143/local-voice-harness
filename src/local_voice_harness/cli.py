@@ -32,6 +32,7 @@ from .credentials import (
     get_venice_api_key,
     store_venice_api_key,
 )
+from .diagnostic_safety import COMMAND_FAILURE, log_diagnostic
 from .diagnostics import doctor
 from .dictation import run as run_dictation
 from .intent import Intent, IntentRoute, route_intent
@@ -741,9 +742,9 @@ def main() -> None:
     try:
         dispatch(parser().parse_args())
     except Exception as exc:
-        message = str(exc) or type(exc).__name__
-        print(f"voice-harness: {message}", file=__import__("sys").stderr)
-        notify(message, error=True)
+        log_diagnostic("cli", "command_failed", f"{type(exc).__name__}: {exc}")
+        print(f"voice-harness: {COMMAND_FAILURE}", file=__import__("sys").stderr)
+        notify(COMMAND_FAILURE, error=True)
         raise SystemExit(1) from exc
 
 

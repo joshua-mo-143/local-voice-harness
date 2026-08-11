@@ -7,6 +7,11 @@ from collections.abc import Callable, Mapping, Sequence
 from .agents.delivery import AgentDeliveryClaims as DeliveryClaims
 from .agents.service import AgentTurnRequest as CursorTurnRequest
 from .agents.service import agent_turn as cursor_turn
+from .diagnostic_safety import (
+    CURSOR_TOOL_FAILURE,
+    redact_diagnostic,
+    redact_fields,
+)
 from .errors import HarnessError
 from .llm_transport import ChatCompletionRequest, LlmTransport
 from .notifications import notify
@@ -113,7 +118,10 @@ _TOOL_FREE_ACTION_CLAIM = re.compile(
 
 def _log_llm_event(event: str, **fields: object) -> None:
     print(
-        json.dumps({"stage": "llm", "event": event, **fields}, ensure_ascii=False),
+        json.dumps(
+            redact_fields({"stage": "llm", "event": event, **fields}, limit=None),
+            ensure_ascii=False,
+        ),
         flush=True,
     )
 
@@ -315,7 +323,16 @@ def qwen_turn(
                             )
                         tool_result = as_assistant_response(turn_response).display_text
                     except Exception as exc:
-                        tool_result = f"Cursor tool failed: {type(exc).__name__}: {exc}"
+                        _log_llm_event(
+                            "tool_failure",
+                            round=tool_round + 1,
+                            tool_call_id=str(call.get("id", "")),
+                            name=name,
+                            diagnostic=redact_diagnostic(
+                                f"{type(exc).__name__}: {exc}"
+                            ),
+                        )
+                        tool_result = CURSOR_TOOL_FAILURE
             _log_llm_event(
                 "tool_result",
                 round=tool_round + 1,

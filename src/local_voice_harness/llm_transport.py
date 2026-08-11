@@ -10,9 +10,9 @@ from dataclasses import dataclass
 
 from .config import BackendSettings, load_backend_settings
 from .credentials import get_venice_api_key
+from .diagnostic_safety import redact_diagnostic, redact_fields
 from .errors import HarnessError
 
-_AUTH_REDACT = re.compile(r"Bearer\s+\S+", re.IGNORECASE)
 _SENTENCE = re.compile(r'^(.+?[.!?]["\']?)(?:\s+)', re.DOTALL)
 
 
@@ -36,13 +36,12 @@ class ChatCompletionRequest:
     parallel_tool_calls: bool | None = None
 
 
-def _redact_secrets(text: str) -> str:
-    return _AUTH_REDACT.sub("Bearer [REDACTED]", text)
-
-
 def _log_transport_event(event: str, **fields: object) -> None:
     print(
-        json.dumps({"stage": "llm", "event": event, **fields}, ensure_ascii=False),
+        json.dumps(
+            redact_fields({"stage": "llm", "event": event, **fields}, limit=None),
+            ensure_ascii=False,
+        ),
         flush=True,
     )
 
@@ -104,7 +103,8 @@ def streamed_message(
         if not isinstance(event, dict):
             raise HarnessError("LLM returned a malformed streaming event")
         if event.get("error"):
-            raise HarnessError(f"LLM streaming request failed: {event['error']}")
+            detail = redact_diagnostic(event["error"])
+            raise HarnessError(f"LLM streaming request failed: {detail}")
         choices = event.get("choices")
         if not isinstance(choices, list) or not choices:
             continue
@@ -228,7 +228,7 @@ class LlmTransport:
             detail = exc.read(4096).decode("utf-8", errors="replace").strip()
         except OSError:
             detail = ""
-        detail = _redact_secrets(detail)
+        detail = redact_diagnostic(detail)
         suffix = f": {detail}" if detail else ""
         return HarnessError(f"LLM request failed: HTTP {exc.code} {exc.reason}{suffix}")
 

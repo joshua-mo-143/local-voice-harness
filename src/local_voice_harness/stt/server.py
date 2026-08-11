@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Literal
 
 from .. import config, recorder, vocabulary
+from ..diagnostic_safety import redact_diagnostic
 from ..transcript import (
     TranscriptReplacement,
     effective_replacements,
@@ -148,7 +149,11 @@ class RecoveryResult:
 
 
 def log(message: str) -> None:
-    print(f"[dictation] {message}", file=sys.stderr, flush=True)
+    print(
+        f"[dictation] {redact_diagnostic(message)}",
+        file=sys.stderr,
+        flush=True,
+    )
 
 
 def _user_replacements() -> tuple[vocabulary.Replacement, ...]:
@@ -702,7 +707,7 @@ def handle_connection(connection: socket.socket, transcriber: Transcriber) -> No
                 claim = None
                 raise _recovery_error(
                     "transcription_failed",
-                    f"{type(exc).__name__}: {exc}",
+                    redact_diagnostic(f"{type(exc).__name__}: {exc}"),
                     recovery,
                 ) from exc
         except ProtocolError as exc:
