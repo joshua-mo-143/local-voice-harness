@@ -2078,14 +2078,23 @@ class ForceListenTests(unittest.TestCase):
     def test_request_listen_signals_the_recorded_pid(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             pid_path = Path(temporary) / "wake.pid"
-            pid_path.write_text("4321")
+            pid_path.write_text(
+                json.dumps({"pid": 4321, "process_start": "daemon-start"})
+            )
+            handle = mock.Mock()
             with (
                 mock.patch.object(wake_daemon, "WAKE_PID_PATH", pid_path),
-                mock.patch.object(wake_daemon.os, "kill") as kill,
+                mock.patch.object(
+                    wake_daemon.ProcessHandle,
+                    "open",
+                    return_value=handle,
+                ) as open_handle,
             ):
                 wake_daemon.request_listen()
 
-        kill.assert_called_once_with(4321, wake_daemon.signal.SIGUSR1)
+        open_handle.assert_called_once_with(4321, expected_start="daemon-start")
+        handle.send_signal.assert_called_once_with(wake_daemon.signal.SIGUSR1)
+        handle.close.assert_called_once()
 
     def test_request_listen_reports_a_stopped_daemon(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -2099,15 +2108,44 @@ class ForceListenTests(unittest.TestCase):
     def test_request_listen_reports_a_dead_pid(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             pid_path = Path(temporary) / "wake.pid"
-            pid_path.write_text("4321")
+            pid_path.write_text(
+                json.dumps({"pid": 4321, "process_start": "daemon-start"})
+            )
             with (
                 mock.patch.object(wake_daemon, "WAKE_PID_PATH", pid_path),
-                mock.patch.object(
-                    wake_daemon.os, "kill", side_effect=ProcessLookupError
-                ),
+                mock.patch.object(wake_daemon.ProcessHandle, "open", return_value=None),
                 self.assertRaisesRegex(HarnessError, "not running"),
             ):
                 wake_daemon.request_listen()
+
+    def test_request_listen_rejects_pid_reuse_without_signalling(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            pid_path = Path(temporary) / "wake.pid"
+            pid_path.write_text(
+                json.dumps({"pid": 4321, "process_start": "original-start"})
+            )
+            with (
+                mock.patch.object(wake_daemon, "WAKE_PID_PATH", pid_path),
+                mock.patch.object(
+                    wake_daemon.ProcessHandle, "open", return_value=None
+                ) as open_handle,
+                self.assertRaisesRegex(HarnessError, "not running"),
+            ):
+                wake_daemon.request_listen()
+
+        open_handle.assert_called_once_with(4321, expected_start="original-start")
+
+    def test_main_rejects_duplicate_daemon_startup(self) -> None:
+        with (
+            mock.patch.object(
+                wake_daemon,
+                "_acquire_wake_singleton",
+                side_effect=HarnessError("wake daemon is already running"),
+            ),
+            mock.patch.object(wake_daemon, "WakeConversationDaemon"),
+            self.assertRaisesRegex(HarnessError, "already running"),
+        ):
+            wake_daemon.main()
 
 
 class CompletedFollowupContextTests(unittest.TestCase):

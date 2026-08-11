@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import math
 import os
+import select
 import signal
 import subprocess
 import threading
@@ -115,12 +116,31 @@ class SpeechDetector:
         )
 
 
-def _read_frame(process: subprocess.Popen[bytes]) -> bytes:
+def _read_frame(
+    process: subprocess.Popen[bytes],
+    stop_requested: threading.Event,
+    *,
+    poll_timeout: float = 0.5,
+) -> bytes:
     if process.stdout is None:
         raise HarnessError("microphone stream is unavailable")
     data = bytearray()
     while len(data) < FRAME_BYTES:
-        chunk = process.stdout.read(FRAME_BYTES - len(data))
+        if stop_requested.is_set():
+            raise HarnessError("VAD dictation was cancelled")
+        stdout = process.stdout
+        pollable = False
+        try:
+            pollable = select.select([stdout], [], [], poll_timeout) == (
+                [stdout],
+                [],
+                [],
+            )
+        except (OSError, ValueError):
+            pollable = True
+        if not pollable:
+            continue
+        chunk = stdout.read(FRAME_BYTES - len(data))
         if not chunk:
             detail = (
                 process.stderr.read().decode(errors="replace").strip()
@@ -181,9 +201,9 @@ def capture_vad_audio(
             output.setsampwidth(2)
             output.setframerate(SAMPLE_RATE)
             while True:
-                frame = _read_frame(process)
                 if stop_requested.is_set():
                     raise HarnessError("VAD dictation was cancelled")
+                frame = _read_frame(process, stop_requested)
                 speech_detected = detector.is_speech(frame)
                 if not has_speech:
                     if speech_detected:

@@ -29,6 +29,7 @@ from ..errors import HarnessError
 from ..integrations.herdr import HERDR_BIN, HerdrClient, HerdrError
 from ..integrations.registry import capability_statuses
 from ..ipc import socket_ready
+from ..process import capability_diagnostics
 from .model import CheckResult, Repair, Severity
 
 Check = Callable[[], list[CheckResult]]
@@ -787,6 +788,27 @@ def check_runtime_directories() -> list[CheckResult]:
     return results
 
 
+def check_process_capabilities() -> list[CheckResult]:
+    issues = capability_diagnostics()
+    if not issues:
+        return [
+            CheckResult(
+                name="runtime:process-ownership",
+                category="runtime",
+                severity=Severity.OK,
+                detail="Linux process identity and pidfd ownership are available",
+            )
+        ]
+    return [
+        CheckResult(
+            name="runtime:process-ownership",
+            category="runtime",
+            severity=Severity.WARNING,
+            detail="; ".join(issues),
+        )
+    ]
+
+
 def check_cursor_jobs() -> list[CheckResult]:
     """Read job JSON read-only; never quarantine or mutate durable state."""
 
@@ -1025,6 +1047,7 @@ ALL_CHECKS: tuple[Check, ...] = (
     check_systemd_units,
     check_runtime_sockets,
     check_runtime_directories,
+    check_process_capabilities,
     check_cursor_jobs,
     check_herdr,
     check_cursor_cli,
