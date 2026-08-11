@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import fcntl
 import json
+import logging
 import os
 import re
 import shutil
@@ -10,6 +11,7 @@ import uuid
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
+from enum import StrEnum
 from pathlib import Path
 from urllib.parse import SplitResult, urlsplit
 
@@ -58,6 +60,7 @@ MAX_COMMENT_CHARS = 800
 MAX_COMMENTS = 5
 PROVIDER_NAME = "github"
 Checkpoint = Callable[[], None]
+_LOGGER = logging.getLogger(__name__)
 
 
 class GitHubError(RuntimeError):
@@ -66,6 +69,112 @@ class GitHubError(RuntimeError):
 
 class GitHubOperationAmbiguous(GitHubError):
     pass
+
+
+class GitHubIssueLookupReason(StrEnum):
+    NOT_FOUND_OR_INACCESSIBLE = "not_found_or_inaccessible"
+    UNAUTHORIZED = "unauthorized"
+    TRANSIENT = "transient"
+    UNKNOWN = "unknown"
+
+
+class GitHubIssueLookupError(GitHubError):
+    """A classified issue lookup failure with a safe spoken message."""
+
+    def __init__(
+        self,
+        reason: GitHubIssueLookupReason,
+        diagnostic: str,
+    ) -> None:
+        self.reason = reason
+        self.diagnostic = _redact_diagnostic(diagnostic)
+        super().__init__(self.voice_message)
+
+    @property
+    def voice_message(self) -> str:
+        if self.reason == GitHubIssueLookupReason.NOT_FOUND_OR_INACCESSIBLE:
+            return "I couldn't find or access that GitHub issue."
+        if self.reason == GitHubIssueLookupReason.UNAUTHORIZED:
+            return "I couldn't access that GitHub issue because GitHub authorization is required."
+        if self.reason == GitHubIssueLookupReason.TRANSIENT:
+            return "GitHub is temporarily unavailable while checking that issue."
+        if "malformed issue metadata" in self.diagnostic.casefold():
+            return "I couldn't verify that GitHub issue: malformed issue metadata."
+        return "I couldn't verify that GitHub issue."
+
+
+def _redact_diagnostic(value: str) -> str:
+    """Remove credentials and authorization values before diagnostics are logged."""
+    redacted = re.sub(
+        r"(?i)(authorization|token|password|secret)(\s*[:=]\s*)\S+",
+        r"\1\2[REDACTED]",
+        value,
+    )
+    redacted = re.sub(
+        r"(?i)\b(?:gh[pousr]|github_pat)_[A-Za-z0-9_]+",
+        "[REDACTED_TOKEN]",
+        redacted,
+    )
+    return re.sub(r"\s+", " ", redacted).strip()[:2_000]
+
+
+def _classify_issue_lookup(detail: str) -> GitHubIssueLookupReason:
+    normalized = detail.casefold()
+    if any(
+        marker in normalized
+        for marker in (
+            "authentication required",
+            "not logged in",
+            "gh auth login",
+            "unauthorized",
+            "bad credentials",
+            "http 401",
+            "status 401",
+            "http 403",
+            "status 403",
+            "permission denied",
+        )
+    ):
+        return GitHubIssueLookupReason.UNAUTHORIZED
+    if any(
+        marker in normalized
+        for marker in (
+            "could not resolve to an issue",
+            "issue not found",
+            "issue does not exist",
+            "http 404",
+            "status 404",
+            "not found",
+        )
+    ):
+        return GitHubIssueLookupReason.NOT_FOUND_OR_INACCESSIBLE
+    if any(
+        marker in normalized
+        for marker in (
+            "timed out",
+            "timeout",
+            "http 429",
+            "http 500",
+            "http 502",
+            "http 503",
+            "http 504",
+            "connection",
+            "temporarily unavailable",
+            "rate limit",
+        )
+    ):
+        return GitHubIssueLookupReason.TRANSIENT
+    return GitHubIssueLookupReason.UNKNOWN
+
+
+def _issue_lookup_error(detail: str) -> GitHubIssueLookupError:
+    error = GitHubIssueLookupError(_classify_issue_lookup(detail), detail)
+    _LOGGER.error(
+        "GitHub issue lookup failed: reason=%s diagnostic=%s",
+        error.reason.value,
+        error.diagnostic,
+    )
+    return error
 
 
 @dataclass(frozen=True)
@@ -251,25 +360,36 @@ class GitHubClient:
         if issue.number <= 0:
             raise GitHubError("GitHub issue number must be positive")
         repository = self.validate_repository(issue.name_with_owner)
-        process = self._run(
-            [
-                self.gh_executable,
-                "issue",
-                "view",
-                str(issue.number),
-                "--repo",
-                repository,
-                "--json",
-                "number,title,state,author,labels,body,comments,url",
-            ],
-            timeout=15,
-        )
+        try:
+            process = self._run(
+                [
+                    self.gh_executable,
+                    "issue",
+                    "view",
+                    str(issue.number),
+                    "--repo",
+                    repository,
+                    "--json",
+                    "number,title,state,author,labels,body,comments,url",
+                ],
+                timeout=15,
+                check=False,
+            )
+        except GitHubError as exc:
+            raise _issue_lookup_error(str(exc)) from exc
+        if process.returncode:
+            detail = process.stderr.strip() or process.stdout.strip()
+            raise _issue_lookup_error(
+                detail or f"issue lookup exited with status {process.returncode}"
+            )
         try:
             value = json.loads(process.stdout)
         except json.JSONDecodeError as exc:
-            raise GitHubError("GitHub returned malformed issue metadata") from exc
+            raise _issue_lookup_error(
+                "GitHub returned malformed issue metadata"
+            ) from exc
         if not isinstance(value, dict):
-            raise GitHubError("GitHub returned malformed issue metadata")
+            raise _issue_lookup_error("GitHub returned malformed issue metadata")
         return value
 
     def repository_context_details(self, repository: str) -> dict[str, object]:

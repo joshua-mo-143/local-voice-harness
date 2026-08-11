@@ -21,6 +21,7 @@ from ..integrations.github import (
     GitHubClient,
     GitHubError,
     GitHubIssue,
+    GitHubIssueLookupError,
     format_issue_context,
     github_issue_from_url,
 )
@@ -426,7 +427,10 @@ def _github_target(
     try:
         details = client.issue_details(issue)
     except GitHubError as exc:
-        return _rejected(reference, str(exc))
+        detail = (
+            exc.voice_message if isinstance(exc, GitHubIssueLookupError) else str(exc)
+        )
+        return _rejected(reference, detail)
 
     detail_number = details.get("number")
     if isinstance(detail_number, int) and detail_number != issue.number:
@@ -548,7 +552,10 @@ def _ticket_start_summary(outcomes: tuple[TicketStartOutcome, ...]) -> str:
             parts.append(f"{outcome.target}: accepted as job {outcome.job_id}")
         else:
             detail = f" ({outcome.detail})" if outcome.detail else ""
-            parts.append(f"{outcome.target}: {outcome.status}{detail}")
+            if len(outcomes) == 1:
+                parts.append(f"{outcome.status}{detail}")
+            else:
+                parts.append(f"{outcome.target}: {outcome.status}{detail}")
     return "Ticket starts: " + "; ".join(parts) + "."
 
 
