@@ -84,7 +84,7 @@ class GitHubClientTests(unittest.TestCase):
     def test_configured_timeout_is_the_generic_command_default(self) -> None:
         client = GitHubClient(timeout=42)
         with mock.patch(
-            "local_voice_harness.integrations.github.subprocess.run",
+            "local_voice_harness.integrations.github.run_command",
             return_value=_completed(),
         ) as run:
             client._run(["gh", "status"])

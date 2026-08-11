@@ -191,12 +191,8 @@ WORKFLOW_PLAN[token]: <bounded multiline implementation plan>
     def test_clone_timeout_reports_ambiguous_outcome(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            client = herdr.HerdrClient("herdr")
+            client = herdr.HerdrClient("herdr", repository_root=root)
             with (
-                mock.patch(
-                    "local_voice_harness.integrations.herdr.repository.HOME_ROOT",
-                    root,
-                ),
                 mock.patch(
                     "local_voice_harness.local_git.run_command",
                     side_effect=subprocess.TimeoutExpired(["git", "clone"], 300),
