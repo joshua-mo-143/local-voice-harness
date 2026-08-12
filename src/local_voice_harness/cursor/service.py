@@ -1037,6 +1037,18 @@ def cancel_job(
 def job_status(job_id: str | None = None) -> str:
     if job_id:
         job = read_job(job_id)
+        if (
+            job.manual_reconcile_operation == "pane"
+            and job.participant_creation_state == "manual_required"
+        ):
+            participant = job.participant_creation_participant or "workflow"
+            target = job.participant_creation_target or "unknown"
+            return (
+                f"Cursor job {job_id} requires manual reconciliation for the "
+                f"{participant} pane target {target}. Inspect Herdr, then resolve "
+                "pane creation as materialized or confirmed absent using token "
+                f"{job.manual_reconcile_token}."
+            )
         workflow = (
             f", {job.workflow_tier.value} tier" if job.workflow_tier is not None else ""
         )
@@ -1067,9 +1079,18 @@ def resolve_manual_reconciliation(
     operation: str,
     token: str,
     outcome: str,
+    *,
+    pane_id: str | None = None,
+    workspace_id: str | None = None,
 ) -> CursorJob:
     return recovery.resolve_manual_reconciliation(
-        _job_store(), job_id, operation, token, outcome
+        _job_store(),
+        job_id,
+        operation,
+        token,
+        outcome,
+        pane_id=pane_id,
+        workspace_id=workspace_id,
     )
 
 

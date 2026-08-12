@@ -469,24 +469,55 @@ def reconcile_prompt_and_pane_operations(
         store.update(job.id, reconcile_prompt)
 
     current = store.get(job.id)
-    if current.participant_creation_state == "submitting":
+    if current.participant_creation_state in {"submitting", "ambiguous"}:
         # Herdr does not expose an idempotency key for tab creation. Absence in
         # a listing cannot prove the create was not accepted, so retain every
         # deterministic identity and require an operator decision.
+        token = uuid.uuid4().hex
+
+        def require_pane_reconciliation(candidate: CursorJob) -> CursorJob | None:
+            if candidate.participant_creation_state not in {
+                "submitting",
+                "ambiguous",
+            }:
+                return None
+            action = _pane_manual_reconciliation_action(candidate, token)
+            terminal_result = candidate.terminal_intent_result
+            terminal_error = candidate.terminal_intent_error
+            if candidate.terminal_intent_status is not None:
+                terminal_result = _append_manual_action(terminal_result, action)
+                if terminal_error is not None:
+                    terminal_error = _append_manual_action(terminal_error, action)
+            return candidate.evolve_recovery(
+                now=now,
+                participant_creation_state="manual_required",
+                manual_reconcile_operation="pane",
+                manual_reconcile_token=token,
+                manual_reconcile_required_at=now,
+                terminal_intent_result=terminal_result,
+                terminal_intent_error=terminal_error,
+            )
+
         store.update(
             job.id,
-            lambda candidate: (
-                candidate.evolve_recovery(
-                    now=now,
-                    participant_creation_state="manual_required",
-                    manual_reconcile_operation="pane",
-                    manual_reconcile_token=uuid.uuid4().hex,
-                    manual_reconcile_required_at=now,
-                )
-                if candidate.participant_creation_state == "submitting"
-                else None
-            ),
+            require_pane_reconciliation,
         )
+
+
+def _append_manual_action(message: str | None, action: str) -> str:
+    base = (message or "Cursor job cleanup is waiting").rstrip(". ")
+    suffix = f". {action}"
+    return f"{base[: max(0, 500 - len(suffix))]}{suffix}"[:500]
+
+
+def _pane_manual_reconciliation_action(job: CursorJob, token: str) -> str:
+    participant = job.participant_creation_participant or "workflow"
+    target = job.participant_creation_target or "unknown"
+    return (
+        f"Inspect Herdr for the {participant} pane target {target}, then manually "
+        "reconcile pane creation as materialized or confirmed absent "
+        f"with token {token}."
+    )
 
 
 def stage_terminal_intent(
@@ -503,6 +534,15 @@ def stage_terminal_intent(
 ) -> CursorJob:
     if status not in TERMINAL_STATUSES:
         raise HarnessError("terminal cleanup requires a terminal intent")
+    if (
+        job.manual_reconcile_operation == "pane"
+        and job.participant_creation_state == "manual_required"
+        and job.manual_reconcile_token
+    ):
+        action = _pane_manual_reconciliation_action(job, job.manual_reconcile_token)
+        result = _append_manual_action(result, action)
+        if error is not None:
+            error = _append_manual_action(error, action)
     changes: dict[str, object] = {
         "terminal_intent_status": status.value,
         "terminal_intent_result": result,
@@ -583,6 +623,12 @@ def cancel_target_and_release(
         not staged and current.status not in {JobStatus.CANCELLED, JobStatus.FAILED}
     ) or current.target_release_token != release_token:
         return
+    uncertain_pane_target = (
+        current.participant_creation_target
+        if current.participant_creation_state
+        in {"submitting", "ambiguous", "manual_required"}
+        else None
+    )
     targets = list(
         dict.fromkeys(
             value
@@ -593,7 +639,7 @@ def cancel_target_and_release(
                 current.participant_target(WorkflowParticipant.IMPLEMENTER),
                 current.participant_creation_target,
             )
-            if value
+            if value and value != uncertain_pane_target
         )
     )
     interrupted = True
@@ -732,11 +778,23 @@ def resolve_manual_reconciliation(
     outcome: str,
     *,
     now: float | None = None,
+    pane_id: str | None = None,
+    workspace_id: str | None = None,
 ) -> CursorJob:
     if operation not in {"agent", "fork", "worktree", "prompt", "pane"}:
         raise HarnessError("manual reconciliation operation is invalid")
     if outcome not in {"confirmed_absent", "materialized"}:
         raise HarnessError("manual reconciliation outcome is invalid")
+    supplied_pane_identity = pane_id is not None or workspace_id is not None
+    if supplied_pane_identity and (
+        operation != "pane"
+        or outcome != "materialized"
+        or not pane_id
+        or not workspace_id
+    ):
+        raise HarnessError(
+            "pane and workspace identity require a materialized pane outcome"
+        )
     resolved_at = time.time() if now is None else now
 
     def resolve(job: CursorJob) -> CursorJob | None:
@@ -747,7 +805,13 @@ def resolve_manual_reconciliation(
             != ("ambiguous" if operation == "prompt" else "manual_required")
         ):
             return None
-        return job.resolve_manual_operation(operation, outcome, resolved_at=resolved_at)
+        return job.resolve_manual_operation(
+            operation,
+            outcome,
+            resolved_at=resolved_at,
+            pane_id=pane_id,
+            workspace_id=workspace_id,
+        )
 
     resolved = store.update(job_id, resolve)
     if resolved is None:
@@ -1124,6 +1188,21 @@ def recover_jobs(
                         target_release_owner_pid=owner_pid,
                         target_release_owner_boot_id=owner_boot_id,
                         target_release_owner_start=owner_start,
+                        worker_pid=None,
+                        worker_boot_id=None,
+                        worker_process_start=None,
+                        worker_token=None,
+                    )
+                if not is_worker_alive(job) and any(
+                    value is not None
+                    for value in (
+                        job.worker_pid,
+                        job.worker_boot_id,
+                        job.worker_process_start,
+                        job.worker_token,
+                    )
+                ):
+                    return job.evolve(
                         worker_pid=None,
                         worker_boot_id=None,
                         worker_process_start=None,

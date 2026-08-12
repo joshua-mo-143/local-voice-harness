@@ -231,11 +231,24 @@ pending_deliveries = pending_results
 
 
 def resolve_manual_reconciliation(
-    job_id: str, operation: str, token: str, outcome: str
+    job_id: str,
+    operation: str,
+    token: str,
+    outcome: str,
+    *,
+    pane_id: str | None = None,
+    workspace_id: str | None = None,
 ) -> dict[str, object]:
     from .service import resolve_manual_reconciliation as typed_resolve
 
-    return typed_resolve(job_id, operation, token, outcome).to_dict()
+    return typed_resolve(
+        job_id,
+        operation,
+        token,
+        outcome,
+        pane_id=pane_id,
+        workspace_id=workspace_id,
+    ).to_dict()
 
 
 __all__ = [
