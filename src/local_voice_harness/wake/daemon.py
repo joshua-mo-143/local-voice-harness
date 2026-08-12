@@ -71,7 +71,7 @@ from ..diagnostic_safety import (
     VOICE_REQUEST_FAILURE,
     redact_diagnostic,
 )
-from ..errors import HarnessError
+from ..errors import HarnessError, NoSpeechError
 from ..integrations.registry import IntegrationRegistry, build_integration_registry
 from ..intent import (
     NON_ACTIONABLE_SUBMIT_RESPONSE,
@@ -110,6 +110,8 @@ CONVERSATION_TIMEOUT_SECONDS = 60
 PRE_ROLL_FRAMES = 25
 MICROPHONE_START_ATTEMPTS = 30
 MICROPHONE_RETRY_SECONDS = 1
+PLAYBACK_ECHO_WINDOW_SECONDS = 8.0
+RECENT_PLAYBACK_LIMIT = 8
 
 
 def acknowledge_delivery(job_id: str, token: str) -> bool:
@@ -255,6 +257,12 @@ class CompletedFollowup:
 
 
 @dataclass(frozen=True, slots=True)
+class RecentPlayback:
+    text: str
+    expires_at: float
+
+
+@dataclass(frozen=True, slots=True)
 class PendingQuestionSnapshot:
     job_id: str
     text: str
@@ -273,6 +281,25 @@ def log(message: str) -> None:
 
 def _display_fingerprint(display_text: str) -> str:
     return hashlib.sha256(display_text.encode("utf-8")).hexdigest()
+
+
+def _transcript_words(text: str) -> tuple[str, ...]:
+    return tuple(
+        re.findall(r"[^\W_]+(?:['’][^\W_]+)*", text.casefold(), flags=re.UNICODE)
+    )
+
+
+def _matches_playback_prefix(transcript: str, playback: str) -> bool:
+    captured_words = _transcript_words(transcript)
+    played_words = _transcript_words(playback)
+    if not captured_words or len(captured_words) > len(played_words):
+        return False
+    if captured_words == played_words:
+        return True
+    return (
+        len(captured_words) >= 3
+        and captured_words == played_words[: len(captured_words)]
+    )
 
 
 class WakeConversationDaemon:
@@ -306,6 +333,9 @@ class WakeConversationDaemon:
         self.history: list[dict[str, str]] = []
         self.cursor_session: str | None = None
         self.completed_followup: CompletedFollowup | None = None
+        self.recent_playback: collections.deque[RecentPlayback] = collections.deque(
+            maxlen=RECENT_PLAYBACK_LIMIT
+        )
         self.conversation_deadline = 0.0
         self.awaiting_followup = False
         self.last_wake = 0.0
@@ -505,6 +535,7 @@ class WakeConversationDaemon:
         self.history.clear()
         self.cursor_session = None
         self.completed_followup = None
+        self.recent_playback.clear()
         self.conversation_deadline = 0.0
         self.awaiting_followup = False
         self.pause_microphone()
@@ -539,6 +570,32 @@ class WakeConversationDaemon:
             if quiet >= self.audio.playback_quiet_frames:
                 break
         self.pre_roll.clear()
+
+    def _remember_recent_playback(self, text: str) -> None:
+        text = text.strip()
+        if not text:
+            return
+        self.recent_playback.append(
+            RecentPlayback(
+                text=text,
+                expires_at=time.monotonic() + PLAYBACK_ECHO_WINDOW_SECONDS,
+            )
+        )
+
+    def _active_recent_playback(self) -> tuple[RecentPlayback, ...]:
+        now = time.monotonic()
+        while self.recent_playback and self.recent_playback[0].expires_at <= now:
+            self.recent_playback.popleft()
+        return tuple(self.recent_playback)
+
+    @staticmethod
+    def _is_playback_echo(
+        transcript: str, recent_playback: tuple[RecentPlayback, ...]
+    ) -> bool:
+        return any(
+            _matches_playback_prefix(transcript, playback.text)
+            for playback in recent_playback
+        )
 
     def _build_interrupt_checker(
         self, response: str
@@ -605,6 +662,8 @@ class WakeConversationDaemon:
         finally:
             self.wake_model.reset()
         interruption = interruption_result()
+        for playback, _interrupted, _request in batch:
+            self._remember_recent_playback(str(playback.get("played_text") or ""))
         if interruption is None and batch and not batch[-1][1]:
             self.wait_for_playback_quiet()
         return batch, interruption
@@ -992,6 +1051,7 @@ class WakeConversationDaemon:
     def process_utterance(self, audio_path: Path, *, woke: bool) -> BargeIn | None:
         had_active_conversation = bool(self.conversation_deadline)
         delivery_claims: DeliveryClaims = []
+        recent_playback = self._active_recent_playback() if not woke else ()
         self.pause_microphone()
         try:
             text = transcribe(audio_path)
@@ -1007,6 +1067,10 @@ class WakeConversationDaemon:
                         log(f"rejected wake candidate: {text!r}")
                         self.stop_components_when_idle()
                         return None
+            if self._is_playback_echo(text, recent_playback):
+                log("rejected follow-up matching recent local playback")
+                self.awaiting_followup = True
+                return None
             if not text:
                 log("wake phrase contained no request; waiting for follow-up")
                 notify("Listening for a follow-up…")
@@ -1311,6 +1375,21 @@ class WakeConversationDaemon:
             self.conversation_deadline = time.monotonic() + CONVERSATION_TIMEOUT_SECONDS
             self.awaiting_followup = True
             notify("Listening for a follow-up…")
+        except NoSpeechError as exc:
+            release_deliveries(delivery_claims)
+            if had_active_conversation:
+                log(
+                    "follow-up contained no recognizable speech; listening remains armed"
+                )
+                self.awaiting_followup = True
+            else:
+                log(f"turn failed: NoSpeechError: {exc}")
+                notify(VOICE_REQUEST_FAILURE, error=True)
+                self.awaiting_followup = False
+                self.history.clear()
+                self.cursor_session = None
+                self.conversation_deadline = 0.0
+                self.stop_components_when_idle()
         except Exception as exc:
             release_deliveries(delivery_claims)
             log(f"turn failed: {type(exc).__name__}: {exc}")

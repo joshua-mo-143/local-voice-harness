@@ -22,7 +22,7 @@ from local_voice_harness.cursor.delivery import DeliveryClaim
 from local_voice_harness.cursor.model import CursorJob, JobStatus
 from local_voice_harness.cursor.service import CursorTurnRequest
 from local_voice_harness.cursor.store import JobStore
-from local_voice_harness.errors import HarnessError
+from local_voice_harness.errors import HarnessError, NoSpeechError
 from local_voice_harness.integrations.registry import build_integration_registry
 from local_voice_harness.intent import Intent, IntentRoute
 from local_voice_harness.questions import AnswerProvenance
@@ -121,6 +121,9 @@ def _bare_daemon() -> WakeConversationDaemon:
     instance.history = []
     instance.cursor_session = None
     instance.completed_followup = None
+    instance.recent_playback = collections.deque(
+        maxlen=wake_daemon.RECENT_PLAYBACK_LIMIT
+    )
     instance.conversation_deadline = 0.0
     instance.awaiting_followup = False
     instance.last_wake = 0.0
@@ -1843,6 +1846,10 @@ class PlaybackBargeInTests(unittest.TestCase):
         self.assertIsNone(interruption)
         quiet.assert_called_once()
         daemon.wake_model.predict.assert_not_called()
+        self.assertEqual(
+            tuple(playback.text for playback in daemon.recent_playback),
+            ("response",),
+        )
 
     def test_response_wake_phrase_cannot_trigger_itself(self) -> None:
         daemon = _bare_daemon()
@@ -1893,6 +1900,135 @@ class PlaybackBargeInTests(unittest.TestCase):
 
         self.assertEqual(daemon.read_frame.call_count, 3)
         self.assertEqual(list(daemon.pre_roll), [])
+
+
+class PlaybackEchoSuppressionTests(unittest.TestCase):
+    def test_recent_playback_prefix_is_not_admitted_as_followup(self) -> None:
+        daemon = _bare_daemon()
+        daemon.awaiting_followup = True
+        daemon.conversation_deadline = time.monotonic() + 100
+        daemon.recent_playback.append(
+            wake_daemon.RecentPlayback(
+                "I will report back when it finishes.",
+                time.monotonic() + 5,
+            )
+        )
+
+        with (
+            mock.patch.object(
+                wake_daemon,
+                "transcribe",
+                return_value="I will report back when",
+            ),
+            mock.patch.object(daemon, "ensure_components") as ensure_components,
+            mock.patch.object(wake_daemon, "request_context") as request_context,
+            mock.patch.object(wake_daemon, "log") as log,
+        ):
+            result = daemon.process_utterance(AUDIO_GENERATION, woke=False)
+
+        self.assertIsNone(result)
+        self.assertTrue(daemon.awaiting_followup)
+        ensure_components.assert_not_called()
+        request_context.assert_not_called()
+        self.assertIn("matching recent local playback", log.call_args.args[0])
+
+    def test_no_speech_from_leakage_keeps_followup_armed(self) -> None:
+        daemon = _bare_daemon()
+        daemon.awaiting_followup = True
+        deadline = time.monotonic() + 100
+        daemon.conversation_deadline = deadline
+
+        with (
+            mock.patch.object(
+                wake_daemon,
+                "transcribe",
+                side_effect=NoSpeechError("STT did not recognize any speech"),
+            ),
+            mock.patch.object(wake_daemon, "release_deliveries") as release,
+            mock.patch.object(daemon, "stop_components_when_idle") as stop_components,
+            mock.patch.object(wake_daemon, "notify") as notify,
+            mock.patch.object(wake_daemon, "log") as log,
+        ):
+            result = daemon.process_utterance(AUDIO_GENERATION, woke=False)
+
+        self.assertIsNone(result)
+        self.assertTrue(daemon.awaiting_followup)
+        self.assertEqual(daemon.conversation_deadline, deadline)
+        release.assert_called_once_with([])
+        stop_components.assert_not_called()
+        notify.assert_not_called()
+        self.assertIn("listening remains armed", log.call_args.args[0])
+
+    def test_genuine_vad_barge_in_over_playback_is_admitted(self) -> None:
+        daemon = _bare_daemon()
+        daemon.recent_playback.append(
+            wake_daemon.RecentPlayback(
+                "I will report back when it finishes.",
+                time.monotonic() + 5,
+            )
+        )
+
+        with (
+            mock.patch.object(
+                wake_daemon,
+                "transcribe",
+                return_value="No, cancel that job instead.",
+            ),
+            mock.patch.object(daemon, "ensure_components"),
+            mock.patch.object(
+                wake_daemon,
+                "request_context",
+                return_value=RequestContext("No, cancel that job instead."),
+            ),
+            mock.patch.object(
+                wake_daemon,
+                "route_intent",
+                return_value=IntentRoute(Intent.CONVERSATION, "high"),
+            ),
+            mock.patch.object(
+                wake_daemon,
+                "qwen_turn",
+                return_value=("Okay, I will cancel it.", None),
+            ) as qwen_turn,
+            mock.patch.object(
+                daemon,
+                "play_response",
+                return_value=(
+                    {
+                        "interrupted": False,
+                        "played_text": "Okay, I will cancel it.",
+                    },
+                    None,
+                ),
+            ),
+            mock.patch.object(wake_daemon, "notify"),
+        ):
+            result = daemon.process_utterance(AUDIO_GENERATION, woke=False)
+
+        self.assertIsNone(result)
+        qwen_turn.assert_called_once()
+        self.assertEqual(
+            qwen_turn.call_args.kwargs["trusted_utterance"],
+            "No, cancel that job instead.",
+        )
+        self.assertEqual(
+            daemon.history[0],
+            {"role": "user", "content": "No, cancel that job instead."},
+        )
+
+    def test_recent_playback_window_expires(self) -> None:
+        daemon = _bare_daemon()
+        with mock.patch.object(wake_daemon.time, "monotonic", return_value=10.0):
+            daemon._remember_recent_playback("A bounded response.")
+
+        with mock.patch.object(
+            wake_daemon.time,
+            "monotonic",
+            return_value=10.0 + wake_daemon.PLAYBACK_ECHO_WINDOW_SECONDS,
+        ):
+            recent = daemon._active_recent_playback()
+
+        self.assertEqual(recent, ())
 
 
 class InterruptedTurnTests(unittest.TestCase):
