@@ -31,6 +31,9 @@ def _make(
     status: str = "queued",
     label: str | None = None,
     request: str = "do the thing",
+    issue_key: str | None = None,
+    issue_provider: str | None = None,
+    github_repository: str | None = None,
     github_issue: int | None = None,
 ) -> CursorJob:
     now = time.time()
@@ -44,6 +47,9 @@ def _make(
         "delivered": False,
         "foreground_until": 0,
         "speakable_label": label,
+        "issue_key": issue_key,
+        "issue_provider": issue_provider,
+        "github_repository": github_repository,
         "github_issue": github_issue,
     }
     if status == "queued":
@@ -104,6 +110,32 @@ def test_status_reports_speakable_label(store: JobStore) -> None:
     result = cursor_turn(CursorTurnRequest("aaaa", action="status", reference="aaaa"))
 
     assert result.text == "issue 42 is running."
+
+
+def test_status_resolves_linear_ticket_over_same_github_number(
+    store: JobStore,
+) -> None:
+    _make(
+        store,
+        "aaaaaaaaaaaa",
+        status="running",
+        label="APP-43",
+        issue_key="APP-43",
+        issue_provider="linear",
+    )
+    _make(
+        store,
+        "bbbbbbbbbbbb",
+        status="completed",
+        label="widgets issue 43",
+        issue_provider="github",
+        github_repository="acme/widgets",
+        github_issue=43,
+    )
+
+    result = cursor_turn(CursorTurnRequest("how is APP-43 doing?", action="status"))
+
+    assert result.text == "APP-43 is running."
 
 
 def test_dismiss_suppresses_delivery_and_persists_state(store: JobStore) -> None:
