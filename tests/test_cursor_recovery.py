@@ -1,12 +1,15 @@
 from __future__ import annotations
 
+import io
 import json
 import tempfile
+import threading
 import unittest
+from contextlib import redirect_stderr
 from pathlib import Path
 from unittest import mock
 
-from local_voice_harness.cursor import delivery
+from local_voice_harness.cursor import delivery, provisioning, worker_lifecycle
 from local_voice_harness.cursor.model import (
     CursorJob,
     JobStatus,
@@ -841,6 +844,251 @@ class CursorRecoveryTests(unittest.TestCase):
         self.assertEqual(updated.participant_creation_state, "manual_required")
         self.assertEqual(updated.manual_reconcile_operation, "pane")
         self.assertTrue(updated.manual_reconcile_token)
+
+    def test_reviewer_pane_fence_survives_terminal_intent_and_cleanup(self) -> None:
+        created = self.create(
+            {
+                "id": "123456789abc",
+                "status": "running",
+                "request": "review a plan",
+                "created_at": 1,
+                "delivered": False,
+                "worker_token": "worker",
+                "worker_pid": 42,
+                "worker_boot_id": "boot",
+                "worker_process_start": "start",
+                "herdr_target": "planner",
+                "planner_target": "planner",
+                "active_participant": "planner",
+                "agent_dispatch_state": "ready",
+                "participant_creation_state": "manual_required",
+                "participant_creation_participant": "reviewer",
+                "participant_creation_target": "reviewer-pending",
+                "participant_creation_label": "task-reviewer",
+                "participant_creation_workspace_id": "workspace",
+                "manual_reconcile_operation": "pane",
+                "manual_reconcile_token": "pane-fence",
+                "manual_reconcile_required_at": 9,
+            }
+        )
+        staged = self.store.update(
+            created.id,
+            lambda job: stage_terminal_intent(
+                job,
+                JobStatus.FAILED,
+                now=10,
+                result="Reviewer startup failed.",
+                error="pane request timed out",
+            ),
+        )
+        assert staged is not None and staged.target_release_token
+        client = mock.Mock()
+
+        cancel_target_and_release(
+            self.store,
+            created.id,
+            "planner",
+            staged.target_release_token,
+            herdr_factory=lambda: client,
+        )
+
+        current = self.store.get(created.id)
+        self.assertEqual(current.status, JobStatus.RECONCILING)
+        self.assertEqual(current.terminal_intent_status, JobStatus.FAILED)
+        self.assertEqual(current.participant_creation_state, "manual_required")
+        self.assertEqual(current.manual_reconcile_operation, "pane")
+        self.assertEqual(current.manual_reconcile_token, "pane-fence")
+        self.assertEqual(current.participant_creation_target, "reviewer-pending")
+        self.assertIn("confirmed absent", current.terminal_intent_result or "")
+        client.cancel_agent.assert_called_once_with("planner")
+
+    def test_materialized_reviewer_pane_identity_allows_terminal_cleanup(self) -> None:
+        created = self.create(
+            {
+                "id": "123456789abc",
+                "status": "running",
+                "request": "review a plan",
+                "created_at": 1,
+                "delivered": False,
+                "worker_token": "worker",
+                "worker_pid": 42,
+                "worker_boot_id": "boot",
+                "worker_process_start": "start",
+                "herdr_target": "planner",
+                "planner_target": "planner",
+                "active_participant": "planner",
+                "agent_dispatch_state": "ready",
+                "participant_creation_state": "manual_required",
+                "participant_creation_participant": "reviewer",
+                "participant_creation_target": "reviewer-pending",
+                "participant_creation_label": "task-reviewer",
+                "participant_creation_workspace_id": "workspace",
+                "manual_reconcile_operation": "pane",
+                "manual_reconcile_token": "pane-fence",
+            }
+        )
+        staged = self.store.update(
+            created.id,
+            lambda job: stage_terminal_intent(
+                job,
+                JobStatus.FAILED,
+                now=10,
+                result="Reviewer startup failed.",
+                error="pane request timed out",
+            ),
+        )
+        assert staged is not None and staged.target_release_token
+
+        resolved = resolve_manual_reconciliation(
+            self.store,
+            created.id,
+            "pane",
+            "pane-fence",
+            "materialized",
+            now=11,
+            pane_id="pane-reviewer",
+            workspace_id="workspace",
+        )
+
+        self.assertEqual(resolved.participant_creation_state, "created")
+        self.assertEqual(resolved.participant_creation_pane_id, "pane-reviewer")
+        self.assertEqual(resolved.herdr_pane_id, "pane-reviewer")
+        client = mock.Mock()
+        cancel_target_and_release(
+            self.store,
+            created.id,
+            "planner",
+            resolved.target_release_token or "",
+            herdr_factory=lambda: client,
+        )
+        finished = self.store.get(created.id)
+        self.assertEqual(finished.status, JobStatus.FAILED)
+        self.assertIsNone(finished.manual_reconcile_operation)
+        self.assertEqual(
+            {call.args[0] for call in client.cancel_agent.call_args_list},
+            {"planner", "reviewer-pending"},
+        )
+
+    def test_concurrent_terminal_intent_fences_reviewer_pane_acceptance(self) -> None:
+        created = self.create(
+            {
+                "id": "123456789abc",
+                "status": "running",
+                "request": "review a plan",
+                "created_at": 1,
+                "delivered": False,
+                "worker_token": "worker",
+                "worker_pid": 42,
+                "worker_boot_id": "boot",
+                "worker_process_start": "start",
+                "herdr_target": "planner",
+                "planner_target": "planner",
+                "active_participant": "planner",
+                "agent_dispatch_state": "ready",
+            }
+        )
+        planned = provisioning._plan_participant_creation(
+            self.store,
+            created,
+            "worker",
+            WorkflowParticipant.REVIEWER,
+            target="reviewer-pending",
+            label="task-reviewer",
+            workspace_id="workspace",
+        )
+        before_submit, accepted = provisioning._participant_pane_callbacks(
+            self.store,
+            planned.id,
+            "worker",
+            "reviewer-pending",
+        )
+        before_submit()
+        staged = self.store.update(
+            created.id,
+            lambda job: stage_terminal_intent(
+                job,
+                JobStatus.FAILED,
+                now=10,
+                result="Reviewer startup failed.",
+                error="worker exited",
+            ),
+        )
+        assert staged is not None
+
+        with self.assertRaises(provisioning.WorkerCancelled):
+            accepted("pane-reviewer", "workspace")
+        recover_jobs(
+            self.store,
+            launch_worker=mock.Mock(),
+            is_worker_alive=lambda _job: False,
+            now=11,
+        )
+
+        recovered = self.store.get(created.id)
+        self.assertEqual(recovered.participant_creation_state, "manual_required")
+        self.assertEqual(recovered.manual_reconcile_operation, "pane")
+        self.assertEqual(recovered.participant_creation_target, "reviewer-pending")
+        self.assertEqual(recovered.participant_creation_label, "task-reviewer")
+        self.assertIsNone(recovered.participant_creation_pane_id)
+        self.assertIsNone(recovered.worker_token)
+        self.assertIn("Inspect Herdr", recovered.terminal_intent_error or "")
+
+    def test_worker_logs_terminal_cleanup_failure(self) -> None:
+        created = self.create(
+            {
+                "id": "123456789abc",
+                "status": "running",
+                "request": "review a plan",
+                "created_at": 1,
+                "delivered": False,
+                "worker_token": "worker",
+                "worker_pid": 42,
+                "worker_boot_id": "boot",
+                "worker_process_start": "start",
+            }
+        )
+        staged = self.store.update(
+            created.id,
+            lambda job: stage_terminal_intent(
+                job,
+                JobStatus.FAILED,
+                now=10,
+                result="failed",
+                error="original failure",
+            ),
+        )
+        assert staged is not None
+        context = worker_lifecycle.WorkerContext(
+            self.store,
+            staged,
+            "worker",
+            threading.Event(),
+        )
+        factories = provisioning.ClientFactories(
+            mock.Mock(),
+            mock.Mock(),
+            mock.Mock(),
+        )
+        diagnostic = io.StringIO()
+
+        with (
+            mock.patch.object(
+                provisioning,
+                "require_issue_provider",
+                side_effect=provisioning.WorkerCancelled,
+            ),
+            mock.patch.object(
+                provisioning.recovery,
+                "cancel_target_and_release",
+                side_effect=RuntimeError("cleanup exploded"),
+            ),
+            redirect_stderr(diagnostic),
+        ):
+            provisioning.run_claimed_worker(context, factories)
+
+        logged = diagnostic.getvalue()
+        self.assertIn("terminal cleanup failed", logged)
+        self.assertIn("RuntimeError: cleanup exploded", logged)
 
     def test_terminal_intent_cancels_every_target_before_publication(self) -> None:
         for job_id, terminal in (

@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import re
+import sys
 import time
+import traceback
 import uuid
 from collections.abc import Callable, Mapping, Set
 from dataclasses import dataclass
@@ -2035,14 +2037,20 @@ def _fence_participant_creation(
     def fence(current: CursorJob) -> CursorJob | None:
         if current.participant_creation_state not in {"planned", "submitting"}:
             return None
-        state = (
-            "ambiguous"
-            if current.participant_creation_state == "submitting"
-            or exc.code in {"operation_timeout", "operation_ambiguous"}
-            else "none"
-        )
+        uncertain = current.participant_creation_state == "submitting" or exc.code in {
+            "operation_timeout",
+            "operation_ambiguous",
+        }
+        if uncertain:
+            return current.evolve(
+                participant_creation_state="manual_required",
+                manual_reconcile_operation="pane",
+                manual_reconcile_token=uuid.uuid4().hex,
+                manual_reconcile_required_at=time.time(),
+                worker_operation=None,
+            )
         return current.evolve(
-            participant_creation_state=state,
+            participant_creation_state="none",
             worker_operation=None,
         )
 
@@ -3463,6 +3471,11 @@ def run_claimed_worker(  # pyright: ignore[reportGeneralTypeIssues]
                     worker_stopped=True,
                     herdr_factory=clients.herdr,
                 )
-        except Exception:
+        except Exception as cleanup_exc:
             # Durable terminal intent and release fences are recovered later.
-            pass
+            print(
+                "Cursor worker terminal cleanup failed: "
+                f"{type(cleanup_exc).__name__}: {cleanup_exc}",
+                file=sys.stderr,
+            )
+            traceback.print_exc()

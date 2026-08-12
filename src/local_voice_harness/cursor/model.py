@@ -1293,6 +1293,10 @@ class AgentJob:
                 resource = (
                     f"GitHub fork {values.get('fork_operation_target') or 'unknown'}"
                 )
+            elif operation == "pane":
+                role = values.get("participant_creation_participant") or "workflow"
+                target = values.get("participant_creation_target") or "unknown"
+                resource = f"{role} pane target {target}"
             else:
                 resource = f"worktree {values.get('worktree_path') or 'unknown'}"
             message = (f"{base}; manual reconciliation required for {resource}")[:500]
@@ -1889,7 +1893,13 @@ class AgentJob:
         return states.get(operation)
 
     def resolve_manual_operation(
-        self, operation: str, outcome: str, *, resolved_at: float
+        self,
+        operation: str,
+        outcome: str,
+        *,
+        resolved_at: float,
+        pane_id: str | None = None,
+        workspace_id: str | None = None,
     ) -> CursorJob | None:
         retain_terminal_release = self.terminal_intent_status is not None
         state_key = {
@@ -1932,12 +1942,21 @@ class AgentJob:
                     prompt_baseline_sequence=None,
                 )
         elif operation == "pane":
-            if outcome == "materialized" and not (
-                self.participant_creation_pane_id
-                and self.participant_creation_workspace_id
-            ):
-                return None
-            changes[state_key] = "created" if outcome == "materialized" else "none"
+            resolved_pane = pane_id or self.participant_creation_pane_id
+            resolved_workspace = workspace_id or self.participant_creation_workspace_id
+            if outcome == "materialized":
+                if not resolved_pane or not resolved_workspace:
+                    return None
+                changes.update(
+                    participant_creation_state="created",
+                    participant_creation_pane_id=resolved_pane,
+                    participant_creation_workspace_id=resolved_workspace,
+                    herdr_pane_id=resolved_pane,
+                    herdr_workspace_id=resolved_workspace,
+                    agent_name=self.participant_creation_target,
+                )
+            else:
+                changes[state_key] = "none"
             if outcome == "confirmed_absent":
                 changes.update(
                     participant_creation_participant=None,
