@@ -280,6 +280,12 @@ PENDING_SUBMIT_PATTERN = re.compile(
     r"start|create|build|refactor|test)\b",
     re.IGNORECASE,
 )
+GROUPED_REPOSITORY_MAPPING_PATTERN = re.compile(
+    r"(?:\b[A-Z][A-Z0-9]*-\d+\b|"
+    r"(?:https?://github\.com/)?"
+    r"[A-Z0-9_.-]+/[A-Z0-9_.-]+(?:/issues/|#)\d+)\s*:",
+    re.IGNORECASE,
+)
 FILLER_WORDS = frozenset(
     {
         "ah",
@@ -1270,7 +1276,15 @@ class WakeConversationDaemon:
                         and pending.question is not None
                         and bool(pending.question.choices)
                     )
-                    if resolved_as_answer or question_control(text) is not None:
+                    grouped_repository_answer = (
+                        pending.owner == "grouped_repository"
+                        and GROUPED_REPOSITORY_MAPPING_PATTERN.search(text) is not None
+                    )
+                    if (
+                        resolved_as_answer
+                        or grouped_repository_answer
+                        or question_control(text) is not None
+                    ):
                         route = IntentRoute(Intent.AGENT_REPLY, "high")
                     invalid_pending_reply = (
                         not resolved_as_answer
