@@ -33,6 +33,17 @@ ROUTER_SYSTEM_PROMPT = (
     "cursor_dismiss to silence or acknowledge a job announcement, and cursor_repeat "
     "to hear a job update again. When several jobs run at once the user may name a "
     "job by its label, issue number, or short id; still classify only the action. "
+    "Use workspace_consultation for any read-only question whose answer requires "
+    "inspecting the selected workspace, including factual questions about files or "
+    "implementation and requests to inspect, read, or check something read-only. Also "
+    "use it for workspace-grounded opinions, explanations, comparisons, or "
+    "recommendations without requested changes. Do not use cursor_submit merely "
+    "because a read-only consultation request says inspect, read, or check. "
+    "Use question_consultation only when the user asks to discuss, explain, or recommend "
+    "an option for the current pending Cursor question without answering it. A request "
+    "such as 'what do you think?' is question_consultation only when it clearly refers "
+    "to the pending question; otherwise it is conversation or "
+    "workspace_consultation. "
     "Use cursor_details when the user asks to see or hear more detail about the "
     "just-announced completed result, such as 'tell me more' or 'show me the details'; "
     "this is read-only and must not start more work. "
@@ -42,10 +53,8 @@ ROUTER_SYSTEM_PROMPT = (
     "acknowledgment such as 'ok' or 'okay' when no question is pending. When a "
     "Cursor job is awaiting a reply and the utterance answers it, prefer "
     "cursor_reply over end_conversation. "
-    "Use question_consultation when a Cursor question is pending and the user "
-    "explicitly asks for advice, a recommendation, or an explanation that would "
-    "help them answer it. Use conversation_continue only when a question is pending "
-    "and the user explicitly asks to keep talking, change the subject, or discuss "
+    "Use conversation_continue only when a question is pending and the user explicitly "
+    "asks to keep talking, change the subject, or discuss "
     "something else without answering the question. Do not use either intent for "
     "filler, background speech, or unrelated conversation that is not explicitly "
     "addressed to the assistant. While a question is pending, use cursor_submit only "
@@ -89,6 +98,7 @@ ROUTE_TOOL = {
                         "cursor_details",
                         "question_consultation",
                         "conversation_continue",
+                        "workspace_consultation",
                         "end_conversation",
                         "uncertain",
                     ],
@@ -123,6 +133,7 @@ class Intent(StrEnum):
     AGENT_DETAILS = "cursor_details"
     QUESTION_CONSULTATION = "question_consultation"
     CONVERSATION_CONTINUE = "conversation_continue"
+    WORKSPACE_CONSULTATION = "workspace_consultation"
     # Compatibility aliases for the original Cursor-specific intent names.
     CURSOR_SUBMIT = "cursor_submit"
     CURSOR_REPLY = "cursor_reply"

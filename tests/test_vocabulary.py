@@ -347,7 +347,12 @@ class RoutingPrepassTests(unittest.TestCase):
 
         self.assertEqual(captured, ["summarize owner/harness readme"])
         route_intent.assert_called_once_with(
-            "summarize owner/harness readme", mock.ANY, settings=mock.ANY
+            "summarize owner/harness readme",
+            mock.ANY,
+            cursor_session=None,
+            pending_question=None,
+            clarification_kind=None,
+            settings=mock.ANY,
         )
 
 

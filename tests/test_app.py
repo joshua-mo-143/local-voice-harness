@@ -3,11 +3,13 @@ from __future__ import annotations
 import contextlib
 import io
 import unittest
+from pathlib import Path
 from unittest import mock
 
 from local_voice_harness import app
 from local_voice_harness.agents.model import JobStatus
 from local_voice_harness.browser_context import RequestContext
+from local_voice_harness.cursor import consultation
 from local_voice_harness.cursor.service import CursorTurnRequest
 from local_voice_harness.intent import Intent, IntentRoute
 from local_voice_harness.questions import AnswerProvenance
@@ -569,6 +571,147 @@ class AppContextTests(unittest.TestCase):
         )
 
 
+class AppConsultationTests(unittest.TestCase):
+    def test_workspace_consultation_uses_read_only_dispatch(self) -> None:
+        context = RequestContext(
+            "What do you think about this approach?",
+            focused_repository="source/project",
+        )
+        registry = mock.Mock()
+        client = registry.herdr_client.return_value
+        target = consultation.WorkspaceTarget(
+            checkout=Path("/tmp/project"),
+            workspace_id="workspace-1",
+            label="project",
+        )
+        with (
+            mock.patch.object(app, "start_components"),
+            mock.patch.object(app, "build_integration_registry", return_value=registry),
+            mock.patch.object(app, "request_context", return_value=context),
+            mock.patch.object(
+                app.cursor_consultation,
+                "pending_question_snapshot",
+                return_value=None,
+            ),
+            mock.patch.object(
+                app,
+                "route_intent",
+                return_value=IntentRoute(Intent.WORKSPACE_CONSULTATION, "high"),
+            ),
+            mock.patch.object(
+                app.cursor_consultation, "workspace_target", return_value=target
+            ),
+            mock.patch.object(
+                app.cursor_consultation,
+                "consult",
+                return_value="Use the simpler boundary.",
+            ) as consult,
+            mock.patch.object(app, "cursor_turn") as cursor,
+            mock.patch.object(app, "qwen_response") as qwen,
+            mock.patch.object(app, "stream_and_play") as play,
+        ):
+            app.respond("What do you think about this approach?")
+
+        consult.assert_called_once_with(client, target, context.text)
+        cursor.assert_not_called()
+        qwen.assert_not_called()
+        play.assert_called_once_with("Use the simpler boundary.", settings=mock.ANY)
+
+    def test_pending_consultation_supplies_router_context_without_replying(
+        self,
+    ) -> None:
+        context = RequestContext("Which option do you recommend?")
+        snapshot = mock.Mock(
+            job_id="aaaaaaaaaaaa",
+            text="Which design?",
+            owner="agent",
+        )
+        registry = mock.Mock()
+        client = registry.herdr_client.return_value
+        with (
+            mock.patch.object(app, "start_components"),
+            mock.patch.object(app, "build_integration_registry", return_value=registry),
+            mock.patch.object(app, "request_context", return_value=context),
+            mock.patch.object(
+                app.cursor_consultation,
+                "pending_question_snapshot",
+                return_value=snapshot,
+            ),
+            mock.patch.object(
+                app,
+                "route_intent",
+                return_value=IntentRoute(
+                    Intent.QUESTION_CONSULTATION,
+                    "high",
+                ),
+            ) as route,
+            mock.patch.object(
+                app.cursor_consultation,
+                "consult_pending_question",
+                return_value="Choose the safe design.",
+            ) as consult,
+            mock.patch.object(app, "cursor_turn") as cursor,
+            mock.patch.object(app, "qwen_response") as qwen,
+            mock.patch.object(app, "stream_and_play"),
+        ):
+            app.respond("Which option do you recommend?")
+
+        route.assert_called_once_with(
+            "Which option do you recommend?",
+            context,
+            cursor_session="aaaaaaaaaaaa",
+            pending_question="Which design?",
+            clarification_kind="agent",
+            settings=mock.ANY,
+        )
+        consult.assert_called_once_with(
+            client,
+            app.CURSOR_STORE,
+            snapshot,
+            context.text,
+        )
+        cursor.assert_not_called()
+        qwen.assert_not_called()
+
+    def test_ambiguous_pending_consultation_fails_without_fallback(self) -> None:
+        with (
+            mock.patch.object(app, "start_components"),
+            mock.patch.object(
+                app,
+                "request_context",
+                return_value=RequestContext("Which option do you recommend?"),
+            ),
+            mock.patch.object(
+                app.cursor_consultation,
+                "pending_question_snapshot",
+                return_value=None,
+            ),
+            mock.patch.object(
+                app,
+                "route_intent",
+                return_value=IntentRoute(
+                    Intent.QUESTION_CONSULTATION,
+                    "high",
+                ),
+            ),
+            mock.patch.object(
+                app.cursor_consultation, "consult_pending_question"
+            ) as consult,
+            mock.patch.object(app, "cursor_turn") as cursor,
+            mock.patch.object(app, "qwen_response") as qwen,
+            mock.patch.object(app, "stream_and_play") as play,
+        ):
+            app.respond("Which option do you recommend?")
+
+        consult.assert_not_called()
+        cursor.assert_not_called()
+        qwen.assert_not_called()
+        play.assert_called_once_with(
+            consultation.NO_PENDING_QUESTION,
+            settings=mock.ANY,
+        )
+
+
 class CursorFastPathTests(unittest.TestCase):
     def test_coding_request_does_not_need_to_name_cursor(self) -> None:
         text = "fix the failing authentication tests"
@@ -610,6 +753,9 @@ class CursorFastPathTests(unittest.TestCase):
         route_intent.assert_called_once_with(
             text,
             RequestContext(text),
+            cursor_session=None,
+            pending_question=None,
+            clarification_kind=None,
             settings=mock.ANY,
         )
 
@@ -656,7 +802,12 @@ class CursorFastPathTests(unittest.TestCase):
             app.respond("what is the weather")
 
         route_intent.assert_called_once_with(
-            "what is the weather", context, settings=mock.ANY
+            "what is the weather",
+            context,
+            cursor_session=None,
+            pending_question=None,
+            clarification_kind=None,
+            settings=mock.ANY,
         )
 
 

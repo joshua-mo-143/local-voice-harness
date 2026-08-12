@@ -25,6 +25,7 @@ from .config import (
     STT_SOCKET,
     TTS_SOCKET,
 )
+from .cursor import consultation as cursor_consultation
 from .cursor import questions as cursor_questions
 from .errors import HarnessError
 from .integrations.registry import IntegrationRegistry, build_integration_registry
@@ -66,7 +67,12 @@ def _context_for_route(
 ) -> RequestContext:
     """Capture external context only when the routed action can consume it."""
     if route.intent == Intent.CONVERSATION or (
-        route.actionable and route.intent == Intent.AGENT_SUBMIT
+        route.actionable
+        and route.intent
+        in {
+            Intent.AGENT_SUBMIT,
+            Intent.WORKSPACE_CONSULTATION,
+        }
     ):
         return request_context(
             text,
@@ -115,12 +121,20 @@ def respond(text: str, *, user_config: UserConfig | None = None) -> None:
                 if is_grouped_repository_mapping(text)
                 else None
             )
+            pending = cursor_consultation.pending_question_snapshot(CURSOR_STORE, None)
             if grouped_reply is not None:
                 route = IntentRoute(Intent.AGENT_REPLY, "high")
             elif CURSOR_PATTERN.search(text):
                 route = IntentRoute(Intent.AGENT_SUBMIT, "high")
             else:
-                route = route_intent(text, routing_context, settings=settings.providers)
+                route = route_intent(
+                    text,
+                    routing_context,
+                    cursor_session=pending.job_id if pending is not None else None,
+                    pending_question=pending.text if pending is not None else None,
+                    clarification_kind=pending.owner if pending is not None else None,
+                    settings=settings.providers,
+                )
             context = _context_for_route(
                 text,
                 route,
@@ -153,6 +167,39 @@ def respond(text: str, *, user_config: UserConfig | None = None) -> None:
             }
             if missing_ticket_scope:
                 response = MISSING_ISSUE_SCOPE_RESPONSE
+            elif route.actionable and route.intent == Intent.QUESTION_CONSULTATION:
+                if pending is None:
+                    response = cursor_consultation.NO_PENDING_QUESTION
+                else:
+                    try:
+                        response = cursor_consultation.consult_pending_question(
+                            integrations.herdr_client(),
+                            CURSOR_STORE,
+                            pending,
+                            context.text,
+                        )
+                    except Exception as exc:  # noqa: BLE001 - consultation fails closed
+                        response = (
+                            str(exc)
+                            if isinstance(exc, HarnessError)
+                            and str(exc) == cursor_consultation.STALE_PENDING_QUESTION
+                            else cursor_consultation.CONSULTATION_FAILED
+                        )
+            elif route.actionable and route.intent == Intent.WORKSPACE_CONSULTATION:
+                try:
+                    client = integrations.herdr_client()
+                    target = cursor_consultation.workspace_target(
+                        client,
+                        focused_repository=context.focused_repository,
+                        completed_job=None,
+                    )
+                    response = (
+                        cursor_consultation.consult(client, target, context.text)
+                        if target is not None
+                        else cursor_consultation.NO_WORKSPACE
+                    )
+                except Exception:  # noqa: BLE001 - consultation fails closed
+                    response = cursor_consultation.CONSULTATION_FAILED
             elif route.actionable and route.intent == Intent.AGENT_SUBMIT:
                 response = cursor_turn(
                     CursorTurnRequest(

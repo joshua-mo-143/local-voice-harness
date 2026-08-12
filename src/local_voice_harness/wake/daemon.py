@@ -51,6 +51,7 @@ from ..critical_targets import (
     resolve_readback,
     select_submit_target,
 )
+from ..cursor import consultation as cursor_consultation
 from ..cursor import questions as cursor_questions
 from ..cursor import service as cursor_service
 from ..cursor.delivery import (
@@ -1311,7 +1312,14 @@ class WakeConversationDaemon:
                         return None
             if pending_readback is None and (
                 route.intent == Intent.CONVERSATION
-                or (route.actionable and route.intent == Intent.AGENT_SUBMIT)
+                or (
+                    route.actionable
+                    and route.intent
+                    in {
+                        Intent.AGENT_SUBMIT,
+                        Intent.WORKSPACE_CONSULTATION,
+                    }
+                )
             ):
                 context = request_context(
                     text,
@@ -1355,6 +1363,49 @@ class WakeConversationDaemon:
                 )
             elif missing_ticket_scope:
                 response = MISSING_ISSUE_SCOPE_RESPONSE
+            elif route.actionable and route.intent == Intent.QUESTION_CONSULTATION:
+                snapshot = cursor_consultation.pending_question_snapshot(
+                    CURSOR_STORE,
+                    pending.job_id if pending is not None else None,
+                )
+                if snapshot is None:
+                    response = cursor_consultation.NO_PENDING_QUESTION
+                else:
+                    try:
+                        response = cursor_consultation.consult_pending_question(
+                            self.integrations.herdr_client(),
+                            CURSOR_STORE,
+                            snapshot,
+                            context.text,
+                        )
+                    except Exception as exc:  # noqa: BLE001 - consultation fails closed
+                        response = (
+                            str(exc)
+                            if isinstance(exc, HarnessError)
+                            and str(exc) == cursor_consultation.STALE_PENDING_QUESTION
+                            else cursor_consultation.CONSULTATION_FAILED
+                        )
+            elif route.actionable and route.intent == Intent.WORKSPACE_CONSULTATION:
+                completed_job = None
+                if active_completed is not None:
+                    try:
+                        completed_job = CURSOR_STORE.get(active_completed.job_id)
+                    except Exception:  # noqa: BLE001 - selection must fail closed
+                        completed_job = None
+                try:
+                    client = self.integrations.herdr_client()
+                    target = cursor_consultation.workspace_target(
+                        client,
+                        focused_repository=context.focused_repository,
+                        completed_job=completed_job,
+                    )
+                    response = (
+                        cursor_consultation.consult(client, target, context.text)
+                        if target is not None
+                        else cursor_consultation.NO_WORKSPACE
+                    )
+                except Exception:  # noqa: BLE001 - consultation fails closed
+                    response = cursor_consultation.CONSULTATION_FAILED
             elif route.actionable and route.intent == Intent.AGENT_LIST:
                 response, next_cursor_session = cursor_turn(
                     CursorTurnRequest(
