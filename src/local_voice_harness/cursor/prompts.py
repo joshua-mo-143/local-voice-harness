@@ -1,8 +1,73 @@
 from __future__ import annotations
 
+import hashlib
 import re
+from collections.abc import Mapping
+from dataclasses import dataclass
 
 from ..config import CURSOR_PATTERN
+
+MAX_PROMPT_CHARS = 64 * 1024
+SECTION_LIMITS = {
+    "request": 16 * 1024,
+    "issue_context": 24 * 1024,
+    "classification": 4 * 1024,
+    "plan": 32 * 1024,
+    "review": 24 * 1024,
+    "clarification": 8 * 1024,
+    "integration": 4 * 1024,
+}
+
+
+class PromptSizeError(ValueError):
+    """Required prompt context cannot fit within a safe bounded payload."""
+
+
+@dataclass(frozen=True, slots=True)
+class PromptPayload:
+    text: str
+    manifest: dict[str, object]
+
+
+def bounded_prompt_payload(
+    text: str,
+    *,
+    phase: str,
+    session_identity: str,
+    full_rehydration: bool,
+    sections: Mapping[str, str | None],
+) -> PromptPayload:
+    """Validate a prompt and describe its contents without persisting their text."""
+    manifest_sections: dict[str, dict[str, object]] = {}
+    for name, value in sections.items():
+        if not value:
+            continue
+        limit = SECTION_LIMITS.get(name)
+        size = len(value)
+        if limit is not None and size > limit:
+            raise PromptSizeError(
+                f"required prompt section {name!r} exceeds its {limit}-character limit"
+            )
+        manifest_sections[name] = {
+            "chars": size,
+            "sha256": hashlib.sha256(value.encode()).hexdigest(),
+        }
+    if len(text) > MAX_PROMPT_CHARS:
+        raise PromptSizeError(
+            f"required prompt exceeds its {MAX_PROMPT_CHARS}-character total limit"
+        )
+    return PromptPayload(
+        text=text,
+        manifest={
+            "version": 1,
+            "phase": phase,
+            "session_identity": session_identity,
+            "full_rehydration": full_rehydration,
+            "total_chars": len(text),
+            "sha256": hashlib.sha256(text.encode()).hexdigest(),
+            "sections": manifest_sections,
+        },
+    )
 
 
 def _request_text(text: str) -> str:
@@ -23,6 +88,59 @@ def _voice_question_marker(token: str) -> str:
         '"multiple_choice","choices":[{"id":"stable-id","label":"spoken label"}],'
         '"sensitivity":"routine" or "security" or "destructive" or "architecture" '
         'or "product"}. Use an empty choices list for free text.'
+    )
+
+
+def continuation_prompt(
+    phase: str,
+    clarification: str,
+    token: str,
+    *,
+    issue_reference: str | None = None,
+) -> str:
+    """Build a same-session delta containing no previously submitted context."""
+    question = _voice_question_marker(token)
+    if phase == "classifying":
+        outcome = (
+            f"{question}\nor both:\n"
+            f"WORKFLOW_TIER[{token}]: simple|medium|high-risk\n"
+            f"WORKFLOW_REASON[{token}]: <brief evidence-based reason>"
+        )
+        action = "Continue classification using only this clarification."
+    elif phase in {"planning", "revising"}:
+        outcome = (
+            f"{question}\nor:\n"
+            f"WORKFLOW_PLAN[{token}]: <bounded multiline implementation plan>"
+        )
+        action = "Continue the existing plan using only this clarification."
+    elif phase == "reviewing":
+        outcome = (
+            f"{question}\nor both:\n"
+            f"WORKFLOW_REVIEW_DECISION[{token}]: approve|revise\n"
+            f"WORKFLOW_REVIEW[{token}]: <bounded multiline findings>"
+        )
+        action = "Continue the existing review using only this clarification."
+    elif phase == "implementing":
+        completion = (
+            f" The summary must be exactly \"I've finished working on "
+            f'{issue_reference}".'
+            if issue_reference
+            else ""
+        )
+        outcome = (
+            f"{question}\nor WORKFLOW_PROMOTE[{token}]: medium|high-risk followed by "
+            f"WORKFLOW_REASON[{token}]: <brief evidence>\n"
+            f"or VOICE_SUMMARY[{token}]: <plain-text summary of at most 20 words>."
+            f"{completion}"
+        )
+        action = "Continue the existing implementation using only this clarification."
+    else:
+        raise ValueError(f"unsupported workflow phase {phase!r}")
+    return (
+        f"{action} The prior verified agent session already has the base request and "
+        "durable artifacts. Do not infer additional user intent. Return exactly one "
+        f"allowed outcome marker set:\n{outcome}\n\n"
+        f"Current question/answer delta:\n{clarification}"
     )
 
 

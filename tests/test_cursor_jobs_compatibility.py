@@ -98,17 +98,39 @@ def test_read_modify_write_increments_revision_once_and_rejects_stale_edits(
     )
     first = jobs.read_job("123456789abc")
     stale = dict(first)
-    first["request"] = "edited"
+    first["repository_hint"] = "edited"
 
     jobs.write_job(first)
 
     persisted = jobs.read_job("123456789abc")
-    assert persisted["request"] == "edited"
+    assert persisted["repository_hint"] == "edited"
+    assert persisted["request"] == "original"
     assert persisted["revision"] == 1
-    stale["request"] = "stale edit"
+    stale["repository_hint"] = "stale edit"
     with pytest.raises(jobs.HarnessError, match="stale Cursor job revision"):
         jobs.write_job(stale)
     assert jobs.read_job("123456789abc")["revision"] == 1
+
+
+def test_read_modify_write_rejects_original_request_mutation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    configure_store(tmp_path, monkeypatch)
+    jobs.write_job(
+        {
+            "id": "123456789abc",
+            "status": "queued",
+            "request": "original",
+            "created_at": 1,
+            "queued_at": 1,
+            "delivered": False,
+        }
+    )
+    edited = jobs.read_job("123456789abc")
+    edited["request"] = "changed"
+
+    with pytest.raises(jobs.HarnessError, match="cannot change the original request"):
+        jobs.write_job(edited)
 
 
 def test_compatibility_store_errors_use_harness_error_semantics(

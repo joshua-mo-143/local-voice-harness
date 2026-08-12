@@ -3,7 +3,12 @@ from __future__ import annotations
 import unittest
 
 from local_voice_harness.cursor.prompts import (
+    MAX_PROMPT_CHARS,
+    SECTION_LIMITS,
+    PromptSizeError,
+    bounded_prompt_payload,
     classification_prompt,
+    continuation_prompt,
     cursor_prompt,
     plan_approval_prompt,
     planning_prompt,
@@ -156,6 +161,55 @@ class CursorPromptTests(unittest.TestCase):
             with self.subTest(prompt=prompt.splitlines()[0]):
                 self.assertIn("Trusted integration instructions", prompt)
                 self.assertIn("Linear MCP", prompt)
+
+    def test_same_session_continuation_contains_only_delta_and_markers(self) -> None:
+        prompt = continuation_prompt(
+            "planning",
+            "Question: Which format?\nUser answered: Keep JSON",
+            "turn",
+        )
+
+        self.assertIn("Keep JSON", prompt)
+        self.assertIn("WORKFLOW_PLAN[turn]", prompt)
+        self.assertIn("VOICE_QUESTION[turn]", prompt)
+        self.assertNotIn("User request:", prompt)
+        self.assertNotIn("Approved-plan candidate:", prompt)
+
+    def test_prompt_manifest_is_redacted_and_records_section_hashes(self) -> None:
+        payload = bounded_prompt_payload(
+            "bounded prompt",
+            phase="planning",
+            session_identity="session-1",
+            full_rehydration=True,
+            sections={"request": "secret request", "plan": "safe plan"},
+        )
+
+        self.assertEqual(payload.manifest["phase"], "planning")
+        self.assertTrue(payload.manifest["full_rehydration"])
+        self.assertNotIn("secret request", repr(payload.manifest))
+        sections = payload.manifest["sections"]
+        assert isinstance(sections, dict)
+        self.assertEqual(sections["request"]["chars"], len("secret request"))
+        self.assertEqual(len(sections["request"]["sha256"]), 64)
+
+    def test_required_oversized_context_fails_closed(self) -> None:
+        with self.assertRaises(PromptSizeError):
+            bounded_prompt_payload(
+                "x" * (MAX_PROMPT_CHARS + 1),
+                phase="reviewing",
+                session_identity="session-1",
+                full_rehydration=True,
+                sections={"issue_context": "issue"},
+            )
+
+        with self.assertRaisesRegex(PromptSizeError, "issue_context"):
+            bounded_prompt_payload(
+                "small envelope",
+                phase="reviewing",
+                session_identity="session-1",
+                full_rehydration=True,
+                sections={"issue_context": "x" * (SECTION_LIMITS["issue_context"] + 1)},
+            )
 
 
 if __name__ == "__main__":

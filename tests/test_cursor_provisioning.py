@@ -788,6 +788,125 @@ class DurablePromptOperationTests(unittest.TestCase):
         self.assertEqual(outcome, ("output", "idle"))
         self.assertEqual(self.store.get(job.id).prompt_operation_state, "submitted")
 
+    def _execute_continuation_with_session(self, session: str) -> tuple[bool, str]:
+        created = self.create()
+        job = self.store.update(
+            created.id,
+            lambda current: current.evolve(
+                continuation=True,
+                continuation_answer="Question: Format?\nUser answered: JSON",
+                prompt_context_sessions={"planner": "planner-session"},
+            ),
+        )
+        assert job is not None
+        client = mock.Mock()
+        client.get_agent.return_value = {
+            "state_change_seq": 7,
+            "agent_session": session,
+        }
+
+        def submit(*args: object, **kwargs: object) -> PromptOutcome:
+            cast(Callable[[int], None], kwargs["before_submit"])(7)
+            cast(Callable[[], None], kwargs["accepted"])()
+            return PromptOutcome("idle", None, None, "output")
+
+        client.prompt_and_wait.side_effect = submit
+        decisions: list[bool] = []
+
+        def factory(identity: str, full: bool) -> production_jobs.PromptPayload:
+            decisions.append(full)
+            text = "full request and artifacts" if full else "delta only"
+            return production_jobs.bounded_prompt_payload(
+                text,
+                phase="classifying",
+                session_identity=identity,
+                full_rehydration=full,
+                sections={"request": "test"} if full else {"clarification": "JSON"},
+            )
+
+        production_jobs._execute_phase_prompt(
+            self.store,
+            job,
+            "worker",
+            client,
+            lambda: None,
+            target="planner",
+            prompt_factory=factory,
+            token="123456789abc-1",
+        )
+        sent = str(client.prompt_and_wait.call_args.args[1])
+        return decisions[0], sent
+
+    def test_same_session_continuation_submits_only_delta(self) -> None:
+        full_rehydration, sent = self._execute_continuation_with_session(
+            "planner-session"
+        )
+
+        self.assertFalse(full_rehydration)
+        self.assertEqual(sent, "delta only")
+        manifest = self.store.get("123456789abc").prompt_manifest
+        assert manifest is not None
+        self.assertFalse(manifest["full_rehydration"])
+
+    def test_replaced_session_rehydrates_full_context(self) -> None:
+        full_rehydration, sent = self._execute_continuation_with_session(
+            "replacement-session"
+        )
+
+        self.assertTrue(full_rehydration)
+        self.assertEqual(sent, "full request and artifacts")
+        current = self.store.get("123456789abc")
+        self.assertEqual(
+            current.prompt_context_sessions["planner"], "replacement-session"
+        )
+
+    def test_repeated_clarification_history_does_not_grow_delta_prompt(self) -> None:
+        created = self.create()
+        record = {
+            "question_id": "question-1",
+            "question": "Format?",
+            "answer": "JSON",
+            "turn_token": "123456789abc-1",
+        }
+        one = created.evolve(
+            continuation=True,
+            continuation_answer="Question: Format?\nUser answered: JSON",
+            clarifications=[record],
+        )
+        many = one.evolve(clarifications=[record] * 50)
+
+        one_payload = production_jobs._WorkflowPromptFactory(
+            one, one.workflow_phase, one.turn_token or "", ()
+        )("session", False)
+        many_payload = production_jobs._WorkflowPromptFactory(
+            many, many.workflow_phase, many.turn_token or "", ()
+        )("session", False)
+
+        self.assertEqual(one_payload.text, many_payload.text)
+        self.assertEqual(
+            one_payload.manifest["total_chars"],
+            many_payload.manifest["total_chars"],
+        )
+        self.assertNotIn(created.request, one_payload.text)
+
+    def test_fresh_session_payload_rehydrates_request_and_current_answer(self) -> None:
+        created = self.create()
+        continued = created.evolve(
+            continuation=True,
+            continuation_answer="Question: Format?\nUser answered: JSON",
+        )
+
+        payload = production_jobs._WorkflowPromptFactory(
+            continued,
+            continued.workflow_phase,
+            continued.turn_token or "",
+            (),
+        )("replacement-session", True)
+
+        self.assertIn("User request: test", payload.text)
+        self.assertIn("User answered: JSON", payload.text)
+        self.assertTrue(payload.manifest["full_rehydration"])
+
     def test_prompt_call_failure_is_ambiguous_even_without_callback(self) -> None:
         job = self.create()
         client = mock.Mock()
@@ -1157,8 +1276,10 @@ class CursorJobStateTests(unittest.TestCase):
             resumed.active_participant,
             WorkflowParticipant.REVIEWER,
         )
-        self.assertIn("change several components", resumed.request)
-        self.assertIn("User clarification: keep the old format", resumed.request)
+        self.assertEqual(resumed.request, "change several components")
+        self.assertEqual(len(resumed.clarifications), 1)
+        self.assertEqual(resumed.clarifications[0]["answer"], "keep the old format")
+        self.assertIn("keep the old format", str(resumed.continuation_answer))
 
     def test_auto_mode_approves_only_the_reviewed_plan_gate(self) -> None:
         jobs.write_job(
@@ -1539,7 +1660,7 @@ class CursorJobStateTests(unittest.TestCase):
 
         self.assertEqual(store.get("123456789abc").status, JobStatus.BLOCKED)
 
-    def test_promotion_carries_clarification_into_planning_request(self) -> None:
+    def test_promotion_carries_clarification_without_mutating_request(self) -> None:
         jobs.write_job(
             {
                 "id": "123456789abc",
@@ -1577,9 +1698,8 @@ class CursorJobStateTests(unittest.TestCase):
             promoted.active_participant,
             WorkflowParticipant.IMPLEMENTER,
         )
-        self.assertIn("rename text", promoted.request)
-        self.assertIn("preserve compatibility", promoted.request)
-        self.assertIsNone(promoted.continuation_answer)
+        self.assertEqual(promoted.request, "rename text")
+        self.assertIn("preserve compatibility", str(promoted.continuation_answer))
         self.assertFalse(promoted.continuation)
 
     def test_high_risk_final_rejected_review_awaits_explicit_decision(self) -> None:

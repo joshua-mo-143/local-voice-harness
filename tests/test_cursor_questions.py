@@ -595,6 +595,9 @@ def test_duplicate_answer_cannot_launch_twice(store: JobStore) -> None:
     launch.assert_called_once_with("aaaaaaaaaaaa")
     queued = store.get("aaaaaaaaaaaa")
     assert queued.request == "build the feature"
+    assert len(queued.clarifications) == 1
+    assert queued.clarifications[0]["question"] == "Which approach should I use?"
+    assert queued.clarifications[0]["answer"] == "Use SQLite"
     continuation = str(queued.to_dict()["continuation_answer"])
     assert "Which approach should I use?" in continuation
     assert "Use SQLite" in continuation

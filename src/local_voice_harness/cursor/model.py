@@ -16,7 +16,7 @@ from ..integrations.github import (
 )
 from ..questions import Question, QuestionError
 
-CURRENT_SCHEMA_VERSION = 14
+CURRENT_SCHEMA_VERSION = 15
 LEGACY_SCHEMA_VERSIONS = frozenset(range(CURRENT_SCHEMA_VERSION))
 LEGACY_BOOT_ID = "legacy-unknown"
 
@@ -650,6 +650,9 @@ def _advance_legacy_version(values: dict[str, object], version: int) -> None:
             "participant_admission_state",
             _default_participant_admission_state(values),
         )
+    elif version == 14:
+        values.setdefault("clarifications", [])
+        values.setdefault("prompt_context_sessions", {})
     values["schema_version"] = version + 1
 
 
@@ -963,6 +966,40 @@ class AgentJob:
                 Question.from_dict(values["voice_question"])
             except QuestionError as exc:
                 raise JobValidationError(f"invalid voice_question: {exc}") from exc
+        clarifications = values.setdefault("clarifications", [])
+        if not isinstance(clarifications, list):
+            raise JobValidationError("clarifications must be an array")
+        for clarification in clarifications:
+            if not isinstance(clarification, dict):
+                raise JobValidationError("clarification records must be objects")
+            if not all(
+                isinstance(clarification.get(field), str)
+                and bool(str(clarification[field]).strip())
+                for field in ("question_id", "question", "answer", "turn_token")
+            ):
+                raise JobValidationError(
+                    "clarification records require question, answer, and turn identity"
+                )
+        context_sessions = values.setdefault("prompt_context_sessions", {})
+        if not isinstance(context_sessions, dict) or not all(
+            key in {participant.value for participant in WorkflowParticipant}
+            and isinstance(value, str)
+            and bool(value)
+            for key, value in context_sessions.items()
+        ):
+            raise JobValidationError("prompt_context_sessions is invalid")
+        prompt_manifest = values.get("prompt_manifest")
+        if prompt_manifest is not None and (
+            not isinstance(prompt_manifest, dict)
+            or prompt_manifest.get("version") != 1
+            or not isinstance(prompt_manifest.get("phase"), str)
+            or not isinstance(prompt_manifest.get("session_identity"), str)
+            or not isinstance(prompt_manifest.get("full_rehydration"), bool)
+            or not isinstance(prompt_manifest.get("total_chars"), int)
+            or not isinstance(prompt_manifest.get("sha256"), str)
+            or not isinstance(prompt_manifest.get("sections"), dict)
+        ):
+            raise JobValidationError("prompt_manifest is invalid")
 
         job_id = str(values.get("id") or "")
         if not re.fullmatch(r"[0-9a-f]{12}", job_id):
@@ -1513,6 +1550,29 @@ class AgentJob:
     @property
     def continuation_answer(self) -> str | None:
         return self._optional_string("continuation_answer")
+
+    @property
+    def clarifications(self) -> tuple[dict[str, object], ...]:
+        value = self._values.get("clarifications")
+        if not isinstance(value, list):
+            return ()
+        return tuple(dict(item) for item in value if isinstance(item, dict))
+
+    @property
+    def prompt_context_sessions(self) -> dict[str, str]:
+        value = self._values.get("prompt_context_sessions")
+        if not isinstance(value, dict):
+            return {}
+        return {
+            str(key): str(session)
+            for key, session in value.items()
+            if isinstance(key, str) and isinstance(session, str)
+        }
+
+    @property
+    def prompt_manifest(self) -> dict[str, object] | None:
+        value = self._values.get("prompt_manifest")
+        return dict(value) if isinstance(value, dict) else None
 
     @property
     def interactive_questionnaire_blocked(self) -> bool:
@@ -2556,6 +2616,10 @@ def validate_transition(before: CursorJob, after: CursorJob) -> None:
         raise JobValidationError("Cursor job transition cannot change created_at")
     if before.parent_job_id != after.parent_job_id:
         raise JobValidationError("Cursor job transition cannot change parent_job_id")
+    if before.request != after.request:
+        raise JobValidationError(
+            "Cursor job transition cannot change the original request"
+        )
     if before.harness_kind != after.harness_kind:
         raise JobValidationError("agent job transition cannot change harness_kind")
     if before.issue_provider != after.issue_provider:

@@ -79,7 +79,11 @@ from .model import (
     transition,
 )
 from .prompts import (
+    PromptPayload,
+    PromptSizeError,
+    bounded_prompt_payload,
     classification_prompt,
+    continuation_prompt,
     implementation_prompt,
     planning_prompt,
     review_prompt,
@@ -99,6 +103,129 @@ class ClientFactories:
     herdr: Callable[[], HerdrClient]
     github: Callable[[], GitHubClient | GitHubProvider]
     integrations: IntegrationRegistry | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class _WorkflowPromptFactory:
+    job: CursorJob
+    phase: WorkflowPhase
+    token: str
+    integration_instructions: tuple[str, ...]
+    plan: str | None = None
+    review: str | None = None
+    issue_reference: str | None = None
+
+    def __call__(self, session_identity: str, full_rehydration: bool) -> PromptPayload:
+        if not full_rehydration:
+            clarification = self.job.continuation_answer
+            if not clarification:
+                raise HarnessError(
+                    "same-session continuation has no clarification delta"
+                )
+            text = continuation_prompt(
+                self.phase.value,
+                clarification,
+                self.token,
+                issue_reference=self.issue_reference,
+            )
+            sections: dict[str, str | None] = {"clarification": clarification}
+        else:
+            text = self._full_prompt()
+            issue_context = self._deduplicated_issue_context()
+            sections = {
+                "request": self.job.request,
+                "issue_context": issue_context,
+                "classification": self.job.workflow_classification_reason,
+                "integration": " ".join(self.integration_instructions) or None,
+                "plan": self.plan,
+                "review": self.review,
+                "clarification": self.job.continuation_answer,
+            }
+        return bounded_prompt_payload(
+            text,
+            phase=self.phase.value,
+            session_identity=session_identity,
+            full_rehydration=full_rehydration,
+            sections=sections,
+        )
+
+    def _full_prompt(self) -> str:
+        if self.phase == WorkflowPhase.CLASSIFYING:
+            return self._with_current_clarification(
+                classification_prompt(
+                    self.job.request,
+                    self.token,
+                    github_issue_context=self._deduplicated_issue_context(),
+                    integration_instructions=self.integration_instructions,
+                )
+            )
+        if self.phase == WorkflowPhase.PLANNING:
+            if self.job.workflow_tier is None:
+                raise HarnessError("planning phase requires a workflow tier")
+            return self._with_current_clarification(
+                planning_prompt(
+                    self.job.request,
+                    self.token,
+                    tier=self.job.workflow_tier.value,
+                    github_issue_context=self._deduplicated_issue_context(),
+                    classification_reason=self.job.workflow_classification_reason,
+                    integration_instructions=self.integration_instructions,
+                )
+            )
+        if self.phase == WorkflowPhase.REVIEWING:
+            if self.plan is None or self.job.workflow_tier is None:
+                raise HarnessError("review phase requires a durable plan and tier")
+            return self._with_current_clarification(
+                review_prompt(
+                    self.job.request,
+                    self.plan,
+                    self.token,
+                    tier=self.job.workflow_tier.value,
+                    github_issue_context=self._deduplicated_issue_context(),
+                    classification_reason=self.job.workflow_classification_reason,
+                    integration_instructions=self.integration_instructions,
+                )
+            )
+        if self.phase == WorkflowPhase.REVISING:
+            if self.plan is None or self.review is None:
+                raise HarnessError("revision phase requires plan and review artifacts")
+            return self._with_current_clarification(
+                revision_prompt(
+                    self.job.request,
+                    self.plan,
+                    self.review,
+                    self.token,
+                    github_issue_context=self._deduplicated_issue_context(),
+                    classification_reason=self.job.workflow_classification_reason,
+                    integration_instructions=self.integration_instructions,
+                )
+            )
+        if self.phase == WorkflowPhase.IMPLEMENTING:
+            text = implementation_prompt(
+                self.job.request,
+                self.token,
+                plan=self.plan,
+                github_issue_context=self._deduplicated_issue_context(),
+                classification_reason=self.job.workflow_classification_reason,
+                issue_reference=self.issue_reference,
+                integration_instructions=self.integration_instructions,
+            )
+            if self.review:
+                text += f"\n\nApproved review findings:\n{self.review}"
+            return self._with_current_clarification(text)
+        raise HarnessError(f"unsupported workflow phase {self.phase.value}")
+
+    def _with_current_clarification(self, text: str) -> str:
+        if not self.job.continuation_answer:
+            return text
+        return f"{text}\n\nCurrent clarification:\n{self.job.continuation_answer}"
+
+    def _deduplicated_issue_context(self) -> str | None:
+        context = self.job.github_issue_context
+        if not context:
+            return None
+        represented_by = (self.job.request, self.plan or "", self.review or "")
+        return None if any(context in value for value in represented_by) else context
 
 
 def _github_provider(
@@ -1939,8 +2066,7 @@ def _advance_workflow_output(
                 worker_token,
                 MODEL_WORKER_STATUSES,
                 lambda current: current.evolve(
-                    request=_request_with_clarification(current),
-                    remove=frozenset({"continuation", "continuation_answer"}),
+                    continuation=False,
                     workflow_tier=promoted.value,
                     workflow_classification_reason=classification_reason[:500],
                     workflow_phase=WorkflowPhase.PLANNING.value,
@@ -2255,11 +2381,33 @@ def _execute_phase_prompt(
     checkpoint: Callable[[], None],
     *,
     target: str,
-    prompt: str,
     token: str,
+    prompt: str | None = None,
+    prompt_factory: Callable[[str, bool], PromptPayload] | None = None,
 ) -> tuple[str, str] | None:
     phase = job.workflow_phase
     state = job.prompt_operation_state
+    payload: PromptPayload | None = None
+    build_prompt = prompt_factory
+    if prompt_factory is None:
+        if prompt is None:
+            raise HarnessError("Cursor prompt content is missing")
+
+        def legacy_factory(
+            session_identity: str, full_rehydration: bool
+        ) -> PromptPayload:
+            assert prompt is not None
+            return bounded_prompt_payload(
+                prompt,
+                phase=phase.value,
+                session_identity=session_identity,
+                full_rehydration=full_rehydration,
+                sections={},
+            )
+
+        build_prompt = legacy_factory
+    assert build_prompt is not None
+
     if state == "none":
         checkpoint()
         baseline_agent = client.get_agent(target)
@@ -2272,6 +2420,19 @@ def _execute_phase_prompt(
         baseline_session = agent_session_identity(baseline_agent.get("agent_session"))
         if baseline_session is None:
             raise HarnessError("Herdr returned no agent session for prompt fencing")
+        participant = job.active_participant
+        prior_session = (
+            job.prompt_context_sessions.get(participant.value)
+            if participant is not None
+            else None
+        )
+        full_rehydration = not (
+            job.continuation
+            and bool(job.continuation_answer)
+            and prior_session == baseline_session
+        )
+        payload = build_prompt(baseline_session, full_rehydration)
+        planned_manifest = payload.manifest
 
         def plan_prompt(current: CursorJob) -> CursorJob:
             if (
@@ -2287,6 +2448,7 @@ def _execute_phase_prompt(
                 prompt_operation_target=target,
                 prompt_operation_agent_session=baseline_session,
                 prompt_baseline_sequence=baseline,
+                prompt_manifest=planned_manifest,
                 continuation=(
                     False
                     if phase == WorkflowPhase.IMPLEMENTING
@@ -2320,15 +2482,23 @@ def _execute_phase_prompt(
             and sequence != job.prompt_baseline_sequence
         ):
             counted = _accepted_explicit_plan_approval(job)
+
+            def mark_observed_submission(current: CursorJob) -> CursorJob:
+                sessions = current.prompt_context_sessions
+                if current.active_participant is not None:
+                    sessions[current.active_participant.value] = observed_session
+                return current.evolve(
+                    prompt_operation_state="submitted",
+                    plan_approval_counted=(current.plan_approval_counted or counted),
+                    prompt_context_sessions=sessions,
+                )
+
             submitted = _worker_change(
                 store,
                 job.id,
                 worker_token,
                 MODEL_WORKER_STATUSES,
-                lambda current: current.evolve(
-                    prompt_operation_state="submitted",
-                    plan_approval_counted=(current.plan_approval_counted or counted),
-                ),
+                mark_observed_submission,
             )
             if submitted is None:
                 return None
@@ -2434,6 +2604,19 @@ def _execute_phase_prompt(
         raise HarnessError(f"invalid durable prompt state {state}")
 
     operation_baseline = job.prompt_baseline_sequence
+    if payload is None:
+        session_identity = job.prompt_operation_agent_session
+        manifest = job.prompt_manifest
+        if session_identity is None:
+            raise HarnessError("planned Cursor prompt has no verified session identity")
+        full_rehydration = not (
+            manifest is not None
+            and manifest.get("phase") == phase.value
+            and manifest.get("session_identity") == session_identity
+            and isinstance(manifest.get("full_rehydration"), bool)
+        ) or bool(manifest and manifest.get("full_rehydration"))
+        payload = build_prompt(session_identity, full_rehydration)
+    prompt = payload.text
 
     def before_submit(observed_baseline: int) -> None:
         if observed_baseline != operation_baseline:
@@ -2462,9 +2645,18 @@ def _execute_phase_prompt(
         def mark_submitted(current: CursorJob) -> CursorJob:
             if current.prompt_operation_state != "submitting":
                 raise WorkerCancelled
+            sessions = current.prompt_context_sessions
+            if (
+                current.active_participant is not None
+                and current.prompt_operation_agent_session is not None
+            ):
+                sessions[current.active_participant.value] = (
+                    current.prompt_operation_agent_session
+                )
             return current.evolve(
                 prompt_operation_state="submitted",
                 plan_approval_counted=(current.plan_approval_counted or counted),
+                prompt_context_sessions=sessions,
             )
 
         if (
@@ -2608,81 +2800,47 @@ def _run_tiered_workflow(
             registry,
             provider=job.issue_provider,
         )
-        if phase == WorkflowPhase.CLASSIFYING:
-            prompt = classification_prompt(
-                job.request,
-                token,
-                github_issue_context=job.github_issue_context,
-                integration_instructions=integration_instructions,
-            )
-        elif phase == WorkflowPhase.PLANNING:
-            assert job.workflow_tier is not None
-            prompt = planning_prompt(
-                job.request,
-                token,
-                tier=job.workflow_tier.value,
-                github_issue_context=job.github_issue_context,
-                classification_reason=job.workflow_classification_reason,
-                integration_instructions=integration_instructions,
-            )
-        elif phase == WorkflowPhase.REVIEWING:
-            if not job.plan_artifact or job.workflow_tier is None:
-                raise HarnessError("review phase requires a durable plan")
-            plan = store.read_artifact(job.id, job.plan_artifact, kind="plan")
-            prompt = review_prompt(
-                job.request,
-                plan,
-                token,
-                tier=job.workflow_tier.value,
-                github_issue_context=job.github_issue_context,
-                classification_reason=job.workflow_classification_reason,
-                integration_instructions=integration_instructions,
-            )
-        elif phase == WorkflowPhase.REVISING:
-            if not job.plan_artifact or not job.review_artifact:
-                raise HarnessError("revision phase requires plan and review artifacts")
-            plan = store.read_artifact(job.id, job.plan_artifact, kind="plan")
-            review = store.read_artifact(job.id, job.review_artifact, kind="review")
-            prompt = revision_prompt(
-                job.request,
-                plan,
-                review,
-                token,
-                github_issue_context=job.github_issue_context,
-                classification_reason=job.workflow_classification_reason,
-                integration_instructions=integration_instructions,
-            )
-        elif phase == WorkflowPhase.IMPLEMENTING:
-            plan = (
-                store.read_artifact(job.id, job.plan_artifact, kind="plan")
-                if job.plan_artifact
-                else None
-            )
-            issue_reference = job.issue_key or (
-                f"issue {job.github_issue}" if job.github_issue else None
-            )
-            prompt = implementation_prompt(
-                _prompt_request(job),
-                token,
-                plan=plan,
-                continuation=job.continuation or bool(job.continuation_answer),
-                github_issue_context=job.github_issue_context,
-                classification_reason=job.workflow_classification_reason,
-                issue_reference=issue_reference,
-                integration_instructions=integration_instructions,
-            )
-        else:
-            raise HarnessError(f"unsupported workflow phase {phase.value}")
-        pending_output = _execute_phase_prompt(
-            store,
-            job,
-            worker_token,
-            client,
-            checkpoint,
-            target=target,
-            prompt=prompt,
-            token=token,
+        plan = (
+            store.read_artifact(job.id, job.plan_artifact, kind="plan")
+            if job.plan_artifact
+            and phase
+            in {
+                WorkflowPhase.REVIEWING,
+                WorkflowPhase.REVISING,
+                WorkflowPhase.IMPLEMENTING,
+            }
+            else None
         )
+        review = (
+            store.read_artifact(job.id, job.review_artifact, kind="review")
+            if job.review_artifact
+            and phase in {WorkflowPhase.REVISING, WorkflowPhase.IMPLEMENTING}
+            else None
+        )
+        prompt_factory = _WorkflowPromptFactory(
+            job=job,
+            phase=phase,
+            token=token,
+            integration_instructions=integration_instructions,
+            plan=plan,
+            review=review,
+            issue_reference=job.issue_key
+            or (f"issue {job.github_issue}" if job.github_issue else None),
+        )
+        try:
+            pending_output = _execute_phase_prompt(
+                store,
+                job,
+                worker_token,
+                client,
+                checkpoint,
+                target=target,
+                prompt_factory=prompt_factory,
+                token=token,
+            )
+        except PromptSizeError as exc:
+            _workflow_block(store, job.id, worker_token, str(exc))
+            return
         if pending_output is None:
             return
 
@@ -2793,13 +2951,6 @@ def _mark_prompt_boundary(
 
 def _prompt_request(job: CursorJob) -> str:
     return job.continuation_answer or job.request
-
-
-def _request_with_clarification(job: CursorJob) -> str:
-    answer = job.continuation_answer
-    if not answer or answer in job.request:
-        return job.request
-    return f"{job.request}\n\nUser clarification:\n{answer}"
 
 
 def run_claimed_worker(  # pyright: ignore[reportGeneralTypeIssues]
