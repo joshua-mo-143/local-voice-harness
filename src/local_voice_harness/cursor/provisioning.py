@@ -1354,12 +1354,41 @@ _NEGATED_RISK = re.compile(
     r"|\b(?:[a-z-]+\s+){1,4}(?:is|are)\s+not\s+"
     r"(?:a\s+)?(?:concern|risk|issue)\b"
 )
+_NEGATION_WORD = re.compile(r"\b(?:no|without|not)\b")
+_NEGATION_CONTRAST = re.compile(r"\b(?:but|however|yet)\b")
+_NEGATED_RISK_SUFFIX = re.compile(
+    r"^s?\s+(?:is|are|was|were)\s+not\s+"
+    r"(?:required|involved|needed|modified|changed)\b"
+)
 
 
 def _bounded_risk_text(value: str | None) -> str:
     if not value:
         return ""
     return value.encode()[:_MAX_RISK_EVIDENCE_BYTES].decode(errors="ignore").casefold()
+
+
+def _risk_occurrence_is_negated(evidence: str, start: int, end: int) -> bool:
+    suffix = evidence[end : end + 64]
+    if _NEGATED_RISK_SUFFIX.search(suffix) is not None:
+        return True
+    clause_start = max(
+        evidence.rfind(separator, max(0, start - 160), start) for separator in ".;:!?\n"
+    )
+    prefix = evidence[clause_start + 1 : start]
+    matches = list(_NEGATION_WORD.finditer(prefix))
+    if not matches:
+        return False
+    negation = matches[-1]
+    tail = prefix[negation.end() :]
+    if _NEGATION_CONTRAST.search(tail) is not None:
+        return False
+    words = re.findall(r"[a-z-]+", tail)
+    if len(words) > 8:
+        return False
+    if negation.group(0) == "not" and words[:1] == ["only"]:
+        return False
+    return True
 
 
 def _hard_risk_evidence(
@@ -1380,7 +1409,15 @@ def _hard_risk_evidence(
         evidence = _bounded_risk_text(value)
         evidence = _NEGATED_RISK.sub("", evidence)
         for term in _HARD_RISK_TERMS:
-            if term in evidence:
+            occurrences = tuple(re.finditer(re.escape(term), evidence))
+            if any(
+                not _risk_occurrence_is_negated(
+                    evidence,
+                    occurrence.start(),
+                    occurrence.end(),
+                )
+                for occurrence in occurrences
+            ):
                 return f"{source} contains {term!r}"
     return None
 

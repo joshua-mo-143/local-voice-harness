@@ -1378,6 +1378,9 @@ class CursorJobStateTests(unittest.TestCase):
             "No persistence, concurrency, or security concerns.",
             "Without known migration or database risks.",
             "This does not introduce persistence risks.",
+            "Read-only audit requiring no edits or external writes.",
+            "No schema migration or database changes are needed.",
+            "External writes are not required.",
         ):
             with self.subTest(value=value):
                 self.assertIsNone(
@@ -1389,6 +1392,20 @@ class CursorJobStateTests(unittest.TestCase):
                 "Requires persistence and concurrency changes.",
             ),
             "classification or promotion reason contains 'persistence'",
+        )
+        self.assertEqual(
+            production_jobs._hard_risk_evidence(
+                "rename a label",
+                "No schema migration, but external writes are required.",
+            ),
+            "classification or promotion reason contains 'external write'",
+        )
+        self.assertEqual(
+            production_jobs._hard_risk_evidence(
+                "rename a label",
+                "This requires not only security review but external writes.",
+            ),
+            "classification or promotion reason contains 'security'",
         )
         with self.assertRaises(jobs.HarnessError):
             production_jobs._classified_tier("unknown", "rename text", "localized")
