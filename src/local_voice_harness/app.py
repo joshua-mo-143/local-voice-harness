@@ -104,6 +104,18 @@ def release_deliveries(claims: DeliveryClaims) -> None:
     release_claims(CURSOR_STORE, claims)
 
 
+def _acknowledge_consultation(
+    speech_renderer: SpeechRenderer,
+    settings: UserConfig,
+) -> None:
+    acknowledgement = as_assistant_response(cursor_consultation.ACKNOWLEDGEMENT)
+    print(f"Assistant: {acknowledgement.display_text}")
+    stream_and_play(
+        speech_renderer.render(acknowledgement.spoken_text),
+        settings=settings.audio,
+    )
+
+
 def respond(text: str, *, user_config: UserConfig | None = None) -> None:
     """Handle one foreground request from one immutable startup snapshot."""
     settings = user_config if user_config is not None else load_user_config()
@@ -175,8 +187,10 @@ def respond(text: str, *, user_config: UserConfig | None = None) -> None:
                     response = cursor_consultation.NO_PENDING_QUESTION
                 else:
                     try:
+                        client = integrations.herdr_client()
+                        _acknowledge_consultation(speech_renderer, settings)
                         response = cursor_consultation.consult_pending_question(
-                            integrations.herdr_client(),
+                            client,
                             CURSOR_STORE,
                             pending,
                             context.text,
@@ -196,11 +210,13 @@ def respond(text: str, *, user_config: UserConfig | None = None) -> None:
                         focused_repository=context.focused_repository,
                         completed_job=None,
                     )
-                    response = (
-                        cursor_consultation.consult(client, target, context.text)
-                        if target is not None
-                        else cursor_consultation.NO_WORKSPACE
-                    )
+                    if target is None:
+                        response = cursor_consultation.NO_WORKSPACE
+                    else:
+                        _acknowledge_consultation(speech_renderer, settings)
+                        response = cursor_consultation.consult(
+                            client, target, context.text
+                        )
                 except Exception:  # noqa: BLE001 - consultation fails closed
                     response = cursor_consultation.CONSULTATION_FAILED
             elif route.actionable and route.intent == Intent.AGENT_SUBMIT:
