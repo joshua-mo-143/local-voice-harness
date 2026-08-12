@@ -90,6 +90,7 @@ from ..intent import (
     Intent,
     IntentRoute,
     decide_fork_intent,
+    is_grouped_repository_mapping,
     route_intent,
 )
 from ..llm import qwen_turn
@@ -278,12 +279,6 @@ CLOSE_PATTERN = re.compile(
 PENDING_SUBMIT_PATTERN = re.compile(
     r"\b(?:work\s+on|fix|change|update|implement|add|remove|run|review|inspect|"
     r"start|create|build|refactor|test)\b",
-    re.IGNORECASE,
-)
-GROUPED_REPOSITORY_MAPPING_PATTERN = re.compile(
-    r"(?:\b[A-Z][A-Z0-9]*-\d+\b|"
-    r"(?:https?://github\.com/)?"
-    r"[A-Z0-9_.-]+/[A-Z0-9_.-]+(?:/issues/|#)\d+)\s*:",
     re.IGNORECASE,
 )
 FILLER_WORDS = frozenset(
@@ -1278,7 +1273,7 @@ class WakeConversationDaemon:
                     )
                     grouped_repository_answer = (
                         pending.owner == "grouped_repository"
-                        and GROUPED_REPOSITORY_MAPPING_PATTERN.search(text) is not None
+                        and is_grouped_repository_mapping(text)
                     )
                     if (
                         resolved_as_answer
