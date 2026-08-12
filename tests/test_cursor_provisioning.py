@@ -2769,6 +2769,167 @@ class CursorJobStateTests(unittest.TestCase):
         self.assertIn("refusing unrelated repository fallback", str(failed["error"]))
         client.choose_or_clone_repository.assert_not_called()
 
+    def test_linear_routing_precedes_conflicting_focused_repository(self) -> None:
+        focused = Path("/repos/local-voice-harness")
+        intended = Path("/repos/local-voice-harness-tiered-batch-fixture")
+        repositories = [focused, intended]
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": (
+                    "work on JOS-20\n\n"
+                    "Ticket description names "
+                    "joshua-mo-143/local-voice-harness-tiered-batch-fixture."
+                ),
+                "context_repository": "joshua-mo-143/local-voice-harness",
+                "issue_key": "JOS-20",
+                "issue_provider": "linear",
+                "status": "queued",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        client = mock.Mock()
+        client.repository_roots.return_value = repositories
+        client.ensure_router.return_value = mock.Mock(target="voice-router")
+        client.ensure_agent.return_value = AgentSelection(
+            "cursor-agent",
+            "pane",
+            "workspace",
+            str(intended),
+            "cursor-agent",
+            str(intended),
+        )
+
+        def resolve(
+            hint: str | None, _task: str, _repositories: list[Path]
+        ) -> tuple[Path | None, list[Path]]:
+            if hint == intended.name:
+                return intended, [intended]
+            return focused, [focused]
+
+        client.resolve_repository.side_effect = resolve
+        configure_tiered_outcomes(client, intended)
+        client.prompt_and_wait.side_effect = [
+            PromptOutcome(
+                "idle",
+                None,
+                None,
+                "ROUTE_REPO[123456789abc-route]: "
+                "local-voice-harness-tiered-batch-fixture\n"
+                "ROUTE_CONFIDENCE[123456789abc-route]: high\n"
+                "ROUTE_REASON[123456789abc-route]: named in the Linear ticket",
+            ),
+            PromptOutcome(
+                "idle",
+                None,
+                None,
+                "WORKFLOW_TIER[123456789abc-1]: simple\n"
+                "WORKFLOW_REASON[123456789abc-1]: test classification",
+            ),
+            PromptOutcome(
+                "idle",
+                "done",
+                None,
+                "VOICE_SUMMARY[123456789abc-2]: done",
+            ),
+        ]
+
+        def route(
+            routed_client: Any,
+            reference: str,
+            available: list[Path],
+            **kwargs: object,
+        ) -> tuple[Path | None, str, str]:
+            return linear.LinearIntegration().route_repository(
+                routed_client,
+                reference,
+                available,
+                token=str(kwargs["token"]),
+                reserved=cast(set[str], kwargs["reserved"]),
+                checkpoint=kwargs.get("checkpoint"),
+            )
+
+        with (
+            mock.patch.object(jobs, "HerdrClient", return_value=client),
+            mock.patch.object(
+                production_jobs, "resolve_issue_reference", return_value="JOS-20"
+            ),
+            mock.patch.object(production_jobs, "require_issue_provider"),
+            mock.patch.object(production_jobs, "require_issue_capabilities"),
+            mock.patch.object(production_jobs, "prompt_instructions", return_value=()),
+            mock.patch.object(
+                production_jobs, "route_issue_repository", side_effect=route
+            ),
+            mock.patch.object(
+                linear,
+                "LINEAR_ROUTER_LOCK",
+                Path(self.temporary.name) / "linear-router.lock",
+            ),
+        ):
+            service.run_worker("123456789abc")
+
+        completed = jobs.read_job("123456789abc")
+        self.assertEqual(completed["status"], "completed", completed.get("error"))
+        self.assertEqual(completed["repository"], str(intended))
+        client.ensure_router.assert_called_once()
+        client.resolve_repository.assert_called_once_with(
+            intended.name, "", repositories
+        )
+        client.choose_or_clone_repository.assert_not_called()
+
+    def test_explicit_repository_hint_precedes_linear_routing(self) -> None:
+        hinted = Path("/repos/explicit-repository")
+        repositories = [hinted, Path("/repos/ticket-repository")]
+        request = "work on JOS-20"
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": request,
+                "repository_hint": str(hinted),
+                "context_repository": "owner/conflicting-focused-repository",
+                "issue_key": "JOS-20",
+                "issue_provider": "linear",
+                "status": "queued",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        client = mock.Mock()
+        client.repository_roots.return_value = repositories
+        client.resolve_repository.return_value = (hinted, [hinted])
+        client.ensure_agent.return_value = AgentSelection(
+            "cursor-agent",
+            "pane",
+            "workspace",
+            str(hinted),
+            "cursor-agent",
+            str(hinted),
+        )
+        configure_tiered_outcomes(client, hinted)
+
+        with (
+            mock.patch.object(jobs, "HerdrClient", return_value=client),
+            mock.patch.object(
+                production_jobs, "resolve_issue_reference", return_value="JOS-20"
+            ),
+            mock.patch.object(production_jobs, "require_issue_provider"),
+            mock.patch.object(production_jobs, "require_issue_capabilities"),
+            mock.patch.object(production_jobs, "prompt_instructions", return_value=()),
+            mock.patch.object(
+                production_jobs, "route_issue_repository"
+            ) as route_repository,
+        ):
+            service.run_worker("123456789abc")
+
+        completed = jobs.read_job("123456789abc")
+        self.assertEqual(completed["status"], "completed", completed.get("error"))
+        self.assertEqual(completed["repository"], str(hinted))
+        client.resolve_repository.assert_called_once_with(
+            str(hinted), request, repositories
+        )
+        route_repository.assert_not_called()
+
     def test_prompt_timeout_retains_target_reservation_for_cancellation(self) -> None:
         repository = Path(self.temporary.name) / "project"
         checkout = Path(self.temporary.name) / "worktree"
