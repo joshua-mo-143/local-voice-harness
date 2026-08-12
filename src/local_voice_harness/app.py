@@ -14,7 +14,7 @@ from .agents.delivery import (
 from .agents.service import AgentTurnRequest as CursorTurnRequest
 from .agents.service import agent_turn as cursor_turn
 from .agents.store import AgentJobStore as JobStore
-from .browser_context import request_context
+from .browser_context import RequestContext, request_context
 from .components import component_usage, llm_ready, start_components
 from .config import (
     CURSOR_PATTERN,
@@ -25,7 +25,7 @@ from .config import (
     TTS_SOCKET,
 )
 from .errors import HarnessError
-from .integrations.registry import build_integration_registry
+from .integrations.registry import IntegrationRegistry, build_integration_registry
 from .intent import (
     NON_ACTIONABLE_SUBMIT_RESPONSE,
     ForkIntent,
@@ -53,6 +53,25 @@ CURSOR_MANAGEMENT_ACTIONS = {
 }
 
 
+def _context_for_route(
+    text: str,
+    route: IntentRoute,
+    *,
+    settings: UserConfig,
+    integrations: IntegrationRegistry,
+) -> RequestContext:
+    """Capture external context only when the routed action can consume it."""
+    if route.intent == Intent.CONVERSATION or (
+        route.actionable and route.intent == Intent.AGENT_SUBMIT
+    ):
+        return request_context(
+            text,
+            platform=settings.platform,
+            integrations=integrations,
+        )
+    return RequestContext(text)
+
+
 def acknowledge_deliveries(claims: DeliveryClaims) -> None:
     acknowledge_claims(CURSOR_STORE, claims)
 
@@ -74,15 +93,17 @@ def respond(text: str, *, user_config: UserConfig | None = None) -> None:
         try:
             start_components(settings.providers)
             print(f"You: {text}")
-            context = request_context(
-                text,
-                platform=settings.platform,
-                integrations=integrations,
-            )
+            routing_context = RequestContext(text)
             if CURSOR_PATTERN.search(text):
                 route = IntentRoute(Intent.AGENT_SUBMIT, "high")
             else:
-                route = route_intent(text, context, settings=settings.providers)
+                route = route_intent(text, routing_context, settings=settings.providers)
+            context = _context_for_route(
+                text,
+                route,
+                settings=settings,
+                integrations=integrations,
+            )
             fork_requested = decide_fork_intent(text) == ForkIntent.AFFIRMATIVE
             github_arguments = (
                 {

@@ -483,6 +483,49 @@ class AppContextTests(unittest.TestCase):
 
 
 class CursorFastPathTests(unittest.TestCase):
+    def test_coding_request_does_not_need_to_name_cursor(self) -> None:
+        text = "fix the failing authentication tests"
+        context = RequestContext(f"{text}\n\nrepository context")
+        with (
+            mock.patch.object(app, "start_components"),
+            mock.patch.object(app, "request_context", return_value=context) as capture,
+            mock.patch.object(
+                app,
+                "route_intent",
+                return_value=IntentRoute(Intent.AGENT_SUBMIT, "high"),
+            ),
+            mock.patch.object(
+                app, "cursor_turn", return_value=("started", None)
+            ) as cursor_turn,
+            mock.patch.object(app, "stream_and_play"),
+        ):
+            app.respond(text)
+
+        capture.assert_called_once()
+        self.assertEqual(cursor_turn.call_args.args[0].utterance, text)
+
+    def test_job_management_does_not_capture_external_context(self) -> None:
+        text = "list my running jobs"
+        with (
+            mock.patch.object(app, "start_components"),
+            mock.patch.object(app, "request_context") as capture,
+            mock.patch.object(
+                app,
+                "route_intent",
+                return_value=IntentRoute(Intent.AGENT_LIST, "high"),
+            ) as route_intent,
+            mock.patch.object(app, "cursor_turn", return_value=("none", None)),
+            mock.patch.object(app, "stream_and_play"),
+        ):
+            app.respond(text)
+
+        capture.assert_not_called()
+        route_intent.assert_called_once_with(
+            text,
+            RequestContext(text),
+            settings=mock.ANY,
+        )
+
     def test_explicit_cursor_utterance_skips_router(self) -> None:
         with (
             mock.patch.object(app, "start_components"),
