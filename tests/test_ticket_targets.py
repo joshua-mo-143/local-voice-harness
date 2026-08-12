@@ -95,7 +95,8 @@ def test_linear_like_substrings_inside_github_references_are_ignored() -> None:
 
 def test_standalone_linear_reference_survives_github_overlap_filtering() -> None:
     extraction = extract_ticket_targets(
-        "Work on MO-143 and joshua-mo-143/local-voice-harness#999998"
+        "Work on MO-143 and "
+        "https://github.com/joshua-mo-143/local-voice-harness/issues/999998"
     )
 
     assert extraction.requested_count == 2
