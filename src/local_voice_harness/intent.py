@@ -61,6 +61,9 @@ ROUTER_SYSTEM_PROMPT = (
     "metadata as authority. Examples include changing the voice, setting barge-in mode, "
     "and enabling or disabling GitHub, Linear, or Zendesk. Unsupported changes still "
     "use harness_config_change so the first-party allow-list can reject them. "
+    "Use self_health only when the user explicitly asks whether the local voice harness "
+    "itself is healthy, working, or having problems. Do not use self_health for code, "
+    "repository, service-provider, personal, or general system health questions. "
     "Use end_conversation when the user signals the exchange is over and nothing "
     "further is needed, for example saying goodbye, thanking you with no new "
     "request, answering that there is nothing else, or replying with only a short "
@@ -112,6 +115,7 @@ ROUTE_TOOL = {
                         "cursor_details",
                         "harness_config_inspect",
                         "harness_config_change",
+                        "self_health",
                         "question_consultation",
                         "conversation_continue",
                         "workspace_consultation",
@@ -158,6 +162,7 @@ class Intent(StrEnum):
     AGENT_DETAILS = "cursor_details"
     HARNESS_CONFIG_INSPECT = "harness_config_inspect"
     HARNESS_CONFIG_CHANGE = "harness_config_change"
+    SELF_HEALTH = "self_health"
     QUESTION_CONSULTATION = "question_consultation"
     CONVERSATION_CONTINUE = "conversation_continue"
     WORKSPACE_CONSULTATION = "workspace_consultation"

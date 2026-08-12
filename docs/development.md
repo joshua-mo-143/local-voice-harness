@@ -8,12 +8,17 @@ configuration and durable state to ignored paths in the checkout:
 ```fish
 scripts/dev.sh text "What is two plus two?"
 scripts/dev.sh pronounce "PR #128 changed src/http_client.py"
+scripts/dev.sh text "Is the voice harness healthy?"
 scripts/dev.sh setup --defaults
 scripts/dev.sh config show audio.wake_threshold
 scripts/dev.sh integrations list
 scripts/dev.sh text "What voice are you using?"
 scripts/dev.sh text "Is Linear enabled?"
 ```
+
+The self-health request runs bounded, read-only diagnostics and returns only a
+non-sensitive summary. This text-only smoke does not use the microphone and does
+not require stopping the installed wake listener.
 
 The launcher sets `XDG_CONFIG_HOME` to `.dev/config` and `XDG_STATE_HOME` to
 `.dev/state`. For example, branch-specific backend configuration belongs at

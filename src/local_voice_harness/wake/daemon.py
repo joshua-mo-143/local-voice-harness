@@ -98,6 +98,7 @@ from ..diagnostic_safety import (
     VOICE_REQUEST_FAILURE,
     redact_diagnostic,
 )
+from ..diagnostics.health import self_health_response
 from ..errors import HarnessError, NoSpeechError
 from ..github_issue_creation import repository_from_utterance
 from ..integrations.registry import IntegrationRegistry, build_integration_registry
@@ -1719,6 +1720,8 @@ class WakeConversationDaemon:
                         "I couldn't identify a safe configuration change, so I didn't "
                         "write anything."
                     )
+            elif route.actionable and route.intent == Intent.SELF_HEALTH:
+                response = self_health_response()
             elif missing_ticket_scope:
                 response = MISSING_ISSUE_SCOPE_RESPONSE
             elif route.actionable and route.intent == Intent.QUESTION_CONSULTATION:
