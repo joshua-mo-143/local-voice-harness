@@ -15,7 +15,7 @@ from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
-from local_voice_harness import llm, llm_transport, recorder
+from local_voice_harness import config_activation, llm, llm_transport, recorder
 from local_voice_harness.browser_context import RequestContext
 from local_voice_harness.config import load_backend_settings
 from local_voice_harness.config_management import (
@@ -146,6 +146,13 @@ def _bare_daemon() -> WakeConversationDaemon:
     )
     instance.pending_target_readback = None
     instance.pending_config_change = None
+    instance.config_activation_store = mock.Mock(spec=wake_daemon.ActivationStore)
+    instance.config_activation_store.current.return_value = None
+    instance.config_activation_store.create_offer.return_value = None
+    instance.config_activation_store.next_delivery.return_value = None
+    instance.config_activation_delivery = None
+    instance.launched_config_activations = {}
+    instance.config_activation_dispatch_attempts = {}
     instance.conversation_deadline = 0.0
     instance.awaiting_followup = False
     instance.last_wake = 0.0
@@ -1921,6 +1928,10 @@ class ConfigChangeConversationTests(unittest.TestCase):
                 return_value=None if commit_error is not None else result,
                 side_effect=commit_error,
             ) as commit,
+            mock.patch.object(
+                wake_daemon,
+                "launch_activation_worker",
+            ) as launch_activation,
             mock.patch.object(wake_daemon, "cursor_turn") as cursor_turn,
             mock.patch.object(wake_daemon, "qwen_turn") as qwen_turn,
             mock.patch.object(
@@ -1935,6 +1946,7 @@ class ConfigChangeConversationTests(unittest.TestCase):
             "route": route_intent,
             "prepare": prepare,
             "commit": commit,
+            "launch_activation": launch_activation,
             "cursor": cursor_turn,
             "qwen": qwen_turn,
             "play": play,
@@ -2130,6 +2142,182 @@ class ConfigChangeConversationTests(unittest.TestCase):
 
                 self.assertIsNone(daemon.pending_config_change)
                 commit.assert_not_called()
+
+    def test_saved_change_creates_durable_activation_offer_after_response(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            daemon = _bare_daemon()
+            daemon.config_activation_store = wake_daemon.ActivationStore(
+                Path(temporary) / "activation.json"
+            )
+            pending = _pending_config()
+            daemon.pending_config_change = pending
+
+            calls = self._run_turn(daemon, "yes")
+            offer = daemon.config_activation_store.current()
+
+        assert offer is not None
+        self.assertEqual(offer.status, wake_daemon.ActivationStatus.OFFERED)
+        self.assertTrue(offer.offer_delivered)
+        self.assertEqual(offer.targets, ("voice-harness-wake.service",))
+        calls["launch_activation"].assert_not_called()
+        response = calls["play"].call_args.args[0]
+        self.assertIn("separate explicit confirmation", response.spoken_text)
+        self.assertIn("activate now", response.spoken_text)
+
+    def test_generic_yes_cannot_confirm_wake_activation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            daemon = _bare_daemon()
+            store = wake_daemon.ActivationStore(Path(temporary) / "activation.json")
+            daemon.config_activation_store = store
+            pending = _pending_config()
+            result = ConfigChangeResult(
+                config=replace(
+                    daemon.user_config,
+                    audio=replace(daemon.user_config.audio, voice="new_voice"),
+                ),
+                changed_keys=("audio.voice",),
+                restart_services=("voice-harness-wake.service",),
+            )
+            offer = store.create_offer(pending, result)
+            assert offer is not None
+            store.mark_offer_delivered(offer.id)
+
+            calls = self._run_turn(daemon, "yes")
+            current = store.current()
+
+        assert current is not None
+        self.assertEqual(current.status, wake_daemon.ActivationStatus.OFFERED)
+        calls["launch_activation"].assert_not_called()
+        response = calls["play"].call_args.args[0]
+        self.assertIn("Say activate now", response.spoken_text)
+
+    def test_pre_restart_delivery_precedes_isolated_worker_launch(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            daemon = _bare_daemon()
+            store = wake_daemon.ActivationStore(Path(temporary) / "activation.json")
+            daemon.config_activation_store = store
+            pending = _pending_config()
+            result = ConfigChangeResult(
+                config=replace(
+                    daemon.user_config,
+                    audio=replace(daemon.user_config.audio, voice="new_voice"),
+                ),
+                changed_keys=("audio.voice",),
+                restart_services=("voice-harness-wake.service",),
+            )
+            offer = store.create_offer(pending, result)
+            assert offer is not None
+            store.mark_offer_delivered(offer.id)
+
+            calls = self._run_turn(daemon, "activate now")
+            current = store.current()
+
+        assert current is not None
+        self.assertEqual(current.status, wake_daemon.ActivationStatus.READY)
+        self.assertTrue(current.pre_restart_delivered)
+        calls["launch_activation"].assert_called_once_with(offer.id)
+        response = calls["play"].call_args.args[0]
+        self.assertIn("after this message is delivered", response.spoken_text)
+        self.assertNotIn("succeeded", response.spoken_text)
+
+    def test_interrupted_pre_restart_response_does_not_launch_worker(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            daemon = _bare_daemon()
+            store = wake_daemon.ActivationStore(Path(temporary) / "activation.json")
+            daemon.config_activation_store = store
+            pending = _pending_config()
+            result = ConfigChangeResult(
+                config=replace(
+                    daemon.user_config,
+                    audio=replace(daemon.user_config.audio, voice="new_voice"),
+                ),
+                changed_keys=("audio.voice",),
+                restart_services=("voice-harness-wake.service",),
+            )
+            offer = store.create_offer(pending, result)
+            assert offer is not None
+            store.mark_offer_delivered(offer.id)
+            interruption = wake_daemon.BargeIn([b"speech"], woke=False)
+
+            with (
+                mock.patch.object(
+                    wake_daemon,
+                    "transcribe",
+                    return_value="activate now",
+                ),
+                mock.patch.object(wake_daemon, "start_components"),
+                mock.patch.object(wake_daemon, "route_intent") as route_intent,
+                mock.patch.object(
+                    daemon,
+                    "play_response",
+                    return_value=({"played_text": "Activation accepted"}, interruption),
+                ),
+                mock.patch.object(
+                    wake_daemon,
+                    "launch_activation_worker",
+                ) as launch,
+                mock.patch.object(wake_daemon, "notify"),
+            ):
+                returned = daemon.process_utterance(AUDIO_GENERATION, woke=False)
+            current = store.current()
+
+        self.assertIs(returned, interruption)
+        assert current is not None
+        self.assertEqual(current.status, wake_daemon.ActivationStatus.ACCEPTED)
+        self.assertFalse(current.pre_restart_delivered)
+        route_intent.assert_not_called()
+        launch.assert_not_called()
+
+    def test_post_restart_result_is_acknowledged_only_after_playback(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            daemon = _bare_daemon()
+            store = wake_daemon.ActivationStore(Path(temporary) / "activation.json")
+            daemon.config_activation_store = store
+            pending = _pending_config()
+            result = ConfigChangeResult(
+                config=replace(
+                    daemon.user_config,
+                    audio=replace(daemon.user_config.audio, voice="new_voice"),
+                ),
+                changed_keys=("audio.voice",),
+                restart_services=("voice-harness-wake.service",),
+            )
+            offer = store.create_offer(pending, result)
+            assert offer is not None
+            store.mark_offer_delivered(offer.id)
+            store.accept(offer.id)
+            ready = store.mark_pre_restart_delivered(offer.id)
+            restarting = store.begin_restart(
+                ready.id,
+                (
+                    config_activation.ServiceOutcome(
+                        "voice-harness-wake.service",
+                        status=config_activation.ServiceOutcomeStatus.SUCCEEDED,
+                        attempted=True,
+                    ),
+                ),
+            )
+            store.finish(
+                restarting.id,
+                status=wake_daemon.ActivationStatus.SUCCEEDED,
+                detail="observed",
+            )
+
+            with (
+                mock.patch.object(daemon, "ensure_components"),
+                mock.patch.object(
+                    daemon,
+                    "play_response",
+                    return_value=({"played_text": "Activation succeeded"}, None),
+                ) as play,
+            ):
+                daemon._recover_config_activation()
+            current = store.current()
+
+        assert current is not None
+        self.assertTrue(current.acknowledged)
+        response = play.call_args.args[0]
+        self.assertIn("expected configuration snapshot", response.spoken_text)
 
 
 class AnnounceJobTests(unittest.TestCase):

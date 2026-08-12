@@ -1,0 +1,838 @@
+"""Durable, narrowly targeted activation of confirmed configuration changes."""
+
+from __future__ import annotations
+
+import argparse
+import fcntl
+import hashlib
+import json
+import os
+import subprocess
+import sys
+import time
+import uuid
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+from dataclasses import asdict, dataclass, replace
+from enum import StrEnum
+from pathlib import Path
+from typing import Protocol
+
+from .config import SERVICE_FILES, durable_state_dir
+from .config_management import ConfigChangeResult
+from .errors import HarnessError
+from .responses import AssistantResponse
+from .self_management import PendingConfigChange
+from .user_config import UserConfig, load_user_config, render_user_config
+
+_WAKE_SERVICE = "voice-harness-wake.service"
+_FINAL_STATES = frozenset({"succeeded", "partial", "failed", "declined"})
+
+
+class ActivationStatus(StrEnum):
+    OFFERED = "offered"
+    ACCEPTED = "accepted"
+    READY = "ready"
+    RESTARTING = "restarting"
+    SUCCEEDED = "succeeded"
+    PARTIAL = "partial"
+    FAILED = "failed"
+    DECLINED = "declined"
+
+
+class ActivationDecision(StrEnum):
+    ACTIVATE = "activate"
+    DECLINE = "decline"
+    NONE = "none"
+
+
+class ActivationDeliveryKind(StrEnum):
+    OFFER = "offer"
+    PRE_RESTART = "pre_restart"
+    RESULT = "result"
+
+
+class ServiceOutcomeStatus(StrEnum):
+    PENDING = "pending"
+    SUCCEEDED = "succeeded"
+    FAILED = "failed"
+
+
+@dataclass(frozen=True, slots=True)
+class ServiceSnapshot:
+    installed: bool
+    active_state: str
+    sub_state: str
+    invocation_id: str
+    process_start: str
+    config_digest: str
+
+    @property
+    def identity(self) -> tuple[str, str]:
+        return self.invocation_id, self.process_start
+
+
+@dataclass(frozen=True, slots=True)
+class ServiceOutcome:
+    service: str
+    status: ServiceOutcomeStatus = ServiceOutcomeStatus.PENDING
+    attempted: bool = False
+    before: ServiceSnapshot | None = None
+    after: ServiceSnapshot | None = None
+    detail: str = ""
+
+
+@dataclass(frozen=True, slots=True)
+class ActivationRecord:
+    id: str
+    setting_key: str
+    old_value: str | bool
+    new_value: str | bool
+    expected_config_digest: str
+    targets: tuple[str, ...]
+    status: ActivationStatus
+    outcomes: tuple[ServiceOutcome, ...]
+    offer_delivered: bool = False
+    pre_restart_delivered: bool = False
+    acknowledged: bool = False
+    detail: str = ""
+    created_at: float = 0.0
+    updated_at: float = 0.0
+
+
+@dataclass(frozen=True, slots=True)
+class ActivationDelivery:
+    record: ActivationRecord
+    kind: ActivationDeliveryKind
+
+
+class ActivationStateError(HarnessError):
+    """The durable activation journal cannot accept the requested transition."""
+
+
+class ServiceController(Protocol):
+    def snapshot(self, service: str) -> ServiceSnapshot: ...
+
+    def restart(self, service: str) -> subprocess.CompletedProcess[str]: ...
+
+
+def config_digest(config: UserConfig) -> str:
+    """Fingerprint one immutable configuration snapshot."""
+
+    return hashlib.sha256(render_user_config(config).encode("utf-8")).hexdigest()
+
+
+def service_snapshot_path(
+    service: str,
+    *,
+    state_dir: Path | None = None,
+) -> Path:
+    if service not in SERVICE_FILES:
+        raise ActivationStateError(f"unsupported user service {service!r}")
+    root = state_dir or durable_state_dir()
+    return root / "service-snapshots" / f"{service}.json"
+
+
+def publish_service_snapshot(
+    service: str,
+    config: UserConfig,
+    *,
+    pid: int,
+    process_start: str,
+    state_dir: Path | None = None,
+) -> None:
+    """Publish the immutable snapshot loaded by one running managed service."""
+
+    path = service_snapshot_path(service, state_dir=state_dir)
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    temporary = path.with_suffix(".tmp")
+    temporary.write_text(
+        json.dumps(
+            {
+                "service": service,
+                "pid": pid,
+                "process_start": process_start,
+                "config_digest": config_digest(config),
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n"
+    )
+    temporary.chmod(0o600)
+    os.replace(temporary, path)
+
+
+def _snapshot_from_dict(value: object) -> ServiceSnapshot | None:
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise ActivationStateError("activation snapshot must be an object")
+    try:
+        return ServiceSnapshot(
+            installed=bool(value["installed"]),
+            active_state=str(value["active_state"]),
+            sub_state=str(value["sub_state"]),
+            invocation_id=str(value["invocation_id"]),
+            process_start=str(value["process_start"]),
+            config_digest=str(value["config_digest"]),
+        )
+    except KeyError as exc:
+        raise ActivationStateError("activation snapshot is incomplete") from exc
+
+
+def _outcome_from_dict(value: object) -> ServiceOutcome:
+    if not isinstance(value, dict):
+        raise ActivationStateError("activation outcome must be an object")
+    try:
+        return ServiceOutcome(
+            service=str(value["service"]),
+            status=ServiceOutcomeStatus(str(value["status"])),
+            attempted=bool(value["attempted"]),
+            before=_snapshot_from_dict(value.get("before")),
+            after=_snapshot_from_dict(value.get("after")),
+            detail=str(value.get("detail") or ""),
+        )
+    except (KeyError, ValueError) as exc:
+        raise ActivationStateError("activation outcome is invalid") from exc
+
+
+def _record_from_dict(value: object) -> ActivationRecord:
+    if not isinstance(value, dict):
+        raise ActivationStateError("activation journal must contain an object")
+    try:
+        old_value = value["old_value"]
+        new_value = value["new_value"]
+        if not isinstance(old_value, (str, bool)) or not isinstance(
+            new_value, (str, bool)
+        ):
+            raise ActivationStateError("activation values must be strings or booleans")
+        targets = value["targets"]
+        outcomes = value["outcomes"]
+        if not isinstance(targets, list) or not isinstance(outcomes, list):
+            raise ActivationStateError("activation targets and outcomes must be arrays")
+        record_id = str(value["id"])
+        target_values = tuple(str(item) for item in targets)
+        outcome_values = tuple(_outcome_from_dict(item) for item in outcomes)
+        if (
+            len(record_id) != 32
+            or any(character not in "0123456789abcdef" for character in record_id)
+            or not target_values
+            or any(service not in SERVICE_FILES for service in target_values)
+            or tuple(outcome.service for outcome in outcome_values) != target_values
+        ):
+            raise ActivationStateError("activation identity or targets are invalid")
+        return ActivationRecord(
+            id=record_id,
+            setting_key=str(value["setting_key"]),
+            old_value=old_value,
+            new_value=new_value,
+            expected_config_digest=str(value["expected_config_digest"]),
+            targets=target_values,
+            status=ActivationStatus(str(value["status"])),
+            outcomes=outcome_values,
+            offer_delivered=bool(value.get("offer_delivered")),
+            pre_restart_delivered=bool(value.get("pre_restart_delivered")),
+            acknowledged=bool(value.get("acknowledged")),
+            detail=str(value.get("detail") or ""),
+            created_at=float(value["created_at"]),
+            updated_at=float(value["updated_at"]),
+        )
+    except (KeyError, TypeError, ValueError) as exc:
+        raise ActivationStateError("activation journal is invalid") from exc
+
+
+class ActivationStore:
+    """One atomic durable activation journal."""
+
+    def __init__(self, path: Path | None = None) -> None:
+        self.path = path or durable_state_dir() / "config-activation.json"
+        self.lock_path = self.path.with_suffix(f"{self.path.suffix}.lock")
+        self.execution_lock_path = self.path.with_suffix(
+            f"{self.path.suffix}.execute.lock"
+        )
+
+    @contextmanager
+    def _locked(self) -> Iterator[None]:
+        self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        with self.lock_path.open("a+b") as lock:
+            os.chmod(self.lock_path, 0o600)
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+    @contextmanager
+    def execution_lock(self) -> Iterator[None]:
+        self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        with self.execution_lock_path.open("a+b") as lock:
+            os.chmod(self.execution_lock_path, 0o600)
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+    def _read(self) -> ActivationRecord | None:
+        try:
+            raw = self.path.read_text()
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            raise ActivationStateError(f"could not read {self.path}: {exc}") from exc
+        try:
+            return _record_from_dict(json.loads(raw))
+        except json.JSONDecodeError as exc:
+            raise ActivationStateError(
+                f"activation journal {self.path} is malformed"
+            ) from exc
+
+    def _write(self, record: ActivationRecord) -> None:
+        self.path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        temporary = self.path.with_suffix(".tmp")
+        payload = (
+            json.dumps(asdict(record), sort_keys=True, separators=(",", ":")) + "\n"
+        )
+        descriptor = os.open(
+            temporary,
+            os.O_WRONLY | os.O_CREAT | os.O_TRUNC,
+            0o600,
+        )
+        with os.fdopen(descriptor, "w") as output:
+            output.write(payload)
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary, self.path)
+        directory = os.open(self.path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+
+    def current(self) -> ActivationRecord | None:
+        with self._locked():
+            return self._read()
+
+    def _update(
+        self,
+        record_id: str,
+        transition: Callable[[ActivationRecord], ActivationRecord],
+    ) -> ActivationRecord:
+        with self._locked():
+            current = self._read()
+            if current is None or current.id != record_id:
+                raise ActivationStateError("activation request no longer exists")
+            updated = replace(transition(current), updated_at=time.time())
+            self._write(updated)
+            return updated
+
+    def create_offer(
+        self,
+        pending: PendingConfigChange,
+        result: ConfigChangeResult,
+        *,
+        expected_config: UserConfig | None = None,
+    ) -> ActivationRecord | None:
+        targets = tuple(dict.fromkeys(result.restart_services))
+        if not targets:
+            return None
+        if any(
+            service not in SERVICE_FILES
+            or service not in pending.affected_services
+            or service.casefold() == "herdr"
+            for service in targets
+        ):
+            raise ActivationStateError(
+                "activation target was not reported by the typed configuration change"
+            )
+        now = time.time()
+        record = ActivationRecord(
+            id=uuid.uuid4().hex,
+            setting_key=pending.setting.value,
+            old_value=pending.old_value,
+            new_value=pending.new_value,
+            expected_config_digest=config_digest(expected_config or result.config),
+            targets=targets,
+            status=ActivationStatus.OFFERED,
+            outcomes=tuple(ServiceOutcome(service) for service in targets),
+            created_at=now,
+            updated_at=now,
+        )
+        with self._locked():
+            current = self._read()
+            if current is not None and not current.acknowledged:
+                raise ActivationStateError(
+                    "a previous activation result is still awaiting delivery"
+                )
+            self._write(record)
+        return record
+
+    def mark_offer_delivered(self, record_id: str) -> ActivationRecord:
+        def transition(record: ActivationRecord) -> ActivationRecord:
+            if record.status != ActivationStatus.OFFERED:
+                raise ActivationStateError("activation offer is no longer pending")
+            return replace(record, offer_delivered=True)
+
+        return self._update(record_id, transition)
+
+    def accept(self, record_id: str) -> ActivationRecord:
+        def transition(record: ActivationRecord) -> ActivationRecord:
+            if record.status != ActivationStatus.OFFERED or not record.offer_delivered:
+                raise ActivationStateError("activation offer is not ready to accept")
+            return replace(record, status=ActivationStatus.ACCEPTED)
+
+        return self._update(record_id, transition)
+
+    def decline(self, record_id: str) -> ActivationRecord:
+        def transition(record: ActivationRecord) -> ActivationRecord:
+            if record.status != ActivationStatus.OFFERED or not record.offer_delivered:
+                raise ActivationStateError("activation offer is not ready to decline")
+            return replace(
+                record,
+                status=ActivationStatus.DECLINED,
+                detail="The saved change was not activated; no service was restarted.",
+            )
+
+        return self._update(record_id, transition)
+
+    def mark_pre_restart_delivered(self, record_id: str) -> ActivationRecord:
+        def transition(record: ActivationRecord) -> ActivationRecord:
+            if record.status != ActivationStatus.ACCEPTED:
+                raise ActivationStateError(
+                    "activation request is not awaiting delivery"
+                )
+            return replace(
+                record,
+                status=ActivationStatus.READY,
+                pre_restart_delivered=True,
+            )
+
+        return self._update(record_id, transition)
+
+    def begin_restart(
+        self,
+        record_id: str,
+        outcomes: tuple[ServiceOutcome, ...],
+    ) -> ActivationRecord:
+        def transition(record: ActivationRecord) -> ActivationRecord:
+            if record.status != ActivationStatus.READY:
+                raise ActivationStateError("activation request is not ready")
+            return replace(
+                record,
+                status=ActivationStatus.RESTARTING,
+                outcomes=outcomes,
+            )
+
+        return self._update(record_id, transition)
+
+    def update_outcome(
+        self,
+        record_id: str,
+        outcome: ServiceOutcome,
+    ) -> ActivationRecord:
+        def transition(record: ActivationRecord) -> ActivationRecord:
+            if record.status != ActivationStatus.RESTARTING:
+                raise ActivationStateError("activation request is not restarting")
+            if outcome.service not in record.targets:
+                raise ActivationStateError("service is not an activation target")
+            return replace(
+                record,
+                outcomes=tuple(
+                    outcome if item.service == outcome.service else item
+                    for item in record.outcomes
+                ),
+            )
+
+        return self._update(record_id, transition)
+
+    def finish(
+        self,
+        record_id: str,
+        *,
+        status: ActivationStatus,
+        detail: str,
+    ) -> ActivationRecord:
+        if status.value not in _FINAL_STATES - {"declined"}:
+            raise ActivationStateError("activation result is not terminal")
+        return self._update(
+            record_id,
+            lambda record: replace(record, status=status, detail=detail),
+        )
+
+    def fail_worker(self, record_id: str, detail: str) -> ActivationRecord:
+        def transition(record: ActivationRecord) -> ActivationRecord:
+            if record.status not in {
+                ActivationStatus.READY,
+                ActivationStatus.RESTARTING,
+            }:
+                raise ActivationStateError("activation request is not executable")
+            return replace(record, status=ActivationStatus.FAILED, detail=detail)
+
+        return self._update(record_id, transition)
+
+    def acknowledge(self, record_id: str) -> ActivationRecord:
+        def transition(record: ActivationRecord) -> ActivationRecord:
+            if record.status.value not in _FINAL_STATES:
+                raise ActivationStateError("activation result is not final")
+            return replace(record, acknowledged=True)
+
+        return self._update(record_id, transition)
+
+    def next_delivery(self) -> ActivationDelivery | None:
+        record = self.current()
+        if record is None:
+            return None
+        if record.status == ActivationStatus.OFFERED and not record.offer_delivered:
+            return ActivationDelivery(record, ActivationDeliveryKind.OFFER)
+        if record.status == ActivationStatus.ACCEPTED:
+            return ActivationDelivery(record, ActivationDeliveryKind.PRE_RESTART)
+        if record.status.value in _FINAL_STATES and not record.acknowledged:
+            return ActivationDelivery(record, ActivationDeliveryKind.RESULT)
+        return None
+
+
+def resolve_activation_decision(utterance: str) -> ActivationDecision:
+    normalized = " ".join(utterance.casefold().strip().split())
+    if normalized in {"activate now", "restart it now"}:
+        return ActivationDecision.ACTIVATE
+    if normalized in {"not now", "cancel activation", "do not restart"}:
+        return ActivationDecision.DECLINE
+    return ActivationDecision.NONE
+
+
+def _display_value(value: str | bool) -> str:
+    if isinstance(value, bool):
+        return "enabled" if value else "disabled"
+    return value or "the configured default"
+
+
+def render_activation_delivery(delivery: ActivationDelivery) -> AssistantResponse:
+    record = delivery.record
+    targets = ", ".join(record.targets)
+    if delivery.kind == ActivationDeliveryKind.OFFER:
+        wake_notice = (
+            " Because this affects the active wake listener, activation requires a "
+            "separate explicit confirmation."
+            if _WAKE_SERVICE in record.targets
+            else ""
+        )
+        text = (
+            f"Saved {record.setting_key} as {_display_value(record.new_value)}. "
+            "The running configuration snapshot is unchanged."
+            f"{wake_notice} Say activate now to restart {targets}, or say not now "
+            "to leave the saved change inactive."
+        )
+    elif delivery.kind == ActivationDeliveryKind.PRE_RESTART:
+        text = (
+            f"Activation accepted. I will restart only {targets} after this message "
+            "is delivered. The completion result will be delivered after recovery."
+        )
+    elif record.status == ActivationStatus.SUCCEEDED:
+        text = (
+            f"Activation succeeded. {targets} is active with the expected "
+            "configuration snapshot."
+        )
+    elif record.status == ActivationStatus.DECLINED:
+        text = (
+            "Activation was cancelled. The configuration remains saved, but no "
+            "service was restarted."
+        )
+    else:
+        text = (
+            f"Activation {record.status.value}. {record.detail} "
+            "I will not repeat any ambiguous restart automatically."
+        )
+    return AssistantResponse(spoken_text=text, display_text=text)
+
+
+class SystemdUserServiceController:
+    """Observe and restart allow-listed installed user services only."""
+
+    def __init__(self, *, state_dir: Path | None = None) -> None:
+        self.state_dir = state_dir
+
+    def snapshot(self, service: str) -> ServiceSnapshot:
+        if service not in SERVICE_FILES:
+            raise ActivationStateError(f"unsupported user service {service!r}")
+        process = subprocess.run(
+            [
+                "systemctl",
+                "--user",
+                "show",
+                service,
+                "--property=LoadState",
+                "--property=ActiveState",
+                "--property=SubState",
+                "--property=InvocationID",
+                "--no-pager",
+            ],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        properties = {}
+        for line in process.stdout.splitlines():
+            key, separator, value = line.partition("=")
+            if separator:
+                properties[key] = value
+        process_start = ""
+        digest = ""
+        marker = service_snapshot_path(service, state_dir=self.state_dir)
+        try:
+            value = json.loads(marker.read_text())
+        except (OSError, json.JSONDecodeError):
+            value = None
+        if isinstance(value, dict) and value.get("service") == service:
+            process_start = str(value.get("process_start") or "")
+            digest = str(value.get("config_digest") or "")
+        return ServiceSnapshot(
+            installed=properties.get("LoadState") == "loaded",
+            active_state=properties.get("ActiveState", "unknown"),
+            sub_state=properties.get("SubState", "unknown"),
+            invocation_id=properties.get("InvocationID", ""),
+            process_start=process_start,
+            config_digest=digest,
+        )
+
+    def restart(self, service: str) -> subprocess.CompletedProcess[str]:
+        if service not in SERVICE_FILES:
+            raise ActivationStateError(f"unsupported user service {service!r}")
+        return subprocess.run(
+            ["systemctl", "--user", "try-restart", service],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+
+
+def _observe_restart(
+    controller: ServiceController,
+    outcome: ServiceOutcome,
+    expected_digest: str,
+    *,
+    timeout: float,
+) -> ServiceOutcome:
+    deadline = time.monotonic() + timeout
+    after = controller.snapshot(outcome.service)
+    while time.monotonic() < deadline:
+        identity_changed = (
+            outcome.before is not None
+            and after.identity != outcome.before.identity
+            and any(after.identity)
+        )
+        if (
+            after.active_state == "active"
+            and identity_changed
+            and after.config_digest == expected_digest
+        ):
+            break
+        time.sleep(0.2)
+        after = controller.snapshot(outcome.service)
+    identity_changed = (
+        outcome.before is not None
+        and after.identity != outcome.before.identity
+        and any(after.identity)
+    )
+    if (
+        after.installed
+        and after.active_state == "active"
+        and identity_changed
+        and after.config_digest == expected_digest
+    ):
+        return replace(
+            outcome,
+            status=ServiceOutcomeStatus.SUCCEEDED,
+            after=after,
+            detail="active with the expected immutable snapshot",
+        )
+    reasons = []
+    if not after.installed:
+        reasons.append("service is no longer installed")
+    if after.active_state != "active":
+        reasons.append(f"service state is {after.active_state}")
+    if not identity_changed:
+        reasons.append("restart invocation was not observed")
+    if after.config_digest != expected_digest:
+        reasons.append("expected configuration snapshot was not observed")
+    return replace(
+        outcome,
+        status=ServiceOutcomeStatus.FAILED,
+        after=after,
+        detail=", ".join(reasons) or "restart outcome is ambiguous",
+    )
+
+
+def execute_activation(
+    record_id: str,
+    *,
+    store: ActivationStore | None = None,
+    controller: ServiceController | None = None,
+    load_config: Callable[[], UserConfig] = load_user_config,
+    observation_timeout: float = 30.0,
+) -> ActivationRecord:
+    """Execute or reconcile one durable request without blind restart repetition."""
+
+    resolved_store = store or ActivationStore()
+    resolved_controller = controller or SystemdUserServiceController()
+    with resolved_store.execution_lock():
+        return _execute_activation(
+            record_id,
+            store=resolved_store,
+            controller=resolved_controller,
+            load_config=load_config,
+            observation_timeout=observation_timeout,
+        )
+
+
+def _execute_activation(
+    record_id: str,
+    *,
+    store: ActivationStore,
+    controller: ServiceController,
+    load_config: Callable[[], UserConfig],
+    observation_timeout: float,
+) -> ActivationRecord:
+    record = store.current()
+    if record is None or record.id != record_id:
+        raise ActivationStateError("activation request no longer exists")
+    if record.status.value in _FINAL_STATES:
+        return record
+    if config_digest(load_config()) != record.expected_config_digest:
+        if record.status == ActivationStatus.READY:
+            record = store.begin_restart(record.id, record.outcomes)
+        return store.finish(
+            record.id,
+            status=ActivationStatus.FAILED,
+            detail="The stored configuration changed before activation.",
+        )
+    if record.status == ActivationStatus.READY:
+        initial: list[ServiceOutcome] = []
+        for outcome in record.outcomes:
+            before = controller.snapshot(outcome.service)
+            if not before.installed:
+                initial.append(
+                    replace(
+                        outcome,
+                        status=ServiceOutcomeStatus.FAILED,
+                        before=before,
+                        detail="service is not installed",
+                    )
+                )
+            elif before.active_state != "active":
+                initial.append(
+                    replace(
+                        outcome,
+                        status=ServiceOutcomeStatus.FAILED,
+                        before=before,
+                        detail=f"service is {before.active_state}; it was not started",
+                    )
+                )
+            else:
+                initial.append(replace(outcome, before=before))
+        record = store.begin_restart(record.id, tuple(initial))
+    if record.status != ActivationStatus.RESTARTING:
+        raise ActivationStateError("activation request is not executable")
+    for outcome in record.outcomes:
+        if outcome.status != ServiceOutcomeStatus.PENDING:
+            continue
+        if outcome.attempted:
+            reconciled = _observe_restart(
+                controller,
+                outcome,
+                record.expected_config_digest,
+                timeout=observation_timeout,
+            )
+            record = store.update_outcome(record.id, reconciled)
+            continue
+        attempted = replace(outcome, attempted=True)
+        record = store.update_outcome(record.id, attempted)
+        try:
+            controller.restart(outcome.service)
+        except Exception as exc:  # noqa: BLE001 - reconcile ambiguous systemd result
+            observed = _observe_restart(
+                controller,
+                attempted,
+                record.expected_config_digest,
+                timeout=observation_timeout,
+            )
+            if observed.status == ServiceOutcomeStatus.FAILED:
+                observed = replace(
+                    observed,
+                    detail=f"restart command failed: {exc}; {observed.detail}",
+                )
+            record = store.update_outcome(record.id, observed)
+            continue
+        observed = _observe_restart(
+            controller,
+            attempted,
+            record.expected_config_digest,
+            timeout=observation_timeout,
+        )
+        record = store.update_outcome(record.id, observed)
+    outcomes = record.outcomes
+    succeeded = sum(
+        outcome.status == ServiceOutcomeStatus.SUCCEEDED for outcome in outcomes
+    )
+    if config_digest(load_config()) != record.expected_config_digest:
+        status = ActivationStatus.PARTIAL if succeeded else ActivationStatus.FAILED
+        detail = (
+            "Service actions completed, but the expected config is no longer stored."
+        )
+    elif succeeded == len(outcomes):
+        status = ActivationStatus.SUCCEEDED
+        detail = "All targeted services loaded the expected configuration."
+    elif succeeded:
+        status = ActivationStatus.PARTIAL
+        detail = "; ".join(
+            f"{outcome.service}: {outcome.detail}"
+            for outcome in outcomes
+            if outcome.status == ServiceOutcomeStatus.FAILED
+        )
+    else:
+        status = ActivationStatus.FAILED
+        detail = "; ".join(
+            f"{outcome.service}: {outcome.detail}" for outcome in outcomes
+        )
+    return store.finish(record.id, status=status, detail=detail)
+
+
+def launch_activation_worker(record_id: str) -> subprocess.Popen[bytes]:
+    """Launch the executor in a transient scope outside the wake service cgroup."""
+
+    unit = f"voice-harness-config-activation-{record_id[:16]}"
+    return subprocess.Popen(
+        [
+            "systemd-run",
+            "--user",
+            "--scope",
+            "--collect",
+            "--quiet",
+            f"--unit={unit}",
+            sys.executable,
+            "-m",
+            "local_voice_harness.config_activation",
+            "--execute",
+            record_id,
+        ],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+        close_fds=True,
+    )
+
+
+def _parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--execute", metavar="ACTIVATION_ID", required=True)
+    return parser
+
+
+def main() -> None:
+    arguments = _parser().parse_args()
+    execute_activation(arguments.execute)
+
+
+if __name__ == "__main__":
+    main()

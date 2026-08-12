@@ -43,7 +43,19 @@ from ..config import (
     WAKE_PID_PATH,
     WAV_PATH,
 )
-from ..config_management import StaleConfigChangeError
+from ..config_activation import (
+    ActivationDecision,
+    ActivationDelivery,
+    ActivationDeliveryKind,
+    ActivationStateError,
+    ActivationStatus,
+    ActivationStore,
+    launch_activation_worker,
+    publish_service_snapshot,
+    render_activation_delivery,
+    resolve_activation_decision,
+)
+from ..config_management import StaleConfigChangeError, apply_config_values
 from ..critical_targets import (
     CriticalTarget,
     ReadbackCandidate,
@@ -402,7 +414,12 @@ def _is_filler_speech(text: str) -> bool:
 
 
 class WakeConversationDaemon:
-    def __init__(self, user_config: UserConfig) -> None:
+    def __init__(
+        self,
+        user_config: UserConfig,
+        *,
+        config_activation_store: ActivationStore | None = None,
+    ) -> None:
         import numpy as np
         import openwakeword
         from openwakeword.model import Model
@@ -440,6 +457,10 @@ class WakeConversationDaemon:
         )
         self.pending_target_readback: PendingTargetReadback | None = None
         self.pending_config_change: PendingConfigChange | None = None
+        self.config_activation_store = config_activation_store or ActivationStore()
+        self.config_activation_delivery: ActivationDelivery | None = None
+        self.launched_config_activations: dict[str, subprocess.Popen[bytes]] = {}
+        self.config_activation_dispatch_attempts: dict[str, int] = {}
         self.conversation_deadline = 0.0
         self.awaiting_followup = False
         self.last_wake = 0.0
@@ -1233,14 +1254,182 @@ class WakeConversationDaemon:
                 "please start the change again."
             )
         else:
-            response = render_change_committed(pending, result)
+            try:
+                expected_config = apply_config_values(
+                    self.user_config,
+                    {pending.setting.value: pending.raw_value},
+                )
+                offer = self.config_activation_store.create_offer(
+                    pending,
+                    result,
+                    expected_config=expected_config,
+                )
+            except ActivationStateError as exc:
+                log(f"activation offer persistence failed: {exc}")
+                response = AssistantResponse.from_text(
+                    f"Saved {pending.setting.value}, but I could not durably track "
+                    "activation. The running snapshot is unchanged and no service "
+                    "was restarted."
+                )
+            else:
+                if offer is None:
+                    response = render_change_committed(pending, result)
+                else:
+                    delivery = ActivationDelivery(
+                        offer,
+                        ActivationDeliveryKind.OFFER,
+                    )
+                    self.config_activation_delivery = delivery
+                    response = render_activation_delivery(delivery)
         return response, decision, pending
+
+    def _resolve_activation_confirmation(
+        self,
+        text: str,
+    ) -> AssistantResponse | None:
+        record = self.config_activation_store.current()
+        if (
+            record is None
+            or record.status != ActivationStatus.OFFERED
+            or not record.offer_delivered
+        ):
+            return None
+        decision = resolve_activation_decision(text)
+        if decision == ActivationDecision.ACTIVATE:
+            record = self.config_activation_store.accept(record.id)
+            delivery = ActivationDelivery(
+                record,
+                ActivationDeliveryKind.PRE_RESTART,
+            )
+            self.config_activation_delivery = delivery
+            return render_activation_delivery(delivery)
+        if decision == ActivationDecision.DECLINE:
+            record = self.config_activation_store.decline(record.id)
+            delivery = ActivationDelivery(record, ActivationDeliveryKind.RESULT)
+            self.config_activation_delivery = delivery
+            return render_activation_delivery(delivery)
+        if resolve_confirmation(text) == ConfirmationDecision.CONFIRM:
+            return AssistantResponse.from_text(
+                "This activation needs a separate explicit confirmation. "
+                "Say activate now to restart the affected service, or not now "
+                "to leave it unchanged."
+            )
+        return None
+
+    def _dispatch_ready_config_activation(self, record_id: str) -> None:
+        if record_id in self.launched_config_activations:
+            return
+        try:
+            process = launch_activation_worker(record_id)
+        except OSError as exc:
+            self.config_activation_store.fail_worker(
+                record_id,
+                f"Could not launch the isolated activation worker: {exc}",
+            )
+            return
+        self.launched_config_activations[record_id] = process
+        self.config_activation_dispatch_attempts[record_id] = (
+            self.config_activation_dispatch_attempts.get(record_id, 0) + 1
+        )
+
+    def _complete_config_activation_delivery(
+        self,
+        delivery: ActivationDelivery,
+    ) -> None:
+        if delivery.kind == ActivationDeliveryKind.OFFER:
+            self.config_activation_store.mark_offer_delivered(delivery.record.id)
+        elif delivery.kind == ActivationDeliveryKind.PRE_RESTART:
+            ready = self.config_activation_store.mark_pre_restart_delivered(
+                delivery.record.id
+            )
+            self._dispatch_ready_config_activation(ready.id)
+        else:
+            self.config_activation_store.acknowledge(delivery.record.id)
+        if self.config_activation_delivery == delivery:
+            self.config_activation_delivery = None
+
+    def _recover_config_activation(self) -> BargeIn | None:
+        for record_id, process in tuple(self.launched_config_activations.items()):
+            return_code = process.poll()
+            if return_code is None:
+                continue
+            del self.launched_config_activations[record_id]
+            current = self.config_activation_store.current()
+            if (
+                current is not None
+                and current.id == record_id
+                and current.status
+                in {ActivationStatus.READY, ActivationStatus.RESTARTING}
+                and self.config_activation_dispatch_attempts.get(record_id, 0) >= 2
+            ):
+                self.config_activation_store.fail_worker(
+                    record_id,
+                    "The isolated activation worker could not reconcile the durable "
+                    f"request (status {return_code}); no restart will be repeated.",
+                )
+        record = self.config_activation_store.current()
+        if record is not None and record.status in {
+            ActivationStatus.READY,
+            ActivationStatus.RESTARTING,
+        }:
+            self._dispatch_ready_config_activation(record.id)
+        delivery = self.config_activation_store.next_delivery()
+        if delivery is None:
+            return None
+        self.ensure_components()
+        response = render_activation_delivery(delivery)
+        print(f"Assistant: {response.display_text}", flush=True)
+        _playback, interruption = self.play_response(response)
+        if interruption is None:
+            self._complete_config_activation_delivery(delivery)
+        return interruption
+
+    def _resolve_pending_target_readback(
+        self,
+        text: str,
+        pending: PendingTargetReadback,
+        context: RequestContext,
+    ) -> tuple[AssistantResponse | None, CursorTurnRequest | None]:
+        resolution = resolve_readback(
+            pending.candidate,
+            text,
+            context,
+        )
+        self.pending_target_readback = None
+        if resolution.reply == ReadbackReply.AFFIRMATIVE:
+            return None, pending.request
+        if resolution.reply == ReadbackReply.CORRECTION:
+            assert resolution.replacement is not None
+            replacement = new_candidate(
+                TargetSelection(
+                    resolution.replacement,
+                    pending.candidate.context_binding,
+                ),
+                origin_turn=uuid.uuid4().hex,
+            )
+            self.pending_target_readback = PendingTargetReadback(
+                replacement,
+                _critical_target_request(resolution.replacement),
+            )
+            return readback_response(replacement), None
+        if resolution.reply == ReadbackReply.NEGATIVE:
+            return AssistantResponse.from_text("Okay, I didn't start that work."), None
+        if resolution.reply == ReadbackReply.EXPIRED:
+            return (
+                AssistantResponse.from_text(
+                    "That confirmation expired because the target context changed. "
+                    "Please repeat the request."
+                ),
+                None,
+            )
+        return None, None
 
     def process_utterance(  # pyright: ignore[reportGeneralTypeIssues]
         self, audio_path: Path, *, woke: bool
     ) -> BargeIn | None:
         had_active_conversation = bool(self.conversation_deadline)
         delivery_claims: DeliveryClaims = []
+        self.config_activation_delivery = None
         recent_playback = self._active_recent_playback() if not woke else ()
         self.pause_microphone()
         try:
@@ -1315,37 +1504,14 @@ class WakeConversationDaemon:
                 else routing_context
             )
             if pending_readback is not None:
-                resolution = resolve_readback(
-                    pending_readback.candidate,
+                (
+                    readback_result,
+                    confirmed_request,
+                ) = self._resolve_pending_target_readback(
                     text,
+                    pending_readback,
                     context,
                 )
-                self.pending_target_readback = None
-                if resolution.reply == ReadbackReply.AFFIRMATIVE:
-                    confirmed_request = pending_readback.request
-                elif resolution.reply == ReadbackReply.CORRECTION:
-                    assert resolution.replacement is not None
-                    replacement = new_candidate(
-                        TargetSelection(
-                            resolution.replacement,
-                            pending_readback.candidate.context_binding,
-                        ),
-                        origin_turn=uuid.uuid4().hex,
-                    )
-                    self.pending_target_readback = PendingTargetReadback(
-                        replacement,
-                        _critical_target_request(resolution.replacement),
-                    )
-                    readback_result = readback_response(replacement)
-                elif resolution.reply == ReadbackReply.NEGATIVE:
-                    readback_result = AssistantResponse.from_text(
-                        "Okay, I didn't start that work."
-                    )
-                elif resolution.reply == ReadbackReply.EXPIRED:
-                    readback_result = AssistantResponse.from_text(
-                        "That confirmation expired because the target context changed. "
-                        "Please repeat the request."
-                    )
             (
                 config_response,
                 config_decision,
@@ -1354,12 +1520,20 @@ class WakeConversationDaemon:
                 text,
                 blocked=pending_readback is not None,
             )
+            activation_response = (
+                self._resolve_activation_confirmation(text)
+                if pending_readback is None
+                and pending_config is None
+                and config_response is None
+                else None
+            )
             active_completed = self._active_completed_followup()
             pending = self._pending_cursor_question()
             if (
                 readback_result is not None
                 or confirmed_request is not None
                 or config_response is not None
+                or activation_response is not None
             ):
                 route = IntentRoute(Intent.UNCERTAIN, "low")
             else:
@@ -1484,6 +1658,8 @@ class WakeConversationDaemon:
             }
             if config_response is not None:
                 response = config_response
+            elif activation_response is not None:
+                response = activation_response
             elif readback_result is not None:
                 response = readback_result
             elif confirmed_request is not None:
@@ -1834,6 +2010,10 @@ class WakeConversationDaemon:
                 release_deliveries(delivery_claims)
                 self.history = next_history
                 return interruption
+            if self.config_activation_delivery is not None:
+                self._complete_config_activation_delivery(
+                    self.config_activation_delivery
+                )
             acknowledged = acknowledge_deliveries(delivery_claims)
             completed_claims = [
                 claim
@@ -1890,6 +2070,11 @@ class WakeConversationDaemon:
         self.start_microphone()
         speech_streak = 0
         while self.running:
+            activation_interruption = self._recover_config_activation()
+            if activation_interruption is not None:
+                self.continue_after_barge_in(activation_interruption)
+                speech_streak = 0
+                continue
             for job in pending_results(self.integrations):
                 self._enqueue_job_announcement(job)
             if len(self.playback_queue) > 0:
@@ -2052,8 +2237,17 @@ def main() -> None:
     signal.signal(signal.SIGTERM, handle_signal)
     signal.signal(signal.SIGINT, handle_signal)
     signal.signal(signal.SIGUSR1, handle_listen)
-    _write_pidfile()
     try:
+        _write_pidfile()
+        identity = process_identity(os.getpid())
+        if identity is None:
+            raise HarnessError("could not publish wake service configuration snapshot")
+        publish_service_snapshot(
+            "voice-harness-wake.service",
+            daemon.user_config,
+            pid=os.getpid(),
+            process_start=identity,
+        )
         daemon.run()
     except Exception as exc:
         if daemon.running:

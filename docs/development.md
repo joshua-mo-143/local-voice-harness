@@ -91,6 +91,43 @@ scripts/dev.sh config set audio.voice "$original_voice"
 systemctl --user start voice-harness-wake.service
 ```
 
+### Controlled activation recovery smoke
+
+This smoke restarts the installed wake service and captures microphone audio. Do not
+run it as part of automated verification. Explain that the installed wake listener
+will be restarted, identify the branch/worktree under test, and pause until the user
+explicitly acknowledges readiness.
+
+The foreground `scripts/dev.sh wake` workflow cannot exercise this path because its
+safety check requires the installed wake unit to be inactive. Use the controlled
+service-double tests by default. A real smoke requires a disposable test user/session
+whose already-installed `voice-harness-wake.service` has been independently reviewed
+and confirmed to execute this checkout with the intended configuration profile. The
+activation path itself never installs, replaces, enables, disables, or removes units.
+
+After acknowledgement, use an allow-listed change that differs from the current
+value. Confirm the configuration write with “yes.” Verify that the saved-change
+response is delivered before any restart and asks for the distinct phrase
+“activate now.” A generic “yes” must not activate it. Say “activate now” and verify
+that the complete pre-restart response is delivered before the wake process exits.
+After systemd starts the listener again, verify that the durable completion response
+is spoken/displayed only after the service is active with the expected immutable
+configuration snapshot.
+
+For recovery testing, repeat with one controlled interruption at a time:
+
+- stop the branch wake process before saying “activate now”; no restart request should
+  exist;
+- terminate it after activation acceptance but before pre-restart delivery; the next
+  branch wake process must replay that delivery before dispatch;
+- terminate the isolated activation worker while restart state is durable; recovery
+  must reconcile service identity and snapshot state without blindly restarting;
+- terminate wake after restart observation but before completion acknowledgement; the
+  next process must redeliver the stored result without another restart.
+
+Restore the original configuration after the smoke. Failed or partial outcomes must
+remain visible in the completion response; do not retry them automatically.
+
 This is branch testing isolation, not a complete runtime profile:
 
 - `XDG_RUNTIME_DIR` is preserved. Runtime sockets, recording paths, locks, and
