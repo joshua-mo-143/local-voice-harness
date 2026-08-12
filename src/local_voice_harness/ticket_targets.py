@@ -42,6 +42,10 @@ _LINEAR_REFERENCE = re.compile(
 )
 _SCOPED_PREFIX = re.compile(r"\b(?:issues?|tickets?)\s+", re.IGNORECASE)
 _NUMBER_AT = re.compile(r"#?\d+")
+_RANGE_SEPARATOR_AT = re.compile(
+    r"(?:\s+(?:through|to)\s+|\s*[-–—]\s*)",
+    re.IGNORECASE,
+)
 _NUMBER_WORD_AT = re.compile(
     r"(?:zero|one|two|three|four|five|six|seven|eight|nine|ten|eleven|"
     r"twelve|thirteen|fourteen|fifteen|sixteen|seventeen|eighteen|"
@@ -82,6 +86,7 @@ _TENS_NUMBER_WORDS = {
     "ninety": 90,
 }
 _LINEAR_TEAM = re.compile(r"^[A-Za-z][A-Za-z0-9]+$")
+_MAX_TICKET_RANGE_SIZE = 25
 
 
 def _overlaps(start: int, end: int, spans: list[tuple[int, int]]) -> bool:
@@ -151,23 +156,85 @@ def _spoken_number_at(text: str, start: int) -> tuple[int, int] | None:
     return (total + group, end) if consumed else None
 
 
-def _scoped_items(text: str) -> list[tuple[str, int, int, int]]:
+def _number_at(text: str, position: int) -> tuple[int, int] | None:
+    digit = _NUMBER_AT.match(text, position)
+    if digit is not None:
+        return int(digit.group(0).removeprefix("#")), digit.end()
+    return _spoken_number_at(text, position)
+
+
+@dataclass(frozen=True, slots=True)
+class _ScopedItem:
+    raw: str
+    position: int
+    end: int
+    value: int | None
+    requested_count: int = 1
+    error: str | None = None
+
+
+def _scoped_items(text: str) -> list[_ScopedItem]:
     """Return raw text, position, end, and value for scoped ticket lists."""
 
-    items: list[tuple[str, int, int, int]] = []
+    items: list[_ScopedItem] = []
     for prefix in _SCOPED_PREFIX.finditer(text):
         position = prefix.end()
         while True:
-            digit = _NUMBER_AT.match(text, position)
-            spoken = None if digit is not None else _spoken_number_at(text, position)
-            if digit is not None:
-                end = digit.end()
-                value = int(digit.group(0).removeprefix("#"))
-            elif spoken is not None:
-                value, end = spoken
-            else:
+            start = position
+            parsed = _number_at(text, start)
+            if parsed is None:
                 break
-            items.append((text[position:end], position, end, value))
+            value, end = parsed
+
+            separator = _RANGE_SEPARATOR_AT.match(text, end)
+            range_end = (
+                _number_at(text, separator.end()) if separator is not None else None
+            )
+            if separator is not None and range_end is not None:
+                final_value, final_end = range_end
+                raw = text[start:final_end]
+                requested_count = abs(final_value - value) + 1
+                if value < 1 or final_value < 1:
+                    items.append(
+                        _ScopedItem(
+                            raw,
+                            start,
+                            final_end,
+                            None,
+                            requested_count,
+                            "ticket range endpoints must be positive",
+                        )
+                    )
+                elif final_value < value:
+                    items.append(
+                        _ScopedItem(
+                            raw,
+                            start,
+                            final_end,
+                            None,
+                            requested_count,
+                            "ticket range must be ascending",
+                        )
+                    )
+                elif requested_count > _MAX_TICKET_RANGE_SIZE:
+                    items.append(
+                        _ScopedItem(
+                            raw,
+                            start,
+                            final_end,
+                            None,
+                            requested_count,
+                            f"ticket range cannot exceed {_MAX_TICKET_RANGE_SIZE} tickets",
+                        )
+                    )
+                else:
+                    items.extend(
+                        _ScopedItem(str(number), start, final_end, number)
+                        for number in range(value, final_value + 1)
+                    )
+                end = final_end
+            else:
+                items.append(_ScopedItem(text[start:end], start, end, value))
             position = end
 
             spaces = re.match(r"\s*", text[position:])
@@ -367,18 +434,33 @@ def extract_ticket_targets(
         )
         specific_spans.append(match.span())
 
-    for raw, start, end, number in _scoped_items(text):
-        if _overlaps(start, end, specific_spans):
+    requested_count = len(candidates)
+    for item in _scoped_items(text):
+        if _overlaps(item.position, item.end, specific_spans):
             continue
-        candidates.append(
-            _scoped_reference(
-                raw,
-                start,
-                str(number),
-                scope_source=scope_source,
-                scope=scope,
+        requested_count += item.requested_count
+        if item.error is not None:
+            candidates.append(
+                TicketReference(
+                    item.raw,
+                    item.position,
+                    None,
+                    None,
+                    scoped=True,
+                    error=item.error,
+                )
             )
-        )
+        else:
+            assert item.value is not None
+            candidates.append(
+                _scoped_reference(
+                    item.raw,
+                    item.position,
+                    str(item.value),
+                    scope_source=scope_source,
+                    scope=scope,
+                )
+            )
 
     candidates.sort(key=lambda candidate: candidate.position)
     unique: list[TicketReference] = []
@@ -393,4 +475,4 @@ def extract_ticket_targets(
             continue
         seen.add(key)
         unique.append(candidate)
-    return TicketExtraction(tuple(unique), len(candidates))
+    return TicketExtraction(tuple(unique), requested_count)

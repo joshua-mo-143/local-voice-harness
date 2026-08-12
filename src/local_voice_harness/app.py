@@ -11,6 +11,7 @@ from .agents.delivery import (
 from .agents.delivery import (
     release_deliveries as release_claims,
 )
+from .agents.model import JobStatus
 from .agents.service import AgentTurnRequest as CursorTurnRequest
 from .agents.service import agent_turn as cursor_turn
 from .agents.store import AgentJobStore as JobStore
@@ -24,6 +25,7 @@ from .config import (
     STT_SOCKET,
     TTS_SOCKET,
 )
+from .cursor import questions as cursor_questions
 from .errors import HarnessError
 from .integrations.registry import IntegrationRegistry, build_integration_registry
 from .intent import (
@@ -32,10 +34,12 @@ from .intent import (
     Intent,
     IntentRoute,
     decide_fork_intent,
+    is_grouped_repository_mapping,
     route_intent,
 )
 from .ipc import socket_ready
 from .llm import qwen_response
+from .questions import AnswerProvenance
 from .responses import as_assistant_response
 from .ticket_targets import MISSING_ISSUE_SCOPE_RESPONSE, extract_ticket_targets
 from .tts.client import stream_and_play
@@ -72,6 +76,18 @@ def _context_for_route(
     return RequestContext(text)
 
 
+def _pending_grouped_repository_question() -> tuple[str, str, str] | None:
+    matches: list[tuple[str, str, str]] = []
+    for job in CURSOR_STORE.list():
+        if job.status != JobStatus.AWAITING_USER:
+            continue
+        question = cursor_questions.current(job)
+        if question is None or question.owner != "grouped_repository":
+            continue
+        matches.append((job.id, question.id, question.origin.turn_token))
+    return matches[0] if len(matches) == 1 else None
+
+
 def acknowledge_deliveries(claims: DeliveryClaims) -> None:
     acknowledge_claims(CURSOR_STORE, claims)
 
@@ -94,7 +110,14 @@ def respond(text: str, *, user_config: UserConfig | None = None) -> None:
             start_components(settings.providers)
             print(f"You: {text}")
             routing_context = RequestContext(text)
-            if CURSOR_PATTERN.search(text):
+            grouped_reply = (
+                _pending_grouped_repository_question()
+                if is_grouped_repository_mapping(text)
+                else None
+            )
+            if grouped_reply is not None:
+                route = IntentRoute(Intent.AGENT_REPLY, "high")
+            elif CURSOR_PATTERN.search(text):
                 route = IntentRoute(Intent.AGENT_SUBMIT, "high")
             else:
                 route = route_intent(text, routing_context, settings=settings.providers)
@@ -168,6 +191,14 @@ def respond(text: str, *, user_config: UserConfig | None = None) -> None:
                         action="reply",
                         reference=text,
                         utterance=text,
+                        job_id=grouped_reply[0] if grouped_reply is not None else None,
+                        expected_question_id=(
+                            grouped_reply[1] if grouped_reply is not None else None
+                        ),
+                        expected_question_turn=(
+                            grouped_reply[2] if grouped_reply is not None else None
+                        ),
+                        answer_provenance=AnswerProvenance.USER_TEXT,
                     ),
                     delivery_claims=delivery_claims,
                     integrations=integrations,

@@ -173,8 +173,8 @@ def test_fanout_preflights_every_target_before_bounded_background_starts() -> No
     ):
         result = service.cursor_turn(
             CursorTurnRequest(
-                "Work on issues 1, 2, and 3",
-                utterance="Work on issues 1, 2, and 3",
+                "Work on issues 1 through 3",
+                utterance="Work on issues 1 through 3",
                 issue_scope="example/project",
                 issue_scope_source="github",
             )
@@ -204,7 +204,11 @@ def test_multi_ticket_repository_ambiguities_use_one_durable_grouped_question(
     tmp_path: Path,
 ) -> None:
     store = JobStore(tmp_path / "jobs", tmp_path / "legacy")
-    repositories = [tmp_path / "alpha", tmp_path / "beta"]
+    repositories = [
+        tmp_path / "alpha",
+        tmp_path / "beta",
+        *[tmp_path / f"long-repository-candidate-{index:03d}" for index in range(100)],
+    ]
     client = mock.Mock()
     client.repository_roots.return_value = repositories
     client.resolve_repository.side_effect = lambda hint, _task, _repositories: (
@@ -286,7 +290,12 @@ def test_multi_ticket_repository_ambiguities_use_one_durable_grouped_question(
         question = service.questions.current(clarification)
         assert question is not None
         assert question.owner == service.GROUPED_REPOSITORY_OWNER
+        assert len(question.text) <= service.GROUPED_REPOSITORY_QUESTION_LIMIT
         assert question.text.index("JOS-1") < question.text.index("JOS-2")
+        assert "(+" in question.text and " more)" in question.text
+        assert clarification.grouped_repository_candidates == tuple(
+            str(repository) for repository in repositories
+        )
         client.choose_or_clone_repository.assert_not_called()
 
         revision = clarification.revision
