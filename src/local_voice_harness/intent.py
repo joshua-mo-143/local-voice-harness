@@ -55,6 +55,12 @@ NON_ACTIONABLE_SUBMIT_RESPONSE = (
     "I didn't start any work because I couldn't route that request confidently. "
     "Please clarify the target."
 )
+GROUPED_REPOSITORY_MAPPING_PATTERN = re.compile(
+    r"(?:\b[A-Z][A-Z0-9]*-\d+\b|"
+    r"(?:https?://github\.com/)?"
+    r"[A-Z0-9_.-]+/[A-Z0-9_.-]+(?:/issues/|#)\d+)\s*:",
+    re.IGNORECASE,
+)
 ROUTE_TOOL = {
     "type": "function",
     "function": {
@@ -93,6 +99,10 @@ ROUTE_TOOL = {
         },
     },
 }
+
+
+def is_grouped_repository_mapping(text: str) -> bool:
+    return GROUPED_REPOSITORY_MAPPING_PATTERN.search(text) is not None
 
 
 class Intent(StrEnum):

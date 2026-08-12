@@ -6,9 +6,11 @@ import unittest
 from unittest import mock
 
 from local_voice_harness import app
+from local_voice_harness.agents.model import JobStatus
 from local_voice_harness.browser_context import RequestContext
 from local_voice_harness.cursor.service import CursorTurnRequest
 from local_voice_harness.intent import Intent, IntentRoute
+from local_voice_harness.questions import AnswerProvenance
 from local_voice_harness.responses import AssistantResponse
 
 
@@ -91,6 +93,91 @@ class ForegroundDeliveryTests(unittest.TestCase):
 
 
 class AppContextTests(unittest.TestCase):
+    def test_text_mapping_answers_single_durable_grouped_question(self) -> None:
+        answer = (
+            "JOS-30: local-voice-harness-batch-fixture, "
+            "JOS-29: local-voice-harness-tiered-batch-fixture"
+        )
+        grouped = ("grouped12345", "question-grouped", "grouped12345-turn")
+        with (
+            mock.patch.object(app, "start_components"),
+            mock.patch.object(
+                app,
+                "request_context",
+                return_value=RequestContext(answer),
+            ),
+            mock.patch.object(
+                app,
+                "_pending_grouped_repository_question",
+                return_value=grouped,
+            ),
+            mock.patch.object(app, "route_intent") as route_intent,
+            mock.patch.object(
+                app, "cursor_turn", return_value=("Two jobs started.", None)
+            ) as cursor_turn,
+            mock.patch.object(app, "stream_and_play"),
+        ):
+            app.respond(answer)
+
+        route_intent.assert_not_called()
+        cursor_turn.assert_called_once_with(
+            CursorTurnRequest(
+                answer,
+                action="reply",
+                reference=answer,
+                utterance=answer,
+                job_id="grouped12345",
+                expected_question_id="question-grouped",
+                expected_question_turn="grouped12345-turn",
+                answer_provenance=AnswerProvenance.USER_TEXT,
+            ),
+            delivery_claims=mock.ANY,
+            integrations=mock.ANY,
+        )
+
+    def test_grouped_question_lookup_requires_one_matching_owner(self) -> None:
+        grouped_job = mock.Mock(id="grouped12345", status=JobStatus.AWAITING_USER)
+        unrelated_job = mock.Mock(id="other1234567", status=JobStatus.AWAITING_USER)
+        grouped_question = mock.Mock(
+            id="question-grouped",
+            owner="grouped_repository",
+            origin=mock.Mock(turn_token="grouped12345-turn"),
+        )
+        unrelated_question = mock.Mock(owner="repository")
+
+        with (
+            mock.patch.object(
+                app.CURSOR_STORE,
+                "list",
+                return_value=[grouped_job, unrelated_job],
+            ),
+            mock.patch.object(
+                app.cursor_questions,
+                "current",
+                side_effect=[grouped_question, unrelated_question],
+            ),
+        ):
+            target = app._pending_grouped_repository_question()
+
+        self.assertEqual(
+            target,
+            ("grouped12345", "question-grouped", "grouped12345-turn"),
+        )
+
+        with (
+            mock.patch.object(
+                app.CURSOR_STORE,
+                "list",
+                return_value=[grouped_job, grouped_job],
+            ),
+            mock.patch.object(
+                app.cursor_questions,
+                "current",
+                return_value=grouped_question,
+            ),
+        ):
+            self.assertIsNone(app._pending_grouped_repository_question())
+
     def test_response_channels_are_selected_at_foreground_boundary(self) -> None:
         output = io.StringIO()
         response = AssistantResponse(

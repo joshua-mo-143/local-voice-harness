@@ -90,6 +90,7 @@ from ..intent import (
     Intent,
     IntentRoute,
     decide_fork_intent,
+    is_grouped_repository_mapping,
     route_intent,
 )
 from ..llm import qwen_turn
@@ -1270,7 +1271,15 @@ class WakeConversationDaemon:
                         and pending.question is not None
                         and bool(pending.question.choices)
                     )
-                    if resolved_as_answer or question_control(text) is not None:
+                    grouped_repository_answer = (
+                        pending.owner == "grouped_repository"
+                        and is_grouped_repository_mapping(text)
+                    )
+                    if (
+                        resolved_as_answer
+                        or grouped_repository_answer
+                        or question_control(text) is not None
+                    ):
                         route = IntentRoute(Intent.AGENT_REPLY, "high")
                     invalid_pending_reply = (
                         not resolved_as_answer

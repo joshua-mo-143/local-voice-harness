@@ -192,6 +192,30 @@ def _pending_free_text_snapshot() -> wake_daemon.PendingQuestionSnapshot:
     )
 
 
+def _pending_grouped_repository_snapshot() -> wake_daemon.PendingQuestionSnapshot:
+    question = Question(
+        id="question-grouped",
+        text="Reply TARGET: REPOSITORY for JOS-30 and JOS-29.",
+        kind=QuestionKind.FREE_TEXT,
+        sensitivity=QuestionSensitivity.ROUTINE,
+        origin=QuestionOrigin(
+            "cursor",
+            "grouped12345",
+            "grouped12345-repository-group",
+        ),
+        owner="grouped_repository",
+        asked_at=1,
+    )
+    return wake_daemon.PendingQuestionSnapshot(
+        "grouped12345",
+        question.text,
+        question.owner,
+        question.id,
+        question.origin.turn_token,
+        question,
+    )
+
+
 class StartupConfigSnapshotTests(unittest.TestCase):
     def test_restart_observes_file_change_without_mutating_running_daemon(
         self,
@@ -713,6 +737,81 @@ class ProcessUtteranceTests(unittest.TestCase):
             integrations=mock.ANY,
         )
         qwen_turn.assert_not_called()
+
+    def test_grouped_repository_mapping_overrides_submit_route(self) -> None:
+        daemon = _bare_daemon()
+        daemon.cursor_session = "grouped12345"
+        answer = (
+            "JOS-30: local-voice-harness-batch-fixture, "
+            "JOS-29: local-voice-harness-tiered-batch-fixture"
+        )
+        with (
+            mock.patch.object(wake_daemon, "transcribe", return_value=answer),
+            mock.patch.object(wake_daemon, "start_components"),
+            mock.patch.object(
+                wake_daemon,
+                "request_context",
+                return_value=RequestContext(answer),
+            ),
+            mock.patch.object(
+                daemon,
+                "_pending_cursor_question",
+                return_value=_pending_grouped_repository_snapshot(),
+            ),
+            mock.patch.object(
+                wake_daemon,
+                "route_intent",
+                return_value=IntentRoute(Intent.CURSOR_SUBMIT, "high"),
+            ),
+            mock.patch.object(
+                wake_daemon, "cursor_turn", return_value=("continued", None)
+            ) as cursor_turn,
+            mock.patch.object(
+                daemon,
+                "_drain_playback_queue",
+                return_value=(_playback_batch("ok"), None),
+            ),
+            mock.patch.object(wake_daemon, "notify"),
+        ):
+            daemon.process_utterance(AUDIO_GENERATION, woke=True)
+
+        request = cursor_turn.call_args.args[0]
+        self.assertEqual(request.action, "reply")
+        self.assertEqual(request.job_id, "grouped12345")
+        self.assertEqual(request.expected_question_id, "question-grouped")
+        self.assertEqual(
+            request.expected_question_turn,
+            "grouped12345-repository-group",
+        )
+
+    def test_repository_mapping_does_not_override_unrelated_question(self) -> None:
+        daemon = _bare_daemon()
+        daemon.cursor_session = "oldjob123456"
+        answer = "JOS-30: local-voice-harness-batch-fixture"
+        with (
+            mock.patch.object(wake_daemon, "transcribe", return_value=answer),
+            mock.patch.object(wake_daemon, "start_components"),
+            mock.patch.object(
+                wake_daemon,
+                "request_context",
+                return_value=RequestContext(answer),
+            ),
+            mock.patch.object(
+                daemon,
+                "_pending_cursor_question",
+                return_value=_pending_free_text_snapshot(),
+            ),
+            mock.patch.object(
+                wake_daemon,
+                "route_intent",
+                return_value=IntentRoute(Intent.CURSOR_SUBMIT, "high"),
+            ),
+            mock.patch.object(wake_daemon, "cursor_turn") as cursor_turn,
+            mock.patch.object(wake_daemon, "notify"),
+        ):
+            daemon.process_utterance(AUDIO_GENERATION, woke=False)
+
+        cursor_turn.assert_not_called()
 
     def test_pending_question_closes_silently_on_filler_speech(self) -> None:
         daemon = _bare_daemon()
