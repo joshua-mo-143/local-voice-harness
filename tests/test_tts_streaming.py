@@ -38,6 +38,66 @@ class TextSplittingTests(unittest.TestCase):
 
 
 class ServerStreamingTests(unittest.TestCase):
+    def test_readiness_disconnect_is_silent_and_later_synthesis_succeeds(
+        self,
+    ) -> None:
+        for disconnect in (BrokenPipeError, ConnectionResetError):
+            with self.subTest(disconnect=disconnect.__name__):
+                readiness_handler = server.RequestHandler.__new__(server.RequestHandler)
+                readiness_handler.rfile = io.BytesIO(b"")
+                readiness_handler.wfile = io.BytesIO()
+                request_handler = server.RequestHandler.__new__(server.RequestHandler)
+                request_handler.wfile = io.BytesIO()
+
+                with (
+                    tempfile.TemporaryDirectory() as temporary,
+                    mock.patch.object(server, "OUTPUT_ROOT", Path(temporary)),
+                    mock.patch.object(
+                        server,
+                        "_synthesize",
+                        return_value=(24_000, 1.0, 0.1),
+                    ) as synthesize,
+                    mock.patch.object(
+                        server,
+                        "_write_json",
+                        side_effect=[disconnect("peer closed"), None],
+                    ) as write,
+                    mock.patch.object(server, "log") as log,
+                ):
+                    readiness_handler.handle()
+                    request_handler.rfile = io.BytesIO(
+                        (
+                            json.dumps(
+                                {
+                                    "text": "Still healthy.",
+                                    "output": str(Path(temporary) / "reply.wav"),
+                                }
+                            )
+                            + "\n"
+                        ).encode()
+                    )
+                    request_handler.handle()
+
+                log.assert_not_called()
+                synthesize.assert_called_once()
+                self.assertEqual(write.call_count, 2)
+                self.assertTrue(write.call_args_list[1].args[1]["ok"])
+
+    def test_genuine_request_failure_is_still_logged(self) -> None:
+        handler = server.RequestHandler.__new__(server.RequestHandler)
+        handler.rfile = io.BytesIO(b"{not-json}\n")
+        handler.wfile = io.BytesIO()
+
+        with (
+            mock.patch.object(server, "log") as log,
+            mock.patch.object(server, "_write_json") as write,
+        ):
+            handler.handle()
+
+        log.assert_called_once()
+        self.assertIn("request failed: JSONDecodeError:", log.call_args.args[0])
+        self.assertFalse(write.call_args.args[1]["ok"])
+
     def test_cancellation_stops_before_the_next_model_call(self) -> None:
         handler = mock.Mock()
         handler.wfile = io.BytesIO()
