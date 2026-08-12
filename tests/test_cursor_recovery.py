@@ -207,7 +207,7 @@ class CursorRecoveryTests(unittest.TestCase):
                 "delivered": False,
             }
         )
-        self.store.legacy_dir.mkdir()
+        self.store.legacy_dir.mkdir(exist_ok=True)
         source = self.store.legacy_dir / "123456789abc.json"
         source.write_text(
             json.dumps(
@@ -269,7 +269,8 @@ class CursorRecoveryTests(unittest.TestCase):
         )
 
         launch.assert_not_called()
-        self.assertEqual(path.read_bytes(), before)
+        self.assertEqual(path.with_suffix(".json.imported").read_bytes(), before)
+        self.assertEqual(self.store.get("123456789abc").loaded_schema_version, 5)
 
     def test_all_uncertain_operations_reconcile_before_any_launch(self) -> None:
         base = {

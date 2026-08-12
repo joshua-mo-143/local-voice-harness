@@ -1050,7 +1050,7 @@ class CursorJobStateTests(unittest.TestCase):
         (Path(self.temporary.name) / "123456789abc.json").write_text("{not json")
 
         with self.assertWarnsRegex(
-            JobQuarantineWarning, "123456789abc.json: job is quarantined"
+            JobQuarantineWarning, "123456789abc.json: legacy import is quarantined"
         ):
             self.assertEqual(jobs.active_jobs(), [])
 
@@ -1068,7 +1068,7 @@ class CursorJobStateTests(unittest.TestCase):
         )
 
         with self.assertWarnsRegex(
-            JobQuarantineWarning, "bbbbbbbbbbbb.json: job is quarantined"
+            JobQuarantineWarning, "bbbbbbbbbbbb.json: legacy import is quarantined"
         ):
             self.assertEqual(
                 [job["id"] for job in jobs.active_jobs()], ["aaaaaaaaaaaa"]
@@ -3058,9 +3058,7 @@ class CursorJobStateTests(unittest.TestCase):
             mock.patch.object(service, "launch_worker") as launch,
         ):
             self.assertEqual(service.pending_results(), [])
-        updated = json.loads(
-            (Path(self.temporary.name) / "123456789abc.json").read_text()
-        )
+        updated = jobs.read_job("123456789abc")
         self.assertTrue(updated["reconcile"])
         launch.assert_called_once_with("123456789abc")
 

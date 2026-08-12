@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import tempfile
 import threading
 import unittest
@@ -47,7 +46,7 @@ class CursorDeliveryTests(unittest.TestCase):
         self.assertIsInstance(claim, DeliveryClaim)
         assert claim is not None
         self.assertIsInstance(claim.job, CursorJob)
-        persisted = json.loads((self.root / "jobs" / "123456789abc.json").read_text())
+        persisted = self.store.get("123456789abc").to_dict()
         self.assertNotIn("_delivery_token", persisted)
         self.assertEqual(persisted["delivery_claim_token"], claim.token)
         self.assertEqual(persisted["revision"], 1)

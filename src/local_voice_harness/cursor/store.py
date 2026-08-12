@@ -6,7 +6,9 @@ import json
 import os
 import re
 import shutil
+import sqlite3
 import tempfile
+import threading
 import time
 import warnings
 from collections.abc import Callable, Iterator
@@ -26,6 +28,7 @@ from .model import (
     validate_reservations,
     validate_transition,
 )
+from .sqlite_store import SQLiteJobDatabase, fsync_database_directory
 
 DELIVERED_JOB_RETENTION_SECONDS = 7 * 24 * 60 * 60
 MAX_WORKFLOW_ARTIFACT_BYTES = 64 * 1024
@@ -1282,7 +1285,7 @@ FollowUpBuilder = Callable[[CursorJob], CursorJob]
 ArtifactCommand = Callable[[CursorJob, str], CursorJob]
 
 
-class JobStore:
+class JsonJobStore:
     """Typed transaction boundary for durable Cursor jobs."""
 
     def __init__(self, durable_dir: Path, legacy_dir: Path) -> None:
@@ -1826,6 +1829,948 @@ class JobStore:
                 removed.append(path.stem)
             _maintenance_path(self.durable_dir).unlink()
             _fsync_directory(self.durable_dir)
+        return removed
+
+
+_SQLITE_OPEN_LOCK = threading.RLock()
+
+
+class JobStore:
+    """SQLite-backed implementation of the existing typed store boundary."""
+
+    def __init__(self, durable_dir: Path, legacy_dir: Path) -> None:
+        self.durable_dir = durable_dir
+        self.legacy_dir = legacy_dir
+        self._db = SQLiteJobDatabase(durable_dir)
+        self._ready = False
+
+    @property
+    def db_path(self) -> Path:
+        return self._db.path
+
+    def path(self, job_id: str) -> Path:
+        if len(job_id) != 12 or any(
+            character not in "0123456789abcdef" for character in job_id
+        ):
+            raise JobValidationError("invalid Cursor job ID")
+        # Retained for legacy import fixtures and compatibility callers. SQLite
+        # is authoritative after the cutover marker is committed.
+        return self.durable_dir / f"{job_id}.json"
+
+    @contextmanager
+    def _locked_legacy_and_durable(self) -> Iterator[None]:
+        if self.legacy_dir.resolve() == self.durable_dir.resolve():
+            with locked(self.durable_dir):
+                yield
+            return
+        with locked(self.legacy_dir), locked(self.durable_dir):
+            yield
+
+    @staticmethod
+    def _maintenance_from_row(row: sqlite3.Row | None) -> MaintenanceLease | None:
+        if row is None:
+            return None
+        return MaintenanceLease(
+            token=str(row["token"]),
+            started_at=float(row["started_at"]),
+            owner_pid=int(row["owner_pid"]),
+            owner_boot_id=str(row["owner_boot_id"]),
+            owner_process_start=str(row["owner_process_start"]),
+        )
+
+    @staticmethod
+    def _read_maintenance_db(
+        connection: sqlite3.Connection,
+    ) -> MaintenanceLease | None:
+        return JobStore._maintenance_from_row(
+            connection.execute(
+                "SELECT token, started_at, owner_pid, owner_boot_id, "
+                "owner_process_start FROM maintenance WHERE singleton = 1"
+            ).fetchone()
+        )
+
+    @staticmethod
+    def _reservation_rows(job: CursorJob) -> list[tuple[str, str, str]]:
+        if not _job_reserves_resources(job):
+            return []
+        rows: list[tuple[str, str, str]] = []
+        ticket = _ticket_identity(job)
+        if ticket is not None:
+            rows.append(("ticket", "\x1f".join(ticket), "active ticket ownership"))
+        values = job.to_dict()
+        targets = {
+            value
+            for value in (
+                job.herdr_target,
+                values.get("planner_target"),
+                values.get("reviewer_target"),
+                values.get("implementer_target"),
+                values.get("participant_creation_target"),
+            )
+            if isinstance(value, str) and value
+        }
+        rows.extend(
+            ("target", target, "active or recovery-fenced target")
+            for target in sorted(targets)
+        )
+        if job.worktree_path:
+            rows.append(
+                ("worktree", job.worktree_path, "active or recovery-fenced checkout")
+            )
+        return rows
+
+    def _save(self, connection: sqlite3.Connection, candidate: CursorJob) -> CursorJob:
+        try:
+            self._db.save_job(
+                connection,
+                candidate.to_dict(),
+                reservations=self._reservation_rows(candidate),
+            )
+        except sqlite3.IntegrityError as exc:
+            message = str(exc)
+            if "reservations.resource_kind, reservations.resource_key" in message:
+                raise JobValidationError(
+                    "resource is reserved by both this job and another Cursor job"
+                ) from exc
+            if "delivery_claims.claim_token" in message:
+                raise JobValidationError(
+                    "delivery claim token is already owned by another Cursor job"
+                ) from exc
+            raise JobValidationError(
+                f"SQLite job constraint failed: {message}"
+            ) from exc
+        return candidate
+
+    @staticmethod
+    def _validate_db_quarantine_reservation(
+        connection: sqlite3.Connection,
+        candidate: CursorJob,
+        reservation: Literal["target", "worktree"],
+    ) -> None:
+        value = (
+            candidate.herdr_target
+            if reservation == "target"
+            else candidate.worktree_path
+        )
+        if not value:
+            return
+        key_column = "target_key" if reservation == "target" else "worktree_key"
+        flag_column = (
+            "reserves_target" if reservation == "target" else "reserves_worktree"
+        )
+        row = connection.execute(
+            f"SELECT metadata_path FROM quarantine WHERE resolved_at IS NULL "
+            f"AND (blocks_all = 1 OR ({flag_column} = 1 AND {key_column} = ?)) "
+            "ORDER BY metadata_path LIMIT 1",
+            (value,),
+        ).fetchone()
+        if row is not None:
+            raise JobValidationError(
+                f"{reservation} reservation {value!r} is blocked by unresolved "
+                f"quarantine evidence {Path(str(row['metadata_path'])).name}"
+            )
+
+    def _import_quarantine_rows(self, connection: sqlite3.Connection) -> int:
+        count = 0
+        quarantine = self.durable_dir / ".quarantine"
+        for metadata_path in sorted(quarantine.glob("*.metadata.json")):
+            evidence = _quarantine_evidence_unlocked(metadata_path)
+            digest = None
+            try:
+                raw = json.loads(metadata_path.read_text())
+                if isinstance(raw, dict):
+                    digest = _optional_string(raw.get("sha256"))
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                pass
+            reserves_target = bool(
+                evidence.herdr_target
+                and _quarantine_may_reserve(
+                    metadata_path,
+                    reservation="target",
+                    value=evidence.herdr_target,
+                )
+            )
+            reserves_worktree = bool(
+                evidence.worktree_path
+                and _quarantine_may_reserve(
+                    metadata_path,
+                    reservation="worktree",
+                    value=evidence.worktree_path,
+                )
+            )
+            connection.execute(
+                """
+                INSERT INTO quarantine(
+                    evidence_id, job_id, metadata_path, payload_path,
+                    payload_digest, error, quarantined_at, target_key,
+                    worktree_key, blocks_all, reserves_target,
+                    reserves_worktree, resolved_at, resolution_reason
+                ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+                ON CONFLICT(metadata_path) DO UPDATE SET
+                    job_id = excluded.job_id,
+                    payload_path = excluded.payload_path,
+                    payload_digest = excluded.payload_digest,
+                    error = excluded.error,
+                    quarantined_at = excluded.quarantined_at,
+                    target_key = excluded.target_key,
+                    worktree_key = excluded.worktree_key,
+                    blocks_all = excluded.blocks_all,
+                    reserves_target = excluded.reserves_target,
+                    reserves_worktree = excluded.reserves_worktree,
+                    resolved_at = excluded.resolved_at
+                """,
+                (
+                    hashlib.sha256(str(metadata_path).encode()).hexdigest(),
+                    evidence.job_id,
+                    str(metadata_path),
+                    str(evidence.payload_path) if evidence.payload_path else None,
+                    digest,
+                    evidence.quarantine_error,
+                    evidence.quarantined_at,
+                    evidence.herdr_target,
+                    evidence.worktree_path,
+                    int(evidence.inspection_error is not None),
+                    int(reserves_target),
+                    int(reserves_worktree),
+                    evidence.quarantined_at if evidence.resolved else None,
+                ),
+            )
+            if not evidence.resolved:
+                count += 1
+        return count
+
+    def _import_json_sources(self) -> set[str]:
+        archived: list[Path] = []
+        failed_sources: list[Path] = []
+        blocked: set[str] = set()
+        with self._db.transaction() as connection:
+            quarantine_count = self._import_quarantine_rows(connection)
+            sources = sorted(self.durable_dir.glob("*.json"))
+            invalid_sources: set[Path] = set()
+            # Discover every malformed peer before importing any valid record.
+            # This preserves the JSON store's scan-first reservation fence.
+            for source in sources:
+                try:
+                    candidate = _parse_path(source)
+                    if candidate.id != source.stem:
+                        raise JobValidationError(
+                            "Cursor job id must match its filename"
+                        )
+                    if not _has_legacy_worker_claim(candidate):
+                        _normalize_for_durable_write(candidate)
+                except JobValidationError as error:
+                    blocked.add(source.stem)
+                    invalid_sources.add(source)
+                    _quarantine_import(
+                        source,
+                        self.durable_dir,
+                        error,
+                        remove_source=False,
+                    )
+                    failed_sources.append(source)
+                    quarantine_count += 1
+            self._import_quarantine_rows(connection)
+            for source in sources:
+                if source in invalid_sources:
+                    continue
+                try:
+                    candidate = _parse_path(source)
+                    if candidate.id != source.stem:
+                        raise JobValidationError(
+                            "Cursor job id must match its filename"
+                        )
+                    preserve_legacy_owner = _has_legacy_worker_claim(candidate)
+                    if not preserve_legacy_owner:
+                        candidate = _normalize_for_durable_write(candidate)
+                    try:
+                        current_raw = self._db.load_job(connection, candidate.id)
+                    except FileNotFoundError:
+                        current = None
+                    else:
+                        current = CursorJob.from_dict(current_raw)
+                    if current is not None:
+                        if (
+                            current.created_at != candidate.created_at
+                            or current.id != candidate.id
+                        ):
+                            raise JobValidationError(
+                                "import identity/created_at lineage conflicts "
+                                "with the durable job"
+                            )
+                        if current.revision > candidate.revision:
+                            archived.append(source)
+                            continue
+                        if current.revision == candidate.revision:
+                            if current.to_dict() != candidate.to_dict():
+                                raise JobValidationError(
+                                    "import conflicts with durable job at the same revision"
+                                )
+                            archived.append(source)
+                            continue
+                    _validate_candidate_artifacts_unlocked(source, candidate, current)
+                    if current is None:
+                        _validate_quarantine_reservation_unlocked(
+                            self.durable_dir, candidate, "target"
+                        )
+                        _validate_quarantine_reservation_unlocked(
+                            self.durable_dir, candidate, "worktree"
+                        )
+                    if preserve_legacy_owner:
+                        self._db.save_job(
+                            connection,
+                            candidate.to_dict(preserve_loaded_version=True),
+                            reservations=self._reservation_rows(candidate),
+                        )
+                    else:
+                        self._save(connection, candidate)
+                    archived.append(source)
+                except (JobValidationError, sqlite3.IntegrityError) as error:
+                    blocked.add(source.stem)
+                    if source.exists():
+                        validation = (
+                            error
+                            if isinstance(error, JobValidationError)
+                            else JobValidationError(str(error))
+                        )
+                        _quarantine_import(
+                            source,
+                            self.durable_dir,
+                            validation,
+                            remove_source=False,
+                        )
+                        failed_sources.append(source)
+                        quarantine_count += 1
+            self._import_quarantine_rows(connection)
+            self._db.set_meta(
+                connection,
+                "migration_status",
+                "complete_with_quarantine" if quarantine_count else "complete",
+            )
+            self._db.set_meta(connection, "cutover_complete", "1")
+            self._db.set_meta(connection, "import_failure_count", str(quarantine_count))
+        for source in archived:
+            destination = source.with_suffix(source.suffix + ".imported")
+            if destination.exists():
+                if destination.read_bytes() == source.read_bytes():
+                    source.unlink()
+                else:
+                    destination = source.with_name(
+                        f"{source.name}.{hashlib.sha256(source.read_bytes()).hexdigest()[:12]}.imported"
+                    )
+                    os.replace(source, destination)
+            elif source.exists():
+                os.replace(source, destination)
+        for source in failed_sources:
+            if source.exists():
+                destination = source.with_suffix(source.suffix + ".failed")
+                if destination.exists():
+                    destination = source.with_name(
+                        f"{source.name}.{hashlib.sha256(source.read_bytes()).hexdigest()[:12]}.failed"
+                    )
+                os.replace(source, destination)
+        if archived or failed_sources:
+            _fsync_directory(self.durable_dir)
+        return blocked
+
+    def _refresh_legacy_sources(self) -> set[str]:
+        if not any(self.durable_dir.glob("*.json")):
+            return set()
+        with locked(self.durable_dir):
+            return self._import_json_sources()
+
+    def _ensure_ready(self) -> None:
+        if self._ready:
+            return
+        with _SQLITE_OPEN_LOCK:
+            if self._ready:
+                return
+            self._db.initialize()
+            with self._locked_legacy_and_durable():
+                with self._db.transaction() as connection:
+                    complete = self._db.meta(connection, "cutover_complete") == "1"
+                    if not complete:
+                        lease = _read_maintenance_unlocked(self.durable_dir)
+                        if lease is not None:
+                            connection.execute(
+                                """
+                                INSERT OR REPLACE INTO maintenance(
+                                    singleton, token, operation, started_at, owner_pid,
+                                    owner_boot_id, owner_process_start
+                                ) VALUES(1, ?, 'delete_all', ?, ?, ?, ?)
+                                """,
+                                (
+                                    lease.token,
+                                    lease.started_at,
+                                    lease.owner_pid,
+                                    lease.owner_boot_id,
+                                    lease.owner_process_start,
+                                ),
+                            )
+                if not complete:
+                    self._import_json_sources()
+                    maintenance_path = _maintenance_path(self.durable_dir)
+                    if maintenance_path.exists():
+                        maintenance_path.rename(
+                            maintenance_path.with_suffix(".imported")
+                        )
+                        _fsync_directory(self.durable_dir)
+            fsync_database_directory(self.durable_dir)
+            self._ready = True
+
+    def migrate_legacy(
+        self, *, inspect_worker: LegacyWorkerInspector | None = None
+    ) -> set[str]:
+        self._ensure_ready()
+        blocked = migrate_legacy_jobs(
+            self.legacy_dir,
+            self.durable_dir,
+            inspect_worker=inspect_worker,
+        )
+        blocked.update(self._import_json_sources())
+        return blocked
+
+    def get(self, job_id: str) -> CursorJob:
+        self._ensure_ready()
+        self._refresh_legacy_sources()
+        with self._db.connect() as connection:
+            try:
+                return CursorJob.from_dict(self._db.load_job(connection, job_id))
+            except FileNotFoundError as exc:
+                quarantined = _quarantine_error(self.path(job_id))
+                if quarantined is not None:
+                    raise quarantined from exc
+                raise
+
+    def get_unless_maintenance(self, job_id: str) -> CursorJob | None:
+        self._ensure_ready()
+        with self._db.transaction() as connection:
+            if self._read_maintenance_db(connection) is not None:
+                return None
+            return CursorJob.from_dict(self._db.load_job(connection, job_id))
+
+    def list(self) -> list[CursorJob]:
+        self._ensure_ready()
+        self._refresh_legacy_sources()
+        with self._db.connect() as connection:
+            return [CursorJob.from_dict(raw) for raw in self._db.list_jobs(connection)]
+
+    def maintenance_active(self) -> bool:
+        self._ensure_ready()
+        with self._db.connect() as connection:
+            return self._read_maintenance_db(connection) is not None
+
+    def create(
+        self,
+        job: CursorJob,
+        *,
+        enforce_unique_ticket: bool = False,
+    ) -> CursorJob:
+        self._ensure_ready()
+        self._refresh_legacy_sources()
+        with self._db.transaction() as connection:
+            if self._read_maintenance_db(connection) is not None:
+                raise JobMaintenanceError(
+                    "Cursor jobs are temporarily unavailable during job deletion"
+                )
+            try:
+                self._db.load_job(connection, job.id)
+            except FileNotFoundError:
+                pass
+            else:
+                raise JobValidationError(f"{job.id}.json: Cursor job already exists")
+            candidate = _normalize_for_durable_write(job)
+            if candidate.revision != 0:
+                raise JobValidationError("new Cursor job revision must be zero")
+            if enforce_unique_ticket:
+                identity = _ticket_identity(candidate)
+                if identity is not None:
+                    conflict = connection.execute(
+                        "SELECT job_id FROM reservations "
+                        "WHERE resource_kind = 'ticket' AND resource_key = ?",
+                        ("\x1f".join(identity),),
+                    ).fetchone()
+                    if conflict is not None:
+                        raise ActiveTicketConflict(str(conflict["job_id"]))
+            _validate_candidate_artifacts_unlocked(self.path(job.id), candidate, None)
+            _validate_quarantine_reservation_unlocked(
+                self.durable_dir, candidate, "target"
+            )
+            _validate_quarantine_reservation_unlocked(
+                self.durable_dir, candidate, "worktree"
+            )
+            self._validate_db_quarantine_reservation(connection, candidate, "target")
+            self._validate_db_quarantine_reservation(connection, candidate, "worktree")
+            return self._save(connection, candidate)
+
+    def update(self, job_id: str, command: JobCommand) -> CursorJob | None:
+        return self._transaction(job_id, command)
+
+    def reserve_target(self, job_id: str, command: JobCommand) -> CursorJob | None:
+        return self._transaction(
+            job_id, command, reservation="target", reject_maintenance=True
+        )
+
+    def reserve_worktree(self, job_id: str, command: JobCommand) -> CursorJob | None:
+        return self._transaction(
+            job_id, command, reservation="worktree", reject_maintenance=True
+        )
+
+    def update_unless_maintenance(
+        self, job_id: str, command: JobCommand
+    ) -> CursorJob | None:
+        return self._transaction(job_id, command, reject_maintenance=True)
+
+    def _transaction(
+        self,
+        job_id: str,
+        command: JobCommand,
+        *,
+        reservation: Literal["target", "worktree"] | None = None,
+        reject_maintenance: bool = False,
+    ) -> CursorJob | None:
+        self._ensure_ready()
+        self._refresh_legacy_sources()
+        with self._db.transaction() as connection:
+            if reject_maintenance and self._read_maintenance_db(connection) is not None:
+                return None
+            current = CursorJob.from_dict(self._db.load_job(connection, job_id))
+            candidate = command(current)
+            if candidate is None:
+                return None
+            candidate = _normalize_for_durable_write(candidate)
+            validate_transition(current, candidate)
+            _validate_candidate_artifacts_unlocked(
+                self.path(job_id), candidate, current
+            )
+            if reservation is not None:
+                _validate_quarantine_reservation_unlocked(
+                    self.durable_dir, candidate, reservation
+                )
+                self._validate_db_quarantine_reservation(
+                    connection, candidate, reservation
+                )
+            return self._save(connection, candidate)
+
+    def write_artifact(
+        self,
+        job_id: str,
+        kind: Literal["plan", "review"],
+        round_number: int,
+        text: str,
+        *,
+        source_text: str | None = None,
+    ) -> str:
+        if kind not in WORKFLOW_ARTIFACT_KINDS:
+            raise JobValidationError("invalid workflow artifact kind")
+        if round_number < 0 or round_number > 2:
+            raise JobValidationError(
+                "workflow artifact round must be between zero and two"
+            )
+        plan_sha256 = None
+        if kind == "review":
+            if source_text is None or not source_text.strip():
+                raise JobValidationError(
+                    "workflow review requires the reviewed plan text"
+                )
+            plan_sha256 = hashlib.sha256(source_text.encode()).hexdigest()
+        reference, serialized = _artifact_payload(
+            job_id,
+            kind,
+            round_number,
+            text,
+            plan_sha256=plan_sha256,
+        )
+        self._ensure_ready()
+        with self._db.transaction() as connection:
+            self._db.load_job(connection, job_id)
+            path = _artifact_path(self.durable_dir, reference)
+            _ensure_artifact_directory_unlocked(self.durable_dir, job_id)
+            _exclusive_bytes(path, serialized)
+        return reference
+
+    def publish_artifact(
+        self,
+        job_id: str,
+        kind: Literal["plan", "review"],
+        round_number: int,
+        text: str,
+        *,
+        expected_worker_token: str,
+        expected_turn_token: str,
+        expected_phase: str,
+        expected_prior_reference: str | None,
+        change: ArtifactCommand,
+        expected_plan_reference: str | None = None,
+    ) -> CursorJob | None:
+        if kind not in WORKFLOW_ARTIFACT_KINDS or not 0 <= round_number <= 2:
+            raise JobValidationError("invalid workflow artifact publication")
+        self._ensure_ready()
+        with self._db.transaction() as connection:
+            current = CursorJob.from_dict(self._db.load_job(connection, job_id))
+            field = "plan_artifact" if kind == "plan" else "review_artifact"
+            if (
+                current.terminal_intent_status is not None
+                or current.worker_token != expected_worker_token
+                or current.turn_token != expected_turn_token
+                or current.workflow_phase.value != expected_phase
+                or current.review_round != round_number
+                or current.to_dict().get(field) != expected_prior_reference
+            ):
+                return None
+            plan_sha256 = None
+            if kind == "review":
+                if (
+                    expected_plan_reference is None
+                    or current.plan_artifact != expected_plan_reference
+                ):
+                    return None
+                match = _ARTIFACT_REF.fullmatch(expected_plan_reference)
+                if match is None:
+                    raise JobValidationError("invalid reviewed plan artifact reference")
+                plan_text = _parse_artifact(
+                    _artifact_path(self.durable_dir, expected_plan_reference),
+                    expected_job_id=job_id,
+                    expected_kind="plan",
+                    expected_round=int(match.group("round")),
+                )
+                plan_sha256 = hashlib.sha256(plan_text.encode()).hexdigest()
+            reference, serialized = _artifact_payload(
+                job_id,
+                kind,
+                round_number,
+                text,
+                plan_sha256=plan_sha256,
+            )
+            artifact_path = _artifact_path(self.durable_dir, reference)
+            _ensure_artifact_directory_unlocked(self.durable_dir, job_id)
+            _exclusive_bytes(artifact_path, serialized)
+            candidate = change(current, reference)
+            if candidate.to_dict().get(field) != reference:
+                raise JobValidationError(
+                    f"artifact publication must set {field} to the new reference"
+                )
+            candidate = _normalize_for_durable_write(candidate)
+            validate_transition(current, candidate)
+            return self._save(connection, candidate)
+
+    def read_artifact(
+        self,
+        job_id: str,
+        reference: str,
+        *,
+        kind: Literal["plan", "review"],
+    ) -> str:
+        match = _ARTIFACT_REF.fullmatch(reference)
+        if match is None or match.group("job") != job_id or match.group("kind") != kind:
+            raise JobValidationError("workflow artifact reference does not match job")
+        job = self.get(job_id)
+        field = "plan_artifact" if kind == "plan" else "review_artifact"
+        if job.to_dict().get(field) != reference:
+            raise JobValidationError("workflow artifact reference is stale")
+        source_sha256 = None
+        if kind == "review":
+            plan_reference = job.plan_artifact
+            if plan_reference is None:
+                raise JobValidationError("workflow review has no current plan")
+            plan_match = _ARTIFACT_REF.fullmatch(plan_reference)
+            assert plan_match is not None
+            plan_text = _parse_artifact(
+                _artifact_path(self.durable_dir, plan_reference),
+                expected_job_id=job_id,
+                expected_kind="plan",
+                expected_round=int(plan_match.group("round")),
+            )
+            source_sha256 = hashlib.sha256(plan_text.encode()).hexdigest()
+        return _parse_artifact(
+            _artifact_path(self.durable_dir, reference),
+            expected_job_id=job_id,
+            expected_kind=kind,
+            expected_round=int(match.group("round")),
+            expected_source_sha256=source_sha256,
+        )
+
+    def create_follow_up(
+        self,
+        parent_job_id: str,
+        build: FollowUpBuilder,
+        *,
+        expected_completed_at: float | None = None,
+    ) -> CursorJob:
+        self._ensure_ready()
+        self._refresh_legacy_sources()
+        with self._db.transaction() as connection:
+            if self._read_maintenance_db(connection) is not None:
+                raise JobMaintenanceError(
+                    "Cursor follow-ups are temporarily unavailable during job deletion"
+                )
+            try:
+                parent = CursorJob.from_dict(
+                    self._db.load_job(connection, parent_job_id)
+                )
+            except FileNotFoundError as exc:
+                raise FollowUpUnavailable(
+                    f"Cursor job {parent_job_id} is no longer available"
+                ) from exc
+            _validate_follow_up_source(parent, expected_completed_at)
+            child = build(parent)
+            if child.parent_job_id != parent.id:
+                raise JobValidationError(
+                    "follow-up child must reference its parent job id"
+                )
+            if child.harness_kind != parent.harness_kind:
+                raise JobValidationError(
+                    "follow-up child must inherit parent harness_kind exactly"
+                )
+            if child.issue_provider != parent.issue_provider:
+                raise JobValidationError(
+                    "follow-up child must inherit parent issue_provider exactly"
+                )
+            for field in (
+                "repository",
+                "worktree_branch",
+                "worktree_path",
+                "worktree_workspace_id",
+                "worktree_root_pane_id",
+            ):
+                if getattr(child, field) != getattr(parent, field):
+                    raise JobValidationError(
+                        f"follow-up child must inherit parent {field} exactly"
+                    )
+            try:
+                self._db.load_job(connection, child.id)
+            except FileNotFoundError:
+                pass
+            else:
+                raise JobValidationError(f"{child.id}.json: Cursor job already exists")
+            try:
+                _validate_quarantine_reservation_unlocked(
+                    self.durable_dir, child, "worktree"
+                )
+                self._validate_db_quarantine_reservation(connection, child, "worktree")
+                return self._save(connection, _normalize_for_durable_write(child))
+            except JobValidationError as exc:
+                if "reserved by both" in str(
+                    exc
+                ) or "blocked by unresolved quarantine evidence" in str(exc):
+                    raise FollowUpCheckoutBusy(
+                        f"{parent.worktree_path} is busy with another Cursor job"
+                    ) from exc
+                raise
+
+    def acknowledge_quarantine_reservations(
+        self,
+        job_id: str,
+        *,
+        reason: str,
+        now: float | None = None,
+    ) -> QuarantineAcknowledgement:
+        if not reason.strip():
+            raise JobValidationError("quarantine acknowledgement reason is required")
+        self._ensure_ready()
+        acknowledged_at = time.time() if now is None else now
+        with self._db.transaction() as connection:
+            metadata_paths = _quarantine_metadata(self.path(job_id))
+            if not metadata_paths:
+                raise JobValidationError(
+                    f"{job_id}: no quarantine evidence is available to acknowledge"
+                )
+            resolved: list[str] = []
+            for metadata_path in metadata_paths:
+                if _quarantine_metadata_resolved(metadata_path):
+                    continue
+                if metadata_path.is_symlink():
+                    raise JobValidationError(
+                        f"{metadata_path.name}: quarantine metadata cannot be a symlink"
+                    )
+                _atomic_json(
+                    _quarantine_resolution_path(metadata_path),
+                    {
+                        "job_id": job_id,
+                        "metadata_name": metadata_path.name,
+                        "metadata_sha256": hashlib.sha256(
+                            metadata_path.read_bytes()
+                        ).hexdigest(),
+                        "acknowledged_at": acknowledged_at,
+                        "reason": reason.strip(),
+                    },
+                )
+                connection.execute(
+                    "UPDATE quarantine SET resolved_at = ?, resolution_reason = ? "
+                    "WHERE metadata_path = ?",
+                    (acknowledged_at, reason.strip(), str(metadata_path)),
+                )
+                resolved.append(metadata_path.name)
+            return QuarantineAcknowledgement(job_id, tuple(resolved), acknowledged_at)
+
+    def list_quarantine_evidence(
+        self, *, include_resolved: bool = False
+    ) -> list[QuarantineEvidence]:
+        self._ensure_ready()
+        evidence = [
+            _quarantine_evidence_unlocked(path)
+            for path in sorted(
+                (self.durable_dir / ".quarantine").glob("*.metadata.json")
+            )
+        ]
+        return [
+            record for record in evidence if include_resolved or not record.resolved
+        ]
+
+    def prune(
+        self,
+        *,
+        now: float | None = None,
+        retention_seconds: float = DELIVERED_JOB_RETENTION_SECONDS,
+    ) -> list[str]:
+        self._ensure_ready()
+        cutoff = (time.time() if now is None else now) - retention_seconds
+        removed: list[str] = []
+        with self._db.transaction() as connection:
+            if self._read_maintenance_db(connection) is not None:
+                return removed
+            for raw in self._db.list_jobs(connection):
+                job = CursorJob.from_dict(raw)
+                if (
+                    job.status in TERMINAL_STATUSES
+                    and job.delivered
+                    and job.completed_at is not None
+                    and job.completed_at < cutoff
+                    and not _must_retain(job)
+                ):
+                    self._db.delete_job(connection, job.id)
+                    removed.append(job.id)
+        for job_id in removed:
+            _delete_artifacts_unlocked(self.durable_dir, job_id)
+        return removed
+
+    def begin_maintenance(
+        self,
+        lease: MaintenanceLease,
+        stage: JobCommand,
+        *,
+        owner_alive: MaintenanceOwnerAlive,
+    ) -> list[CursorJob]:
+        self._ensure_ready()
+        with self._db.transaction() as connection:
+            existing = self._read_maintenance_db(connection)
+            if existing is not None:
+                disposition = owner_alive(existing)
+                if disposition is True:
+                    raise JobMaintenanceError(
+                        "another Cursor job deletion is already in progress"
+                    )
+                if disposition is None:
+                    raise JobMaintenanceError(
+                        "an existing Cursor job deletion owner cannot be verified; "
+                        "retry after checking the recorded process"
+                    )
+            unresolved = _unresolved_quarantine_metadata(self.durable_dir)
+            if unresolved:
+                raise JobMaintenanceError(
+                    "Cursor jobs could not be deleted safely: quarantine evidence "
+                    "requires manual inspection: "
+                    + ", ".join(path.name for path in unresolved)
+                )
+            connection.execute("DELETE FROM maintenance")
+            connection.execute(
+                """
+                INSERT INTO maintenance(
+                    singleton, token, operation, started_at, owner_pid,
+                    owner_boot_id, owner_process_start
+                ) VALUES(1, ?, 'delete_all', ?, ?, ?, ?)
+                """,
+                (
+                    lease.token,
+                    lease.started_at,
+                    lease.owner_pid,
+                    lease.owner_boot_id,
+                    lease.owner_process_start,
+                ),
+            )
+            staged: list[CursorJob] = []
+            for raw in self._db.list_jobs(connection):
+                current = CursorJob.from_dict(raw)
+                candidate = stage(current)
+                if candidate is not None:
+                    candidate = _normalize_for_durable_write(candidate)
+                    validate_transition(current, candidate)
+                    current = self._save(connection, candidate)
+                staged.append(current)
+            return staged
+
+    def abort_maintenance(self, token: str) -> bool:
+        self._ensure_ready()
+        with self._db.transaction() as connection:
+            result = connection.execute(
+                "DELETE FROM maintenance WHERE singleton = 1 AND token = ?",
+                (token,),
+            )
+            return result.rowcount == 1
+
+    def finalize_maintenance(self, token: str) -> list[str]:
+        self._ensure_ready()
+        removed: list[str] = []
+        with self._locked_legacy_and_durable():
+            with self._db.transaction() as connection:
+                lease = self._read_maintenance_db(connection)
+                if lease is None or lease.token != token:
+                    raise JobMaintenanceError(
+                        "Cursor job deletion lease changed before finalization"
+                    )
+                legacy_records = sorted(self.legacy_dir.glob("*.json"))
+                if (
+                    self.legacy_dir.resolve() != self.durable_dir.resolve()
+                    and legacy_records
+                ):
+                    raise JobMaintenanceError(
+                        "Cursor jobs could not be deleted safely: legacy source "
+                        "records remain; run job recovery and retry"
+                    )
+                unresolved = [
+                    path.name
+                    for path in _unresolved_quarantine_metadata(self.durable_dir)
+                ]
+                blockers: list[str] = []
+                if unresolved:
+                    blockers.append(
+                        "quarantine evidence requires manual inspection: "
+                        + ", ".join(unresolved)
+                    )
+                jobs = [
+                    CursorJob.from_dict(raw) for raw in self._db.list_jobs(connection)
+                ]
+                for job in jobs:
+                    reasons: list[str] = []
+                    if job.status in ACTIVE_STATUSES:
+                        reasons.append(f"status {job.status.value}")
+                    if any(
+                        value is not None
+                        for value in (
+                            job.worker_token,
+                            job.worker_pid,
+                            job.worker_boot_id,
+                            job.worker_process_start,
+                        )
+                    ):
+                        reasons.append("worker ownership remains")
+                    if _must_retain(job):
+                        reasons.append("recovery or reservation fence remains")
+                    if reasons:
+                        blockers.append(f"{job.id}: {', '.join(reasons)}")
+                if blockers:
+                    raise JobMaintenanceError(
+                        "Cursor jobs could not be deleted safely: "
+                        + "; ".join(blockers)
+                    )
+                for job in jobs:
+                    self._db.delete_job(connection, job.id)
+                    removed.append(job.id)
+                connection.execute(
+                    "DELETE FROM maintenance WHERE singleton = 1 AND token = ?",
+                    (token,),
+                )
+        for job_id in removed:
+            _delete_artifacts_unlocked(self.durable_dir, job_id)
         return removed
 
 

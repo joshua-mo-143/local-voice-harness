@@ -194,10 +194,10 @@ an invalid or partially prepared checkout is marked quarantined and is never dis
 Agent questions cross a provider-neutral broker contract before entering the Cursor
 job flow. A question records its type (free text or multiple choice), choices,
 decision sensitivity, provider, opaque job identity, and originating turn token.
-The initial Cursor adapter stores that versioned envelope in the same atomically
-replaced job JSON as `AWAITING_USER`; the legacy `question` and
-`clarification_kind` fields remain mirrored for voice and inbox compatibility.
-There is no sidecar transaction that can disagree with job state.
+The Cursor adapter stores that versioned envelope in the same SQLite transaction
+as the `AWAITING_USER` state; the legacy `question` and `clarification_kind`
+fields remain mirrored for voice and inbox compatibility. There is no sidecar
+transaction that can disagree with job state.
 
 Answers are compare-and-swap fenced by question identity and originating turn.
 Multiple-choice matching accepts only an exact choice identifier, exact spoken
@@ -300,15 +300,18 @@ manual or focused-dictation recorder owns the shared recording lock. Manual and
 focused-dictation starts inspect every configured recorder owner atomically under
 that lock, so different capture modes cannot run concurrently.
 
-Cursor job JSON, its lock, and quarantine evidence are durable under the absolute
-`$STATE_DIRECTORY/jobs` supplied by systemd. Outside the service they use
+Cursor jobs use a WAL-mode SQLite database at
+`$STATE_DIRECTORY/jobs/jobs.sqlite3`; quarantine evidence and content-addressed
+artifacts remain below the same durable jobs directory. Outside the service they use
 `$XDG_STATE_HOME/voice-harness/jobs`, falling back to
 `~/.local/state/voice-harness/jobs`. `STATE_DIRECTORY` is service-owned and must
 not be set in user environment overrides. Detached worker logs remain private,
-session-only files under `$XDG_RUNTIME_DIR/voice-harness/jobs`. On first recovery,
-legacy runtime job JSON is imported under both legacy and durable locks; conflicting
-same-revision imports are preserved in the durable quarantine instead of replacing
-state. Linux boot identity is part of worker and target-release ownership, so a
+session-only files under `$XDG_RUNTIME_DIR/voice-harness/jobs`. On first open,
+durable and legacy runtime JSON is normalized into SQLite under both legacy and
+durable locks. Original valid records receive an `.imported` archival suffix;
+invalid records receive a `.failed` archival suffix and a byte-preserving quarantine
+copy. Conflicting same-revision imports are quarantined instead of replacing state.
+Linux boot identity is part of worker and target-release ownership, so a
 reused PID after reboot cannot inherit a stale claim. Recovery retains active,
 undelivered, uncertain, fenced, manual-review, and quarantined records. It prunes
 only delivered terminal jobs whose completion is more than seven days old and never
