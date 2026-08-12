@@ -1059,6 +1059,7 @@ class ProcessUtteranceTests(unittest.TestCase):
     def test_pending_question_allows_related_consultation(self) -> None:
         daemon = _bare_daemon()
         daemon.cursor_session = "oldjob123456"
+        consultant_snapshot = mock.Mock()
         with (
             mock.patch.object(
                 wake_daemon,
@@ -1082,10 +1083,16 @@ class ProcessUtteranceTests(unittest.TestCase):
                 return_value=IntentRoute(Intent.QUESTION_CONSULTATION, "high"),
             ),
             mock.patch.object(
-                wake_daemon,
-                "qwen_turn",
-                return_value=("SQLite is simpler for a local tool.", "oldjob123456"),
-            ) as qwen_turn,
+                wake_daemon.cursor_consultation,
+                "pending_question_snapshot",
+                return_value=consultant_snapshot,
+            ),
+            mock.patch.object(
+                wake_daemon.cursor_consultation,
+                "consult_pending_question",
+                return_value="SQLite is simpler for a local tool.",
+            ) as consult,
+            mock.patch.object(wake_daemon, "qwen_turn") as qwen_turn,
             mock.patch.object(
                 daemon,
                 "_drain_playback_queue",
@@ -1095,7 +1102,13 @@ class ProcessUtteranceTests(unittest.TestCase):
         ):
             daemon.process_utterance(AUDIO_GENERATION, woke=False)
 
-        qwen_turn.assert_called_once()
+        consult.assert_called_once_with(
+            mock.ANY,
+            wake_daemon.CURSOR_STORE,
+            consultant_snapshot,
+            "which option would you recommend",
+        )
+        qwen_turn.assert_not_called()
         self.assertEqual(daemon.cursor_session, "oldjob123456")
         self.assertTrue(daemon.awaiting_followup)
 

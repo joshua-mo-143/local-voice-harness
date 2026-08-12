@@ -81,6 +81,14 @@ class IntentRouterTests(LocalRouterTestCase):
             payload["tool_choice"]["function"]["name"],
             "route_intent",
         )
+        self.assertIn(
+            "any read-only question whose answer requires inspecting",
+            payload["messages"][0]["content"],
+        )
+        self.assertIn(
+            "Do not use cursor_submit merely because",
+            payload["messages"][0]["content"],
+        )
         self.assertEqual(payload["temperature"], 0)
         # Reasoning models drop the required ``confidence`` field when the
         # completion budget is too small to finish the forced tool call.
@@ -160,6 +168,8 @@ class IntentRouterTests(LocalRouterTestCase):
         context = RequestContext("hello")
         cases = [
             ("cursor_reply", "high", True),
+            ("workspace_consultation", "high", True),
+            ("question_consultation", "high", True),
             ("cursor_status", "medium", False),
             ("conversation", "high", False),
             ("uncertain", "high", False),
