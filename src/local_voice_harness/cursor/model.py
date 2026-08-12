@@ -1496,6 +1496,33 @@ class AgentJob:
         return self._optional_string("repository_hint")
 
     @property
+    def grouped_repository_targets(self) -> list[dict[str, object]] | None:
+        value = self._values.get("grouped_repository_targets")
+        if not isinstance(value, list) or not all(
+            isinstance(item, dict) for item in value
+        ):
+            return None
+        return [dict(item) for item in value]
+
+    @property
+    def grouped_repository_candidates(self) -> tuple[str, ...] | None:
+        value = self._values.get("grouped_repository_candidates")
+        if not isinstance(value, list) or not all(
+            isinstance(item, str) and item for item in value
+        ):
+            return None
+        return tuple(value)
+
+    @property
+    def grouped_repository_launches(self) -> list[dict[str, object]]:
+        value = self._values.get("grouped_repository_launches", [])
+        if not isinstance(value, list) or not all(
+            isinstance(item, dict) for item in value
+        ):
+            return []
+        return [dict(item) for item in value]
+
+    @property
     def context_repository(self) -> str | None:
         return self._optional_string("context_repository")
 

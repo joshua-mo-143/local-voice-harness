@@ -8,6 +8,7 @@ import uuid
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, replace
+from pathlib import Path
 from typing import Literal, NamedTuple
 
 from ..config import JOB_LOGS_DIR, JOBS_DIR, LEGACY_JOBS_DIR
@@ -24,6 +25,7 @@ from ..integrations.github import (
     format_issue_context,
     github_issue_from_url,
 )
+from ..integrations.herdr import HerdrClient, HerdrError
 from ..integrations.registry import (
     IntegrationRegistry,
     extract_issue_reference,
@@ -32,10 +34,16 @@ from ..integrations.registry import (
     require_issue_capabilities,
     require_issue_provider,
     resolve_issue_reference,
+    route_issue_repository,
 )
 from ..questions import (
     AnswerOutcome,
     AnswerProvenance,
+    Question,
+    QuestionKind,
+    QuestionOrigin,
+    QuestionSensitivity,
+    QuestionSpec,
     QuestionState,
     choices_prompt,
     question_prompt,
@@ -129,7 +137,9 @@ class CursorTurnResult(NamedTuple):
     session_id: str | None
 
 
-TicketStartStatus = Literal["accepted", "rejected", "start-failed"]
+TicketStartStatus = Literal[
+    "accepted", "awaiting-clarification", "rejected", "start-failed"
+]
 
 
 @dataclass(frozen=True, slots=True)
@@ -145,6 +155,11 @@ class TicketStartOutcome:
     job_id: str | None = None
     detail: str | None = None
     github_lookup_reason: GitHubIssueLookupReason | None = None
+
+
+GROUPED_REPOSITORY_OWNER = "grouped_repository"
+GROUPED_REPOSITORY_TARGETS_FIELD = "grouped_repository_targets"
+GROUPED_REPOSITORY_CANDIDATES_FIELD = "grouped_repository_candidates"
 
 
 def _job_store() -> JobStore:
@@ -241,6 +256,107 @@ def launch_worker(job_id: str) -> None:
     )
 
 
+def _build_start_job(
+    request: StartJobRequest,
+    *,
+    job_id: str,
+    foreground_seconds: float,
+    integrations: IntegrationRegistry | None,
+) -> CursorJob:
+    registry = _integration_registry(integrations)
+    now = time.time()
+    spoken_text = request.utterance or request.text
+    candidate_issue_key = (
+        request.issue_key
+        if request.issue_key is not None
+        else extract_issue_reference(spoken_text, registry)
+    )
+    resolved_issue_key = resolve_issue_reference(candidate_issue_key, registry)
+    issue_provider = (
+        issue_provider_identity(resolved_issue_key, registry)
+        if resolved_issue_key
+        else ("github" if request.github_issue is not None else None)
+    )
+    if resolved_issue_key:
+        assert issue_provider is not None
+        require_issue_capabilities(
+            resolved_issue_key,
+            registry,
+            provider=issue_provider,
+        )
+    elif request.issue_key is not None:
+        raise HarnessError("selected issue provider is unavailable")
+    if issue_provider == "github":
+        require_issue_provider(issue_provider, registry)
+    issue_repository = (request.github_repository or "").strip()
+    github_issue_url = (
+        f"https://github.com/{issue_repository}/issues/{request.github_issue}"
+        if issue_repository and request.github_issue
+        else None
+    )
+    return CursorJob.new(
+        NewCursorJob(
+            id=job_id,
+            request=request.text,
+            created_at=now,
+            foreground_until=(
+                now + foreground_seconds + FOREGROUND_GRACE_SECONDS
+                if request.foreground
+                else 0
+            ),
+            utterance=request.utterance,
+            trusted_utterance=spoken_text,
+            repository_hint=request.repository,
+            context_repository=request.context_repository,
+            github_repository=request.github_repository,
+            github_issue=request.github_issue,
+            github_issue_url=github_issue_url,
+            github_issue_context=request.github_issue_context,
+            fork_requested=request.fork_requested,
+            github_pull_request=request.github_pull_request,
+            worktree_branch=(
+                f"voice/github-{job_id}"
+                if request.fork_requested
+                else (
+                    f"voice/github-issue-{request.github_issue}"
+                    if request.github_issue
+                    else (
+                        f"voice/github-pr-{job_id}"
+                        if request.github_pull_request
+                        else None
+                    )
+                )
+            ),
+            worktree_label=(
+                f"github-{job_id[:6]}"
+                if request.fork_requested
+                else (
+                    f"issue-{request.github_issue}"
+                    if request.github_issue
+                    else (
+                        f"pr-{request.github_pull_request}"
+                        if request.github_pull_request
+                        else None
+                    )
+                )
+            ),
+            pull_request_worktree_state=(
+                "pending" if request.github_pull_request else None
+            ),
+            agent_hint=request.agent,
+            issue_key=resolved_issue_key,
+            issue_provider=issue_provider,
+            speakable_label=inbox.build_speakable_label(
+                request.text,
+                issue_key=resolved_issue_key,
+                github_repository=request.github_repository,
+                github_issue=request.github_issue,
+                github_pull_request=request.github_pull_request,
+            ),
+        )
+    )
+
+
 def start_job(
     request: StartJobRequest | str,
     *,
@@ -258,101 +374,30 @@ def start_job(
     foreground_seconds: float = 5.0,
     integrations: IntegrationRegistry | None = None,
 ) -> str:
-    if isinstance(request, StartJobRequest):
-        text = request.text
-        repository = request.repository
-        github_repository = request.github_repository
-        github_issue = request.github_issue
-        github_issue_context = request.github_issue_context
-        fork_requested = request.fork_requested
-        github_pull_request = request.github_pull_request
-        agent = request.agent
-        utterance = request.utterance
-        context_repository = request.context_repository
-        issue_key = request.issue_key
-        foreground = request.foreground
-    else:
-        text = request
-    registry = _integration_registry(integrations)
-    job_id = uuid.uuid4().hex[:12]
-    now = time.time()
-    spoken_text = utterance if utterance is not None else text
-    candidate_issue_key = (
-        issue_key
-        if issue_key is not None
-        else extract_issue_reference(spoken_text, registry)
-    )
-    resolved_issue_key = resolve_issue_reference(candidate_issue_key, registry)
-    issue_provider = (
-        issue_provider_identity(resolved_issue_key, registry)
-        if resolved_issue_key
-        else ("github" if github_issue is not None else None)
-    )
-    if resolved_issue_key:
-        assert issue_provider is not None
-        require_issue_capabilities(
-            resolved_issue_key,
-            registry,
-            provider=issue_provider,
-        )
-    elif issue_key is not None:
-        raise HarnessError("selected issue provider is unavailable")
-    if issue_provider == "github":
-        require_issue_provider(issue_provider, registry)
-    issue_repository = (github_repository or "").strip()
-    github_issue_url = (
-        f"https://github.com/{issue_repository}/issues/{github_issue}"
-        if issue_repository and github_issue
-        else None
-    )
-    job = CursorJob.new(
-        NewCursorJob(
-            id=job_id,
-            request=text,
-            created_at=now,
-            foreground_until=(
-                now + foreground_seconds + FOREGROUND_GRACE_SECONDS if foreground else 0
-            ),
-            utterance=utterance,
-            trusted_utterance=spoken_text,
-            repository_hint=repository,
-            context_repository=context_repository,
+    normalized = (
+        request
+        if isinstance(request, StartJobRequest)
+        else StartJobRequest(
+            request,
+            repository=repository,
             github_repository=github_repository,
             github_issue=github_issue,
-            github_issue_url=github_issue_url,
             github_issue_context=github_issue_context,
             fork_requested=fork_requested,
             github_pull_request=github_pull_request,
-            worktree_branch=(
-                f"voice/github-{job_id}"
-                if fork_requested
-                else (
-                    f"voice/github-issue-{github_issue}"
-                    if github_issue
-                    else (f"voice/github-pr-{job_id}" if github_pull_request else None)
-                )
-            ),
-            worktree_label=(
-                f"github-{job_id[:6]}"
-                if fork_requested
-                else (
-                    f"issue-{github_issue}"
-                    if github_issue
-                    else (f"pr-{github_pull_request}" if github_pull_request else None)
-                )
-            ),
-            pull_request_worktree_state=("pending" if github_pull_request else None),
-            agent_hint=agent,
-            issue_key=resolved_issue_key,
-            issue_provider=issue_provider,
-            speakable_label=inbox.build_speakable_label(
-                text,
-                issue_key=resolved_issue_key,
-                github_repository=github_repository,
-                github_issue=github_issue,
-                github_pull_request=github_pull_request,
-            ),
+            agent=agent,
+            utterance=utterance,
+            context_repository=context_repository,
+            issue_key=issue_key,
+            foreground=foreground,
         )
+    )
+    job_id = uuid.uuid4().hex[:12]
+    job = _build_start_job(
+        normalized,
+        job_id=job_id,
+        foreground_seconds=foreground_seconds,
+        integrations=integrations,
     )
     _job_store().create(job, enforce_unique_ticket=True)
     launch_worker(job_id)
@@ -598,6 +643,210 @@ def _preflight_ticket_targets(
     return slots, prepared
 
 
+def _serialize_start_request(request: StartJobRequest) -> dict[str, object]:
+    return {
+        "text": request.text,
+        "repository": request.repository,
+        "github_repository": request.github_repository,
+        "github_issue": request.github_issue,
+        "github_issue_context": request.github_issue_context,
+        "fork_requested": request.fork_requested,
+        "github_pull_request": request.github_pull_request,
+        "agent": request.agent,
+        "utterance": request.utterance,
+        "context_repository": request.context_repository,
+        "issue_key": request.issue_key,
+        "foreground": request.foreground,
+    }
+
+
+def _deserialize_start_request(raw: object) -> StartJobRequest | None:
+    if not isinstance(raw, dict) or not isinstance(raw.get("text"), str):
+        return None
+    string_fields = (
+        "repository",
+        "github_repository",
+        "github_issue_context",
+        "agent",
+        "utterance",
+        "context_repository",
+        "issue_key",
+    )
+    if any(
+        raw.get(field) is not None and not isinstance(raw.get(field), str)
+        for field in string_fields
+    ):
+        return None
+    integer_fields = ("github_issue", "github_pull_request")
+    if any(
+        raw.get(field) is not None
+        and (not isinstance(raw.get(field), int) or isinstance(raw.get(field), bool))
+        for field in integer_fields
+    ):
+        return None
+    if not isinstance(raw.get("fork_requested", False), bool) or not isinstance(
+        raw.get("foreground", False), bool
+    ):
+        return None
+    return StartJobRequest(
+        text=str(raw["text"]),
+        repository=raw.get("repository"),
+        github_repository=raw.get("github_repository"),
+        github_issue=raw.get("github_issue"),
+        github_issue_context=raw.get("github_issue_context"),
+        fork_requested=bool(raw.get("fork_requested", False)),
+        github_pull_request=raw.get("github_pull_request"),
+        agent=raw.get("agent"),
+        utterance=raw.get("utterance"),
+        context_repository=raw.get("context_repository"),
+        issue_key=raw.get("issue_key"),
+        foreground=bool(raw.get("foreground", False)),
+    )
+
+
+def _grouped_repository_question(
+    targets: list[dict[str, object]], repositories: list[Path]
+) -> str:
+    identities = ", ".join(str(target["target"]) for target in targets)
+    names = ", ".join(repository.name for repository in repositories)
+    return (
+        "Several tickets need repository clarification. Reply using each canonical "
+        f"target identity followed by its repository, for example TARGET: REPOSITORY. "
+        f"Targets, in request order: {identities}. Available repositories: {names}."
+    )
+
+
+def _create_grouped_repository_clarification(
+    targets: list[dict[str, object]],
+    repositories: list[Path],
+    *,
+    original_request: StartJobRequest,
+) -> str:
+    job_id = uuid.uuid4().hex[:12]
+    now = time.time()
+    question = _grouped_repository_question(targets, repositories)
+    coordinator = CursorJob.new(
+        NewCursorJob(
+            id=job_id,
+            request=original_request.text,
+            utterance=original_request.utterance,
+            trusted_utterance=original_request.utterance or original_request.text,
+            created_at=now,
+            foreground_until=0,
+            speakable_label="grouped ticket repository clarification",
+        )
+    )
+    envelope = Question(
+        id=uuid.uuid4().hex,
+        text=question,
+        kind=QuestionKind.FREE_TEXT,
+        sensitivity=QuestionSensitivity.ROUTINE,
+        origin=QuestionOrigin(
+            provider="cursor",
+            job_id=job_id,
+            turn_token=f"{job_id}-repository-group",
+        ),
+        owner=GROUPED_REPOSITORY_OWNER,
+        asked_at=now,
+    )
+    coordinator_values = coordinator.to_dict()
+    coordinator_values.update(
+        {
+            "status": JobStatus.AWAITING_USER.value,
+            "question": question,
+            "result": question,
+            "clarification_kind": GROUPED_REPOSITORY_OWNER,
+            "voice_question": envelope.to_dict(),
+            GROUPED_REPOSITORY_TARGETS_FIELD: targets,
+            GROUPED_REPOSITORY_CANDIDATES_FIELD: [
+                str(repository) for repository in repositories
+            ],
+        }
+    )
+    coordinator = CursorJob.from_dict(coordinator_values)
+    _job_store().create(coordinator)
+    return job_id
+
+
+def _preflight_batch_repositories(
+    prepared: list[tuple[int, TicketJobRequest]],
+    slots: list[TicketStartOutcome | None],
+    *,
+    integrations: IntegrationRegistry,
+) -> tuple[list[tuple[int, TicketJobRequest]], list[dict[str, object]], list[Path]]:
+    """Resolve provider-backed repositories without allowing child Rofi prompts."""
+    routable = [
+        item
+        for item in prepared
+        if item[1].request.issue_key and not item[1].request.repository
+    ]
+    if not routable:
+        return prepared, [], []
+
+    startable: list[tuple[int, TicketJobRequest]] = []
+    ambiguous: list[dict[str, object]] = []
+    routable_indexes = {index for index, _request in routable}
+    client = HerdrClient()
+    try:
+        repositories = client.repository_roots()
+        reserved = provisioning.reserved_targets(_job_store())
+    except (HarnessError, HerdrError) as exc:
+        for index, ticket in prepared:
+            if index in routable_indexes:
+                slots[index] = TicketStartOutcome(
+                    ticket.target,
+                    "rejected",
+                    detail=_start_error_detail(exc),
+                )
+            else:
+                startable.append((index, ticket))
+        return startable, [], []
+
+    for index, ticket in prepared:
+        if index not in routable_indexes:
+            startable.append((index, ticket))
+            continue
+        issue_key = ticket.request.issue_key
+        assert issue_key is not None
+        try:
+            routed = route_issue_repository(
+                client,
+                issue_key,
+                repositories,
+                token=f"batch-{uuid.uuid4().hex[:12]}",
+                reserved=reserved,
+                integrations=integrations,
+                provider="linear",
+            )
+        except (HarnessError, HerdrError) as exc:
+            slots[index] = TicketStartOutcome(
+                ticket.target,
+                "rejected",
+                detail=_start_error_detail(exc),
+            )
+            continue
+        if routed is not None and routed[0] is not None:
+            repository = routed[0]
+            startable.append(
+                (
+                    index,
+                    TicketJobRequest(
+                        ticket.target,
+                        replace(ticket.request, repository=str(repository)),
+                    ),
+                )
+            )
+            continue
+        ambiguous.append(
+            {
+                "index": index,
+                "target": ticket.target,
+                "request": _serialize_start_request(ticket.request),
+            }
+        )
+    return startable, ambiguous, repositories
+
+
 def _counted(count: int, singular: str, plural: str | None = None) -> str:
     quantity = {
         1: "one",
@@ -641,6 +890,7 @@ def _ticket_start_spoken(outcomes: tuple[TicketStartOutcome, ...]) -> str:
         for outcome in outcomes
     )
     start_failed = sum(outcome.status == "start-failed" for outcome in outcomes)
+    awaiting = sum(outcome.status == "awaiting-clarification" for outcome in outcomes)
     parts: list[str] = []
     if accepted:
         parts.append(f"{_counted(accepted, 'job')} started")
@@ -652,6 +902,10 @@ def _ticket_start_spoken(outcomes: tuple[TicketStartOutcome, ...]) -> str:
         parts.append(f"{_counted(rejected, 'ticket')} rejected")
     if start_failed:
         parts.append(f"{_counted(start_failed, 'job')} failed to start")
+    if awaiting:
+        parts.append(
+            f"{_counted(awaiting, 'ticket')} waiting for one grouped clarification"
+        )
     if not parts:
         return "No ticket jobs were started."
     sentence = "; ".join(parts) + "."
@@ -677,6 +931,8 @@ def _ticket_display_detail(outcome: TicketStartOutcome) -> str | None:
         if outcome.job_id:
             return f"active job {outcome.job_id} already exists"
         return "request could not be accepted; verify the ticket reference and access"
+    if outcome.status == "awaiting-clarification":
+        return "waiting for a repository in the grouped clarification"
     return None
 
 
@@ -712,6 +968,57 @@ def _submit_extracted_targets(
         foreground=foreground,
         integrations=integrations,
     )
+    ambiguous: list[dict[str, object]] = []
+    repositories: list[Path] = []
+    if extraction.batch_requested:
+        prepared, ambiguous, repositories = _preflight_batch_repositories(
+            prepared,
+            slots,
+            integrations=integrations,
+        )
+        available: list[dict[str, object]] = []
+        store = _job_store()
+        for target in ambiguous:
+            request = _deserialize_start_request(target.get("request"))
+            identity = (
+                ("linear", request.issue_key.casefold())
+                if request is not None and request.issue_key
+                else None
+            )
+            owner = (
+                store.ticket_reservation_owner(identity)
+                if identity is not None
+                else None
+            )
+            if owner is None:
+                available.append(target)
+                continue
+            raw_index = target.get("index")
+            if not isinstance(raw_index, int):
+                raise HarnessError("grouped clarification target index is invalid")
+            slots[raw_index] = TicketStartOutcome(
+                str(target.get("target") or ""),
+                "rejected",
+                job_id=owner,
+                detail=f"ticket is already active as Cursor job {owner}",
+            )
+        ambiguous = available
+    clarification_job_id: str | None = None
+    if ambiguous:
+        clarification_job_id = _create_grouped_repository_clarification(
+            ambiguous,
+            repositories,
+            original_request=base,
+        )
+        for target in ambiguous:
+            raw_index = target["index"]
+            if not isinstance(raw_index, int):
+                raise HarnessError("grouped clarification target index is invalid")
+            slots[raw_index] = TicketStartOutcome(
+                str(target["target"]),
+                "awaiting-clarification",
+                job_id=clarification_job_id,
+            )
     started = start_jobs(
         tuple(request for _index, request in prepared),
         concurrency=concurrency,
@@ -721,6 +1028,272 @@ def _submit_extracted_targets(
     for (index, _request), outcome in zip(prepared, started, strict=True):
         slots[index] = outcome
     return tuple(outcome for outcome in slots if outcome is not None)
+
+
+def _grouped_repository_assignments(
+    text: str, targets: list[dict[str, object]]
+) -> dict[str, str]:
+    identities = [str(target.get("target") or "") for target in targets]
+    identities = [identity for identity in identities if identity]
+    if not identities:
+        return {}
+    identity_pattern = "|".join(
+        re.escape(identity) for identity in sorted(identities, key=len, reverse=True)
+    )
+    marker = re.compile(
+        rf"(?P<target>{identity_pattern})\s*(?::|=|\bis\b|\buses?\b)\s*",
+        re.IGNORECASE,
+    )
+    matches = list(marker.finditer(text))
+    assignments: dict[str, str] = {}
+    duplicates: set[str] = set()
+    canonical = {identity.casefold(): identity for identity in identities}
+    for position, match in enumerate(matches):
+        target = canonical[match.group("target").casefold()]
+        end = (
+            matches[position + 1].start() if position + 1 < len(matches) else len(text)
+        )
+        value = text[match.end() : end].strip(" \t\r\n,;.")
+        value = re.sub(r"^(?:repository|repo)\s+", "", value, flags=re.IGNORECASE)
+        if target in assignments:
+            duplicates.add(target)
+        elif value:
+            assignments[target] = value
+    for target in duplicates:
+        assignments.pop(target, None)
+    return assignments
+
+
+def _reply_grouped_repository(
+    job: CursorJob,
+    text: str,
+    *,
+    trusted_utterance: str | None,
+    expected_question_id: str | None,
+    expected_question_turn: str | None,
+    on_started: Callable[[], None] | None,
+    foreground_seconds: float,
+    concurrency: int,
+    integrations: IntegrationRegistry | None,
+) -> str:
+    question = questions.current(job)
+    if question is None:
+        raise HarnessError(f"Cursor job {job.id} has no grouped clarification")
+    if (expected_question_id is not None and question.id != expected_question_id) or (
+        expected_question_turn is not None
+        and question.origin.turn_token != expected_question_turn
+    ):
+        return "That answer belongs to an older question, so I did not use it."
+    raw_targets = job.grouped_repository_targets
+    raw_candidates = job.grouped_repository_candidates
+    if raw_targets is None or raw_candidates is None:
+        raise HarnessError("grouped repository clarification state is invalid")
+    targets = raw_targets
+    candidates = [Path(candidate) for candidate in raw_candidates]
+    assignments = _grouped_repository_assignments(
+        trusted_utterance or text,
+        targets,
+    )
+    client = HerdrClient()
+    selected: dict[str, Path] = {}
+    for target in targets:
+        identity = str(target.get("target") or "")
+        answer = assignments.get(identity)
+        if answer is None:
+            continue
+        repository, _matches = client.resolve_repository(answer, "", candidates)
+        if repository is not None:
+            selected[identity] = repository
+    if not selected:
+        return (
+            "I could not map any canonical ticket target to one available "
+            "repository. No ticket jobs were started."
+        )
+
+    requests: list[TicketJobRequest] = []
+    children: list[CursorJob] = []
+    launch_records: list[dict[str, object]] = []
+    resolved_targets: set[str] = set()
+    for target in targets:
+        identity = str(target.get("target") or "")
+        repository = selected.get(identity)
+        request = _deserialize_start_request(target.get("request"))
+        if repository is None or request is None:
+            continue
+        selected_request = replace(
+            request,
+            repository=str(repository),
+            foreground=False,
+        )
+        child_id = uuid.uuid4().hex[:12]
+        requests.append(TicketJobRequest(identity, selected_request))
+        child = _build_start_job(
+            selected_request,
+            job_id=child_id,
+            foreground_seconds=foreground_seconds,
+            integrations=integrations,
+        )
+        child_values = child.to_dict()
+        child_values["grouped_repository_coordinator_id"] = job.id
+        children.append(CursorJob.from_dict(child_values))
+        launch_records.append(
+            {
+                "target": identity,
+                "job_id": child_id,
+                "state": "pending",
+            }
+        )
+        resolved_targets.add(identity)
+    if not requests:
+        return "The grouped clarification is invalid. No ticket jobs were started."
+
+    remaining = [
+        target
+        for target in targets
+        if str(target.get("target") or "") not in resolved_targets
+    ]
+    now = time.time()
+
+    def record(current: CursorJob) -> CursorJob | None:
+        pending = questions.current(current)
+        if (
+            current.status != JobStatus.AWAITING_USER
+            or pending is None
+            or pending.id != question.id
+        ):
+            return None
+        if remaining:
+            return questions.ask(
+                current,
+                QuestionSpec(
+                    _grouped_repository_question(remaining, candidates),
+                    sensitivity=QuestionSensitivity.ROUTINE,
+                ),
+                owner=GROUPED_REPOSITORY_OWNER,
+                turn_token=f"{current.id}-repository-group-{current.revision + 1}",
+                now=now,
+                job_changes={
+                    GROUPED_REPOSITORY_TARGETS_FIELD: remaining,
+                    "grouped_repository_launches": [
+                        *current.grouped_repository_launches,
+                        *launch_records,
+                    ],
+                },
+            )
+        return current.evolve_for_delivery(
+            now=now,
+            status=JobStatus.COMPLETED,
+            question=None,
+            clarification_kind=None,
+            result="Grouped ticket repository clarification was applied.",
+            completed_at=now,
+            worker_pid=None,
+            worker_boot_id=None,
+            worker_process_start=None,
+            worker_token=None,
+            voice_question=questions.envelope(
+                pending,
+                QuestionState.RESOLVED,
+                answer=text,
+                trusted_answer=trusted_utterance or text,
+                answered_at=now,
+            ),
+            grouped_repository_targets=[],
+            grouped_repository_launches=[
+                *current.grouped_repository_launches,
+                *launch_records,
+            ],
+        )
+
+    store = _job_store()
+    updated = store.stage_grouped_children(job.id, record, tuple(children))
+    if updated is None:
+        return "That grouped clarification was already changed, so I did not use it."
+    outcomes = _launch_grouped_children(
+        job.id,
+        concurrency=concurrency,
+    )
+    if any(outcome.status == "accepted" for outcome in outcomes) and on_started:
+        on_started()
+    message = _ticket_start_spoken(outcomes)
+    if remaining:
+        message += (
+            f" {_counted(len(remaining), 'ticket')} still needs a repository in "
+            "the grouped clarification."
+        )
+    return message
+
+
+def _launch_grouped_children(
+    coordinator_id: str,
+    *,
+    concurrency: int,
+) -> tuple[TicketStartOutcome, ...]:
+    store = _job_store()
+    coordinator = store.get(coordinator_id)
+    pending = [
+        launch
+        for launch in coordinator.grouped_repository_launches
+        if launch.get("state") == "pending"
+        and isinstance(launch.get("target"), str)
+        and isinstance(launch.get("job_id"), str)
+    ]
+    if not pending:
+        return ()
+    outcomes: list[TicketStartOutcome | None] = [None] * len(pending)
+
+    def launch(entry: dict[str, object]) -> TicketStartOutcome:
+        target = str(entry["target"])
+        child_id = str(entry["job_id"])
+        try:
+            launch_worker(child_id)
+        except Exception as exc:  # noqa: BLE001 - durable child records the failure
+            return TicketStartOutcome(
+                target,
+                "start-failed",
+                job_id=child_id,
+                detail=_start_error_detail(exc),
+            )
+        child = store.get(child_id)
+        if child.status == JobStatus.FAILED:
+            return TicketStartOutcome(
+                target,
+                "start-failed",
+                job_id=child_id,
+                detail=_start_error_detail(
+                    HarnessError(str(child.error or child.result or "worker failed"))
+                ),
+            )
+        return TicketStartOutcome(target, "accepted", job_id=child_id)
+
+    with ThreadPoolExecutor(max_workers=max(1, concurrency)) as executor:
+        futures = {
+            executor.submit(launch, entry): index for index, entry in enumerate(pending)
+        }
+        for future in as_completed(futures):
+            outcomes[futures[future]] = future.result()
+    completed_ids = {
+        str(entry["job_id"])
+        for entry in pending
+        if isinstance(entry.get("job_id"), str)
+    }
+
+    def complete(current: CursorJob) -> CursorJob:
+        launches = [
+            {
+                **entry,
+                "state": (
+                    "completed"
+                    if str(entry.get("job_id") or "") in completed_ids
+                    else entry.get("state")
+                ),
+            }
+            for entry in current.grouped_repository_launches
+        ]
+        return current.evolve(grouped_repository_launches=launches)
+
+    store.update(coordinator_id, complete)
+    return tuple(outcome for outcome in outcomes if outcome is not None)
 
 
 def reply_job(
@@ -733,8 +1306,22 @@ def reply_job(
     answer_provenance: AnswerProvenance = AnswerProvenance.USER_TEXT,
     on_started: Callable[[], None] | None = None,
     foreground_seconds: float = 5.0,
+    concurrency: int = 3,
     integrations: IntegrationRegistry | None = None,
 ) -> str | None:
+    current = read_job(job_id)
+    if current.clarification_kind == GROUPED_REPOSITORY_OWNER:
+        return _reply_grouped_repository(
+            current,
+            text,
+            trusted_utterance=trusted_utterance,
+            expected_question_id=expected_question_id,
+            expected_question_turn=expected_question_turn,
+            on_started=on_started,
+            foreground_seconds=foreground_seconds,
+            concurrency=concurrency,
+            integrations=integrations,
+        )
     now = time.time()
     should_launch = False
     should_cancel = False
@@ -1149,6 +1736,18 @@ def _defer_or_acknowledge(
 
 def recover_jobs(*, integrations: IntegrationRegistry | None = None) -> None:
     registry = _integration_registry(integrations)
+    runtime = registry.platform or default_user_config().platform
+    store = _job_store()
+    if isinstance(store, JobStore):
+        for job in store.list():
+            if any(
+                launch.get("state") == "pending"
+                for launch in job.grouped_repository_launches
+            ):
+                _launch_grouped_children(
+                    job.id,
+                    concurrency=runtime.agent_job_start_concurrency,
+                )
     herdr_factory = (
         provisioning.HerdrClient if integrations is None else integrations.herdr_client
     )
@@ -1158,7 +1757,7 @@ def recover_jobs(*, integrations: IntegrationRegistry | None = None) -> None:
         else integrations.github_client
     )
     recovery.recover_jobs(
-        _job_store(),
+        store,
         launch_worker=launch_worker,
         herdr_factory=herdr_factory,
         github_factory=github_factory,
@@ -1649,6 +2248,7 @@ def cursor_turn(
             answer_provenance=answer_provenance,
             on_started=on_job_started,
             foreground_seconds=runtime.cursor_foreground_seconds,
+            concurrency=runtime.agent_job_start_concurrency,
             integrations=registry,
         )
         if immediate is not None:
