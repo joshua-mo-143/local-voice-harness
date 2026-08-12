@@ -1388,6 +1388,33 @@ class ProcessUtteranceTests(unittest.TestCase):
         cursor_turn.assert_not_called()
         qwen_turn.assert_called_once()
 
+    def test_job_management_does_not_capture_external_context(self) -> None:
+        daemon = _bare_daemon()
+        text = "list my running jobs"
+        with (
+            mock.patch.object(wake_daemon, "transcribe", return_value=text),
+            mock.patch.object(wake_daemon, "start_components"),
+            mock.patch.object(wake_daemon, "request_context") as capture,
+            mock.patch.object(
+                wake_daemon,
+                "route_intent",
+                return_value=IntentRoute(Intent.AGENT_LIST, "high"),
+            ) as route_intent,
+            mock.patch.object(
+                wake_daemon, "cursor_turn", return_value=("No jobs.", None)
+            ),
+            mock.patch.object(
+                daemon,
+                "_drain_playback_queue",
+                return_value=(_playback_batch("No jobs."), None),
+            ),
+            mock.patch.object(wake_daemon, "notify"),
+        ):
+            daemon.process_utterance(AUDIO_GENERATION, woke=False)
+
+        capture.assert_not_called()
+        self.assertEqual(route_intent.call_args.args[:2], (text, RequestContext(text)))
+
     def test_existing_fork_confirmation_remains_authoritative(self) -> None:
         daemon = _bare_daemon()
         context = RequestContext(

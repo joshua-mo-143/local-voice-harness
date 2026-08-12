@@ -76,13 +76,13 @@ Say “Hey Jarvis” followed by your request:
 
 ```text
 Hey Jarvis, what time is it?
-Hey Jarvis, ask Cursor to summarize the api-docs repository.
-Hey Jarvis, ask Cursor to work on Linear issue API-79.
-Hey Jarvis, ask Cursor to work on owner/repository#42.
+Hey Jarvis, summarize the api-docs repository.
+Hey Jarvis, work on Linear issue API-79.
+Hey Jarvis, work on owner/repository#42.
 Hey Jarvis, summarize this issue.  # with a GitHub issue focused in Firefox
 Hey Jarvis, summarize this ticket. # with a Zendesk ticket focused (opt-in; see below)
 Hey Jarvis, fork this repo and add Venice.  # with a public GitHub repo focused
-Hey Jarvis, ask Cursor to check out this PR and make sure it works.  # with a PR focused
+Hey Jarvis, check out this PR and make sure it works.  # with a PR focused
 Hey Jarvis, what is the status of that Cursor job?
 Hey Jarvis, cancel that Cursor job.
 ```

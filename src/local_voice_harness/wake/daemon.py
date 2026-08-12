@@ -24,7 +24,7 @@ from ..agents.model import JobStatus
 from ..agents.service import AgentTurnRequest as CursorTurnRequest
 from ..agents.service import agent_turn as cursor_turn
 from ..agents.service import recover_jobs
-from ..browser_context import request_context
+from ..browser_context import RequestContext, request_context
 from ..components import start_components, stop_components
 from ..config import (
     DICTATION_PID_PATH,
@@ -1199,14 +1199,19 @@ class WakeConversationDaemon:
             streamed_playback = False
             playback: dict[str, object] = {}
             interruption: BargeIn | None = None
-            context = request_context(
-                text,
-                platform=self.platform,
-                integrations=self.integrations,
-            )
             readback_result: AssistantResponse | None = None
             confirmed_request: CursorTurnRequest | None = None
             pending_readback = getattr(self, "pending_target_readback", None)
+            routing_context = RequestContext(text)
+            context = (
+                request_context(
+                    text,
+                    platform=self.platform,
+                    integrations=self.integrations,
+                )
+                if pending_readback is not None
+                else routing_context
+            )
             if pending_readback is not None:
                 resolution = resolve_readback(
                     pending_readback.candidate,
@@ -1246,7 +1251,7 @@ class WakeConversationDaemon:
             else:
                 route = route_intent(
                     text,
-                    context,
+                    routing_context,
                     cursor_session=pending.job_id if pending is not None else None,
                     pending_question=pending.text if pending is not None else None,
                     clarification_kind=pending.owner if pending is not None else None,
@@ -1304,6 +1309,15 @@ class WakeConversationDaemon:
                         # close silently and leave the durable question untouched.
                         self.close_pending_capture("non-actionable speech")
                         return None
+            if pending_readback is None and (
+                route.intent == Intent.CONVERSATION
+                or (route.actionable and route.intent == Intent.AGENT_SUBMIT)
+            ):
+                context = request_context(
+                    text,
+                    platform=self.platform,
+                    integrations=self.integrations,
+                )
             if route.actionable and route.intent == Intent.END_CONVERSATION:
                 return self.end_conversation()
             fork_requested = decide_fork_intent(text) == ForkIntent.AFFIRMATIVE
