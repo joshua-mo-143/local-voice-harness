@@ -84,7 +84,13 @@ from ..intent import (
 from ..llm import qwen_turn
 from ..notifications import notify
 from ..process import ProcessHandle, process_identity
-from ..questions import AnswerProvenance, question_control
+from ..questions import (
+    AnswerOutcome,
+    AnswerProvenance,
+    Question,
+    question_control,
+    resolve_answer,
+)
 from ..responses import AssistantResponse, ResponseLike, as_assistant_response
 from ..stt.client import transcribe
 from ..ticket_targets import MISSING_ISSUE_SCOPE_RESPONSE, extract_ticket_targets
@@ -229,6 +235,33 @@ def strip_wake_prefix(text: str) -> tuple[str, bool]:
 CLOSE_PATTERN = re.compile(
     r"\b(?:goodbye|stop listening|go to sleep|end conversation)\b", re.IGNORECASE
 )
+PENDING_SUBMIT_PATTERN = re.compile(
+    r"\b(?:work\s+on|fix|change|update|implement|add|remove|run|review|inspect|"
+    r"start|create|build|refactor|test)\b",
+    re.IGNORECASE,
+)
+FILLER_WORDS = frozenset(
+    {
+        "ah",
+        "and",
+        "but",
+        "erm",
+        "hmm",
+        "i",
+        "like",
+        "mean",
+        "mm",
+        "okay",
+        "ok",
+        "so",
+        "uh",
+        "um",
+        "well",
+        "yeah",
+        "you",
+        "know",
+    }
+)
 END_CONVERSATION_RESPONSE = "Okay, I'll be here if you need me."
 RECENT_DETAILS_UNAVAILABLE = (
     "I no longer have details for that recent announcement. "
@@ -269,6 +302,7 @@ class PendingQuestionSnapshot:
     owner: str
     question_id: str
     turn_token: str
+    question: Question | None = None
 
 
 def log(message: str) -> None:
@@ -300,6 +334,11 @@ def _matches_playback_prefix(transcript: str, playback: str) -> bool:
         len(captured_words) >= 3
         and captured_words == played_words[: len(captured_words)]
     )
+
+
+def _is_filler_speech(text: str) -> bool:
+    words = re.findall(r"[a-z]+", text.casefold())
+    return bool(words) and all(word in FILLER_WORDS for word in words)
 
 
 class WakeConversationDaemon:
@@ -544,6 +583,19 @@ class WakeConversationDaemon:
         finally:
             self.resume_microphone()
         notify("Conversation closed")
+
+    def close_pending_capture(self, reason: str) -> None:
+        """Stop ambient follow-up capture without discarding the durable question."""
+        log(f"pending-question capture closed: {reason}")
+        self.history.clear()
+        self.completed_followup = None
+        self.conversation_deadline = 0.0
+        self.awaiting_followup = False
+        self.pause_microphone()
+        try:
+            self.stop_components_when_idle()
+        finally:
+            self.resume_microphone()
 
     def end_conversation(self) -> BargeIn | None:
         """Speak a brief farewell, then close unless the user barges in."""
@@ -933,6 +985,7 @@ class WakeConversationDaemon:
             owner=question.owner,
             question_id=question.id,
             turn_token=question.origin.turn_token,
+            question=question,
         )
 
     def _finish_job_playback(
@@ -1108,8 +1161,49 @@ class WakeConversationDaemon:
                 recent_completion=active_completed is not None,
                 settings=self.providers,
             )
-            if pending is not None and question_control(text) is not None:
-                route = IntentRoute(Intent.AGENT_REPLY, "high")
+            if pending is not None:
+                deterministic_answer = (
+                    resolve_answer(
+                        pending.question,
+                        text,
+                        provenance=AnswerProvenance.USER_VOICE,
+                    ).outcome
+                    if pending.question is not None
+                    else None
+                )
+                resolved_as_answer = deterministic_answer in {
+                    AnswerOutcome.REPEAT,
+                    AnswerOutcome.DEFERRED,
+                } or (
+                    deterministic_answer == AnswerOutcome.ACCEPTED
+                    and pending.question is not None
+                    and bool(pending.question.choices)
+                )
+                if resolved_as_answer or question_control(text) is not None:
+                    route = IntentRoute(Intent.AGENT_REPLY, "high")
+                invalid_pending_reply = (
+                    not resolved_as_answer
+                    and route.intent == Intent.AGENT_REPLY
+                    and (
+                        (
+                            pending.question is not None
+                            and bool(pending.question.choices)
+                        )
+                        or _is_filler_speech(text)
+                    )
+                )
+                implicit_submit = (
+                    route.intent == Intent.AGENT_SUBMIT
+                    and PENDING_SUBMIT_PATTERN.search(text) is None
+                )
+                if not woke and (
+                    not route.actionable or invalid_pending_reply or implicit_submit
+                ):
+                    # Follow-up VAD can capture nearby conversation. A pending
+                    # structured question makes conversational fallback unsafe:
+                    # close silently and leave the durable question untouched.
+                    self.close_pending_capture("non-actionable speech")
+                    return None
             if route.actionable and route.intent == Intent.END_CONVERSATION:
                 return self.end_conversation()
             fork_requested = decide_fork_intent(text) == ForkIntent.AFFIRMATIVE
