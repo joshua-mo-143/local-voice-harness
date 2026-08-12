@@ -3,11 +3,19 @@ from __future__ import annotations
 import argparse
 
 from ..config import JOBS_DIR, LEGACY_JOBS_DIR
-from ..integrations.registry import build_integration_registry
+from ..integrations.registry import IntegrationRegistry, build_integration_registry
 from ..user_config import load_user_config
 from .provisioning import ClientFactories, run_claimed_worker
 from .store import JobStore
 from .worker_lifecycle import run_worker
+
+
+def dispatch_waiting_jobs(registry: IntegrationRegistry) -> None:
+    """Fill capacity released by this detached worker."""
+
+    from .service import _dispatch_waiting_jobs
+
+    _dispatch_waiting_jobs(integrations=registry)
 
 
 def main() -> None:
@@ -21,12 +29,15 @@ def main() -> None:
         github=registry.github_client,
         integrations=registry,
     )
-    run_worker(
-        JobStore(JOBS_DIR, LEGACY_JOBS_DIR),
-        args.job_id,
-        args.claim,
-        lambda context: run_claimed_worker(context, factories),
-    )
+    try:
+        run_worker(
+            JobStore(JOBS_DIR, LEGACY_JOBS_DIR),
+            args.job_id,
+            args.claim,
+            lambda context: run_claimed_worker(context, factories),
+        )
+    finally:
+        dispatch_waiting_jobs(registry)
 
 
 if __name__ == "__main__":
