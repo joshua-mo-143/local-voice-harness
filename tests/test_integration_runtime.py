@@ -129,12 +129,15 @@ class IntegrationRuntimeTests(unittest.TestCase):
             ) as load_config,
             mock.patch.object(worker, "run_worker") as run_worker,
             mock.patch.object(worker, "run_claimed_worker") as run_claimed,
+            mock.patch.object(worker, "dispatch_waiting_jobs") as dispatch,
         ):
             worker.main()
             runner = run_worker.call_args.args[3]
             runner(context)
 
         load_config.assert_called_once_with()
+        dispatch.assert_called_once()
+        self.assertIs(dispatch.call_args.args[0].settings, config.integrations)
         factories = run_claimed.call_args.args[1]
         self.assertIs(factories.integrations.settings, config.integrations)
         self.assertEqual(
@@ -145,6 +148,23 @@ class IntegrationRuntimeTests(unittest.TestCase):
             factories.herdr().workspace.worktree_root,
             config.platform.herdr_worktree_root,
         )
+
+    def test_detached_worker_dispatches_after_runner_failure(self) -> None:
+        config = default_user_config(Path("/home/worker"))
+        with (
+            mock.patch.object(sys, "argv", ["worker", "job-1"]),
+            mock.patch.object(worker, "load_user_config", return_value=config),
+            mock.patch.object(
+                worker,
+                "run_worker",
+                side_effect=RuntimeError("worker failed"),
+            ),
+            mock.patch.object(worker, "dispatch_waiting_jobs") as dispatch,
+            self.assertRaisesRegex(RuntimeError, "worker failed"),
+        ):
+            worker.main()
+
+        dispatch.assert_called_once()
 
     def test_recovery_and_release_use_injected_client_factories(self) -> None:
         registry = build_integration_registry(
