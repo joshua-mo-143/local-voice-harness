@@ -322,8 +322,8 @@ byte-for-byte backup of the durable jobs directory and legacy runtime jobs
 directory, and record paths, timestamps, hashes, and the current application
 version.
 
-1. Acquire the legacy and durable locks in the existing order. Create a new
-   database beside the durable jobs directory with restrictive permissions,
+1. Acquire the legacy and durable locks in the existing order. Create
+   `jobs/jobs.sqlite3` inside the durable jobs directory with restrictive permissions,
    foreign keys, WAL, and a migration lease.
 2. Inventory ordinary `*.json`, `.maintenance`, `.quarantine` payloads,
    metadata, resolution tombstones, and `.artifacts`. Do not follow symlinks.
@@ -359,6 +359,39 @@ version.
    open sees the completed manifest and performs no import. A partial import
    without a committed marker is discarded or resumed from the manifest while
    the JSON source remains authoritative.
+
+### Backup and manual recovery
+
+Stop the wake service and all detached workers before a manual backup or restore.
+This drains writers and avoids copying a database while a delivery or release lease
+is changing:
+
+```fish
+voice-harness services stop
+set state_home "$HOME/.local/state"
+if set -q XDG_STATE_HOME
+    set state_home "$XDG_STATE_HOME"
+end
+set jobs_root "$state_home/voice-harness/jobs"
+cp -a "$jobs_root" "$jobs_root.backup-"(date +%Y%m%d-%H%M%S)
+```
+
+For the systemd service, obtain the absolute `STATE_DIRECTORY` from
+`systemctl --user show voice-harness-wake.service --property=Environment` and use
+its `jobs` child instead. A complete backup includes `jobs.sqlite3`, any
+`jobs.sqlite3-wal`/`jobs.sqlite3-shm` files present after shutdown, `.artifacts`,
+`.quarantine`, and archived `*.json.imported`/`*.json.failed` sources. Do not back
+up only the database: artifact bytes and quarantine payloads intentionally remain
+file-backed.
+
+`voice-harness doctor` reports the database path, schema version, migration status,
+integrity result, and unresolved import failures without opening the store for
+writes. If it reports an unreadable database or failed integrity check, leave the
+services stopped, copy the entire jobs directory for forensics, and restore the
+most recent complete directory backup. Do not delete WAL files, clear reservations,
+mark results delivered, or copy selected rows between databases. Inspect unresolved
+quarantine with `voice-harness jobs quarantine list`; acknowledge a reservation
+only after verifying its worker, Herdr target, and worktree no longer exist.
 
 ### Rollback
 

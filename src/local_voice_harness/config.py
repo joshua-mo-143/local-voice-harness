@@ -311,6 +311,7 @@ def durable_state_dir(
 
 DURABLE_STATE_DIR = durable_state_dir()
 JOBS_DIR = DURABLE_STATE_DIR / "jobs"
+JOBS_DB = JOBS_DIR / "jobs.sqlite3"
 REPLAY_DIR = DURABLE_STATE_DIR / "replays"
 VOCABULARY_PATH = vocabulary_path()
 WAV_PATH = STATE_DIR / "request.wav"

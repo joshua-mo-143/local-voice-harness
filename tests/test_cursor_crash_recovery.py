@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import signal
+import sqlite3
 from pathlib import Path
 from typing import Any
 
@@ -79,13 +80,36 @@ def test_active_schema_import_survives_process_death(
     _crash(tmp_path, "migrate", killpoint)
     _recover(tmp_path)
 
+    store = JobStore(tmp_path / "jobs", legacy)
+    persisted = store.get(JOB_ID)
     durable_jobs = list((tmp_path / "jobs").glob("*.json"))
-    assert [path.name for path in durable_jobs] == [f"{JOB_ID}.json"]
+    assert durable_jobs == []
     assert not source.exists()
-    persisted = json.loads(durable_jobs[0].read_text())
-    assert persisted["schema_version"] == CURRENT_SCHEMA_VERSION
-    assert persisted["id"] == JOB_ID
+    assert persisted.schema_version == CURRENT_SCHEMA_VERSION
+    assert persisted.id == JOB_ID
+    assert (tmp_path / "jobs" / f"{JOB_ID}.json.imported").exists()
     assert _effects(tmp_path)["launches"] == [JOB_ID]
+
+
+@pytest.mark.parametrize("killpoint", ["before-marker", "after-marker", "after-commit"])
+def test_sqlite_cutover_recovers_around_transaction_commit(
+    tmp_path: Path, killpoint: str
+) -> None:
+    jobs = tmp_path / "jobs"
+    jobs.mkdir()
+    (jobs / f"{JOB_ID}.json").write_bytes((FIXTURES / "agent-v9.json").read_bytes())
+
+    _crash(tmp_path, "sqlite-import", killpoint)
+    _recover(tmp_path)
+
+    store = JobStore(jobs, tmp_path / "legacy")
+    assert store.get(JOB_ID).schema_version == CURRENT_SCHEMA_VERSION
+    with sqlite3.connect(store.db_path) as connection:
+        assert connection.execute("PRAGMA integrity_check").fetchone() == ("ok",)
+        assert connection.execute(
+            "SELECT value FROM store_meta WHERE key = 'cutover_complete'"
+        ).fetchone() == ("1",)
+    assert (jobs / f"{JOB_ID}.json.imported").exists()
 
 
 @pytest.mark.parametrize(

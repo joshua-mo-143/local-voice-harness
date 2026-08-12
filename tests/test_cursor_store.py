@@ -952,7 +952,7 @@ class CursorStoreIntegrationTests(unittest.TestCase):
         store = JobStore(self.jobs_dir, self.jobs_dir / "legacy")
         quarantine = self.jobs_dir / ".quarantine"
         quarantine.mkdir()
-        outside = self.jobs_dir / "outside.json"
+        outside = self.jobs_dir / "outside.txt"
         outside.write_text(json.dumps({"error": "outside"}))
         metadata = quarantine / "aaaaaaaaaaaa-deadbeef.metadata.json"
         metadata.symlink_to(outside)
@@ -1293,7 +1293,7 @@ class CursorStoreIntegrationTests(unittest.TestCase):
     def test_typed_store_failed_command_does_not_write(self) -> None:
         store = JobStore(self.jobs_dir, self.jobs_dir / "legacy")
         created = store.create(CursorJob.from_dict(self.job("123456789abc")))
-        before = (self.jobs_dir / "123456789abc.json").read_bytes()
+        before = store.get(created.id).to_dict()
 
         def fail(_job: CursorJob) -> CursorJob:
             raise RuntimeError("command failed")
@@ -1301,7 +1301,7 @@ class CursorStoreIntegrationTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "command failed"):
             store.update(created.id, fail)
 
-        self.assertEqual((self.jobs_dir / "123456789abc.json").read_bytes(), before)
+        self.assertEqual(store.get(created.id).to_dict(), before)
         self.assertEqual(store.get(created.id).revision, 0)
 
     def test_typed_reservation_transaction_has_single_winner(self) -> None:
@@ -1374,7 +1374,7 @@ class CursorStoreIntegrationTests(unittest.TestCase):
             store.begin_maintenance(lease, stage, owner_alive=lambda _lease: False)
 
         stage.assert_not_called()
-        self.assertTrue((self.jobs_dir / "aaaaaaaaaaaa.json").exists())
+        self.assertEqual(store.get("aaaaaaaaaaaa").status, JobStatus.COMPLETED)
         self.assertTrue(evidence.exists())
         self.assertFalse(store.maintenance_active())
 
@@ -1421,7 +1421,7 @@ class CursorStoreIntegrationTests(unittest.TestCase):
         with self.assertRaisesRegex(JobMaintenanceError, "legacy source records"):
             store.finalize_maintenance(lease.token)
 
-        self.assertTrue((self.jobs_dir / "bbbbbbbbbbbb.json").exists())
+        self.assertEqual(store.get("bbbbbbbbbbbb").status, JobStatus.COMPLETED)
         self.assertTrue(store.abort_maintenance(lease.token))
 
     def test_maintenance_blocks_create_and_acquisition_until_abort(self) -> None:

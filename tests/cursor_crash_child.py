@@ -283,6 +283,7 @@ def _run_quarantine(root: Path, point: str) -> None:
     durable = root / "jobs"
     kill = _kill_at(point)
     original_atomic_json = store_module._atomic_json
+    original_atomic_bytes = store_module._atomic_bytes
     original_replace = os.replace
     original_directory_fsync = store_module._fsync_directory
 
@@ -290,6 +291,11 @@ def _run_quarantine(root: Path, point: str) -> None:
         original_atomic_json(path, value)
         if path.parent == durable / ".quarantine":
             kill("quarantine-metadata")
+
+    def atomic_bytes(path: Path, contents: bytes) -> None:
+        original_atomic_bytes(path, contents)
+        if path.parent == durable / ".quarantine":
+            kill("quarantine-move")
 
     def replace(source: os.PathLike[str] | str, target: os.PathLike[str] | str) -> None:
         original_replace(source, target)
@@ -306,6 +312,7 @@ def _run_quarantine(root: Path, point: str) -> None:
     store = JobStore(durable, root / "legacy")
     with (
         mock.patch.object(store_module, "_atomic_json", atomic_json),
+        mock.patch.object(store_module, "_atomic_bytes", atomic_bytes),
         mock.patch.object(os, "replace", replace),
         mock.patch.object(store_module, "_fsync_directory", fsync_directory),
     ):
@@ -550,6 +557,24 @@ def _run_delivery(root: Path, point: str, now: float) -> None:
     kill("after-ack")
 
 
+def _run_sqlite_import(root: Path, point: str) -> None:
+    from local_voice_harness.cursor.sqlite_store import SQLiteJobDatabase
+
+    kill = _kill_at(point)
+    original_set_meta = SQLiteJobDatabase.set_meta
+
+    def set_meta(connection: object, key: str, value: str) -> None:
+        if key == "cutover_complete":
+            kill("before-marker")
+        original_set_meta(cast(Any, connection), key, value)
+        if key == "cutover_complete":
+            kill("after-marker")
+
+    with mock.patch.object(SQLiteJobDatabase, "set_meta", side_effect=set_meta):
+        JobStore(root / "jobs", root / "legacy").list()
+    kill("after-commit")
+
+
 def main() -> None:
     if len(sys.argv) < 3:
         raise SystemExit("usage: cursor_crash_child.py COMMAND ROOT [ARG ...]")
@@ -565,6 +590,8 @@ def main() -> None:
         _run_recovery(root)
     elif command == "delivery":
         _run_delivery(root, sys.argv[3], float(sys.argv[4]))
+    elif command == "sqlite-import":
+        _run_sqlite_import(root, sys.argv[3])
     else:
         raise SystemExit(f"unknown command: {command}")
 

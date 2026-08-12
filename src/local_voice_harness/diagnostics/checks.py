@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import sqlite3
 import subprocess
 import time
 from collections import Counter
@@ -23,6 +24,7 @@ from ..config import (
     TTS_SOCKET,
 )
 from ..credentials import CredentialError, get_venice_api_key
+from ..cursor.sqlite_store import SQLiteJobDatabase
 from ..diagnostic_safety import redact_diagnostic
 from ..errors import HarnessError
 from ..integrations.herdr import HerdrError
@@ -894,7 +896,7 @@ def check_process_capabilities(
 def check_cursor_jobs(
     _snapshot: DiagnosticSnapshot | None = None,
 ) -> list[CheckResult]:
-    """Read job JSON read-only; never quarantine or mutate durable state."""
+    """Inspect durable jobs read-only; never initialize, import, or quarantine."""
 
     results: list[CheckResult] = []
     if not JOBS_DIR.is_dir():
@@ -903,22 +905,84 @@ def check_cursor_jobs(
                 name="jobs:store",
                 category="jobs",
                 severity=Severity.OK,
-                detail=f"no durable job store yet at {JOBS_DIR}",
+                detail=(
+                    f"no durable job store yet; SQLite database will be "
+                    f"{JOBS_DIR / 'jobs.sqlite3'}"
+                ),
             )
         ]
     statuses: Counter[str] = Counter()
     unreadable: list[str] = []
     stuck: list[str] = []
     now = time.time()
-    for path in sorted(JOBS_DIR.glob("*.json")):
+    database = SQLiteJobDatabase(JOBS_DIR)
+    records: list[tuple[str, dict[str, object]]] = []
+    if database.path.exists():
         try:
-            raw = json.loads(path.read_text())
-        except (OSError, json.JSONDecodeError, UnicodeDecodeError):
-            unreadable.append(path.name)
-            continue
-        if not isinstance(raw, dict):
-            unreadable.append(path.name)
-            continue
+            diagnostic = database.diagnostics()
+            with database.connect(readonly=True) as connection:
+                records = [
+                    (str(raw.get("id") or "unknown"), raw)
+                    for raw in database.list_jobs(connection)
+                ]
+        except (OSError, sqlite3.DatabaseError, ValueError) as exc:
+            return [
+                CheckResult(
+                    name="jobs:database",
+                    category="jobs",
+                    severity=Severity.FATAL,
+                    detail=redact_diagnostic(
+                        f"SQLite job database {database.path} cannot be read: {exc}"
+                    ),
+                    suggestion=(
+                        "stop voice-harness services and follow the durable-store "
+                        "manual recovery procedure"
+                    ),
+                )
+            ]
+        results.append(
+            CheckResult(
+                name="jobs:database",
+                category="jobs",
+                severity=(
+                    Severity.OK if diagnostic["integrity"] == "ok" else Severity.FATAL
+                ),
+                detail=(
+                    f"path={database.path}; schema={diagnostic['schema_version']}; "
+                    f"migration={diagnostic['migration_status'] or 'pending'}; "
+                    f"integrity={diagnostic['integrity']}; "
+                    f"import_failures={diagnostic['import_failures']}"
+                ),
+            )
+        )
+    else:
+        for path in sorted(JOBS_DIR.glob("*.json")):
+            try:
+                raw = json.loads(path.read_text())
+            except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+                unreadable.append(path.name)
+                continue
+            if not isinstance(raw, dict):
+                unreadable.append(path.name)
+                continue
+            records.append((path.name, raw))
+        results.append(
+            CheckResult(
+                name="jobs:database",
+                category="jobs",
+                severity=Severity.WARNING if records else Severity.OK,
+                detail=(
+                    f"SQLite job database {database.path} is pending"
+                    + (
+                        f"; {len(records)} legacy JSON record(s) await first-open import"
+                        if records
+                        else ""
+                    )
+                ),
+            )
+        )
+
+    for name, raw in records:
         status = str(raw.get("status") or "unknown")
         statuses[status] += 1
         if status in _WORKER_JOB_STATUSES:
@@ -926,7 +990,7 @@ def check_cursor_jobs(
             if isinstance(timestamp, int | float) and now - timestamp > (
                 STUCK_JOB_SECONDS
             ):
-                stuck.append(path.name)
+                stuck.append(name)
 
     active = sum(statuses[status] for status in _ACTIVE_JOB_STATUSES)
     attention = sum(statuses[status] for status in _ATTENTION_JOB_STATUSES)

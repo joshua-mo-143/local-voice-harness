@@ -64,7 +64,7 @@ def test_admission_persists_selected_provider_and_harness(tmp_path: Path) -> Non
     job = store.get(job_id)
     assert job.harness_kind == HarnessKind.CURSOR
     assert job.issue_provider == "github"
-    persisted = json.loads(store.path(job_id).read_text())
+    persisted = store.get(job_id).to_dict()
     assert persisted["harness_kind"] == "cursor"
     assert persisted["issue_provider"] == "github"
 
@@ -733,7 +733,7 @@ def test_cancellation_refuses_unsafe_durable_legacy_owner(
     ):
         service.cancel_job("123456789abc")
 
-    assert path.read_bytes() == before
+    assert path.with_suffix(".json.imported").read_bytes() == before
 
 
 def test_cancellation_clears_safely_absent_durable_legacy_owner(
@@ -875,7 +875,7 @@ def test_nuke_preflights_quarantine_before_staging_or_stopping_jobs(
         worker_process_start="start",
     )
     _write_quarantine_evidence(jobs_dir, "bbbbbbbbbbbb")
-    before = (jobs_dir / "aaaaaaaaaaaa.json").read_bytes()
+    before = JobStore(jobs_dir, tmp_path / "legacy").get("aaaaaaaaaaaa").to_dict()
 
     with (
         mock.patch.object(service, "_stop_worker") as stop_worker,
@@ -887,8 +887,9 @@ def test_nuke_preflights_quarantine_before_staging_or_stopping_jobs(
         service.nuke_jobs()
 
     stop_worker.assert_not_called()
-    assert (jobs_dir / "aaaaaaaaaaaa.json").read_bytes() == before
-    assert not (jobs_dir / ".maintenance").exists()
+    store = JobStore(jobs_dir, tmp_path / "legacy")
+    assert store.get("aaaaaaaaaaaa").to_dict() == before
+    assert not store.maintenance_active()
 
 
 def test_nuke_jobs_deletes_all_and_reports(
@@ -1118,7 +1119,9 @@ def test_nuke_jobs_checks_legacy_claim_before_modern_token(
 
     inspect.assert_called_once()
     stop.assert_not_called()
-    assert (jobs_dir / "aaaaaaaaaaaa.json").exists()
+    store = JobStore(jobs_dir, tmp_path / "legacy")
+    assert store.get("aaaaaaaaaaaa").loaded_schema_version == 5
+    assert (jobs_dir / "aaaaaaaaaaaa.json.imported").exists()
 
 
 def test_nuke_jobs_with_no_jobs_reports_nothing_to_delete(

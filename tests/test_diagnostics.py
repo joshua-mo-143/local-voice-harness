@@ -814,6 +814,41 @@ class CursorJobTests(unittest.TestCase):
             after = sorted(p.name for p in jobs.iterdir())
         self.assertEqual(before, after)
 
+    def test_sqlite_store_reports_path_schema_migration_and_integrity(self) -> None:
+        import tempfile
+
+        from local_voice_harness.cursor.model import CursorJob
+        from local_voice_harness.cursor.store import JobStore
+
+        with tempfile.TemporaryDirectory() as temporary:
+            jobs = Path(temporary) / "jobs"
+            store = JobStore(jobs, Path(temporary) / "legacy")
+            store.create(
+                CursorJob.from_dict(
+                    {
+                        "id": "123456789abc",
+                        "revision": 0,
+                        "request": "diagnose",
+                        "status": "queued",
+                        "created_at": 1,
+                        "queued_at": 1,
+                        "delivered": False,
+                    }
+                )
+            )
+            before = store.db_path.stat().st_mtime_ns
+            with mock.patch.object(checks, "JOBS_DIR", jobs):
+                results = checks.check_cursor_jobs()
+            after = store.db_path.stat().st_mtime_ns
+
+        database = next(result for result in results if result.name == "jobs:database")
+        self.assertIs(database.severity, Severity.OK)
+        self.assertIn(str(store.db_path), database.detail)
+        self.assertIn("schema=1", database.detail)
+        self.assertIn("migration=complete", database.detail)
+        self.assertIn("integrity=ok", database.detail)
+        self.assertEqual(after, before)
+
 
 class IntegrationCheckTests(unittest.TestCase):
     def test_herdr_uses_configured_snapshot_client_and_path(self) -> None:
