@@ -3,14 +3,25 @@
 ```text
 PipeWire microphone
   -> OpenWakeWord ("Hey Jarvis")
-  -> Parakeet TDT 0.6B v2 via ONNX Runtime (CUDA)
-  -> Qwen3.5-4B Q4_K_M via llama.cpp (CUDA)
+  -> local STT
+       -> Parakeet TDT 0.6B v2 via ONNX Runtime (CPU or CUDA), or
+       -> faster-whisper (CPU or CUDA)
+  -> configured LLM
+       -> Qwen3.5-4B Q4_K_M via local llama.cpp (CUDA), or
+       -> Venice AI
        -> focused intent classification
        -> ordinary conversational response
        -> Herdr-managed Cursor agent, GitHub CLI, and optional integrations
-  -> Chatterbox Turbo (CUDA)
+  -> configured TTS
+       -> local Chatterbox Turbo (CUDA), or
+       -> Venice AI
   -> PipeWire playback
 ```
+
+Provider selection is independent for LLM and TTS. Wake detection and transcription
+remain local; transcript and response text leave the machine when a Venice provider
+is selected. Cursor, GitHub, Linear, and other enabled integrations also cross local
+process boundaries regardless of the voice-model profile.
 
 The always-on wake daemon verifies OpenWakeWord candidates with the configured
 dictation backend to reject false activations. A request that takes longer than five

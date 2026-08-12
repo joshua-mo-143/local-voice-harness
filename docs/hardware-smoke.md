@@ -11,7 +11,7 @@ second terminal for logs and keep `voice-harness services stop` available for cl
 
 Entry point:
 
-```fish
+```bash
 wpctl status
 pw-record --version
 pw-play --version
@@ -31,7 +31,7 @@ Checklist:
 If `end` or transcription fails, cancel any surviving recording before retrying.
 Then stop services started by the turn:
 
-```fish
+```bash
 voice-harness cancel
 voice-harness services stop
 ```
@@ -74,7 +74,7 @@ voice-harness services stop
 
 Entry point:
 
-```fish
+```bash
 nvidia-smi
 llama-server --list-devices
 systemctl --user start dictation.service voice-harness-llm.service voice-harness-tts.service
@@ -94,7 +94,7 @@ Checklist:
 
 Stop every service started by this isolated check:
 
-```fish
+```bash
 systemctl --user stop voice-harness-tts.service voice-harness-llm.service dictation.service
 ```
 
@@ -104,7 +104,7 @@ This check starts or reuses a Cursor agent but should not ask it to modify files
 
 Entry point:
 
-```fish
+```bash
 herdr status server
 herdr agent list
 voice-harness text "Use Cursor to inspect this repository and report its current branch without changing anything."
@@ -122,7 +122,7 @@ Checklist:
 Stop any voice services activated while delivering the result. Herdr and its retained
 agent are intentionally left running for inspection:
 
-```fish
+```bash
 voice-harness services stop
 ```
 
@@ -131,18 +131,19 @@ voice-harness services stop
 Use a harmless Cursor request that remains active beyond the foreground timeout.
 Record its ID, then reboot the workstation rather than manually copying state:
 
-```fish
-set state_home "$HOME/.local/state/voice-harness"
-if set -q STATE_DIRECTORY
-    for candidate in (string split : "$STATE_DIRECTORY")
-        if string match -q '*/voice-harness' "$candidate"; and string match -q '/*' "$candidate"
-            set state_home "$candidate"
-            break
-        end
-    end
-else if set -q XDG_STATE_HOME
-    set state_home "$XDG_STATE_HOME/voice-harness"
-end
+```bash
+state_home="$HOME/.local/state/voice-harness"
+if [[ -n ${STATE_DIRECTORY:-} ]]; then
+  IFS=: read -ra candidates <<<"$STATE_DIRECTORY"
+  for candidate in "${candidates[@]}"; do
+    if [[ $candidate == /*/voice-harness ]]; then
+      state_home=$candidate
+      break
+    fi
+  done
+elif [[ -n ${XDG_STATE_HOME:-} ]]; then
+  state_home="$XDG_STATE_HOME/voice-harness"
+fi
 voice-harness text "Use Cursor to inspect this repository and wait for my next instruction without changing files."
 ls "$state_home/jobs"
 # Reboot, sign back in, and start the wake service before continuing.
@@ -165,7 +166,7 @@ Checklist:
 
 Start from stopped on-demand models so this check includes service activation:
 
-```fish
+```bash
 voice-harness services start
 voice-harness services status
 ```
@@ -184,7 +185,7 @@ Checklist:
 
 Clean up:
 
-```fish
+```bash
 voice-harness services stop
 voice-harness services status
 ```

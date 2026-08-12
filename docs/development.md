@@ -5,7 +5,7 @@
 The repository-local launcher runs the branch through `uv` while redirecting its
 configuration and durable state to ignored paths in the checkout:
 
-```fish
+```bash
 scripts/dev.sh text "What is two plus two?"
 scripts/dev.sh pronounce "PR #128 changed src/http_client.py"
 scripts/dev.sh text "Is the voice harness healthy?"
@@ -26,8 +26,8 @@ The launcher sets `XDG_CONFIG_HOME` to `.dev/config` and `XDG_STATE_HOME` to
 `.dev/state/voice-harness/`. Existing `VOICE_HARNESS_*` values are inherited, so
 temporary overrides remain available:
 
-```fish
-env VOICE_HARNESS_LLM_PROVIDER=venice scripts/dev.sh text "Summarize my open work"
+```bash
+VOICE_HARNESS_LLM_PROVIDER=venice scripts/dev.sh text "Summarize my open work"
 ```
 
 Every launcher command selects Python 3.11 and the `wake` extra because the
@@ -43,7 +43,7 @@ the launcher if that profile is not authenticated.
 
 To run the checkout's wake daemon in the foreground:
 
-```fish
+```bash
 systemctl --user stop voice-harness-wake.service
 scripts/dev.sh wake
 # Press Ctrl-C when finished.
@@ -156,8 +156,8 @@ This is branch testing isolation, not a complete runtime profile:
 The default development environment contains only the package and quality tools;
 it does not install the CUDA, audio, wake-word, or model extras:
 
-```fish
-set python_version 3.12
+```bash
+python_version=3.12
 uv sync --python $python_version
 uv run ruff format --check .
 uv run ruff check .

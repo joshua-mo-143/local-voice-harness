@@ -92,14 +92,13 @@ stores MCP OAuth state per workspace, so authenticating one checkout does not
 authenticate router or ticket workspaces. Configure one trusted source before
 enabling Linear:
 
-```fish
-set source /home/example/src/authenticated-checkout
-cd $source
-agent mcp login linear
-and agent mcp enable linear
-set project_id (string replace -ar '[^A-Za-z0-9]+' '-' -- $source | string trim -c '-')
+```bash
+source_checkout=/home/example/src/authenticated-checkout
+cd "$source_checkout"
+agent mcp login linear && agent mcp enable linear
+project_id=$(printf '%s' "$source_checkout" | sed -E 's/[^A-Za-z0-9]+/-/g; s/^-+|-+$//g')
 chmod 600 ~/.cursor/projects/$project_id/mcp-auth.json
-voice-harness config set platform.cursor_mcp_auth_source $source
+voice-harness config set platform.cursor_mcp_auth_source "$source_checkout"
 voice-harness config set integrations.linear true
 ```
 

@@ -1,16 +1,20 @@
 # Manual installation
 
-The [Quick install](../README.md#installation) path runs `scripts/install.sh`,
-which performs every deterministic step here and pauses only for the interactive
-logins you have not already completed. This document is the manual, step-by-step
-breakdown for partial setups, troubleshooting, or non-Arch systems.
+The [Quick start](../README.md#quick-start) path runs `scripts/install.sh`, which
+automates the tested Arch/CachyOS CUDA setup and pauses for interactive choices or
+logins when needed. This document also covers partial setups, CPU dictation,
+troubleshooting, and non-Arch systems.
 
 The supplied systemd units assume the repository is cloned to
 `$HOME/local-voice-harness`.
 
 ## Compute requirements
 
-Tested configuration:
+The project supports an all-local voice-model pipeline, hosted Venice LLM/TTS, or a
+mix of local and hosted providers. Wake detection and dictation are always local.
+Cursor, GitHub, Linear, and Venice are external services when enabled.
+
+The tested all-local configuration is:
 
 - Linux x86-64 with systemd user services and PipeWire.
 - NVIDIA GeForce RTX 5070 Ti Laptop GPU with 12 GB VRAM.
@@ -38,7 +42,9 @@ are:
 The tested configuration uses CUDA for Parakeet and Chatterbox, but dictation can
 run independently on CPU. CPU dictation has substantially higher latency. The
 optional faster-whisper backend supports the same `auto`, `cpu`, and `cuda` device
-selection.
+selection. Hosted LLM/TTS with CPU dictation can avoid local model inference on the
+GPU, but the current one-shot installer still provisions CUDA dictation and NVIDIA
+packages; use the manual CPU instructions below for a GPU-free profile.
 
 ## External prerequisites
 
@@ -112,7 +118,7 @@ OpenWakeWord includes the `hey_jarvis_v0.1.onnx` model used by the daemon.
 
 ## 2. Create the bundled dictation environment
 
-```fish
+```bash
 env UV_PROJECT_ENVIRONMENT=.venv-dictation \
   uv sync --python 3.11 --extra dictation --no-dev
 voice-harness config set compute.dictation_device cpu
@@ -124,7 +130,7 @@ start downloads `nemo-parakeet-tdt-0.6b-v2` from Hugging Face.
 
 For CUDA-enabled Parakeet, select the separate profile and device:
 
-```fish
+```bash
 env UV_PROJECT_ENVIRONMENT=.venv-dictation \
   uv sync --python 3.11 --extra dictation-cuda --no-dev
 voice-harness config set compute.dictation_device cuda
@@ -137,7 +143,7 @@ at service startup when the provider or device is unavailable.
 To use the supported faster-whisper backend instead, install its separate extra and
 select it in the unified configuration:
 
-```fish
+```bash
 env UV_PROJECT_ENVIRONMENT=.venv-dictation \
   uv sync --python 3.11 --extra dictation-whisper --no-dev
 voice-harness config set compute.dictation_backend whisper
@@ -189,7 +195,7 @@ The LLM and TTS providers can be selected independently. The installer prompts f
 each provider and skips the corresponding local environment or model download when
 Venice is selected. Its choices can also be supplied non-interactively:
 
-```fish
+```bash
 env LLM_PROVIDER=venice TTS_PROVIDER=venice ./scripts/install.sh
 ```
 
@@ -197,17 +203,11 @@ Venice credentials are stored through libsecret in the desktop Secret Service, n
 in a file, command argument, environment variable, or systemd unit. For a manual
 installation:
 
-```fish
+```bash
 paru -S --needed libsecret oo7
 voice-harness credentials set
-mkdir -p "$HOME/.config/voice-harness"
-printf '%s\n' \
-  '[llm]' \
-  'provider = "venice"' \
-  '' \
-  '[tts]' \
-  'provider = "venice"' \
-  >"$HOME/.config/voice-harness/backends.toml"
+voice-harness config set providers.llm.provider venice
+voice-harness config set providers.tts.provider venice
 ```
 
 `credentials set` prompts without echo and sends the key to libsecret's
@@ -248,8 +248,15 @@ List llama.cpp devices:
 llama-server --list-devices
 ```
 
-Edit `systemd/user/voice-harness-llm.service` if the NVIDIA device is not `CUDA0`, or if
-`llama-server` is installed somewhere other than `/usr/sbin/llama-server`.
+Configure the llama.cpp device if it is not `CUDA0`:
+
+```bash
+voice-harness config set compute.cuda_device '<LLAMA_CPP_DEVICE>'
+```
+
+The shipped launcher expects `llama-server` at `/usr/sbin/llama-server`. If it is
+installed elsewhere, changing that operational executable path requires a reviewed
+unit/package adjustment rather than a user-choice environment override.
 
 ## 5. Install Cursor and Herdr
 
@@ -266,18 +273,29 @@ herdr --version
 The harness starts `herdr server` automatically as the transient user service
 `voice-harness-herdr.service`. Running the Herdr TUI later attaches to that server.
 
-For Linear support, configure the server in `~/.cursor/mcp.json`, then authenticate
-and approve it:
+For Linear support, first configure the server in `~/.cursor/mcp.json`. Cursor stores
+MCP OAuth state per workspace, so authenticate one dedicated, trusted checkout whose
+MCP access is suitable for every harness-managed ticket workspace:
 
 ```bash
+SOURCE_CHECKOUT=/absolute/path/to/trusted-checkout
+cd "$SOURCE_CHECKOUT"
 agent mcp login linear
 agent mcp enable linear
 agent mcp list
 agent mcp list-tools linear
+chmod 600 "$HOME/.cursor/projects/$(printf '%s' "$SOURCE_CHECKOUT" | sed -E 's/[^[:alnum:]]+/-/g; s/^-|-$//g')/mcp-auth.json"
+voice-harness config set platform.cursor_mcp_auth_source "$SOURCE_CHECKOUT"
+voice-harness integrations enable linear
+voice-harness integrations doctor
 ```
 
-OAuth is reused from the same local Cursor user profile. If Linear is unavailable,
-ordinary repository tasks still work.
+The configured source path must be absolute and its `mcp-auth.json` must be a regular
+file owned by the harness user with mode `0600`. The harness links that opaque auth
+file into trusted router, planner, reviewer, and implementer workspaces without
+reading or logging token content. See [Configuration](configuration.md) for the
+normalization and collision rules. If Linear is unavailable, ordinary repository
+tasks still work.
 
 ## 6. Configure audio
 
@@ -288,22 +306,16 @@ wpctl status
 ```
 
 The source currently defaults to the microphone from the original development
-machine. Override it with a systemd drop-in:
+machine. Store the selected source in unified configuration:
 
 ```bash
-systemctl --user edit voice-harness-wake.service
-```
-
-```ini
-[Service]
-Environment=VOICE_HARNESS_SOURCE=<PIPEWIRE_SOURCE_NAME>
+voice-harness config set audio.source '<PIPEWIRE_SOURCE_NAME>'
 ```
 
 Optional Chatterbox voice cloning accepts a reference WAV:
 
-```ini
-[Service]
-Environment=VOICE_HARNESS_VOICE=/absolute/path/to/reference.wav
+```bash
+voice-harness config set audio.voice /absolute/path/to/reference.wav
 ```
 
 The default playback interruption mode is `wake`: saying “Hey Jarvis” while the
@@ -326,13 +338,19 @@ pactl load-module module-echo-cancel \
 wpctl status
 ```
 
-Set `VOICE_HARNESS_SOURCE=voice_harness_aec` and
-`VOICE_HARNESS_BARGE_IN_MODE=vad` in the wake service drop-in. The virtual source
-must use the same physical capture/playback devices as the harness; make this module
-persistent through the machine's PipeWire/WirePlumber configuration after validating
-it interactively. Use `VOICE_HARNESS_BARGE_IN_MODE=off` if no acoustic interruption
-is wanted. The streaming client also exposes `StreamingPlayback.cancel()` for an
-explicit stop control in local integrations.
+Set the source and mode through unified configuration:
+
+```bash
+voice-harness config set audio.source voice_harness_aec
+voice-harness config set audio.barge_in_mode vad
+```
+
+The virtual source must use the same physical capture/playback devices as the
+harness; make this module persistent through the machine's PipeWire/WirePlumber
+configuration after validating it interactively. Select `off` for
+`audio.barge_in_mode` if no acoustic interruption is wanted. The streaming client
+also exposes `StreamingPlayback.cancel()` for an explicit stop control in local
+integrations.
 
 ## 7. Install and enable services
 
@@ -350,7 +368,7 @@ from an older installation. An existing, separately managed `dictation.service` 
 preserved by default and is not covered by the shipped hardening policy. After
 reviewing and migrating its customizations, adopt the hardened unit with:
 
-```fish
+```bash
 voice-harness services install --force --replace-dictation
 voice-harness services audit
 ```

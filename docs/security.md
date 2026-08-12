@@ -48,14 +48,15 @@
 - Intent routing uses the configured LLM backend, but only a high-confidence
   authoritative route can invoke Cursor. Conversation and low-confidence fallback are
   tool-free.
-- Runtime job metadata and conversational audio live under
-  `$XDG_RUNTIME_DIR/voice-harness`; focused dictation audio lives under
+- Durable job records, workflow artifacts, and quarantine evidence live under the
+  private systemd `StateDirectory=voice-harness`, or
+  `$XDG_STATE_HOME/voice-harness` outside the service. Conversational audio, service
+  sockets, recorder ownership, and detached worker logs remain session-scoped under
+  `$XDG_RUNTIME_DIR`; focused dictation audio lives under
   `$XDG_RUNTIME_DIR/dictation`.
 - The unauthenticated llama.cpp API is bound to `127.0.0.1` for this trusted
   single-user workstation. Same-account processes are trusted; loopback is not a
   per-UID boundary on a mutually untrusted multi-user host.
 - Shipped services use service-specific systemd hardening and bounded resources; see
-  the [hardening policy](docs/service-hardening.md) for deliberate exceptions and
-  host checks.
-
-
+  the [hardening policy](service-hardening.md) for deliberate exceptions and host
+  checks.
