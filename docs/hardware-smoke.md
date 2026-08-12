@@ -36,6 +36,40 @@ voice-harness cancel
 voice-harness services stop
 ```
 
+## Speaker-to-microphone leakage
+
+This check must use the wake daemon so it can associate captured speech with its own
+recent playback. Start the services, follow the wake log in a second terminal, and
+temporarily avoid headphones:
+
+```fish
+voice-harness services start
+journalctl --user -u voice-harness-wake.service -f
+voice-harness listen
+# Say: Say exactly, tomorrow is another day.
+```
+
+Remain silent through playback and for ten seconds afterward. Then repeat the request
+and say “Hey Jarvis, stop” while the response is still playing.
+
+Checklist:
+
+- Audible speaker output leaks into the configured microphone at the normal test
+  volume.
+- Silence after playback does not produce a `You:` turn or another assistant reply.
+- If STT recognizes the leaked response, the log says the follow-up matched recent
+  local playback.
+- The wake-word interruption still cancels playback and admits “stop” as user speech.
+- An ordinary, differently worded follow-up immediately after playback is admitted.
+- After ten seconds, repeating words from the response is no longer rejected solely
+  as recent playback.
+
+Clean up:
+
+```fish
+voice-harness services stop
+```
+
 ## CUDA model loading
 
 Entry point:
