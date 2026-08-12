@@ -47,6 +47,87 @@ def test_service_request_and_result_types_are_explicit() -> None:
     assert tuple(result) == ("done", None)
 
 
+def test_waiting_job_cancellation_releases_without_worker_launch(
+    tmp_path: Path,
+) -> None:
+    store = JobStore(tmp_path / "jobs", tmp_path / "legacy")
+    job = CursorJob.new(
+        NewCursorJob(
+            id="123456789abc",
+            request="queued work",
+            created_at=1,
+            foreground_until=0,
+        )
+    )
+    store.create(job)
+
+    with (
+        mock.patch.object(service, "_job_store", return_value=store),
+        mock.patch.object(service, "launch_worker") as launch,
+    ):
+        service.cancel_job(job.id)
+
+    cancelled = store.get(job.id)
+    assert cancelled.status == JobStatus.CANCELLED
+    assert cancelled.participant_admission_state == "released"
+    launch.assert_not_called()
+
+
+@pytest.mark.parametrize("target_count", [10, 24])
+def test_fake_herdr_lifecycle_never_exceeds_global_capacity(
+    tmp_path: Path, target_count: int
+) -> None:
+    store = JobStore(tmp_path / "jobs", tmp_path / "legacy")
+    ids = [f"{index:012x}" for index in range(1, target_count + 1)]
+    for index, job_id in enumerate(ids):
+        store.create(
+            CursorJob.new(
+                NewCursorJob(
+                    id=job_id,
+                    request=f"target {index}",
+                    created_at=float(index),
+                    foreground_until=0,
+                )
+            )
+        )
+
+    live_panes: set[str] = set()
+    launch_order: list[str] = []
+
+    def fake_herdr_launch(job_id: str) -> None:
+        live_panes.add(job_id)
+        launch_order.append(job_id)
+
+    with (
+        mock.patch.object(service, "_job_store", return_value=store),
+        mock.patch.object(service, "launch_worker", side_effect=fake_herdr_launch),
+    ):
+        service._dispatch_waiting_jobs(capacity=3)
+        while live_panes:
+            jobs = store.list()
+            held = [job for job in jobs if job.participant_admission_state == "held"]
+            assert len(held) <= 3
+            assert len(live_panes) <= 3
+            completed = min(held, key=lambda job: (job.created_at, job.id))
+            live_panes.remove(completed.id)
+            store.update(
+                completed.id,
+                lambda job: job.evolve_for_delivery(
+                    now=100,
+                    status=JobStatus.FAILED,
+                    error="fake terminal run",
+                    result="fake terminal run",
+                    completed_at=100,
+                    participant_admission_state="released",
+                ),
+            )
+            service._dispatch_waiting_jobs(capacity=3)
+
+    assert launch_order == ids
+    assert not live_panes
+    assert all(job.participant_admission_state == "released" for job in store.list())
+
+
 def test_admission_persists_selected_provider_and_harness(tmp_path: Path) -> None:
     store = JobStore(tmp_path / "jobs", tmp_path / "legacy")
     registry = build_integration_registry(default_user_config(tmp_path))
@@ -108,6 +189,11 @@ def test_submit_notifies_only_after_job_starts() -> None:
 
     with (
         mock.patch.object(service, "start_job", side_effect=start),
+        mock.patch.object(
+            service,
+            "read_job",
+            return_value=mock.Mock(participant_admission_state="held"),
+        ),
         mock.patch.object(
             service,
             "_await_foreground",
@@ -444,7 +530,9 @@ def _grouped_target(index: int, target: str) -> dict[str, object]:
     }
 
 
-def test_grouped_answer_enforces_configured_launch_concurrency(tmp_path: Path) -> None:
+def test_grouped_answer_queues_children_over_participant_capacity(
+    tmp_path: Path,
+) -> None:
     store = JobStore(tmp_path / "jobs", tmp_path / "legacy")
     repositories = [tmp_path / "alpha"]
     targets = [_grouped_target(index, f"JOS-{index}") for index in range(1, 5)]
@@ -488,8 +576,8 @@ def test_grouped_answer_enforces_configured_launch_concurrency(tmp_path: Path) -
             integrations=registry,
         )
 
-    assert "Four jobs started" in str(result)
-    assert maximum == 2
+    assert "Two jobs started; two jobs accepted and queued" in str(result)
+    assert maximum <= 2
 
 
 def test_concurrent_grouped_answers_only_winning_cas_launches_children(
@@ -681,7 +769,7 @@ def test_overlapping_unresolved_batches_share_ticket_ownership_fence(
     assert store.ticket_reservation_owner(("linear", "jos-2")) == outcomes[1].job_id
 
 
-def test_start_jobs_enforces_bound_and_preserves_outcome_order() -> None:
+def test_start_jobs_preserves_outcome_order_during_durable_creation() -> None:
     lock = threading.Lock()
     active = 0
     maximum = 0
@@ -706,7 +794,7 @@ def test_start_jobs_enforces_bound_and_preserves_outcome_order() -> None:
     ):
         outcomes = service.start_jobs(requests, concurrency=2)
 
-    assert 1 < maximum <= 2
+    assert maximum == 1
     assert [outcome.target for outcome in outcomes] == [
         "0",
         "1",
@@ -781,7 +869,7 @@ def test_start_job_enforces_unique_ticket_before_worker_launch() -> None:
     store = mock.Mock(spec=JobStore)
     with (
         mock.patch.object(service, "_job_store", return_value=store),
-        mock.patch.object(service, "launch_worker") as launch,
+        mock.patch.object(service, "_dispatch_waiting_jobs") as dispatch,
     ):
         job_id = service.start_job(
             "work on the focused issue",
@@ -794,7 +882,7 @@ def test_start_job_enforces_unique_ticket_before_worker_launch() -> None:
     assert persisted.github_repository == "example/project"
     assert persisted.github_issue == 7
     assert store.create.call_args.kwargs == {"enforce_unique_ticket": True}
-    launch.assert_called_once_with(job_id)
+    dispatch.assert_called_once_with(integrations=None)
 
 
 def test_start_job_rejects_active_github_issue_before_second_launch(

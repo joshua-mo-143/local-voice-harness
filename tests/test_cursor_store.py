@@ -348,6 +348,59 @@ class CursorStoreIntegrationTests(unittest.TestCase):
         with locked(self.jobs_dir):
             write_unlocked(path, job)
 
+    def test_concurrent_capacity_claims_are_atomic_and_fifo(self) -> None:
+        store = JobStore(self.jobs_dir, self.jobs_dir / "legacy")
+        ids = [f"{index:012x}" for index in range(1, 7)]
+        for job_id in reversed(ids):
+            store.create(CursorJob.from_dict(self.job(job_id)))
+        barrier = threading.Barrier(5)
+        claimed: list[str] = []
+        claimed_lock = threading.Lock()
+
+        def claim() -> None:
+            candidate_store = JobStore(self.jobs_dir, self.jobs_dir / "legacy")
+            barrier.wait()
+            result = candidate_store.claim_participant_capacity(2)
+            with claimed_lock:
+                claimed.extend(job.id for job in result)
+
+        threads = [threading.Thread(target=claim) for _ in range(4)]
+        for thread in threads:
+            thread.start()
+        barrier.wait()
+        for thread in threads:
+            thread.join()
+
+        self.assertEqual(sorted(claimed), ids[:2])
+        self.assertEqual(
+            sum(job.participant_admission_state == "held" for job in store.list()),
+            2,
+        )
+
+    def test_capacity_fifo_continues_after_store_restart(self) -> None:
+        store = JobStore(self.jobs_dir, self.jobs_dir / "legacy")
+        ids = [f"{index:012x}" for index in range(1, 5)]
+        for index, job_id in enumerate(ids):
+            store.create(CursorJob.from_dict(self.job(job_id, created_at=float(index))))
+        first = store.claim_participant_capacity(2)
+        self.assertEqual([job.id for job in first], ids[:2])
+        store.update(
+            ids[0],
+            lambda job: job.evolve_for_delivery(
+                now=10,
+                status=JobStatus.FAILED,
+                error="terminal",
+                result="terminal",
+                completed_at=10,
+                participant_admission_state="released",
+            ),
+        )
+
+        restarted = JobStore(self.jobs_dir, self.jobs_dir / "legacy")
+        resumed = restarted.claim_participant_capacity(2)
+
+        self.assertEqual([job.id for job in resumed], [ids[2]])
+
     def test_concurrent_ticket_admission_has_exactly_one_winner(self) -> None:
         barrier = threading.Barrier(3)
         results: list[tuple[str, str]] = []

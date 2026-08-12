@@ -768,6 +768,7 @@ def cancel_target_and_release(
                     planner_target=None,
                     reviewer_target=None,
                     implementer_target=None,
+                    participant_admission_state="released",
                     prompt_operation_state="none",
                     prompt_operation_phase=None,
                     prompt_operation_turn=None,
@@ -797,10 +798,30 @@ def cancel_target_and_release(
                 worker_boot_id=None,
                 worker_process_start=None,
                 worker_token=None,
+                herdr_target=None,
+                herdr_pane_id=None,
+                herdr_workspace_id=None,
+                agent_name=None,
+                agent_dispatch_state="confirmed_absent",
+                active_participant=None,
+                planner_target=None,
+                reviewer_target=None,
+                implementer_target=None,
+                participant_creation_state="none",
+                participant_creation_participant=None,
+                participant_creation_target=None,
+                participant_creation_label=None,
+                participant_creation_workspace_id=None,
+                participant_creation_pane_id=None,
                 result=(
                     f"Cursor job {job_id} was cancelled."
                     if job.status == JobStatus.CANCELLED
                     else job.result
+                ),
+                participant_admission_state=(
+                    "released"
+                    if job.status in TERMINAL_STATUSES
+                    else job.participant_admission_state
                 ),
             )
         return job.evolve(
