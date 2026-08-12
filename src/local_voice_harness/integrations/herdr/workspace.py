@@ -432,20 +432,26 @@ class HerdrWorkspace:
         name = participant_name or (
             f"voice-{normalize_name(label)[:15] or 'task'}-{suffix}"
         )
-        if not root_pane:
-            if plan_participant is not None:
-                plan_participant(name, label, workspace_id)
+        if not workspace_id:
             root_pane, workspace_id = self._operations.new_pane(
                 checkout,
                 label,
-                workspace_id,
+                None,
                 checkpoint=checkpoint,
-                before_submit=before_pane_submit,
-                accepted=pane_accepted,
             )
+        if plan_participant is not None:
+            plan_participant(name, label, workspace_id)
+        participant_pane, workspace_id = self._operations.new_pane(
+            checkout,
+            label,
+            workspace_id,
+            checkpoint=checkpoint,
+            before_submit=before_pane_submit,
+            accepted=pane_accepted,
+        )
         provisional = AgentSelection(
             target=name,
-            pane_id=root_pane,
+            pane_id=participant_pane,
             workspace_id=str(workspace_id),
             cwd=str(checkout),
             name=name,
@@ -457,7 +463,7 @@ class HerdrWorkspace:
             selection = self._operations.start_agent(
                 checkout,
                 label,
-                root_pane,
+                participant_pane,
                 str(workspace_id),
                 name=name,
                 mode=mode,

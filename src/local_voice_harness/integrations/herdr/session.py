@@ -451,3 +451,90 @@ class HerdrSession:
         agent = dict(result.get("agent") or {})
         if agent.get("agent_status") == "working":
             raise HerdrError(f"Herdr agent {target} did not stop")
+
+    def close_owned_pane(
+        self,
+        target: str,
+        pane_id: str,
+        workspace_id: str,
+    ) -> None:
+        """Close one pane only when every observable ownership binding matches."""
+
+        if not target or not pane_id or not workspace_id:
+            raise HerdrError(
+                "owned pane cleanup requires target, pane, and workspace identity",
+                code="ownership_mismatch",
+            )
+
+        agent: dict[str, Any] | None
+        try:
+            agent = self._client.get_agent(target)
+        except HerdrError as exc:
+            if exc.code not in {"agent_not_found", "not_found"}:
+                raise
+            agent = None
+        if agent is not None:
+            observed_target = str(agent.get("name") or agent.get("pane_id") or "")
+            if (
+                target not in {observed_target, str(agent.get("pane_id") or "")}
+                or str(agent.get("pane_id") or "") != pane_id
+                or str(agent.get("workspace_id") or "") != workspace_id
+            ):
+                raise HerdrError(
+                    "Herdr agent no longer matches the owned pane binding",
+                    code="ownership_mismatch",
+                )
+
+        try:
+            pane = dict(self._client.run_json("pane", "get", pane_id).get("pane") or {})
+        except HerdrError as exc:
+            if exc.code not in {"pane_not_found", "not_found"}:
+                raise
+            if agent is not None:
+                raise HerdrError(
+                    "owned agent exists but its pane is absent",
+                    code="ownership_mismatch",
+                ) from exc
+            return
+        if (
+            str(pane.get("pane_id") or "") != pane_id
+            or str(pane.get("workspace_id") or "") != workspace_id
+        ):
+            raise HerdrError(
+                "Herdr pane no longer matches the owned workspace binding",
+                code="ownership_mismatch",
+            )
+
+        if agent is not None:
+            try:
+                self.cancel_agent(target)
+            except HerdrError as exc:
+                if exc.code not in {"agent_not_found", "not_found"}:
+                    raise
+        try:
+            self._client.run_json("pane", "close", pane_id)
+        except HerdrError as exc:
+            if exc.code not in {"pane_not_found", "not_found"}:
+                raise
+
+        try:
+            self._client.run_json("pane", "get", pane_id)
+        except HerdrError as exc:
+            if exc.code not in {"pane_not_found", "not_found"}:
+                raise
+        else:
+            raise HerdrError(
+                f"Herdr pane {pane_id} still exists after close",
+                code="pane_close_unconfirmed",
+            )
+
+        try:
+            self._client.get_agent(target)
+        except HerdrError as exc:
+            if exc.code in {"agent_not_found", "not_found"}:
+                return
+            raise
+        raise HerdrError(
+            f"Herdr agent {target} still exists after pane close",
+            code="pane_close_unconfirmed",
+        )

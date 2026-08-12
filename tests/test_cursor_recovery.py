@@ -533,6 +533,10 @@ class CursorRecoveryTests(unittest.TestCase):
                 "result": "cancelled",
                 "delivered": False,
                 "herdr_target": "agent",
+                "herdr_pane_id": "pane-agent",
+                "herdr_workspace_id": "workspace",
+                "worktree_workspace_id": "workspace",
+                "worktree_root_pane_id": "pane-anchor",
                 "target_release_pending": True,
                 "target_release_token": "release",
             }
@@ -549,7 +553,9 @@ class CursorRecoveryTests(unittest.TestCase):
                 herdr_factory=factory,
             )
 
-        client.cancel_agent.assert_called_once_with("agent")
+        client.close_owned_pane.assert_called_once_with(
+            "agent", "pane-agent", "workspace"
+        )
         self.assertFalse(self.store.get("123456789abc").target_release_pending)
 
     def test_cancellation_releases_every_workflow_participant(self) -> None:
@@ -563,6 +569,11 @@ class CursorRecoveryTests(unittest.TestCase):
                 "result": "cancelled",
                 "delivered": False,
                 "herdr_target": "implementer",
+                "herdr_pane_id": "pane-implementer",
+                "herdr_workspace_id": "workspace",
+                "worktree_path": "/worktree",
+                "worktree_workspace_id": "workspace",
+                "worktree_root_pane_id": "pane-anchor",
                 "planner_target": "planner",
                 "reviewer_target": "reviewer",
                 "implementer_target": "implementer",
@@ -571,6 +582,12 @@ class CursorRecoveryTests(unittest.TestCase):
             }
         )
         client = mock.Mock()
+        client.get_agent.side_effect = lambda target: {
+            "name": target,
+            "pane_id": f"pane-{target}",
+            "workspace_id": "workspace",
+            "cwd": "/worktree",
+        }
 
         cancel_target_and_release(
             self.store,
@@ -581,8 +598,12 @@ class CursorRecoveryTests(unittest.TestCase):
         )
 
         self.assertEqual(
-            client.cancel_agent.call_args_list,
-            [mock.call("implementer"), mock.call("planner"), mock.call("reviewer")],
+            client.close_owned_pane.call_args_list,
+            [
+                mock.call("implementer", "pane-implementer", "workspace"),
+                mock.call("planner", "pane-planner", "workspace"),
+                mock.call("reviewer", "pane-reviewer", "workspace"),
+            ],
         )
         self.assertFalse(self.store.get("123456789abc").target_release_pending)
 
@@ -701,6 +722,10 @@ class CursorRecoveryTests(unittest.TestCase):
                 "turn": 1,
                 "workflow_turn_phase": "classifying",
                 "herdr_target": "planner",
+                "herdr_pane_id": "pane-planner",
+                "herdr_workspace_id": "workspace",
+                "worktree_workspace_id": "workspace",
+                "worktree_root_pane_id": "pane-anchor",
                 "planner_target": "planner",
                 "active_participant": "planner",
                 "prompt_operation_state": "submitting",
@@ -760,6 +785,10 @@ class CursorRecoveryTests(unittest.TestCase):
                 "turn_token": "123456789abc-4",
                 "workflow_turn_phase": "reviewing",
                 "herdr_target": "planner",
+                "herdr_pane_id": "pane-planner",
+                "herdr_workspace_id": "workspace",
+                "worktree_workspace_id": "workspace",
+                "worktree_root_pane_id": "pane-anchor",
                 "planner_target": "planner",
                 "active_participant": "planner",
                 "plan_approval_state": "boundary",
@@ -858,6 +887,10 @@ class CursorRecoveryTests(unittest.TestCase):
                 "worker_boot_id": "boot",
                 "worker_process_start": "start",
                 "herdr_target": "planner",
+                "herdr_pane_id": "pane-planner",
+                "herdr_workspace_id": "workspace",
+                "worktree_workspace_id": "workspace",
+                "worktree_root_pane_id": "pane-anchor",
                 "planner_target": "planner",
                 "active_participant": "planner",
                 "agent_dispatch_state": "ready",
@@ -900,7 +933,9 @@ class CursorRecoveryTests(unittest.TestCase):
         self.assertEqual(current.manual_reconcile_token, "pane-fence")
         self.assertEqual(current.participant_creation_target, "reviewer-pending")
         self.assertIn("confirmed absent", current.terminal_intent_result or "")
-        client.cancel_agent.assert_called_once_with("planner")
+        client.close_owned_pane.assert_called_once_with(
+            "planner", "pane-planner", "workspace"
+        )
 
     def test_materialized_reviewer_pane_identity_allows_terminal_cleanup(self) -> None:
         created = self.create(
@@ -915,6 +950,11 @@ class CursorRecoveryTests(unittest.TestCase):
                 "worker_boot_id": "boot",
                 "worker_process_start": "start",
                 "herdr_target": "planner",
+                "herdr_pane_id": "pane-planner",
+                "herdr_workspace_id": "workspace",
+                "worktree_path": "/worktree",
+                "worktree_workspace_id": "workspace",
+                "worktree_root_pane_id": "pane-anchor",
                 "planner_target": "planner",
                 "active_participant": "planner",
                 "agent_dispatch_state": "ready",
@@ -954,6 +994,12 @@ class CursorRecoveryTests(unittest.TestCase):
         self.assertEqual(resolved.participant_creation_pane_id, "pane-reviewer")
         self.assertEqual(resolved.herdr_pane_id, "pane-reviewer")
         client = mock.Mock()
+        client.get_agent.return_value = {
+            "name": "planner",
+            "pane_id": "pane-planner",
+            "workspace_id": "workspace",
+            "cwd": "/worktree",
+        }
         cancel_target_and_release(
             self.store,
             created.id,
@@ -965,8 +1011,11 @@ class CursorRecoveryTests(unittest.TestCase):
         self.assertEqual(finished.status, JobStatus.FAILED)
         self.assertIsNone(finished.manual_reconcile_operation)
         self.assertEqual(
-            {call.args[0] for call in client.cancel_agent.call_args_list},
-            {"planner", "reviewer-pending"},
+            {call.args for call in client.close_owned_pane.call_args_list},
+            {
+                ("planner", "pane-planner", "workspace"),
+                ("reviewer-pending", "pane-reviewer", "workspace"),
+            },
         )
 
     def test_concurrent_terminal_intent_fences_reviewer_pane_acceptance(self) -> None:
@@ -1112,6 +1161,11 @@ class CursorRecoveryTests(unittest.TestCase):
                         "workflow_tier": "simple",
                         "workflow_classification_reason": "localized",
                         "herdr_target": f"implementer-{job_id}",
+                        "herdr_pane_id": f"pane-implementer-{job_id}",
+                        "herdr_workspace_id": "workspace",
+                        "worktree_path": "/worktree",
+                        "worktree_workspace_id": "workspace",
+                        "worktree_root_pane_id": "pane-anchor",
                         "active_participant": "implementer",
                         "planner_target": f"planner-{job_id}",
                         "reviewer_target": f"reviewer-{job_id}",
@@ -1138,6 +1192,12 @@ class CursorRecoveryTests(unittest.TestCase):
                 )
                 assert staged is not None and staged.target_release_token
                 client = mock.Mock()
+                client.get_agent.side_effect = lambda target: {
+                    "name": target,
+                    "pane_id": f"pane-{target}",
+                    "workspace_id": "workspace",
+                    "cwd": "/worktree",
+                }
 
                 cancel_target_and_release(
                     self.store,
@@ -1148,7 +1208,7 @@ class CursorRecoveryTests(unittest.TestCase):
                 )
 
                 self.assertEqual(
-                    {call.args[0] for call in client.cancel_agent.call_args_list},
+                    {call.args[0] for call in client.close_owned_pane.call_args_list},
                     {
                         f"planner-{job_id}",
                         f"reviewer-{job_id}",

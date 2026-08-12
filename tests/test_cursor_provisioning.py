@@ -1152,7 +1152,11 @@ class CursorJobStateTests(unittest.TestCase):
         resumed = store.get("123456789abc")
         self.assertEqual(resumed.workflow_tier.value, "high-risk")
         self.assertEqual(resumed.workflow_phase.value, "revising")
-        self.assertEqual(resumed.herdr_target, "planner")
+        self.assertEqual(resumed.herdr_target, "reviewer")
+        self.assertEqual(
+            resumed.active_participant,
+            WorkflowParticipant.REVIEWER,
+        )
         self.assertIn("change several components", resumed.request)
         self.assertIn("User clarification: keep the old format", resumed.request)
 
@@ -1568,6 +1572,11 @@ class CursorJobStateTests(unittest.TestCase):
 
         promoted = store.get("123456789abc")
         self.assertEqual(promoted.workflow_phase.value, "planning")
+        self.assertEqual(promoted.herdr_target, "implementer")
+        self.assertEqual(
+            promoted.active_participant,
+            WorkflowParticipant.IMPLEMENTER,
+        )
         self.assertIn("rename text", promoted.request)
         self.assertIn("preserve compatibility", promoted.request)
         self.assertIsNone(promoted.continuation_answer)
@@ -2160,6 +2169,11 @@ class CursorJobStateTests(unittest.TestCase):
             [call.kwargs["mode"] for call in client.start_fresh_agent.call_args_list],
             ["ask"],
         )
+        client.close_owned_pane.assert_called_once_with(
+            "agent",
+            "pane",
+            "workspace",
+        )
 
         with mock.patch.object(service, "launch_worker"):
             service.reply_job("123456789abc", "yes", trusted_utterance="yes")
@@ -2178,6 +2192,14 @@ class CursorJobStateTests(unittest.TestCase):
         self.assertEqual(
             [call.kwargs["mode"] for call in client.start_fresh_agent.call_args_list],
             ["ask", None],
+        )
+        self.assertEqual(
+            client.close_owned_pane.call_args_list,
+            [
+                mock.call("agent", "pane", "workspace"),
+                mock.call("reviewer", "pane-reviewer", "workspace"),
+                mock.call("implementer", "pane-implementer", "workspace"),
+            ],
         )
         implementation_prompt_text = client.prompt_and_wait.call_args_list[-1].args[1]
         self.assertNotIn("lgtm", implementation_prompt_text)
@@ -3568,7 +3590,9 @@ class CursorJobStateTests(unittest.TestCase):
 
         self.assertFalse(worker.is_alive())
         self.assertFalse(dispatched.is_set())
-        client.cancel_agent.assert_called_once_with("planned-agent")
+        client.close_owned_pane.assert_called_once_with(
+            "planned-agent", "pane", "workspace"
+        )
         client.prompt_and_wait.assert_not_called()
 
     def test_late_agent_visibility_after_cancelled_startup(self) -> None:
@@ -3596,11 +3620,6 @@ class CursorJobStateTests(unittest.TestCase):
         client = mock.Mock()
         client.repository_roots.return_value = [repository]
         client.resolve_repository.return_value = (repository, [repository])
-        client.cancel_agent.side_effect = [
-            HerdrError("not found", code="agent_not_found"),
-            None,
-            None,
-        ]
         client.get_agent.side_effect = [
             HerdrError("not found", code="agent_not_found"),
             {
@@ -3650,7 +3669,7 @@ class CursorJobStateTests(unittest.TestCase):
         self.assertEqual(updated["agent_dispatch_state"], "confirmed_absent")
         self.assertEqual(updated["status"], "cancelled")
         self.assertFalse(updated["target_release_pending"])
-        self.assertEqual(client.cancel_agent.call_count, 2)
+        self.assertEqual(client.close_owned_pane.call_count, 2)
 
     def test_cancellation_during_pr_checkout_prevents_prompt_submission(self) -> None:
         repository = Path(self.temporary.name) / "source" / "project"
@@ -3775,7 +3794,7 @@ class CursorJobStateTests(unittest.TestCase):
 
         self.assertFalse(worker.is_alive())
         self.assertFalse(submitted.is_set())
-        client.cancel_agent.assert_called_once_with("agent")
+        client.close_owned_pane.assert_called_once()
 
     def test_worker_signal_requires_full_process_identity(self) -> None:
         job = {
@@ -4004,6 +4023,10 @@ class CursorJobStateTests(unittest.TestCase):
                 "id": "123456789abc",
                 "status": "running",
                 "herdr_target": "cursor-agent",
+                "herdr_pane_id": "pane",
+                "herdr_workspace_id": "workspace",
+                "worktree_workspace_id": "workspace",
+                "worktree_root_pane_id": "anchor",
                 "worker_token": "worker",
                 "worker_pid": 42,
                 "worker_process_start": "old-worker",
@@ -4019,14 +4042,16 @@ class CursorJobStateTests(unittest.TestCase):
         def inspect_reservation(_target: str) -> None:
             reserved_during_cancel.update(jobs.reserved_targets())
 
-        client.cancel_agent.side_effect = inspect_reservation
+        client.close_owned_pane.side_effect = lambda _target, _pane, _workspace: (
+            inspect_reservation(_target)
+        )
         with mock.patch.object(jobs, "HerdrClient", return_value=client):
             service.cancel_job("123456789abc")
             service.cancel_job("123456789abc")
 
         self.assertIn("cursor-agent", reserved_during_cancel)
         self.assertNotIn("cursor-agent", jobs.reserved_targets())
-        client.cancel_agent.assert_called_once_with("cursor-agent")
+        client.close_owned_pane.assert_called_once()
         self.assertEqual(
             jobs.read_job("123456789abc")["pull_request_worktree_state"],
             "retained",
@@ -4038,7 +4063,11 @@ class CursorJobStateTests(unittest.TestCase):
                 "id": "123456789abc",
                 "status": "running",
                 "herdr_target": "cursor-agent",
+                "herdr_pane_id": "pane",
+                "herdr_workspace_id": "workspace",
                 "worktree_path": "/worktree/task",
+                "worktree_workspace_id": "workspace",
+                "worktree_root_pane_id": "anchor",
                 "worker_token": "worker",
                 "worker_pid": 42,
                 "worker_process_start": "old-worker",
@@ -4046,7 +4075,7 @@ class CursorJobStateTests(unittest.TestCase):
             }
         )
         failing = mock.Mock()
-        failing.cancel_agent.side_effect = HerdrError("still working")
+        failing.close_owned_pane.side_effect = HerdrError("still working")
         recovered = mock.Mock()
         with (
             mock.patch.object(jobs, "_stop_worker", return_value=True),
@@ -4058,7 +4087,9 @@ class CursorJobStateTests(unittest.TestCase):
             self.assertIn("cursor-agent", jobs.reserved_targets())
             service.recover_jobs()
 
-        recovered.cancel_agent.assert_called_once_with("cursor-agent")
+        recovered.close_owned_pane.assert_called_once_with(
+            "cursor-agent", "pane", "workspace"
+        )
         self.assertFalse(jobs.read_job("123456789abc")["target_release_pending"])
 
     def test_provisional_agent_fence_survives_first_not_found(self) -> None:
@@ -4067,7 +4098,11 @@ class CursorJobStateTests(unittest.TestCase):
                 "id": "123456789abc",
                 "status": "routing",
                 "herdr_target": "planned-agent",
+                "herdr_pane_id": "pane",
+                "herdr_workspace_id": "workspace",
                 "worktree_path": "/worktree/task",
+                "worktree_workspace_id": "workspace",
+                "worktree_root_pane_id": "anchor",
                 "agent_dispatch_state": "dispatching",
                 "worker_token": "worker",
                 "worker_pid": 42,
@@ -4076,10 +4111,15 @@ class CursorJobStateTests(unittest.TestCase):
             }
         )
         client = mock.Mock()
-        client.cancel_agent.side_effect = [
-            HerdrError("not found", code="agent_not_found"),
-            None,
-        ]
+        close_attempts = 0
+
+        def close_owned(*_args: object) -> None:
+            nonlocal close_attempts
+            close_attempts += 1
+            if close_attempts == 1:
+                raise HerdrError("close not confirmed")
+
+        client.close_owned_pane.side_effect = close_owned
         client.get_agent.side_effect = [
             HerdrError("not found", code="agent_not_found"),
             {
@@ -4099,13 +4139,13 @@ class CursorJobStateTests(unittest.TestCase):
             self.assertTrue(jobs.read_job("123456789abc")["target_release_pending"])
             with mock.patch("time.time", return_value=104):
                 service.recover_jobs()
-            self.assertEqual(client.get_agent.call_count, 1)
+            self.assertEqual(client.close_owned_pane.call_count, 1)
             with mock.patch("time.time", return_value=105):
                 service.recover_jobs()
 
         self.assertFalse(jobs.read_job("123456789abc")["target_release_pending"])
         self.assertEqual(client.get_agent.call_count, 2)
-        self.assertEqual(client.cancel_agent.call_count, 2)
+        self.assertGreaterEqual(client.close_owned_pane.call_count, 2)
 
     def test_truly_absent_agent_releases_after_bounded_backoff(self) -> None:
         jobs.write_job(
@@ -4121,7 +4161,7 @@ class CursorJobStateTests(unittest.TestCase):
         )
         client = mock.Mock()
         client.get_agent.side_effect = HerdrError("not found", code="agent_not_found")
-        client.cancel_agent.side_effect = HerdrError(
+        client.close_owned_pane.side_effect = HerdrError(
             "not found", code="agent_not_found"
         )
         with mock.patch.object(jobs, "HerdrClient", return_value=client):
@@ -4288,7 +4328,7 @@ class CursorJobStateTests(unittest.TestCase):
                 service.recover_jobs()
 
         self.assertEqual(client.get_agent.call_count, 2)
-        client.cancel_agent.assert_not_called()
+        client.close_owned_pane.assert_not_called()
 
     def test_ambiguous_fork_requires_manual_review_and_can_confirm_absence(
         self,
@@ -4331,7 +4371,7 @@ class CursorJobStateTests(unittest.TestCase):
         manual = jobs.read_job("123456789abc")
         self.assertEqual(manual["fork_operation_state"], "manual_required")
         self.assertFalse(manual["target_release_pending"])
-        client.cancel_agent.assert_called_once_with("unrelated-agent")
+        client.close_owned_pane.assert_not_called()
         token = str(manual["manual_reconcile_token"])
         with self.assertRaisesRegex(jobs.HarnessError, "fence is stale"):
             service.resolve_manual_reconciliation(
@@ -4414,7 +4454,7 @@ class CursorJobStateTests(unittest.TestCase):
         self.assertEqual(quarantined["worktree_provision_state"], "quarantined")
         self.assertTrue(quarantined["worktree_manual_inspection_required"])
         self.assertFalse(quarantined["target_release_pending"])
-        client.cancel_agent.assert_called_once_with("agent")
+        client.close_owned_pane.assert_not_called()
 
         jobs.write_job(
             {
@@ -4530,7 +4570,7 @@ class CursorJobStateTests(unittest.TestCase):
 
         updated = jobs.read_job("123456789abc")
         self.assertFalse(updated["target_release_pending"])
-        client.cancel_agent.assert_called_once_with("cursor-agent")
+        client.close_owned_pane.assert_not_called()
 
     def test_foreground_delivery_is_acknowledged_explicitly(self) -> None:
         jobs.write_job(

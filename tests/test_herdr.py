@@ -415,7 +415,12 @@ WORKFLOW_PLAN[token]: <bounded multiline implementation plan>
     def test_non_linear_task_creates_requested_worktree(self) -> None:
         client = herdr.HerdrClient("herdr")
         selection = herdr.AgentSelection(
-            "agent", "pane", "workspace", "/tmp/worktree", "agent", "/tmp/worktree"
+            "agent",
+            "participant-pane",
+            "workspace",
+            "/tmp/worktree",
+            "agent",
+            "/tmp/worktree",
         )
         with (
             mock.patch.object(
@@ -437,6 +442,11 @@ WORKFLOW_PLAN[token]: <bounded multiline implementation plan>
                 "planned_worktree_path",
                 return_value=Path("/tmp/worktree"),
             ),
+            mock.patch.object(
+                client,
+                "new_pane",
+                return_value=("participant-pane", "workspace"),
+            ) as new_pane,
             mock.patch.object(
                 client, "start_agent", return_value=selection
             ) as start_agent,
@@ -468,11 +478,19 @@ WORKFLOW_PLAN[token]: <bounded multiline implementation plan>
         start_agent.assert_called_once_with(
             Path("/tmp/worktree"),
             "github-123456",
-            "pane",
+            "participant-pane",
             "workspace",
             name=mock.ANY,
             mode=None,
             checkpoint=None,
+        )
+        new_pane.assert_called_once_with(
+            Path("/tmp/worktree"),
+            "github-123456",
+            "workspace",
+            checkpoint=None,
+            before_submit=None,
+            accepted=None,
         )
 
     def test_worktree_and_agent_are_reserved_before_dispatch(self) -> None:
@@ -480,7 +498,7 @@ WORKFLOW_PLAN[token]: <bounded multiline implementation plan>
         checkout = Path("/tmp/worktree")
         selection = herdr.AgentSelection(
             "planned-agent",
-            "pane",
+            "participant-pane",
             "workspace",
             str(checkout),
             "planned-agent",
@@ -521,6 +539,11 @@ WORKFLOW_PLAN[token]: <bounded multiline implementation plan>
             mock.patch.object(client, "find_agent", return_value=None),
             mock.patch.object(client, "workspace_for", return_value=None),
             mock.patch.object(client, "planned_worktree_path", return_value=checkout),
+            mock.patch.object(
+                client,
+                "new_pane",
+                return_value=("participant-pane", "workspace"),
+            ),
             mock.patch.object(client, "start_agent", side_effect=start_agent),
         ):
             client.ensure_agent(
