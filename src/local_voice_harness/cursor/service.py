@@ -160,6 +160,7 @@ class TicketStartOutcome:
 GROUPED_REPOSITORY_OWNER = "grouped_repository"
 GROUPED_REPOSITORY_TARGETS_FIELD = "grouped_repository_targets"
 GROUPED_REPOSITORY_CANDIDATES_FIELD = "grouped_repository_candidates"
+GROUPED_REPOSITORY_QUESTION_LIMIT = 500
 
 
 def _job_store() -> JobStore:
@@ -708,12 +709,46 @@ def _grouped_repository_question(
     targets: list[dict[str, object]], repositories: list[Path]
 ) -> str:
     identities = ", ".join(str(target["target"]) for target in targets)
-    names = ", ".join(repository.name for repository in repositories)
-    return (
-        "Several tickets need repository clarification. Reply using each canonical "
-        f"target identity followed by its repository, for example TARGET: REPOSITORY. "
-        f"Targets, in request order: {identities}. Available repositories: {names}."
+    question = (
+        "Reply TARGET: REPOSITORY for each ticket. "
+        f"Targets in request order: {identities}. "
+        "Use an available local repository name or path."
     )
+    if len(question) > GROUPED_REPOSITORY_QUESTION_LIMIT:
+        raise HarnessError("grouped repository target identities exceed question limit")
+
+    names = [repository.name for repository in repositories]
+    if not names:
+        return question
+    prefix = " Available repositories include: "
+    budget = GROUPED_REPOSITORY_QUESTION_LIMIT - len(question) - len(prefix)
+    if budget <= 0:
+        return question
+
+    included: list[str] = []
+    used = 0
+    for name in names:
+        separator = 2 if included else 0
+        if used + separator + len(name) > budget:
+            break
+        included.append(name)
+        used += separator + len(name)
+    if not included:
+        return question
+
+    summary = ", ".join(included)
+    omitted = len(names) - len(included)
+    if omitted:
+        suffix = f" (+{omitted} more)"
+        while included and len(summary) + len(suffix) > budget:
+            included.pop()
+            summary = ", ".join(included)
+            omitted = len(names) - len(included)
+            suffix = f" (+{omitted} more)"
+        if not included:
+            return question
+        summary += suffix
+    return question + prefix + summary
 
 
 def _create_grouped_repository_clarification(
