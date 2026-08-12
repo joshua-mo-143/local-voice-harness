@@ -169,6 +169,8 @@ _BOOL_FIELDS = frozenset(
         "fork_dispatch_exited",
         "github_issue_create_requested",
         "github_issue_create_confirmed",
+        "linear_ticket_create_requested",
+        "linear_ticket_create_confirmed",
         "fork_operation_source_private",
         "agent_dispatch_exited",
         "worktree_dispatch_exited",
@@ -207,6 +209,7 @@ _INT_FIELDS = frozenset(
         "prompt_baseline_sequence",
         "plan_approval_state_change_sequence",
         "plan_approval_revision",
+        "linear_ticket_create_baseline_sequence",
     }
 )
 _FLOAT_FIELDS = frozenset(
@@ -262,6 +265,17 @@ _STRING_FIELDS = frozenset(
         "github_issue_create_marker",
         "github_issue_create_operation_state",
         "github_issue_created_url",
+        "linear_ticket_create_team",
+        "linear_ticket_create_team_id",
+        "linear_ticket_create_title",
+        "linear_ticket_create_description",
+        "linear_ticket_create_marker",
+        "linear_ticket_create_operation_state",
+        "linear_ticket_create_prompt_target",
+        "linear_ticket_create_prompt_session",
+        "linear_ticket_create_prompt_token",
+        "linear_ticket_created_identifier",
+        "linear_ticket_created_url",
         "worktree_branch",
         "worktree_label",
         "worktree_path",
@@ -370,7 +384,14 @@ _FORK_OPERATION_STATES = frozenset(
     }
 )
 _ISSUE_CREATE_OPERATION_STATES = frozenset(
-    {"planned", "submitted", "created", "ambiguous", "manual_required"}
+    {
+        "planned",
+        "submitting",
+        "submitted",
+        "created",
+        "ambiguous",
+        "manual_required",
+    }
 )
 _WORKTREE_OPERATION_STATES = frozenset(
     {
@@ -422,6 +443,12 @@ class NewAgentJob:
     github_issue_create_title: str | None = None
     github_issue_create_body: str | None = None
     github_issue_create_marker: str | None = None
+    linear_ticket_create_requested: bool = False
+    linear_ticket_create_team: str | None = None
+    linear_ticket_create_team_id: str | None = None
+    linear_ticket_create_title: str | None = None
+    linear_ticket_create_description: str | None = None
+    linear_ticket_create_marker: str | None = None
     fork_requested: bool = False
     github_pull_request: int | None = None
     worktree_branch: str | None = None
@@ -546,7 +573,25 @@ _CHECKOUT_STATE_FIELDS = frozenset(
     }
 )
 _GITHUB_STATE_FIELDS = GITHUB_PROVIDER_STATE_FIELDS
-_LINEAR_STATE_FIELDS = frozenset({"issue_key"})
+_LINEAR_STATE_FIELDS = frozenset(
+    {
+        "issue_key",
+        "linear_ticket_create_requested",
+        "linear_ticket_create_confirmed",
+        "linear_ticket_create_team",
+        "linear_ticket_create_team_id",
+        "linear_ticket_create_title",
+        "linear_ticket_create_description",
+        "linear_ticket_create_marker",
+        "linear_ticket_create_operation_state",
+        "linear_ticket_create_prompt_target",
+        "linear_ticket_create_prompt_session",
+        "linear_ticket_create_prompt_token",
+        "linear_ticket_create_baseline_sequence",
+        "linear_ticket_created_identifier",
+        "linear_ticket_created_url",
+    }
+)
 _CHECKOUT_ALIASES = {
     "branch": "worktree_branch",
     "label": "worktree_label",
@@ -1227,6 +1272,14 @@ class AgentJob:
                 "github_issue_create_title": spec.github_issue_create_title,
                 "github_issue_create_body": spec.github_issue_create_body,
                 "github_issue_create_marker": spec.github_issue_create_marker,
+                "linear_ticket_create_requested": spec.linear_ticket_create_requested,
+                "linear_ticket_create_team": spec.linear_ticket_create_team,
+                "linear_ticket_create_team_id": spec.linear_ticket_create_team_id,
+                "linear_ticket_create_title": spec.linear_ticket_create_title,
+                "linear_ticket_create_description": (
+                    spec.linear_ticket_create_description
+                ),
+                "linear_ticket_create_marker": spec.linear_ticket_create_marker,
                 "fork_requested": spec.fork_requested,
                 "github_pull_request": spec.github_pull_request,
                 "worktree_branch": spec.worktree_branch,
@@ -1697,6 +1750,62 @@ class AgentJob:
         return self._optional_string("github_issue_created_url")
 
     @property
+    def linear_ticket_create_requested(self) -> bool:
+        return self._boolean_field("linear_ticket_create_requested")
+
+    @property
+    def linear_ticket_create_confirmed(self) -> bool:
+        return self._boolean_field("linear_ticket_create_confirmed")
+
+    @property
+    def linear_ticket_create_team(self) -> str | None:
+        return self._optional_string("linear_ticket_create_team")
+
+    @property
+    def linear_ticket_create_team_id(self) -> str | None:
+        return self._optional_string("linear_ticket_create_team_id")
+
+    @property
+    def linear_ticket_create_title(self) -> str | None:
+        return self._optional_string("linear_ticket_create_title")
+
+    @property
+    def linear_ticket_create_description(self) -> str | None:
+        return self._optional_string("linear_ticket_create_description")
+
+    @property
+    def linear_ticket_create_marker(self) -> str | None:
+        return self._optional_string("linear_ticket_create_marker")
+
+    @property
+    def linear_ticket_create_operation_state(self) -> str | None:
+        return self._optional_string("linear_ticket_create_operation_state")
+
+    @property
+    def linear_ticket_create_prompt_target(self) -> str | None:
+        return self._optional_string("linear_ticket_create_prompt_target")
+
+    @property
+    def linear_ticket_create_prompt_session(self) -> str | None:
+        return self._optional_string("linear_ticket_create_prompt_session")
+
+    @property
+    def linear_ticket_create_prompt_token(self) -> str | None:
+        return self._optional_string("linear_ticket_create_prompt_token")
+
+    @property
+    def linear_ticket_create_baseline_sequence(self) -> int | None:
+        return self._optional_int("linear_ticket_create_baseline_sequence")
+
+    @property
+    def linear_ticket_created_identifier(self) -> str | None:
+        return self._optional_string("linear_ticket_created_identifier")
+
+    @property
+    def linear_ticket_created_url(self) -> str | None:
+        return self._optional_string("linear_ticket_created_url")
+
+    @property
     def github_pull_request(self) -> int | None:
         return self._optional_int("github_pull_request")
 
@@ -2064,6 +2173,7 @@ class AgentJob:
             "agent": self.agent_dispatch_state,
             "fork": self.fork_operation_state,
             "issue_create": self.github_issue_create_operation_state,
+            "linear_ticket_create": self.linear_ticket_create_operation_state,
             "worktree": self.worktree_provision_state,
             "prompt": self.prompt_operation_state,
             "pane": self.participant_creation_state,
@@ -2252,6 +2362,44 @@ class AgentJob:
                 "GitHub issue creation operation requires repository, title, and marker"
             )
         if (
+            self.linear_ticket_create_operation_state is not None
+            and self.linear_ticket_create_operation_state
+            not in _ISSUE_CREATE_OPERATION_STATES
+        ):
+            raise JobValidationError("linear_ticket_create_operation_state is invalid")
+        if (
+            self.linear_ticket_create_confirmed
+            and not self.linear_ticket_create_requested
+        ):
+            raise JobValidationError(
+                "Linear ticket creation confirmation requires a creation request"
+            )
+        if self.linear_ticket_create_operation_state is not None and not all(
+            (
+                self.linear_ticket_create_team,
+                self.linear_ticket_create_team_id,
+                self.linear_ticket_create_title,
+                self.linear_ticket_create_marker,
+            )
+        ):
+            raise JobValidationError(
+                "Linear ticket creation operation requires team, title, and marker"
+            )
+        if self.linear_ticket_create_operation_state in {"submitting", "submitted"}:
+            if (
+                not all(
+                    (
+                        self.linear_ticket_create_prompt_target,
+                        self.linear_ticket_create_prompt_session,
+                        self.linear_ticket_create_prompt_token,
+                    )
+                )
+                or self.linear_ticket_create_baseline_sequence is None
+            ):
+                raise JobValidationError(
+                    "Linear ticket submission requires a durable prompt fence"
+                )
+        if (
             self.github_issue is not None
             and self.issue_key is None
             and self.issue_provider != "github"
@@ -2267,7 +2415,13 @@ class AgentJob:
             raise JobValidationError(
                 "github issue_provider requires a GitHub issue identity"
             )
-        if self.issue_provider not in {None, "github"} and self.issue_key is None:
+        if (
+            self.issue_provider not in {None, "github"}
+            and self.issue_key is None
+            and not (
+                self.issue_provider == "linear" and self.linear_ticket_create_requested
+            )
+        ):
             raise JobValidationError("selected issue_provider requires an issue key")
         if self.revision < 0:
             raise JobValidationError("revision must not be negative")
@@ -2676,6 +2830,8 @@ class AgentJob:
             or self.fork_operation_state in _UNCERTAIN_OPERATION_STATES
             or self.worktree_provision_state in _UNCERTAIN_OPERATION_STATES
             or self.github_issue_create_operation_state in {"submitted", "ambiguous"}
+            or self.linear_ticket_create_operation_state
+            in {"submitting", "submitted", "ambiguous"}
             or self.prompt_operation_state in {"submitting", "ambiguous"}
             or self.participant_creation_state
             in {"submitting", "ambiguous", "manual_required"}
@@ -2725,7 +2881,7 @@ def validate_transition(before: CursorJob, after: CursorJob) -> None:
             "Cursor job revision must increase by exactly one "
             f"({before.revision} -> {after.revision})"
         )
-    issue_creation_recovery_transition = (
+    github_issue_creation_recovery_transition = (
         before.status == JobStatus.QUEUED
         and before.github_issue_create_operation_state in {"submitted", "ambiguous"}
         and (
@@ -2739,10 +2895,26 @@ def validate_transition(before: CursorJob, after: CursorJob) -> None:
             )
         )
     )
+    linear_ticket_creation_recovery_transition = (
+        before.status == JobStatus.QUEUED
+        and before.linear_ticket_create_operation_state
+        in {"submitting", "submitted", "ambiguous"}
+        and (
+            (
+                after.status == JobStatus.COMPLETED
+                and after.linear_ticket_create_operation_state == "created"
+            )
+            or (
+                after.status == JobStatus.BLOCKED
+                and after.linear_ticket_create_operation_state == "manual_required"
+            )
+        )
+    )
     if (
         before.status != after.status
         and after.status not in _LEGAL_TRANSITIONS[before.status]
-        and not issue_creation_recovery_transition
+        and not github_issue_creation_recovery_transition
+        and not linear_ticket_creation_recovery_transition
     ):
         raise JobValidationError(
             "illegal Cursor job transition "

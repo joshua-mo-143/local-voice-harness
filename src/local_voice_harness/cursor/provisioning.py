@@ -34,15 +34,23 @@ from ..integrations.herdr import (
     extract_marker,
     normalize_name,
 )
+from ..integrations.linear import (
+    LinearError,
+    LinearIntegration,
+    LinearOperationAmbiguous,
+    LinearTicketCreationResult,
+)
 from ..integrations.registry import (
     IntegrationRegistry,
     build_integration_registry,
+    issue_provider,
     prompt_instructions,
     require_issue_capabilities,
     require_issue_provider,
     resolve_issue_reference,
     route_issue_repository,
 )
+from ..linear_ticket_creation import draft_linear_ticket
 from ..local_git import LocalGitRefChanged
 from ..questions import (
     PromptOperationState,
@@ -620,6 +628,309 @@ def _run_github_issue_creation(
         )
         raise
     _finish_github_issue_creation(store, job.id, token, result)
+
+
+def _finish_linear_ticket_creation(
+    store: JobStore,
+    job_id: str,
+    token: str,
+    result: LinearTicketCreationResult,
+) -> None:
+    identifier = result.issue.identifier
+    url = result.url
+
+    def finish(job: CursorJob) -> CursorJob:
+        now = time.time()
+        return job.evolve_for_delivery(
+            now=now,
+            status=JobStatus.COMPLETED,
+            result=f"Created Linear ticket {identifier}: {url}",
+            completed_at=now,
+            linear_ticket_created_identifier=identifier,
+            linear_ticket_created_url=url,
+            linear_ticket_create_operation_state="created",
+            worker_pid=None,
+            worker_boot_id=None,
+            worker_process_start=None,
+            worker_token=None,
+            worker_operation=None,
+        )
+
+    _worker_change(
+        store,
+        job_id,
+        token,
+        {JobStatus.ROUTING, JobStatus.RUNNING},
+        finish,
+    )
+
+
+def _run_linear_ticket_creation(
+    store: JobStore,
+    job: CursorJob,
+    token: str,
+    clients: ClientFactories,
+    checkpoint: Callable[[], None],
+) -> None:
+    team = (job.linear_ticket_create_team or "").strip()
+    if not team:
+        _worker_question(
+            store,
+            job.id,
+            token,
+            "Which Linear team should I create the ticket in? Please say its team key.",
+            clarification_kind="linear_team",
+        )
+        return
+    registry = clients.integrations or build_integration_registry(default_user_config())
+    provider = issue_provider("linear", registry)
+    if not isinstance(provider, LinearIntegration):
+        raise HarnessError("selected Linear provider cannot create tickets")
+    team = provider.validate_team(team)
+    client = clients.herdr()
+    checkpoint()
+    if not job.linear_ticket_create_team_id:
+        try:
+            resolved_team = provider.resolve_team(
+                client,
+                team,
+                checkpoint=checkpoint,
+            )
+        except LinearError:
+            message = f"I couldn't find Linear team {team}."
+
+            def finish_missing_team(current: CursorJob) -> CursorJob:
+                now = time.time()
+                return recovery.stage_terminal_intent(
+                    current,
+                    JobStatus.FAILED,
+                    now=now,
+                    result=message,
+                    error=message,
+                )
+
+            _worker_change(
+                store,
+                job.id,
+                token,
+                MODEL_WORKER_STATUSES,
+                finish_missing_team,
+            )
+            return
+
+        def persist_team(current: CursorJob) -> CursorJob:
+            return current.evolve(
+                linear_ticket_create_team=resolved_team.key,
+                linear_ticket_create_team_id=resolved_team.id,
+            )
+
+        updated = _worker_change(
+            store,
+            job.id,
+            token,
+            {JobStatus.ROUTING},
+            persist_team,
+        )
+        if updated is None:
+            return
+        job = updated
+        team = resolved_team.key
+    if (
+        not job.linear_ticket_create_title
+        or job.linear_ticket_create_description is None
+    ):
+        config = default_user_config()
+        draft = draft_linear_ticket(
+            job.trusted_utterance or job.request,
+            team,
+            settings=config.providers,
+        )
+        plan = provider.plan_ticket_creation(
+            job.linear_ticket_create_team_id or "",
+            draft.team,
+            draft.title,
+            draft.description,
+            correlation_marker=uuid.uuid4().hex,
+        )
+
+        def persist_draft(current: CursorJob) -> CursorJob:
+            return current.evolve(
+                linear_ticket_create_team=plan.team_key,
+                linear_ticket_create_team_id=plan.team_id,
+                linear_ticket_create_title=plan.title,
+                linear_ticket_create_description=plan.description,
+                linear_ticket_create_marker=plan.correlation_marker,
+                linear_ticket_create_operation_state="planned",
+            )
+
+        updated = _worker_change(
+            store, job.id, token, {JobStatus.ROUTING}, persist_draft
+        )
+        if updated is None:
+            return
+        job = updated
+    plan = provider.plan_ticket_creation(
+        job.linear_ticket_create_team_id or "",
+        job.linear_ticket_create_team or team,
+        job.linear_ticket_create_title or "",
+        job.linear_ticket_create_description or "",
+        correlation_marker=job.linear_ticket_create_marker,
+    )
+    if not job.linear_ticket_create_confirmed:
+        preview = (
+            f"Create this Linear ticket in team {plan.team_key}?\n\n"
+            f"Title: {plan.title}\n\nDescription:\n{plan.description}\n\n"
+            "Say yes to create it or no to cancel."
+        )
+        _worker_question(
+            store,
+            job.id,
+            token,
+            preview,
+            clarification_kind="linear_ticket_create_confirmation",
+            sensitivity=QuestionSensitivity.DESTRUCTIVE,
+        )
+        return
+    if job.linear_ticket_create_operation_state not in {None, "planned"}:
+        raise HarnessError(
+            "Linear ticket creation requires reconciliation before retry"
+        )
+
+    def mark_running(current: CursorJob) -> CursorJob:
+        return current.evolve(
+            status=JobStatus.RUNNING,
+            worker_operation="linear_ticket_create",
+        )
+
+    running = _worker_change(store, job.id, token, {JobStatus.ROUTING}, mark_running)
+    if running is None:
+        return
+
+    def persist_submit_fence(
+        target: str,
+        session: str,
+        prompt_token: str,
+        baseline: int,
+    ) -> None:
+        def fence(current: CursorJob) -> CursorJob:
+            return current.evolve(
+                linear_ticket_create_operation_state="submitting",
+                linear_ticket_create_prompt_target=target,
+                linear_ticket_create_prompt_session=session,
+                linear_ticket_create_prompt_token=prompt_token,
+                linear_ticket_create_baseline_sequence=baseline,
+            )
+
+        if (
+            _worker_change(
+                store,
+                job.id,
+                token,
+                {JobStatus.RUNNING},
+                fence,
+            )
+            is None
+        ):
+            raise WorkerCancelled
+
+    def persist_prompt_acceptance() -> None:
+        def accepted(current: CursorJob) -> CursorJob:
+            if current.linear_ticket_create_operation_state != "submitting":
+                raise JobValidationError(
+                    "Linear ticket prompt acceptance requires a submit fence"
+                )
+            return current.evolve(
+                linear_ticket_create_operation_state="submitted",
+            )
+
+        if (
+            _worker_change(
+                store,
+                job.id,
+                token,
+                {JobStatus.RUNNING},
+                accepted,
+            )
+            is None
+        ):
+            raise WorkerCancelled
+
+    def queue_ambiguous() -> None:
+        def ambiguous(current: CursorJob) -> CursorJob:
+            return current.evolve(
+                status=JobStatus.QUEUED,
+                queued_at=time.time(),
+                linear_ticket_create_operation_state="ambiguous",
+                reconcile=True,
+                worker_pid=None,
+                worker_boot_id=None,
+                worker_process_start=None,
+                worker_token=None,
+                worker_operation=None,
+            )
+
+        _worker_change(store, job.id, token, {JobStatus.RUNNING}, ambiguous)
+
+    try:
+        checkpoint()
+        provider.submit_ticket_creation(
+            client,
+            plan,
+            confirmed=True,
+            checkpoint=checkpoint,
+            before_submit=persist_submit_fence,
+            accepted=persist_prompt_acceptance,
+        )
+    except LinearError as exc:
+        checkpoint()
+        current = store.get(job.id)
+        uncertain = isinstance(
+            exc, LinearOperationAmbiguous
+        ) or current.linear_ticket_create_operation_state in {"submitting", "submitted"}
+        if uncertain:
+            try:
+                visible = provider.observe_ticket_creation(
+                    client,
+                    plan,
+                    checkpoint=checkpoint,
+                )
+            except LinearError:
+                visible = None
+            if visible is not None:
+                _finish_linear_ticket_creation(store, job.id, token, visible)
+                return
+            queue_ambiguous()
+            return
+
+        def failed_before_submit(current: CursorJob) -> CursorJob:
+            return current.evolve(
+                worker_operation=None,
+            )
+
+        _worker_change(
+            store,
+            job.id,
+            token,
+            {JobStatus.RUNNING},
+            failed_before_submit,
+        )
+        raise
+    current = store.get(job.id)
+    if current.linear_ticket_create_operation_state != "submitted":
+        queue_ambiguous()
+        return
+    try:
+        visible = provider.observe_ticket_creation(
+            client,
+            plan,
+            checkpoint=checkpoint,
+        )
+    except LinearError:
+        visible = None
+    if visible is None:
+        queue_ambiguous()
+        return
+    _finish_linear_ticket_creation(store, job.id, token, visible)
 
 
 def _completion_preferences(
@@ -3160,6 +3471,15 @@ def run_claimed_worker(  # pyright: ignore[reportGeneralTypeIssues]
             return
         if job.github_issue_create_requested:
             _run_github_issue_creation(
+                store,
+                job,
+                worker_token,
+                clients,
+                checkpoint,
+            )
+            return
+        if job.linear_ticket_create_requested:
+            _run_linear_ticket_creation(
                 store,
                 job,
                 worker_token,

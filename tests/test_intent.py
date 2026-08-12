@@ -73,6 +73,22 @@ class IntentRouterTests(LocalRouterTestCase):
         self.assertEqual(route.intent, intent.Intent.GITHUB_ISSUE_CREATE)
         self.assertTrue(route.actionable)
 
+    def test_routes_new_linear_ticket_creation_as_a_distinct_action(self) -> None:
+        with mock.patch.object(
+            llm_transport.urllib.request,
+            "urlopen",
+            return_value=_response("linear_ticket_create"),
+        ):
+            route = intent.route_intent(
+                "Create a Linear ticket in team API about startup failures",
+                RequestContext(
+                    "Create a Linear ticket in team API about startup failures",
+                ),
+            )
+
+        self.assertEqual(route.intent, intent.Intent.LINEAR_TICKET_CREATE)
+        self.assertTrue(route.actionable)
+
     def test_sends_bounded_context_to_forced_router_tool(self) -> None:
         context = RequestContext(
             text="work on this\n\nuntrusted issue body",

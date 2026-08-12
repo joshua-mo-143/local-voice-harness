@@ -8,6 +8,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass, replace
 from typing import Any, Protocol
 
+from ..integrations.linear import LinearError, LinearIntegration
 from ..questions import (
     AnswerResolution,
     Question,
@@ -206,6 +207,8 @@ def _queue_answer(
     github_repository: str | None = None,
     fork_confirmed: bool | None = None,
     github_issue_create_confirmed: bool | None = None,
+    linear_ticket_create_team: str | None = None,
+    linear_ticket_create_confirmed: bool | None = None,
     clear_target: bool = False,
 ) -> CursorJob:
     return job.evolve(
@@ -235,6 +238,16 @@ def _queue_answer(
             job.github_issue_create_confirmed
             if github_issue_create_confirmed is None
             else github_issue_create_confirmed
+        ),
+        linear_ticket_create_confirmed=(
+            job.linear_ticket_create_confirmed
+            if linear_ticket_create_confirmed is None
+            else linear_ticket_create_confirmed
+        ),
+        linear_ticket_create_team=(
+            job.linear_ticket_create_team
+            if linear_ticket_create_team is None
+            else linear_ticket_create_team
         ),
         herdr_target=None if clear_target else job.herdr_target,
         continuation=continuation,
@@ -475,6 +488,98 @@ def _github_issue_create_confirmation_answer(
         question=None,
         clarification_kind=None,
         result="Okay, I did not create the GitHub issue.",
+        completed_at=context.now,
+        worker_pid=None,
+        worker_boot_id=None,
+        worker_process_start=None,
+        worker_token=None,
+        voice_question=envelope(
+            question,
+            QuestionState.RESOLVED,
+            answer="no",
+            trusted_answer=context.trusted_text,
+            answered_at=context.now,
+        ),
+    )
+    return AnswerTransition(completed)
+
+
+def _linear_team_answer(
+    job: CursorJob,
+    question: Question,
+    resolution: AnswerResolution,
+    context: AnswerContext,
+) -> AnswerTransition:
+    if context.trusted_text is None:
+        return AnswerTransition(None, message="Please name the Linear team directly.")
+    candidate = context.trusted_text.strip()
+    match = re.search(
+        r"\b(?:linear\s+)?team\s+([A-Za-z][A-Za-z0-9]{0,15})\b",
+        candidate,
+        re.IGNORECASE,
+    )
+    if match is not None:
+        candidate = match.group(1)
+    try:
+        team = LinearIntegration.validate_team(candidate)
+    except LinearError:
+        return AnswerTransition(
+            None,
+            message="Please say a valid Linear team key, such as API.",
+        )
+    return AnswerTransition(
+        _queue_answer(
+            job,
+            question,
+            resolution,
+            context,
+            continuation=False,
+            linear_ticket_create_team=team,
+        ),
+        launch=True,
+    )
+
+
+def _linear_ticket_create_confirmation_answer(
+    job: CursorJob,
+    question: Question,
+    resolution: AnswerResolution,
+    context: AnswerContext,
+) -> AnswerTransition:
+    if context.trusted_text is None:
+        return AnswerTransition(
+            None,
+            message="Please confirm directly. Should I create this Linear ticket?",
+        )
+    confirmation = _confirmation(
+        context.trusted_text,
+        confirmations=_FORK_CONFIRMATIONS | {"create the ticket"},
+        rejections=_FORK_REJECTIONS,
+    )
+    if confirmation is None:
+        return AnswerTransition(
+            None,
+            message="Please answer yes or no. Should I create this Linear ticket?",
+        )
+    if confirmation:
+        return AnswerTransition(
+            _queue_answer(
+                job,
+                question,
+                resolution,
+                context,
+                continuation=False,
+                clear_target=True,
+                linear_ticket_create_confirmed=True,
+            ),
+            launch=True,
+        )
+    completed = job.evolve_for_delivery(
+        now=context.now,
+        status=JobStatus.COMPLETED,
+        question=None,
+        clarification_kind=None,
+        result="Okay, I did not create the Linear ticket.",
         completed_at=context.now,
         worker_pid=None,
         worker_boot_id=None,
@@ -783,6 +888,8 @@ _ANSWER_HANDLERS: dict[str, AnswerHandler] = {
     "github_repository": _github_repository_answer,
     "fork_confirmation": _fork_confirmation_answer,
     "github_issue_create_confirmation": _github_issue_create_confirmation_answer,
+    "linear_team": _linear_team_answer,
+    "linear_ticket_create_confirmation": _linear_ticket_create_confirmation_answer,
     "workflow": _workflow_answer,
     "workflow_review": _workflow_review_answer,
     "workflow_review_exhausted": _workflow_review_exhausted_answer,

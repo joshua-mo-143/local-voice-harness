@@ -25,6 +25,12 @@
   to `gh` over standard input rather than process arguments. A durable hidden
   correlation marker lets recovery observe a timed-out creation without resubmitting;
   an unprovable outcome stops for manual inspection.
+- Linear ticket creation uses a separate external-write workflow over the authenticated
+  Cursor Linear MCP integration. The team comes only from the trusted utterance or a
+  validated focused Linear team page, the bounded draft is persisted and displayed
+  before direct confirmation, and a correlation marker supports read-only recovery.
+  An ambiguous or unobservable result blocks for manual inspection rather than
+  resubmitting.
 - Checking out a focused pull request clones or reuses its repository below the GitHub
   root and runs `gh pr checkout` only in a job-unique, reserved worktree. Recovery
   retries that same worktree; failed preparation quarantines it.

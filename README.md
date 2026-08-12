@@ -80,6 +80,7 @@ Hey Jarvis, summarize the api-docs repository.
 Hey Jarvis, work on Linear issue API-79.
 Hey Jarvis, work on owner/repository#42.
 Hey Jarvis, create an issue in this repo about the launcher failing after reboot.
+Hey Jarvis, create a Linear ticket in team API about the launcher failing after reboot.
 Hey Jarvis, summarize this issue.  # with a GitHub issue focused in Firefox
 Hey Jarvis, summarize this ticket. # with a Zendesk ticket focused (opt-in; see below)
 Hey Jarvis, fork this repo and add Venice.  # with a public GitHub repo focused
@@ -94,6 +95,10 @@ Jarvis” again while it is talking.
 Creating a GitHub issue first produces a title and body draft. The full draft is
 displayed, a short summary is spoken, and no issue is created until you answer the
 separate confirmation question with a direct yes.
+
+Creating a Linear ticket follows the same preview and direct-confirmation flow. The
+team must come from the spoken request or a validated focused Linear team page, and
+the authenticated Linear MCP integration performs the write only after confirmation.
 
 To act on what is on your screen, focus a GitHub or pull request tab, or select
 code in your editor, then refer to it in your request (for example “summarize this

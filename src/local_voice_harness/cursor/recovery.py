@@ -22,7 +22,10 @@ from ..integrations.herdr import (
     HerdrError,
     agent_session_identity,
 )
+from ..integrations.linear import LinearError, LinearIntegration
+from ..integrations.registry import build_integration_registry, issue_provider
 from ..questions import PromptOperationState, QuestionState
+from ..user_config import default_user_config
 from . import questions as question_adapter
 from .model import (
     TERMINAL_STATUSES,
@@ -50,6 +53,7 @@ PROMPT_ABSENT_OBSERVATIONS = 2
 
 HerdrFactory = Callable[[], HerdrClient]
 GitHubFactory = Callable[[], GitHubClient | GitHubProvider]
+LinearFactory = Callable[[], LinearIntegration]
 LaunchWorker = Callable[[str], None]
 RequireIssueProvider = Callable[[str | None], None]
 
@@ -61,6 +65,18 @@ def _github_provider(factory: GitHubFactory) -> GitHubProvider:
         if isinstance(integration, GitHubProvider)
         else GitHubProvider(integration)
     )
+
+
+def _linear_provider(factory: LinearFactory | None = None) -> LinearIntegration:
+    if factory is not None:
+        return factory()
+    integration = issue_provider(
+        "linear",
+        build_integration_registry(default_user_config()),
+    )
+    if not isinstance(integration, LinearIntegration):
+        raise HarnessError("selected Linear provider cannot create tickets")
+    return integration
 
 
 def _agent_not_found(exc: HerdrError) -> bool:
@@ -324,7 +340,7 @@ def reconcile_uncertain_issue_creation(
     now: float,
     github_factory: GitHubFactory = GitHubClient,
 ) -> None:
-    states = frozenset({"submitted", "ambiguous"})
+    states = frozenset({"submitting", "submitted", "ambiguous"})
     if job.github_issue_create_operation_state not in states:
         return
     repository = job.github_repository or ""
@@ -374,6 +390,73 @@ def reconcile_uncertain_issue_creation(
             github_issue_created_url=result.url,
             github_issue_create_operation_state="created",
             result=f"Created GitHub issue {result.issue.reference}: {result.url}",
+            completed_at=now,
+            reconcile=False,
+            worker_operation=None,
+            worker_pid=None,
+            worker_boot_id=None,
+            worker_process_start=None,
+            worker_token=None,
+            prepare_delivery=True,
+        )
+
+    store.update(job.id, reconcile)
+
+
+def reconcile_uncertain_linear_ticket_creation(
+    store: JobStore,
+    job: CursorJob,
+    *,
+    now: float,
+    herdr_factory: HerdrFactory = HerdrClient,
+    linear_factory: LinearFactory | None = None,
+) -> None:
+    states = frozenset({"submitted", "ambiguous"})
+    if job.linear_ticket_create_operation_state not in states:
+        return
+    try:
+        provider = _linear_provider(linear_factory)
+        plan = provider.plan_ticket_creation(
+            job.linear_ticket_create_team_id or "",
+            job.linear_ticket_create_team or "",
+            job.linear_ticket_create_title or "",
+            job.linear_ticket_create_description or "",
+            correlation_marker=job.linear_ticket_create_marker,
+        )
+        result = provider.observe_ticket_creation(herdr_factory(), plan)
+    except (HarnessError, LinearError):
+        # Incomplete observation is not proof of absence; retry on a later scan.
+        return
+
+    def reconcile(current: CursorJob) -> CursorJob | None:
+        if current.linear_ticket_create_operation_state not in states:
+            return None
+        if result is None:
+            message = (
+                "Linear ticket creation could not be reconciled automatically. "
+                "Check the team before trying again."
+            )
+            return current.evolve_recovery(
+                now=now,
+                status=JobStatus.BLOCKED,
+                linear_ticket_create_operation_state="manual_required",
+                result=message,
+                completed_at=now,
+                reconcile=False,
+                worker_operation=None,
+                worker_pid=None,
+                worker_boot_id=None,
+                worker_process_start=None,
+                worker_token=None,
+                prepare_delivery=True,
+            )
+        return current.evolve_recovery(
+            now=now,
+            status=JobStatus.COMPLETED,
+            linear_ticket_created_identifier=result.issue.identifier,
+            linear_ticket_created_url=result.url,
+            linear_ticket_create_operation_state="created",
+            result=f"Created Linear ticket {result.issue.identifier}: {result.url}",
             completed_at=now,
             reconcile=False,
             worker_operation=None,
@@ -487,6 +570,7 @@ def reconcile_uncertain_operations(
     now: float,
     herdr_factory: HerdrFactory = HerdrClient,
     github_factory: GitHubFactory = GitHubClient,
+    linear_factory: LinearFactory | None = None,
 ) -> None:
     reconcile_uncertain_agent(store, job, now=now, herdr_factory=herdr_factory)
     current = store.get(job.id)
@@ -495,6 +579,14 @@ def reconcile_uncertain_operations(
         current,
         now=now,
         github_factory=github_factory,
+    )
+    current = store.get(job.id)
+    reconcile_uncertain_linear_ticket_creation(
+        store,
+        current,
+        now=now,
+        herdr_factory=herdr_factory,
+        linear_factory=linear_factory,
     )
     current = store.get(job.id)
     reconcile_uncertain_fork(store, current, now=now, github_factory=github_factory)

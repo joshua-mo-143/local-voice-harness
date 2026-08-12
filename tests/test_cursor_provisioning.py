@@ -38,6 +38,14 @@ from local_voice_harness.integrations.herdr import (
     HerdrError,
     PromptOutcome,
 )
+from local_voice_harness.integrations.linear import (
+    LinearError,
+    LinearIssue,
+    LinearOperationAmbiguous,
+    LinearTeam,
+    LinearTicketCreationResult,
+)
+from local_voice_harness.linear_ticket_creation import LinearTicketDraft
 from local_voice_harness.local_git import LocalGitRefChanged
 
 
@@ -2547,6 +2555,229 @@ class CursorJobStateTests(unittest.TestCase):
         self.assertEqual(updated["github_issue_create_operation_state"], "ambiguous")
         self.assertEqual(github.submit_issue.call_count, 1)
 
+    def test_worker_drafts_linear_ticket_before_requesting_confirmation(self) -> None:
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "create a Linear ticket about startup",
+                "trusted_utterance": "create a Linear ticket about startup",
+                "issue_provider": "linear",
+                "linear_ticket_create_requested": True,
+                "linear_ticket_create_team": "API",
+                "status": "queued",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        provider = linear.LinearIntegration()
+        herdr = mock.Mock()
+        with (
+            mock.patch.object(jobs, "HerdrClient", return_value=herdr),
+            mock.patch.object(
+                production_jobs,
+                "issue_provider",
+                return_value=provider,
+            ),
+            mock.patch.object(
+                provider,
+                "resolve_team",
+                return_value=LinearTeam("team-id-api", "API", "Application Platform"),
+            ),
+            mock.patch.object(
+                production_jobs,
+                "draft_linear_ticket",
+                return_value=LinearTicketDraft(
+                    "API",
+                    "Fix startup",
+                    "Startup fails after reboot.",
+                ),
+            ),
+        ):
+            service.run_worker("123456789abc")
+
+        updated = jobs.read_job("123456789abc")
+        self.assertEqual(updated["status"], "awaiting_user")
+        self.assertEqual(
+            updated["clarification_kind"],
+            "linear_ticket_create_confirmation",
+        )
+        self.assertEqual(updated["linear_ticket_create_title"], "Fix startup")
+        self.assertEqual(updated["linear_ticket_create_operation_state"], "planned")
+        herdr.ensure_router.assert_not_called()
+
+    def test_worker_says_it_could_not_find_the_linear_team(self) -> None:
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "create a Linear ticket in team API about startup",
+                "trusted_utterance": "create a Linear ticket in team API about startup",
+                "issue_provider": "linear",
+                "linear_ticket_create_requested": True,
+                "linear_ticket_create_team": "API",
+                "status": "queued",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        provider = linear.LinearIntegration()
+        herdr = mock.Mock()
+        with (
+            mock.patch.object(jobs, "HerdrClient", return_value=herdr),
+            mock.patch.object(
+                production_jobs,
+                "issue_provider",
+                return_value=provider,
+            ),
+            mock.patch.object(
+                provider,
+                "resolve_team",
+                side_effect=LinearError("I couldn't find Linear team API."),
+            ),
+            mock.patch.object(production_jobs, "draft_linear_ticket") as draft,
+        ):
+            service.run_worker("123456789abc")
+
+        updated = jobs.read_job("123456789abc")
+        self.assertEqual(updated["status"], "failed")
+        self.assertEqual(updated["result"], "I couldn't find Linear team API.")
+        draft.assert_not_called()
+        herdr.ensure_router.assert_not_called()
+
+    def test_confirmed_linear_ticket_creation_completes(self) -> None:
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "create a Linear ticket about startup",
+                "trusted_utterance": "create a Linear ticket about startup",
+                "issue_provider": "linear",
+                "linear_ticket_create_requested": True,
+                "linear_ticket_create_confirmed": True,
+                "linear_ticket_create_team": "API",
+                "linear_ticket_create_team_id": "team-id-api",
+                "linear_ticket_create_title": "Fix startup",
+                "linear_ticket_create_description": "Startup fails after reboot.",
+                "linear_ticket_create_marker": "a" * 32,
+                "linear_ticket_create_operation_state": "planned",
+                "status": "queued",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        provider = linear.LinearIntegration()
+        result = LinearTicketCreationResult(
+            LinearIssue("API-42"),
+            "https://linear.app/acme/issue/API-42/fix-startup",
+            "a" * 32,
+        )
+        herdr = mock.Mock()
+
+        def submit(*_args: object, **kwargs: object) -> LinearTicketCreationResult:
+            before_submit = kwargs["before_submit"]
+            accepted = kwargs["accepted"]
+            assert callable(before_submit)
+            assert callable(accepted)
+            before_submit("voice-router", "router-session", "prompt-token", 7)
+            accepted()
+            return result
+
+        with (
+            mock.patch.object(jobs, "HerdrClient", return_value=herdr),
+            mock.patch.object(
+                production_jobs,
+                "issue_provider",
+                return_value=provider,
+            ),
+            mock.patch.object(
+                provider,
+                "submit_ticket_creation",
+                side_effect=submit,
+            ) as submit,
+            mock.patch.object(
+                provider,
+                "observe_ticket_creation",
+                return_value=result,
+            ) as observe,
+        ):
+            service.run_worker("123456789abc")
+
+        updated = jobs.read_job("123456789abc")
+        self.assertEqual(updated["status"], "completed")
+        self.assertEqual(updated["linear_ticket_created_identifier"], "API-42")
+        self.assertEqual(updated["linear_ticket_create_operation_state"], "created")
+        submit.assert_called_once_with(
+            herdr,
+            mock.ANY,
+            confirmed=True,
+            checkpoint=mock.ANY,
+            before_submit=mock.ANY,
+            accepted=mock.ANY,
+        )
+        observe.assert_called_once_with(
+            herdr,
+            mock.ANY,
+            checkpoint=mock.ANY,
+        )
+
+    def test_ambiguous_linear_ticket_creation_queues_reconciliation(self) -> None:
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "create a Linear ticket",
+                "trusted_utterance": "create a Linear ticket",
+                "issue_provider": "linear",
+                "linear_ticket_create_requested": True,
+                "linear_ticket_create_confirmed": True,
+                "linear_ticket_create_team": "API",
+                "linear_ticket_create_team_id": "team-id-api",
+                "linear_ticket_create_title": "Fix startup",
+                "linear_ticket_create_description": "Startup fails.",
+                "linear_ticket_create_marker": "a" * 32,
+                "linear_ticket_create_operation_state": "planned",
+                "status": "queued",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        provider = linear.LinearIntegration()
+        herdr = mock.Mock()
+
+        def submit(*_args: object, **kwargs: object) -> object:
+            before_submit = kwargs["before_submit"]
+            accepted = kwargs["accepted"]
+            assert callable(before_submit)
+            assert callable(accepted)
+            before_submit("voice-router", "router-session", "prompt-token", 7)
+            accepted()
+            raise LinearOperationAmbiguous("timed out")
+
+        with (
+            mock.patch.object(jobs, "HerdrClient", return_value=herdr),
+            mock.patch.object(
+                production_jobs,
+                "issue_provider",
+                return_value=provider,
+            ),
+            mock.patch.object(
+                provider,
+                "submit_ticket_creation",
+                side_effect=submit,
+            ) as submit,
+            mock.patch.object(
+                provider,
+                "observe_ticket_creation",
+                return_value=None,
+            ),
+        ):
+            service.run_worker("123456789abc")
+
+        updated = jobs.read_job("123456789abc")
+        self.assertEqual(updated["status"], "queued")
+        self.assertEqual(
+            updated["linear_ticket_create_operation_state"],
+            "ambiguous",
+        )
+        submit.assert_called_once()
+
     def test_only_trusted_affirmative_reply_confirms_fork(self) -> None:
         job = {
             "id": "123456789abc",
@@ -2840,6 +3071,8 @@ class CursorJobStateTests(unittest.TestCase):
             github_issue=None,
             github_issue_context=None,
             github_issue_create_requested=False,
+            linear_team=None,
+            linear_ticket_create_requested=False,
             fork_requested=False,
             github_pull_request=None,
             agent=None,

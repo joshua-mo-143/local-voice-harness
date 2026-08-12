@@ -7,7 +7,8 @@ import re
 import shutil
 import subprocess
 import time
-from collections.abc import Iterator
+import uuid
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -17,6 +18,7 @@ from urllib.parse import SplitResult, urlsplit
 from ..config import DURABLE_STATE_DIR
 from ..context_fragment import ContextFragment
 from ..errors import HarnessError
+from .herdr import HerdrError, agent_session_identity, extract_marker
 from .herdr.cursor_auth import CursorMcpAuthError, CursorMcpAuthLinker
 
 LINEAR_HOSTS = {"linear.app", "www.linear.app"}
@@ -37,6 +39,7 @@ LINEAR_ISSUE = re.compile(
     re.IGNORECASE,
 )
 LINEAR_IDENTIFIER = re.compile(r"^[A-Z][A-Z0-9]+-\d+$", re.IGNORECASE)
+LINEAR_TEAM = re.compile(r"^[A-Z][A-Z0-9]{0,15}$", re.IGNORECASE)
 HEALTHY_MCP_STATUSES = frozenset({"connected", "ready"})
 LINEAR_ROUTER_LOCK = DURABLE_STATE_DIR / "linear-router.lock"
 MCP_ACCESS_FAILURE = re.compile(
@@ -56,6 +59,37 @@ MCP_ACCESS_FAILURE = re.compile(
 @dataclass(frozen=True)
 class LinearIssue:
     identifier: str
+
+
+@dataclass(frozen=True)
+class LinearTeam:
+    id: str
+    key: str
+    name: str
+
+
+@dataclass(frozen=True)
+class LinearTicketCreationPlan:
+    team_id: str
+    team_key: str
+    title: str
+    description: str
+    correlation_marker: str
+
+
+@dataclass(frozen=True)
+class LinearTicketCreationResult:
+    issue: LinearIssue
+    url: str
+    correlation_marker: str
+
+
+class LinearError(HarnessError):
+    """Linear integration failure."""
+
+
+class LinearOperationAmbiguous(LinearError):
+    """A Linear write may have completed despite a local failure."""
 
 
 @dataclass(frozen=True)
@@ -81,6 +115,26 @@ class RoutingClient(Protocol):
     def resolve_repository(
         self, hint: str | None, task: str, repositories: list[Path]
     ) -> tuple[Path | None, list[Path]]: ...
+
+
+class CreationClient(Protocol):
+    def ensure_router(self, reserved: set[str], *, checkpoint: Any = None) -> Any: ...
+
+    def get_agent(self, target: str) -> dict[str, Any]: ...
+
+    def prompt_and_wait(
+        self,
+        target: str,
+        text: str,
+        *,
+        token: str,
+        timeout: float,
+        checkpoint: Any = None,
+        baseline_sequence: int | None = None,
+        expected_agent_session: str | None = None,
+        before_submit: Any = None,
+        accepted: Any = None,
+    ) -> Any: ...
 
 
 def _split_url(url: str) -> SplitResult | None:
@@ -249,6 +303,288 @@ class LinearIntegration:
 
     def canonicalize_issue_reference(self, reference: str) -> str:
         return reference.strip().upper()
+
+    @staticmethod
+    def validate_team(team: str) -> str:
+        normalized = team.strip().upper()
+        if LINEAR_TEAM.fullmatch(normalized) is None:
+            raise LinearError("Linear ticket creation requires a valid team key")
+        return normalized
+
+    @classmethod
+    def validate_ticket_creation_plan(
+        cls,
+        plan: LinearTicketCreationPlan,
+    ) -> LinearTicketCreationPlan:
+        team_key = cls.validate_team(plan.team_key)
+        team_id = plan.team_id.strip()
+        title = " ".join(plan.title.split())
+        description = plan.description.strip()
+        marker = plan.correlation_marker.strip()
+        if (
+            not team_id
+            or len(team_id) > 128
+            or re.search(r"[\s\x00-\x1f]", team_id) is not None
+        ):
+            raise LinearError("Linear ticket creation requires a valid team ID")
+        if not title or len(title) > 255:
+            raise LinearError("Linear ticket creation requires a bounded title")
+        if not description or len(description) > 10_000:
+            raise LinearError("Linear ticket creation requires a bounded description")
+        if not re.fullmatch(r"[0-9a-f]{32}", marker):
+            raise LinearError("Linear ticket creation marker is invalid")
+        return LinearTicketCreationPlan(
+            team_id,
+            team_key,
+            title,
+            description,
+            marker,
+        )
+
+    def plan_ticket_creation(
+        self,
+        team_id: str,
+        team_key: str,
+        title: str,
+        description: str,
+        *,
+        correlation_marker: str | None = None,
+    ) -> LinearTicketCreationPlan:
+        return self.validate_ticket_creation_plan(
+            LinearTicketCreationPlan(
+                team_id,
+                team_key,
+                title,
+                description,
+                correlation_marker or uuid.uuid4().hex,
+            )
+        )
+
+    def resolve_team(
+        self,
+        client: CreationClient,
+        team_key: str,
+        *,
+        checkpoint: Any = None,
+    ) -> LinearTeam:
+        team_key = self.validate_team(team_key)
+        self.require_capabilities()
+        token = f"linear-team-{uuid.uuid4().hex[:12]}"
+        with _router_owner(checkpoint):
+            try:
+                router = client.ensure_router(set(), checkpoint=checkpoint)
+                outcome = client.prompt_and_wait(
+                    router.target,
+                    (
+                        "Use configured Linear MCP tools read-only. Resolve exactly one "
+                        f"team whose key is {team_key}. Do not create or modify anything. "
+                        "Return exactly one status. If exactly one team matches:\n"
+                        f"VOICE_LINEAR_STATUS[{token}]: found\n"
+                        f"VOICE_LINEAR_TEAM_ID[{token}]: <immutable team ID>\n"
+                        f"VOICE_LINEAR_TEAM_KEY[{token}]: <team key>\n"
+                        f"VOICE_LINEAR_TEAM_NAME[{token}]: <team name>\n"
+                        "If none match:\n"
+                        f"VOICE_LINEAR_STATUS[{token}]: not_found\n"
+                        "If multiple match or resolution is incomplete:\n"
+                        f"VOICE_LINEAR_STATUS[{token}]: ambiguous"
+                    ),
+                    token=token,
+                    timeout=180,
+                    checkpoint=checkpoint,
+                )
+            except HerdrError as exc:
+                raise LinearError(f"I couldn't find Linear team {team_key}.") from exc
+        status = extract_marker(outcome.output, "VOICE_LINEAR_STATUS", token)
+        if status != "found":
+            raise LinearError(f"I couldn't find Linear team {team_key}.")
+        team_id = extract_marker(outcome.output, "VOICE_LINEAR_TEAM_ID", token)
+        returned_key = extract_marker(outcome.output, "VOICE_LINEAR_TEAM_KEY", token)
+        name = extract_marker(outcome.output, "VOICE_LINEAR_TEAM_NAME", token)
+        if (
+            team_id is None
+            or returned_key is None
+            or name is None
+            or self.validate_team(returned_key) != team_key
+            or not name.strip()
+            or len(name.strip()) > 200
+        ):
+            raise LinearError("Linear MCP returned an invalid team identity")
+        validated = self.validate_ticket_creation_plan(
+            LinearTicketCreationPlan(
+                team_id,
+                team_key,
+                "validation",
+                "validation",
+                "0" * 32,
+            )
+        )
+        return LinearTeam(validated.team_id, team_key, name.strip())
+
+    @staticmethod
+    def _ticket_marker(marker: str) -> str:
+        return f"<!-- voice-harness-linear-ticket:{marker} -->"
+
+    @staticmethod
+    def _creation_result(
+        plan: LinearTicketCreationPlan,
+        identifier: str,
+        url: str,
+    ) -> LinearTicketCreationResult:
+        issue = linear_issue_from_url(url)
+        canonical = identifier.strip().upper()
+        if (
+            issue is None
+            or issue.identifier != canonical
+            or not canonical.startswith(f"{plan.team_key}-")
+        ):
+            raise LinearError("Linear MCP returned an invalid created ticket identity")
+        return LinearTicketCreationResult(issue, url.strip(), plan.correlation_marker)
+
+    def submit_ticket_creation(
+        self,
+        client: CreationClient,
+        plan: LinearTicketCreationPlan,
+        *,
+        confirmed: bool,
+        checkpoint: Any = None,
+        before_submit: Callable[[str, str, str, int], None] | None = None,
+        accepted: Callable[[], None] | None = None,
+    ) -> LinearTicketCreationResult:
+        if not confirmed:
+            raise LinearError("Linear ticket creation requires explicit confirmation")
+        plan = self.validate_ticket_creation_plan(plan)
+        self.require_capabilities()
+        token = f"linear-create-{uuid.uuid4().hex[:12]}"
+        description = (
+            f"{plan.description.rstrip()}\n\n"
+            f"{self._ticket_marker(plan.correlation_marker)}"
+        )
+        with _router_owner(checkpoint):
+            try:
+                router = client.ensure_router(set(), checkpoint=checkpoint)
+                agent = client.get_agent(router.target)
+            except HerdrError as exc:
+                raise LinearError(
+                    "Could not prepare authenticated Linear MCP access"
+                ) from exc
+            session = agent_session_identity(agent.get("agent_session"))
+            if session is None:
+                raise LinearError("Linear MCP router has no durable agent session")
+            baseline = int(agent.get("state_change_seq") or 0)
+            fenced = False
+            prompt_accepted = False
+
+            def persist_fence(observed_baseline: int) -> None:
+                nonlocal fenced
+                if observed_baseline != baseline:
+                    raise LinearOperationAmbiguous(
+                        "Linear MCP router changed before submission"
+                    )
+                if before_submit is not None:
+                    before_submit(router.target, session, token, baseline)
+                fenced = True
+
+            def mark_accepted() -> None:
+                nonlocal prompt_accepted
+                if accepted is not None:
+                    accepted()
+                prompt_accepted = True
+
+            prompt = (
+                "Create exactly one Linear issue using the configured Linear MCP tools. "
+                "This is an explicitly confirmed external write. Use only the exact "
+                "bounded values below; do not infer or add fields.\n\n"
+                f"Immutable team ID: {plan.team_id}\n"
+                f"Team key: {plan.team_key}\n"
+                f"Title: {plan.title}\n"
+                f"Description:\n{description}\n\n"
+                "After the MCP call succeeds, return exactly:\n"
+                f"VOICE_LINEAR_IDENTIFIER[{token}]: <created identifier>\n"
+                f"VOICE_LINEAR_URL[{token}]: <created https URL>"
+            )
+            try:
+                outcome = client.prompt_and_wait(
+                    router.target,
+                    prompt,
+                    token=token,
+                    timeout=180,
+                    checkpoint=checkpoint,
+                    expected_agent_session=session,
+                    baseline_sequence=baseline,
+                    before_submit=persist_fence,
+                    accepted=mark_accepted,
+                )
+            except HerdrError as exc:
+                error = (
+                    LinearOperationAmbiguous(
+                        "Linear ticket creation outcome is ambiguous"
+                    )
+                    if fenced or prompt_accepted
+                    else LinearError("Linear ticket creation was not submitted")
+                )
+                raise error from exc
+
+        identifier = extract_marker(outcome.output, "VOICE_LINEAR_IDENTIFIER", token)
+        url = extract_marker(outcome.output, "VOICE_LINEAR_URL", token)
+        if identifier is None or url is None:
+            raise LinearOperationAmbiguous(
+                "Linear MCP did not return the created ticket identity"
+            )
+        return self._creation_result(plan, identifier, url)
+
+    def observe_ticket_creation(
+        self,
+        client: CreationClient,
+        plan: LinearTicketCreationPlan,
+        *,
+        checkpoint: Any = None,
+    ) -> LinearTicketCreationResult | None:
+        plan = self.validate_ticket_creation_plan(plan)
+        self.require_capabilities()
+        token = f"linear-observe-{uuid.uuid4().hex[:12]}"
+        marker = self._ticket_marker(plan.correlation_marker)
+        with _router_owner(checkpoint):
+            try:
+                router = client.ensure_router(set(), checkpoint=checkpoint)
+                outcome = client.prompt_and_wait(
+                    router.target,
+                    (
+                        "Use configured Linear MCP tools read-only. Do not create or "
+                        "modify anything. Call list_issues with query set to this exact "
+                        "correlation marker from the issue description:\n"
+                        f"{marker}\n"
+                        "Do not search by team key; Linear team records may omit keys. "
+                        f"If list_issues accepts a team filter, pass team ID {plan.team_id}. "
+                        "Return exactly one status. If exactly one issue is found:\n"
+                        f"VOICE_LINEAR_STATUS[{token}]: found\n"
+                        f"VOICE_LINEAR_IDENTIFIER[{token}]: <identifier>\n"
+                        f"VOICE_LINEAR_URL[{token}]: <https URL>\n"
+                        "If a complete search proves it absent:\n"
+                        f"VOICE_LINEAR_STATUS[{token}]: not_found\n"
+                        "If more than one issue matches:\n"
+                        f"VOICE_LINEAR_STATUS[{token}]: multiple\n"
+                        "If the search cannot be completed:\n"
+                        f"VOICE_LINEAR_STATUS[{token}]: unknown"
+                    ),
+                    token=token,
+                    timeout=180,
+                    checkpoint=checkpoint,
+                )
+            except HerdrError as exc:
+                raise LinearError("Could not observe Linear ticket creation") from exc
+
+        status = extract_marker(outcome.output, "VOICE_LINEAR_STATUS", token)
+        if status == "not_found":
+            return None
+        if status == "multiple":
+            raise LinearError("Multiple Linear tickets have the correlation marker")
+        if status != "found":
+            raise LinearError("Linear ticket creation could not be observed")
+        identifier = extract_marker(outcome.output, "VOICE_LINEAR_IDENTIFIER", token)
+        url = extract_marker(outcome.output, "VOICE_LINEAR_URL", token)
+        if identifier is None or url is None:
+            raise LinearError("Linear MCP returned an incomplete ticket observation")
+        return self._creation_result(plan, identifier, url)
 
     def prompt_instructions(self, reference: str) -> tuple[str, ...]:
         if not self.owns_issue_reference(reference):
