@@ -642,19 +642,84 @@ def cancel_target_and_release(
             if value and value != uncertain_pane_target
         )
     )
-    interrupted = True
+    cleanup_confirmed = True
     if targets:
         try:
             client = herdr_factory()
             client.ensure_server()
             for participant_target in targets:
+                pane_id = ""
+                workspace_id = ""
+                creation_binding_replaced_current = bool(
+                    current.participant_creation_state == "created"
+                    and current.participant_creation_target
+                    and current.participant_creation_target != current.herdr_target
+                    and current.participant_creation_pane_id == current.herdr_pane_id
+                )
+                if (
+                    participant_target == current.herdr_target
+                    and not creation_binding_replaced_current
+                ):
+                    pane_id = current.herdr_pane_id or ""
+                    workspace_id = current.herdr_workspace_id or ""
+                if (
+                    participant_target == current.participant_creation_target
+                    and current.participant_creation_pane_id
+                    and current.participant_creation_workspace_id
+                ):
+                    pane_id = current.participant_creation_pane_id
+                    workspace_id = current.participant_creation_workspace_id
+                if not pane_id or not workspace_id:
+                    try:
+                        agent = client.get_agent(participant_target)
+                    except HerdrError as exc:
+                        if _agent_not_found(exc):
+                            continue
+                        cleanup_confirmed = False
+                        continue
+                    if not isinstance(agent, dict) or not agent:
+                        continue
+                    pane_id = str(agent.get("pane_id") or "")
+                    workspace_id = str(agent.get("workspace_id") or "")
+                    expected_workspace = (
+                        current.worktree_workspace_id
+                        or current.herdr_workspace_id
+                        or ""
+                    )
+                    expected_checkout = (
+                        current.worktree_path or current.repository or ""
+                    )
+                    actual_checkout = str(agent.get("cwd") or "")
+                    try:
+                        checkout_matches = bool(
+                            expected_checkout
+                            and actual_checkout
+                            and Path(expected_checkout).resolve()
+                            == Path(actual_checkout).resolve()
+                        )
+                    except OSError:
+                        checkout_matches = False
+                    if (
+                        not pane_id
+                        or not expected_workspace
+                        or workspace_id != expected_workspace
+                        or not checkout_matches
+                    ):
+                        cleanup_confirmed = False
+                        continue
+                if pane_id == current.worktree_root_pane_id:
+                    cleanup_confirmed = False
+                    continue
                 try:
-                    client.cancel_agent(participant_target)
-                except HerdrError as exc:
-                    if not _agent_not_found(exc):
-                        interrupted = False
+                    client.close_owned_pane(
+                        participant_target,
+                        pane_id,
+                        workspace_id,
+                    )
+                except HerdrError:
+                    cleanup_confirmed = False
         except HerdrError:
-            interrupted = False
+            cleanup_confirmed = False
 
     def release(job: CursorJob) -> CursorJob | None:
         if (
@@ -664,7 +729,7 @@ def cancel_target_and_release(
         ):
             return None
         if (
-            interrupted
+            cleanup_confirmed
             and worker_stopped
             and not _infrastructure_uncertain_for_release(job)
         ):

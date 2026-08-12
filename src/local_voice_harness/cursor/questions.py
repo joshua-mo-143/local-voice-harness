@@ -24,7 +24,6 @@ from ..user_config import (
 from .model import (
     CursorJob,
     JobStatus,
-    WorkflowParticipant,
     WorkflowPhase,
     WorkflowTier,
 )
@@ -517,12 +516,6 @@ def _workflow_review_answer(
     resolution: AnswerResolution,
     context: AnswerContext,
 ) -> AnswerTransition:
-    planner_target = job.participant_target(WorkflowParticipant.PLANNER)
-    if not planner_target:
-        return AnswerTransition(
-            None,
-            message=("The planner is unavailable. Please cancel or restart this job."),
-        )
     promoted = (
         WorkflowTier.HIGH_RISK
         if job.workflow_tier == WorkflowTier.MEDIUM
@@ -538,13 +531,11 @@ def _workflow_review_answer(
             resolution,
             context,
             request_text=f"{job.request}\n\nUser clarification: {context.text}",
-            herdr_target=planner_target,
             continuation=True,
             workflow_phase=WorkflowPhase.REVISING.value,
             workflow_tier=promoted.value if promoted is not None else None,
             workflow_reason=reason,
             review_round=max(1, job.review_round),
-            active_participant=WorkflowParticipant.PLANNER.value,
             extra_changes={
                 "plan_approval_state": "none",
                 "plan_approval_id": None,

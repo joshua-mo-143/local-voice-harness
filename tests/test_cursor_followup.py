@@ -902,10 +902,10 @@ def test_uncertain_followup_agent_wrong_cwd_is_failed_and_cancelled(
         now=time.time() + 2,
     )
 
-    client.cancel_agent.assert_called_once_with("wrong-agent")
+    client.close_owned_pane.assert_not_called()
     released = store.get(job.id)
-    assert not released.target_release_pending
-    assert not released.cancellation_reconciliation_pending
+    assert released.target_release_pending
+    assert released.cancellation_reconciliation_pending
 
 
 def _routing_child_with_ready_target(

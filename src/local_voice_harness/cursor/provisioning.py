@@ -1856,15 +1856,6 @@ def _advance_workflow_output(
                 clarification_kind="workflow_review_exhausted",
             )
             return None
-        planner_target = job.participant_target(WorkflowParticipant.PLANNER)
-        if not planner_target:
-            _workflow_block(
-                store,
-                job.id,
-                worker_token,
-                "The planner agent is unavailable for the required revision.",
-            )
-            return None
         return store.publish_artifact(
             job.id,
             "review",
@@ -1879,8 +1870,6 @@ def _advance_workflow_output(
                 workflow_phase=WorkflowPhase.REVISING.value,
                 review_artifact=reference,
                 review_round=current.review_round + 1,
-                active_participant=WorkflowParticipant.PLANNER.value,
-                herdr_target=planner_target,
                 prompt_operation_state="none",
                 review_approved=False,
                 review_decision="revise",
@@ -1933,15 +1922,6 @@ def _advance_workflow_output(
                     "Cursor requested a workflow promotion that did not increase risk.",
                 )
                 return None
-            planner_target = job.participant_target(WorkflowParticipant.PLANNER)
-            if not planner_target:
-                _workflow_block(
-                    store,
-                    job.id,
-                    worker_token,
-                    "The planner agent is unavailable for workflow promotion.",
-                )
-                return None
             hard_risk_evidence = _hard_risk_evidence(
                 job.request,
                 promotion_reason,
@@ -1964,8 +1944,6 @@ def _advance_workflow_output(
                     workflow_tier=promoted.value,
                     workflow_classification_reason=classification_reason[:500],
                     workflow_phase=WorkflowPhase.PLANNING.value,
-                    active_participant=WorkflowParticipant.PLANNER.value,
-                    herdr_target=planner_target,
                     review_round=0,
                     plan_artifact=None,
                     review_artifact=None,
@@ -2105,39 +2083,94 @@ def _ensure_workflow_participant(
     target = job.participant_target(participant)
     if job.active_participant == participant and target == job.herdr_target and target:
         return job, target
-    if participant == WorkflowParticipant.PLANNER and target:
-        updated = _worker_change(
-            store,
-            job.id,
-            worker_token,
-            MODEL_WORKER_STATUSES,
-            lambda current: current.evolve(
-                active_participant=participant.value,
-                herdr_target=target,
-            ),
-        )
-        if updated is None:
-            raise WorkerCancelled
-        return updated, target
-
-    # Non-planner roles must be fresh, but do not overwrite the only durable
-    # handle to an earlier participant until that agent has been stopped.
-    if target:
-        try:
-            client.cancel_agent(target)
-        except HerdrError as exc:
-            if not _agent_not_found(exc):
-                raise HarnessError(
-                    f"could not stop previous {participant.value} agent"
-                ) from exc
 
     checkout_value = job.worktree_path or job.repository
-    workspace = job.herdr_workspace_id or job.worktree_workspace_id or ""
+    workspace = job.worktree_workspace_id or job.herdr_workspace_id or ""
     if not checkout_value or not workspace:
         raise HarnessError(
             "workflow participant requires a prepared checkout and workspace"
         )
     checkout = Path(checkout_value).resolve()
+
+    owned_targets = list(
+        dict.fromkeys(
+            candidate
+            for candidate in (
+                job.herdr_target,
+                job.participant_target(WorkflowParticipant.PLANNER),
+                job.participant_target(WorkflowParticipant.REVIEWER),
+                job.participant_target(WorkflowParticipant.IMPLEMENTER),
+            )
+            if candidate
+        )
+    )
+    for owned_target in owned_targets:
+        pane_id = ""
+        workspace_id = ""
+        if owned_target == job.herdr_target:
+            pane_id = job.herdr_pane_id or ""
+            workspace_id = job.herdr_workspace_id or ""
+        if not pane_id or not workspace_id:
+            try:
+                observed = client.get_agent(owned_target)
+            except HerdrError as exc:
+                if _agent_not_found(exc):
+                    continue
+                raise
+            observed_cwd = str(observed.get("cwd") or "")
+            observed_pane = str(observed.get("pane_id") or "")
+            observed_workspace = str(observed.get("workspace_id") or "")
+            try:
+                cwd_matches = Path(observed_cwd).resolve() == checkout
+            except OSError:
+                cwd_matches = False
+            if (
+                not cwd_matches
+                or observed_workspace != workspace
+                or not observed_pane
+                or observed_pane == job.worktree_root_pane_id
+            ):
+                raise HarnessError(
+                    f"could not verify ownership of previous {owned_target} pane"
+                )
+            pane_id = observed_pane
+            workspace_id = observed_workspace
+        if pane_id == job.worktree_root_pane_id:
+            raise HarnessError("refusing to close the retained workspace anchor")
+        try:
+            client.close_owned_pane(owned_target, pane_id, workspace_id)
+        except HerdrError as exc:
+            raise HarnessError("could not close previous workflow participant") from exc
+
+    def clear_closed_participants(current: CursorJob) -> CursorJob:
+        if (
+            current.herdr_target != job.herdr_target
+            or current.herdr_pane_id != job.herdr_pane_id
+            or current.herdr_workspace_id != job.herdr_workspace_id
+        ):
+            raise WorkerCancelled
+        return current.evolve(
+            herdr_target=None,
+            herdr_pane_id=None,
+            herdr_workspace_id=None,
+            agent_name=None,
+            agent_dispatch_state="confirmed_absent",
+            active_participant=None,
+            planner_target=None,
+            reviewer_target=None,
+            implementer_target=None,
+        )
+
+    cleared = _worker_change(
+        store,
+        job.id,
+        worker_token,
+        MODEL_WORKER_STATUSES,
+        clear_closed_participants,
+    )
+    if cleared is None:
+        raise WorkerCancelled
+    job = cleared
     selection_holder: dict[str, AgentSelection] = {}
     role_label = f"{job.worktree_label or checkout.name}-{participant.value}"
     if (

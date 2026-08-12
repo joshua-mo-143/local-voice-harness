@@ -9,6 +9,7 @@ from unittest import mock
 from local_voice_harness.integrations.herdr import (
     AgentSelection,
     HerdrClient,
+    HerdrError,
     HerdrRepository,
     HerdrTransport,
     HerdrWorkspace,
@@ -38,6 +39,120 @@ class HerdrComponentBoundaryTests(unittest.TestCase):
                 mock.call("agent", "wait", "agent", "--timeout", "5000", timeout=10),
             ],
         )
+
+    def test_owned_pane_close_verifies_binding_and_post_close_absence(self) -> None:
+        client = HerdrClient("herdr")
+        agent = {
+            "name": "planner",
+            "pane_id": "workspace:participant",
+            "workspace_id": "workspace",
+        }
+        pane = {
+            "pane_id": "workspace:participant",
+            "workspace_id": "workspace",
+        }
+        with (
+            mock.patch.object(
+                client,
+                "get_agent",
+                side_effect=[
+                    agent,
+                    HerdrError("absent", code="agent_not_found"),
+                ],
+            ),
+            mock.patch.object(
+                client,
+                "run_json",
+                side_effect=[
+                    {"pane": pane},
+                    {},
+                    HerdrError("absent", code="pane_not_found"),
+                ],
+            ) as run_json,
+            mock.patch.object(client.session, "cancel_agent") as cancel,
+        ):
+            client.close_owned_pane(
+                "planner",
+                "workspace:participant",
+                "workspace",
+            )
+
+        cancel.assert_called_once_with("planner")
+        self.assertEqual(
+            run_json.call_args_list,
+            [
+                mock.call("pane", "get", "workspace:participant"),
+                mock.call("pane", "close", "workspace:participant"),
+                mock.call("pane", "get", "workspace:participant"),
+            ],
+        )
+
+    def test_owned_pane_close_is_idempotent_when_agent_and_pane_are_absent(
+        self,
+    ) -> None:
+        client = HerdrClient("herdr")
+        with (
+            mock.patch.object(
+                client,
+                "get_agent",
+                side_effect=HerdrError("absent", code="agent_not_found"),
+            ),
+            mock.patch.object(
+                client,
+                "run_json",
+                side_effect=HerdrError("absent", code="pane_not_found"),
+            ) as run_json,
+            mock.patch.object(client.session, "cancel_agent") as cancel,
+        ):
+            client.close_owned_pane("planner", "workspace:pane", "workspace")
+
+        run_json.assert_called_once_with("pane", "get", "workspace:pane")
+        cancel.assert_not_called()
+
+    def test_owned_pane_close_fails_closed_on_binding_mismatch(self) -> None:
+        client = HerdrClient("herdr")
+        with (
+            mock.patch.object(
+                client,
+                "get_agent",
+                return_value={
+                    "name": "planner",
+                    "pane_id": "workspace:other",
+                    "workspace_id": "workspace",
+                },
+            ),
+            mock.patch.object(client, "run_json") as run_json,
+            self.assertRaises(HerdrError) as raised,
+        ):
+            client.close_owned_pane("planner", "workspace:pane", "workspace")
+
+        self.assertEqual(raised.exception.code, "ownership_mismatch")
+        run_json.assert_not_called()
+
+    def test_owned_pane_close_retains_failure_when_close_needs_confirmation(
+        self,
+    ) -> None:
+        client = HerdrClient("herdr")
+        pane = {"pane_id": "workspace:pane", "workspace_id": "workspace"}
+        with (
+            mock.patch.object(
+                client,
+                "get_agent",
+                side_effect=HerdrError("absent", code="agent_not_found"),
+            ),
+            mock.patch.object(
+                client,
+                "run_json",
+                side_effect=[
+                    {"pane": pane},
+                    HerdrError("confirmation required", code="confirmation_required"),
+                ],
+            ),
+            self.assertRaises(HerdrError) as raised,
+        ):
+            client.close_owned_pane("planner", "workspace:pane", "workspace")
+
+        self.assertEqual(raised.exception.code, "confirmation_required")
 
     def test_repository_resolution_is_independent_of_workspace(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -147,12 +262,12 @@ class HerdrComponentBoundaryTests(unittest.TestCase):
         operations.find_agent.return_value = None
         operations.workspace_for.return_value = None
         operations.planned_worktree_path.return_value = checkout
-        operations.new_pane.return_value = ("pane", "workspace")
+        operations.new_pane.return_value = ("participant-pane", "workspace")
         workspace = HerdrWorkspace(operations)
         events: list[str] = []
         selection = AgentSelection(
             "planned-agent",
-            "pane",
+            "participant-pane",
             "workspace",
             str(checkout),
             "planned-agent",
@@ -179,7 +294,7 @@ class HerdrComponentBoundaryTests(unittest.TestCase):
                 events.append("agent:started"),
                 selection,
             )[1],
-        ):
+        ) as start_agent:
             workspace.ensure_agent(
                 Path("/tmp/repository"),
                 issue_key=None,
@@ -202,6 +317,15 @@ class HerdrComponentBoundaryTests(unittest.TestCase):
                 "agent:started",
                 "agent:settled",
             ],
+        )
+        start_agent.assert_called_once_with(
+            checkout,
+            "repository",
+            "participant-pane",
+            "workspace",
+            name=mock.ANY,
+            mode=None,
+            checkpoint=None,
         )
 
     def test_router_workspace_is_not_a_transport_concern(self) -> None:

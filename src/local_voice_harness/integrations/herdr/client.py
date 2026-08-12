@@ -349,3 +349,11 @@ class HerdrClient:
 
     def cancel_agent(self, target: str) -> None:
         self.session.cancel_agent(target)
+
+    def close_owned_pane(
+        self,
+        target: str,
+        pane_id: str,
+        workspace_id: str,
+    ) -> None:
+        self.session.close_owned_pane(target, pane_id, workspace_id)
