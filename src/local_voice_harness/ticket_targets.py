@@ -20,7 +20,7 @@ MISSING_ISSUE_SCOPE_RESPONSE = (
 _GITHUB_URL = re.compile(
     r"https://(?:www\.)?github\.com/"
     r"(?P<owner>[A-Za-z0-9_.-]+)/(?P<repo>[A-Za-z0-9_.-]+)/issues/"
-    r"(?P<number>\d+)/?(?![A-Za-z0-9_./-])",
+    r"(?P<number>\d+)/?(?![A-Za-z0-9_/-])",
     re.IGNORECASE,
 )
 _GITHUB_REFERENCE = re.compile(

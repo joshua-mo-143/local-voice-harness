@@ -200,6 +200,51 @@ def test_fanout_preflights_every_target_before_bounded_background_starts() -> No
     foreground.assert_not_called()
 
 
+def test_repeated_full_github_urls_start_only_github_children() -> None:
+    client = mock.Mock()
+    client.issue_details.side_effect = lambda issue: {
+        "number": issue.number,
+        "title": f"Issue {issue.number}",
+        "state": "OPEN",
+        "url": (
+            "https://github.com/joshua-mo-143/"
+            f"local-voice-harness-batch-fixture/issues/{issue.number}"
+        ),
+    }
+    started: list[StartJobRequest] = []
+
+    def start(request: StartJobRequest, **_kwargs: object) -> str:
+        started.append(request)
+        return f"job-{request.github_issue}"
+
+    utterance = (
+        "Work on https://github.com/joshua-mo-143/"
+        "local-voice-harness-batch-fixture/issues/3 and "
+        "https://github.com/joshua-mo-143/"
+        "local-voice-harness-batch-fixture/issues/5."
+    )
+    with (
+        mock.patch.object(service, "GitHubClient", return_value=client),
+        mock.patch.object(service, "integration_enabled", return_value=True),
+        mock.patch.object(service, "start_job", side_effect=start),
+        mock.patch.object(service, "read_job", side_effect=KeyError),
+    ):
+        result = service.cursor_turn(CursorTurnRequest(utterance, utterance=utterance))
+
+    assert [
+        (request.issue_key, request.github_repository, request.github_issue)
+        for request in started
+    ] == [
+        (None, "joshua-mo-143/local-voice-harness-batch-fixture", 3),
+        (None, "joshua-mo-143/local-voice-harness-batch-fixture", 5),
+    ]
+    response = as_assistant_response(result.text)
+    assert "MO-143" not in response.display_text
+    assert response.display_text.index(
+        "local-voice-harness-batch-fixture#3"
+    ) < response.display_text.index("local-voice-harness-batch-fixture#5")
+
+
 def test_multi_ticket_repository_ambiguities_use_one_durable_grouped_question(
     tmp_path: Path,
 ) -> None:
