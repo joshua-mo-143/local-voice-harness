@@ -1776,6 +1776,7 @@ def cancel_job(
 def job_status(job_id: str | None = None) -> str:
     if job_id:
         job = read_job(job_id)
+        label = inbox.speakable_label_for(job)
         if (
             job.manual_reconcile_operation == "pane"
             and job.participant_creation_state == "manual_required"
@@ -1783,7 +1784,7 @@ def job_status(job_id: str | None = None) -> str:
             participant = job.participant_creation_participant or "workflow"
             target = job.participant_creation_target or "unknown"
             return (
-                f"Cursor job {job_id} requires manual reconciliation for the "
+                f"{label} requires manual reconciliation for the "
                 f"{participant} pane target {target}. Inspect Herdr, then resolve "
                 "pane creation as materialized or confirmed absent using token "
                 f"{job.manual_reconcile_token}."
@@ -1792,7 +1793,7 @@ def job_status(job_id: str | None = None) -> str:
             f", {job.workflow_tier.value} tier" if job.workflow_tier is not None else ""
         )
         return (
-            f"Cursor job {job_id} is {job.status.value.replace('_', ' ')}, "
+            f"{label} is {job.status.value.replace('_', ' ')}, "
             f"in {job.workflow_phase.value.replace('_', ' ')}{workflow}."
         )
     jobs = [job for job in _job_store().list() if job.status in ACTIVE_STATUSES]
@@ -1801,7 +1802,8 @@ def job_status(job_id: str | None = None) -> str:
     return (
         "Active Cursor jobs: "
         + "; ".join(
-            f"{job.id} is {job.status.value.replace('_', ' ')} "
+            f"{inbox.speakable_label_for(job)} is "
+            f"{job.status.value.replace('_', ' ')} "
             f"({job.workflow_phase.value.replace('_', ' ')})"
             for job in jobs
         )

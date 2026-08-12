@@ -124,6 +124,21 @@ def test_status_reports_speakable_label(store: JobStore) -> None:
     assert result.text == "issue 42 is running."
 
 
+def test_compatibility_status_uses_labels_instead_of_job_ids(store: JobStore) -> None:
+    _make(store, "aaaaaaaaaaaa", status="running", label="issue 42")
+    _make(store, "bbbbbbbbbbbb", status="running", label="readme update")
+
+    single = service.job_status("aaaaaaaaaaaa")
+    active = service.job_status()
+
+    assert "issue 42 is running" in single
+    assert "aaaaaaaaaaaa" not in single
+    assert "issue 42" in active
+    assert "readme update" in active
+    assert "aaaaaaaaaaaa" not in active
+    assert "bbbbbbbbbbbb" not in active
+
+
 def test_status_resolves_linear_ticket_over_same_github_number(
     store: JobStore,
 ) -> None:

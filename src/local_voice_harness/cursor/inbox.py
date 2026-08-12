@@ -10,6 +10,7 @@ here, and persisting any state changes.
 from __future__ import annotations
 
 import re
+from collections import Counter
 from dataclasses import dataclass
 
 from .model import (
@@ -319,9 +320,17 @@ def resolve_reference(jobs: list[CursorJob], reference: str) -> ReferenceResolut
 def clarify(summaries: list[JobSummary], action: str) -> str:
     """Build a clarification prompt listing the candidate jobs."""
 
-    labels = [summary.label.casefold() for summary in summaries]
-    needs_id = len(labels) != len(set(labels))
-    options = _join([summary.spoken(disambiguator=needs_id) for summary in summaries])
+    label_counts = Counter(
+        _normalize(summary.label).casefold() for summary in summaries
+    )
+    options = _join(
+        [
+            summary.spoken(
+                disambiguator=label_counts[_normalize(summary.label).casefold()] > 1
+            )
+            for summary in summaries
+        ]
+    )
     if not options:
         return f"I could not find a job to {action}."
     return f"There are several jobs I could {action}. Which one: {options}?"

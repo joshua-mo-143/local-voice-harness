@@ -419,8 +419,43 @@ class QwenClientTests(unittest.TestCase):
         notify.assert_not_called()
         second_request = urlopen.call_args_list[1].args[0]
         second_payload = json.loads(second_request.data)
-        self.assertEqual(second_payload["messages"][-1]["content"], result.spoken_text)
-        self.assertNotIn(result.display_text, second_payload["messages"][-1]["content"])
+        self.assertEqual(
+            second_payload["messages"][-1]["content"],
+            "Spoken response: Two tickets were rejected.\n"
+            "Detailed outcome: Ticket starts: #92: rejected; #93: rejected.",
+        )
+
+    def test_tool_result_preserves_partial_batch_mapping_without_job_ids(self) -> None:
+        result = AssistantResponse(
+            spoken_text="One job started; one ticket rejected.",
+            display_text=(
+                "Ticket starts: example/project#92: accepted as job aaaaaaaaaaaa; "
+                "example/project#93: rejected "
+                "(active job bbbbbbbbbbbb already exists)."
+            ),
+        )
+
+        tool_result = llm._cursor_tool_result(result)
+
+        self.assertIn("One job started; one ticket rejected.", tool_result)
+        self.assertIn("example/project#92: accepted", tool_result)
+        self.assertIn("example/project#93: rejected", tool_result)
+        self.assertNotIn("aaaaaaaaaaaa", tool_result)
+        self.assertNotIn("bbbbbbbbbbbb", tool_result)
+
+    def test_tool_result_preserves_commit_ids_and_redacts_job_log_names(self) -> None:
+        result = AssistantResponse(
+            spoken_text="The job failed during implementation.",
+            display_text=(
+                "Cursor job aaaaaaaaaaaa failed after commit c0ffee123456. "
+                "Inspect /tmp/logs/aaaaaaaaaaaa.log."
+            ),
+        )
+
+        tool_result = llm._cursor_tool_result(result)
+
+        self.assertIn("commit c0ffee123456", tool_result)
+        self.assertNotIn("aaaaaaaaaaaa", tool_result)
 
     def test_retries_without_replaying_malformed_tool_arguments(self) -> None:
         malformed_call = {

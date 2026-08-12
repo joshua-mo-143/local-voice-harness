@@ -230,11 +230,14 @@ class InboxSummaryTests(unittest.TestCase):
             [
                 _job("aaaaaaaaaaaa", speakable_label="readme update"),
                 _job("bbbbbbbbbbbb", speakable_label="readme update"),
+                _job("cccccccccccc", speakable_label="issue 42"),
             ]
         )
         prompt = inbox.clarify(summaries, "cancel")
         self.assertIn("readme update (aaaa)", prompt)
         self.assertIn("readme update (bbbb)", prompt)
+        self.assertIn("issue 42", prompt)
+        self.assertNotIn("issue 42 (cccc)", prompt)
 
     def test_summary_detail_reflects_status(self) -> None:
         awaiting = inbox.summarize(_job("aaaaaaaaaaaa", status="awaiting_user"))
