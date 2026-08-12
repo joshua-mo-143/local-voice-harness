@@ -10,6 +10,8 @@ import unittest
 from pathlib import Path
 from typing import Any
 
+from local_voice_harness import config_management
+
 CHILD = Path(__file__).with_name("runtime_config_child.py")
 
 
@@ -170,6 +172,48 @@ class RuntimeConfigProcessTests(unittest.TestCase):
             restarted["config"]["providers"]["llm_model"],
             "restart-model",
         )
+
+    def test_committed_change_does_not_mutate_running_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            config_home = Path(temporary)
+            config_dir = config_home / "voice-harness"
+            config_dir.mkdir()
+            path = config_dir / "config.toml"
+            path.write_text('[audio]\nvoice = "startup-voice"\n')
+            process = subprocess.Popen(
+                [sys.executable, str(CHILD), "watch"],
+                env=_environment(config_home),
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+            assert process.stdin is not None
+            assert process.stdout is not None
+            try:
+                startup = json.loads(process.stdout.readline())
+                paths = config_management.ConfigPaths(
+                    config=path,
+                    backends=config_dir / "backends.toml",
+                    backend_env=config_home / "dictation" / "backend.env",
+                    home=Path.home(),
+                )
+                config_management.commit_config_change(
+                    {"audio.voice": "committed-voice"},
+                    paths=paths,
+                )
+                process.stdin.write("snapshot\n")
+                process.stdin.flush()
+                unchanged = json.loads(process.stdout.readline())
+            finally:
+                process.stdin.close()
+                process.wait(timeout=5)
+
+            restarted = _snapshot(config_home)
+
+        self.assertEqual(startup, unchanged)
+        self.assertEqual(startup["config"]["audio"]["voice"], "startup-voice")
+        self.assertEqual(restarted["config"]["audio"]["voice"], "committed-voice")
 
     def test_malformed_config_fails_at_process_boundary_with_source_path(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

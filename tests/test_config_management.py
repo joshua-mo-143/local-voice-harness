@@ -145,6 +145,32 @@ class ConfigManagementTests(unittest.TestCase):
             self.assertIn("voice-harness-wake.service", notice)
             self.assertNotIn("dictation.service", notice)
 
+    def test_expected_value_fences_stale_confirmed_change(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            paths = self.paths(root)
+            config_management.commit_config_change(
+                {"audio.voice": "original"},
+                paths=paths,
+            )
+            config_management.commit_config_change(
+                {"audio.voice": "intervening"},
+                paths=paths,
+            )
+
+            with self.assertRaisesRegex(
+                config_management.StaleConfigChangeError,
+                "changed after confirmation",
+            ):
+                config_management.commit_config_change(
+                    {"audio.voice": "confirmed"},
+                    paths=paths,
+                    expected_values={"audio.voice": "original"},
+                )
+
+            current = config_management.load_managed_config(paths)
+            self.assertEqual(current.audio.voice, "intervening")
+
     def test_switching_to_venice_still_stops_an_active_local_llm(self) -> None:
         config = config_management.default_user_config()
         config = replace(

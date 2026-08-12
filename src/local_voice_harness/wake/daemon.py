@@ -17,6 +17,7 @@ import wave
 from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 from .. import recorder
 from ..agents.model import AgentJob as CursorJob
@@ -42,6 +43,7 @@ from ..config import (
     WAKE_PID_PATH,
     WAV_PATH,
 )
+from ..config_management import StaleConfigChangeError
 from ..critical_targets import (
     CriticalTarget,
     ReadbackCandidate,
@@ -110,7 +112,15 @@ from ..questions import (
 from ..responses import AssistantResponse, ResponseLike, as_assistant_response
 from ..self_management import (
     UNSUPPORTED_INSPECTION_RESPONSE,
+    ConfigChangeRequest,
+    ConfirmationDecision,
+    PendingConfigChange,
+    commit_pending_change,
     inspect_config_utterance,
+    prepare_config_change,
+    render_change_committed,
+    render_change_preparation,
+    resolve_confirmation,
 )
 from ..speech import SpeechRenderer, StreamingSpeechRenderer
 from ..stt.client import transcribe
@@ -405,14 +415,14 @@ class WakeConversationDaemon:
             local_checkout=PROJECT_ROOT
         )
         self.integrations = build_integration_registry(user_config)
-        self.np = np
+        self.np: Any = np
         module_path = openwakeword.__file__
         if module_path is None:
             raise HarnessError("Could not locate OpenWakeWord package resources")
         model_path = (
             Path(module_path).parent / "resources" / "models" / "hey_jarvis_v0.1.onnx"
         )
-        self.wake_model = Model(
+        self.wake_model: Any = Model(
             wakeword_models=[str(model_path)],
             inference_framework="onnx",
             vad_threshold=0.0,
@@ -429,6 +439,7 @@ class WakeConversationDaemon:
             maxlen=RECENT_PLAYBACK_LIMIT
         )
         self.pending_target_readback: PendingTargetReadback | None = None
+        self.pending_config_change: PendingConfigChange | None = None
         self.conversation_deadline = 0.0
         self.awaiting_followup = False
         self.last_wake = 0.0
@@ -630,6 +641,7 @@ class WakeConversationDaemon:
         self.completed_followup = None
         self.recent_playback.clear()
         self.pending_target_readback = None
+        self.pending_config_change = None
         self.conversation_deadline = 0.0
         self.awaiting_followup = False
         self.pause_microphone()
@@ -644,6 +656,7 @@ class WakeConversationDaemon:
         log(f"pending-question capture closed: {reason}")
         self.history.clear()
         self.completed_followup = None
+        self.pending_config_change = None
         self.conversation_deadline = 0.0
         self.awaiting_followup = False
         self.pause_microphone()
@@ -1182,6 +1195,47 @@ class WakeConversationDaemon:
                 return
             interruption = self.process_utterance(audio_path, woke=interruption.woke)
 
+    def _resolve_pending_config_confirmation(
+        self,
+        text: str,
+        *,
+        blocked: bool,
+    ) -> tuple[
+        AssistantResponse | None, ConfirmationDecision, PendingConfigChange | None
+    ]:
+        pending = self.pending_config_change
+        if pending is None or blocked:
+            return None, ConfirmationDecision.AMBIGUOUS, pending
+        decision = resolve_confirmation(text)
+        if decision == ConfirmationDecision.AMBIGUOUS:
+            return None, decision, pending
+        self.pending_config_change = None
+        if decision == ConfirmationDecision.CANCEL:
+            return (
+                AssistantResponse.from_text(
+                    "Okay, I cancelled that configuration change. Nothing was written."
+                ),
+                decision,
+                pending,
+            )
+        try:
+            result = commit_pending_change(pending)
+        except StaleConfigChangeError:
+            response = AssistantResponse.from_text(
+                "The stored value changed before confirmation, so I didn't write "
+                "anything. Please start the change again."
+            )
+        except Exception as exc:  # noqa: BLE001 - report a bounded write failure
+            log(f"confirmed configuration write failed: {type(exc).__name__}: {exc}")
+            response = AssistantResponse.from_text(
+                "I couldn't save that configuration change, so I didn't write "
+                "anything. The running configuration snapshot is unchanged; "
+                "please start the change again."
+            )
+        else:
+            response = render_change_committed(pending, result)
+        return response, decision, pending
+
     def process_utterance(  # pyright: ignore[reportGeneralTypeIssues]
         self, audio_path: Path, *, woke: bool
     ) -> BargeIn | None:
@@ -1193,14 +1247,22 @@ class WakeConversationDaemon:
             try:
                 text = transcribe(audio_path)
             except NoSpeechError:
-                if getattr(self, "pending_target_readback", None) is None:
+                if (
+                    getattr(self, "pending_target_readback", None) is None
+                    and getattr(self, "pending_config_change", None) is None
+                ):
                     raise
-                log("critical-target reply contained no recognizable speech")
+                log("confirmation reply contained no recognizable speech")
                 self.awaiting_followup = True
                 self.conversation_deadline = (
                     time.monotonic() + CONVERSATION_TIMEOUT_SECONDS
                 )
-                notify("I didn't catch that. Please repeat yes, no, or the correction.")
+                if getattr(self, "pending_target_readback", None) is not None:
+                    notify(
+                        "I didn't catch that. Please repeat yes, no, or the correction."
+                    )
+                else:
+                    notify("I didn't catch that. Please repeat yes or no.")
                 return None
             if woke:
                 text, found_wake = strip_wake_prefix(text)
@@ -1284,9 +1346,21 @@ class WakeConversationDaemon:
                         "That confirmation expired because the target context changed. "
                         "Please repeat the request."
                     )
+            (
+                config_response,
+                config_decision,
+                pending_config,
+            ) = self._resolve_pending_config_confirmation(
+                text,
+                blocked=pending_readback is not None,
+            )
             active_completed = self._active_completed_followup()
             pending = self._pending_cursor_question()
-            if readback_result is not None or confirmed_request is not None:
+            if (
+                readback_result is not None
+                or confirmed_request is not None
+                or config_response is not None
+            ):
                 route = IntentRoute(Intent.UNCERTAIN, "low")
             else:
                 route = route_intent(
@@ -1298,7 +1372,7 @@ class WakeConversationDaemon:
                     recent_completion=active_completed is not None,
                     settings=self.providers,
                 )
-                if pending is not None:
+                if pending is not None and pending_config is None:
                     deterministic_answer = (
                         resolve_answer(
                             pending.question,
@@ -1349,6 +1423,21 @@ class WakeConversationDaemon:
                         # close silently and leave the durable question untouched.
                         self.close_pending_capture("non-actionable speech")
                         return None
+            if (
+                pending_config is not None
+                and config_decision == ConfirmationDecision.AMBIGUOUS
+                and config_response is None
+            ):
+                if route.intent == Intent.HARNESS_CONFIG_CHANGE:
+                    self.pending_config_change = None
+                elif route.actionable:
+                    self.pending_config_change = None
+                else:
+                    config_response = AssistantResponse.from_text(
+                        "Please say yes to confirm that configuration change or no to "
+                        "cancel it."
+                    )
+                    route = IntentRoute(Intent.UNCERTAIN, "low")
             if pending_readback is None and (
                 route.intent == Intent.CONVERSATION
                 or (
@@ -1393,7 +1482,9 @@ class WakeConversationDaemon:
                 Intent.AGENT_SUBMIT,
                 Intent.UNCERTAIN,
             }
-            if readback_result is not None:
+            if config_response is not None:
+                response = config_response
+            elif readback_result is not None:
                 response = readback_result
             elif confirmed_request is not None:
                 self.completed_followup = None
@@ -1438,6 +1529,20 @@ class WakeConversationDaemon:
                     if route.actionable
                     else AssistantResponse.from_text(UNSUPPORTED_INSPECTION_RESPONSE)
                 )
+            elif route.intent == Intent.HARNESS_CONFIG_CHANGE:
+                if route.actionable:
+                    preparation = prepare_config_change(
+                        ConfigChangeRequest(text, route.raw_value),
+                        self.user_config,
+                    )
+                    self.pending_config_change = preparation.pending
+                    response = render_change_preparation(preparation)
+                else:
+                    self.pending_config_change = None
+                    response = AssistantResponse.from_text(
+                        "I couldn't identify a safe configuration change, so I didn't "
+                        "write anything."
+                    )
             elif missing_ticket_scope:
                 response = MISSING_ISSUE_SCOPE_RESPONSE
             elif route.actionable and route.intent == Intent.QUESTION_CONSULTATION:
@@ -1850,6 +1955,7 @@ class WakeConversationDaemon:
 
     def stop(self) -> None:
         self.running = False
+        self.pending_config_change = None
         if self.microphone is not None and self.microphone.poll() is None:
             if self.microphone_paused:
                 with contextlib.suppress(ProcessLookupError):

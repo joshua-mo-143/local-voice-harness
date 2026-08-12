@@ -16,7 +16,18 @@ LOCAL_SETTINGS = load_backend_settings(
 )
 
 
-def _response(route: str, confidence: str = "high") -> io.BytesIO:
+def _response(
+    route: str,
+    confidence: str = "high",
+    *,
+    raw_value: object = None,
+) -> io.BytesIO:
+    arguments: dict[str, object] = {
+        "intent": route,
+        "confidence": confidence,
+    }
+    if raw_value is not None:
+        arguments["raw_value"] = raw_value
     return io.BytesIO(
         json.dumps(
             {
@@ -27,12 +38,7 @@ def _response(route: str, confidence: str = "high") -> io.BytesIO:
                                 {
                                     "function": {
                                         "name": "route_intent",
-                                        "arguments": json.dumps(
-                                            {
-                                                "intent": route,
-                                                "confidence": confidence,
-                                            }
-                                        ),
+                                        "arguments": json.dumps(arguments),
                                     }
                                 }
                             ]
@@ -443,6 +449,47 @@ class HarnessConfigInspectionIntentTests(LocalRouterTestCase):
 
             self.assertEqual(route.intent, intent.Intent.HARNESS_CONFIG_INSPECT)
             self.assertEqual(route.actionable, actionable)
+
+
+class HarnessConfigChangeIntentTests(LocalRouterTestCase):
+    def test_route_tool_exposes_change_intent_and_raw_value(self) -> None:
+        properties = intent.ROUTE_TOOL["function"]["parameters"]["properties"]
+        self.assertIn("harness_config_change", properties["intent"]["enum"])
+        self.assertIn("raw_value", properties)
+
+    def test_change_route_retains_typed_raw_value(self) -> None:
+        with mock.patch.object(
+            llm_transport.urllib.request,
+            "urlopen",
+            return_value=_response(
+                "harness_config_change",
+                raw_value="vad",
+            ),
+        ):
+            route = intent.route_intent(
+                "Set barge-in mode to vad",
+                RequestContext("Set barge-in mode to vad"),
+            )
+
+        self.assertEqual(route.intent, intent.Intent.HARNESS_CONFIG_CHANGE)
+        self.assertEqual(route.raw_value, "vad")
+        self.assertTrue(route.actionable)
+
+    def test_non_string_raw_value_fails_closed(self) -> None:
+        with mock.patch.object(
+            llm_transport.urllib.request,
+            "urlopen",
+            return_value=_response(
+                "harness_config_change",
+                raw_value={"key": "audio.voice"},
+            ),
+        ):
+            route = intent.route_intent(
+                "Change the voice",
+                RequestContext("Change the voice"),
+            )
+
+        self.assertEqual(route, intent.FALLBACK_ROUTE)
 
 
 class ForkIntentTests(unittest.TestCase):
