@@ -131,6 +131,7 @@ def _bare_daemon() -> WakeConversationDaemon:
     instance.recent_playback = collections.deque(
         maxlen=wake_daemon.RECENT_PLAYBACK_LIMIT
     )
+    instance.pending_target_readback = None
     instance.conversation_deadline = 0.0
     instance.awaiting_followup = False
     instance.last_wake = 0.0
@@ -621,7 +622,7 @@ class ProcessUtteranceTests(unittest.TestCase):
 
         qwen_turn.assert_called_once()
 
-    def test_fuzzy_new_task_bypasses_main_qwen(self) -> None:
+    def test_fuzzy_new_ticket_task_bypasses_main_qwen_for_readback(self) -> None:
         daemon = _bare_daemon()
         daemon.cursor_session = "oldjob123456"
         with (
@@ -657,15 +658,8 @@ class ProcessUtteranceTests(unittest.TestCase):
         ):
             daemon.process_utterance(AUDIO_GENERATION, woke=False)
 
-        cursor_turn.assert_called_once_with(
-            CursorTurnRequest(
-                "work on APP-43 instead",
-                utterance="work on APP-43 instead",
-                context_repository=None,
-            ),
-            delivery_claims=mock.ANY,
-            integrations=mock.ANY,
-        )
+        cursor_turn.assert_not_called()
+        self.assertIsNotNone(daemon.pending_target_readback)
         qwen_turn.assert_not_called()
 
     def test_router_sends_clarification_answer_to_awaiting_job(self) -> None:
@@ -1061,7 +1055,9 @@ class ProcessUtteranceTests(unittest.TestCase):
         cursor_turn.assert_not_called()
         qwen_turn.assert_called_once()
 
-    def test_explicit_cursor_request_starts_fresh_job(self) -> None:
+    def test_explicit_ticket_request_requires_readback_before_starting_job(
+        self,
+    ) -> None:
         daemon = _bare_daemon()
         daemon.cursor_session = "oldjob123456"
         with (
@@ -1097,17 +1093,244 @@ class ProcessUtteranceTests(unittest.TestCase):
         ):
             daemon.process_utterance(AUDIO_GENERATION, woke=False)
 
+        cursor_turn.assert_not_called()
+        self.assertIsNotNone(daemon.pending_target_readback)
+        assert daemon.pending_target_readback is not None
+        self.assertEqual(
+            daemon.pending_target_readback.candidate.target.canonical,
+            "APP-43",
+        )
+        qwen_turn.assert_not_called()
+
+    def test_exact_affirmation_dispatches_canonical_readback_target(self) -> None:
+        daemon = _bare_daemon()
+        with (
+            mock.patch.object(
+                wake_daemon,
+                "transcribe",
+                side_effect=["work on example/payments#42", "yes"],
+            ),
+            mock.patch.object(wake_daemon, "start_components"),
+            mock.patch.object(
+                wake_daemon,
+                "request_context",
+                side_effect=[
+                    RequestContext("work on example/payments#42"),
+                    RequestContext("yes"),
+                ],
+            ),
+            mock.patch.object(
+                wake_daemon,
+                "route_intent",
+                return_value=IntentRoute(Intent.CURSOR_SUBMIT, "high"),
+            ) as route_intent,
+            mock.patch.object(
+                wake_daemon, "cursor_turn", return_value=("started", None)
+            ) as cursor_turn,
+            mock.patch.object(
+                daemon,
+                "_drain_playback_queue",
+                return_value=(_playback_batch("ok"), None),
+            ),
+            mock.patch.object(wake_daemon, "notify"),
+        ):
+            daemon.process_utterance(AUDIO_GENERATION, woke=False)
+            cursor_turn.assert_not_called()
+            daemon.process_utterance(AUDIO_GENERATION, woke=False)
+
+        route_intent.assert_called_once()
         cursor_turn.assert_called_once_with(
             CursorTurnRequest(
-                "ask Cursor to work on APP-43\n\nLinear context",
-                utterance="ask Cursor to work on APP-43",
-                context_repository=None,
-                issue_key="APP-43",
+                "Work on example/payments#42.",
+                utterance="Work on example/payments#42.",
+                context_repository="example/payments",
+                github_repository="example/payments",
+                github_issue=42,
+                issue_scope="example/payments",
+                issue_scope_source="github",
             ),
             delivery_claims=mock.ANY,
             integrations=mock.ANY,
         )
-        qwen_turn.assert_not_called()
+        self.assertIsNone(daemon.pending_target_readback)
+
+    def test_correction_requires_new_readback_and_dispatches_only_replacement(
+        self,
+    ) -> None:
+        daemon = _bare_daemon()
+        with (
+            mock.patch.object(
+                wake_daemon,
+                "transcribe",
+                side_effect=[
+                    "work on example/payments#42",
+                    "No, issue 43",
+                    "yes",
+                ],
+            ),
+            mock.patch.object(wake_daemon, "start_components"),
+            mock.patch.object(
+                wake_daemon,
+                "request_context",
+                side_effect=[
+                    RequestContext("work on example/payments#42"),
+                    RequestContext("No, issue 43"),
+                    RequestContext("yes"),
+                ],
+            ),
+            mock.patch.object(
+                wake_daemon,
+                "route_intent",
+                return_value=IntentRoute(Intent.CURSOR_SUBMIT, "high"),
+            ) as route_intent,
+            mock.patch.object(
+                wake_daemon, "cursor_turn", return_value=("started", None)
+            ) as cursor_turn,
+            mock.patch.object(
+                daemon,
+                "_drain_playback_queue",
+                return_value=(_playback_batch("ok"), None),
+            ),
+            mock.patch.object(wake_daemon, "notify"),
+        ):
+            daemon.process_utterance(AUDIO_GENERATION, woke=False)
+            daemon.process_utterance(AUDIO_GENERATION, woke=False)
+            cursor_turn.assert_not_called()
+            assert daemon.pending_target_readback is not None
+            self.assertEqual(
+                daemon.pending_target_readback.candidate.target.canonical,
+                "example/payments#43",
+            )
+            daemon.process_utterance(AUDIO_GENERATION, woke=False)
+
+        route_intent.assert_called_once()
+        request = cursor_turn.call_args.args[0]
+        self.assertEqual(request.github_issue, 43)
+        self.assertNotIn("#42", request.text)
+
+    def test_missed_confirmation_keeps_same_candidate_and_followup_listening(
+        self,
+    ) -> None:
+        daemon = _bare_daemon()
+        with (
+            mock.patch.object(
+                wake_daemon,
+                "transcribe",
+                side_effect=[
+                    "work on example/payments#42",
+                    wake_daemon.NoSpeechError("no recognizable speech"),
+                ],
+            ),
+            mock.patch.object(wake_daemon, "start_components"),
+            mock.patch.object(
+                wake_daemon,
+                "request_context",
+                return_value=RequestContext("work on example/payments#42"),
+            ),
+            mock.patch.object(
+                wake_daemon,
+                "route_intent",
+                return_value=IntentRoute(Intent.CURSOR_SUBMIT, "high"),
+            ),
+            mock.patch.object(wake_daemon, "cursor_turn") as cursor_turn,
+            mock.patch.object(
+                daemon,
+                "_drain_playback_queue",
+                return_value=(_playback_batch("ok"), None),
+            ),
+            mock.patch.object(wake_daemon, "notify") as notify,
+        ):
+            daemon.process_utterance(AUDIO_GENERATION, woke=False)
+            pending = daemon.pending_target_readback
+            daemon.process_utterance(AUDIO_GENERATION, woke=False)
+
+        self.assertIsNotNone(pending)
+        self.assertIs(daemon.pending_target_readback, pending)
+        self.assertTrue(daemon.awaiting_followup)
+        self.assertGreater(daemon.conversation_deadline, time.monotonic())
+        cursor_turn.assert_not_called()
+        notify.assert_called_with(
+            "I didn't catch that. Please repeat yes, no, or the correction."
+        )
+
+    def test_read_only_ticket_request_does_not_gain_readback(self) -> None:
+        daemon = _bare_daemon()
+        with (
+            mock.patch.object(
+                wake_daemon,
+                "transcribe",
+                return_value="what is the status of APP-43",
+            ),
+            mock.patch.object(wake_daemon, "start_components"),
+            mock.patch.object(
+                wake_daemon,
+                "request_context",
+                return_value=RequestContext("what is the status of APP-43"),
+            ),
+            mock.patch.object(
+                wake_daemon,
+                "route_intent",
+                return_value=IntentRoute(Intent.CONVERSATION, "high"),
+            ),
+            mock.patch.object(
+                wake_daemon, "qwen_turn", return_value=("It is open.", None)
+            ) as qwen_turn,
+            mock.patch.object(wake_daemon, "cursor_turn") as cursor_turn,
+            mock.patch.object(
+                daemon,
+                "_drain_playback_queue",
+                return_value=(_playback_batch("ok"), None),
+            ),
+            mock.patch.object(wake_daemon, "notify"),
+        ):
+            daemon.process_utterance(AUDIO_GENERATION, woke=False)
+
+        self.assertIsNone(daemon.pending_target_readback)
+        cursor_turn.assert_not_called()
+        qwen_turn.assert_called_once()
+
+    def test_existing_fork_confirmation_remains_authoritative(self) -> None:
+        daemon = _bare_daemon()
+        context = RequestContext(
+            "fork example/payments and work on example/payments#42",
+            focused_repository="example/payments",
+            focused_issue="example/payments#42",
+            github_repository="example/payments",
+            github_issue=42,
+        )
+        with (
+            mock.patch.object(
+                wake_daemon,
+                "transcribe",
+                return_value="fork example/payments and work on example/payments#42",
+            ),
+            mock.patch.object(wake_daemon, "start_components"),
+            mock.patch.object(wake_daemon, "request_context", return_value=context),
+            mock.patch.object(
+                wake_daemon,
+                "route_intent",
+                return_value=IntentRoute(Intent.CURSOR_SUBMIT, "high"),
+            ),
+            mock.patch.object(
+                wake_daemon,
+                "decide_fork_intent",
+                return_value=wake_daemon.ForkIntent.AFFIRMATIVE,
+            ),
+            mock.patch.object(
+                wake_daemon, "cursor_turn", return_value=("fork confirmation", None)
+            ) as cursor_turn,
+            mock.patch.object(
+                daemon,
+                "_drain_playback_queue",
+                return_value=(_playback_batch("ok"), None),
+            ),
+            mock.patch.object(wake_daemon, "notify"),
+        ):
+            daemon.process_utterance(AUDIO_GENERATION, woke=False)
+
+        self.assertIsNone(daemon.pending_target_readback)
+        cursor_turn.assert_called_once()
+        self.assertTrue(cursor_turn.call_args.args[0].fork_requested)
 
     def test_issue_list_scope_reaches_voice_submission(self) -> None:
         daemon = _bare_daemon()

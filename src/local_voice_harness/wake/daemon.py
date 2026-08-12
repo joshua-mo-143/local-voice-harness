@@ -12,6 +12,7 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 import wave
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -39,6 +40,16 @@ from ..config import (
     WAKE_LOCK,
     WAKE_PID_PATH,
     WAV_PATH,
+)
+from ..critical_targets import (
+    CriticalTarget,
+    ReadbackCandidate,
+    ReadbackReply,
+    TargetSelection,
+    new_candidate,
+    readback_response,
+    resolve_readback,
+    select_submit_target,
 )
 from ..cursor import questions as cursor_questions
 from ..cursor import service as cursor_service
@@ -118,6 +129,35 @@ MICROPHONE_START_ATTEMPTS = 30
 MICROPHONE_RETRY_SECONDS = 1
 PLAYBACK_ECHO_WINDOW_SECONDS = 8.0
 RECENT_PLAYBACK_LIMIT = 8
+
+
+@dataclass(frozen=True, slots=True)
+class PendingTargetReadback:
+    candidate: ReadbackCandidate
+    request: CursorTurnRequest
+
+
+def _critical_target_request(target: CriticalTarget) -> CursorTurnRequest:
+    """Build a dispatch request containing only the confirmed canonical identity."""
+
+    text = f"Work on {target.canonical}."
+    if target.provider == "github":
+        return CursorTurnRequest(
+            text,
+            utterance=text,
+            context_repository=target.repository,
+            github_repository=target.repository,
+            github_issue=int(target.ticket),
+            issue_scope=target.repository,
+            issue_scope_source="github",
+        )
+    return CursorTurnRequest(
+        text,
+        utterance=text,
+        issue_key=target.canonical,
+        issue_scope=target.repository,
+        issue_scope_source="linear",
+    )
 
 
 def acknowledge_delivery(job_id: str, token: str) -> bool:
@@ -375,6 +415,7 @@ class WakeConversationDaemon:
         self.recent_playback: collections.deque[RecentPlayback] = collections.deque(
             maxlen=RECENT_PLAYBACK_LIMIT
         )
+        self.pending_target_readback: PendingTargetReadback | None = None
         self.conversation_deadline = 0.0
         self.awaiting_followup = False
         self.last_wake = 0.0
@@ -575,6 +616,7 @@ class WakeConversationDaemon:
         self.cursor_session = None
         self.completed_followup = None
         self.recent_playback.clear()
+        self.pending_target_readback = None
         self.conversation_deadline = 0.0
         self.awaiting_followup = False
         self.pause_microphone()
@@ -1107,7 +1149,18 @@ class WakeConversationDaemon:
         recent_playback = self._active_recent_playback() if not woke else ()
         self.pause_microphone()
         try:
-            text = transcribe(audio_path)
+            try:
+                text = transcribe(audio_path)
+            except NoSpeechError:
+                if getattr(self, "pending_target_readback", None) is None:
+                    raise
+                log("critical-target reply contained no recognizable speech")
+                self.awaiting_followup = True
+                self.conversation_deadline = (
+                    time.monotonic() + CONVERSATION_TIMEOUT_SECONDS
+                )
+                notify("I didn't catch that. Please repeat yes, no, or the correction.")
+                return None
             if woke:
                 text, found_wake = strip_wake_prefix(text)
                 if not found_wake:
@@ -1150,60 +1203,98 @@ class WakeConversationDaemon:
                 platform=self.platform,
                 integrations=self.integrations,
             )
+            readback_result: AssistantResponse | None = None
+            confirmed_request: CursorTurnRequest | None = None
+            pending_readback = getattr(self, "pending_target_readback", None)
+            if pending_readback is not None:
+                resolution = resolve_readback(
+                    pending_readback.candidate,
+                    text,
+                    context,
+                )
+                self.pending_target_readback = None
+                if resolution.reply == ReadbackReply.AFFIRMATIVE:
+                    confirmed_request = pending_readback.request
+                elif resolution.reply == ReadbackReply.CORRECTION:
+                    assert resolution.replacement is not None
+                    replacement = new_candidate(
+                        TargetSelection(
+                            resolution.replacement,
+                            pending_readback.candidate.context_binding,
+                        ),
+                        origin_turn=uuid.uuid4().hex,
+                    )
+                    self.pending_target_readback = PendingTargetReadback(
+                        replacement,
+                        _critical_target_request(resolution.replacement),
+                    )
+                    readback_result = readback_response(replacement)
+                elif resolution.reply == ReadbackReply.NEGATIVE:
+                    readback_result = AssistantResponse.from_text(
+                        "Okay, I didn't start that work."
+                    )
+                elif resolution.reply == ReadbackReply.EXPIRED:
+                    readback_result = AssistantResponse.from_text(
+                        "That confirmation expired because the target context changed. "
+                        "Please repeat the request."
+                    )
             active_completed = self._active_completed_followup()
             pending = self._pending_cursor_question()
-            route = route_intent(
-                text,
-                context,
-                cursor_session=pending.job_id if pending is not None else None,
-                pending_question=pending.text if pending is not None else None,
-                clarification_kind=pending.owner if pending is not None else None,
-                recent_completion=active_completed is not None,
-                settings=self.providers,
-            )
-            if pending is not None:
-                deterministic_answer = (
-                    resolve_answer(
-                        pending.question,
-                        text,
-                        provenance=AnswerProvenance.USER_VOICE,
-                    ).outcome
-                    if pending.question is not None
-                    else None
+            if readback_result is not None or confirmed_request is not None:
+                route = IntentRoute(Intent.UNCERTAIN, "low")
+            else:
+                route = route_intent(
+                    text,
+                    context,
+                    cursor_session=pending.job_id if pending is not None else None,
+                    pending_question=pending.text if pending is not None else None,
+                    clarification_kind=pending.owner if pending is not None else None,
+                    recent_completion=active_completed is not None,
+                    settings=self.providers,
                 )
-                resolved_as_answer = deterministic_answer in {
-                    AnswerOutcome.REPEAT,
-                    AnswerOutcome.DEFERRED,
-                } or (
-                    deterministic_answer == AnswerOutcome.ACCEPTED
-                    and pending.question is not None
-                    and bool(pending.question.choices)
-                )
-                if resolved_as_answer or question_control(text) is not None:
-                    route = IntentRoute(Intent.AGENT_REPLY, "high")
-                invalid_pending_reply = (
-                    not resolved_as_answer
-                    and route.intent == Intent.AGENT_REPLY
-                    and (
-                        (
-                            pending.question is not None
-                            and bool(pending.question.choices)
-                        )
-                        or _is_filler_speech(text)
+                if pending is not None:
+                    deterministic_answer = (
+                        resolve_answer(
+                            pending.question,
+                            text,
+                            provenance=AnswerProvenance.USER_VOICE,
+                        ).outcome
+                        if pending.question is not None
+                        else None
                     )
-                )
-                implicit_submit = (
-                    route.intent == Intent.AGENT_SUBMIT
-                    and PENDING_SUBMIT_PATTERN.search(text) is None
-                )
-                if not woke and (
-                    not route.actionable or invalid_pending_reply or implicit_submit
-                ):
-                    # Follow-up VAD can capture nearby conversation. A pending
-                    # structured question makes conversational fallback unsafe:
-                    # close silently and leave the durable question untouched.
-                    self.close_pending_capture("non-actionable speech")
-                    return None
+                    resolved_as_answer = deterministic_answer in {
+                        AnswerOutcome.REPEAT,
+                        AnswerOutcome.DEFERRED,
+                    } or (
+                        deterministic_answer == AnswerOutcome.ACCEPTED
+                        and pending.question is not None
+                        and bool(pending.question.choices)
+                    )
+                    if resolved_as_answer or question_control(text) is not None:
+                        route = IntentRoute(Intent.AGENT_REPLY, "high")
+                    invalid_pending_reply = (
+                        not resolved_as_answer
+                        and route.intent == Intent.AGENT_REPLY
+                        and (
+                            (
+                                pending.question is not None
+                                and bool(pending.question.choices)
+                            )
+                            or _is_filler_speech(text)
+                        )
+                    )
+                    implicit_submit = (
+                        route.intent == Intent.AGENT_SUBMIT
+                        and PENDING_SUBMIT_PATTERN.search(text) is None
+                    )
+                    if not woke and (
+                        not route.actionable or invalid_pending_reply or implicit_submit
+                    ):
+                        # Follow-up VAD can capture nearby conversation. A pending
+                        # structured question makes conversational fallback unsafe:
+                        # close silently and leave the durable question untouched.
+                        self.close_pending_capture("non-actionable speech")
+                        return None
             if route.actionable and route.intent == Intent.END_CONVERSATION:
                 return self.end_conversation()
             fork_requested = decide_fork_intent(text) == ForkIntent.AFFIRMATIVE
@@ -1230,7 +1321,16 @@ class WakeConversationDaemon:
                 Intent.AGENT_SUBMIT,
                 Intent.UNCERTAIN,
             }
-            if missing_ticket_scope:
+            if readback_result is not None:
+                response = readback_result
+            elif confirmed_request is not None:
+                self.completed_followup = None
+                response, next_cursor_session = cursor_turn(
+                    confirmed_request,
+                    delivery_claims=delivery_claims,
+                    integrations=self.integrations,
+                )
+            elif missing_ticket_scope:
                 response = MISSING_ISSUE_SCOPE_RESPONSE
             elif route.actionable and route.intent == Intent.AGENT_LIST:
                 response, next_cursor_session = cursor_turn(
@@ -1330,19 +1430,31 @@ class WakeConversationDaemon:
             elif route.actionable and route.intent == Intent.AGENT_SUBMIT:
                 # Explicit new work invalidates any retained completed-job slot.
                 self.completed_followup = None
-                response, next_cursor_session = cursor_turn(
-                    CursorTurnRequest(
-                        context.text,
-                        utterance=text,
-                        context_repository=context.focused_repository,
-                        issue_key=context.external_issue_reference,
-                        issue_scope=context.issue_scope,
-                        issue_scope_source=context.issue_scope_source,
-                        **github_arguments,
-                    ),
-                    delivery_claims=delivery_claims,
-                    integrations=self.integrations,
-                )
+                selection = select_submit_target(extraction, context)
+                if selection is not None and not fork_requested:
+                    candidate = new_candidate(
+                        selection,
+                        origin_turn=uuid.uuid4().hex,
+                    )
+                    self.pending_target_readback = PendingTargetReadback(
+                        candidate,
+                        _critical_target_request(candidate.target),
+                    )
+                    response = readback_response(candidate)
+                else:
+                    response, next_cursor_session = cursor_turn(
+                        CursorTurnRequest(
+                            context.text,
+                            utterance=text,
+                            context_repository=context.focused_repository,
+                            issue_key=context.external_issue_reference,
+                            issue_scope=context.issue_scope,
+                            issue_scope_source=context.issue_scope_source,
+                            **github_arguments,
+                        ),
+                        delivery_claims=delivery_claims,
+                        integrations=self.integrations,
+                    )
             elif route.intent == Intent.AGENT_SUBMIT:
                 response = NON_ACTIONABLE_SUBMIT_RESPONSE
             elif route.intent == Intent.AGENT_PR_UNSUPPORTED:
