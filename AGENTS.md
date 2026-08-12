@@ -1,3 +1,11 @@
+# Implementation discipline
+
+Before editing, trace the existing production call path and identify where the requested behavior is currently owned. Prefer the smallest change to that path that satisfies the acceptance criteria.
+
+Do not add APIs, helpers, files, or abstractions unless production code uses them or they are required for correctness. If the requested production path does not exist, report that mismatch instead of building speculative infrastructure.
+
+Keep tests proportional to the acceptance criteria. Before handing off, audit every new symbol for a real caller, review the complete diff, and remove dead, duplicated, or speculative code.
+
 # Verification
 
 After completing code changes, always run the local equivalents of every CI check before handing off. Run formatting checks, linting, type checking, and the full test suite for every Python version in the CI matrix. Do not claim completion until those checks pass, or clearly report any check that could not be run and why.
