@@ -167,6 +167,8 @@ _BOOL_FIELDS = frozenset(
         "fork_committed",
         "fork_exists",
         "fork_dispatch_exited",
+        "github_issue_create_requested",
+        "github_issue_create_confirmed",
         "fork_operation_source_private",
         "agent_dispatch_exited",
         "worktree_dispatch_exited",
@@ -188,6 +190,7 @@ _INT_FIELDS = frozenset(
         "revision",
         "turn",
         "github_issue",
+        "github_issue_created_number",
         "github_pull_request",
         "worker_pid",
         "target_release_owner_pid",
@@ -254,6 +257,11 @@ _STRING_FIELDS = frozenset(
         "github_repository",
         "github_issue_url",
         "github_issue_context",
+        "github_issue_create_title",
+        "github_issue_create_body",
+        "github_issue_create_marker",
+        "github_issue_create_operation_state",
+        "github_issue_created_url",
         "worktree_branch",
         "worktree_label",
         "worktree_path",
@@ -361,6 +369,9 @@ _FORK_OPERATION_STATES = frozenset(
         "retained",
     }
 )
+_ISSUE_CREATE_OPERATION_STATES = frozenset(
+    {"planned", "submitted", "created", "ambiguous", "manual_required"}
+)
 _WORKTREE_OPERATION_STATES = frozenset(
     {
         "planned",
@@ -407,6 +418,10 @@ class NewAgentJob:
     github_issue: int | None = None
     github_issue_url: str | None = None
     github_issue_context: str | None = None
+    github_issue_create_requested: bool = False
+    github_issue_create_title: str | None = None
+    github_issue_create_body: str | None = None
+    github_issue_create_marker: str | None = None
     fork_requested: bool = False
     github_pull_request: int | None = None
     worktree_branch: str | None = None
@@ -1208,6 +1223,10 @@ class AgentJob:
                 "github_issue": spec.github_issue,
                 "github_issue_url": spec.github_issue_url,
                 "github_issue_context": spec.github_issue_context,
+                "github_issue_create_requested": spec.github_issue_create_requested,
+                "github_issue_create_title": spec.github_issue_create_title,
+                "github_issue_create_body": spec.github_issue_create_body,
+                "github_issue_create_marker": spec.github_issue_create_marker,
                 "fork_requested": spec.fork_requested,
                 "github_pull_request": spec.github_pull_request,
                 "worktree_branch": spec.worktree_branch,
@@ -1646,6 +1665,38 @@ class AgentJob:
         return self._optional_string("github_issue_context")
 
     @property
+    def github_issue_create_requested(self) -> bool:
+        return self._boolean_field("github_issue_create_requested")
+
+    @property
+    def github_issue_create_confirmed(self) -> bool:
+        return self._boolean_field("github_issue_create_confirmed")
+
+    @property
+    def github_issue_create_title(self) -> str | None:
+        return self._optional_string("github_issue_create_title")
+
+    @property
+    def github_issue_create_body(self) -> str | None:
+        return self._optional_string("github_issue_create_body")
+
+    @property
+    def github_issue_create_marker(self) -> str | None:
+        return self._optional_string("github_issue_create_marker")
+
+    @property
+    def github_issue_create_operation_state(self) -> str | None:
+        return self._optional_string("github_issue_create_operation_state")
+
+    @property
+    def github_issue_created_number(self) -> int | None:
+        return self._optional_int("github_issue_created_number")
+
+    @property
+    def github_issue_created_url(self) -> str | None:
+        return self._optional_string("github_issue_created_url")
+
+    @property
     def github_pull_request(self) -> int | None:
         return self._optional_int("github_pull_request")
 
@@ -2012,6 +2063,7 @@ class AgentJob:
         states = {
             "agent": self.agent_dispatch_state,
             "fork": self.fork_operation_state,
+            "issue_create": self.github_issue_create_operation_state,
             "worktree": self.worktree_provision_state,
             "prompt": self.prompt_operation_state,
             "pane": self.participant_creation_state,
@@ -2177,6 +2229,29 @@ class AgentJob:
         if self.participant_admission_state not in {"waiting", "held", "released"}:
             raise JobValidationError("participant_admission_state has invalid value")
         if (
+            self.github_issue_create_operation_state is not None
+            and self.github_issue_create_operation_state
+            not in _ISSUE_CREATE_OPERATION_STATES
+        ):
+            raise JobValidationError("github_issue_create_operation_state is invalid")
+        if (
+            self.github_issue_create_confirmed
+            and not self.github_issue_create_requested
+        ):
+            raise JobValidationError(
+                "GitHub issue creation confirmation requires a creation request"
+            )
+        if self.github_issue_create_operation_state is not None and not all(
+            (
+                self.github_repository,
+                self.github_issue_create_title,
+                self.github_issue_create_marker,
+            )
+        ):
+            raise JobValidationError(
+                "GitHub issue creation operation requires repository, title, and marker"
+            )
+        if (
             self.github_issue is not None
             and self.issue_key is None
             and self.issue_provider != "github"
@@ -2184,7 +2259,11 @@ class AgentJob:
             raise JobValidationError("GitHub issue job requires github issue_provider")
         if self.issue_key is not None and self.issue_provider is None:
             raise JobValidationError("issue-key job requires issue_provider")
-        if self.issue_provider == "github" and self.github_issue is None:
+        if (
+            self.issue_provider == "github"
+            and self.github_issue is None
+            and not self.github_issue_create_requested
+        ):
             raise JobValidationError(
                 "github issue_provider requires a GitHub issue identity"
             )
@@ -2596,6 +2675,7 @@ class AgentJob:
             self.agent_dispatch_state in _UNCERTAIN_OPERATION_STATES
             or self.fork_operation_state in _UNCERTAIN_OPERATION_STATES
             or self.worktree_provision_state in _UNCERTAIN_OPERATION_STATES
+            or self.github_issue_create_operation_state in {"submitted", "ambiguous"}
             or self.prompt_operation_state in {"submitting", "ambiguous"}
             or self.participant_creation_state
             in {"submitting", "ambiguous", "manual_required"}
@@ -2645,9 +2725,24 @@ def validate_transition(before: CursorJob, after: CursorJob) -> None:
             "Cursor job revision must increase by exactly one "
             f"({before.revision} -> {after.revision})"
         )
+    issue_creation_recovery_transition = (
+        before.status == JobStatus.QUEUED
+        and before.github_issue_create_operation_state in {"submitted", "ambiguous"}
+        and (
+            (
+                after.status == JobStatus.COMPLETED
+                and after.github_issue_create_operation_state == "created"
+            )
+            or (
+                after.status == JobStatus.BLOCKED
+                and after.github_issue_create_operation_state == "manual_required"
+            )
+        )
+    )
     if (
         before.status != after.status
         and after.status not in _LEGAL_TRANSITIONS[before.status]
+        and not issue_creation_recovery_transition
     ):
         raise JobValidationError(
             "illegal Cursor job transition "

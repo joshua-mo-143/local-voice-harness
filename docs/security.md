@@ -19,6 +19,12 @@
 - Merely focusing a GitHub page cannot create a fork. The original spoken request must
   unambiguously ask for one, and the user must separately confirm before the validated
   public repository is forked.
+- GitHub issue creation is a dedicated external-write workflow. The target comes only
+  from the trusted utterance or validated focused repository, the exact bounded draft
+  is persisted and shown before a separate direct confirmation, and the body is passed
+  to `gh` over standard input rather than process arguments. A durable hidden
+  correlation marker lets recovery observe a timed-out creation without resubmitting;
+  an unprovable outcome stops for manual inspection.
 - Checking out a focused pull request clones or reuses its repository below the GitHub
   root and runs `gh pr checkout` only in a job-unique, reserved worktree. Recovery
   retries that same worktree; failed preparation quarantines it.

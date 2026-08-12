@@ -56,6 +56,23 @@ class LocalRouterTestCase(unittest.TestCase):
 
 
 class IntentRouterTests(LocalRouterTestCase):
+    def test_routes_new_github_issue_creation_as_a_distinct_action(self) -> None:
+        with mock.patch.object(
+            llm_transport.urllib.request,
+            "urlopen",
+            return_value=_response("github_issue_create"),
+        ):
+            route = intent.route_intent(
+                "Create an issue in this repo about startup failures",
+                RequestContext(
+                    "Create an issue in this repo about startup failures",
+                    focused_repository="example/project",
+                ),
+            )
+
+        self.assertEqual(route.intent, intent.Intent.GITHUB_ISSUE_CREATE)
+        self.assertTrue(route.actionable)
+
     def test_sends_bounded_context_to_forced_router_tool(self) -> None:
         context = RequestContext(
             text="work on this\n\nuntrusted issue body",

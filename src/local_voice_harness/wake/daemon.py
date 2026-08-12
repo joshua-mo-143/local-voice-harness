@@ -85,6 +85,7 @@ from ..diagnostic_safety import (
     redact_diagnostic,
 )
 from ..errors import HarnessError, NoSpeechError
+from ..github_issue_creation import repository_from_utterance
 from ..integrations.registry import IntegrationRegistry, build_integration_registry
 from ..intent import (
     NON_ACTIONABLE_SUBMIT_RESPONSE,
@@ -1348,6 +1349,7 @@ class WakeConversationDaemon:
                     and route.intent
                     in {
                         Intent.AGENT_SUBMIT,
+                        Intent.GITHUB_ISSUE_CREATE,
                         Intent.WORKSPACE_CONSULTATION,
                     }
                 )
@@ -1389,6 +1391,20 @@ class WakeConversationDaemon:
                 self.completed_followup = None
                 response, next_cursor_session = cursor_turn(
                     confirmed_request,
+                    delivery_claims=delivery_claims,
+                    integrations=self.integrations,
+                )
+            elif route.actionable and route.intent == Intent.GITHUB_ISSUE_CREATE:
+                self.completed_followup = None
+                response, next_cursor_session = cursor_turn(
+                    CursorTurnRequest(
+                        context.text,
+                        utterance=text,
+                        github_repository=(
+                            context.github_repository or repository_from_utterance(text)
+                        ),
+                        github_issue_create_requested=True,
+                    ),
                     delivery_claims=delivery_claims,
                     integrations=self.integrations,
                 )
@@ -1570,6 +1586,11 @@ class WakeConversationDaemon:
                     )
             elif route.intent == Intent.AGENT_SUBMIT:
                 response = NON_ACTIONABLE_SUBMIT_RESPONSE
+            elif route.intent == Intent.GITHUB_ISSUE_CREATE:
+                response = (
+                    "I did not create an issue because the request was unclear. "
+                    "Please name the repository and issue."
+                )
             elif route.intent == Intent.AGENT_PR_UNSUPPORTED:
                 response = (
                     "I can't open pull requests. I can review the changes or run "

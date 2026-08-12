@@ -44,6 +44,8 @@ ROUTER_SYSTEM_PROMPT = (
     "such as 'what do you think?' is question_consultation only when it clearly refers "
     "to the pending question; otherwise it is conversation or "
     "workspace_consultation. "
+    "Use github_issue_create when the user asks to create, file, or open a new GitHub "
+    "issue. Do not use it for working on, summarizing, or editing an existing issue. "
     "Use cursor_details when the user asks to see or hear more detail about the "
     "just-announced completed result, such as 'tell me more' or 'show me the details'; "
     "this is read-only and must not start more work. "
@@ -99,6 +101,7 @@ ROUTE_TOOL = {
                         "question_consultation",
                         "conversation_continue",
                         "workspace_consultation",
+                        "github_issue_create",
                         "end_conversation",
                         "uncertain",
                     ],
@@ -134,6 +137,7 @@ class Intent(StrEnum):
     QUESTION_CONSULTATION = "question_consultation"
     CONVERSATION_CONTINUE = "conversation_continue"
     WORKSPACE_CONSULTATION = "workspace_consultation"
+    GITHUB_ISSUE_CREATE = "github_issue_create"
     # Compatibility aliases for the original Cursor-specific intent names.
     CURSOR_SUBMIT = "cursor_submit"
     CURSOR_REPLY = "cursor_reply"

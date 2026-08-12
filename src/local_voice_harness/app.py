@@ -11,7 +11,7 @@ from .agents.delivery import (
 from .agents.delivery import (
     release_deliveries as release_claims,
 )
-from .agents.model import JobStatus
+from .agents.model import AgentJob, JobStatus
 from .agents.service import AgentTurnRequest as CursorTurnRequest
 from .agents.service import agent_turn as cursor_turn
 from .agents.store import AgentJobStore as JobStore
@@ -29,6 +29,7 @@ from .config import (
 from .cursor import consultation as cursor_consultation
 from .cursor import questions as cursor_questions
 from .errors import HarnessError
+from .github_issue_creation import repository_from_utterance
 from .integrations.registry import IntegrationRegistry, build_integration_registry
 from .intent import (
     NON_ACTIONABLE_SUBMIT_RESPONSE,
@@ -73,6 +74,7 @@ def _context_for_route(
         and route.intent
         in {
             Intent.AGENT_SUBMIT,
+            Intent.GITHUB_ISSUE_CREATE,
             Intent.WORKSPACE_CONSULTATION,
         }
     ):
@@ -94,6 +96,13 @@ def _pending_grouped_repository_question() -> tuple[str, str, str] | None:
             continue
         matches.append((job.id, question.id, question.origin.turn_token))
     return matches[0] if len(matches) == 1 else None
+
+
+def _single_pending_job() -> AgentJob | None:
+    pending = [
+        job for job in CURSOR_STORE.list() if job.status == JobStatus.AWAITING_USER
+    ]
+    return pending[0] if len(pending) == 1 else None
 
 
 def acknowledge_deliveries(claims: DeliveryClaims) -> None:
@@ -137,6 +146,7 @@ def respond(text: str, *, user_config: UserConfig | None = None) -> None:
                 else None
             )
             pending = cursor_consultation.pending_question_snapshot(CURSOR_STORE, None)
+            pending_job = _single_pending_job() if pending is None else None
             if grouped_reply is not None:
                 route = IntentRoute(Intent.AGENT_REPLY, "high")
             elif CURSOR_PATTERN.search(text):
@@ -145,9 +155,31 @@ def respond(text: str, *, user_config: UserConfig | None = None) -> None:
                 route = route_intent(
                     text,
                     routing_context,
-                    cursor_session=pending.job_id if pending is not None else None,
-                    pending_question=pending.text if pending is not None else None,
-                    clarification_kind=pending.owner if pending is not None else None,
+                    cursor_session=(
+                        pending.job_id
+                        if pending is not None
+                        else pending_job.id
+                        if pending_job is not None
+                        else None
+                    ),
+                    pending_question=(
+                        pending.text
+                        if pending is not None
+                        else (
+                            str(pending_job.question or "")
+                            if pending_job is not None
+                            else None
+                        )
+                    ),
+                    clarification_kind=(
+                        pending.owner
+                        if pending is not None
+                        else (
+                            pending_job.clarification_kind
+                            if pending_job is not None
+                            else None
+                        )
+                    ),
                     settings=settings.providers,
                 )
             context = _context_for_route(
@@ -180,7 +212,20 @@ def respond(text: str, *, user_config: UserConfig | None = None) -> None:
                 Intent.AGENT_SUBMIT,
                 Intent.UNCERTAIN,
             }
-            if missing_ticket_scope:
+            if route.actionable and route.intent == Intent.GITHUB_ISSUE_CREATE:
+                response = cursor_turn(
+                    CursorTurnRequest(
+                        context.text,
+                        utterance=text,
+                        github_repository=(
+                            context.github_repository or repository_from_utterance(text)
+                        ),
+                        github_issue_create_requested=True,
+                    ),
+                    delivery_claims=delivery_claims,
+                    integrations=integrations,
+                )[0]
+            elif missing_ticket_scope:
                 response = MISSING_ISSUE_SCOPE_RESPONSE
             elif route.actionable and route.intent == Intent.QUESTION_CONSULTATION:
                 if pending is None:
@@ -235,6 +280,11 @@ def respond(text: str, *, user_config: UserConfig | None = None) -> None:
                 )[0]
             elif route.intent == Intent.AGENT_SUBMIT:
                 response = NON_ACTIONABLE_SUBMIT_RESPONSE
+            elif route.intent == Intent.GITHUB_ISSUE_CREATE:
+                response = (
+                    "I did not create an issue because the request was unclear. "
+                    "Please name the repository and issue."
+                )
             elif route.actionable and route.intent in CURSOR_MANAGEMENT_ACTIONS:
                 response = cursor_turn(
                     CursorTurnRequest(

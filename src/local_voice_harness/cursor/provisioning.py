@@ -12,11 +12,13 @@ from pathlib import Path
 
 from ..diagnostic_safety import redact_diagnostic
 from ..errors import HarnessError
+from ..github_issue_creation import draft_github_issue
 from ..integrations.github import (
     GitHubClient,
     GitHubError,
     GitHubForkPlan,
     GitHubIssue,
+    GitHubIssueCreationResult,
     GitHubIssueLookupError,
     GitHubOperationAmbiguous,
     GitHubProvider,
@@ -424,6 +426,7 @@ def _worker_question(
     *,
     clarification_kind: str,
     job_changes: Mapping[str, object] | None = None,
+    sensitivity: QuestionSensitivity = QuestionSensitivity.ROUTINE,
 ) -> None:
     def ask(job: CursorJob) -> CursorJob:
         now = time.time()
@@ -431,7 +434,7 @@ def _worker_question(
             job,
             QuestionSpec(
                 question,
-                sensitivity=QuestionSensitivity.ROUTINE,
+                sensitivity=sensitivity,
             ),
             owner=clarification_kind,
             turn_token=job.turn_token or f"{job.id}-routing-{job.turn}",
@@ -442,6 +445,181 @@ def _worker_question(
         )
 
     _worker_change(store, job_id, token, {JobStatus.ROUTING, JobStatus.RUNNING}, ask)
+
+
+def _finish_github_issue_creation(
+    store: JobStore,
+    job_id: str,
+    token: str,
+    result: GitHubIssueCreationResult,
+) -> None:
+    issue = result.issue
+    url = str(result.url)
+
+    def finish(job: CursorJob) -> CursorJob:
+        now = time.time()
+        return job.evolve_for_delivery(
+            now=now,
+            status=JobStatus.COMPLETED,
+            issue_provider="github",
+            result=f"Created GitHub issue {issue.reference}: {url}",
+            completed_at=now,
+            github_issue=issue.number,
+            github_issue_url=url,
+            github_issue_created_number=issue.number,
+            github_issue_created_url=url,
+            github_issue_create_operation_state="created",
+            worker_pid=None,
+            worker_boot_id=None,
+            worker_process_start=None,
+            worker_token=None,
+            worker_operation=None,
+        )
+
+    _worker_change(
+        store,
+        job_id,
+        token,
+        {JobStatus.ROUTING, JobStatus.RUNNING},
+        finish,
+    )
+
+
+def _run_github_issue_creation(
+    store: JobStore,
+    job: CursorJob,
+    token: str,
+    clients: ClientFactories,
+    checkpoint: Callable[[], None],
+) -> None:
+    repository = (job.github_repository or "").strip()
+    if not repository:
+        _worker_question(
+            store,
+            job.id,
+            token,
+            "Which GitHub repository should I create the issue in? "
+            "Please say its owner and repository name.",
+            clarification_kind="github_repository",
+        )
+        return
+    github = _github_provider(clients.github)
+    checkpoint()
+    source = github.resolve_repository(repository)
+    repository = source.name_with_owner
+    checkpoint()
+    if not job.github_issue_create_title or job.github_issue_create_body is None:
+        config = default_user_config()
+        draft = draft_github_issue(
+            job.trusted_utterance or job.request,
+            repository,
+            settings=config.providers,
+        )
+        plan = github.plan_issue_creation(
+            draft.repository,
+            draft.title,
+            draft.body,
+            correlation_marker=uuid.uuid4().hex,
+        )
+
+        def persist_draft(current: CursorJob) -> CursorJob:
+            return current.evolve(
+                github_repository=plan.repository,
+                github_issue_create_title=plan.title,
+                github_issue_create_body=plan.body,
+                github_issue_create_marker=plan.correlation_marker,
+                github_issue_create_operation_state="planned",
+            )
+
+        updated = _worker_change(
+            store, job.id, token, {JobStatus.ROUTING}, persist_draft
+        )
+        if updated is None:
+            return
+        job = updated
+    plan = github.plan_issue_creation(
+        job.github_repository or repository,
+        job.github_issue_create_title or "",
+        job.github_issue_create_body or "",
+        correlation_marker=job.github_issue_create_marker,
+    )
+    if not job.github_issue_create_confirmed:
+        preview = (
+            f"Create this GitHub issue in {plan.repository}?\n\n"
+            f"Title: {plan.title}\n\nBody:\n{plan.body}\n\n"
+            "Say yes to create it or no to cancel."
+        )
+        _worker_question(
+            store,
+            job.id,
+            token,
+            preview,
+            clarification_kind="github_issue_create_confirmation",
+            sensitivity=QuestionSensitivity.DESTRUCTIVE,
+        )
+        return
+    if job.github_issue_create_operation_state not in {None, "planned"}:
+        raise HarnessError("GitHub issue creation requires reconciliation before retry")
+
+    def mark_submitted(current: CursorJob) -> CursorJob:
+        return current.evolve(
+            status=JobStatus.RUNNING,
+            github_issue_create_operation_state="submitted",
+            worker_operation="github_issue_create",
+        )
+
+    submitted = _worker_change(
+        store, job.id, token, {JobStatus.ROUTING}, mark_submitted
+    )
+    if submitted is None:
+        return
+    try:
+        checkpoint()
+        result = github.submit_issue_creation(plan, confirmed=True)
+    except GitHubError as exc:
+        checkpoint()
+        observation_failed = False
+        try:
+            visible = github.observe_issue_creation(plan)
+        except GitHubError:
+            visible = None
+            observation_failed = True
+        if visible is not None:
+            _finish_github_issue_creation(store, job.id, token, visible)
+            return
+        if isinstance(exc, GitHubOperationAmbiguous) or observation_failed:
+
+            def ambiguous(current: CursorJob) -> CursorJob:
+                return current.evolve(
+                    status=JobStatus.QUEUED,
+                    queued_at=time.time(),
+                    github_issue_create_operation_state="ambiguous",
+                    reconcile=True,
+                    worker_pid=None,
+                    worker_boot_id=None,
+                    worker_process_start=None,
+                    worker_token=None,
+                    worker_operation=None,
+                )
+
+            _worker_change(store, job.id, token, {JobStatus.RUNNING}, ambiguous)
+            return
+
+        def failed_before_creation(current: CursorJob) -> CursorJob:
+            return current.evolve(
+                github_issue_create_operation_state="planned",
+                worker_operation=None,
+            )
+
+        _worker_change(
+            store,
+            job.id,
+            token,
+            {JobStatus.RUNNING},
+            failed_before_creation,
+        )
+        raise
+    _finish_github_issue_creation(store, job.id, token, result)
 
 
 def _completion_preferences(
@@ -2979,6 +3157,15 @@ def run_claimed_worker(  # pyright: ignore[reportGeneralTypeIssues]
         if job.plan_approval_completion_pending:
             checkpoint()
             _resume_plan_approval_completion(store, job, worker_token)
+            return
+        if job.github_issue_create_requested:
+            _run_github_issue_creation(
+                store,
+                job,
+                worker_token,
+                clients,
+                checkpoint,
+            )
             return
         require_issue_provider(job.issue_provider, registry)
         active_issue_key = resolve_issue_reference(

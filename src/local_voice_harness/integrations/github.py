@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import secrets
 import subprocess
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
@@ -23,8 +24,8 @@ from ..local_git import (
 from ..process import run_command
 
 REPOSITORY = re.compile(
-    r"^(?P<owner>[A-Za-z0-9](?:[A-Za-z0-9-]{0,38}))/"
-    r"(?P<repo>[A-Za-z0-9_.-]+)$"
+    r"^(?P<owner>[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?)/"
+    r"(?P<repo>[A-Za-z0-9_.-]{1,100})$"
 )
 GITHUB_HOSTS = {"github.com", "www.github.com"}
 ISSUE_PATH = re.compile(
@@ -62,6 +63,10 @@ REPOSITORY_PATH = re.compile(
 MAX_BODY_CHARS = 5_000
 MAX_COMMENT_CHARS = 800
 MAX_COMMENTS = 5
+MAX_ISSUE_TITLE_CHARS = 200
+MAX_ISSUE_BODY_CHARS = 10_000
+ISSUE_CORRELATION_MARKER = re.compile(r"^[0-9a-f]{32}$")
+ISSUE_OBSERVATION_LIMIT = 100
 PROVIDER_NAME = "github"
 Checkpoint = Callable[[], None]
 _LOGGER = logging.getLogger(__name__)
@@ -200,6 +205,21 @@ class GitHubIssue:
 
 
 @dataclass(frozen=True)
+class GitHubIssueCreationPlan:
+    repository: str
+    title: str
+    body: str
+    correlation_marker: str
+
+
+@dataclass(frozen=True)
+class GitHubIssueCreationResult:
+    issue: GitHubIssue
+    url: str
+    correlation_marker: str
+
+
+@dataclass(frozen=True)
 class GitHubPullRequest:
     owner: str
     repository: str
@@ -291,12 +311,14 @@ class GitHubClient:
         timeout: float | None = None,
         check: bool = True,
         cwd: Path | None = None,
+        stdin: str | None = None,
     ) -> subprocess.CompletedProcess[str]:
         try:
             process = run_command(
                 command,
                 timeout=self.timeout if timeout is None else timeout,
                 cwd=cwd,
+                stdin=stdin,
             )
         except OSError as exc:
             raise GitHubError(f"GitHub command failed: {exc}") from exc
@@ -311,6 +333,134 @@ class GitHubClient:
                 detail or f"command exited with status {process.returncode}"
             )
         return process
+
+    @staticmethod
+    def validate_issue_creation_plan(plan: GitHubIssueCreationPlan) -> None:
+        if not isinstance(plan.repository, str):
+            raise GitHubError("GitHub issue repository must be text")
+        repository = GitHubClient.validate_repository(plan.repository)
+        if repository != plan.repository:
+            raise GitHubError("GitHub issue plan repository is not normalized")
+        if not isinstance(plan.title, str):
+            raise GitHubError("GitHub issue title must be text")
+        if not plan.title.strip():
+            raise GitHubError("GitHub issue title must not be empty")
+        if len(plan.title) > MAX_ISSUE_TITLE_CHARS:
+            raise GitHubError(
+                f"GitHub issue title must be at most {MAX_ISSUE_TITLE_CHARS} characters"
+            )
+        if not isinstance(plan.body, str):
+            raise GitHubError("GitHub issue body must be text")
+        if not plan.body.strip():
+            raise GitHubError("GitHub issue body must not be empty")
+        if len(plan.body) > MAX_ISSUE_BODY_CHARS:
+            raise GitHubError(
+                f"GitHub issue body must be at most {MAX_ISSUE_BODY_CHARS} characters"
+            )
+        if (
+            not isinstance(plan.correlation_marker, str)
+            or ISSUE_CORRELATION_MARKER.fullmatch(plan.correlation_marker) is None
+        ):
+            raise GitHubError(
+                "GitHub issue correlation marker must be 32 lowercase hex characters"
+            )
+        if plan.correlation_marker in plan.body:
+            raise GitHubError(
+                "GitHub issue body must not contain its correlation marker"
+            )
+
+    @staticmethod
+    def _issue_marker(correlation_marker: str) -> str:
+        return f"<!-- local-voice-harness-correlation:{correlation_marker} -->"
+
+    @staticmethod
+    def _creation_result(
+        plan: GitHubIssueCreationPlan, url: object
+    ) -> GitHubIssueCreationResult:
+        value = str(url or "").strip()
+        issue = github_issue_from_url(value)
+        if issue is None or value != issue.url:
+            raise GitHubError("GitHub returned a non-canonical issue URL")
+        if issue.name_with_owner.casefold() != plan.repository.casefold():
+            raise GitHubError("GitHub created an issue in an unexpected repository")
+        return GitHubIssueCreationResult(issue, value, plan.correlation_marker)
+
+    def submit_issue(
+        self,
+        plan: GitHubIssueCreationPlan,
+        *,
+        confirmed: bool,
+    ) -> GitHubIssueCreationResult:
+        if not confirmed:
+            raise GitHubError("GitHub issue creation requires explicit confirmation")
+        self.validate_issue_creation_plan(plan)
+        submitted_body = (
+            f"{plan.body.rstrip()}\n\n{self._issue_marker(plan.correlation_marker)}\n"
+        )
+        process = self._run(
+            [
+                self.gh_executable,
+                "issue",
+                "create",
+                "--repo",
+                plan.repository,
+                "--title",
+                plan.title,
+                "--body-file",
+                "-",
+            ],
+            timeout=30,
+            stdin=submitted_body,
+        )
+        return self._creation_result(plan, process.stdout)
+
+    def observe_issue(
+        self, plan: GitHubIssueCreationPlan
+    ) -> GitHubIssueCreationResult | None:
+        self.validate_issue_creation_plan(plan)
+        process = self._run(
+            [
+                self.gh_executable,
+                "api",
+                "--method",
+                "GET",
+                f"repos/{plan.repository}/issues",
+                "-f",
+                "state=all",
+                "-f",
+                "sort=created",
+                "-f",
+                "direction=desc",
+                "-f",
+                f"per_page={ISSUE_OBSERVATION_LIMIT}",
+            ],
+            timeout=15,
+        )
+        try:
+            values = json.loads(process.stdout)
+        except json.JSONDecodeError as exc:
+            raise GitHubError(
+                "GitHub returned malformed recent issue metadata"
+            ) from exc
+        if not isinstance(values, list):
+            raise GitHubError("GitHub returned malformed recent issue metadata")
+        marker = self._issue_marker(plan.correlation_marker)
+        matches: list[GitHubIssueCreationResult] = []
+        for value in values:
+            if (
+                not isinstance(value, dict)
+                or "pull_request" in value
+                or marker not in str(value.get("body") or "")
+            ):
+                continue
+            result = self._creation_result(plan, value.get("html_url"))
+            number = value.get("number")
+            if not isinstance(number, int) or number != result.issue.number:
+                raise GitHubError("GitHub returned malformed recent issue metadata")
+            matches.append(result)
+        if len(matches) > 1:
+            raise GitHubError("GitHub issue correlation marker is not unique")
+        return matches[0] if matches else None
 
     def _repo_view(self, repository: str, *, required: bool) -> GitHubRepository | None:
         process = self._run(
@@ -1036,6 +1186,16 @@ _GITHUB_STATE_SECTIONS: dict[str, dict[str, str]] = {
         "url": "github_issue_url",
         "context": "github_issue_context",
     },
+    "issue_creation": {
+        "requested": "github_issue_create_requested",
+        "confirmed": "github_issue_create_confirmed",
+        "title": "github_issue_create_title",
+        "body": "github_issue_create_body",
+        "marker": "github_issue_create_marker",
+        "operation_state": "github_issue_create_operation_state",
+        "created_number": "github_issue_created_number",
+        "created_url": "github_issue_created_url",
+    },
     "pull_request": {
         "number": "github_pull_request",
         "worktree_state": "pull_request_worktree_state",
@@ -1176,6 +1336,63 @@ class GitHubProvider:
         """Validate and resolve current forge metadata for an issue."""
 
         return self._client.issue_details(issue)
+
+    def plan_issue_creation(
+        self,
+        repository: str,
+        title: str,
+        body: str,
+        *,
+        correlation_marker: str | None = None,
+    ) -> GitHubIssueCreationPlan:
+        if not isinstance(repository, str):
+            raise GitHubError("GitHub issue repository must be text")
+        if not isinstance(title, str):
+            raise GitHubError("GitHub issue title must be text")
+        if not isinstance(body, str):
+            raise GitHubError("GitHub issue body must be text")
+        plan = GitHubIssueCreationPlan(
+            repository=GitHubClient.validate_repository(repository),
+            title=title.strip(),
+            body=body.strip(),
+            correlation_marker=correlation_marker or secrets.token_hex(16),
+        )
+        self.validate_issue_creation_plan(plan)
+        return plan
+
+    @staticmethod
+    def validate_issue_creation_plan(plan: GitHubIssueCreationPlan) -> None:
+        GitHubClient.validate_issue_creation_plan(plan)
+
+    def observe_issue(
+        self, plan: GitHubIssueCreationPlan
+    ) -> GitHubIssueCreationResult | None:
+        self.validate_issue_creation_plan(plan)
+        return self._client.observe_issue(plan)
+
+    def observe_issue_creation(
+        self, plan: GitHubIssueCreationPlan
+    ) -> GitHubIssueCreationResult | None:
+        return self.observe_issue(plan)
+
+    def submit_issue(
+        self,
+        plan: GitHubIssueCreationPlan,
+        *,
+        confirmed: bool,
+    ) -> GitHubIssueCreationResult:
+        if not confirmed:
+            raise GitHubError("GitHub issue creation requires explicit confirmation")
+        self.validate_issue_creation_plan(plan)
+        return self._client.submit_issue(plan, confirmed=True)
+
+    def submit_issue_creation(
+        self,
+        plan: GitHubIssueCreationPlan,
+        *,
+        confirmed: bool,
+    ) -> GitHubIssueCreationResult:
+        return self.submit_issue(plan, confirmed=confirmed)
 
     def materialize_repository(
         self,

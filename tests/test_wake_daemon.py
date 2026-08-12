@@ -3769,6 +3769,19 @@ class CompletedFollowupContextTests(unittest.TestCase):
         self.assertEqual(cursor_turn.call_args.args[0].action, "submit")
         self.assertIsNone(daemon.completed_followup)
 
+    def test_github_issue_creation_dispatches_dedicated_job(self) -> None:
+        daemon = _bare_daemon()
+        cursor_turn = self._run_route(
+            daemon,
+            IntentRoute(Intent.GITHUB_ISSUE_CREATE, "high"),
+            transcript="create an issue in example/project about startup",
+        )
+
+        request = cursor_turn.call_args.args[0]
+        self.assertTrue(request.github_issue_create_requested)
+        self.assertEqual(request.github_repository, "example/project")
+        self._last_qwen.assert_not_called()
+
     def test_pr_unsupported_declines_without_starting_a_job(self) -> None:
         daemon = _bare_daemon()
         cursor_turn = self._run_route(

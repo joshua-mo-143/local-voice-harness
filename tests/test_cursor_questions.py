@@ -87,6 +87,39 @@ def _awaiting(store: JobStore, question: Question | None = None) -> CursorJob:
     )
 
 
+def _issue_creation_awaiting(store: JobStore) -> CursorJob:
+    pending = replace(
+        _question(sensitivity=QuestionSensitivity.DESTRUCTIVE),
+        text="Create this GitHub issue?",
+        owner="github_issue_create_confirmation",
+    )
+    return store.create(
+        CursorJob.from_dict(
+            {
+                "id": "aaaaaaaaaaaa",
+                "request": "create an issue",
+                "trusted_utterance": "create an issue",
+                "status": JobStatus.AWAITING_USER.value,
+                "created_at": 1,
+                "updated_at": 10,
+                "delivered": True,
+                "question": pending.text,
+                "result": pending.text,
+                "clarification_kind": pending.owner,
+                "turn": 1,
+                "turn_token": pending.origin.turn_token,
+                "voice_question": pending.to_dict(),
+                "github_repository": "example/project",
+                "github_issue_create_requested": True,
+                "github_issue_create_title": "Fix startup",
+                "github_issue_create_body": "Startup fails.",
+                "github_issue_create_marker": "a" * 32,
+                "github_issue_create_operation_state": "planned",
+            }
+        )
+    )
+
+
 def _plan_approval_awaiting(store: JobStore) -> CursorJob:
     pending = replace(
         _question(sensitivity=QuestionSensitivity.ARCHITECTURE),
@@ -402,6 +435,48 @@ def test_automated_answer_cannot_approve_plan(store: JobStore) -> None:
     assert message is not None
     assert "direct user answer" in message
     assert store.get(original.id).revision == original.revision
+    launch.assert_not_called()
+
+
+def test_only_direct_answer_confirms_github_issue_creation(store: JobStore) -> None:
+    original = _issue_creation_awaiting(store)
+    with mock.patch.object(service, "launch_worker") as launch:
+        message = service.reply_job(
+            original.id,
+            "yes",
+            answer_provenance=AnswerProvenance.AUTOMATION,
+        )
+        assert message is not None
+        assert store.get(original.id).revision == original.revision
+        service.reply_job(
+            original.id,
+            "yes",
+            trusted_utterance="yes",
+            answer_provenance=AnswerProvenance.USER_VOICE,
+        )
+
+    updated = store.get(original.id)
+    assert updated.github_issue_create_confirmed
+    assert updated.status == JobStatus.QUEUED
+    launch.assert_called_once_with(original.id)
+
+
+def test_rejecting_github_issue_creation_completes_without_launch(
+    store: JobStore,
+) -> None:
+    original = _issue_creation_awaiting(store)
+    with mock.patch.object(service, "launch_worker") as launch:
+        service.reply_job(
+            original.id,
+            "no",
+            trusted_utterance="no",
+            answer_provenance=AnswerProvenance.USER_VOICE,
+        )
+
+    updated = store.get(original.id)
+    assert updated.status == JobStatus.COMPLETED
+    assert not updated.github_issue_create_confirmed
+    assert updated.github_issue_create_operation_state == "planned"
     launch.assert_not_called()
 
 
