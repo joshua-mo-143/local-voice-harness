@@ -29,7 +29,12 @@ LINEAR_TEAM_PATH = re.compile(
     r"(?P<team>[A-Za-z][A-Za-z0-9]+)(?:/[^?#]*)?/?$",
     re.IGNORECASE,
 )
-LINEAR_ISSUE = re.compile(r"\b([A-Z][A-Z0-9]+)(?:\s*-\s*|\s+)(\d+)\b", re.IGNORECASE)
+LINEAR_ISSUE = re.compile(
+    r"(?<![A-Za-z0-9_./-])"
+    r"([A-Z][A-Z0-9]+)(?:\s*-\s*|\s+)(\d+)"
+    r"(?![A-Za-z0-9_./#-])",
+    re.IGNORECASE,
+)
 LINEAR_IDENTIFIER = re.compile(r"^[A-Z][A-Z0-9]+-\d+$", re.IGNORECASE)
 HEALTHY_MCP_STATUSES = frozenset({"connected", "ready"})
 LINEAR_ROUTER_LOCK = DURABLE_STATE_DIR / "linear-router.lock"

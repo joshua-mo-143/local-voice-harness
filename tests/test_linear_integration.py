@@ -53,6 +53,17 @@ class LinearEnablementTests(unittest.TestCase):
             )
         )
 
+    def test_issue_extraction_ignores_github_targets_with_linear_like_names(
+        self,
+    ) -> None:
+        for target in (
+            "https://github.com/joshua-mo-143/local-voice-harness/issues/229",
+            "joshua-mo-143/local-voice-harness#229",
+            "example/eng-42#7",
+        ):
+            with self.subTest(target=target):
+                self.assertIsNone(registry.extract_issue_reference(target, ENABLED))
+
     def test_enabled_integration_recognizes_url_with_external_provenance(self) -> None:
         fragment = registry.capture_context(
             "https://linear.app/acme/issue/API-42/fix-it", ENABLED

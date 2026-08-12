@@ -4,6 +4,7 @@ import ast
 import json
 import threading
 import time
+from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
@@ -66,6 +67,35 @@ def test_admission_persists_selected_provider_and_harness(tmp_path: Path) -> Non
     persisted = json.loads(store.path(job_id).read_text())
     assert persisted["harness_kind"] == "cursor"
     assert persisted["issue_provider"] == "github"
+
+
+def test_github_target_with_linear_like_owner_reaches_github_classification(
+    tmp_path: Path,
+) -> None:
+    store = JobStore(tmp_path / "jobs", tmp_path / "legacy")
+    config = default_user_config(tmp_path)
+    config = replace(
+        config,
+        integrations=replace(config.integrations, linear_enabled=True),
+    )
+    registry = build_integration_registry(config)
+    with (
+        mock.patch.object(service, "_job_store", return_value=store),
+        mock.patch.object(service, "launch_worker"),
+        mock.patch.object(service, "require_issue_capabilities") as capability,
+    ):
+        job_id = service.start_job(
+            "Work only on GitHub issue joshua-mo-143/local-voice-harness#229.",
+            github_repository="joshua-mo-143/local-voice-harness",
+            github_issue=229,
+            foreground=False,
+            integrations=registry,
+        )
+
+    job = store.get(job_id)
+    assert job.issue_key is None
+    assert job.issue_provider == "github"
+    capability.assert_not_called()
 
 
 def test_submit_notifies_only_after_job_starts() -> None:
