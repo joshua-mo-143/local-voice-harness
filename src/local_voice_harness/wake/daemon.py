@@ -108,6 +108,10 @@ from ..questions import (
     resolve_answer,
 )
 from ..responses import AssistantResponse, ResponseLike, as_assistant_response
+from ..self_management import (
+    UNSUPPORTED_INSPECTION_RESPONSE,
+    inspect_config_utterance,
+)
 from ..speech import SpeechRenderer, StreamingSpeechRenderer
 from ..stt.client import transcribe
 from ..ticket_targets import MISSING_ISSUE_SCOPE_RESPONSE, extract_ticket_targets
@@ -1427,6 +1431,12 @@ class WakeConversationDaemon:
                     ),
                     delivery_claims=delivery_claims,
                     integrations=self.integrations,
+                )
+            elif route.intent == Intent.HARNESS_CONFIG_INSPECT:
+                response = (
+                    inspect_config_utterance(text, self.user_config)
+                    if route.actionable
+                    else AssistantResponse.from_text(UNSUPPORTED_INSPECTION_RESPONSE)
                 )
             elif missing_ticket_scope:
                 response = MISSING_ISSUE_SCOPE_RESPONSE

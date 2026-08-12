@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 import io
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
@@ -14,6 +15,7 @@ from local_voice_harness.cursor.service import CursorTurnRequest
 from local_voice_harness.intent import Intent, IntentRoute
 from local_voice_harness.questions import AnswerProvenance
 from local_voice_harness.responses import AssistantResponse
+from local_voice_harness.user_config import default_user_config
 
 
 class ForegroundDeliveryTests(unittest.TestCase):
@@ -95,6 +97,34 @@ class ForegroundDeliveryTests(unittest.TestCase):
 
 
 class AppContextTests(unittest.TestCase):
+    def test_config_inspection_reads_snapshot_without_context_or_cursor(self) -> None:
+        config = default_user_config(home=Path("/home/example"))
+        config = replace(
+            config,
+            integrations=replace(config.integrations, linear_enabled=True),
+        )
+        output = io.StringIO()
+        with (
+            mock.patch.object(app, "start_components"),
+            mock.patch.object(
+                app,
+                "route_intent",
+                return_value=IntentRoute(Intent.HARNESS_CONFIG_INSPECT, "high"),
+            ),
+            mock.patch.object(app, "request_context") as request_context,
+            mock.patch.object(app, "cursor_turn") as cursor_turn,
+            mock.patch.object(app, "qwen_response") as qwen_response,
+            mock.patch.object(app, "stream_and_play") as play,
+            contextlib.redirect_stdout(output),
+        ):
+            app.respond("Is Linear enabled?", user_config=config)
+
+        request_context.assert_not_called()
+        cursor_turn.assert_not_called()
+        qwen_response.assert_not_called()
+        play.assert_called_once_with("Linear is enabled.", settings=config.audio)
+        self.assertIn("integrations.linear: enabled", output.getvalue())
+
     def test_text_mapping_answers_single_durable_grouped_question(self) -> None:
         answer = (
             "JOS-30: local-voice-harness-batch-fixture, "

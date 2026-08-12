@@ -323,6 +323,53 @@ class StripWakePrefixTests(unittest.TestCase):
 
 
 class ProcessUtteranceTests(unittest.TestCase):
+    def test_config_inspection_uses_active_snapshot_without_context_or_cursor(
+        self,
+    ) -> None:
+        daemon = _bare_daemon()
+        with (
+            mock.patch.object(
+                wake_daemon,
+                "transcribe",
+                return_value="Is Linear enabled?",
+            ),
+            mock.patch.object(wake_daemon, "start_components"),
+            mock.patch.object(
+                wake_daemon,
+                "route_intent",
+                return_value=IntentRoute(Intent.HARNESS_CONFIG_INSPECT, "high"),
+            ) as route_intent,
+            mock.patch.object(wake_daemon, "request_context") as request_context,
+            mock.patch.object(wake_daemon, "cursor_turn") as cursor_turn,
+            mock.patch.object(wake_daemon, "qwen_turn") as qwen_turn,
+            mock.patch.object(
+                daemon,
+                "play_response",
+                return_value=({"played_text": "Linear is disabled."}, None),
+            ) as play,
+            mock.patch.object(wake_daemon, "notify"),
+        ):
+            daemon.process_utterance(AUDIO_GENERATION, woke=False)
+
+        route_intent.assert_called_once_with(
+            "Is Linear enabled?",
+            RequestContext("Is Linear enabled?"),
+            cursor_session=None,
+            pending_question=None,
+            clarification_kind=None,
+            recent_completion=False,
+            settings=daemon.providers,
+        )
+        request_context.assert_not_called()
+        cursor_turn.assert_not_called()
+        qwen_turn.assert_not_called()
+        play.assert_called_once_with(
+            AssistantResponse(
+                spoken_text="Linear is disabled.",
+                display_text="integrations.linear: disabled",
+            )
+        )
+
     def test_response_channels_are_selected_at_wake_boundary(self) -> None:
         daemon = _bare_daemon()
         output = io.StringIO()
