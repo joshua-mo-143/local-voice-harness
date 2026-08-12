@@ -13,6 +13,7 @@ from unittest import mock
 from local_voice_harness.cursor import service
 from local_voice_harness.errors import HarnessError
 from local_voice_harness.integrations import linear, registry
+from local_voice_harness.integrations.herdr import HerdrClient
 from local_voice_harness.user_config import IntegrationSettings, default_user_config
 
 DISABLED = IntegrationSettings(linear_enabled=False)
@@ -173,6 +174,39 @@ class LinearCapabilityTests(unittest.TestCase):
                 self.assertFalse(status.available)
                 self.assertIn(expected, status.detail)
 
+    def test_authenticated_preflight_launches_agent_with_mcp_approval(self) -> None:
+        process = subprocess.CompletedProcess([], 0, "linear: ready", "")
+        spawned = {
+            "name": "voice-router",
+            "pane_id": "pane",
+            "workspace_id": "workspace",
+            "cwd": "/repositories",
+            "agent_session": "session",
+            "interactive_ready": True,
+        }
+        client = HerdrClient("herdr")
+
+        with (
+            mock.patch.object(linear.shutil, "which", return_value="/usr/bin/agent"),
+            mock.patch.object(linear, "_run_mcp_list", return_value=process),
+            mock.patch.object(
+                client, "run_json", return_value={"agent": spawned}
+            ) as run,
+        ):
+            self.assertTrue(linear.LinearIntegration().capability_status().available)
+            client.start_agent(
+                Path("/repositories"),
+                "router",
+                "pane",
+                "workspace",
+                name="voice-router",
+            )
+
+        self.assertEqual(
+            run.call_args.args[-3:],
+            ("--", "--trust", "--approve-mcps"),
+        )
+
 
 class LinearRoutingTests(unittest.TestCase):
     def test_enabled_connector_owns_router_prompt(self) -> None:
@@ -220,6 +254,38 @@ class LinearRoutingTests(unittest.TestCase):
         )
         self.assertIsNone(routed)
         client.ensure_router.assert_not_called()
+
+    def test_router_auth_failure_refuses_repository_fallback(self) -> None:
+        client = mock.Mock()
+        client.ensure_router.return_value = mock.Mock(target="router")
+        client.prompt_and_wait.return_value = mock.Mock(
+            output=(
+                "Linear MCP requires authentication, so I cannot read API-42.\n"
+                "ROUTE_CONFIDENCE[token]: low\n"
+                "ROUTE_REASON[token]: Linear is unavailable"
+            )
+        )
+
+        with (
+            tempfile.TemporaryDirectory() as temporary,
+            mock.patch.object(
+                linear, "LINEAR_ROUTER_LOCK", Path(temporary) / "router.lock"
+            ),
+            self.assertRaisesRegex(
+                HarnessError, "refusing unrelated repository fallback"
+            ),
+        ):
+            registry.route_issue_repository(
+                client,
+                "API-42",
+                [Path("/repos/api"), Path("/repos/unrelated")],
+                token="token",
+                reserved=set(),
+                integrations=ENABLED,
+            )
+
+        client.resolve_repository.assert_not_called()
+        client.choose_or_clone_repository.assert_not_called()
 
     def test_router_ownership_is_serialized_across_processes(self) -> None:
         context = multiprocessing.get_context("spawn")
