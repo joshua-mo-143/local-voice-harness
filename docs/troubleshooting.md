@@ -33,7 +33,7 @@ agent mcp list
 
 Job deletion reports unresolved quarantine evidence:
 
-```fish
+```bash
 voice-harness jobs quarantine list
 voice-harness jobs quarantine list --all --json
 ```
@@ -43,7 +43,7 @@ worker identity, Herdr target, or worktree reservation. Verify those external
 resources no longer exist before releasing their fences. Then record what was
 checked and retry deletion:
 
-```fish
+```bash
 voice-harness jobs quarantine acknowledge aaaaaaaaaaaa \
   --reason "worker exited and no Herdr target or worktree remains"
 voice-harness jobs nuke
@@ -56,7 +56,7 @@ fork, or worktree operations must remain fenced until manually reconciled.
 
 SQLite storage or migration failures are reported by:
 
-```fish
+```bash
 voice-harness doctor
 ```
 
@@ -66,10 +66,10 @@ are read-only and do not retry migration or quarantine files. If the database ca
 be opened or fails its integrity check, stop the services and preserve the complete
 jobs directory before attempting recovery:
 
-```fish
+```bash
 voice-harness services stop
 cp -a ~/.local/state/voice-harness/jobs \
-  ~/.local/state/voice-harness/jobs.forensics-(date +%Y%m%d-%H%M%S)
+  ~/.local/state/voice-harness/jobs.forensics-"$(date +%Y%m%d-%H%M%S)"
 ```
 
 Restore only a complete backup containing the database, WAL companions (if present),
@@ -82,12 +82,13 @@ Wrong llama.cpp GPU:
 
 ```bash
 llama-server --list-devices
-systemctl --user edit voice-harness-llm.service
+voice-harness config set compute.cuda_device '<LLAMA_CPP_DEVICE>'
+voice-harness services restart
 ```
 
 After changing shipped units and intentionally adopting the bundled dictation unit:
 
-```fish
+```bash
 voice-harness services install --force --replace-dictation
 voice-harness services audit
 voice-harness services restart

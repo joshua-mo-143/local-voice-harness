@@ -6,7 +6,11 @@ or the public `JobStore` API. The implementation phases are [#140](https://githu
 [#141](https://github.com/joshua-mo-143/local-voice-harness/issues/141), and
 [#142](https://github.com/joshua-mo-143/local-voice-harness/issues/142), in that order.
 
-## Current state
+SQLite parity in #140 is now implemented. The inventory below records the
+pre-migration JSON baseline used to design that change; #141 and #142 remain future
+phases.
+
+## Pre-migration baseline
 
 `cursor/store.py` is the durable transaction boundary. A per-directory `flock`
 serializes readers and writers; a candidate is parsed and normalized, compared
@@ -366,14 +370,11 @@ Stop the wake service and all detached workers before a manual backup or restore
 This drains writers and avoids copying a database while a delivery or release lease
 is changing:
 
-```fish
+```bash
 voice-harness services stop
-set state_home "$HOME/.local/state"
-if set -q XDG_STATE_HOME
-    set state_home "$XDG_STATE_HOME"
-end
-set jobs_root "$state_home/voice-harness/jobs"
-cp -a "$jobs_root" "$jobs_root.backup-"(date +%Y%m%d-%H%M%S)
+state_home="${XDG_STATE_HOME:-$HOME/.local/state}"
+jobs_root="$state_home/voice-harness/jobs"
+cp -a "$jobs_root" "$jobs_root.backup-$(date +%Y%m%d-%H%M%S)"
 ```
 
 For the systemd service, obtain the absolute `STATE_DIRECTORY` from
@@ -462,14 +463,14 @@ for each active reservation.
 
 ### #140 — SQLite parity
 
-- [ ] Add SQLite-backed `JobStore` behind the existing API; do not refactor
+- [x] Add SQLite-backed `JobStore` behind the existing API; do not refactor
   `model.py` yet.
-- [ ] Preserve locks/maintenance behavior with a migration lease and diagnostics.
-- [ ] Implement one-shot import for durable JSON, legacy JSON, maintenance,
+- [x] Preserve locks/maintenance behavior with a migration lease and diagnostics.
+- [x] Implement one-shot import for durable JSON, legacy JSON, maintenance,
   quarantine, and artifact metadata.
-- [ ] Prove parity for CAS, reservations, delivery claims, follow-ups, active
+- [x] Prove parity for CAS, reservations, delivery claims, follow-ups, active
   worker recovery, undelivered terminals, pruning, and quarantine.
-- [ ] Add backup, import-failure, rollback, and DB-path documentation.
+- [x] Add backup, import-failure, rollback, and DB-path documentation.
 
 ### #141 — typed lifecycle and submachines
 

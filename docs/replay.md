@@ -7,7 +7,7 @@ jobs, mutate workspaces, or invoke TTS.
 
 Capture a turn from a raw transcript:
 
-```fish
+```bash
 voice-harness replay capture please work on issues 12 and 18
 ```
 
@@ -21,7 +21,7 @@ already-observed channel-aware response without making another model request.
 Bundles are written with owner-only permissions under the harness state
 directory unless `--output` is supplied. Inspect or verify one with:
 
-```fish
+```bash
 voice-harness replay inspect /path/to/replay.json
 voice-harness replay run /path/to/replay.json
 ```
@@ -33,14 +33,14 @@ and credential material fail explicitly.
 
 Export requires reviewing the manifest summary and typing `export`:
 
-```fish
+```bash
 voice-harness replay export /path/to/replay.json /path/to/shared.json
 ```
 
 To turn a bundle into a regression fixture, use `promote`; it prints the complete
 bounded JSON for review and requires typing `reviewed`:
 
-```fish
+```bash
 voice-harness replay promote /path/to/replay.json tests/fixtures/replay/case.json
 ```
 

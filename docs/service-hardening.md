@@ -30,14 +30,13 @@ endpoint remains trusted. Brittle masks are not used because they would block re
 CUDA discovery or the standalone dictation protocol.
 
 No shipped unit permits `EnvironmentFile`; the installed audit checks both the
-effective unit/drop-in text and systemd's `EnvironmentFiles` property. Required
-socket, cache, runtime, and service-control variables must retain their shipped
-values. Only `voice-harness-wake.service` accepts optional drop-in variables: the
-README-listed audio, voice, wake/barge-in, playback, worker timing, Herdr/repository,
-dictation-injection, and replacement settings. Numeric ranges, enums, durations,
-absolute paths, and GitHub-root containment are validated. Unknown keys and process
-injection or service-boundary overrides such as `LD_PRELOAD`, socket/cache/runtime
-paths, and LLM host/bind controls fail the audit.
+effective unit/drop-in text and systemd's `EnvironmentFiles` property. Each unit's
+explicit `Environment=` keys must exactly match the shipped operational values.
+User-selected providers, devices, audio, integrations, worker timing,
+Herdr/repository paths, dictation injection, and replacements belong in validated
+`config.toml`, not in unit drop-ins. Additional environment assignments, including
+process-injection and service-boundary overrides such as `LD_PRELOAD`,
+socket/cache/runtime paths, and LLM host/bind controls, fail the audit.
 
 Venice credentials are stored in the desktop Secret Service through libsecret's
 `secret-tool`, not in an application file, environment variable, command
@@ -103,7 +102,7 @@ row as `PASS` or `FAIL` with a journal excerpt or observation:
 
 Baseline and read-only effective audit:
 
-```fish
+```bash
 uv run python -m local_voice_harness.service_units --require-systemd-analyze
 # Require rooted staged user context when the installed systemd supports it:
 uv run python -m local_voice_harness.service_units \
@@ -133,7 +132,7 @@ Denied-operation probes use transient throwaway units with the same relevant
 directives; success means the Python operation fails with `PermissionError` or
 `EPERM`. They do not alter the installed units:
 
-```fish
+```bash
 systemd-run --user --wait --collect --pipe --unit=voice-harness-write-probe \
   --property=ProtectSystem=strict --property=ProtectHome=read-only \
   /usr/bin/python -c 'open("/etc/voice-harness-probe", "w")'
@@ -143,7 +142,7 @@ systemd-run --user --wait --collect --pipe --unit=voice-harness-write-probe \
 For CUDA cold starts, stop the model services, remove only their disposable runtime
 caches, then start them individually. Do not remove model caches under home:
 
-```fish
+```bash
 systemctl --user stop dictation.service voice-harness-llm.service voice-harness-tts.service
 rm -rf \
   "$XDG_RUNTIME_DIR/dictation/cuda-cache" \
@@ -152,7 +151,7 @@ rm -rf \
 systemctl --user start dictation.service voice-harness-llm.service voice-harness-tts.service
 systemctl --user is-active dictation.service voice-harness-llm.service voice-harness-tts.service
 curl --fail http://127.0.0.1:8090/health
-ss --tcp --listening --numeric | string match '*127.0.0.1:8090*'
+ss --tcp --listening --numeric | rg '127\.0\.0\.1:8090'
 nvidia-smi
 test -d "$XDG_RUNTIME_DIR/dictation/cuda-cache"
 test -d "$XDG_RUNTIME_DIR/voice-harness-llm/cuda-cache"
@@ -161,7 +160,7 @@ test -d "$XDG_RUNTIME_DIR/voice-harness-tts/cuda-cache"
 
 Exercise PipeWire and desktop/session helpers before dispatching a read-only worker:
 
-```fish
+```bash
 pw-record --version
 pw-play --version
 wpctl status
@@ -178,7 +177,7 @@ herdr agent list
 
 Observe cgroup pressure and OOM/restart state without intentionally exhausting memory:
 
-```fish
+```bash
 journalctl --user -u dictation.service -u voice-harness-llm.service -u voice-harness-tts.service -u voice-harness-wake.service -n 200
 systemctl --user show dictation.service voice-harness-llm.service voice-harness-tts.service voice-harness-wake.service \
   --property=MemoryCurrent --property=MemoryPeak --property=MemoryHigh \
