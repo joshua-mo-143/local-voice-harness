@@ -96,6 +96,35 @@ class ForegroundDeliveryTests(unittest.TestCase):
         release.assert_called_once_with([("123456789abc", "claim")])
 
 
+class SelfHealthRoutingTests(unittest.TestCase):
+    def test_health_route_is_isolated_from_context_cursor_and_conversation(
+        self,
+    ) -> None:
+        response = AssistantResponse.from_text("The voice harness looks healthy.")
+        with (
+            mock.patch.object(app, "start_components"),
+            mock.patch.object(
+                app,
+                "route_intent",
+                return_value=IntentRoute(Intent.SELF_HEALTH, "high"),
+            ),
+            mock.patch.object(app, "request_context") as request_context,
+            mock.patch.object(
+                app, "self_health_response", return_value=response
+            ) as health_response,
+            mock.patch.object(app, "cursor_turn") as cursor_turn,
+            mock.patch.object(app, "qwen_response") as qwen_response,
+            mock.patch.object(app, "stream_and_play") as play,
+        ):
+            app.respond("Is the voice harness healthy?")
+
+        health_response.assert_called_once_with()
+        request_context.assert_not_called()
+        cursor_turn.assert_not_called()
+        qwen_response.assert_not_called()
+        play.assert_called_once_with(response.spoken_text, settings=mock.ANY)
+
+
 class AppContextTests(unittest.TestCase):
     def test_config_inspection_reads_snapshot_without_context_or_cursor(self) -> None:
         config = default_user_config(home=Path("/home/example"))

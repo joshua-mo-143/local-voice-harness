@@ -492,6 +492,34 @@ class HarnessConfigChangeIntentTests(LocalRouterTestCase):
         self.assertEqual(route, intent.FALLBACK_ROUTE)
 
 
+class SelfHealthIntentTests(LocalRouterTestCase):
+    def test_route_tool_exposes_explicit_self_health_intent(self) -> None:
+        enum = intent.ROUTE_TOOL["function"]["parameters"]["properties"]["intent"][
+            "enum"
+        ]
+
+        self.assertIn("self_health", enum)
+        self.assertIn("local voice harness", intent.ROUTER_SYSTEM_PROMPT)
+
+    def test_self_health_is_actionable_only_at_high_confidence(self) -> None:
+        for confidence, actionable in (("high", True), ("medium", False)):
+            with (
+                self.subTest(confidence=confidence),
+                mock.patch.object(
+                    llm_transport.urllib.request,
+                    "urlopen",
+                    return_value=_response("self_health", confidence),
+                ),
+            ):
+                route = intent.route_intent(
+                    "Is the voice harness healthy?",
+                    RequestContext("Is the voice harness healthy?"),
+                )
+
+            self.assertEqual(route.intent, intent.Intent.SELF_HEALTH)
+            self.assertEqual(route.actionable, actionable)
+
+
 class ForkIntentTests(unittest.TestCase):
     def test_accepts_only_unambiguous_fork_requests(self) -> None:
         for utterance in (

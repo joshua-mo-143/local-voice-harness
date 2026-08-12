@@ -404,6 +404,44 @@ class ProcessUtteranceTests(unittest.TestCase):
             )
         )
 
+    def test_self_health_route_skips_context_cursor_and_conversation(self) -> None:
+        daemon = _bare_daemon()
+        response = AssistantResponse.from_text("The voice harness looks healthy.")
+        with (
+            mock.patch.object(
+                wake_daemon,
+                "transcribe",
+                return_value="Is the voice harness healthy?",
+            ),
+            mock.patch.object(wake_daemon, "start_components"),
+            mock.patch.object(
+                wake_daemon,
+                "route_intent",
+                return_value=IntentRoute(Intent.SELF_HEALTH, "high"),
+            ),
+            mock.patch.object(wake_daemon, "request_context") as request_context,
+            mock.patch.object(
+                wake_daemon,
+                "self_health_response",
+                return_value=response,
+            ) as health_response,
+            mock.patch.object(wake_daemon, "cursor_turn") as cursor_turn,
+            mock.patch.object(wake_daemon, "qwen_turn") as qwen_turn,
+            mock.patch.object(
+                daemon,
+                "play_response",
+                return_value=({"played_text": response.spoken_text}, None),
+            ) as play,
+            mock.patch.object(wake_daemon, "notify"),
+        ):
+            daemon.process_utterance(AUDIO_GENERATION, woke=False)
+
+        health_response.assert_called_once_with()
+        request_context.assert_not_called()
+        cursor_turn.assert_not_called()
+        qwen_turn.assert_not_called()
+        play.assert_called_once_with(response)
+
     def test_response_channels_are_selected_at_wake_boundary(self) -> None:
         daemon = _bare_daemon()
         output = io.StringIO()
