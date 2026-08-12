@@ -73,6 +73,7 @@ focused_app_context = true
 cursor_followup = true
 cursor_agent_inactivity_seconds = 900
 cursor_agent_max_runtime_seconds = 3600
+cursor_mcp_auth_source = ""
 agent_job_start_concurrency = 3
 ```
 
@@ -85,9 +86,45 @@ context, routing, agent instructions, or diagnostics. Existing installations can
 preserve prior behavior by enabling the corresponding key or
 `VOICE_HARNESS_INTEGRATION_*` override.
 
-The initial Linear connector requires the `cursor-mcp` harness capability and an
-enabled Linear MCP server. Enable it with `linear = true`, then run
-`agent mcp login linear && agent mcp enable linear`. `voice-harness doctor`
+The Linear connector requires the `cursor-mcp` harness capability, an enabled
+Linear MCP server, and an explicit authenticated source checkout. Cursor currently
+stores MCP OAuth state per workspace, so authenticating one checkout does not
+authenticate router or ticket workspaces. Configure one trusted source before
+enabling Linear:
+
+```fish
+set source /home/example/src/authenticated-checkout
+cd $source
+agent mcp login linear
+and agent mcp enable linear
+set project_id (string replace -ar '[^A-Za-z0-9]+' '-' -- $source | string trim -c '-')
+chmod 600 ~/.cursor/projects/$project_id/mcp-auth.json
+voice-harness config set platform.cursor_mcp_auth_source $source
+voice-harness config set integrations.linear true
+```
+
+The harness validates capability status from that exact checkout, then atomically
+links only its `mcp-auth.json` into each trusted router, planner, reviewer, and
+implementer workspace before launch. The source must be an absolute existing
+directory, and its auth file must be a regular file owned by the harness user with
+`0600` permissions. The target Cursor project directory is restricted to `0700`.
+No token content is read or logged by the harness.
+
+On Linux, Cursor derives the project directory by replacing each run of
+non-ASCII-alphanumeric path characters with one hyphen and trimming delimiters.
+For example, `/home/example/.herdr/worktrees/a b` maps to
+`home-example-herdr-worktrees-a-b`. Because this normalization is not injective,
+the harness fails closed if distinct source and target paths produce the same ID;
+it never replaces the source auth file in that case.
+
+Cursor's auth file is opaque and can contain state for more than one MCP server.
+Consequently, every MCP OAuth entry in the configured source file is shared with
+those trusted harness workspaces, not only Linear. Use a dedicated source checkout
+whose MCP access is intentionally suitable for coding agents. Removing the setting
+disables sharing; existing symlinks can be removed manually if access must be
+revoked immediately.
+
+`voice-harness doctor`
 reports a fatal, actionable configuration result when Linear is enabled without
 that capability, and a Linear job is rejected before it is persisted or dispatched.
 Invalid values (an unknown provider, an out-of-range TTS speed or wake threshold,
@@ -292,6 +329,7 @@ voice-harness plan-approval ask
 | `VOICE_HARNESS_CURSOR_FOREGROUND_SECONDS` | Non-negative time before a Cursor job backgrounds | `5` | Process environment override |
 | `VOICE_HARNESS_CURSOR_AGENT_INACTIVITY_SECONDS` | Positive time without observable Cursor progress before cancellation | `900` | Process environment override |
 | `VOICE_HARNESS_CURSOR_AGENT_MAX_RUNTIME_SECONDS` | Positive absolute runtime limit for one Cursor turn | `3600` | Process environment override |
+| `VOICE_HARNESS_CURSOR_MCP_AUTH_SOURCE` | Absolute trusted Cursor workspace whose owner-only MCP OAuth state is linked into harness workspaces | Unset | Process environment override |
 | `VOICE_HARNESS_AGENT_JOB_START_CONCURRENCY` | Positive maximum number of concurrent durable job starts in a multi-ticket request | `3` | Process environment override |
 | `VOICE_HARNESS_CURSOR_FOLLOWUP` | Enable completed-job follow-up context (kill switch) | `1` | Process environment override |
 | `VOICE_HARNESS_CURSOR_FOLLOWUP_WINDOW_SECONDS` | Finite, non-negative absolute lifetime of the retained completed-job reference | `60` | Process environment override |

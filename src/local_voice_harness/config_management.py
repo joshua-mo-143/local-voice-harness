@@ -437,6 +437,12 @@ _CONFIG_FIELDS: dict[str, ConfigField] = {
         attribute="cursor_agent_max_runtime_seconds",
         services=(_WAKE_SERVICE,),
     ),
+    "platform.cursor_mcp_auth_source": _field(
+        parse=_parse_path,
+        section="platform",
+        attribute="cursor_mcp_auth_source",
+        services=(_WAKE_SERVICE,),
+    ),
     "platform.agent_job_start_concurrency": _field(
         parse=_parse_int,
         section="platform",

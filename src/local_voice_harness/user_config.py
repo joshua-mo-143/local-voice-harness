@@ -97,6 +97,7 @@ _PLATFORM_KEYS = (
     "cursor_foreground_seconds",
     "cursor_agent_inactivity_seconds",
     "cursor_agent_max_runtime_seconds",
+    "cursor_mcp_auth_source",
     "agent_job_start_concurrency",
 )
 
@@ -236,6 +237,7 @@ class PlatformSettings:
     cursor_foreground_seconds: float = 5.0
     cursor_agent_inactivity_seconds: float = 15 * 60
     cursor_agent_max_runtime_seconds: float = 60 * 60
+    cursor_mcp_auth_source: Path | None = None
     agent_job_start_concurrency: int = 3
 
 
@@ -390,6 +392,11 @@ def _as_choice(value: object, choices: set[str], *, label: str) -> str:
 
 def _as_path(value: object, *, label: str) -> Path:
     return Path(_as_nonempty(value, label=label)).expanduser()
+
+
+def _as_optional_path(value: object, *, label: str) -> Path | None:
+    text = str(value).strip()
+    return Path(text).expanduser() if text else None
 
 
 def _as_classes(value: object, *, label: str) -> tuple[str, ...]:
@@ -961,6 +968,16 @@ def _load_platform(
             ),
             label="platform.cursor_agent_max_runtime_seconds",
         ),
+        cursor_mcp_auth_source=_as_optional_path(
+            _resolve(
+                environment,
+                "VOICE_HARNESS_CURSOR_MCP_AUTH_SOURCE",
+                section,
+                "cursor_mcp_auth_source",
+                "",
+            ),
+            label="platform.cursor_mcp_auth_source",
+        ),
         agent_job_start_concurrency=_as_positive_int(
             _resolve(
                 environment,
@@ -980,6 +997,13 @@ def _load_platform(
     ):
         if not path.is_absolute():
             raise UserConfigurationError(f"{label} must be an absolute path")
+    if (
+        settings.cursor_mcp_auth_source is not None
+        and not settings.cursor_mcp_auth_source.is_absolute()
+    ):
+        raise UserConfigurationError(
+            "platform.cursor_mcp_auth_source must be an absolute path"
+        )
     try:
         settings.github_root.resolve().relative_to(settings.project_root.resolve())
     except ValueError as exc:
@@ -1200,6 +1224,11 @@ def render_user_config(user_config: UserConfig) -> str:
                 platform.cursor_agent_inactivity_seconds
             ),
             "cursor_agent_max_runtime_seconds": platform.cursor_agent_max_runtime_seconds,
+            "cursor_mcp_auth_source": (
+                str(platform.cursor_mcp_auth_source)
+                if platform.cursor_mcp_auth_source is not None
+                else ""
+            ),
             "agent_job_start_concurrency": platform.agent_job_start_concurrency,
         },
     )

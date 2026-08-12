@@ -24,6 +24,7 @@ from local_voice_harness.cursor.model import (
 )
 from local_voice_harness.cursor.recovery import stage_terminal_intent
 from local_voice_harness.cursor.store import JobQuarantineWarning, JobStore
+from local_voice_harness.integrations import linear
 from local_voice_harness.integrations.github import (
     GitHubIssue,
     GitHubRepository,
@@ -2707,6 +2708,66 @@ class CursorJobStateTests(unittest.TestCase):
         self.assertEqual(failed["status"], "failed")
         self.assertIn("requires authentication", str(failed["error"]))
         client.ensure_server.assert_not_called()
+
+    def test_router_mcp_unavailability_never_opens_rofi_fallback(self) -> None:
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "work on JOS-17",
+                "issue_key": "JOS-17",
+                "status": "queued",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        client = mock.Mock()
+        client.repository_roots.return_value = [Path("/repos/tiered")]
+        client.resolve_repository.return_value = (None, [])
+        client.ensure_router.return_value = mock.Mock(target="router")
+        client.prompt_and_wait.return_value = mock.Mock(
+            output=(
+                "JOS-17 was unavailable through Linear MCP; generic repository "
+                "selected as fallback."
+            )
+        )
+
+        def route(
+            routed_client: Any,
+            reference: str,
+            repositories: list[Path],
+            **kwargs: object,
+        ) -> tuple[Path | None, str, str]:
+            return linear.LinearIntegration().route_repository(
+                routed_client,
+                reference,
+                repositories,
+                token=str(kwargs["token"]),
+                reserved=cast(set[str], kwargs["reserved"]),
+                checkpoint=kwargs.get("checkpoint"),
+            )
+
+        with (
+            mock.patch.object(jobs, "HerdrClient", return_value=client),
+            mock.patch.object(
+                production_jobs, "resolve_issue_reference", return_value="JOS-17"
+            ),
+            mock.patch.object(production_jobs, "require_issue_provider"),
+            mock.patch.object(production_jobs, "require_issue_capabilities"),
+            mock.patch.object(
+                production_jobs, "route_issue_repository", side_effect=route
+            ),
+            mock.patch.object(
+                linear,
+                "LINEAR_ROUTER_LOCK",
+                Path(self.temporary.name) / "linear-router.lock",
+            ),
+        ):
+            service.run_worker("123456789abc")
+
+        failed = jobs.read_job("123456789abc")
+        self.assertEqual(failed["status"], "failed")
+        self.assertIn("refusing unrelated repository fallback", str(failed["error"]))
+        client.choose_or_clone_repository.assert_not_called()
 
     def test_prompt_timeout_retains_target_reservation_for_cancellation(self) -> None:
         repository = Path(self.temporary.name) / "project"

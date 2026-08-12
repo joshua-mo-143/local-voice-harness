@@ -94,6 +94,7 @@ class RegistryTests(unittest.TestCase):
                 gh_bin=Path("/tools/gh"),
                 git_bin=Path("/tools/git"),
                 herdr_bin=Path("/tools/herdr"),
+                cursor_mcp_auth_source=Path("/authenticated/workspace"),
                 github_timeout_seconds=12,
                 herdr_timeout_seconds=7,
             ),
@@ -111,6 +112,12 @@ class RegistryTests(unittest.TestCase):
         self.assertEqual(herdr.executable, "/tools/herdr")
         self.assertEqual(herdr.repository.root, Path("/repositories"))
         self.assertEqual(herdr.workspace.worktree_root, Path("/worktrees"))
+        self.assertIsNotNone(herdr.workspace._cursor_mcp_auth)
+        assert herdr.workspace._cursor_mcp_auth is not None
+        self.assertEqual(
+            herdr.workspace._cursor_mcp_auth.source_workspace,
+            Path("/authenticated/workspace"),
+        )
         self.assertEqual(herdr.timeout, 7)
 
     def test_disabled_github_does_not_construct_client(self) -> None:

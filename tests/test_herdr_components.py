@@ -237,6 +237,39 @@ class HerdrComponentBoundaryTests(unittest.TestCase):
             hasattr(operations, "prompt_and_wait") and operations.prompt_and_wait.called
         )
 
+    def test_every_cursor_launch_mode_links_mcp_auth_at_shared_boundary(self) -> None:
+        checkout = Path("/tmp/worktree")
+        for mode in (None, "ask", "plan"):
+            with self.subTest(mode=mode):
+                operations = mock.Mock()
+                operations.run_json.return_value = {
+                    "agent": {
+                        "name": "participant",
+                        "pane_id": "pane",
+                        "workspace_id": "workspace",
+                        "cwd": str(checkout),
+                        "agent_session": "session",
+                        "interactive_ready": True,
+                    }
+                }
+                workspace = HerdrWorkspace(
+                    operations,
+                    cursor_mcp_auth_source=Path("/authenticated"),
+                )
+                assert workspace._cursor_mcp_auth is not None
+                with mock.patch.object(workspace._cursor_mcp_auth, "link") as link:
+                    workspace.start_agent(
+                        checkout,
+                        "participant",
+                        "pane",
+                        "workspace",
+                        name="participant",
+                        mode=mode,
+                    )
+
+                link.assert_called_once_with(checkout)
+                self.assertIn("--approve-mcps", operations.run_json.call_args.args)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -17,6 +17,7 @@ from urllib.parse import SplitResult, urlsplit
 from ..config import DURABLE_STATE_DIR
 from ..context_fragment import ContextFragment
 from ..errors import HarnessError
+from .herdr.cursor_auth import CursorMcpAuthError, CursorMcpAuthLinker
 
 LINEAR_HOSTS = {"linear.app", "www.linear.app"}
 LINEAR_ISSUE_PATH = re.compile(
@@ -39,10 +40,15 @@ LINEAR_IDENTIFIER = re.compile(r"^[A-Z][A-Z0-9]+-\d+$", re.IGNORECASE)
 HEALTHY_MCP_STATUSES = frozenset({"connected", "ready"})
 LINEAR_ROUTER_LOCK = DURABLE_STATE_DIR / "linear-router.lock"
 MCP_ACCESS_FAILURE = re.compile(
-    r"\b(?:linear(?:\s+mcp)?|mcp)\b.{0,120}\b(?:"
+    r"(?:"
+    r"\b(?:linear(?:\s+mcp)?|mcp)\b.{0,160}\b(?:"
     r"requires?\s+authentication|authentication\s+(?:is\s+)?required|"
     r"not\s+authenticated|unavailable|not\s+available"
-    r")\b",
+    r")\b|"
+    r"\b(?:requires?\s+authentication|authentication\s+(?:is\s+)?required|"
+    r"not\s+authenticated|unavailable|not\s+available"
+    r")\b.{0,160}\b(?:linear(?:\s+mcp)?|mcp)\b"
+    r")",
     re.IGNORECASE | re.DOTALL,
 )
 
@@ -130,7 +136,7 @@ def extract_linear_issue(text: str) -> str | None:
     return f"{match.group(1)}-{match.group(2)}".upper() if match else None
 
 
-def _run_mcp_list() -> subprocess.CompletedProcess[str] | None:
+def _run_mcp_list(cwd: Path) -> subprocess.CompletedProcess[str] | None:
     try:
         return subprocess.run(
             ["agent", "mcp", "list"],
@@ -138,6 +144,7 @@ def _run_mcp_list() -> subprocess.CompletedProcess[str] | None:
             text=True,
             timeout=10,
             check=False,
+            cwd=cwd,
         )
     except (OSError, subprocess.TimeoutExpired):
         return None
@@ -179,6 +186,21 @@ class LinearIntegration:
     name = "linear"
     settings_flag = "linear_enabled"
     required_capabilities = frozenset({"cursor-mcp"})
+
+    def __init__(
+        self,
+        *,
+        cursor_mcp_auth_source: Path | None = None,
+        cursor_projects_root: Path | None = None,
+    ) -> None:
+        self._cursor_mcp_auth = (
+            CursorMcpAuthLinker(
+                cursor_mcp_auth_source,
+                projects_root=cursor_projects_root,
+            )
+            if cursor_mcp_auth_source is not None
+            else None
+        )
 
     def matches(self, url: str) -> bool:
         return (
@@ -240,6 +262,23 @@ class LinearIntegration:
         )
 
     def capability_status(self) -> CapabilityStatus:
+        if self._cursor_mcp_auth is None:
+            return CapabilityStatus(
+                False,
+                "Linear is enabled but no authenticated Cursor MCP source workspace "
+                "is configured.",
+                "Set `platform.cursor_mcp_auth_source` to an absolute trusted "
+                "workspace, authenticate Linear there, and restrict its "
+                "mcp-auth.json to mode 0600.",
+            )
+        try:
+            source_workspace, _ = self._cursor_mcp_auth.validated_source()
+        except CursorMcpAuthError as exc:
+            return CapabilityStatus(
+                False,
+                f"Linear Cursor MCP auth source is unsafe or unavailable: {exc}.",
+                "Repair the configured source workspace before starting Linear jobs.",
+            )
         if shutil.which("agent") is None:
             return CapabilityStatus(
                 False,
@@ -248,7 +287,7 @@ class LinearIntegration:
                 "Install and authenticate the Cursor CLI, then run "
                 "`agent mcp login linear && agent mcp enable linear`.",
             )
-        process = _run_mcp_list()
+        process = _run_mcp_list(source_workspace)
         if process is None or process.returncode:
             return CapabilityStatus(
                 False,
@@ -327,6 +366,11 @@ class LinearIntegration:
             )
             from .herdr.types import extract_marker
 
+            if MCP_ACCESS_FAILURE.search(outcome.output):
+                raise HarnessError(
+                    "Linear MCP access failed after capability preflight; "
+                    "refusing unrelated repository fallback."
+                )
             name = extract_marker(outcome.output, "ROUTE_REPO", token) or ""
             confidence = (
                 extract_marker(outcome.output, "ROUTE_CONFIDENCE", token) or "low"
@@ -335,10 +379,5 @@ class LinearIntegration:
                 extract_marker(outcome.output, "ROUTE_REASON", token)
                 or "No routing reason."
             )
-            if confidence != "high" and MCP_ACCESS_FAILURE.search(outcome.output):
-                raise HarnessError(
-                    "Linear MCP access failed after capability preflight; "
-                    "refusing unrelated repository fallback."
-                )
         resolved, _ = client.resolve_repository(name, "", repositories)
         return (resolved if confidence == "high" else None), confidence, reason
