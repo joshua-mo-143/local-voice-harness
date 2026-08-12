@@ -1660,6 +1660,12 @@ def cursor_turn(
             )
             return CursorTurnResult(immediate, next_session)
         job_id = reply_id
+        return _await_foreground(
+            job_id,
+            delivery_claims,
+            timeout=runtime.cursor_foreground_seconds,
+            continuation=True,
+        )
     elif action == "follow_up":
         if not job_id:
             return CursorTurnResult(
@@ -1841,13 +1847,35 @@ def _await_foreground(
     delivery_claims: DeliveryClaims | None,
     *,
     timeout: float = 5.0,
+    continuation: bool = False,
 ) -> CursorTurnResult:
     started = time.perf_counter()
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         job = read_job(job_id)
+        result = _foreground_delivery_result(job_id, job, delivery_claims)
+        if result is not None:
+            if job.status == JobStatus.COMPLETED:
+                print(
+                    json.dumps(
+                        {
+                            "stage": "cursor",
+                            "job_id": job_id,
+                            "background": False,
+                            "seconds": round(time.perf_counter() - started, 3),
+                        }
+                    )
+                )
+            return result
+        time.sleep(0.1)
+    updated = _job_store().update(
+        job_id,
+        lambda job: job.evolve(foreground_until=0, updated_at=time.time()),
+    )
+    job = updated if updated is not None else read_job(job_id)
+    result = _foreground_delivery_result(job_id, job, delivery_claims)
+    if result is not None:
         if job.status == JobStatus.COMPLETED:
-            claimed = _defer_or_acknowledge(job_id, delivery_claims)
             print(
                 json.dumps(
                     {
@@ -1858,35 +1886,7 @@ def _await_foreground(
                     }
                 )
             )
-            result = claimed.result if claimed is not None else job.result
-            return CursorTurnResult(str(result or "").strip(), None)
-        if job.status == JobStatus.AWAITING_USER:
-            claimed = _defer_or_acknowledge(job_id, delivery_claims)
-            awaiting = claimed if claimed is not None else job
-            pending = questions.current(awaiting)
-            rendered_question = (
-                question_prompt(pending)
-                if pending is not None
-                else str(awaiting.question or awaiting.result or "").strip()
-            )
-            return CursorTurnResult(rendered_question, job_id)
-        if job.status == JobStatus.BLOCKED:
-            claimed = _defer_or_acknowledge(job_id, delivery_claims)
-            blocked = claimed if claimed is not None else job
-            return CursorTurnResult(render_job_announcement(blocked), None)
-        if job.status == JobStatus.FAILED:
-            claimed = _defer_or_acknowledge(job_id, delivery_claims)
-            failed = claimed if claimed is not None else job
-            return CursorTurnResult(_foreground_failure_response(failed), None)
-        if job.status == JobStatus.CANCELLED:
-            claimed = _defer_or_acknowledge(job_id, delivery_claims)
-            cancelled = claimed if claimed is not None else job
-            return CursorTurnResult(render_job_announcement(cancelled), None)
-        time.sleep(0.1)
-    updated = _job_store().update(
-        job_id,
-        lambda job: job.evolve(foreground_until=0, updated_at=time.time()),
-    )
+        return result
     print(
         json.dumps(
             {
@@ -1897,7 +1897,17 @@ def _await_foreground(
             }
         )
     )
-    job = updated if updated is not None else read_job(job_id)
+    if continuation:
+        return CursorTurnResult(
+            AssistantResponse(
+                spoken_text="Answer sent; Cursor is continuing.",
+                display_text=(
+                    f"Answer sent to Cursor job {job_id}; the same job is continuing "
+                    "in the background."
+                ),
+            ),
+            None,
+        )
     label = inbox.speakable_label_for(job)
     return CursorTurnResult(
         AssistantResponse(
@@ -1911,6 +1921,40 @@ def _await_foreground(
         ),
         None,
     )
+
+
+def _foreground_delivery_result(
+    job_id: str,
+    job: CursorJob,
+    delivery_claims: DeliveryClaims | None,
+) -> CursorTurnResult | None:
+    if job.status == JobStatus.COMPLETED:
+        claimed = _defer_or_acknowledge(job_id, delivery_claims)
+        result = claimed.result if claimed is not None else job.result
+        return CursorTurnResult(str(result or "").strip(), None)
+    if job.status == JobStatus.AWAITING_USER:
+        claimed = _defer_or_acknowledge(job_id, delivery_claims)
+        awaiting = claimed if claimed is not None else job
+        pending = questions.current(awaiting)
+        rendered_question = (
+            question_prompt(pending)
+            if pending is not None
+            else str(awaiting.question or awaiting.result or "").strip()
+        )
+        return CursorTurnResult(rendered_question, job_id)
+    if job.status == JobStatus.BLOCKED:
+        claimed = _defer_or_acknowledge(job_id, delivery_claims)
+        blocked = claimed if claimed is not None else job
+        return CursorTurnResult(render_job_announcement(blocked), None)
+    if job.status == JobStatus.FAILED:
+        claimed = _defer_or_acknowledge(job_id, delivery_claims)
+        failed = claimed if claimed is not None else job
+        return CursorTurnResult(_foreground_failure_response(failed), None)
+    if job.status == JobStatus.CANCELLED:
+        claimed = _defer_or_acknowledge(job_id, delivery_claims)
+        cancelled = claimed if claimed is not None else job
+        return CursorTurnResult(render_job_announcement(cancelled), None)
+    return None
 
 
 # Compatibility aliases for callers migrating to the agent-neutral service API.
