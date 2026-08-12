@@ -989,6 +989,41 @@ class CursorFastPathTests(unittest.TestCase):
             "create an issue in this repo about startup",
         )
 
+    def test_linear_ticket_creation_dispatches_dedicated_durable_job(self) -> None:
+        context = RequestContext(
+            "create a Linear ticket in this team",
+            issue_scope="API",
+            issue_scope_source="linear",
+        )
+        with (
+            mock.patch.object(app, "start_components"),
+            mock.patch.object(app, "request_context", return_value=context),
+            mock.patch.object(
+                app.cursor_consultation,
+                "pending_question_snapshot",
+                return_value=None,
+            ),
+            mock.patch.object(app, "_single_pending_job", return_value=None),
+            mock.patch.object(
+                app,
+                "route_intent",
+                return_value=IntentRoute(Intent.LINEAR_TICKET_CREATE, "high"),
+            ),
+            mock.patch.object(
+                app, "cursor_turn", return_value=("drafted", "job")
+            ) as cursor,
+            mock.patch.object(app, "stream_and_play"),
+        ):
+            app.respond("create a Linear ticket in this team about startup")
+
+        request = cursor.call_args.args[0]
+        self.assertTrue(request.linear_ticket_create_requested)
+        self.assertEqual(request.linear_team, "API")
+        self.assertEqual(
+            request.utterance,
+            "create a Linear ticket in this team about startup",
+        )
+
     def test_router_receives_the_single_pending_confirmation(self) -> None:
         context = RequestContext("no")
         pending = mock.Mock(

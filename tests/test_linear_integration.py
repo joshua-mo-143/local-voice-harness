@@ -13,7 +13,7 @@ from unittest import mock
 from local_voice_harness.cursor import service
 from local_voice_harness.errors import HarnessError
 from local_voice_harness.integrations import linear, registry
-from local_voice_harness.integrations.herdr import HerdrClient
+from local_voice_harness.integrations.herdr import HerdrClient, HerdrError
 from local_voice_harness.integrations.herdr.cursor_auth import cursor_project_id
 from local_voice_harness.user_config import IntegrationSettings, default_user_config
 
@@ -139,6 +139,56 @@ class LinearEnablementTests(unittest.TestCase):
 
         store.return_value.create.assert_not_called()
         launch.assert_not_called()
+
+    def test_ticket_creation_preflights_capability_before_persistence(self) -> None:
+        with (
+            mock.patch.object(
+                linear.LinearIntegration,
+                "capability_status",
+                return_value=linear.CapabilityStatus(
+                    False, "cursor-mcp unavailable", "configure Cursor MCP"
+                ),
+            ),
+            mock.patch.object(service, "_job_store") as store,
+            mock.patch.object(service, "launch_worker") as launch,
+            self.assertRaisesRegex(
+                HarnessError, "cursor-mcp unavailable.*configure Cursor MCP"
+            ),
+        ):
+            service.start_job(
+                "create a Linear ticket",
+                linear_team="API",
+                linear_ticket_create_requested=True,
+                integrations=registry.build_integration_registry(
+                    replace(default_user_config(), integrations=ENABLED)
+                ),
+            )
+
+        store.return_value.create.assert_not_called()
+        launch.assert_not_called()
+
+    def test_ticket_creation_does_not_adopt_referenced_existing_ticket(self) -> None:
+        with (
+            mock.patch.object(
+                linear.LinearIntegration,
+                "capability_status",
+                return_value=linear.CapabilityStatus(True, "ready"),
+            ),
+            mock.patch.object(service, "_job_store") as store,
+            mock.patch.object(service, "_dispatch_waiting_jobs"),
+        ):
+            service.start_job(
+                "create a Linear ticket in team API about API-42 failing",
+                linear_team="API",
+                linear_ticket_create_requested=True,
+                integrations=registry.build_integration_registry(
+                    replace(default_user_config(), integrations=ENABLED)
+                ),
+            )
+
+        created = store.return_value.create.call_args.args[0]
+        self.assertEqual(created.issue_provider, "linear")
+        self.assertIsNone(created.issue_key)
 
 
 class LinearCapabilityTests(unittest.TestCase):
@@ -368,6 +418,199 @@ class LinearRoutingTests(unittest.TestCase):
                 waiter.terminate()
             self.assertEqual(owner.exitcode, 0)
             self.assertEqual(waiter.exitcode, 0)
+
+
+class LinearTicketCreationTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.integration = linear.LinearIntegration()
+        self.plan = self.integration.plan_ticket_creation(
+            "team-id-api",
+            "api",
+            "Fix startup",
+            "The launcher fails after reboot.",
+            correlation_marker="a" * 32,
+        )
+
+    def test_submit_requires_confirmation_and_returns_validated_identity(self) -> None:
+        client = mock.Mock()
+        client.ensure_router.return_value = mock.Mock(target="voice-router")
+        client.get_agent.return_value = {
+            "agent_session": "router-session",
+            "state_change_seq": 7,
+        }
+
+        def prompt(*_args: object, **kwargs: object) -> object:
+            before_submit = kwargs["before_submit"]
+            assert callable(before_submit)
+            before_submit(7)
+            accepted = kwargs["accepted"]
+            assert callable(accepted)
+            accepted()
+            token = str(kwargs["token"])
+            return mock.Mock(
+                output=(
+                    f"VOICE_LINEAR_IDENTIFIER[{token}]: API-42\n"
+                    f"VOICE_LINEAR_URL[{token}]: "
+                    "https://linear.app/acme/issue/API-42/fix-startup"
+                )
+            )
+
+        client.prompt_and_wait.side_effect = prompt
+        with (
+            tempfile.TemporaryDirectory() as temporary,
+            mock.patch.object(
+                linear,
+                "LINEAR_ROUTER_LOCK",
+                Path(temporary) / "router.lock",
+            ),
+            mock.patch.object(self.integration, "require_capabilities"),
+        ):
+            result = self.integration.submit_ticket_creation(
+                client,
+                self.plan,
+                confirmed=True,
+            )
+
+        self.assertEqual(result.issue.identifier, "API-42")
+        submitted = client.prompt_and_wait.call_args.args[1]
+        self.assertIn("voice-harness-linear-ticket:" + "a" * 32, submitted)
+        self.assertIn("Team key: API", submitted)
+        self.assertIn("Immutable team ID: team-id-api", submitted)
+        self.assertEqual(
+            client.prompt_and_wait.call_args.kwargs["expected_agent_session"],
+            "router-session",
+        )
+
+        with self.assertRaisesRegex(linear.LinearError, "explicit confirmation"):
+            self.integration.submit_ticket_creation(
+                client,
+                self.plan,
+                confirmed=False,
+            )
+
+    def test_accepted_prompt_failure_is_ambiguous(self) -> None:
+        client = mock.Mock()
+        client.ensure_router.return_value = mock.Mock(target="voice-router")
+        client.get_agent.return_value = {
+            "agent_session": "router-session",
+            "state_change_seq": 7,
+        }
+
+        def prompt(*_args: object, **kwargs: object) -> object:
+            before_submit = kwargs["before_submit"]
+            assert callable(before_submit)
+            before_submit(7)
+            accepted = kwargs["accepted"]
+            assert callable(accepted)
+            accepted()
+            raise HerdrError("timeout", code="operation_ambiguous")
+
+        client.prompt_and_wait.side_effect = prompt
+        with (
+            tempfile.TemporaryDirectory() as temporary,
+            mock.patch.object(
+                linear,
+                "LINEAR_ROUTER_LOCK",
+                Path(temporary) / "router.lock",
+            ),
+            mock.patch.object(self.integration, "require_capabilities"),
+            self.assertRaises(linear.LinearOperationAmbiguous),
+        ):
+            self.integration.submit_ticket_creation(
+                client,
+                self.plan,
+                confirmed=True,
+            )
+
+    def test_observe_uses_read_only_marker_search(self) -> None:
+        client = mock.Mock()
+        client.ensure_router.return_value = mock.Mock(target="voice-router")
+
+        def prompt(*_args: object, **kwargs: object) -> object:
+            token = str(kwargs["token"])
+            return mock.Mock(
+                output=(
+                    f"VOICE_LINEAR_STATUS[{token}]: found\n"
+                    f"VOICE_LINEAR_IDENTIFIER[{token}]: API-42\n"
+                    f"VOICE_LINEAR_URL[{token}]: "
+                    "https://linear.app/acme/issue/API-42/fix-startup"
+                )
+            )
+
+        client.prompt_and_wait.side_effect = prompt
+        with (
+            tempfile.TemporaryDirectory() as temporary,
+            mock.patch.object(
+                linear,
+                "LINEAR_ROUTER_LOCK",
+                Path(temporary) / "router.lock",
+            ),
+            mock.patch.object(self.integration, "require_capabilities"),
+        ):
+            result = self.integration.observe_ticket_creation(client, self.plan)
+
+        assert result is not None
+        self.assertEqual(result.issue.identifier, "API-42")
+        prompt_text = client.prompt_and_wait.call_args.args[1]
+        self.assertIn("read-only", prompt_text)
+        self.assertIn("Do not create or modify anything", prompt_text)
+        self.assertIn("list_issues", prompt_text)
+        self.assertIn("<!-- voice-harness-linear-ticket:", prompt_text)
+        self.assertNotIn("Search team ", prompt_text)
+
+    def test_resolves_exact_team_identity_read_only(self) -> None:
+        client = mock.Mock()
+        client.ensure_router.return_value = mock.Mock(target="voice-router")
+
+        def prompt(*_args: object, **kwargs: object) -> object:
+            token = str(kwargs["token"])
+            return mock.Mock(
+                output=(
+                    f"VOICE_LINEAR_STATUS[{token}]: found\n"
+                    f"VOICE_LINEAR_TEAM_ID[{token}]: team-id-api\n"
+                    f"VOICE_LINEAR_TEAM_KEY[{token}]: API\n"
+                    f"VOICE_LINEAR_TEAM_NAME[{token}]: Application Platform"
+                )
+            )
+
+        client.prompt_and_wait.side_effect = prompt
+        with (
+            tempfile.TemporaryDirectory() as temporary,
+            mock.patch.object(
+                linear,
+                "LINEAR_ROUTER_LOCK",
+                Path(temporary) / "router.lock",
+            ),
+            mock.patch.object(self.integration, "require_capabilities"),
+        ):
+            team = self.integration.resolve_team(client, "api")
+
+        self.assertEqual(team.id, "team-id-api")
+        self.assertEqual(team.key, "API")
+        self.assertIn("read-only", client.prompt_and_wait.call_args.args[1])
+
+    def test_missing_team_is_reported_as_not_found(self) -> None:
+        client = mock.Mock()
+        client.ensure_router.return_value = mock.Mock(target="voice-router")
+
+        def prompt(*_args: object, **kwargs: object) -> object:
+            token = str(kwargs["token"])
+            return mock.Mock(output=f"VOICE_LINEAR_STATUS[{token}]: not_found\n")
+
+        client.prompt_and_wait.side_effect = prompt
+        with (
+            tempfile.TemporaryDirectory() as temporary,
+            mock.patch.object(
+                linear,
+                "LINEAR_ROUTER_LOCK",
+                Path(temporary) / "router.lock",
+            ),
+            mock.patch.object(self.integration, "require_capabilities"),
+        ):
+            with self.assertRaises(linear.LinearError) as raised:
+                self.integration.resolve_team(client, "api")
+
+        self.assertEqual(str(raised.exception), "I couldn't find Linear team API.")
 
 
 if __name__ == "__main__":

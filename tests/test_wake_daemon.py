@@ -3782,6 +3782,19 @@ class CompletedFollowupContextTests(unittest.TestCase):
         self.assertEqual(request.github_repository, "example/project")
         self._last_qwen.assert_not_called()
 
+    def test_linear_ticket_creation_dispatches_dedicated_job(self) -> None:
+        daemon = _bare_daemon()
+        cursor_turn = self._run_route(
+            daemon,
+            IntentRoute(Intent.LINEAR_TICKET_CREATE, "high"),
+            transcript="create a Linear ticket in team API about startup",
+        )
+
+        request = cursor_turn.call_args.args[0]
+        self.assertTrue(request.linear_ticket_create_requested)
+        self.assertEqual(request.linear_team, "API")
+        self._last_qwen.assert_not_called()
+
     def test_pr_unsupported_declines_without_starting_a_job(self) -> None:
         daemon = _bare_daemon()
         cursor_turn = self._run_route(

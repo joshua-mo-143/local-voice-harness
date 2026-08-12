@@ -1283,6 +1283,28 @@ def test_background_job_renderings_cover_each_deliverable_status() -> None:
         assert "123456789abc" in response.display_text
 
 
+def test_missing_linear_team_is_spoken_directly() -> None:
+    job = CursorJob.from_dict(
+        {
+            "id": "123456789abc",
+            "request": "create a Linear ticket in team API",
+            "status": JobStatus.FAILED.value,
+            "created_at": 1,
+            "completed_at": 2,
+            "delivered": False,
+            "issue_provider": "linear",
+            "linear_ticket_create_requested": True,
+            "linear_ticket_create_team": "API",
+            "result": "I couldn't find Linear team API.",
+            "error": "I couldn't find Linear team API.",
+            "speakable_label": "Create a Linear ticket in team",
+        }
+    )
+    response = service.render_job_announcement(job)
+    assert response.spoken_text == "I couldn't find Linear team API."
+    assert response.display_text == "I couldn't find Linear team API."
+
+
 @pytest.mark.parametrize(
     ("status", "safe_detail"),
     [

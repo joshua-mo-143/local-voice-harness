@@ -96,6 +96,7 @@ from ..intent import (
     is_grouped_repository_mapping,
     route_intent,
 )
+from ..linear_ticket_creation import team_from_utterance
 from ..llm import qwen_turn
 from ..notifications import notify
 from ..process import ProcessHandle, process_identity
@@ -1177,7 +1178,9 @@ class WakeConversationDaemon:
                 return
             interruption = self.process_utterance(audio_path, woke=interruption.woke)
 
-    def process_utterance(self, audio_path: Path, *, woke: bool) -> BargeIn | None:
+    def process_utterance(  # pyright: ignore[reportGeneralTypeIssues]
+        self, audio_path: Path, *, woke: bool
+    ) -> BargeIn | None:
         had_active_conversation = bool(self.conversation_deadline)
         delivery_claims: DeliveryClaims = []
         recent_playback = self._active_recent_playback() if not woke else ()
@@ -1350,6 +1353,7 @@ class WakeConversationDaemon:
                     in {
                         Intent.AGENT_SUBMIT,
                         Intent.GITHUB_ISSUE_CREATE,
+                        Intent.LINEAR_TICKET_CREATE,
                         Intent.WORKSPACE_CONSULTATION,
                     }
                 )
@@ -1404,6 +1408,22 @@ class WakeConversationDaemon:
                             context.github_repository or repository_from_utterance(text)
                         ),
                         github_issue_create_requested=True,
+                    ),
+                    delivery_claims=delivery_claims,
+                    integrations=self.integrations,
+                )
+            elif route.actionable and route.intent == Intent.LINEAR_TICKET_CREATE:
+                self.completed_followup = None
+                response, next_cursor_session = cursor_turn(
+                    CursorTurnRequest(
+                        context.text,
+                        utterance=text,
+                        linear_team=(
+                            context.issue_scope
+                            if context.issue_scope_source == "linear"
+                            else team_from_utterance(text)
+                        ),
+                        linear_ticket_create_requested=True,
                     ),
                     delivery_claims=delivery_claims,
                     integrations=self.integrations,
@@ -1590,6 +1610,11 @@ class WakeConversationDaemon:
                 response = (
                     "I did not create an issue because the request was unclear. "
                     "Please name the repository and issue."
+                )
+            elif route.intent == Intent.LINEAR_TICKET_CREATE:
+                response = (
+                    "I did not create a Linear ticket because the request was unclear. "
+                    "Please name the Linear team and ticket."
                 )
             elif route.intent == Intent.AGENT_PR_UNSUPPORTED:
                 response = (

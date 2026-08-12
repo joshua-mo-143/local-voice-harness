@@ -23,6 +23,7 @@ from local_voice_harness.cursor.recovery import (
     reconcile_uncertain_agent,
     reconcile_uncertain_fork,
     reconcile_uncertain_issue_creation,
+    reconcile_uncertain_linear_ticket_creation,
     recover_jobs,
     resolve_manual_reconciliation,
     stage_terminal_intent,
@@ -40,6 +41,12 @@ from local_voice_harness.integrations.github import (
     GitHubRepository,
 )
 from local_voice_harness.integrations.herdr import HerdrError
+from local_voice_harness.integrations.linear import (
+    LinearError,
+    LinearIntegration,
+    LinearIssue,
+    LinearTicketCreationResult,
+)
 
 
 class CursorRecoveryTests(unittest.TestCase):
@@ -131,6 +138,131 @@ class CursorRecoveryTests(unittest.TestCase):
             "manual_required",
         )
         client.submit_issue.assert_not_called()
+
+    def test_reconciles_ambiguous_linear_creation_without_resubmitting(
+        self,
+    ) -> None:
+        job = self.create(
+            {
+                "id": "123456789abc",
+                "status": "queued",
+                "request": "create a Linear ticket",
+                "created_at": 1,
+                "queued_at": 1,
+                "delivered": False,
+                "issue_provider": "linear",
+                "linear_ticket_create_requested": True,
+                "linear_ticket_create_confirmed": True,
+                "linear_ticket_create_team": "API",
+                "linear_ticket_create_team_id": "team-id-api",
+                "linear_ticket_create_title": "Fix startup",
+                "linear_ticket_create_description": "Startup fails.",
+                "linear_ticket_create_marker": "a" * 32,
+                "linear_ticket_create_operation_state": "ambiguous",
+            }
+        )
+        provider = LinearIntegration()
+        result = LinearTicketCreationResult(
+            LinearIssue("API-42"),
+            "https://linear.app/acme/issue/API-42/fix-startup",
+            "a" * 32,
+        )
+        with mock.patch.object(
+            provider,
+            "observe_ticket_creation",
+            return_value=result,
+        ) as observe:
+            reconcile_uncertain_linear_ticket_creation(
+                self.store,
+                job,
+                now=100,
+                herdr_factory=mock.Mock,
+                linear_factory=lambda: provider,
+            )
+
+        updated = self.store.get(job.id)
+        self.assertEqual(updated.status, JobStatus.COMPLETED)
+        self.assertEqual(updated.linear_ticket_created_identifier, "API-42")
+        observe.assert_called_once()
+
+    def test_unobserved_linear_creation_requires_manual_check(self) -> None:
+        job = self.create(
+            {
+                "id": "123456789abc",
+                "status": "queued",
+                "request": "create a Linear ticket",
+                "created_at": 1,
+                "queued_at": 1,
+                "delivered": False,
+                "issue_provider": "linear",
+                "linear_ticket_create_requested": True,
+                "linear_ticket_create_confirmed": True,
+                "linear_ticket_create_team": "API",
+                "linear_ticket_create_team_id": "team-id-api",
+                "linear_ticket_create_title": "Fix startup",
+                "linear_ticket_create_description": "Startup fails.",
+                "linear_ticket_create_marker": "a" * 32,
+                "linear_ticket_create_operation_state": "ambiguous",
+            }
+        )
+        provider = LinearIntegration()
+        with mock.patch.object(
+            provider,
+            "observe_ticket_creation",
+            return_value=None,
+        ):
+            reconcile_uncertain_linear_ticket_creation(
+                self.store,
+                job,
+                now=100,
+                herdr_factory=mock.Mock,
+                linear_factory=lambda: provider,
+            )
+
+        updated = self.store.get(job.id)
+        self.assertEqual(updated.status, JobStatus.BLOCKED)
+        self.assertEqual(
+            updated.linear_ticket_create_operation_state,
+            "manual_required",
+        )
+
+    def test_incomplete_linear_observation_stays_ambiguous(self) -> None:
+        job = self.create(
+            {
+                "id": "123456789abc",
+                "status": "queued",
+                "request": "create a Linear ticket",
+                "created_at": 1,
+                "queued_at": 1,
+                "delivered": False,
+                "issue_provider": "linear",
+                "linear_ticket_create_requested": True,
+                "linear_ticket_create_confirmed": True,
+                "linear_ticket_create_team": "API",
+                "linear_ticket_create_team_id": "team-id-api",
+                "linear_ticket_create_title": "Fix startup",
+                "linear_ticket_create_description": "Startup fails.",
+                "linear_ticket_create_marker": "a" * 32,
+                "linear_ticket_create_operation_state": "ambiguous",
+            }
+        )
+        provider = LinearIntegration()
+        with mock.patch.object(
+            provider,
+            "observe_ticket_creation",
+            side_effect=LinearError("Linear ticket creation could not be observed"),
+        ):
+            reconcile_uncertain_linear_ticket_creation(
+                self.store,
+                job,
+                now=100,
+                herdr_factory=mock.Mock,
+                linear_factory=lambda: provider,
+            )
+
+        updated = self.store.get(job.id)
+        self.assertEqual(updated.status, JobStatus.QUEUED)
+        self.assertEqual(updated.linear_ticket_create_operation_state, "ambiguous")
 
     def test_migration_and_pruning_precede_recovery_scans(self) -> None:
         store = mock.Mock(spec=JobStore)

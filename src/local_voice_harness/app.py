@@ -41,6 +41,7 @@ from .intent import (
     route_intent,
 )
 from .ipc import socket_ready
+from .linear_ticket_creation import team_from_utterance
 from .llm import qwen_response
 from .questions import AnswerProvenance
 from .responses import as_assistant_response
@@ -75,6 +76,7 @@ def _context_for_route(
         in {
             Intent.AGENT_SUBMIT,
             Intent.GITHUB_ISSUE_CREATE,
+            Intent.LINEAR_TICKET_CREATE,
             Intent.WORKSPACE_CONSULTATION,
         }
     ):
@@ -225,6 +227,21 @@ def respond(text: str, *, user_config: UserConfig | None = None) -> None:
                     delivery_claims=delivery_claims,
                     integrations=integrations,
                 )[0]
+            elif route.actionable and route.intent == Intent.LINEAR_TICKET_CREATE:
+                response = cursor_turn(
+                    CursorTurnRequest(
+                        context.text,
+                        utterance=text,
+                        linear_team=(
+                            context.issue_scope
+                            if context.issue_scope_source == "linear"
+                            else team_from_utterance(text)
+                        ),
+                        linear_ticket_create_requested=True,
+                    ),
+                    delivery_claims=delivery_claims,
+                    integrations=integrations,
+                )[0]
             elif missing_ticket_scope:
                 response = MISSING_ISSUE_SCOPE_RESPONSE
             elif route.actionable and route.intent == Intent.QUESTION_CONSULTATION:
@@ -284,6 +301,11 @@ def respond(text: str, *, user_config: UserConfig | None = None) -> None:
                 response = (
                     "I did not create an issue because the request was unclear. "
                     "Please name the repository and issue."
+                )
+            elif route.intent == Intent.LINEAR_TICKET_CREATE:
+                response = (
+                    "I did not create a Linear ticket because the request was unclear. "
+                    "Please name the Linear team and ticket."
                 )
             elif route.actionable and route.intent in CURSOR_MANAGEMENT_ACTIONS:
                 response = cursor_turn(
