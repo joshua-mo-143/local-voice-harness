@@ -23,7 +23,7 @@ task.
 
 The harness is designed for a trusted, single-user Linux workstation. It is a
 personal project rather than a supported production service; read the
-[maintainer note](#maintainer-note) and [security notes](docs/security.md) before
+[maintainer note](#note-from-maintainer) and [security notes](docs/security.md) before
 granting it access to repositories or external integrations.
 
 ## Deployment profiles
@@ -265,26 +265,14 @@ Read [Security notes](docs/security.md) and the
 `docs/durable-storage-migration.md` is an internal design and migration record, not
 an installation or operations guide.
 
-## Maintainer note
+## Note from maintainer
+Hi! (this note is entirely human-written)
 
-Hi! This note is entirely human-written.
+I primarily built this to help me interface with my Cursor agents a bit better. It is annoying to have to go to a Github issue and ask it to work on (or verify) the issue, or do the entire workflow for just gh pr checkout-ing a user's changes and checking locally to make sure everything makes sense. And the same with Linear tickets... and also Zendesk tickets to a degree.
 
-I built this project primarily to make working with my Cursor agents less
-interruptive. Going to a GitHub issue, asking an agent to work on or verify it, and
-manually checking out pull requests breaks my flow; the same is true for Linear and,
-to a degree, Zendesk. This harness is my attempt to make those workflows accessible
-by voice.
+Pretty much all of this code is AI generated. While I am dogfooding this harness (so any bugs are likely to be found and squashed by me) and I'll be making all the major architectural decisions on this personal project, using this software will primarily be at your own risk. I've tried to make the installation as user-friendly as possible, but you may come across unforeseen issues.
 
-Almost all of the code is AI-generated. I dogfood the harness and make the major
-architectural decisions, so I expect to find and fix problems through regular use,
-but this remains a personal project and you use it at your own risk. I have tried to
-make installation approachable, but other hardware and desktop configurations may
-expose bugs I have not encountered.
-
-I also do not manually review every line of generated code. I care first about
-whether the system works for me, while continuing to add tests, safety boundaries,
-and architectural checks so the code does not become the programming equivalent of
-a Lovecraftian horror. Code quality may still reflect that pragmatic approach.
+To add: I also am not looking at the code - as long as it works, I will likely keep using it (and fixing bugs as I find them). ~~Be prepared to see LLM-made horrors beyond comprehension should you explore the codebase.~~ There will be attempts made to make sure the code is not the programming equivalent of a Lovecraftian horror. However, you may find that the code quality is perhaps not the best quality due to me just wanting to get stuff to work.
 
 ## License
 
