@@ -844,9 +844,9 @@ class CursorFastPathTests(unittest.TestCase):
     def test_router_receives_the_single_pending_confirmation(self) -> None:
         context = RequestContext("no")
         pending = mock.Mock(
-            job_id="aaaaaaaaaaaa",
-            text="Create this GitHub issue?",
-            owner="github_issue_create_confirmation",
+            id="aaaaaaaaaaaa",
+            question="Create this GitHub issue?",
+            clarification_kind="github_issue_create_confirmation",
         )
         with (
             mock.patch.object(app, "start_components"),
@@ -854,8 +854,9 @@ class CursorFastPathTests(unittest.TestCase):
             mock.patch.object(
                 app.cursor_consultation,
                 "pending_question_snapshot",
-                return_value=pending,
+                return_value=None,
             ),
+            mock.patch.object(app, "_single_pending_job", return_value=pending),
             mock.patch.object(
                 app,
                 "route_intent",
