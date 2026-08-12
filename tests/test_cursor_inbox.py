@@ -99,6 +99,77 @@ class ReferenceResolutionTests(unittest.TestCase):
         assert resolution.unique is not None
         self.assertEqual(resolution.unique.id, "aaaaaaaaaaaa")
 
+    def test_issue_key_outranks_unrelated_github_issue_number(self) -> None:
+        jobs = [
+            _job(
+                "aaaaaaaaaaaa",
+                issue_key="APP-43",
+                issue_provider="linear",
+                speakable_label="APP-43",
+            ),
+            _job(
+                "bbbbbbbbbbbb",
+                github_repository="acme/widgets",
+                github_issue=43,
+                issue_provider="github",
+                speakable_label="widgets issue 43",
+            ),
+        ]
+
+        resolution = inbox.resolve_reference(jobs, "what is happening with APP-43?")
+
+        assert resolution.unique is not None
+        self.assertEqual(resolution.unique.id, "aaaaaaaaaaaa")
+
+    def test_qualified_github_issue_outranks_same_number_in_other_repo(self) -> None:
+        jobs = [
+            _job(
+                "aaaaaaaaaaaa",
+                github_repository="acme/widgets",
+                github_issue=43,
+                issue_provider="github",
+                speakable_label="widgets issue 43",
+            ),
+            _job(
+                "bbbbbbbbbbbb",
+                github_repository="acme/api",
+                github_issue=43,
+                issue_provider="github",
+                speakable_label="api issue 43",
+            ),
+        ]
+
+        resolution = inbox.resolve_reference(
+            jobs, "status of https://github.com/acme/widgets/issues/43"
+        )
+
+        assert resolution.unique is not None
+        self.assertEqual(resolution.unique.id, "aaaaaaaaaaaa")
+
+    def test_bare_github_issue_number_stays_ambiguous_across_repositories(
+        self,
+    ) -> None:
+        jobs = [
+            _job(
+                "aaaaaaaaaaaa",
+                github_repository="acme/widgets",
+                github_issue=43,
+                issue_provider="github",
+                speakable_label="widgets issue 43",
+            ),
+            _job(
+                "bbbbbbbbbbbb",
+                github_repository="acme/api",
+                github_issue=43,
+                issue_provider="github",
+                speakable_label="api issue 43",
+            ),
+        ]
+
+        resolution = inbox.resolve_reference(jobs, "status of issue 43")
+
+        self.assertTrue(resolution.ambiguous)
+
     def test_shared_label_words_are_ambiguous(self) -> None:
         jobs = [
             _job("aaaaaaaaaaaa", speakable_label="issue 42"),

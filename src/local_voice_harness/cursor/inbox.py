@@ -231,9 +231,26 @@ class ReferenceResolution:
         return len(self.matches) > 1
 
 
+_TIER_EXTERNAL_IDENTITY = 3
 _TIER_STRONG = 2
 _TIER_WEAK = 1
 _TIER_NONE = 0
+
+
+def _qualified_github_issue_matches(job: CursorJob, lowered: str) -> bool:
+    repository = (job.github_repository or "").strip().casefold().strip("/")
+    number = job.github_issue
+    if not repository or number is None:
+        return False
+    return any(
+        reference in lowered
+        for reference in (
+            f"github.com/{repository}/issues/{number}",
+            f"{repository}#{number}",
+            f"{repository} issue {number}",
+            f"{repository} issue #{number}",
+        )
+    )
 
 
 def _match_tier(
@@ -241,9 +258,10 @@ def _match_tier(
 ) -> int:
     """Rank how specifically a reference identifies a job.
 
-    A strong tier means an unambiguous handle (short id, full id, issue key, or
-    issue/PR number). A weak tier means the reference only shares descriptive
-    words with the job label, which is far more likely to collide.
+    An external-identity tier means a complete provider-owned ticket handle.
+    It outranks a strong bare job ID or issue number so, for example, ``APP-43``
+    does not collide with GitHub issue 43. A weak tier only shares descriptive
+    label words, which is far more likely to collide.
     """
 
     if summary.short_id in tokens or job.id in tokens:
@@ -252,7 +270,9 @@ def _match_tier(
         key = job.issue_key.casefold()
         key_tokens = set(_tokens(key))
         if key in lowered or (key_tokens and key_tokens <= tokens):
-            return _TIER_STRONG
+            return _TIER_EXTERNAL_IDENTITY
+    if _qualified_github_issue_matches(job, lowered):
+        return _TIER_EXTERNAL_IDENTITY
     for number in (job.github_issue, job.github_pull_request):
         if number is not None and str(number) in tokens:
             return _TIER_STRONG
@@ -279,16 +299,19 @@ def resolve_reference(jobs: list[CursorJob], reference: str) -> ReferenceResolut
     if not tokens:
         return ReferenceResolution(())
     lowered = reference.casefold()
+    external_identity: list[JobSummary] = []
     strong: list[JobSummary] = []
     weak: list[JobSummary] = []
     for job in jobs:
         summary = summarize(job)
         tier = _match_tier(summary, job, tokens, lowered)
-        if tier == _TIER_STRONG:
+        if tier == _TIER_EXTERNAL_IDENTITY:
+            external_identity.append(summary)
+        elif tier == _TIER_STRONG:
             strong.append(summary)
         elif tier == _TIER_WEAK:
             weak.append(summary)
-    return ReferenceResolution(tuple(strong or weak))
+    return ReferenceResolution(tuple(external_identity or strong or weak))
 
 
 def clarify(summaries: list[JobSummary], action: str) -> str:
