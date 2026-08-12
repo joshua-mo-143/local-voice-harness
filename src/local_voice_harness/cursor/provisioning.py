@@ -1345,9 +1345,10 @@ _HARD_RISK_TERMS = (
     "unclear acceptance",
 )
 _MAX_RISK_EVIDENCE_BYTES = 16 * 1024
-_NEGATED_REVIEW_RISK = re.compile(
+_NEGATED_RISK = re.compile(
     r"\b(?:no|without)\s+(?:known\s+)?"
-    r"(?:[a-z-]+\s+){0,6}(?:concerns?|risks?|issues?)\b"
+    r"(?:[a-z-]+\s*(?:,\s*|\s+(?:and|or)\s+|\s+)){0,12}"
+    r"(?:concerns?|risks?|issues?)\b"
     r"|\b(?:does|did)\s+not\s+(?:raise|introduce|create)\s+"
     r"(?:[a-z-]+\s+){0,6}(?:concerns?|risks?|issues?)\b"
     r"|\b(?:[a-z-]+\s+){1,4}(?:is|are)\s+not\s+"
@@ -1377,8 +1378,7 @@ def _hard_risk_evidence(
         ("review", review),
     ):
         evidence = _bounded_risk_text(value)
-        if source == "review":
-            evidence = _NEGATED_REVIEW_RISK.sub("", evidence)
+        evidence = _NEGATED_RISK.sub("", evidence)
         for term in _HARD_RISK_TERMS:
             if term in evidence:
                 return f"{source} contains {term!r}"
