@@ -68,12 +68,14 @@ def run_command(
     *,
     timeout: float,
     cwd: Path | None = None,
+    stdin: str | None = None,
     terminate_grace: float = TERMINATE_GRACE_SECONDS,
 ) -> subprocess.CompletedProcess[str]:
     """Run a command in an isolated session and stop all descendants on timeout."""
     arguments = list(command)
     process = subprocess.Popen(
         arguments,
+        stdin=subprocess.PIPE if stdin is not None else None,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
@@ -81,7 +83,7 @@ def run_command(
         start_new_session=True,
     )
     try:
-        stdout, stderr = process.communicate(timeout=timeout)
+        stdout, stderr = process.communicate(input=stdin, timeout=timeout)
     except subprocess.TimeoutExpired as exc:
         _stop_process_group(process, terminate_grace=terminate_grace)
         stdout, stderr = process.communicate()

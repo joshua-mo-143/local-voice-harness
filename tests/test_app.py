@@ -813,6 +813,68 @@ class CursorFastPathTests(unittest.TestCase):
             settings=mock.ANY,
         )
 
+    def test_github_issue_creation_dispatches_dedicated_durable_job(self) -> None:
+        context = RequestContext(
+            "create an issue in this repo",
+            github_repository="example/project",
+        )
+        with (
+            mock.patch.object(app, "start_components"),
+            mock.patch.object(app, "request_context", return_value=context),
+            mock.patch.object(
+                app,
+                "route_intent",
+                return_value=IntentRoute(Intent.GITHUB_ISSUE_CREATE, "high"),
+            ),
+            mock.patch.object(
+                app, "cursor_turn", return_value=("drafted", "job")
+            ) as cursor,
+            mock.patch.object(app, "stream_and_play"),
+        ):
+            app.respond("create an issue in this repo about startup")
+
+        request = cursor.call_args.args[0]
+        self.assertTrue(request.github_issue_create_requested)
+        self.assertEqual(request.github_repository, "example/project")
+        self.assertEqual(
+            request.utterance,
+            "create an issue in this repo about startup",
+        )
+
+    def test_router_receives_the_single_pending_confirmation(self) -> None:
+        context = RequestContext("no")
+        pending = mock.Mock(
+            job_id="aaaaaaaaaaaa",
+            text="Create this GitHub issue?",
+            owner="github_issue_create_confirmation",
+        )
+        with (
+            mock.patch.object(app, "start_components"),
+            mock.patch.object(app, "request_context", return_value=context),
+            mock.patch.object(
+                app.cursor_consultation,
+                "pending_question_snapshot",
+                return_value=pending,
+            ),
+            mock.patch.object(
+                app,
+                "route_intent",
+                return_value=IntentRoute(Intent.END_CONVERSATION, "high"),
+            ) as route,
+            mock.patch.object(app, "qwen_response", return_value="okay"),
+            mock.patch.object(app, "stream_and_play"),
+        ):
+            app.respond("no")
+
+        route.assert_called_once_with(
+            "no",
+            context,
+            cursor_session="aaaaaaaaaaaa",
+            pending_question="Create this GitHub issue?",
+            clarification_kind="github_issue_create_confirmation",
+            settings=mock.ANY,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

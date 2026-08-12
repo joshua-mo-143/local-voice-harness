@@ -96,6 +96,22 @@ class ProcessHandleTests(unittest.TestCase):
 
 
 class CommandProcessGroupTests(unittest.TestCase):
+    def test_command_accepts_stdin_without_adding_it_to_arguments(self) -> None:
+        secret = "body that must not appear in argv"
+        completed = process.run_command(
+            [
+                sys.executable,
+                "-c",
+                "import sys; print(sys.stdin.read()); print(sys.argv)",
+            ],
+            timeout=2,
+            stdin=secret,
+        )
+
+        self.assertEqual(completed.returncode, 0)
+        self.assertEqual(completed.stdout.splitlines()[0], secret)
+        self.assertNotIn(secret, completed.args)
+
     def test_command_runs_as_new_session_leader(self) -> None:
         completed = process.run_command(
             [

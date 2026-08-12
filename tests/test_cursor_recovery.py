@@ -22,6 +22,7 @@ from local_voice_harness.cursor.recovery import (
     reconcile_prompt_and_pane_operations,
     reconcile_uncertain_agent,
     reconcile_uncertain_fork,
+    reconcile_uncertain_issue_creation,
     recover_jobs,
     resolve_manual_reconciliation,
     stage_terminal_intent,
@@ -31,7 +32,13 @@ from local_voice_harness.cursor.store import (
     JobStore,
     MaintenanceLease,
 )
-from local_voice_harness.integrations.github import GitHubError, GitHubRepository
+from local_voice_harness.integrations.github import (
+    GitHubClient,
+    GitHubError,
+    GitHubIssue,
+    GitHubIssueCreationResult,
+    GitHubRepository,
+)
 from local_voice_harness.integrations.herdr import HerdrError
 
 
@@ -46,6 +53,84 @@ class CursorRecoveryTests(unittest.TestCase):
 
     def create(self, values: dict[str, object]) -> CursorJob:
         return self.store.create(CursorJob.from_dict(values))
+
+    def test_reconciles_ambiguous_issue_creation_without_resubmitting(self) -> None:
+        job = self.create(
+            {
+                "id": "123456789abc",
+                "status": "reconciling",
+                "request": "create an issue",
+                "created_at": 1,
+                "delivered": False,
+                "issue_provider": "github",
+                "github_repository": "example/project",
+                "github_issue_create_requested": True,
+                "github_issue_create_confirmed": True,
+                "github_issue_create_title": "Fix startup",
+                "github_issue_create_body": "Startup fails.",
+                "github_issue_create_marker": "a" * 32,
+                "github_issue_create_operation_state": "ambiguous",
+            }
+        )
+        client = mock.Mock(spec=GitHubClient)
+        client.observe_issue.return_value = GitHubIssueCreationResult(
+            GitHubIssue("example", "project", 42),
+            "https://github.com/example/project/issues/42",
+            "a" * 32,
+        )
+
+        reconcile_uncertain_issue_creation(
+            self.store,
+            job,
+            now=100,
+            github_factory=lambda: client,
+        )
+
+        updated = self.store.get(job.id)
+        self.assertEqual(updated.status, JobStatus.COMPLETED)
+        self.assertEqual(updated.github_issue_created_number, 42)
+        self.assertEqual(
+            updated.github_issue_created_url,
+            "https://github.com/example/project/issues/42",
+        )
+        client.submit_issue.assert_not_called()
+
+    def test_unobserved_issue_creation_requires_manual_check(self) -> None:
+        job = self.create(
+            {
+                "id": "123456789abc",
+                "status": "queued",
+                "request": "create an issue",
+                "created_at": 1,
+                "queued_at": 1,
+                "delivered": False,
+                "issue_provider": "github",
+                "github_repository": "example/project",
+                "github_issue_create_requested": True,
+                "github_issue_create_confirmed": True,
+                "github_issue_create_title": "Fix startup",
+                "github_issue_create_body": "Startup fails.",
+                "github_issue_create_marker": "a" * 32,
+                "github_issue_create_operation_state": "ambiguous",
+            }
+        )
+        client = mock.Mock(spec=GitHubClient)
+        client.observe_issue.return_value = None
+
+        reconcile_uncertain_issue_creation(
+            self.store,
+            job,
+            now=100,
+            github_factory=lambda: client,
+        )
+
+        updated = self.store.get(job.id)
+        self.assertEqual(updated.status, JobStatus.BLOCKED)
+        self.assertEqual(
+            updated.github_issue_create_operation_state,
+            "manual_required",
+        )
+        client.submit_issue.assert_not_called()
 
     def test_migration_and_pruning_precede_recovery_scans(self) -> None:
         store = mock.Mock(spec=JobStore)

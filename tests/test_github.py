@@ -11,6 +11,8 @@ from local_voice_harness.integrations.github import (
     GitHubClient,
     GitHubError,
     GitHubIssue,
+    GitHubIssueCreationPlan,
+    GitHubIssueCreationResult,
     GitHubIssueLookupError,
     GitHubIssueLookupReason,
     GitHubOperationAmbiguous,
@@ -96,7 +98,14 @@ class GitHubClientTests(unittest.TestCase):
             GitHubClient.validate_repository("Example/project.git"),
             "Example/project",
         )
-        for invalid in ("project", "../project", "owner/../repo", "owner/repo/extra"):
+        for invalid in (
+            "project",
+            "../project",
+            "owner-/repo",
+            "owner/../repo",
+            f"owner/{'r' * 101}",
+            "owner/repo/extra",
+        ):
             with self.subTest(invalid=invalid), self.assertRaises(GitHubError):
                 GitHubClient.validate_repository(invalid)
 
@@ -230,6 +239,141 @@ class GitHubClientTests(unittest.TestCase):
         )
         self.assertEqual(issue.reference, "example/project#42")
         self.assertEqual(issue.url, "https://github.com/example/project/issues/42")
+
+    def test_issue_submission_uses_stdin_and_validates_canonical_result(self) -> None:
+        client = GitHubClient()
+        plan = GitHubIssueCreationPlan(
+            "example/project",
+            "Fix the reader",
+            "Detailed private body",
+            "a" * 32,
+        )
+        with mock.patch.object(
+            client,
+            "_run",
+            return_value=_completed("https://github.com/example/project/issues/42\n"),
+        ) as run:
+            result = client.submit_issue(plan, confirmed=True)
+
+        self.assertEqual(
+            result,
+            GitHubIssueCreationResult(
+                GitHubIssue("example", "project", 42),
+                "https://github.com/example/project/issues/42",
+                "a" * 32,
+            ),
+        )
+        command = run.call_args.args[0]
+        self.assertEqual(
+            command,
+            [
+                "gh",
+                "issue",
+                "create",
+                "--repo",
+                "example/project",
+                "--title",
+                "Fix the reader",
+                "--body-file",
+                "-",
+            ],
+        )
+        self.assertNotIn(plan.body, command)
+        self.assertEqual(
+            run.call_args.kwargs["stdin"],
+            "Detailed private body\n\n"
+            f"<!-- local-voice-harness-correlation:{'a' * 32} -->\n",
+        )
+
+    def test_issue_submission_requires_confirmation_before_running(self) -> None:
+        client = GitHubClient()
+        plan = GitHubIssueCreationPlan("example/project", "Title", "Body", "a" * 32)
+        with (
+            mock.patch.object(client, "_run") as run,
+            self.assertRaisesRegex(GitHubError, "confirmation"),
+        ):
+            client.submit_issue(plan, confirmed=False)
+        run.assert_not_called()
+
+    def test_issue_submission_rejects_invalid_plan_and_result(self) -> None:
+        client = GitHubClient()
+        invalid_plans = (
+            GitHubIssueCreationPlan("not-a-repository", "Title", "Body", "a" * 32),
+            GitHubIssueCreationPlan("example/project", "", "Body", "a" * 32),
+            GitHubIssueCreationPlan("example/project", "Title", "", "a" * 32),
+            GitHubIssueCreationPlan("example/project", "Title", "Body", "A" * 32),
+            GitHubIssueCreationPlan(
+                "example/project", "Title", f"Body {'a' * 32}", "a" * 32
+            ),
+        )
+        for plan in invalid_plans:
+            with (
+                self.subTest(plan=plan),
+                mock.patch.object(client, "_run") as run,
+                self.assertRaises(GitHubError),
+            ):
+                client.submit_issue(plan, confirmed=True)
+            run.assert_not_called()
+
+        plan = GitHubIssueCreationPlan("example/project", "Title", "Body", "a" * 32)
+        for url in (
+            "https://github.com/example/project/issues/42?query=x",
+            "https://github.com/other/project/issues/42",
+            "not a URL",
+        ):
+            with (
+                self.subTest(url=url),
+                mock.patch.object(client, "_run", return_value=_completed(url)),
+                self.assertRaises(GitHubError),
+            ):
+                client.submit_issue(plan, confirmed=True)
+
+    def test_issue_submission_timeout_is_ambiguous(self) -> None:
+        client = GitHubClient()
+        plan = GitHubIssueCreationPlan("example/project", "Title", "Body", "a" * 32)
+        with (
+            mock.patch(
+                "local_voice_harness.integrations.github.run_command",
+                side_effect=subprocess.TimeoutExpired(["gh", "issue", "create"], 30),
+            ),
+            self.assertRaises(GitHubOperationAmbiguous),
+        ):
+            client.submit_issue(plan, confirmed=True)
+
+    def test_issue_observation_lists_recent_issues_and_matches_marker(self) -> None:
+        client = GitHubClient()
+        plan = GitHubIssueCreationPlan("example/project", "Title", "Body", "a" * 32)
+        payload = [
+            {
+                "number": 44,
+                "html_url": "https://github.com/example/project/issues/44",
+                "body": "Other issue",
+            },
+            {
+                "number": 42,
+                "html_url": "https://github.com/example/project/issues/42",
+                "body": (
+                    f"Body\n\n<!-- local-voice-harness-correlation:{'a' * 32} -->"
+                ),
+            },
+        ]
+        with mock.patch.object(
+            client, "_run", return_value=_completed(json.dumps(payload))
+        ) as run:
+            result = client.observe_issue(plan)
+
+        self.assertEqual(result, client._creation_result(plan, payload[1]["html_url"]))
+        command = run.call_args.args[0]
+        self.assertEqual(
+            command[:5],
+            ["gh", "api", "--method", "GET", "repos/example/project/issues"],
+        )
+        self.assertNotIn("search", command)
+
+        with mock.patch.object(
+            client, "_run", return_value=_completed(json.dumps(payload[:1]))
+        ):
+            self.assertIsNone(client.observe_issue(plan))
 
     def test_issue_lookup_failure_is_classified_and_voice_safe(self) -> None:
         client = GitHubClient()

@@ -10,6 +10,8 @@ from local_voice_harness.integrations.github import (
     GitHubError,
     GitHubForkPlan,
     GitHubIssue,
+    GitHubIssueCreationPlan,
+    GitHubIssueCreationResult,
     GitHubProvider,
     GitHubPullRequest,
     GitHubPullRequestCheckoutInputs,
@@ -169,6 +171,53 @@ class GitHubProviderTests(unittest.TestCase):
             self.provider.submit_fork(plan, confirmed=False)
 
         self.client.ensure_fork.assert_not_called()
+
+    def test_provider_plans_observes_and_submits_issue_creation(self) -> None:
+        result = GitHubIssueCreationResult(
+            GitHubIssue("example", "project", 42),
+            "https://github.com/example/project/issues/42",
+            "a" * 32,
+        )
+        self.client.observe_issue.return_value = None
+        self.client.submit_issue.return_value = result
+
+        plan = self.provider.plan_issue_creation(
+            " example/project.git ",
+            " Fix the reader ",
+            " Detailed body ",
+            correlation_marker="a" * 32,
+        )
+
+        self.assertEqual(
+            plan,
+            GitHubIssueCreationPlan(
+                "example/project",
+                "Fix the reader",
+                "Detailed body",
+                "a" * 32,
+            ),
+        )
+        self.assertIsNone(self.provider.observe_issue_creation(plan))
+        self.assertEqual(
+            self.provider.submit_issue_creation(plan, confirmed=True),
+            result,
+        )
+        self.client.observe_issue.assert_called_once_with(plan)
+        self.client.submit_issue.assert_called_once_with(plan, confirmed=True)
+
+    def test_provider_generates_unique_lowercase_hex_issue_markers(self) -> None:
+        first = self.provider.plan_issue_creation("example/project", "Title", "Body")
+        second = self.provider.plan_issue_creation("example/project", "Title", "Body")
+
+        self.assertRegex(first.correlation_marker, r"^[0-9a-f]{32}$")
+        self.assertRegex(second.correlation_marker, r"^[0-9a-f]{32}$")
+        self.assertNotEqual(first.correlation_marker, second.correlation_marker)
+
+    def test_provider_requires_confirmation_before_issue_submission(self) -> None:
+        plan = GitHubIssueCreationPlan("example/project", "Title", "Body", "a" * 32)
+        with self.assertRaisesRegex(GitHubError, "confirmation"):
+            self.provider.submit_issue(plan, confirmed=False)
+        self.client.submit_issue.assert_not_called()
 
     def test_provider_rejects_inconsistent_persisted_fork_plan(self) -> None:
         source = GitHubRepository(

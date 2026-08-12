@@ -317,6 +317,76 @@ def reconcile_uncertain_fork(
     store.update(job.id, visible)
 
 
+def reconcile_uncertain_issue_creation(
+    store: JobStore,
+    job: CursorJob,
+    *,
+    now: float,
+    github_factory: GitHubFactory = GitHubClient,
+) -> None:
+    states = frozenset({"submitted", "ambiguous"})
+    if job.github_issue_create_operation_state not in states:
+        return
+    repository = job.github_repository or ""
+    title = job.github_issue_create_title or ""
+    body = job.github_issue_create_body or ""
+    marker = job.github_issue_create_marker
+    try:
+        github = _github_provider(github_factory)
+        plan = github.plan_issue_creation(
+            repository,
+            title,
+            body,
+            correlation_marker=marker,
+        )
+        result = github.observe_issue_creation(plan)
+    except GitHubError:
+        result = None
+
+    def reconcile(current: CursorJob) -> CursorJob | None:
+        if current.github_issue_create_operation_state not in states:
+            return None
+        if result is None:
+            message = (
+                "GitHub issue creation could not be reconciled automatically. "
+                "Check the repository before trying again."
+            )
+            return current.evolve_recovery(
+                now=now,
+                status=JobStatus.BLOCKED,
+                github_issue_create_operation_state="manual_required",
+                result=message,
+                completed_at=now,
+                reconcile=False,
+                worker_operation=None,
+                worker_pid=None,
+                worker_boot_id=None,
+                worker_process_start=None,
+                worker_token=None,
+                prepare_delivery=True,
+            )
+        return current.evolve_recovery(
+            now=now,
+            status=JobStatus.COMPLETED,
+            github_issue=result.issue.number,
+            github_issue_url=result.url,
+            github_issue_created_number=result.issue.number,
+            github_issue_created_url=result.url,
+            github_issue_create_operation_state="created",
+            result=f"Created GitHub issue {result.issue.reference}: {result.url}",
+            completed_at=now,
+            reconcile=False,
+            worker_operation=None,
+            worker_pid=None,
+            worker_boot_id=None,
+            worker_process_start=None,
+            worker_token=None,
+            prepare_delivery=True,
+        )
+
+    store.update(job.id, reconcile)
+
+
 def reconcile_uncertain_worktree(
     store: JobStore,
     job: CursorJob,
@@ -419,6 +489,13 @@ def reconcile_uncertain_operations(
     github_factory: GitHubFactory = GitHubClient,
 ) -> None:
     reconcile_uncertain_agent(store, job, now=now, herdr_factory=herdr_factory)
+    current = store.get(job.id)
+    reconcile_uncertain_issue_creation(
+        store,
+        current,
+        now=now,
+        github_factory=github_factory,
+    )
     current = store.get(job.id)
     reconcile_uncertain_fork(store, current, now=now, github_factory=github_factory)
     current = store.get(job.id)

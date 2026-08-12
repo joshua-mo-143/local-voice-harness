@@ -24,9 +24,12 @@ from local_voice_harness.cursor.model import (
 )
 from local_voice_harness.cursor.recovery import stage_terminal_intent
 from local_voice_harness.cursor.store import JobQuarantineWarning, JobStore
+from local_voice_harness.github_issue_creation import GitHubIssueDraft
 from local_voice_harness.integrations import linear
 from local_voice_harness.integrations.github import (
     GitHubIssue,
+    GitHubIssueCreationResult,
+    GitHubOperationAmbiguous,
     GitHubRepository,
     ProvisionedIssue,
 )
@@ -2416,6 +2419,134 @@ class CursorJobStateTests(unittest.TestCase):
         self.assertEqual(updated["clarification_kind"], "fork_confirmation")
         self.assertIn("source/project", str(updated["question"]))
 
+    def test_worker_drafts_issue_before_requesting_confirmation(self) -> None:
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "create an issue about startup",
+                "trusted_utterance": "create an issue about startup",
+                "issue_provider": "github",
+                "github_repository": "source/project",
+                "github_issue_create_requested": True,
+                "status": "queued",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        source = GitHubRepository(
+            "source/project",
+            "https://github.com/source/project",
+            False,
+            "main",
+        )
+        github = mock.Mock()
+        github.inspect_repository.return_value = source
+        with (
+            mock.patch.object(jobs, "GitHubClient", return_value=github),
+            mock.patch.object(
+                production_jobs,
+                "draft_github_issue",
+                return_value=GitHubIssueDraft(
+                    "source/project",
+                    "Fix startup",
+                    "Startup fails after reboot.",
+                ),
+            ),
+        ):
+            service.run_worker("123456789abc")
+
+        updated = jobs.read_job("123456789abc")
+        self.assertEqual(updated["status"], "awaiting_user")
+        self.assertEqual(
+            updated["clarification_kind"],
+            "github_issue_create_confirmation",
+        )
+        self.assertEqual(updated["github_issue_create_title"], "Fix startup")
+        self.assertEqual(updated["github_issue_create_operation_state"], "planned")
+        github.submit_issue.assert_not_called()
+
+    def test_confirmed_issue_creation_completes_without_starting_herdr(self) -> None:
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "create an issue about startup",
+                "trusted_utterance": "create an issue about startup",
+                "issue_provider": "github",
+                "github_repository": "source/project",
+                "github_issue_create_requested": True,
+                "github_issue_create_confirmed": True,
+                "github_issue_create_title": "Fix startup",
+                "github_issue_create_body": "Startup fails after reboot.",
+                "github_issue_create_marker": "a" * 32,
+                "github_issue_create_operation_state": "planned",
+                "status": "queued",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        source = GitHubRepository(
+            "source/project",
+            "https://github.com/source/project",
+            False,
+            "main",
+        )
+        result = GitHubIssueCreationResult(
+            GitHubIssue("source", "project", 42),
+            "https://github.com/source/project/issues/42",
+            "a" * 32,
+        )
+        github = mock.Mock()
+        github.inspect_repository.return_value = source
+        github.submit_issue.return_value = result
+        herdr = mock.Mock()
+        with (
+            mock.patch.object(jobs, "GitHubClient", return_value=github),
+            mock.patch.object(jobs, "HerdrClient", return_value=herdr),
+        ):
+            service.run_worker("123456789abc")
+
+        updated = jobs.read_job("123456789abc")
+        self.assertEqual(updated["status"], "completed")
+        self.assertEqual(updated["github_issue_created_number"], 42)
+        self.assertEqual(updated["github_issue_create_operation_state"], "created")
+        herdr.assert_not_called()
+
+    def test_timed_out_issue_creation_is_reconciled_without_resubmission(self) -> None:
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "create an issue",
+                "trusted_utterance": "create an issue",
+                "issue_provider": "github",
+                "github_repository": "source/project",
+                "github_issue_create_requested": True,
+                "github_issue_create_confirmed": True,
+                "github_issue_create_title": "Fix startup",
+                "github_issue_create_body": "Startup fails.",
+                "github_issue_create_marker": "a" * 32,
+                "github_issue_create_operation_state": "planned",
+                "status": "queued",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        github = mock.Mock()
+        github.inspect_repository.return_value = GitHubRepository(
+            "source/project",
+            "https://github.com/source/project",
+            False,
+            "main",
+        )
+        github.submit_issue.side_effect = GitHubOperationAmbiguous("timed out")
+        github.observe_issue.return_value = None
+        with mock.patch.object(jobs, "GitHubClient", return_value=github):
+            service.run_worker("123456789abc")
+
+        updated = jobs.read_job("123456789abc")
+        self.assertEqual(updated["status"], "queued")
+        self.assertEqual(updated["github_issue_create_operation_state"], "ambiguous")
+        self.assertEqual(github.submit_issue.call_count, 1)
+
     def test_only_trusted_affirmative_reply_confirms_fork(self) -> None:
         job = {
             "id": "123456789abc",
@@ -2708,6 +2839,7 @@ class CursorJobStateTests(unittest.TestCase):
             github_repository=None,
             github_issue=None,
             github_issue_context=None,
+            github_issue_create_requested=False,
             fork_requested=False,
             github_pull_request=None,
             agent=None,

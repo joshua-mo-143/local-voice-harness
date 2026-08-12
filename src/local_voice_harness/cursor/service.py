@@ -95,6 +95,7 @@ class StartJobRequest:
     github_repository: str | None = None
     github_issue: int | None = None
     github_issue_context: str | None = None
+    github_issue_create_requested: bool = False
     fork_requested: bool = False
     github_pull_request: int | None = None
     agent: str | None = None
@@ -112,6 +113,7 @@ class CursorTurnRequest:
     github_repository: str | None = None
     github_issue: int | None = None
     github_issue_context: str | None = None
+    github_issue_create_requested: bool = False
     fork_requested: bool = False
     github_pull_request: int | None = None
     agent: str | None = None
@@ -314,7 +316,11 @@ def _build_start_job(
     issue_provider = (
         issue_provider_identity(resolved_issue_key, registry)
         if resolved_issue_key
-        else ("github" if request.github_issue is not None else None)
+        else (
+            "github"
+            if request.github_issue is not None or request.github_issue_create_requested
+            else None
+        )
     )
     if resolved_issue_key:
         assert issue_provider is not None
@@ -351,6 +357,7 @@ def _build_start_job(
             github_issue=request.github_issue,
             github_issue_url=github_issue_url,
             github_issue_context=request.github_issue_context,
+            github_issue_create_requested=request.github_issue_create_requested,
             fork_requested=request.fork_requested,
             github_pull_request=request.github_pull_request,
             worktree_branch=(
@@ -403,6 +410,7 @@ def start_job(
     github_repository: str | None = None,
     github_issue: int | None = None,
     github_issue_context: str | None = None,
+    github_issue_create_requested: bool = False,
     fork_requested: bool = False,
     github_pull_request: int | None = None,
     agent: str | None = None,
@@ -422,6 +430,7 @@ def start_job(
             github_repository=github_repository,
             github_issue=github_issue,
             github_issue_context=github_issue_context,
+            github_issue_create_requested=github_issue_create_requested,
             fork_requested=fork_requested,
             github_pull_request=github_pull_request,
             agent=agent,
@@ -2252,6 +2261,7 @@ def cursor_turn(
     github_repository: str | None = None,
     github_issue: int | None = None,
     github_issue_context: str | None = None,
+    github_issue_create_requested: bool = False,
     fork_requested: bool = False,
     github_pull_request: int | None = None,
     agent: str | None = None,
@@ -2281,6 +2291,7 @@ def cursor_turn(
         github_repository = request.github_repository
         github_issue = request.github_issue
         github_issue_context = request.github_issue_context
+        github_issue_create_requested = request.github_issue_create_requested
         fork_requested = request.fork_requested
         github_pull_request = request.github_pull_request
         agent = request.agent
@@ -2433,6 +2444,7 @@ def cursor_turn(
                 github_repository=github_repository,
                 github_issue=github_issue,
                 github_issue_context=github_issue_context,
+                github_issue_create_requested=github_issue_create_requested,
                 fork_requested=fork_requested,
                 github_pull_request=github_pull_request,
                 agent=agent,
@@ -2475,6 +2487,7 @@ def cursor_turn(
                 github_repository=github_repository,
                 github_issue=github_issue,
                 github_issue_context=github_issue_context,
+                github_issue_create_requested=github_issue_create_requested,
                 fork_requested=fork_requested,
                 github_pull_request=github_pull_request,
                 agent=agent,
@@ -2534,6 +2547,13 @@ def render_job_announcement(job: CursorJob) -> AssistantResponse:
     identity = f"Cursor job {job.id} ({label})"
     if job.status == JobStatus.COMPLETED:
         detail = str(job.result or "").strip()
+        if job.github_issue_create_requested and job.github_issue_created_number:
+            return AssistantResponse(
+                spoken_text=(
+                    f"Created GitHub issue {job.github_issue_created_number}."
+                ),
+                display_text=detail,
+            )
         return AssistantResponse(
             spoken_text=f"Cursor finished {label}.",
             display_text=(
@@ -2549,6 +2569,14 @@ def render_job_announcement(job: CursorJob) -> AssistantResponse:
             if pending is not None
             else str(job.question or job.result or "").strip()
         )
+        if job.clarification_kind == "github_issue_create_confirmation":
+            return AssistantResponse(
+                spoken_text=(
+                    f"I drafted “{job.github_issue_create_title}” for "
+                    f"{job.github_repository}. Should I create it?"
+                ),
+                display_text=question,
+            )
         return AssistantResponse(
             spoken_text=f"Cursor needs clarification for {label}. {question}",
             display_text=f"{identity} needs clarification: {question}",
@@ -2664,7 +2692,10 @@ def _foreground_delivery_result(
 ) -> CursorTurnResult | None:
     if job.status == JobStatus.COMPLETED:
         claimed = _defer_or_acknowledge(job_id, delivery_claims)
-        result = claimed.result if claimed is not None else job.result
+        completed = claimed if claimed is not None else job
+        if completed.github_issue_create_requested:
+            return CursorTurnResult(render_job_announcement(completed), None)
+        result = completed.result
         return CursorTurnResult(str(result or "").strip(), None)
     if job.status == JobStatus.AWAITING_USER:
         claimed = _defer_or_acknowledge(job_id, delivery_claims)
@@ -2675,6 +2706,17 @@ def _foreground_delivery_result(
             if pending is not None
             else str(awaiting.question or awaiting.result or "").strip()
         )
+        if awaiting.clarification_kind == "github_issue_create_confirmation":
+            return CursorTurnResult(
+                AssistantResponse(
+                    spoken_text=(
+                        f"I drafted “{awaiting.github_issue_create_title}” for "
+                        f"{awaiting.github_repository}. Should I create it?"
+                    ),
+                    display_text=rendered_question,
+                ),
+                job_id,
+            )
         return CursorTurnResult(rendered_question, job_id)
     if job.status == JobStatus.BLOCKED:
         claimed = _defer_or_acknowledge(job_id, delivery_claims)
