@@ -313,7 +313,9 @@ WORKFLOW_PLAN[token]: <bounded multiline implementation plan>
         self.assertRegex(name, r"^[a-z][a-z0-9_-]{0,31}$")
         self.assertTrue(name.endswith("-aaaaaaaaaa"))
 
-    def test_start_agent_passes_explicit_cursor_read_only_mode(self) -> None:
+    def test_start_agent_approves_mcps_and_passes_explicit_read_only_mode(
+        self,
+    ) -> None:
         client = herdr.HerdrClient("herdr")
         agent = {
             "name": "reviewer",
@@ -336,8 +338,8 @@ WORKFLOW_PLAN[token]: <bounded multiline implementation plan>
             )
 
         self.assertEqual(
-            run.call_args.args[-4:],
-            ("--", "--trust", "--mode", "ask"),
+            run.call_args.args[-5:],
+            ("--", "--trust", "--approve-mcps", "--mode", "ask"),
         )
 
     def test_start_agent_waits_for_ready_cursor_session(self) -> None:

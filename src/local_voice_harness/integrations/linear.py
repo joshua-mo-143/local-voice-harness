@@ -38,6 +38,13 @@ LINEAR_ISSUE = re.compile(
 LINEAR_IDENTIFIER = re.compile(r"^[A-Z][A-Z0-9]+-\d+$", re.IGNORECASE)
 HEALTHY_MCP_STATUSES = frozenset({"connected", "ready"})
 LINEAR_ROUTER_LOCK = DURABLE_STATE_DIR / "linear-router.lock"
+MCP_ACCESS_FAILURE = re.compile(
+    r"\b(?:linear(?:\s+mcp)?|mcp)\b.{0,120}\b(?:"
+    r"requires?\s+authentication|authentication\s+(?:is\s+)?required|"
+    r"not\s+authenticated|unavailable|not\s+available"
+    r")\b",
+    re.IGNORECASE | re.DOTALL,
+)
 
 
 @dataclass(frozen=True)
@@ -328,5 +335,10 @@ class LinearIntegration:
                 extract_marker(outcome.output, "ROUTE_REASON", token)
                 or "No routing reason."
             )
+            if confidence != "high" and MCP_ACCESS_FAILURE.search(outcome.output):
+                raise HarnessError(
+                    "Linear MCP access failed after capability preflight; "
+                    "refusing unrelated repository fallback."
+                )
         resolved, _ = client.resolve_repository(name, "", repositories)
         return (resolved if confidence == "high" else None), confidence, reason

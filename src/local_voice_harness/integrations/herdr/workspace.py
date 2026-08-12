@@ -223,7 +223,10 @@ class HerdrWorkspace:
             try:
                 if checkpoint is not None:
                     checkpoint()
-                agent_args = ["--trust"]
+                # Capability preflight verifies the configured MCP authentication,
+                # while this flag lets the spawned non-interactive session use it
+                # instead of opening a desktop approval prompt.
+                agent_args = ["--trust", "--approve-mcps"]
                 if mode is not None:
                     agent_args.extend(["--mode", mode])
                 result = self._operations.run_json(
