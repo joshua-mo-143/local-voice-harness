@@ -19,6 +19,7 @@ NO_WORKSPACE = "I couldn't identify one eligible workspace for that consultation
 NO_PENDING_QUESTION = (
     "I couldn't identify one current pending question for that consultation."
 )
+ACKNOWLEDGEMENT = "Let me take a look. I'll get back to you."
 STALE_PENDING_QUESTION = (
     "That question changed before consultation started, so I did not consult it."
 )

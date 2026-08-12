@@ -1117,6 +1117,25 @@ class ProcessUtteranceTests(unittest.TestCase):
         daemon = _bare_daemon()
         daemon.cursor_session = "oldjob123456"
         consultant_snapshot = mock.Mock()
+        events: list[tuple[str, str]] = []
+
+        def consult_after_acknowledgement(
+            _client: object,
+            _store: object,
+            _snapshot: object,
+            text: str,
+        ) -> str:
+            self.assertEqual(
+                events,
+                [("play", wake_daemon.cursor_consultation.ACKNOWLEDGEMENT)],
+            )
+            events.append(("consult", text))
+            return "SQLite is simpler for a local tool."
+
+        def play(response: AssistantResponse) -> tuple[dict[str, object], None]:
+            events.append(("play", response.spoken_text))
+            return {"played_text": response.spoken_text, "interrupted": False}, None
+
         with (
             mock.patch.object(
                 wake_daemon,
@@ -1147,14 +1166,10 @@ class ProcessUtteranceTests(unittest.TestCase):
             mock.patch.object(
                 wake_daemon.cursor_consultation,
                 "consult_pending_question",
-                return_value="SQLite is simpler for a local tool.",
+                side_effect=consult_after_acknowledgement,
             ) as consult,
             mock.patch.object(wake_daemon, "qwen_turn") as qwen_turn,
-            mock.patch.object(
-                daemon,
-                "_drain_playback_queue",
-                return_value=(_playback_batch("SQLite is simpler."), None),
-            ),
+            mock.patch.object(daemon, "play_response", side_effect=play),
             mock.patch.object(wake_daemon, "notify"),
         ):
             daemon.process_utterance(AUDIO_GENERATION, woke=False)
@@ -1166,6 +1181,14 @@ class ProcessUtteranceTests(unittest.TestCase):
             "which option would you recommend",
         )
         qwen_turn.assert_not_called()
+        self.assertEqual(
+            events,
+            [
+                ("play", wake_daemon.cursor_consultation.ACKNOWLEDGEMENT),
+                ("consult", "which option would you recommend"),
+                ("play", "SQLite is simpler for a local tool."),
+            ],
+        )
         self.assertEqual(daemon.cursor_session, "oldjob123456")
         self.assertTrue(daemon.awaiting_followup)
 

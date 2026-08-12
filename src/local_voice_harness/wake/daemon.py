@@ -656,6 +656,12 @@ class WakeConversationDaemon:
         self.close_conversation("assistant ended the conversation")
         return None
 
+    def _acknowledge_consultation(self) -> BargeIn | None:
+        response = as_assistant_response(cursor_consultation.ACKNOWLEDGEMENT)
+        print(f"Assistant: {response.display_text}", flush=True)
+        _playback, interruption = self.play_response(response)
+        return interruption
+
     def wait_for_playback_quiet(self) -> None:
         if self.microphone is None or self.microphone.poll() is not None:
             self.pre_roll.clear()
@@ -1397,8 +1403,12 @@ class WakeConversationDaemon:
                     response = cursor_consultation.NO_PENDING_QUESTION
                 else:
                     try:
+                        client = self.integrations.herdr_client()
+                        interruption = self._acknowledge_consultation()
+                        if interruption is not None:
+                            return interruption
                         response = cursor_consultation.consult_pending_question(
-                            self.integrations.herdr_client(),
+                            client,
                             CURSOR_STORE,
                             snapshot,
                             context.text,
@@ -1424,11 +1434,15 @@ class WakeConversationDaemon:
                         focused_repository=context.focused_repository,
                         completed_job=completed_job,
                     )
-                    response = (
-                        cursor_consultation.consult(client, target, context.text)
-                        if target is not None
-                        else cursor_consultation.NO_WORKSPACE
-                    )
+                    if target is None:
+                        response = cursor_consultation.NO_WORKSPACE
+                    else:
+                        interruption = self._acknowledge_consultation()
+                        if interruption is not None:
+                            return interruption
+                        response = cursor_consultation.consult(
+                            client, target, context.text
+                        )
                 except Exception:  # noqa: BLE001 - consultation fails closed
                     response = cursor_consultation.CONSULTATION_FAILED
             elif route.actionable and route.intent == Intent.AGENT_LIST:

@@ -576,6 +576,7 @@ class AppContextTests(unittest.TestCase):
 
 class AppConsultationTests(unittest.TestCase):
     def test_workspace_consultation_uses_read_only_dispatch(self) -> None:
+        events: list[tuple[str, str]] = []
         context = RequestContext(
             "What do you think about this approach?",
             focused_repository="source/project",
@@ -587,6 +588,19 @@ class AppConsultationTests(unittest.TestCase):
             workspace_id="workspace-1",
             label="project",
         )
+
+        def consult_after_acknowledgement(
+            _client: object,
+            _target: consultation.WorkspaceTarget,
+            _text: str,
+        ) -> str:
+            self.assertEqual(
+                events,
+                [("play", consultation.ACKNOWLEDGEMENT)],
+            )
+            events.append(("consult", _text))
+            return "Use the simpler boundary."
+
         with (
             mock.patch.object(app, "start_components"),
             mock.patch.object(app, "build_integration_registry", return_value=registry),
@@ -607,22 +621,30 @@ class AppConsultationTests(unittest.TestCase):
             mock.patch.object(
                 app.cursor_consultation,
                 "consult",
-                return_value="Use the simpler boundary.",
+                side_effect=consult_after_acknowledgement,
             ) as consult,
             mock.patch.object(app, "cursor_turn") as cursor,
             mock.patch.object(app, "qwen_response") as qwen,
-            mock.patch.object(app, "stream_and_play") as play,
+            mock.patch.object(
+                app,
+                "stream_and_play",
+                side_effect=lambda text, **_kwargs: events.append(("play", text)),
+            ) as play,
         ):
             app.respond("What do you think about this approach?")
 
         consult.assert_called_once_with(client, target, context.text)
         cursor.assert_not_called()
         qwen.assert_not_called()
-        play.assert_called_once_with("Use the simpler boundary.", settings=mock.ANY)
+        self.assertEqual(
+            [call.args[0] for call in play.call_args_list],
+            [consultation.ACKNOWLEDGEMENT, "Use the simpler boundary."],
+        )
 
     def test_pending_consultation_supplies_router_context_without_replying(
         self,
     ) -> None:
+        events: list[tuple[str, str]] = []
         context = RequestContext("Which option do you recommend?")
         snapshot = mock.Mock(
             job_id="aaaaaaaaaaaa",
@@ -631,6 +653,20 @@ class AppConsultationTests(unittest.TestCase):
         )
         registry = mock.Mock()
         client = registry.herdr_client.return_value
+
+        def consult_after_acknowledgement(
+            _client: object,
+            _store: object,
+            _snapshot: object,
+            text: str,
+        ) -> str:
+            self.assertEqual(
+                events,
+                [("play", consultation.ACKNOWLEDGEMENT)],
+            )
+            events.append(("consult", text))
+            return "Choose the safe design."
+
         with (
             mock.patch.object(app, "start_components"),
             mock.patch.object(app, "build_integration_registry", return_value=registry),
@@ -651,11 +687,15 @@ class AppConsultationTests(unittest.TestCase):
             mock.patch.object(
                 app.cursor_consultation,
                 "consult_pending_question",
-                return_value="Choose the safe design.",
+                side_effect=consult_after_acknowledgement,
             ) as consult,
             mock.patch.object(app, "cursor_turn") as cursor,
             mock.patch.object(app, "qwen_response") as qwen,
-            mock.patch.object(app, "stream_and_play"),
+            mock.patch.object(
+                app,
+                "stream_and_play",
+                side_effect=lambda text, **_kwargs: events.append(("play", text)),
+            ) as play,
         ):
             app.respond("Which option do you recommend?")
 
@@ -675,6 +715,10 @@ class AppConsultationTests(unittest.TestCase):
         )
         cursor.assert_not_called()
         qwen.assert_not_called()
+        self.assertEqual(
+            [call.args[0] for call in play.call_args_list],
+            [consultation.ACKNOWLEDGEMENT, "Choose the safe design."],
+        )
 
     def test_ambiguous_pending_consultation_fails_without_fallback(self) -> None:
         with (
@@ -713,6 +757,110 @@ class AppConsultationTests(unittest.TestCase):
             consultation.NO_PENDING_QUESTION,
             settings=mock.ANY,
         )
+
+    def test_missing_workspace_does_not_play_acknowledgement(self) -> None:
+        registry = mock.Mock()
+        with (
+            mock.patch.object(app, "start_components"),
+            mock.patch.object(app, "build_integration_registry", return_value=registry),
+            mock.patch.object(
+                app,
+                "request_context",
+                return_value=RequestContext("Inspect this checkout"),
+            ),
+            mock.patch.object(
+                app.cursor_consultation,
+                "pending_question_snapshot",
+                return_value=None,
+            ),
+            mock.patch.object(
+                app,
+                "route_intent",
+                return_value=IntentRoute(Intent.WORKSPACE_CONSULTATION, "high"),
+            ),
+            mock.patch.object(
+                app.cursor_consultation,
+                "workspace_target",
+                return_value=None,
+            ),
+            mock.patch.object(app.cursor_consultation, "consult") as consult,
+            mock.patch.object(app, "stream_and_play") as play,
+        ):
+            app.respond("Inspect this checkout")
+
+        consult.assert_not_called()
+        play.assert_called_once_with(consultation.NO_WORKSPACE, settings=mock.ANY)
+
+    def test_later_consultation_failure_keeps_explicit_failure_response(self) -> None:
+        registry = mock.Mock()
+        target = consultation.WorkspaceTarget(
+            checkout=Path("/tmp/project"),
+            workspace_id="workspace-1",
+            label="project",
+        )
+        with (
+            mock.patch.object(app, "start_components"),
+            mock.patch.object(app, "build_integration_registry", return_value=registry),
+            mock.patch.object(
+                app,
+                "request_context",
+                return_value=RequestContext("Inspect this checkout"),
+            ),
+            mock.patch.object(
+                app.cursor_consultation,
+                "pending_question_snapshot",
+                return_value=None,
+            ),
+            mock.patch.object(
+                app,
+                "route_intent",
+                return_value=IntentRoute(Intent.WORKSPACE_CONSULTATION, "high"),
+            ),
+            mock.patch.object(
+                app.cursor_consultation,
+                "workspace_target",
+                return_value=target,
+            ),
+            mock.patch.object(
+                app.cursor_consultation,
+                "consult",
+                side_effect=RuntimeError("agent unavailable"),
+            ),
+            mock.patch.object(app, "stream_and_play") as play,
+        ):
+            app.respond("Inspect this checkout")
+
+        self.assertEqual(
+            [call.args[0] for call in play.call_args_list],
+            [
+                consultation.ACKNOWLEDGEMENT,
+                "I couldn't complete the read only consultation.",
+            ],
+        )
+
+    def test_ordinary_conversation_does_not_play_acknowledgement(self) -> None:
+        with (
+            mock.patch.object(app, "start_components"),
+            mock.patch.object(
+                app.cursor_consultation,
+                "pending_question_snapshot",
+                return_value=None,
+            ),
+            mock.patch.object(
+                app,
+                "route_intent",
+                return_value=IntentRoute(Intent.CONVERSATION, "high"),
+            ),
+            mock.patch.object(
+                app,
+                "qwen_response",
+                return_value="A conversational answer.",
+            ),
+            mock.patch.object(app, "stream_and_play") as play,
+        ):
+            app.respond("Tell me something")
+
+        play.assert_called_once_with("A conversational answer.", settings=mock.ANY)
 
 
 class CursorFastPathTests(unittest.TestCase):
