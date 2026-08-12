@@ -56,7 +56,7 @@ fork, or worktree operations must remain fenced until manually reconciled.
 
 SQLite storage or migration failures are reported by:
 
-```fish
+```bash
 voice-harness doctor
 ```
 
@@ -66,10 +66,10 @@ are read-only and do not retry migration or quarantine files. If the database ca
 be opened or fails its integrity check, stop the services and preserve the complete
 jobs directory before attempting recovery:
 
-```fish
+```bash
 voice-harness services stop
 cp -a ~/.local/state/voice-harness/jobs \
-  ~/.local/state/voice-harness/jobs.forensics-(date +%Y%m%d-%H%M%S)
+  ~/.local/state/voice-harness/jobs.forensics-"$(date +%Y%m%d-%H%M%S)"
 ```
 
 Restore only a complete backup containing the database, WAL companions (if present),

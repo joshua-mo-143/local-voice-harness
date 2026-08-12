@@ -42,7 +42,7 @@ This check must use the wake daemon so it can associate captured speech with its
 recent playback. Start the services, follow the wake log in a second terminal, and
 temporarily avoid headphones:
 
-```fish
+```bash
 voice-harness services start
 journalctl --user -u voice-harness-wake.service -f
 voice-harness listen
@@ -66,7 +66,7 @@ Checklist:
 
 Clean up:
 
-```fish
+```bash
 voice-harness services stop
 ```
 
@@ -154,8 +154,8 @@ ls "$XDG_RUNTIME_DIR/voice-harness/jobs"
 
 Checklist:
 
-- The job JSON survives under the state directory and no JSON is recreated in the
-  runtime jobs directory.
+- `jobs/jobs.sqlite3` survives under the state directory and no active job JSON is
+  recreated in the runtime jobs directory.
 - Recovery does not accept the pre-reboot PID/start-time ownership; it safely resumes
   or reconciles the job.
 - Old worker logs do not survive the reboot or migrate into durable storage.
