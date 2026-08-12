@@ -144,7 +144,8 @@ full command reference.
 - [Service management](docs/service-management.md) - the `voice-harness services` command reference.
 - [Architecture](docs/architecture.md) - pipeline, background jobs, Cursor routing, runtime privacy and durability.
 - [Context capture](docs/context-capture.md) - browser and focused editor/terminal context, compositor setup.
-- [Vocabulary and entity aliases](docs/vocabulary.md) - the local transcription/routing correction store.
+- [Vocabulary, entity aliases, and pronunciations](docs/vocabulary.md) - local
+  transcription/routing corrections and TTS-only name pronunciations.
 - [Reproducible replay](docs/replay.md) - safe semantic capture, replay, export, and fixture review.
 - [Development](docs/development.md) - quality checks, CI matrix, observed performance.
 - [Security notes](docs/security.md) - trust model and safe-by-default behavior.

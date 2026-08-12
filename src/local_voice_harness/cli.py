@@ -16,7 +16,7 @@ from .agents.service import agent_turn as cursor_turn
 from .agents.store import QuarantineEvidence
 from .app import respond, status
 from .browser_context import RequestContext, request_context
-from .config import CURSOR_PATTERN, REPLAY_DIR
+from .config import CURSOR_PATTERN, PROJECT_ROOT, REPLAY_DIR
 from .config_management import (
     commit_config_change,
     format_restart_notice,
@@ -66,6 +66,7 @@ from .service_manager import (
 from .service_manager import (
     status as service_status,
 )
+from .speech import SpeechRenderer
 from .stt.client import transcribe
 from .user_config import (
     PlanApprovalMode,
@@ -75,11 +76,13 @@ from .user_config import (
 )
 from .vocabulary import (
     add_alias,
+    add_pronunciation,
     add_replacement,
     export_entries,
     import_entries,
     list_entries,
     remove_alias,
+    remove_pronunciation,
     remove_replacement,
 )
 
@@ -103,6 +106,11 @@ def parser() -> argparse.ArgumentParser:
         dictate_commands.add_parser(command)
     text = commands.add_parser("text")
     text.add_argument("text", nargs="+")
+    pronunciation = commands.add_parser(
+        "pronounce",
+        help="preview speech rendering without invoking TTS playback",
+    )
+    pronunciation.add_argument("text", nargs="+")
     commands.add_parser("status")
     setup = commands.add_parser(
         "setup",
@@ -445,7 +453,7 @@ def _add_vocabulary_parser(
     )
 
     listing = vocabulary_commands.add_parser("list", help="show stored entries")
-    listing.add_argument("--kind", choices=("replacement", "alias"))
+    listing.add_argument("--kind", choices=("replacement", "alias", "pronunciation"))
 
     add = vocabulary_commands.add_parser("add", help="add or update an entry")
     add_kinds = add.add_subparsers(dest="vocabulary_kind", required=True)
@@ -461,6 +469,12 @@ def _add_vocabulary_parser(
     add_alias_parser.add_argument("phrase")
     add_alias_parser.add_argument("target")
     add_alias_parser.add_argument("--force", action="store_true")
+    add_pronunciation_parser = add_kinds.add_parser(
+        "pronunciation", help="map a written name to a TTS-only pronunciation"
+    )
+    add_pronunciation_parser.add_argument("written")
+    add_pronunciation_parser.add_argument("spoken")
+    add_pronunciation_parser.add_argument("--force", action="store_true")
 
     remove = vocabulary_commands.add_parser("remove", help="delete an entry")
     remove_kinds = remove.add_subparsers(dest="vocabulary_kind", required=True)
@@ -468,6 +482,8 @@ def _add_vocabulary_parser(
     remove_replacement_parser.add_argument("spoken")
     remove_alias_parser = remove_kinds.add_parser("alias")
     remove_alias_parser.add_argument("phrase")
+    remove_pronunciation_parser = remove_kinds.add_parser("pronunciation")
+    remove_pronunciation_parser.add_argument("written")
 
     export = vocabulary_commands.add_parser(
         "export", help="print or back up the store as JSON"
@@ -486,12 +502,16 @@ def _dispatch_vocabulary(args: argparse.Namespace) -> None:
         list_entries(args.kind)
     elif args.vocabulary_command == "add" and args.vocabulary_kind == "replacement":
         add_replacement(args.spoken, args.written, force=args.force)
-    elif args.vocabulary_command == "add":
+    elif args.vocabulary_command == "add" and args.vocabulary_kind == "alias":
         add_alias(args.phrase, args.target, force=args.force)
+    elif args.vocabulary_command == "add":
+        add_pronunciation(args.written, args.spoken, force=args.force)
     elif args.vocabulary_command == "remove" and args.vocabulary_kind == "replacement":
         remove_replacement(args.spoken)
-    elif args.vocabulary_command == "remove":
+    elif args.vocabulary_command == "remove" and args.vocabulary_kind == "alias":
         remove_alias(args.phrase)
+    elif args.vocabulary_command == "remove":
+        remove_pronunciation(args.written)
     elif args.vocabulary_command == "export":
         export_entries(args.output)
     else:
@@ -681,6 +701,9 @@ def dispatch(args: argparse.Namespace) -> None:
     elif args.command == "text":
         user_config = load_user_config()
         respond(" ".join(args.text), user_config=user_config)
+    elif args.command == "pronounce":
+        renderer = SpeechRenderer.from_local_config(local_checkout=PROJECT_ROOT)
+        print(renderer.render(" ".join(args.text)))
     elif args.command == "status":
         status()
     elif args.command == "setup":

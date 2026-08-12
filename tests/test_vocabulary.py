@@ -375,6 +375,30 @@ class VocabularyCliTests(unittest.TestCase):
             cli.dispatch(arguments)
         add_alias.assert_called_once_with("the harness repo", "owner/repo", force=False)
 
+    def test_add_and_remove_pronunciation_dispatches(self) -> None:
+        with mock.patch.object(cli, "add_pronunciation") as add_pronunciation:
+            cli.dispatch(
+                cli.parser().parse_args(
+                    [
+                        "vocabulary",
+                        "add",
+                        "pronunciation",
+                        "Herdr",
+                        "herder",
+                        "--force",
+                    ]
+                )
+            )
+        add_pronunciation.assert_called_once_with("Herdr", "herder", force=True)
+
+        with mock.patch.object(cli, "remove_pronunciation") as remove_pronunciation:
+            cli.dispatch(
+                cli.parser().parse_args(
+                    ["vocabulary", "remove", "pronunciation", "Herdr"]
+                )
+            )
+        remove_pronunciation.assert_called_once_with("Herdr")
+
     def test_remove_and_list_dispatch(self) -> None:
         with mock.patch.object(cli, "remove_alias") as remove_alias:
             cli.dispatch(

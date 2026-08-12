@@ -8,14 +8,14 @@ explicitly asked an agent to run.
 
 Storage
 -------
-The store is a single JSON document (schema ``version`` 1) at
+The store is a single JSON document (schema ``version`` 2) at
 ``$XDG_CONFIG_HOME/voice-harness/vocabulary.json`` (default
 ``~/.config/voice-harness/vocabulary.json``). JSON is used instead of TOML
 because it round-trips losslessly with only the standard library, so the harness
 keeps its zero-runtime-dependency policy. The file is written privately
 (``0o600``) with sorted keys so backups and diffs are stable.
 
-Two entry kinds are stored:
+Three entry kinds are stored:
 
 ``replacements``
     Deterministic speech-to-text corrections. ``spoken`` (the recognized text)
@@ -25,6 +25,9 @@ Two entry kinds are stored:
     A spoken ``phrase`` that resolves to a canonical entity ``target`` before
     routing. ``kind`` is ``repository`` for an ``owner/repo`` target or ``issue``
     for an ``owner/repo#number`` target; it is inferred from the target form.
+``pronunciations``
+    A displayed ``written`` name and its user-owned ``spoken`` pronunciation.
+    These entries are consumed only by the TTS speech renderer.
 
 Normalization
 -------------
@@ -57,6 +60,7 @@ import json
 import os
 import re
 import tempfile
+import unicodedata
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
@@ -64,7 +68,8 @@ from pathlib import Path
 from . import config
 from .errors import HarnessError
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+_SUPPORTED_SCHEMA_VERSIONS = {1, SCHEMA_VERSION}
 
 _REPOSITORY = re.compile(
     r"^(?P<owner>[A-Za-z0-9](?:[A-Za-z0-9-]{0,38}))/(?P<repo>[A-Za-z0-9_.-]+)$"
@@ -82,6 +87,9 @@ class VocabularyError(HarnessError):
 class AliasKind(StrEnum):
     REPOSITORY = "repository"
     ISSUE = "issue"
+
+
+_SPOKEN_PRONUNCIATION_PUNCTUATION = frozenset(" -'’.,+")
 
 
 def _normalize_phrase(value: str) -> str:
@@ -133,10 +141,22 @@ class Alias:
 
 
 @dataclass(frozen=True)
+class Pronunciation:
+    written: str
+    spoken: str
+
+    def apply(self, text: str) -> str:
+        return _phrase_pattern(self.written).sub(
+            lambda _match, replacement=self.spoken: replacement, text
+        )
+
+
+@dataclass(frozen=True)
 class Vocabulary:
     version: int = SCHEMA_VERSION
     replacements: tuple[Replacement, ...] = ()
     aliases: tuple[Alias, ...] = ()
+    pronunciations: tuple[Pronunciation, ...] = ()
 
     def replacement_for(self, spoken: str) -> Replacement | None:
         folded = _normalize_phrase(spoken)
@@ -150,6 +170,13 @@ class Vocabulary:
         for alias in self.aliases:
             if alias.phrase == folded:
                 return alias
+        return None
+
+    def pronunciation_for(self, written: str) -> Pronunciation | None:
+        folded = _normalize_phrase(written)
+        for pronunciation in self.pronunciations:
+            if pronunciation.written.casefold() == folded:
+                return pronunciation
         return None
 
     def resolve_text(self, text: str) -> str:
@@ -185,6 +212,12 @@ class Vocabulary:
             "aliases": [
                 {"phrase": item.phrase, "target": item.target, "kind": str(item.kind)}
                 for item in sorted(self.aliases, key=lambda item: item.phrase)
+            ],
+            "pronunciations": [
+                {"written": item.written, "spoken": item.spoken}
+                for item in sorted(
+                    self.pronunciations, key=lambda item: item.written.casefold()
+                )
             ],
         }
 
@@ -250,6 +283,58 @@ def _parse_aliases(value: object) -> tuple[Alias, ...]:
     return tuple(aliases)
 
 
+def _validate_pronunciation(written: str, spoken: str) -> tuple[str, str]:
+    if any(unicodedata.category(character) == "Cc" for character in written + spoken):
+        raise VocabularyError(
+            "pronunciation values must not contain control characters"
+        )
+    normalized = " ".join(written.split())
+    utterance = " ".join(spoken.split())
+    if not normalized or not utterance:
+        raise VocabularyError("pronunciation 'written' and 'spoken' must not be empty")
+    if len(normalized) > 200 or len(utterance) > 200:
+        raise VocabularyError("pronunciation values must be at most 200 characters")
+    if any(
+        not (
+            character.isalnum()
+            or unicodedata.category(character) in {"Mn", "Mc"}
+            or character in _SPOKEN_PRONUNCIATION_PUNCTUATION
+        )
+        for character in utterance
+    ):
+        raise VocabularyError(
+            "pronunciation 'spoken' must contain only words and speech punctuation"
+        )
+    return normalized, utterance
+
+
+def _parse_pronunciations(value: object) -> tuple[Pronunciation, ...]:
+    if not isinstance(value, list):
+        raise VocabularyError("'pronunciations' must be a list")
+    pronunciations: list[Pronunciation] = []
+    seen: dict[str, str] = {}
+    for entry in value:
+        record = _require_mapping(entry, "each pronunciation must be an object")
+        written_raw = record.get("written")
+        spoken_raw = record.get("spoken")
+        if not isinstance(written_raw, str) or not isinstance(spoken_raw, str):
+            raise VocabularyError(
+                "pronunciation 'written' and 'spoken' must be strings"
+            )
+        written, spoken = _validate_pronunciation(written_raw, spoken_raw)
+        folded = written.casefold()
+        if folded in seen and seen[folded] != spoken:
+            raise VocabularyError(
+                f"pronunciation {written!r} is ambiguous: it maps to both "
+                f"{seen[folded]!r} and {spoken!r}"
+            )
+        if folded in seen:
+            continue
+        seen[folded] = spoken
+        pronunciations.append(Pronunciation(written=written, spoken=spoken))
+    return tuple(pronunciations)
+
+
 def _resolve_path(path: Path | None) -> Path:
     return path if path is not None else config.VOCABULARY_PATH
 
@@ -270,15 +355,16 @@ def load(path: Path | None = None) -> Vocabulary:
         document, f"vocabulary store {location} must be an object"
     )
     version = document.get("version", SCHEMA_VERSION)
-    if version != SCHEMA_VERSION:
+    if version not in _SUPPORTED_SCHEMA_VERSIONS:
         raise VocabularyError(
             f"unsupported vocabulary schema version {version!r}; "
-            f"expected {SCHEMA_VERSION}"
+            f"expected one of {sorted(_SUPPORTED_SCHEMA_VERSIONS)}"
         )
     return Vocabulary(
         version=SCHEMA_VERSION,
         replacements=_parse_replacements(document.get("replacements", [])),
         aliases=_parse_aliases(document.get("aliases", [])),
+        pronunciations=_parse_pronunciations(document.get("pronunciations", [])),
     )
 
 
@@ -340,6 +426,7 @@ def add_replacement(
         version=SCHEMA_VERSION,
         replacements=(*kept, Replacement(spoken=normalized, written=target)),
         aliases=vocabulary.aliases,
+        pronunciations=vocabulary.pronunciations,
     )
     save(updated, path)
     verb = "updated" if existing is not None else "added"
@@ -363,6 +450,7 @@ def add_alias(
         version=SCHEMA_VERSION,
         replacements=vocabulary.replacements,
         aliases=(*kept, Alias(phrase=normalized, target=canonical, kind=kind)),
+        pronunciations=vocabulary.pronunciations,
     )
     save(updated, path)
     verb = "updated" if existing is not None else "added"
@@ -384,6 +472,7 @@ def remove_replacement(spoken: str, *, path: Path | None = None) -> None:
             version=SCHEMA_VERSION,
             replacements=kept,
             aliases=vocabulary.aliases,
+            pronunciations=vocabulary.pronunciations,
         ),
         path,
     )
@@ -401,10 +490,67 @@ def remove_alias(phrase: str, *, path: Path | None = None) -> None:
             version=SCHEMA_VERSION,
             replacements=vocabulary.replacements,
             aliases=kept,
+            pronunciations=vocabulary.pronunciations,
         ),
         path,
     )
     print(f"removed alias {normalized!r}")
+
+
+def add_pronunciation(
+    written: str,
+    spoken: str,
+    *,
+    force: bool = False,
+    path: Path | None = None,
+) -> None:
+    vocabulary = load(path)
+    normalized, utterance = _validate_pronunciation(written, spoken)
+    existing = vocabulary.pronunciation_for(normalized)
+    if existing is not None and existing.spoken != utterance and not force:
+        raise VocabularyError(
+            f"pronunciation {normalized!r} already maps to {existing.spoken!r}; "
+            "pass --force to overwrite"
+        )
+    kept = tuple(
+        item
+        for item in vocabulary.pronunciations
+        if item.written.casefold() != normalized.casefold()
+    )
+    save(
+        Vocabulary(
+            replacements=vocabulary.replacements,
+            aliases=vocabulary.aliases,
+            pronunciations=(
+                *kept,
+                Pronunciation(written=normalized, spoken=utterance),
+            ),
+        ),
+        path,
+    )
+    verb = "updated" if existing is not None else "added"
+    print(f"{verb} pronunciation {normalized!r} -> {utterance!r}")
+
+
+def remove_pronunciation(written: str, *, path: Path | None = None) -> None:
+    vocabulary = load(path)
+    normalized = " ".join(written.split())
+    if vocabulary.pronunciation_for(normalized) is None:
+        raise VocabularyError(f"no pronunciation is stored for {normalized!r}")
+    kept = tuple(
+        item
+        for item in vocabulary.pronunciations
+        if item.written.casefold() != normalized.casefold()
+    )
+    save(
+        Vocabulary(
+            replacements=vocabulary.replacements,
+            aliases=vocabulary.aliases,
+            pronunciations=kept,
+        ),
+        path,
+    )
+    print(f"removed pronunciation {normalized!r}")
 
 
 def list_entries(kind: str | None = None, *, path: Path | None = None) -> None:
@@ -421,6 +567,14 @@ def list_entries(kind: str | None = None, *, path: Path | None = None) -> None:
             print("  (none)")
         for item in sorted(vocabulary.aliases, key=lambda item: item.phrase):
             print(f"  [{item.kind}] {item.phrase!r} -> {item.target!r}")
+    if kind in (None, "pronunciation"):
+        print("pronunciations:")
+        if not vocabulary.pronunciations:
+            print("  (none)")
+        for item in sorted(
+            vocabulary.pronunciations, key=lambda item: item.written.casefold()
+        ):
+            print(f"  {item.written!r} -> {item.spoken!r}")
 
 
 def export_entries(output: Path | None = None, *, path: Path | None = None) -> None:
@@ -453,12 +607,14 @@ def import_entries(
         version=SCHEMA_VERSION,
         replacements=_parse_replacements(document.get("replacements", [])),
         aliases=_parse_aliases(document.get("aliases", [])),
+        pronunciations=_parse_pronunciations(document.get("pronunciations", [])),
     )
     if replace:
         save(incoming, path)
         print(
             f"replaced vocabulary with {len(incoming.replacements)} replacement(s) "
-            f"and {len(incoming.aliases)} alias(es) from {source}"
+            f"{len(incoming.aliases)} alias(es), and "
+            f"{len(incoming.pronunciations)} pronunciation(s) from {source}"
         )
         return
     current = load(path)
@@ -468,15 +624,20 @@ def import_entries(
     aliases = {item.phrase: item for item in current.aliases}
     for item in incoming.aliases:
         aliases[item.phrase] = item
+    pronunciations = {item.written.casefold(): item for item in current.pronunciations}
+    for item in incoming.pronunciations:
+        pronunciations[item.written.casefold()] = item
     save(
         Vocabulary(
             version=SCHEMA_VERSION,
             replacements=tuple(replacements.values()),
             aliases=tuple(aliases.values()),
+            pronunciations=tuple(pronunciations.values()),
         ),
         path,
     )
     print(
-        f"imported {len(incoming.replacements)} replacement(s) and "
-        f"{len(incoming.aliases)} alias(es) from {source}"
+        f"imported {len(incoming.replacements)} replacement(s), "
+        f"{len(incoming.aliases)} alias(es), and "
+        f"{len(incoming.pronunciations)} pronunciation(s) from {source}"
     )

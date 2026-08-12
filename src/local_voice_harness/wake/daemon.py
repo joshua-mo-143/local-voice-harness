@@ -34,6 +34,7 @@ from ..config import (
     JOBS_DIR,
     LEGACY_JOBS_DIR,
     PID_PATH,
+    PROJECT_ROOT,
     RECORDER_LOG,
     RECORDING_LOCK,
     STATE_DIR,
@@ -105,6 +106,7 @@ from ..questions import (
     resolve_answer,
 )
 from ..responses import AssistantResponse, ResponseLike, as_assistant_response
+from ..speech import SpeechRenderer, StreamingSpeechRenderer
 from ..stt.client import transcribe
 from ..ticket_targets import MISSING_ISSUE_SCOPE_RESPONSE, extract_ticket_targets
 from ..tts.queue import PlaybackQueue, PlaybackRequest
@@ -393,6 +395,9 @@ class WakeConversationDaemon:
         self.audio = user_config.audio
         self.platform = user_config.platform
         self.providers = user_config.providers
+        self.speech_renderer = SpeechRenderer.from_local_config(
+            local_checkout=PROJECT_ROOT
+        )
         self.integrations = build_integration_registry(user_config)
         self.np = np
         module_path = openwakeword.__file__
@@ -764,10 +769,18 @@ class WakeConversationDaemon:
             self.wait_for_playback_quiet()
         return batch, interruption
 
+    def _render_speech(self, text: str) -> str:
+        renderer = getattr(self, "speech_renderer", None)
+        return (
+            renderer.render(text)
+            if renderer is not None
+            else SpeechRenderer().render(text)
+        )
+
     def play_response(
         self, response: ResponseLike
     ) -> tuple[dict[str, object], BargeIn | None]:
-        spoken_text = as_assistant_response(response).spoken_text
+        spoken_text = self._render_speech(as_assistant_response(response).spoken_text)
         self.playback_queue.enqueue(PlaybackRequest(text=spoken_text))
         finished: set[int] = set()
 
@@ -805,17 +818,28 @@ class WakeConversationDaemon:
         played: list[dict[str, object]] = []
         playback_errors: list[BaseException] = []
         interruption: BargeIn | None = None
+        stream_renderer = StreamingSpeechRenderer(
+            getattr(self, "speech_renderer", SpeechRenderer())
+        )
 
         def on_text_chunk(text: str) -> None:
             nonlocal stopped
-            text = text.strip()
-            if not text:
+            if not text.strip():
                 return
             with condition:
                 if stopped:
                     return
-                chunks.append(text)
-                self.playback_queue.enqueue(PlaybackRequest(text=text))
+                chunks.append(text.strip())
+                for spoken_text in stream_renderer.feed(text):
+                    self.playback_queue.enqueue(PlaybackRequest(text=spoken_text))
+                condition.notify()
+
+        def flush_text_chunks() -> None:
+            with condition:
+                if stopped:
+                    return
+                for spoken_text in stream_renderer.flush():
+                    self.playback_queue.enqueue(PlaybackRequest(text=spoken_text))
                 condition.notify()
 
         def player() -> None:
@@ -853,6 +877,7 @@ class WakeConversationDaemon:
         playback_thread.start()
         try:
             response, next_cursor_session = generate(on_text_chunk)
+            flush_text_chunks()
         finally:
             with condition:
                 finished = True
@@ -890,7 +915,7 @@ class WakeConversationDaemon:
         print(f"Assistant: {response.display_text}", flush=True)
         self.playback_queue.enqueue(
             PlaybackRequest(
-                text=response.spoken_text,
+                text=self._render_speech(response.spoken_text),
                 job_id=job_id,
                 delivery_token=claim.token,
                 job_status=job.status.value,
