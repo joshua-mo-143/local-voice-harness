@@ -939,6 +939,18 @@ def _ticket_identity(job: CursorJob) -> tuple[str, ...] | None:
     return None
 
 
+def _grouped_ticket_identities(job: CursorJob) -> tuple[tuple[str, ...], ...]:
+    identities: list[tuple[str, ...]] = []
+    for target in job.grouped_repository_targets or []:
+        request = target.get("request")
+        if not isinstance(request, dict):
+            continue
+        issue_key = request.get("issue_key")
+        if isinstance(issue_key, str) and issue_key:
+            identities.append(("linear", issue_key.casefold()))
+    return tuple(identities)
+
+
 def _active_ticket_conflict_unlocked(
     path: Path,
     candidate: CursorJob,
@@ -1897,6 +1909,14 @@ class JobStore:
         ticket = _ticket_identity(job)
         if ticket is not None:
             rows.append(("ticket", "\x1f".join(ticket), "active ticket ownership"))
+        rows.extend(
+            (
+                "ticket",
+                "\x1f".join(identity),
+                "grouped repository clarification ownership",
+            )
+            for identity in _grouped_ticket_identities(job)
+        )
         values = job.to_dict()
         targets = {
             value
@@ -2301,6 +2321,51 @@ class JobStore:
             self._validate_db_quarantine_reservation(connection, candidate, "target")
             self._validate_db_quarantine_reservation(connection, candidate, "worktree")
             return self._save(connection, candidate)
+
+    def ticket_reservation_owner(self, identity: tuple[str, ...]) -> str | None:
+        self._ensure_ready()
+        self._refresh_legacy_sources()
+        with self._db.connect(readonly=True) as connection:
+            row = connection.execute(
+                "SELECT job_id FROM reservations "
+                "WHERE resource_kind = 'ticket' AND resource_key = ?",
+                ("\x1f".join(identity),),
+            ).fetchone()
+        return str(row["job_id"]) if row is not None else None
+
+    def stage_grouped_children(
+        self,
+        coordinator_id: str,
+        command: JobCommand,
+        children: tuple[CursorJob, ...],
+    ) -> CursorJob | None:
+        """Atomically fence a grouped answer and admit its selected children."""
+        self._ensure_ready()
+        self._refresh_legacy_sources()
+        with self._db.transaction() as connection:
+            if self._read_maintenance_db(connection) is not None:
+                raise JobMaintenanceError(
+                    "Cursor jobs are temporarily unavailable during job deletion"
+                )
+            current = CursorJob.from_dict(self._db.load_job(connection, coordinator_id))
+            candidate = command(current)
+            if candidate is None:
+                return None
+            candidate = _normalize_for_durable_write(candidate)
+            validate_transition(current, candidate)
+            _validate_candidate_artifacts_unlocked(
+                self.path(coordinator_id), candidate, current
+            )
+            self._save(connection, candidate)
+            for child in children:
+                normalized = _normalize_for_durable_write(child)
+                if normalized.revision != 0:
+                    raise JobValidationError("new grouped child revision must be zero")
+                _validate_candidate_artifacts_unlocked(
+                    self.path(normalized.id), normalized, None
+                )
+                self._save(connection, normalized)
+            return candidate
 
     def update(self, job_id: str, command: JobCommand) -> CursorJob | None:
         return self._transaction(job_id, command)

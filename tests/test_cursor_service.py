@@ -33,6 +33,7 @@ from local_voice_harness.integrations.github import (
 )
 from local_voice_harness.integrations.registry import build_integration_registry
 from local_voice_harness.responses import AssistantResponse, as_assistant_response
+from local_voice_harness.ticket_targets import TicketExtraction, TicketReference
 from local_voice_harness.user_config import default_user_config
 
 
@@ -197,6 +198,433 @@ def test_fanout_preflights_every_target_before_bounded_background_starts() -> No
     assert "job-one" not in response.spoken_text
     assert "job deletion maintenance is active" not in response.spoken_text
     foreground.assert_not_called()
+
+
+def test_multi_ticket_repository_ambiguities_use_one_durable_grouped_question(
+    tmp_path: Path,
+) -> None:
+    store = JobStore(tmp_path / "jobs", tmp_path / "legacy")
+    repositories = [tmp_path / "alpha", tmp_path / "beta"]
+    client = mock.Mock()
+    client.repository_roots.return_value = repositories
+    client.resolve_repository.side_effect = lambda hint, _task, _repositories: (
+        {
+            "alpha": repositories[0],
+            "beta": repositories[1],
+        }.get(hint),
+        [],
+    )
+    extraction = TicketExtraction(
+        (
+            TicketReference("JOS-1", 0, "linear", "JOS-1"),
+            TicketReference("JOS-2", 10, "linear", "JOS-2"),
+            TicketReference("JOS-3", 20, "linear", "JOS-3"),
+        ),
+        requested_count=3,
+    )
+    registry = mock.Mock()
+    started_requests: list[tuple[TicketJobRequest, ...]] = []
+
+    def start(requests: tuple[TicketJobRequest, ...], **_kwargs: object) -> tuple:
+        started_requests.append(requests)
+        return tuple(
+            service.TicketStartOutcome(
+                request.target,
+                "accepted",
+                job_id=f"{index + 1:012x}",
+            )
+            for index, request in enumerate(requests)
+        )
+
+    with (
+        mock.patch.object(service, "_job_store", return_value=store),
+        mock.patch.object(service, "HerdrClient", return_value=client),
+        mock.patch.object(service, "integration_enabled", return_value=False),
+        mock.patch.object(service, "require_issue_capabilities"),
+        mock.patch.object(
+            service,
+            "resolve_issue_reference",
+            side_effect=lambda reference, _registry: reference,
+        ),
+        mock.patch.object(
+            service,
+            "issue_provider_identity",
+            return_value="linear",
+        ),
+        mock.patch.object(service, "launch_worker") as launch,
+        mock.patch.object(
+            service,
+            "route_issue_repository",
+            side_effect=[
+                (None, "low", "ambiguous"),
+                (None, "medium", "ambiguous"),
+                (repositories[0], "high", "proven"),
+            ],
+        ),
+        mock.patch.object(service, "start_jobs", side_effect=start),
+    ):
+        outcomes = service._submit_extracted_targets(
+            extraction,
+            StartJobRequest("Work on JOS-1, JOS-2, and JOS-3", foreground=False),
+            foreground=False,
+            foreground_seconds=5,
+            concurrency=3,
+            integrations=registry,
+        )
+
+        assert [outcome.status for outcome in outcomes] == [
+            "awaiting-clarification",
+            "awaiting-clarification",
+            "accepted",
+        ]
+        assert [request.target for request in started_requests[0]] == ["JOS-3"]
+        assert started_requests[0][0].request.repository == str(repositories[0])
+        clarification_id = outcomes[0].job_id
+        assert clarification_id == outcomes[1].job_id
+        assert clarification_id is not None
+        clarification = store.get(clarification_id)
+        question = service.questions.current(clarification)
+        assert question is not None
+        assert question.owner == service.GROUPED_REPOSITORY_OWNER
+        assert question.text.index("JOS-1") < question.text.index("JOS-2")
+        client.choose_or_clone_repository.assert_not_called()
+
+        revision = clarification.revision
+        invalid = service.reply_job(
+            clarification_id,
+            "JOS-99: alpha",
+            integrations=registry,
+        )
+        assert "No ticket jobs were started" in str(invalid)
+        assert store.get(clarification_id).revision == revision
+        assert len(started_requests) == 1
+
+        partial = service.reply_job(
+            clarification_id,
+            "JOS-2: beta",
+            integrations=registry,
+        )
+        assert "One job started" in str(partial)
+        assert launch.call_count == 1
+        remaining = store.get(clarification_id)
+        assert remaining.status == JobStatus.AWAITING_USER
+        remaining_targets = remaining.to_dict()[
+            service.GROUPED_REPOSITORY_TARGETS_FIELD
+        ]
+        assert isinstance(remaining_targets, list)
+        assert [target["target"] for target in remaining_targets] == ["JOS-1"]
+
+        service.reply_job(
+            clarification_id,
+            "JOS-1: alpha",
+            integrations=registry,
+        )
+        assert launch.call_count == 2
+        assert store.get(clarification_id).status == JobStatus.COMPLETED
+        client.choose_or_clone_repository.assert_not_called()
+
+
+def test_batch_provider_failure_is_rejected_without_rofi_or_question(
+    tmp_path: Path,
+) -> None:
+    store = JobStore(tmp_path / "jobs", tmp_path / "legacy")
+    client = mock.Mock()
+    client.repository_roots.return_value = [tmp_path / "alpha"]
+    extraction = TicketExtraction(
+        (
+            TicketReference("JOS-1", 0, "linear", "JOS-1"),
+            TicketReference("JOS-2", 10, "linear", "JOS-2"),
+        ),
+        requested_count=2,
+    )
+    registry = mock.Mock()
+    with (
+        mock.patch.object(service, "_job_store", return_value=store),
+        mock.patch.object(service, "HerdrClient", return_value=client),
+        mock.patch.object(service, "integration_enabled", return_value=False),
+        mock.patch.object(service, "require_issue_capabilities"),
+        mock.patch.object(
+            service,
+            "resolve_issue_reference",
+            side_effect=lambda reference, _registry: reference,
+        ),
+        mock.patch.object(
+            service,
+            "route_issue_repository",
+            side_effect=HarnessError("provider authorization failed"),
+        ),
+        mock.patch.object(service, "start_jobs", return_value=()) as start,
+    ):
+        outcomes = service._submit_extracted_targets(
+            extraction,
+            StartJobRequest("Work on JOS-1 and JOS-2", foreground=False),
+            foreground=False,
+            foreground_seconds=5,
+            concurrency=2,
+            integrations=registry,
+        )
+
+    assert [outcome.status for outcome in outcomes] == ["rejected", "rejected"]
+    assert store.list() == []
+    start.assert_called_once_with(
+        (),
+        concurrency=2,
+        foreground_seconds=5,
+        integrations=registry,
+    )
+    client.choose_or_clone_repository.assert_not_called()
+
+
+def _grouped_target(index: int, target: str) -> dict[str, object]:
+    return {
+        "index": index,
+        "target": target,
+        "request": service._serialize_start_request(
+            StartJobRequest(
+                f"Work only on Linear issue {target}.",
+                utterance=f"Work only on Linear issue {target}.",
+                issue_key=target,
+                foreground=False,
+            )
+        ),
+    }
+
+
+def test_grouped_answer_enforces_configured_launch_concurrency(tmp_path: Path) -> None:
+    store = JobStore(tmp_path / "jobs", tmp_path / "legacy")
+    repositories = [tmp_path / "alpha"]
+    targets = [_grouped_target(index, f"JOS-{index}") for index in range(1, 5)]
+    client = mock.Mock()
+    client.resolve_repository.return_value = (repositories[0], repositories)
+    active = 0
+    maximum = 0
+    lock = threading.Lock()
+
+    def launch(_job_id: str) -> None:
+        nonlocal active, maximum
+        with lock:
+            active += 1
+            maximum = max(maximum, active)
+        time.sleep(0.03)
+        with lock:
+            active -= 1
+
+    registry = mock.Mock()
+    with (
+        mock.patch.object(service, "_job_store", return_value=store),
+        mock.patch.object(service, "HerdrClient", return_value=client),
+        mock.patch.object(
+            service,
+            "resolve_issue_reference",
+            side_effect=lambda reference, _registry: reference,
+        ),
+        mock.patch.object(service, "issue_provider_identity", return_value="linear"),
+        mock.patch.object(service, "require_issue_capabilities"),
+        mock.patch.object(service, "launch_worker", side_effect=launch),
+    ):
+        coordinator_id = service._create_grouped_repository_clarification(
+            targets,
+            repositories,
+            original_request=StartJobRequest("work on four tickets", foreground=False),
+        )
+        result = service.reply_job(
+            coordinator_id,
+            "JOS-1: alpha, JOS-2: alpha, JOS-3: alpha, JOS-4: alpha",
+            concurrency=2,
+            integrations=registry,
+        )
+
+    assert "Four jobs started" in str(result)
+    assert maximum == 2
+
+
+def test_concurrent_grouped_answers_only_winning_cas_launches_children(
+    tmp_path: Path,
+) -> None:
+    store = JobStore(tmp_path / "jobs", tmp_path / "legacy")
+    repository = tmp_path / "alpha"
+    client = mock.Mock()
+    client.resolve_repository.return_value = (repository, [repository])
+    registry = mock.Mock()
+    barrier = threading.Barrier(2)
+    launched: list[str] = []
+    results: list[str] = []
+    errors: list[BaseException] = []
+
+    def stale_read(job_id: str) -> CursorJob:
+        snapshot = store.get(job_id)
+        barrier.wait(timeout=2)
+        return snapshot
+
+    def answer(coordinator_id: str) -> None:
+        try:
+            results.append(
+                str(
+                    service.reply_job(
+                        coordinator_id,
+                        "JOS-1: alpha",
+                        concurrency=1,
+                        integrations=registry,
+                    )
+                )
+            )
+        except BaseException as exc:  # pragma: no cover - asserted below
+            errors.append(exc)
+
+    with (
+        mock.patch.object(service, "_job_store", return_value=store),
+        mock.patch.object(service, "HerdrClient", return_value=client),
+        mock.patch.object(
+            service,
+            "resolve_issue_reference",
+            side_effect=lambda reference, _registry: reference,
+        ),
+        mock.patch.object(service, "issue_provider_identity", return_value="linear"),
+        mock.patch.object(service, "require_issue_capabilities"),
+        mock.patch.object(service, "launch_worker", side_effect=launched.append),
+    ):
+        coordinator_id = service._create_grouped_repository_clarification(
+            [_grouped_target(0, "JOS-1")],
+            [repository],
+            original_request=StartJobRequest("work on JOS-1", foreground=False),
+        )
+        with mock.patch.object(service, "read_job", side_effect=stale_read):
+            threads = [
+                threading.Thread(target=answer, args=(coordinator_id,))
+                for _index in range(2)
+            ]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(2)
+
+    assert errors == []
+    assert len(launched) == 1
+    assert sum("One job started" in result for result in results) == 1
+    assert sum("already changed" in result for result in results) == 1
+    children = [
+        job
+        for job in store.list()
+        if job.to_dict().get("grouped_repository_coordinator_id") == coordinator_id
+    ]
+    assert len(children) == 1
+
+
+def test_grouped_handoff_recovery_launches_durably_staged_child(
+    tmp_path: Path,
+) -> None:
+    store = JobStore(tmp_path / "jobs", tmp_path / "legacy")
+    repository = tmp_path / "alpha"
+    client = mock.Mock()
+    client.resolve_repository.return_value = (repository, [repository])
+    runtime = replace(
+        default_user_config(tmp_path).platform,
+        agent_job_start_concurrency=1,
+    )
+    registry = mock.Mock(platform=runtime)
+
+    with (
+        mock.patch.object(service, "_job_store", return_value=store),
+        mock.patch.object(service, "HerdrClient", return_value=client),
+        mock.patch.object(
+            service,
+            "resolve_issue_reference",
+            side_effect=lambda reference, _registry: reference,
+        ),
+        mock.patch.object(service, "issue_provider_identity", return_value="linear"),
+        mock.patch.object(service, "require_issue_capabilities"),
+    ):
+        coordinator_id = service._create_grouped_repository_clarification(
+            [_grouped_target(0, "JOS-1")],
+            [repository],
+            original_request=StartJobRequest("work on JOS-1", foreground=False),
+        )
+        with (
+            mock.patch.object(
+                service,
+                "_launch_grouped_children",
+                side_effect=RuntimeError("crash after atomic handoff"),
+            ),
+            pytest.raises(RuntimeError, match="crash after atomic handoff"),
+        ):
+            service.reply_job(
+                coordinator_id,
+                "JOS-1: alpha",
+                concurrency=1,
+                integrations=registry,
+            )
+
+        staged = store.get(coordinator_id)
+        assert staged.grouped_repository_launches[0]["state"] == "pending"
+        child_id = str(staged.grouped_repository_launches[0]["job_id"])
+        assert store.get(child_id).status == JobStatus.QUEUED
+
+        with (
+            mock.patch.object(service, "launch_worker") as launch,
+            mock.patch.object(service.recovery, "recover_jobs"),
+        ):
+            service.recover_jobs(integrations=registry)
+
+    launch.assert_called_once_with(child_id)
+    recovered = store.get(coordinator_id)
+    assert recovered.grouped_repository_launches[0]["state"] == "completed"
+
+
+def test_overlapping_unresolved_batches_share_ticket_ownership_fence(
+    tmp_path: Path,
+) -> None:
+    store = JobStore(tmp_path / "jobs", tmp_path / "legacy")
+    repository = tmp_path / "alpha"
+    client = mock.Mock()
+    client.repository_roots.return_value = [repository]
+    registry = mock.Mock()
+    first_target = _grouped_target(0, "JOS-1")
+
+    with (
+        mock.patch.object(service, "_job_store", return_value=store),
+        mock.patch.object(service, "HerdrClient", return_value=client),
+        mock.patch.object(service, "integration_enabled", return_value=False),
+        mock.patch.object(service, "require_issue_capabilities"),
+        mock.patch.object(
+            service,
+            "resolve_issue_reference",
+            side_effect=lambda reference, _registry: reference,
+        ),
+        mock.patch.object(
+            service,
+            "route_issue_repository",
+            return_value=(None, "low", "ambiguous"),
+        ),
+        mock.patch.object(service, "start_jobs", return_value=()),
+    ):
+        first_id = service._create_grouped_repository_clarification(
+            [first_target],
+            [repository],
+            original_request=StartJobRequest("work on JOS-1", foreground=False),
+        )
+        outcomes = service._submit_extracted_targets(
+            TicketExtraction(
+                (
+                    TicketReference("JOS-1", 0, "linear", "JOS-1"),
+                    TicketReference("JOS-2", 10, "linear", "JOS-2"),
+                ),
+                requested_count=2,
+            ),
+            StartJobRequest("work on JOS-1 and JOS-2", foreground=False),
+            foreground=False,
+            foreground_seconds=5,
+            concurrency=2,
+            integrations=registry,
+        )
+
+    assert [outcome.status for outcome in outcomes] == [
+        "rejected",
+        "awaiting-clarification",
+    ]
+    assert outcomes[0].job_id == first_id
+    assert outcomes[1].job_id != first_id
+    assert store.ticket_reservation_owner(("linear", "jos-1")) == first_id
+    assert store.ticket_reservation_owner(("linear", "jos-2")) == outcomes[1].job_id
 
 
 def test_start_jobs_enforces_bound_and_preserves_outcome_order() -> None:
@@ -564,9 +992,21 @@ def test_fanout_linear_capability_preflight_happens_before_any_start() -> None:
         events.append(f"start-{request.issue_key}")
         return f"job-{request.issue_key}"
 
+    def preserve_preflight(
+        prepared: list[tuple[int, TicketJobRequest]],
+        _slots: list[service.TicketStartOutcome | None],
+        **_kwargs: object,
+    ) -> tuple[list[tuple[int, TicketJobRequest]], list[dict[str, object]], list[Path]]:
+        return prepared, [], []
+
     with (
         mock.patch.object(service, "require_issue_capabilities", side_effect=require),
         mock.patch.object(service, "resolve_issue_reference", side_effect=resolve),
+        mock.patch.object(
+            service,
+            "_preflight_batch_repositories",
+            side_effect=preserve_preflight,
+        ),
         mock.patch.object(service, "start_job", side_effect=start),
         mock.patch.object(service, "read_job", side_effect=KeyError),
     ):
