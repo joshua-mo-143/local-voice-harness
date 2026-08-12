@@ -10,7 +10,7 @@ from unittest import mock
 
 import pytest
 
-from local_voice_harness.cursor import service
+from local_voice_harness.cursor import delivery, service
 from local_voice_harness.cursor.model import (
     CURRENT_SCHEMA_VERSION,
     CursorJob,
@@ -425,6 +425,84 @@ def test_foreground_timeout_confirms_new_job_by_channel(
     assert job.id in response.display_text
     assert "local-voice-harness issue 149" in response.display_text
     assert service.read_job(job.id).foreground_until == 0
+
+
+def test_foreground_timeout_acknowledges_repeated_answers_as_continuations(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(service, "JOBS_DIR", tmp_path / "jobs")
+    monkeypatch.setattr(service, "LEGACY_JOBS_DIR", tmp_path / "legacy")
+    job = CursorJob.from_dict(
+        {
+            "id": "123456789abc",
+            "request": "work on the focused issue",
+            "status": "running",
+            "created_at": 1,
+            "delivered": True,
+            "foreground_until": 10,
+            "speakable_label": "local-voice-harness issue 206",
+        }
+    )
+    service._job_store().create(job)
+
+    first = service._await_foreground(job.id, [], timeout=0, continuation=True)
+    second = service._await_foreground(job.id, [], timeout=0, continuation=True)
+
+    for result in (first, second):
+        response = as_assistant_response(result.text)
+        assert response.spoken_text == "Answer sent; Cursor is continuing."
+        assert job.id not in response.spoken_text
+        assert job.id in response.display_text
+        assert "same job" in response.display_text
+        assert result.session_id is None
+
+
+def test_immediate_next_question_suppresses_continuation_ack_and_retries_delivery(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(service, "JOBS_DIR", tmp_path / "jobs")
+    monkeypatch.setattr(service, "LEGACY_JOBS_DIR", tmp_path / "legacy")
+    job = CursorJob.from_dict(
+        {
+            "id": "123456789abc",
+            "request": "work on the focused issue",
+            "status": "awaiting_user",
+            "created_at": 1,
+            "updated_at": 2,
+            "delivered": False,
+            "foreground_until": 10,
+            "question": "Which database should I use?",
+            "result": "Which database should I use?",
+        }
+    )
+    store = service._job_store()
+    store.create(job)
+    claims: delivery.DeliveryClaims = []
+
+    result = service._await_foreground(
+        job.id,
+        claims,
+        timeout=0,
+        continuation=True,
+    )
+
+    assert result == CursorTurnResult("Which database should I use?", job.id)
+    assert len(claims) == 1
+    assert not store.get(job.id).delivered
+
+    claimed_at = time.time()
+    service.release_deliveries(claims)
+    assert (
+        delivery.claim_delivery(
+            store,
+            job.id,
+            foreground=True,
+            now=claimed_at + delivery.DELIVERY_RETRY_SECONDS + 1,
+        )
+        is not None
+    )
 
 
 def test_single_scoped_ticket_keeps_foreground_behavior() -> None:
