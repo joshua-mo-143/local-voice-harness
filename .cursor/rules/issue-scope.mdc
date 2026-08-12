@@ -9,10 +9,10 @@ alwaysApply: true
 - If newly discovered work is independently valuable, capture it as a separate follow-up issue instead of expanding the current issue.
 - Keep each issue small enough to produce one focused, reviewable pull request with a clear verification plan.
 - When an issue contains multiple independently deliverable outcomes, treat it as an epic rather than a single implementation issue:
-  1. Create or convert a tracking issue in this repository to the `Epic` issue type when available.
-  2. Add the epic to the repository's GitHub Project when one is configured.
-  3. Split the work into narrowly scoped child issues with explicit acceptance criteria.
-  4. Represent sequencing with GitHub issue dependency links (`blocked by` / `blocking`), not prose alone.
-  5. Link every child issue to the epic and keep the epic focused on coordination and status.
+  1. Prefix the parent issue title with `Epic:`.
+  2. Split the work into narrowly scoped child issues with explicit acceptance criteria.
+  3. Represent sequencing with GitHub issue dependency links (`blocked by` / `blocking`), not prose alone.
+  4. Link every child issue to the epic and keep the epic focused on coordination and status.
+- Do not use GitHub Projects, issue types, or pinning to establish or organize an epic.
 - Do not start all child work through the epic itself. Implement and close each child through its own issue and pull request.
-- If issue types, Projects, or dependency links are unavailable, use a tracking issue with a task list and explicit cross-links, and report the limitation.
+- If dependency links or child-issue relationships are unavailable, use a task list and explicit cross-links, and report the limitation.
