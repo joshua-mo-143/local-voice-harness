@@ -51,6 +51,10 @@ ROUTER_SYSTEM_PROMPT = (
     "Use cursor_details when the user asks to see or hear more detail about the "
     "just-announced completed result, such as 'tell me more' or 'show me the details'; "
     "this is read-only and must not start more work. "
+    "Use harness_config_inspect for explicit questions about the harness's own "
+    "current configuration, including requests about credentials, paths, executables, "
+    "or unsupported settings; the first-party handler will enforce its read allow-list. "
+    "Questions about general software configuration are not harness_config_inspect. "
     "Use end_conversation when the user signals the exchange is over and nothing "
     "further is needed, for example saying goodbye, thanking you with no new "
     "request, answering that there is nothing else, or replying with only a short "
@@ -100,6 +104,7 @@ ROUTE_TOOL = {
                         "cursor_dismiss",
                         "cursor_repeat",
                         "cursor_details",
+                        "harness_config_inspect",
                         "question_consultation",
                         "conversation_continue",
                         "workspace_consultation",
@@ -137,6 +142,7 @@ class Intent(StrEnum):
     AGENT_DISMISS = "cursor_dismiss"
     AGENT_REPEAT = "cursor_repeat"
     AGENT_DETAILS = "cursor_details"
+    HARNESS_CONFIG_INSPECT = "harness_config_inspect"
     QUESTION_CONSULTATION = "question_consultation"
     CONVERSATION_CONTINUE = "conversation_continue"
     WORKSPACE_CONSULTATION = "workspace_consultation"

@@ -44,7 +44,11 @@ from .ipc import socket_ready
 from .linear_ticket_creation import team_from_utterance
 from .llm import qwen_response
 from .questions import AnswerProvenance
-from .responses import as_assistant_response
+from .responses import AssistantResponse, as_assistant_response
+from .self_management import (
+    UNSUPPORTED_INSPECTION_RESPONSE,
+    inspect_config_utterance,
+)
 from .speech import SpeechRenderer
 from .ticket_targets import MISSING_ISSUE_SCOPE_RESPONSE, extract_ticket_targets
 from .tts.client import stream_and_play
@@ -242,6 +246,12 @@ def respond(text: str, *, user_config: UserConfig | None = None) -> None:
                     delivery_claims=delivery_claims,
                     integrations=integrations,
                 )[0]
+            elif route.intent == Intent.HARNESS_CONFIG_INSPECT:
+                response = (
+                    inspect_config_utterance(text, settings)
+                    if route.actionable
+                    else AssistantResponse.from_text(UNSUPPORTED_INSPECTION_RESPONSE)
+                )
             elif missing_ticket_scope:
                 response = MISSING_ISSUE_SCOPE_RESPONSE
             elif route.actionable and route.intent == Intent.QUESTION_CONSULTATION:

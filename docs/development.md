@@ -11,6 +11,8 @@ scripts/dev.sh pronounce "PR #128 changed src/http_client.py"
 scripts/dev.sh setup --defaults
 scripts/dev.sh config show audio.wake_threshold
 scripts/dev.sh integrations list
+scripts/dev.sh text "What voice are you using?"
+scripts/dev.sh text "Is Linear enabled?"
 ```
 
 The launcher sets `XDG_CONFIG_HOME` to `.dev/config` and `XDG_STATE_HOME` to
