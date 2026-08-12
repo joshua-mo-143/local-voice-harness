@@ -173,8 +173,8 @@ def test_fanout_preflights_every_target_before_bounded_background_starts() -> No
     ):
         result = service.cursor_turn(
             CursorTurnRequest(
-                "Work on issues 1, 2, and 3",
-                utterance="Work on issues 1, 2, and 3",
+                "Work on issues 1 through 3",
+                utterance="Work on issues 1 through 3",
                 issue_scope="example/project",
                 issue_scope_source="github",
             )
