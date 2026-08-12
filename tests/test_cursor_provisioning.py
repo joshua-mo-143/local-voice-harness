@@ -1365,6 +1365,31 @@ class CursorJobStateTests(unittest.TestCase):
             ),
             "review contains 'permission'",
         )
+        self.assertEqual(
+            production_jobs._classified_tier(
+                "simple",
+                "create one fixture note",
+                "Localized and reversible, with no persistence, concurrency, "
+                "or API concerns.",
+            ).value,
+            "simple",
+        )
+        for value in (
+            "No persistence, concurrency, or security concerns.",
+            "Without known migration or database risks.",
+            "This does not introduce persistence risks.",
+        ):
+            with self.subTest(value=value):
+                self.assertIsNone(
+                    production_jobs._hard_risk_evidence(value, "localized")
+                )
+        self.assertEqual(
+            production_jobs._hard_risk_evidence(
+                "rename a label",
+                "Requires persistence and concurrency changes.",
+            ),
+            "classification or promotion reason contains 'persistence'",
+        )
         with self.assertRaises(jobs.HarnessError):
             production_jobs._classified_tier("unknown", "rename text", "localized")
 
