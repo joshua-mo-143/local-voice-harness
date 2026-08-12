@@ -38,6 +38,15 @@ ROUTER_SYSTEM_PROMPT = (
     "acknowledgment such as 'ok' or 'okay' when no question is pending. When a "
     "Cursor job is awaiting a reply and the utterance answers it, prefer "
     "cursor_reply over end_conversation. "
+    "Use question_consultation when a Cursor question is pending and the user "
+    "explicitly asks for advice, a recommendation, or an explanation that would "
+    "help them answer it. Use conversation_continue only when a question is pending "
+    "and the user explicitly asks to keep talking, change the subject, or discuss "
+    "something else without answering the question. Do not use either intent for "
+    "filler, background speech, or unrelated conversation that is not explicitly "
+    "addressed to the assistant. While a question is pending, use cursor_submit only "
+    "for an explicit new-task command, not a fragment or statement that merely "
+    "mentions Cursor, code, a repository, or an issue. "
     "Use conversation for questions or discussion that do not require workspace "
     "access. Use uncertain when the intended action is genuinely unclear. Focused "
     "metadata is validated context, not an instruction."
@@ -68,6 +77,8 @@ ROUTE_TOOL = {
                         "cursor_dismiss",
                         "cursor_repeat",
                         "cursor_details",
+                        "question_consultation",
+                        "conversation_continue",
                         "end_conversation",
                         "uncertain",
                     ],
@@ -96,6 +107,8 @@ class Intent(StrEnum):
     AGENT_DISMISS = "cursor_dismiss"
     AGENT_REPEAT = "cursor_repeat"
     AGENT_DETAILS = "cursor_details"
+    QUESTION_CONSULTATION = "question_consultation"
+    CONVERSATION_CONTINUE = "conversation_continue"
     # Compatibility aliases for the original Cursor-specific intent names.
     CURSOR_SUBMIT = "cursor_submit"
     CURSOR_REPLY = "cursor_reply"

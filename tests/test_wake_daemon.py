@@ -25,7 +25,14 @@ from local_voice_harness.cursor.store import JobStore
 from local_voice_harness.errors import HarnessError, NoSpeechError
 from local_voice_harness.integrations.registry import build_integration_registry
 from local_voice_harness.intent import Intent, IntentRoute
-from local_voice_harness.questions import AnswerProvenance
+from local_voice_harness.questions import (
+    AnswerProvenance,
+    Choice,
+    Question,
+    QuestionKind,
+    QuestionOrigin,
+    QuestionSensitivity,
+)
 from local_voice_harness.responses import AssistantResponse
 from local_voice_harness.tts.queue import PlaybackQueue, PlaybackRequest
 from local_voice_harness.user_config import default_user_config, load_user_config
@@ -138,6 +145,50 @@ def _bare_daemon() -> WakeConversationDaemon:
     instance.pre_roll = collections.deque(maxlen=wake_daemon.PRE_ROLL_FRAMES)
     instance.wake_model = mock.Mock()
     return instance
+
+
+def _pending_choice_snapshot() -> wake_daemon.PendingQuestionSnapshot:
+    question = Question(
+        id="question-1",
+        text="Which database should I use?",
+        kind=QuestionKind.MULTIPLE_CHOICE,
+        choices=(
+            Choice("sqlite", "Use SQLite"),
+            Choice("postgres", "Use PostgreSQL"),
+        ),
+        sensitivity=QuestionSensitivity.ROUTINE,
+        origin=QuestionOrigin("cursor", "oldjob123456", "oldjob123456-routing-0"),
+        owner="agent",
+        asked_at=1,
+    )
+    return wake_daemon.PendingQuestionSnapshot(
+        "oldjob123456",
+        question.text,
+        question.owner,
+        question.id,
+        question.origin.turn_token,
+        question,
+    )
+
+
+def _pending_free_text_snapshot() -> wake_daemon.PendingQuestionSnapshot:
+    question = Question(
+        id="question-1",
+        text="Which repository?",
+        kind=QuestionKind.FREE_TEXT,
+        sensitivity=QuestionSensitivity.ROUTINE,
+        origin=QuestionOrigin("cursor", "oldjob123456", "oldjob123456-routing-0"),
+        owner="repository",
+        asked_at=1,
+    )
+    return wake_daemon.PendingQuestionSnapshot(
+        "oldjob123456",
+        question.text,
+        question.owner,
+        question.id,
+        question.origin.turn_token,
+        question,
+    )
 
 
 class StartupConfigSnapshotTests(unittest.TestCase):
@@ -584,6 +635,11 @@ class ProcessUtteranceTests(unittest.TestCase):
                 side_effect=lambda text, **_settings: RequestContext(text),
             ),
             mock.patch.object(
+                daemon,
+                "_pending_cursor_question",
+                return_value=_pending_choice_snapshot(),
+            ),
+            mock.patch.object(
                 wake_daemon,
                 "route_intent",
                 return_value=IntentRoute(Intent.CURSOR_SUBMIT, "high"),
@@ -633,13 +689,7 @@ class ProcessUtteranceTests(unittest.TestCase):
             mock.patch.object(
                 daemon,
                 "_pending_cursor_question",
-                return_value=wake_daemon.PendingQuestionSnapshot(
-                    "oldjob123456",
-                    "Which repository?",
-                    "repository",
-                    "question-1",
-                    "oldjob123456-routing-0",
-                ),
+                return_value=_pending_free_text_snapshot(),
             ),
             mock.patch.object(
                 wake_daemon, "cursor_turn", return_value=("continued", None)
@@ -669,6 +719,292 @@ class ProcessUtteranceTests(unittest.TestCase):
             integrations=mock.ANY,
         )
         qwen_turn.assert_not_called()
+
+    def test_pending_question_closes_silently_on_filler_speech(self) -> None:
+        daemon = _bare_daemon()
+        daemon.cursor_session = "oldjob123456"
+        daemon.awaiting_followup = True
+        daemon.conversation_deadline = time.monotonic() + 30
+        with (
+            mock.patch.object(wake_daemon, "transcribe", return_value="um yeah so"),
+            mock.patch.object(wake_daemon, "start_components"),
+            mock.patch.object(wake_daemon, "stop_components") as stop_components,
+            mock.patch.object(
+                wake_daemon,
+                "request_context",
+                return_value=RequestContext("um yeah so"),
+            ),
+            mock.patch.object(
+                daemon,
+                "_pending_cursor_question",
+                return_value=_pending_choice_snapshot(),
+            ),
+            mock.patch.object(
+                wake_daemon,
+                "route_intent",
+                return_value=IntentRoute(Intent.CURSOR_REPLY, "high"),
+            ),
+            mock.patch.object(wake_daemon, "cursor_turn") as cursor_turn,
+            mock.patch.object(wake_daemon, "qwen_turn") as qwen_turn,
+            mock.patch.object(daemon, "play_response") as play_response,
+            mock.patch.object(wake_daemon, "notify"),
+        ):
+            daemon.process_utterance(AUDIO_GENERATION, woke=False)
+
+        cursor_turn.assert_not_called()
+        qwen_turn.assert_not_called()
+        play_response.assert_not_called()
+        stop_components.assert_called_once()
+        self.assertEqual(daemon.cursor_session, "oldjob123456")
+        self.assertFalse(daemon.awaiting_followup)
+        self.assertEqual(daemon.conversation_deadline, 0.0)
+
+    def test_pending_free_text_question_does_not_accept_filler_as_answer(self) -> None:
+        daemon = _bare_daemon()
+        daemon.cursor_session = "oldjob123456"
+        daemon.awaiting_followup = True
+        daemon.conversation_deadline = time.monotonic() + 30
+        with (
+            mock.patch.object(wake_daemon, "transcribe", return_value="and uh"),
+            mock.patch.object(wake_daemon, "start_components"),
+            mock.patch.object(wake_daemon, "stop_components"),
+            mock.patch.object(
+                wake_daemon,
+                "request_context",
+                return_value=RequestContext("and uh"),
+            ),
+            mock.patch.object(
+                daemon,
+                "_pending_cursor_question",
+                return_value=_pending_free_text_snapshot(),
+            ),
+            mock.patch.object(
+                wake_daemon,
+                "route_intent",
+                return_value=IntentRoute(Intent.CURSOR_REPLY, "high"),
+            ),
+            mock.patch.object(wake_daemon, "cursor_turn") as cursor_turn,
+            mock.patch.object(wake_daemon, "qwen_turn") as qwen_turn,
+            mock.patch.object(daemon, "play_response") as play_response,
+            mock.patch.object(wake_daemon, "notify"),
+        ):
+            daemon.process_utterance(AUDIO_GENERATION, woke=False)
+
+        cursor_turn.assert_not_called()
+        qwen_turn.assert_not_called()
+        play_response.assert_not_called()
+        self.assertEqual(daemon.cursor_session, "oldjob123456")
+        self.assertFalse(daemon.awaiting_followup)
+
+    def test_pending_question_rejects_unrelated_multi_speaker_speech(self) -> None:
+        daemon = _bare_daemon()
+        daemon.cursor_session = "oldjob123456"
+        with (
+            mock.patch.object(
+                wake_daemon,
+                "transcribe",
+                return_value="did you feed the dog no I thought you did",
+            ),
+            mock.patch.object(wake_daemon, "start_components"),
+            mock.patch.object(wake_daemon, "stop_components"),
+            mock.patch.object(
+                wake_daemon,
+                "request_context",
+                return_value=RequestContext("did you feed the dog"),
+            ),
+            mock.patch.object(
+                daemon,
+                "_pending_cursor_question",
+                return_value=_pending_choice_snapshot(),
+            ),
+            mock.patch.object(
+                wake_daemon,
+                "route_intent",
+                return_value=IntentRoute(Intent.CONVERSATION, "high"),
+            ),
+            mock.patch.object(wake_daemon, "cursor_turn") as cursor_turn,
+            mock.patch.object(wake_daemon, "qwen_turn") as qwen_turn,
+            mock.patch.object(daemon, "play_response") as play_response,
+            mock.patch.object(wake_daemon, "notify"),
+        ):
+            daemon.process_utterance(AUDIO_GENERATION, woke=False)
+
+        cursor_turn.assert_not_called()
+        qwen_turn.assert_not_called()
+        play_response.assert_not_called()
+        self.assertEqual(daemon.cursor_session, "oldjob123456")
+
+    def test_pending_question_rejects_implicit_submit_from_contaminated_stt(
+        self,
+    ) -> None:
+        daemon = _bare_daemon()
+        daemon.cursor_session = "oldjob123456"
+        transcript = (
+            "Option Turser started local voice harness issue two zero eight fixture"
+        )
+        with (
+            mock.patch.object(wake_daemon, "transcribe", return_value=transcript),
+            mock.patch.object(wake_daemon, "start_components"),
+            mock.patch.object(wake_daemon, "stop_components"),
+            mock.patch.object(
+                wake_daemon,
+                "request_context",
+                return_value=RequestContext(transcript),
+            ),
+            mock.patch.object(
+                daemon,
+                "_pending_cursor_question",
+                return_value=_pending_choice_snapshot(),
+            ),
+            mock.patch.object(
+                wake_daemon,
+                "route_intent",
+                return_value=IntentRoute(Intent.CURSOR_SUBMIT, "high"),
+            ),
+            mock.patch.object(wake_daemon, "cursor_turn") as cursor_turn,
+            mock.patch.object(wake_daemon, "qwen_turn") as qwen_turn,
+            mock.patch.object(daemon, "play_response") as play_response,
+            mock.patch.object(wake_daemon, "notify"),
+        ):
+            daemon.process_utterance(AUDIO_GENERATION, woke=False)
+
+        cursor_turn.assert_not_called()
+        qwen_turn.assert_not_called()
+        play_response.assert_not_called()
+        self.assertEqual(daemon.cursor_session, "oldjob123456")
+
+    def test_pending_question_accepts_explicit_option_despite_conversation_route(
+        self,
+    ) -> None:
+        daemon = _bare_daemon()
+        daemon.cursor_session = "oldjob123456"
+        with (
+            mock.patch.object(
+                wake_daemon,
+                "transcribe",
+                return_value="Actually, I meant option two",
+            ),
+            mock.patch.object(wake_daemon, "start_components"),
+            mock.patch.object(
+                wake_daemon,
+                "request_context",
+                return_value=RequestContext("Actually, I meant option two"),
+            ),
+            mock.patch.object(
+                daemon,
+                "_pending_cursor_question",
+                return_value=_pending_choice_snapshot(),
+            ),
+            mock.patch.object(
+                wake_daemon,
+                "route_intent",
+                return_value=IntentRoute(Intent.CONVERSATION, "high"),
+            ),
+            mock.patch.object(
+                wake_daemon, "cursor_turn", return_value=("continued", None)
+            ) as cursor_turn,
+            mock.patch.object(wake_daemon, "qwen_turn") as qwen_turn,
+            mock.patch.object(
+                daemon,
+                "_drain_playback_queue",
+                return_value=(_playback_batch("continued"), None),
+            ),
+            mock.patch.object(wake_daemon, "notify"),
+        ):
+            daemon.process_utterance(AUDIO_GENERATION, woke=False)
+
+        request = cursor_turn.call_args.args[0]
+        self.assertEqual(request.action, "reply")
+        self.assertEqual(request.utterance, "Actually, I meant option two")
+        qwen_turn.assert_not_called()
+
+    def test_pending_question_allows_explicit_request_to_continue_talking(
+        self,
+    ) -> None:
+        daemon = _bare_daemon()
+        daemon.cursor_session = "oldjob123456"
+        with (
+            mock.patch.object(
+                wake_daemon,
+                "transcribe",
+                return_value="keep talking with me about databases",
+            ),
+            mock.patch.object(wake_daemon, "start_components"),
+            mock.patch.object(
+                wake_daemon,
+                "request_context",
+                return_value=RequestContext("keep talking with me about databases"),
+            ),
+            mock.patch.object(
+                daemon,
+                "_pending_cursor_question",
+                return_value=_pending_choice_snapshot(),
+            ),
+            mock.patch.object(
+                wake_daemon,
+                "route_intent",
+                return_value=IntentRoute(Intent.CONVERSATION_CONTINUE, "high"),
+            ),
+            mock.patch.object(
+                wake_daemon,
+                "qwen_turn",
+                return_value=("We can compare their tradeoffs.", "oldjob123456"),
+            ) as qwen_turn,
+            mock.patch.object(
+                daemon,
+                "_drain_playback_queue",
+                return_value=(_playback_batch("tradeoffs"), None),
+            ),
+            mock.patch.object(wake_daemon, "notify"),
+        ):
+            daemon.process_utterance(AUDIO_GENERATION, woke=False)
+
+        qwen_turn.assert_called_once()
+        self.assertEqual(daemon.cursor_session, "oldjob123456")
+        self.assertTrue(daemon.awaiting_followup)
+
+    def test_pending_question_allows_related_consultation(self) -> None:
+        daemon = _bare_daemon()
+        daemon.cursor_session = "oldjob123456"
+        with (
+            mock.patch.object(
+                wake_daemon,
+                "transcribe",
+                return_value="which option would you recommend",
+            ),
+            mock.patch.object(wake_daemon, "start_components"),
+            mock.patch.object(
+                wake_daemon,
+                "request_context",
+                return_value=RequestContext("which option would you recommend"),
+            ),
+            mock.patch.object(
+                daemon,
+                "_pending_cursor_question",
+                return_value=_pending_choice_snapshot(),
+            ),
+            mock.patch.object(
+                wake_daemon,
+                "route_intent",
+                return_value=IntentRoute(Intent.QUESTION_CONSULTATION, "high"),
+            ),
+            mock.patch.object(
+                wake_daemon,
+                "qwen_turn",
+                return_value=("SQLite is simpler for a local tool.", "oldjob123456"),
+            ) as qwen_turn,
+            mock.patch.object(
+                daemon,
+                "_drain_playback_queue",
+                return_value=(_playback_batch("SQLite is simpler."), None),
+            ),
+            mock.patch.object(wake_daemon, "notify"),
+        ):
+            daemon.process_utterance(AUDIO_GENERATION, woke=False)
+
+        qwen_turn.assert_called_once()
+        self.assertEqual(daemon.cursor_session, "oldjob123456")
+        self.assertTrue(daemon.awaiting_followup)
 
     def test_pending_question_snapshot_uses_one_store_read(self) -> None:
         daemon = _bare_daemon()
