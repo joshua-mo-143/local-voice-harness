@@ -1630,6 +1630,11 @@ def cancel_job(
                 if question is not None
                 else None
             ),
+            job_changes=(
+                {"plan_approval_state": "rejected"}
+                if question is not None and question.owner == "workflow_plan_approval"
+                else None
+            ),
         )
 
     updated = _job_store().update(job_id, cancel)

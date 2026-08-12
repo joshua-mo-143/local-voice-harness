@@ -877,6 +877,21 @@ def test_cancellation_closes_pending_question(store: JobStore) -> None:
     assert cancelled.state == QuestionState.CANCELLED
 
 
+def test_cancellation_rejects_pending_plan_approval_gate(store: JobStore) -> None:
+    _plan_approval_awaiting(store)
+
+    with mock.patch.object(service, "_cancel_target_and_release"):
+        service.cancel_job("aaaaaaaaaaaa")
+
+    cancelled_job = store.get("aaaaaaaaaaaa")
+    cancelled_question = questions.current(cancelled_job)
+    assert cancelled_job.status == JobStatus.RECONCILING
+    assert cancelled_job.terminal_intent_status == JobStatus.CANCELLED
+    assert cancelled_job.plan_approval_state == "rejected"
+    assert cancelled_question is not None
+    assert cancelled_question.state == QuestionState.CANCELLED
+
+
 def test_successful_cleanup_resolves_dispatched_question(store: JobStore) -> None:
     pending = replace(
         _question(turn_token="aaaaaaaaaaaa-1"),
