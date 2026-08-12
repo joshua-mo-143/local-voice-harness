@@ -197,6 +197,19 @@ def test_linear_like_substrings_inside_github_references_are_ignored() -> None:
     ]
 
 
+def test_repeated_github_urls_before_sentence_period_remain_github_targets() -> None:
+    extraction = extract_ticket_targets(
+        "Work on https://github.com/joshua-mo-143/example/issues/3 and "
+        "https://github.com/joshua-mo-143/example/issues/5."
+    )
+
+    assert extraction.requested_count == 2
+    assert [(item.source, item.canonical) for item in extraction.references] == [
+        ("github", "joshua-mo-143/example#3"),
+        ("github", "joshua-mo-143/example#5"),
+    ]
+
+
 def test_standalone_linear_reference_survives_github_overlap_filtering() -> None:
     extraction = extract_ticket_targets(
         "Work on MO-143 and "
