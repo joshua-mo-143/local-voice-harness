@@ -3194,31 +3194,24 @@ def run_claimed_worker(  # pyright: ignore[reportGeneralTypeIssues]
                 checkpoint()
                 repositories = client.repository_roots()
                 checkpoint()
-                repository, candidates = resolve_job_repository(
-                    client, job, repositories
-                )
-                checkpoint()
-            if (
-                repository is None
-                and issue_key
-                and not hint
-                and not job.fork_requested
-                and not job.github_pull_request
-                and not job.github_issue
-            ):
-                checkpoint()
-                routed = route_issue_repository(
-                    client,
-                    issue_key,
-                    repositories,
-                    token=f"{job_id}-route",
-                    reserved=reserved_targets(store, job_id),
-                    checkpoint=checkpoint,
-                    integrations=registry,
-                    provider=job.issue_provider,
-                )
-                if routed is not None:
-                    repository, _confidence, reason = routed
+                if issue_key and not hint:
+                    routed = route_issue_repository(
+                        client,
+                        issue_key,
+                        repositories,
+                        token=f"{job_id}-route",
+                        reserved=reserved_targets(store, job_id),
+                        checkpoint=checkpoint,
+                        integrations=registry,
+                        provider=job.issue_provider,
+                    )
+                    if routed is not None:
+                        repository, _confidence, reason = routed
+                    checkpoint()
+                if repository is None:
+                    repository, candidates = resolve_job_repository(
+                        client, job, repositories
+                    )
                 checkpoint()
             if repository is None:
                 checkpoint()
