@@ -43,6 +43,18 @@ class SpeechRendererTests(unittest.TestCase):
             "commit a b 1 2 c d e fixed job 0 1 H F 7 Z 9 K 2 M N P.",
         )
 
+    def test_hexadecimal_job_ids_are_not_spelled(self) -> None:
+        renderer = SpeechRenderer()
+
+        self.assertEqual(
+            renderer.render("Cursor job a1b2c3d4e5f6 was queued."),
+            "that job was queued.",
+        )
+        self.assertEqual(
+            renderer.render("Cancel job aaaaaaaaaaaa now."),
+            "Cancel that job now.",
+        )
+
     def test_paths_urls_and_identifiers_use_bounded_rules(self) -> None:
         renderer = SpeechRenderer(local_checkout=Path("/work/harness"))
 

@@ -937,12 +937,27 @@ def test_fork_task_with_issue_context_does_not_claim_ticket(
 def test_single_ticket_conflict_does_not_notify_or_wait() -> None:
     notified = mock.Mock()
     active_job_id = "aaaaaaaaaaaa"
+    active = CursorJob.from_dict(
+        {
+            "id": active_job_id,
+            "request": "work on the focused issue",
+            "status": "running",
+            "created_at": 1,
+            "delivered": False,
+            "speakable_label": "project issue 7",
+            "worker_token": "claim",
+            "worker_pid": 42,
+            "worker_boot_id": "boot",
+            "worker_process_start": "start",
+        }
+    )
     with (
         mock.patch.object(
             service,
             "start_job",
             side_effect=service.ActiveTicketConflict(active_job_id),
         ),
+        mock.patch.object(service, "read_job", return_value=active),
         mock.patch.object(service, "_await_foreground") as foreground,
     ):
         result = service.cursor_turn(
@@ -954,11 +969,67 @@ def test_single_ticket_conflict_does_not_notify_or_wait() -> None:
             )
         )
 
-    assert result == CursorTurnResult(
-        f"ticket is already active as Cursor job {active_job_id}",
-        None,
-    )
+    response = as_assistant_response(result.text)
+    assert result.session_id is None
+    assert active_job_id not in response.spoken_text
+    assert "project issue 7" in response.spoken_text
+    assert active_job_id in response.display_text
     notified.assert_not_called()
+    foreground.assert_not_called()
+
+
+def test_ticket_conflict_falls_back_when_active_job_is_unreadable() -> None:
+    with (
+        mock.patch.object(
+            service,
+            "start_job",
+            side_effect=service.ActiveTicketConflict("aaaaaaaaaaaa"),
+        ),
+        mock.patch.object(service, "read_job", side_effect=FileNotFoundError),
+        mock.patch.object(service, "_await_foreground") as foreground,
+    ):
+        result = service.cursor_turn(
+            CursorTurnRequest(
+                "work on the focused issue",
+                github_repository="example/project",
+                github_issue=7,
+            )
+        )
+
+    response = as_assistant_response(result.text)
+    assert "that job" in response.spoken_text
+    assert "aaaaaaaaaaaa" not in response.spoken_text
+    assert "aaaaaaaaaaaa" in response.display_text
+    foreground.assert_not_called()
+
+
+def test_queued_start_speaks_label_not_hex(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(service, "JOBS_DIR", tmp_path / "jobs")
+    monkeypatch.setattr(service, "LEGACY_JOBS_DIR", tmp_path / "legacy")
+    job = CursorJob.new(
+        NewCursorJob(
+            id="123456789abc",
+            request="update the readme",
+            created_at=1,
+            foreground_until=0,
+            speakable_label="update the readme",
+        )
+    )
+    service._job_store().create(job)
+
+    with (
+        mock.patch.object(service, "start_job", return_value=job.id),
+        mock.patch.object(service, "_await_foreground") as foreground,
+    ):
+        result = service.cursor_turn(CursorTurnRequest("update the readme"))
+
+    response = as_assistant_response(result.text)
+    assert job.id not in response.spoken_text
+    assert "update the readme" in response.spoken_text
+    assert "queued" in response.spoken_text.casefold()
+    assert job.id in response.display_text
     foreground.assert_not_called()
 
 

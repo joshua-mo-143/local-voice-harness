@@ -265,9 +265,10 @@ class QwenClientTests(unittest.TestCase):
         self.assertEqual(payload["model"], self._settings.llm_model)
         system_prompt = payload["messages"][0]["content"]
         self.assertIn(
-            'respond only with "I\'ve finished working on <identifier>"',
+            'respond only with "I\'ve finished working on <label>"',
             system_prompt,
         )
+        self.assertIn("Never speak a hexadecimal job id", system_prompt)
         self.assertIn("When a submission succeeds, acknowledge it", system_prompt)
         self.assertIn("until the Cursor tool result confirms", system_prompt)
         self.assertEqual(payload["messages"][1], history[2])
@@ -418,7 +419,8 @@ class QwenClientTests(unittest.TestCase):
         notify.assert_not_called()
         second_request = urlopen.call_args_list[1].args[0]
         second_payload = json.loads(second_request.data)
-        self.assertEqual(second_payload["messages"][-1]["content"], result.display_text)
+        self.assertEqual(second_payload["messages"][-1]["content"], result.spoken_text)
+        self.assertNotIn(result.display_text, second_payload["messages"][-1]["content"])
 
     def test_retries_without_replaying_malformed_tool_arguments(self) -> None:
         malformed_call = {

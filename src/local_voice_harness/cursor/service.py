@@ -59,6 +59,7 @@ from .model import (
     WORKER_STATUSES,
     CursorJob,
     JobStatus,
+    JobValidationError,
     NewCursorJob,
 )
 from .provisioning import run_claimed_worker
@@ -183,6 +184,13 @@ def _integration_registry(
 
 def read_job(job_id: str) -> CursorJob:
     return _job_store().get(job_id)
+
+
+def _speakable_label(job_id: str) -> str:
+    try:
+        return inbox.speakable_label_for(read_job(job_id))
+    except (FileNotFoundError, OSError, JobValidationError):
+        return "that job"
 
 
 def decide_fork_confirmation(utterance: str) -> bool | None:
@@ -2369,7 +2377,14 @@ def cursor_turn(
         assert resolved.job_id is not None
         result = cancel_job(resolved.job_id, integrations=registry)
         _defer_or_acknowledge(resolved.job_id, delivery_claims)
-        return CursorTurnResult(result, None)
+        label = _speakable_label(resolved.job_id)
+        return CursorTurnResult(
+            AssistantResponse(
+                spoken_text=f"Cursor cancelled {label}.",
+                display_text=result,
+            ),
+            None,
+        )
     if action in {"dismiss", "repeat"}:
         resolved = _resolve_reference(
             reference or text,
@@ -2530,12 +2545,24 @@ def cursor_turn(
                 integrations=registry,
             )
         except ActiveTicketConflict as exc:
-            return CursorTurnResult(str(exc), None)
+            label = _speakable_label(exc.active_job_id)
+            return CursorTurnResult(
+                AssistantResponse(
+                    spoken_text=f"That ticket is already in progress as {label}.",
+                    display_text=str(exc),
+                ),
+                None,
+            )
         if on_job_started is not None:
             on_job_started()
-        if read_job(job_id).participant_admission_state == "waiting":
+        queued = read_job(job_id)
+        if queued.participant_admission_state == "waiting":
+            label = inbox.speakable_label_for(queued)
             return CursorTurnResult(
-                f"Cursor job {job_id} was accepted and queued.",
+                AssistantResponse(
+                    spoken_text=f"Cursor accepted {label} and queued it.",
+                    display_text=f"Cursor job {job_id} was accepted and queued.",
+                ),
                 None,
             )
     return _await_foreground(

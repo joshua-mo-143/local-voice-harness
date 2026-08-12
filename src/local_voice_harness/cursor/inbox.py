@@ -139,8 +139,10 @@ class JobSummary:
     category: str
     detail: str
 
-    def spoken(self) -> str:
-        return f"{self.label} ({self.short_id})"
+    def spoken(self, *, disambiguator: bool = False) -> str:
+        if disambiguator:
+            return f"{self.label} ({self.short_id})"
+        return self.label
 
 
 def _detail(job: CursorJob) -> str:
@@ -317,7 +319,9 @@ def resolve_reference(jobs: list[CursorJob], reference: str) -> ReferenceResolut
 def clarify(summaries: list[JobSummary], action: str) -> str:
     """Build a clarification prompt listing the candidate jobs."""
 
-    options = _join([summary.spoken() for summary in summaries])
+    labels = [summary.label.casefold() for summary in summaries]
+    needs_id = len(labels) != len(set(labels))
+    options = _join([summary.spoken(disambiguator=needs_id) for summary in summaries])
     if not options:
         return f"I could not find a job to {action}."
     return f"There are several jobs I could {action}. Which one: {options}?"

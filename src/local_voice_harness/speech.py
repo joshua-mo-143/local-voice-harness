@@ -56,8 +56,8 @@ _TOKEN_PATTERN = re.compile(
     r"|(?P<commit>(?i:\b(?:commit|SHA)\s+[0-9a-f]{7,40}\b)|"
     r"(?<!\w)(?=[0-9a-fA-F]{7,40}\b)(?=[0-9a-fA-F]*\d)"
     r"(?=[0-9a-fA-F]*[a-fA-F])[0-9a-fA-F]{7,40}\b)"
-    r"|(?P<job>(?i:\bjob)\s+(?=[A-Za-z0-9-]*\d)"
-    r"[A-Za-z0-9][A-Za-z0-9-]{7,63}\b)"
+    r"|(?P<job>(?i:\b(?:cursor\s+)?job)\s+"
+    r"(?:[0-9a-fA-F]{12}|(?=[A-Za-z0-9-]*\d)[A-Za-z0-9][A-Za-z0-9-]{7,63})\b)"
     r"|(?P<path>(?<!\w)(?:(?i:\b(?:open|edit|read|write|file|path))\s+"
     r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]*[._][A-Za-z0-9_.-]+|"
     r"(?:~[A-Za-z0-9_.-]*|\.\.?)/[^\s,;:!?()[\]{}]+|"
@@ -187,8 +187,12 @@ class SpeechRenderer:
             identity = value.rsplit(maxsplit=1)[-1]
             rendered = f"commit {_spell(identity.lower())}"
         elif token.kind == SpeechTokenKind.JOB:
-            _, identity = value.split(maxsplit=1)
-            rendered = f"job {_spell(identity)}"
+            identity = value.rsplit(maxsplit=1)[-1]
+            rendered = (
+                "that job"
+                if re.fullmatch(r"[0-9a-fA-F]{12}", identity)
+                else f"job {_spell(identity)}"
+            )
         elif token.kind == SpeechTokenKind.ACRONYM:
             rendered = _spell(value)
         else:

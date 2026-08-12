@@ -87,8 +87,13 @@ def test_ambiguous_cancel_clarifies_without_cancelling(store: JobStore) -> None:
     _make(store, "bbbbbbbbbbbb", status="running", label="issue 43")
 
     result = cursor_turn(CursorTurnRequest("cancel the issue job", action="cancel"))
+    response = as_assistant_response(result.text)
 
-    assert "Which one" in as_assistant_response(result.text).display_text
+    assert "Which one" in response.display_text
+    assert "issue 42" in response.spoken_text
+    assert "issue 43" in response.spoken_text
+    assert "aaaa" not in response.spoken_text
+    assert "bbbb" not in response.spoken_text
     assert store.get("aaaaaaaaaaaa").status.value == "running"
     assert store.get("bbbbbbbbbbbb").status.value == "running"
 
@@ -98,7 +103,14 @@ def test_reference_cancel_targets_intended_job(store: JobStore) -> None:
     _make(store, "bbbbbbbbbbbb", status="running", label="venice fix")
 
     with mock.patch.object(service, "_stop_worker", return_value=True):
-        cursor_turn(CursorTurnRequest("cancel the venice fix", action="cancel"))
+        result = cursor_turn(
+            CursorTurnRequest("cancel the venice fix", action="cancel")
+        )
+
+    response = as_assistant_response(result.text)
+    assert response.spoken_text == "Cursor cancelled venice fix."
+    assert "bbbbbbbbbbbb" not in response.spoken_text
+    assert "bbbbbbbbbbbb" in response.display_text
 
     assert store.get("bbbbbbbbbbbb").status.value == "cancelled"
     assert store.get("aaaaaaaaaaaa").status.value == "running"
