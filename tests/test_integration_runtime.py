@@ -31,6 +31,11 @@ class IntegrationRuntimeTests(unittest.TestCase):
             mock.patch.object(service, "start_job", return_value="job-1") as start,
             mock.patch.object(
                 service,
+                "read_job",
+                return_value=mock.Mock(participant_admission_state="held"),
+            ),
+            mock.patch.object(
+                service,
                 "_await_foreground",
                 return_value=service.CursorTurnResult("started", None),
             ) as foreground,
@@ -148,6 +153,7 @@ class IntegrationRuntimeTests(unittest.TestCase):
         store = object()
         with (
             mock.patch.object(service, "_job_store", return_value=store),
+            mock.patch.object(service, "_dispatch_waiting_jobs"),
             mock.patch.object(service.recovery, "recover_jobs") as recover,
             mock.patch.object(service.recovery, "cancel_target_and_release") as release,
         ):

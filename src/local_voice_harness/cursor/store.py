@@ -2322,6 +2322,36 @@ class JobStore:
             self._validate_db_quarantine_reservation(connection, candidate, "worktree")
             return self._save(connection, candidate)
 
+    def claim_participant_capacity(self, limit: int) -> tuple[CursorJob, ...]:
+        """Atomically admit the oldest waiting jobs up to the global limit."""
+
+        if limit <= 0:
+            raise JobValidationError("participant capacity must be positive")
+        self._ensure_ready()
+        self._refresh_legacy_sources()
+        with self._db.transaction() as connection:
+            jobs = [CursorJob.from_dict(raw) for raw in self._db.list_jobs(connection)]
+            free = limit - sum(
+                job.participant_admission_state == "held" for job in jobs
+            )
+            if free <= 0:
+                return ()
+            waiting = sorted(
+                (
+                    job
+                    for job in jobs
+                    if job.participant_admission_state == "waiting"
+                    and job.status == JobStatus.QUEUED
+                ),
+                key=lambda job: (job.created_at, job.id),
+            )
+            claimed: list[CursorJob] = []
+            for job in waiting[:free]:
+                candidate = job.evolve(participant_admission_state="held")
+                self._save(connection, candidate)
+                claimed.append(candidate)
+            return tuple(claimed)
+
     def ticket_reservation_owner(self, identity: tuple[str, ...]) -> str | None:
         self._ensure_ready()
         self._refresh_legacy_sources()

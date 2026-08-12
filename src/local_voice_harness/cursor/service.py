@@ -6,7 +6,6 @@ import re
 import time
 import uuid
 from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Literal, NamedTuple
@@ -138,7 +137,7 @@ class CursorTurnResult(NamedTuple):
 
 
 TicketStartStatus = Literal[
-    "accepted", "awaiting-clarification", "rejected", "start-failed"
+    "accepted", "queued", "awaiting-clarification", "rejected", "start-failed"
 ]
 
 
@@ -218,12 +217,15 @@ def _stop_legacy_worker(job_id: str, timeout: float = 2.0) -> bool:
 
 
 def run_worker(job_id: str, claim_token: str | None = None) -> None:
-    worker_lifecycle.run_worker(
-        _job_store(),
-        job_id,
-        claim_token,
-        run_claimed_worker,
-    )
+    try:
+        worker_lifecycle.run_worker(
+            _job_store(),
+            job_id,
+            claim_token,
+            run_claimed_worker,
+        )
+    finally:
+        _dispatch_waiting_jobs()
 
 
 def launch_worker(job_id: str) -> None:
@@ -245,6 +247,7 @@ def launch_worker(job_id: str) -> None:
             worker_pid=None,
             worker_boot_id=None,
             worker_process_start=None,
+            participant_admission_state="released",
         )
 
     worker_lifecycle.launch_worker(
@@ -255,6 +258,41 @@ def launch_worker(job_id: str) -> None:
         get_boot_identity=worker_lifecycle.boot_identity,
         get_process_identity=worker_lifecycle.process_identity,
     )
+
+
+def _participant_capacity(integrations: IntegrationRegistry | None = None) -> int:
+    registry = _integration_registry(integrations)
+    runtime = registry.platform or default_user_config().platform
+    return runtime.agent_job_start_concurrency
+
+
+def _dispatch_waiting_jobs(
+    *,
+    integrations: IntegrationRegistry | None = None,
+    requested_ids: tuple[str, ...] = (),
+    capacity: int | None = None,
+) -> frozenset[str]:
+    """Claim global participant capacity and launch only admitted jobs."""
+
+    store = _job_store()
+    claimed = store.claim_participant_capacity(
+        capacity if capacity is not None else _participant_capacity(integrations)
+    )
+    candidates = [*requested_ids, *(job.id for job in claimed)]
+    launched: set[str] = set()
+    for job_id in dict.fromkeys(candidates):
+        try:
+            current = store.get(job_id)
+        except FileNotFoundError:
+            continue
+        if current.participant_admission_state != "held":
+            continue
+        try:
+            launch_worker(job_id)
+        except Exception:
+            continue
+        launched.add(job_id)
+    return frozenset(launched)
 
 
 def _build_start_job(
@@ -401,7 +439,7 @@ def start_job(
         integrations=integrations,
     )
     _job_store().create(job, enforce_unique_ticket=True)
-    launch_worker(job_id)
+    _dispatch_waiting_jobs(integrations=integrations)
     return job_id
 
 
@@ -416,7 +454,7 @@ def start_jobs(
     foreground_seconds: float = 5.0,
     integrations: IntegrationRegistry | None = None,
 ) -> tuple[TicketStartOutcome, ...]:
-    """Start ordinary durable jobs concurrently without foreground waiting."""
+    """Create durable jobs and dispatch them through global participant capacity."""
     if not requests:
         return ()
     outcomes: list[TicketStartOutcome | None] = [None] * len(requests)
@@ -456,15 +494,15 @@ def start_jobs(
                     )
                 ),
             )
-        return TicketStartOutcome(request.target, "accepted", job_id=job_id)
+        status = (
+            "queued"
+            if current is not None and current.participant_admission_state == "waiting"
+            else "accepted"
+        )
+        return TicketStartOutcome(request.target, status, job_id=job_id)
 
-    with ThreadPoolExecutor(max_workers=max(1, concurrency)) as executor:
-        futures = {
-            executor.submit(start, request): index
-            for index, request in enumerate(requests)
-        }
-        for future in as_completed(futures):
-            outcomes[futures[future]] = future.result()
+    for index, request in enumerate(requests):
+        outcomes[index] = start(request)
     return tuple(outcome for outcome in outcomes if outcome is not None)
 
 
@@ -771,6 +809,12 @@ def _create_grouped_repository_clarification(
             speakable_label="grouped ticket repository clarification",
         )
     )
+    coordinator = CursorJob.from_dict(
+        {
+            **coordinator.to_dict(),
+            "participant_admission_state": "released",
+        }
+    )
     envelope = Question(
         id=uuid.uuid4().hex,
         text=question,
@@ -917,6 +961,7 @@ def _ticket_start_spoken(outcomes: tuple[TicketStartOutcome, ...]) -> str:
             f"I couldn't verify {identity}.",
         )
     accepted = sum(outcome.status == "accepted" for outcome in outcomes)
+    queued = sum(outcome.status == "queued" for outcome in outcomes)
     lookup_failures = sum(
         outcome.github_lookup_reason is not None for outcome in outcomes
     )
@@ -929,6 +974,8 @@ def _ticket_start_spoken(outcomes: tuple[TicketStartOutcome, ...]) -> str:
     parts: list[str] = []
     if accepted:
         parts.append(f"{_counted(accepted, 'job')} started")
+    if queued:
+        parts.append(f"{_counted(queued, 'job')} accepted and queued")
     if lookup_failures:
         parts.append(
             f"{_counted(lookup_failures, 'GitHub issue')} could not be accessed"
@@ -968,6 +1015,8 @@ def _ticket_display_detail(outcome: TicketStartOutcome) -> str | None:
         return "request could not be accepted; verify the ticket reference and access"
     if outcome.status == "awaiting-clarification":
         return "waiting for a repository in the grouped clarification"
+    if outcome.status == "queued":
+        return "accepted and queued for participant capacity"
     return None
 
 
@@ -976,8 +1025,11 @@ def _ticket_start_summary(
 ) -> AssistantResponse:
     parts: list[str] = []
     for outcome in outcomes:
-        if outcome.status == "accepted":
-            parts.append(f"{outcome.target}: accepted as job {outcome.job_id}")
+        if outcome.status in {"accepted", "queued"}:
+            state = (
+                "accepted" if outcome.status == "accepted" else "accepted and queued"
+            )
+            parts.append(f"{outcome.target}: {state} as job {outcome.job_id}")
         else:
             display_detail = _ticket_display_detail(outcome)
             detail = f" ({display_detail})" if display_detail else ""
@@ -1248,7 +1300,10 @@ def _reply_grouped_repository(
         job.id,
         concurrency=concurrency,
     )
-    if any(outcome.status == "accepted" for outcome in outcomes) and on_started:
+    if (
+        any(outcome.status in {"accepted", "queued"} for outcome in outcomes)
+        and on_started
+    ):
         on_started()
     message = _ticket_start_spoken(outcomes)
     if remaining:
@@ -1275,38 +1330,34 @@ def _launch_grouped_children(
     ]
     if not pending:
         return ()
-    outcomes: list[TicketStartOutcome | None] = [None] * len(pending)
-
-    def launch(entry: dict[str, object]) -> TicketStartOutcome:
+    child_ids = tuple(str(entry["job_id"]) for entry in pending)
+    launched = _dispatch_waiting_jobs(requested_ids=child_ids, capacity=concurrency)
+    outcomes: list[TicketStartOutcome] = []
+    for entry in pending:
         target = str(entry["target"])
         child_id = str(entry["job_id"])
-        try:
-            launch_worker(child_id)
-        except Exception as exc:  # noqa: BLE001 - durable child records the failure
-            return TicketStartOutcome(
-                target,
-                "start-failed",
-                job_id=child_id,
-                detail=_start_error_detail(exc),
-            )
         child = store.get(child_id)
         if child.status == JobStatus.FAILED:
-            return TicketStartOutcome(
-                target,
-                "start-failed",
-                job_id=child_id,
-                detail=_start_error_detail(
-                    HarnessError(str(child.error or child.result or "worker failed"))
-                ),
+            outcomes.append(
+                TicketStartOutcome(
+                    target,
+                    "start-failed",
+                    job_id=child_id,
+                    detail=_start_error_detail(
+                        HarnessError(
+                            str(child.error or child.result or "worker failed")
+                        )
+                    ),
+                )
             )
-        return TicketStartOutcome(target, "accepted", job_id=child_id)
-
-    with ThreadPoolExecutor(max_workers=max(1, concurrency)) as executor:
-        futures = {
-            executor.submit(launch, entry): index for index, entry in enumerate(pending)
-        }
-        for future in as_completed(futures):
-            outcomes[futures[future]] = future.result()
+            continue
+        outcomes.append(
+            TicketStartOutcome(
+                target,
+                "accepted" if child_id in launched else "queued",
+                job_id=child_id,
+            )
+        )
     completed_ids = {
         str(entry["job_id"])
         for entry in pending
@@ -1328,7 +1379,7 @@ def _launch_grouped_children(
         return current.evolve(grouped_repository_launches=launches)
 
     store.update(coordinator_id, complete)
-    return tuple(outcome for outcome in outcomes if outcome is not None)
+    return tuple(outcomes)
 
 
 def reply_job(
@@ -1490,8 +1541,12 @@ def reply_job(
             )
         return immediate
     if should_launch:
-        launch_worker(job_id)
-        if on_started is not None:
+        launched = _dispatch_waiting_jobs(
+            integrations=integrations,
+            requested_ids=(job_id,),
+            capacity=concurrency,
+        )
+        if job_id in launched and on_started is not None:
             on_started()
     return immediate
 
@@ -1555,7 +1610,10 @@ def start_follow_up(
     )
     if on_created is not None:
         on_created()
-    launch_worker(created.id)
+    _dispatch_waiting_jobs(
+        integrations=integrations,
+        requested_ids=(created.id,),
+    )
     return created.id
 
 
@@ -1578,6 +1636,7 @@ def _cancel_target_and_release(
         worker_stopped=worker_stopped,
         herdr_factory=herdr_factory,
     )
+    _dispatch_waiting_jobs(integrations=integrations)
 
 
 def cancel_job(
@@ -1607,6 +1666,18 @@ def cancel_job(
             raise HarnessError(f"Cursor job {job_id} is already {job.status.value}")
         if job.status not in ACTIVE_STATUSES:
             raise HarnessError(f"Cursor job {job_id} cannot be cancelled")
+        if (
+            job.participant_admission_state == "waiting"
+            and job.herdr_target is None
+            and job.worker_token is None
+        ):
+            return job.evolve_for_delivery(
+                now=cancelled_at,
+                status=JobStatus.CANCELLED,
+                result=f"Cursor job {job_id} was cancelled.",
+                completed_at=cancelled_at,
+                participant_admission_state="released",
+            )
         if job.fork_committed and job.fork_operation_state in {
             "submitted",
             "ambiguous",
@@ -1796,9 +1867,17 @@ def recover_jobs(*, integrations: IntegrationRegistry | None = None) -> None:
         if integrations is None
         else integrations.github_client
     )
+
+    def dispatch_recovered(job_id: str) -> None:
+        _dispatch_waiting_jobs(
+            integrations=integrations,
+            requested_ids=(job_id,),
+            capacity=runtime.agent_job_start_concurrency,
+        )
+
     recovery.recover_jobs(
         store,
-        launch_worker=launch_worker,
+        launch_worker=dispatch_recovered,
         herdr_factory=herdr_factory,
         github_factory=github_factory,
         is_worker_alive=_worker_is_alive,
@@ -1814,6 +1893,10 @@ def recover_jobs(*, integrations: IntegrationRegistry | None = None) -> None:
             )
         ),
         require_issue_provider=lambda name: require_issue_provider(name, registry),
+    )
+    _dispatch_waiting_jobs(
+        integrations=integrations,
+        capacity=runtime.agent_job_start_concurrency,
     )
 
 
@@ -2367,11 +2450,17 @@ def cursor_turn(
                 integrations=registry,
             )
             accepted = tuple(
-                outcome for outcome in outcomes if outcome.status == "accepted"
+                outcome
+                for outcome in outcomes
+                if outcome.status in {"accepted", "queued"}
             )
             if accepted and on_job_started is not None:
                 on_job_started()
-            if extraction.batch_requested or not accepted:
+            if (
+                extraction.batch_requested
+                or not accepted
+                or accepted[0].status == "queued"
+            ):
                 return CursorTurnResult(_ticket_start_summary(outcomes), None)
             assert len(accepted) == 1 and accepted[0].job_id is not None
             return _await_foreground(
@@ -2399,6 +2488,11 @@ def cursor_turn(
             return CursorTurnResult(str(exc), None)
         if on_job_started is not None:
             on_job_started()
+        if read_job(job_id).participant_admission_state == "waiting":
+            return CursorTurnResult(
+                f"Cursor job {job_id} was accepted and queued.",
+                None,
+            )
     return _await_foreground(
         job_id,
         delivery_claims,

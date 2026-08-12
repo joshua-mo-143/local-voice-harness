@@ -16,7 +16,7 @@ from ..integrations.github import (
 )
 from ..questions import Question, QuestionError
 
-CURRENT_SCHEMA_VERSION = 13
+CURRENT_SCHEMA_VERSION = 14
 LEGACY_SCHEMA_VERSIONS = frozenset(range(CURRENT_SCHEMA_VERSION))
 LEGACY_BOOT_ID = "legacy-unknown"
 
@@ -323,6 +323,7 @@ _STRING_FIELDS = frozenset(
         "prompt_operation_target",
         "prompt_operation_agent_session",
         "participant_creation_state",
+        "participant_admission_state",
         "participant_creation_participant",
         "participant_creation_target",
         "participant_creation_label",
@@ -644,6 +645,11 @@ def _advance_legacy_version(values: dict[str, object], version: int) -> None:
         values.setdefault("issue_provider", _infer_legacy_issue_provider(values))
         # The GitHub provider-state serializer independently migrates its
         # legacy flat v12 payload to the nested provider-owned representation.
+    elif version == 13:
+        values.setdefault(
+            "participant_admission_state",
+            _default_participant_admission_state(values),
+        )
     values["schema_version"] = version + 1
 
 
@@ -655,6 +661,30 @@ def _infer_legacy_issue_provider(values: Mapping[str, object]) -> str | None:
     if values.get("github_issue") is not None:
         return "github"
     return None
+
+
+def _default_participant_admission_state(values: Mapping[str, object]) -> str:
+    status = str(values.get("status") or "")
+    if any(
+        values.get(field)
+        for field in (
+            "herdr_target",
+            "planner_target",
+            "reviewer_target",
+            "implementer_target",
+            "participant_creation_target",
+            "worker_token",
+            "worker_pid",
+            "target_release_pending",
+        )
+    ):
+        return "held"
+    if (
+        status in {item.value for item in TERMINAL_STATUSES}
+        or values.get("clarification_kind") == "grouped_repository"
+    ):
+        return "released"
+    return "waiting"
 
 
 def migrate_job_record(raw: Mapping[str, object]) -> tuple[dict[str, object], int]:
@@ -692,6 +722,10 @@ def migrate_job_record(raw: Mapping[str, object]) -> tuple[dict[str, object], in
             if values.get("herdr_target") is not None:
                 values.setdefault("session_id", values["herdr_target"])
         values.setdefault("issue_provider", _infer_legacy_issue_provider(values))
+        values.setdefault(
+            "participant_admission_state",
+            _default_participant_admission_state(values),
+        )
     values["schema_version"] = CURRENT_SCHEMA_VERSION
     return values, loaded_version
 
@@ -1156,6 +1190,7 @@ class AgentJob:
                 "foreground_until": spec.foreground_until,
                 "workflow_phase": WorkflowPhase.CLASSIFYING.value,
                 "review_round": 0,
+                "participant_admission_state": "waiting",
             }
         )
 
@@ -1753,6 +1788,10 @@ class AgentJob:
         return self._optional_string("participant_creation_state") or "none"
 
     @property
+    def participant_admission_state(self) -> str:
+        return self._optional_string("participant_admission_state") or "waiting"
+
+    @property
     def participant_creation_target(self) -> str | None:
         return self._optional_string("participant_creation_target")
 
@@ -2075,6 +2114,8 @@ class AgentJob:
         return updated
 
     def validate_invariants(self, *, require_worker_owner: bool = False) -> None:
+        if self.participant_admission_state not in {"waiting", "held", "released"}:
+            raise JobValidationError("participant_admission_state has invalid value")
         if (
             self.github_issue is not None
             and self.issue_key is None
@@ -2548,6 +2589,34 @@ def validate_transition(before: CursorJob, after: CursorJob) -> None:
             "illegal Cursor job transition "
             f"{before.status.value} -> {after.status.value}"
         )
+    admission_transitions = {
+        "waiting": {"waiting", "held", "released"},
+        "held": {"held", "released"},
+        "released": {"released"},
+    }
+    if (
+        after.participant_admission_state
+        not in admission_transitions[before.participant_admission_state]
+    ):
+        raise JobValidationError("participant admission state cannot move backward")
+    if before.participant_admission_state == "held" and (
+        after.participant_admission_state == "released"
+    ):
+        participant_fields = (
+            "herdr_target",
+            "planner_target",
+            "reviewer_target",
+            "implementer_target",
+            "participant_creation_target",
+        )
+        if (
+            after.status not in TERMINAL_STATUSES
+            or after.target_release_pending
+            or any(after._values.get(field) for field in participant_fields)
+        ):
+            raise JobValidationError(
+                "held participant capacity requires confirmed terminal cleanup"
+            )
     if (
         before.workflow_phase != after.workflow_phase
         and after.workflow_phase

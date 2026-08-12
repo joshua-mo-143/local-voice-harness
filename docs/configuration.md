@@ -330,7 +330,7 @@ voice-harness plan-approval ask
 | `VOICE_HARNESS_CURSOR_AGENT_INACTIVITY_SECONDS` | Positive time without observable Cursor progress before cancellation | `900` | Process environment override |
 | `VOICE_HARNESS_CURSOR_AGENT_MAX_RUNTIME_SECONDS` | Positive absolute runtime limit for one Cursor turn | `3600` | Process environment override |
 | `VOICE_HARNESS_CURSOR_MCP_AUTH_SOURCE` | Absolute trusted Cursor workspace whose owner-only MCP OAuth state is linked into harness workspaces | Unset | Process environment override |
-| `VOICE_HARNESS_AGENT_JOB_START_CONCURRENCY` | Positive maximum number of concurrent durable job starts in a multi-ticket request | `3` | Process environment override |
+| `VOICE_HARNESS_AGENT_JOB_START_CONCURRENCY` | Positive global maximum number of live harness-owned job participants; overflow jobs remain durably queued FIFO | `3` | Process environment override |
 | `VOICE_HARNESS_CURSOR_FOLLOWUP` | Enable completed-job follow-up context (kill switch) | `1` | Process environment override |
 | `VOICE_HARNESS_CURSOR_FOLLOWUP_WINDOW_SECONDS` | Finite, non-negative absolute lifetime of the retained completed-job reference | `60` | Process environment override |
 | `VOICE_HARNESS_HERDR_BIN` | Absolute Herdr executable path | `~/.local/bin/herdr` | Process environment override |
@@ -393,9 +393,12 @@ An explicit multi-ticket request starts one ordinary durable job per unique,
 validated target. Bare GitHub numbers require a focused repository issue-list page;
 bare Linear numbers require a focused Linear team page. Full GitHub references and
 full Linear keys need no browser scope. All unique targets are preflighted before
-any starts, then valid jobs start with at most
-`VOICE_HARNESS_AGENT_JOB_START_CONCURRENCY` concurrent admissions. The response
-reports each target as accepted, rejected, or start-failed in request order.
+any starts. Valid jobs are accepted durably, while
+`VOICE_HARNESS_AGENT_JOB_START_CONCURRENCY` globally limits live harness-owned
+planner, reviewer, and implementer participants. Overflow remains queued in
+creation order across restarts and starts when physical pane cleanup releases
+capacity. The response distinguishes jobs launched immediately from jobs accepted
+but queued, and reports rejected or start-failed targets in request order.
 Fan-out is best-effort and intentionally not crash-atomic: one child can fail after
 another has started, and there is no durable batch record to roll children back.
 Scoped bare-number lists can include inclusive ranges, such as “tickets 20 through
