@@ -8,6 +8,7 @@ usage() {
   cat >&2 <<'EOF'
 Usage:
   scripts/dev.sh text <request>
+  scripts/dev.sh pronounce <text>
   scripts/dev.sh wake
   scripts/dev.sh setup [--defaults]
   scripts/dev.sh config <show|set|reset> ...
@@ -18,7 +19,7 @@ EOF
 command="${1:-}"
 python_version="3.11"
 case "$command" in
-  text)
+  text|pronounce)
     shift
     if (($# == 0)); then
       usage
@@ -48,8 +49,8 @@ export XDG_CONFIG_HOME="$PROJECT_DIR/.dev/config"
 export XDG_STATE_HOME="$PROJECT_DIR/.dev/state"
 mkdir -p -- "$XDG_CONFIG_HOME" "$XDG_STATE_HOME"
 
-if [[ "$command" == "text" ]]; then
-  exec uv run --project "$PROJECT_DIR" --python "$python_version" --extra wake voice-harness text "$@"
+if [[ "$command" == "text" || "$command" == "pronounce" ]]; then
+  exec uv run --project "$PROJECT_DIR" --python "$python_version" --extra wake voice-harness "$command" "$@"
 fi
 
 if [[ "$command" == "setup" || "$command" == "config" || "$command" == "integrations" ]]; then

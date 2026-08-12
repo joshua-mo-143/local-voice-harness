@@ -420,5 +420,7 @@ the listener. Configure any desktop keybind or wrapper outside the harness.
 
 Transcription and routing accuracy for repository names, issue references, and
 recurring speech-recognition mistakes can be improved with a local, user-owned
-vocabulary store edited through `voice-harness vocabulary` commands. See
-[Vocabulary and entity aliases](vocabulary.md).
+vocabulary store edited through `voice-harness vocabulary` commands. The same local
+store supports validated, TTS-only pronunciations for recurring names, with
+side-effect-free previews through `voice-harness pronounce`. See
+[Vocabulary, aliases, and pronunciations](vocabulary.md).

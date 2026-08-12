@@ -22,6 +22,7 @@ from .config import (
     JOBS_DIR,
     LEGACY_JOBS_DIR,
     PID_PATH,
+    PROJECT_ROOT,
     STT_SOCKET,
     TTS_SOCKET,
 )
@@ -41,6 +42,7 @@ from .ipc import socket_ready
 from .llm import qwen_response
 from .questions import AnswerProvenance
 from .responses import as_assistant_response
+from .speech import SpeechRenderer
 from .ticket_targets import MISSING_ISSUE_SCOPE_RESPONSE, extract_ticket_targets
 from .tts.client import stream_and_play
 from .user_config import UserConfig, load_user_config
@@ -99,6 +101,7 @@ def release_deliveries(claims: DeliveryClaims) -> None:
 def respond(text: str, *, user_config: UserConfig | None = None) -> None:
     """Handle one foreground request from one immutable startup snapshot."""
     settings = user_config if user_config is not None else load_user_config()
+    speech_renderer = SpeechRenderer.from_local_config(local_checkout=PROJECT_ROOT)
     integrations = build_integration_registry(settings)
     text = text.strip()
     if not text:
@@ -214,7 +217,10 @@ def respond(text: str, *, user_config: UserConfig | None = None) -> None:
                 )
             rendered_response = as_assistant_response(response)
             print(f"Assistant: {rendered_response.display_text}")
-            stream_and_play(rendered_response.spoken_text, settings=settings.audio)
+            stream_and_play(
+                speech_renderer.render(rendered_response.spoken_text),
+                settings=settings.audio,
+            )
             acknowledge_deliveries(delivery_claims)
         except Exception:
             release_deliveries(delivery_claims)

@@ -7,6 +7,7 @@ configuration and durable state to ignored paths in the checkout:
 
 ```fish
 scripts/dev.sh text "What is two plus two?"
+scripts/dev.sh pronounce "PR #128 changed src/http_client.py"
 scripts/dev.sh setup --defaults
 scripts/dev.sh config show audio.wake_threshold
 scripts/dev.sh integrations list
@@ -47,8 +48,8 @@ Before starting, `scripts/dev.sh wake` checks
 the stop and restore commands; it also refuses to run if the service state cannot
 be checked safely. The launcher never stops, restarts, edits, or installs a service.
 Its command surface is intentionally limited to `text`, `wake`, and the branch-local
-configuration helpers (`setup`, `config`, and `integrations`), so it does not expose
-service or credential management.
+configuration helpers (`setup`, `config`, and `integrations`) and the side-effect-free
+`pronounce` preview, so it does not expose service or credential management.
 
 This is branch testing isolation, not a complete runtime profile:
 

@@ -10,6 +10,7 @@ import threading
 import time
 import types
 import unittest
+from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
 from unittest import mock
@@ -34,8 +35,10 @@ from local_voice_harness.questions import (
     QuestionSensitivity,
 )
 from local_voice_harness.responses import AssistantResponse
+from local_voice_harness.speech import SpeechRenderer
 from local_voice_harness.tts.queue import PlaybackQueue, PlaybackRequest
 from local_voice_harness.user_config import default_user_config, load_user_config
+from local_voice_harness.vocabulary import Pronunciation
 from local_voice_harness.wake import daemon as wake_daemon
 from local_voice_harness.wake.daemon import WakeConversationDaemon
 
@@ -560,6 +563,60 @@ class ProcessUtteranceTests(unittest.TestCase):
             ],
         )
         self.assertIn("on_text_chunk", qwen_turn.call_args.kwargs)
+
+    def test_streamed_turn_buffers_split_technical_speech(self) -> None:
+        daemon = _bare_daemon()
+        daemon.speech_renderer = SpeechRenderer(
+            pronunciations=(Pronunciation("Local Voice Harness", "the harness"),)
+        )
+        played_requests: list[str] = []
+
+        def generate(callback: Callable[[str], None]) -> tuple[str, None]:
+            callback("PR #")
+            callback("42 changed Local ")
+            callback("Voice Harness.")
+            return "PR #42 changed Local Voice Harness.", None
+
+        def drain(
+            _response: str,
+            **_kwargs: object,
+        ) -> tuple[
+            list[tuple[dict[str, object], bool, PlaybackRequest]],
+            None,
+        ]:
+            with daemon.playback_queue._lock:
+                requests = [
+                    request for request, _handle in daemon.playback_queue._items
+                ]
+                daemon.playback_queue._items.clear()
+            played_requests.extend(request.text for request in requests)
+            return [
+                (
+                    {
+                        "ok": True,
+                        "played_text": request.text,
+                        "interrupted": False,
+                    },
+                    False,
+                    request,
+                )
+                for request in requests
+            ], None
+
+        with mock.patch.object(
+            daemon,
+            "_drain_playback_queue",
+            side_effect=drain,
+        ):
+            response, _session, _playback, _interruption = (
+                daemon.play_streamed_response(generate)
+            )
+
+        self.assertEqual(response, "PR #42 changed Local Voice Harness.")
+        self.assertEqual(
+            played_requests,
+            ["pull request 42 changed the harness."],
+        )
 
     def test_turn_preserves_awaiting_job_session_played_before_response(
         self,
@@ -1835,9 +1892,10 @@ class AnnounceJobTests(unittest.TestCase):
     def test_play_response_queues_only_the_spoken_channel(self) -> None:
         daemon = _bare_daemon()
         response = AssistantResponse(
-            spoken_text="The job failed.",
+            spoken_text="PR #42 changed snake_case.",
             display_text="Job 123 failed in /tmp/example; inspect the logs.",
         )
+        rendered = "pull request 42 changed snake case."
         with mock.patch.object(
             daemon,
             "_drain_playback_queue",
@@ -1845,9 +1903,50 @@ class AnnounceJobTests(unittest.TestCase):
         ) as drain:
             daemon.play_response(response)
 
-        drain.assert_called_once_with(response.spoken_text, on_played=mock.ANY)
-        self.assertEqual(daemon.playback_queue.queued_text(), response.spoken_text)
+        drain.assert_called_once_with(rendered, on_played=mock.ANY)
+        self.assertEqual(daemon.playback_queue.queued_text(), rendered)
         self.assertNotIn(response.display_text, daemon.playback_queue.queued_text())
+
+    def test_background_clarification_uses_the_same_speech_renderer(self) -> None:
+        daemon = _bare_daemon()
+        response = AssistantResponse(
+            spoken_text="PR #42 needs api_client.py.",
+            display_text="PR #42 needs api_client.py at /tmp/exact-copy.",
+        )
+        with (
+            mock.patch.object(daemon, "_job_response", return_value=response),
+            contextlib.redirect_stdout(io.StringIO()) as output,
+        ):
+            daemon._enqueue_job_announcement(
+                _delivery_claim("job1", "awaiting_user", question="Which file?")
+            )
+
+        self.assertEqual(
+            daemon.playback_queue.queued_text(),
+            "pull request 42 needs A P I client dot py.",
+        )
+        self.assertIn(response.display_text, output.getvalue())
+
+    def test_background_batch_renders_every_spoken_item(self) -> None:
+        daemon = _bare_daemon()
+        responses = (
+            AssistantResponse("PR #42 completed.", "PR #42 completed exactly."),
+            AssistantResponse(
+                "Issue #43 changed snake_case.",
+                "Issue #43 changed snake_case exactly.",
+            ),
+        )
+        with (
+            mock.patch.object(daemon, "_job_response", side_effect=responses),
+            contextlib.redirect_stdout(io.StringIO()),
+        ):
+            daemon._enqueue_job_announcement(_delivery_claim("job1", "completed"))
+            daemon._enqueue_job_announcement(_delivery_claim("job2", "completed"))
+
+        self.assertEqual(
+            daemon.playback_queue.queued_text(),
+            "pull request 42 completed. issue 43 changed snake case.",
+        )
 
     def test_awaiting_user_job_enables_followup(self) -> None:
         daemon = _bare_daemon()

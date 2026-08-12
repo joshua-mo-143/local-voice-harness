@@ -170,6 +170,27 @@ raise SystemExit(int(os.environ.get("FAKE_SYSTEMCTL_EXIT", "3")))
             str(github_config),
         )
 
+    def test_pronounce_uses_checkout_without_touching_services(self) -> None:
+        process = self._run("pronounce", "PR #128")
+
+        self.assertEqual(process.returncode, 0, process.stderr)
+        self.assertEqual(
+            self._uv_invocation()["arguments"],
+            [
+                "run",
+                "--project",
+                str(PROJECT_ROOT),
+                "--python",
+                "3.11",
+                "--extra",
+                "wake",
+                "voice-harness",
+                "pronounce",
+                "PR #128",
+            ],
+        )
+        self.assertFalse(self.systemctl_record.exists())
+
     def test_uses_home_github_cli_config_without_xdg_override(self) -> None:
         home = self.test_root / "home"
         environment = self._environment(HOME=str(home))

@@ -463,7 +463,10 @@ class AppContextTests(unittest.TestCase):
         cursor.assert_not_called()
         qwen.assert_not_called()
         play.assert_called_once_with(
-            app.MISSING_ISSUE_SCOPE_RESPONSE, settings=mock.ANY
+            app.MISSING_ISSUE_SCOPE_RESPONSE.replace(
+                "repository-scoped", "repository scoped"
+            ),
+            settings=mock.ANY,
         )
 
     def test_actionable_linear_issue_metadata_reaches_cursor(self) -> None:
