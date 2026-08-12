@@ -16,6 +16,7 @@ EOF
 }
 
 command="${1:-}"
+python_version="3.11"
 case "$command" in
   text)
     shift
@@ -48,11 +49,11 @@ export XDG_STATE_HOME="$PROJECT_DIR/.dev/state"
 mkdir -p -- "$XDG_CONFIG_HOME" "$XDG_STATE_HOME"
 
 if [[ "$command" == "text" ]]; then
-  exec uv run --project "$PROJECT_DIR" --extra wake voice-harness text "$@"
+  exec uv run --project "$PROJECT_DIR" --python "$python_version" --extra wake voice-harness text "$@"
 fi
 
 if [[ "$command" == "setup" || "$command" == "config" || "$command" == "integrations" ]]; then
-  exec uv run --project "$PROJECT_DIR" --extra wake voice-harness "$command" "$@"
+  exec uv run --project "$PROJECT_DIR" --python "$python_version" --extra wake voice-harness "$command" "$@"
 fi
 
 if systemctl --user is-active --quiet voice-harness-wake.service; then
@@ -77,4 +78,4 @@ EOF
   exit 1
 fi
 
-exec uv run --project "$PROJECT_DIR" --extra wake voice-harness-wake
+exec uv run --project "$PROJECT_DIR" --python "$python_version" --extra wake voice-harness-wake
