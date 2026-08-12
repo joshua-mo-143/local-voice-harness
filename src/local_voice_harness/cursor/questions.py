@@ -166,6 +166,34 @@ def _answered_envelope(
     )
 
 
+def _clarification_record(
+    job: CursorJob,
+    question: Question,
+    resolution: AnswerResolution,
+    context: AnswerContext,
+) -> dict[str, object]:
+    return {
+        "question_id": question.id,
+        "question": question.text,
+        "answer": resolution.answer,
+        "trusted_answer": resolution.trusted_answer,
+        "choice_label": resolution.choice_label,
+        "owner": question.owner,
+        "turn_token": question.origin.turn_token,
+        "workflow_phase": job.workflow_phase.value,
+        "answered_at": context.now,
+    }
+
+
+def _answer_delta(question: Question, resolution: AnswerResolution) -> str:
+    if resolution.choice_label is not None:
+        return (
+            f"Question: {question.text}\nUser selected: "
+            f"{resolution.choice_label} (choice id: {resolution.answer})."
+        )
+    return f"Question: {question.text}\nUser answered: {resolution.answer}"
+
+
 def _queue_answer(
     job: CursorJob,
     question: Question,
@@ -205,6 +233,10 @@ def _queue_answer(
         herdr_target=None if clear_target else job.herdr_target,
         continuation=continuation,
         continuation_answer=continuation_answer,
+        clarifications=[
+            *job.clarifications,
+            _clarification_record(job, question, resolution, context),
+        ],
         voice_question=_answered_envelope(question, resolution, context.now),
     )
 
@@ -215,13 +247,7 @@ def _agent_answer(
     resolution: AnswerResolution,
     context: AnswerContext,
 ) -> AnswerTransition:
-    if resolution.choice_label is not None:
-        answer = (
-            f"Question: {question.text}\nUser selected: "
-            f"{resolution.choice_label} (choice id: {resolution.answer})."
-        )
-    else:
-        answer = f"Question: {question.text}\nUser answered: {resolution.answer}"
+    answer = _answer_delta(question, resolution)
     return AnswerTransition(
         _queue_answer(
             job,
@@ -423,7 +449,6 @@ def _workflow_queue_answer(
     resolution: AnswerResolution,
     context: AnswerContext,
     *,
-    request_text: str | None = None,
     repository_hint: str | None = None,
     github_repository: str | None = None,
     fork_confirmed: bool | None = None,
@@ -452,7 +477,7 @@ def _workflow_queue_answer(
         "worker_boot_id": None,
         "worker_process_start": None,
         "worker_token": None,
-        "request": request_text or job.request,
+        "request": job.request,
         "repository_hint": (
             job.repository_hint if repository_hint is None else repository_hint
         ),
@@ -464,7 +489,13 @@ def _workflow_queue_answer(
         ),
         "herdr_target": None if clear_target else (herdr_target or job.herdr_target),
         "continuation": continuation,
-        "continuation_answer": None,
+        "continuation_answer": (
+            _answer_delta(question, resolution) if continuation else None
+        ),
+        "clarifications": [
+            *job.clarifications,
+            _clarification_record(job, question, resolution, context),
+        ],
         "prompt_operation_state": "none",
         "prompt_operation_phase": None,
         "prompt_operation_turn": None,
@@ -496,7 +527,6 @@ def _workflow_answer(
     resolution: AnswerResolution,
     context: AnswerContext,
 ) -> AnswerTransition:
-    request_text = f"{job.request}\n\nUser clarification: {context.text}"
     return AnswerTransition(
         _workflow_queue_answer(
             job,
@@ -504,7 +534,6 @@ def _workflow_answer(
             resolution,
             context,
             continuation=True,
-            request_text=request_text,
         ),
         launch=True,
     )
@@ -530,7 +559,6 @@ def _workflow_review_answer(
             question,
             resolution,
             context,
-            request_text=f"{job.request}\n\nUser clarification: {context.text}",
             continuation=True,
             workflow_phase=WorkflowPhase.REVISING.value,
             workflow_tier=promoted.value if promoted is not None else None,
