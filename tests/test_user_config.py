@@ -49,6 +49,7 @@ class UserConfigDefaultsTests(unittest.TestCase):
         self.assertEqual(config.platform.herdr_timeout_seconds, 30)
         self.assertEqual(config.platform.cursor_agent_inactivity_seconds, 900)
         self.assertEqual(config.platform.cursor_agent_max_runtime_seconds, 3600)
+        self.assertIsNone(config.platform.cursor_mcp_auth_source)
         self.assertEqual(config.platform.agent_job_start_concurrency, 3)
 
     def test_config_path_lives_under_xdg_config_home(self) -> None:
@@ -286,6 +287,37 @@ class UserConfigPrecedenceTests(unittest.TestCase):
         self.assertEqual(config.platform.cursor_agent_max_runtime_seconds, 600)
         self.assertEqual(config.platform.agent_job_start_concurrency, 5)
 
+    def test_cursor_mcp_auth_source_has_config_and_environment_precedence(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            path = root / "config.toml"
+            path.write_text(
+                '[platform]\ncursor_mcp_auth_source = "/configured/source"\n'
+            )
+            from_config = user_config.load_user_config(
+                {},
+                path=path,
+                backends_path=root / "missing.toml",
+                backend_env_path=root / "missing.env",
+                home=self.HOME,
+            )
+            from_environment = user_config.load_user_config(
+                {"VOICE_HARNESS_CURSOR_MCP_AUTH_SOURCE": "/environment/source"},
+                path=path,
+                backends_path=root / "missing.toml",
+                backend_env_path=root / "missing.env",
+                home=self.HOME,
+            )
+
+        self.assertEqual(
+            from_config.platform.cursor_mcp_auth_source,
+            Path("/configured/source"),
+        )
+        self.assertEqual(
+            from_environment.platform.cursor_mcp_auth_source,
+            Path("/environment/source"),
+        )
+
     def test_integration_client_paths_and_timeouts_are_typed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -337,6 +369,12 @@ class UserConfigValidationTests(unittest.TestCase):
     def test_unknown_section_is_rejected(self) -> None:
         with self.assertRaisesRegex(UserConfigurationError, "bogus"):
             self._load("[bogus]\nx = 1\n")
+
+    def test_cursor_mcp_auth_source_must_be_absolute(self) -> None:
+        with self.assertRaisesRegex(
+            UserConfigurationError, "cursor_mcp_auth_source must be an absolute"
+        ):
+            self._load('[platform]\ncursor_mcp_auth_source = "relative"\n')
 
     def test_unknown_key_within_section_is_rejected(self) -> None:
         with self.assertRaisesRegex(UserConfigurationError, "mystery"):

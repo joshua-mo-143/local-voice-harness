@@ -7,6 +7,7 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+from .cursor_auth import CursorMcpAuthError, CursorMcpAuthLinker
 from .types import (
     AGENT_START_READY_POLL_SECONDS,
     AGENT_START_READY_TIMEOUT_SECONDS,
@@ -37,6 +38,8 @@ class HerdrWorkspace:
         *,
         repository_root: Path | None = None,
         worktree_root: Path | None = None,
+        cursor_mcp_auth_source: Path | None = None,
+        cursor_projects_root: Path | None = None,
     ) -> None:
         self._operations = operations
         self.repository_root = (repository_root or Path.home()).expanduser().resolve()
@@ -44,6 +47,14 @@ class HerdrWorkspace:
             (worktree_root or Path.home() / ".herdr" / "worktrees")
             .expanduser()
             .resolve()
+        )
+        self._cursor_mcp_auth = (
+            CursorMcpAuthLinker(
+                cursor_mcp_auth_source,
+                projects_root=cursor_projects_root,
+            )
+            if cursor_mcp_auth_source is not None
+            else None
         )
 
     def list_workspaces(self) -> list[dict[str, Any]]:
@@ -215,6 +226,13 @@ class HerdrWorkspace:
     ) -> AgentSelection:
         if mode not in {None, "plan", "ask"}:
             raise HerdrError("invalid Cursor mode")
+        if self._cursor_mcp_auth is not None:
+            try:
+                self._cursor_mcp_auth.link(checkout)
+            except (CursorMcpAuthError, OSError) as exc:
+                raise HerdrError(
+                    f"could not share configured Cursor MCP authentication: {exc}"
+                ) from exc
         if name is None:
             suffix = uuid.uuid4().hex[:10]
             name = f"voice-{normalize_name(label)[:15] or 'task'}-{suffix}"

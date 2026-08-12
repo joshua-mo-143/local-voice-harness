@@ -61,6 +61,7 @@ def build_integration_registry(config: UserConfig) -> IntegrationRegistry:
         str(platform.herdr_bin),
         repository_root=platform.project_root,
         worktree_root=platform.herdr_worktree_root,
+        cursor_mcp_auth_source=platform.cursor_mcp_auth_source,
         timeout=platform.herdr_timeout_seconds,
         agent_inactivity_timeout=platform.cursor_agent_inactivity_seconds,
         agent_max_runtime=platform.cursor_agent_max_runtime_seconds,
@@ -70,7 +71,14 @@ def build_integration_registry(config: UserConfig) -> IntegrationRegistry:
             flag,
             partial(_github_provider, github_client)
             if factory is GitHubProvider
-            else factory,
+            else (
+                partial(
+                    LinearIntegration,
+                    cursor_mcp_auth_source=platform.cursor_mcp_auth_source,
+                )
+                if factory is LinearIntegration
+                else factory
+            ),
         )
         for flag, factory in _INTEGRATION_FACTORIES
     )

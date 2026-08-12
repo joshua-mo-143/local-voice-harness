@@ -14,6 +14,7 @@ from local_voice_harness.cursor import service
 from local_voice_harness.errors import HarnessError
 from local_voice_harness.integrations import linear, registry
 from local_voice_harness.integrations.herdr import HerdrClient
+from local_voice_harness.integrations.herdr.cursor_auth import cursor_project_id
 from local_voice_harness.user_config import IntegrationSettings, default_user_config
 
 DISABLED = IntegrationSettings(linear_enabled=False)
@@ -31,6 +32,17 @@ def _observe_router_lock(path: str, acquired: Any) -> None:
     linear.LINEAR_ROUTER_LOCK = Path(path)
     with linear._router_owner():
         acquired.set()
+
+
+def _authenticated_source(root: Path) -> tuple[Path, Path]:
+    source = root / "authenticated"
+    source.mkdir()
+    projects = root / "projects"
+    auth = projects / cursor_project_id(source.resolve()) / "mcp-auth.json"
+    auth.parent.mkdir(parents=True)
+    auth.write_text("{}")
+    auth.chmod(0o600)
+    return source, projects
 
 
 class LinearEnablementTests(unittest.TestCase):
@@ -131,59 +143,74 @@ class LinearEnablementTests(unittest.TestCase):
 
 class LinearCapabilityTests(unittest.TestCase):
     def test_cursor_mcp_and_linear_server_are_required(self) -> None:
-        integration = linear.LinearIntegration()
-        with mock.patch.object(linear.shutil, "which", return_value=None):
-            self.assertFalse(integration.capability_status().available)
+        with tempfile.TemporaryDirectory() as temporary:
+            source, projects = _authenticated_source(Path(temporary))
+            integration = linear.LinearIntegration(
+                cursor_mcp_auth_source=source,
+                cursor_projects_root=projects,
+            )
+            with mock.patch.object(linear.shutil, "which", return_value=None):
+                self.assertFalse(integration.capability_status().available)
 
-        process = subprocess.CompletedProcess([], 1, "", "unsupported")
-        with (
-            mock.patch.object(linear.shutil, "which", return_value="/usr/bin/agent"),
-            mock.patch.object(linear, "_run_mcp_list", return_value=process),
-        ):
-            status = integration.capability_status()
-        self.assertFalse(status.available)
-        self.assertIn("cursor-mcp", status.detail)
+            process = subprocess.CompletedProcess([], 1, "", "unsupported")
+            with (
+                mock.patch.object(
+                    linear.shutil, "which", return_value="/usr/bin/agent"
+                ),
+                mock.patch.object(linear, "_run_mcp_list", return_value=process),
+            ):
+                status = integration.capability_status()
+            self.assertFalse(status.available)
+            self.assertIn("cursor-mcp", status.detail)
 
-        process = subprocess.CompletedProcess([], 0, "github: ready", "")
-        with (
-            mock.patch.object(linear.shutil, "which", return_value="/usr/bin/agent"),
-            mock.patch.object(linear, "_run_mcp_list", return_value=process),
-        ):
-            status = integration.capability_status()
-        self.assertFalse(status.available)
-        self.assertIn("not configured", status.detail)
+            process = subprocess.CompletedProcess([], 0, "github: ready", "")
+            with (
+                mock.patch.object(
+                    linear.shutil, "which", return_value="/usr/bin/agent"
+                ),
+                mock.patch.object(linear, "_run_mcp_list", return_value=process),
+            ):
+                status = integration.capability_status()
+            self.assertFalse(status.available)
+            self.assertIn("not configured", status.detail)
 
-        for healthy in ("ready", "connected"):
-            with self.subTest(status=healthy):
-                process = subprocess.CompletedProcess([], 0, f"linear: {healthy}", "")
-                with (
-                    mock.patch.object(
-                        linear.shutil, "which", return_value="/usr/bin/agent"
-                    ),
-                    mock.patch.object(linear, "_run_mcp_list", return_value=process),
-                ):
-                    self.assertTrue(integration.capability_status().available)
+            for healthy in ("ready", "connected"):
+                with self.subTest(status=healthy):
+                    process = subprocess.CompletedProcess(
+                        [], 0, f"linear: {healthy}", ""
+                    )
+                    with (
+                        mock.patch.object(
+                            linear.shutil, "which", return_value="/usr/bin/agent"
+                        ),
+                        mock.patch.object(
+                            linear, "_run_mcp_list", return_value=process
+                        ),
+                    ):
+                        self.assertTrue(integration.capability_status().available)
 
-        unavailable = {
-            "requires_authentication": "requires authentication",
-            "disabled": "disabled",
-            "disconnected": "disconnected",
-            "Error: Connection failed": "unavailable",
-        }
-        for server_status, expected in unavailable.items():
-            with self.subTest(status=server_status):
-                process = subprocess.CompletedProcess(
-                    [], 0, f"linear: {server_status}", ""
-                )
-                with (
-                    mock.patch.object(
-                        linear.shutil, "which", return_value="/usr/bin/agent"
-                    ),
-                    mock.patch.object(linear, "_run_mcp_list", return_value=process),
-                ):
-                    status = integration.capability_status()
-                self.assertFalse(status.available)
-                self.assertIn(expected, status.detail)
+            unavailable = {
+                "requires_authentication": "requires authentication",
+                "disabled": "disabled",
+                "disconnected": "disconnected",
+                "Error: Connection failed": "unavailable",
+            }
+            for server_status, expected in unavailable.items():
+                with self.subTest(status=server_status):
+                    process = subprocess.CompletedProcess(
+                        [], 0, f"linear: {server_status}", ""
+                    )
+                    with (
+                        mock.patch.object(
+                            linear.shutil, "which", return_value="/usr/bin/agent"
+                        ),
+                        mock.patch.object(
+                            linear, "_run_mcp_list", return_value=process
+                        ),
+                    ):
+                        status = integration.capability_status()
+                    self.assertFalse(status.available)
+                    self.assertIn(expected, status.detail)
 
     def test_authenticated_preflight_launches_agent_with_mcp_approval(self) -> None:
         process = subprocess.CompletedProcess([], 0, "linear: ready", "")
@@ -197,21 +224,32 @@ class LinearCapabilityTests(unittest.TestCase):
         }
         client = HerdrClient("herdr")
 
-        with (
-            mock.patch.object(linear.shutil, "which", return_value="/usr/bin/agent"),
-            mock.patch.object(linear, "_run_mcp_list", return_value=process),
-            mock.patch.object(
-                client, "run_json", return_value={"agent": spawned}
-            ) as run,
-        ):
-            self.assertTrue(linear.LinearIntegration().capability_status().available)
-            client.start_agent(
-                Path("/repositories"),
-                "router",
-                "pane",
-                "workspace",
-                name="voice-router",
-            )
+        with tempfile.TemporaryDirectory() as temporary:
+            source, projects = _authenticated_source(Path(temporary))
+            with (
+                mock.patch.object(
+                    linear.shutil, "which", return_value="/usr/bin/agent"
+                ),
+                mock.patch.object(linear, "_run_mcp_list", return_value=process),
+                mock.patch.object(
+                    client, "run_json", return_value={"agent": spawned}
+                ) as run,
+            ):
+                self.assertTrue(
+                    linear.LinearIntegration(
+                        cursor_mcp_auth_source=source,
+                        cursor_projects_root=projects,
+                    )
+                    .capability_status()
+                    .available
+                )
+                client.start_agent(
+                    Path("/repositories"),
+                    "router",
+                    "pane",
+                    "workspace",
+                    name="voice-router",
+                )
 
         self.assertEqual(
             run.call_args.args[-3:],
@@ -271,9 +309,11 @@ class LinearRoutingTests(unittest.TestCase):
         client.ensure_router.return_value = mock.Mock(target="router")
         client.prompt_and_wait.return_value = mock.Mock(
             output=(
-                "Linear MCP requires authentication, so I cannot read API-42.\n"
-                "ROUTE_CONFIDENCE[token]: low\n"
-                "ROUTE_REASON[token]: Linear is unavailable"
+                "JOS-17 was unavailable through Linear MCP; generic repository "
+                "selected as fallback.\n"
+                "ROUTE_REPO[token]: unrelated\n"
+                "ROUTE_CONFIDENCE[token]: high\n"
+                "ROUTE_REASON[token]: fallback"
             )
         )
 

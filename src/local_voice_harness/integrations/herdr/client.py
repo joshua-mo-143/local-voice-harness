@@ -35,6 +35,8 @@ class HerdrClient:
         *,
         repository_root: Path | None = None,
         worktree_root: Path | None = None,
+        cursor_mcp_auth_source: Path | None = None,
+        cursor_projects_root: Path | None = None,
         timeout: float = 30,
         agent_inactivity_timeout: float = 15 * 60,
         agent_max_runtime: float = 60 * 60,
@@ -56,6 +58,8 @@ class HerdrClient:
             self,
             repository_root=root,
             worktree_root=worktrees,
+            cursor_mcp_auth_source=cursor_mcp_auth_source,
+            cursor_projects_root=cursor_projects_root,
         )
 
     def command(self, *args: str) -> list[str]:
