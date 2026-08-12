@@ -398,6 +398,10 @@ any starts, then valid jobs start with at most
 reports each target as accepted, rejected, or start-failed in request order.
 Fan-out is best-effort and intentionally not crash-atomic: one child can fail after
 another has started, and there is no durable batch record to roll children back.
+Scoped bare-number lists can include inclusive ranges, such as “tickets 20 through
+25”, “tickets 20 to 25”, or “tickets 20-25”. Digit and spoken-number ranges can be
+mixed with ordinary list items. Ranges must be ascending and contain no more than
+25 tickets.
 
 Intent routing uses the configured LLM provider and endpoint, including Venice when
 selected. The router is authoritative for workspace mutations: conversation fallback

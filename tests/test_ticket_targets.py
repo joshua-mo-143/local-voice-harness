@@ -33,6 +33,110 @@ def test_spoken_scoped_github_numbers_are_extracted() -> None:
     ]
 
 
+def test_scoped_digit_ranges_expand_inclusively() -> None:
+    for text in (
+        "Work on tickets 20 through 25",
+        "Work on tickets 20 to 25",
+        "Work on tickets 20-25",
+        "Work on tickets 20–25",
+    ):
+        extraction = extract_ticket_targets(
+            text,
+            scope_source="github",
+            scope="example/project",
+        )
+
+        assert extraction.requested_count == 6
+        assert [reference.canonical for reference in extraction.references] == [
+            f"example/project#{number}" for number in range(20, 26)
+        ]
+
+
+def test_spoken_range_expands_and_can_be_mixed_with_list_items() -> None:
+    extraction = extract_ticket_targets(
+        "Work on issues eighteen, twenty through twenty-three, and 25",
+        scope_source="github",
+        scope="example/project",
+    )
+
+    assert extraction.requested_count == 6
+    assert [reference.canonical for reference in extraction.references] == [
+        "example/project#18",
+        "example/project#20",
+        "example/project#21",
+        "example/project#22",
+        "example/project#23",
+        "example/project#25",
+    ]
+
+
+def test_range_expansion_uses_linear_scope_and_existing_deduplication() -> None:
+    extraction = extract_ticket_targets(
+        "Work on tickets 7 to 9 and 8",
+        scope_source="linear",
+        scope="eng",
+    )
+
+    assert extraction.requested_count == 4
+    assert [reference.canonical for reference in extraction.references] == [
+        "ENG-7",
+        "ENG-8",
+        "ENG-9",
+    ]
+
+
+def test_descending_range_is_rejected_without_partial_expansion() -> None:
+    extraction = extract_ticket_targets(
+        "Work on tickets 25 through 20",
+        scope_source="github",
+        scope="example/project",
+    )
+
+    assert extraction.batch_requested
+    assert extraction.requested_count == 6
+    assert len(extraction.references) == 1
+    assert extraction.references[0].canonical is None
+    assert extraction.references[0].raw == "25 through 20"
+    assert extraction.references[0].error == "ticket range must be ascending"
+
+
+def test_oversized_range_is_rejected_without_partial_expansion() -> None:
+    extraction = extract_ticket_targets(
+        "Work on tickets 1-26",
+        scope_source="github",
+        scope="example/project",
+    )
+
+    assert extraction.requested_count == 26
+    assert len(extraction.references) == 1
+    assert extraction.references[0].canonical is None
+    assert extraction.references[0].error == "ticket range cannot exceed 25 tickets"
+
+
+def test_nonpositive_range_is_rejected_without_partial_expansion() -> None:
+    extraction = extract_ticket_targets(
+        "Work on tickets 0 to 2",
+        scope_source="github",
+        scope="example/project",
+    )
+
+    assert extraction.requested_count == 3
+    assert len(extraction.references) == 1
+    assert extraction.references[0].canonical is None
+    assert extraction.references[0].error == "ticket range endpoints must be positive"
+
+
+def test_range_language_outside_scoped_ticket_list_is_ignored() -> None:
+    extraction = extract_ticket_targets(
+        "Use 20 to 25 workers",
+        scope_source="github",
+        scope="example/project",
+    )
+
+    assert extraction.requested_count == 0
+    assert extraction.references == ()
+
+
 def test_spoken_hundreds_distinguish_internal_and_list_conjunctions() -> None:
     extraction = extract_ticket_targets(
         "Work on issues one hundred and fifty, two hundred and seven, "
