@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import shutil
 import subprocess
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
+from contextlib import contextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path
 
@@ -47,6 +49,10 @@ class ConfigChangeResult:
     legacy_backup: Path | None = None
 
 
+class StaleConfigChangeError(UserConfigurationError):
+    """A confirmed change no longer matches its preflight baseline."""
+
+
 Parser = Callable[[str], object]
 Applier = Callable[[UserConfig, object], UserConfig]
 
@@ -70,6 +76,15 @@ def _parse_bool(value: str) -> bool:
 
 def _parse_str(value: str) -> str:
     return value.strip()
+
+
+def _parse_barge_in_mode(value: str) -> str:
+    mode = value.strip().casefold()
+    if mode not in {"off", "vad", "wake"}:
+        raise UserConfigurationError(
+            "audio.barge_in_mode must be one of: off, vad, wake"
+        )
+    return mode
 
 
 def _parse_int(value: str) -> int:
@@ -264,7 +279,7 @@ _CONFIG_FIELDS: dict[str, ConfigField] = {
         services=(_WAKE_SERVICE,),
     ),
     "audio.barge_in_mode": _field(
-        parse=_parse_str,
+        parse=_parse_barge_in_mode,
         section="audio",
         attribute="barge_in_mode",
         services=(_WAKE_SERVICE,),
@@ -532,6 +547,16 @@ def restart_services_for_keys(
     return tuple(dict.fromkeys(services))
 
 
+def describe_config_value(config: UserConfig, key: str) -> object:
+    """Return one typed configuration value using the managed field registry."""
+
+    normalized = key.strip().casefold()
+    field = _CONFIG_FIELDS.get(normalized)
+    if field is None:
+        raise UserConfigurationError(f"unknown configuration key {key!r}")
+    return field.describe(config)
+
+
 def active_services(services: Sequence[str]) -> tuple[str, ...]:
     active: list[str] = []
     for name in services:
@@ -577,31 +602,51 @@ def apply_config_values(
     return updated
 
 
+@contextmanager
+def _locked_config_write(path: Path) -> Iterator[None]:
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    lock_path = path.with_suffix(f"{path.suffix}.lock")
+    with lock_path.open("a+b") as lock:
+        os.chmod(lock_path, 0o600)
+        fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+
 def commit_config_change(
     assignments: Mapping[str, str],
     *,
     paths: ConfigPaths | None = None,
     environment: Mapping[str, str] | None = None,
     migrate_legacy_backends: bool = False,
+    expected_values: Mapping[str, object] | None = None,
 ) -> ConfigChangeResult:
     resolved_paths = paths or config_paths(environment)
     env = _file_environment(environment)
-    current = load_managed_config(resolved_paths, env)
-    updated = apply_config_values(current, assignments)
-    legacy_backup = (
-        _legacy_backup_path(resolved_paths.backends)
-        if migrate_legacy_backends and resolved_paths.backends.is_file()
-        else None
-    )
-    if legacy_backup is not None:
-        resolved_paths.backends.replace(legacy_backup)
-    try:
-        validated = validate_managed_config(updated, resolved_paths, env)
-        write_user_config(validated, resolved_paths.config)
-    except BaseException:
+    with _locked_config_write(resolved_paths.config):
+        current = load_managed_config(resolved_paths, env)
+        for key, expected in (expected_values or {}).items():
+            if describe_config_value(current, key) != expected:
+                raise StaleConfigChangeError(
+                    "configuration changed after confirmation was requested"
+                )
+        updated = apply_config_values(current, assignments)
+        legacy_backup = (
+            _legacy_backup_path(resolved_paths.backends)
+            if migrate_legacy_backends and resolved_paths.backends.is_file()
+            else None
+        )
         if legacy_backup is not None:
-            legacy_backup.replace(resolved_paths.backends)
-        raise
+            resolved_paths.backends.replace(legacy_backup)
+        try:
+            validated = validate_managed_config(updated, resolved_paths, env)
+            write_user_config(validated, resolved_paths.config)
+        except BaseException:
+            if legacy_backup is not None:
+                legacy_backup.replace(resolved_paths.backends)
+            raise
     restart = active_services(restart_services_for_keys(validated, tuple(assignments)))
     return ConfigChangeResult(
         config=validated,

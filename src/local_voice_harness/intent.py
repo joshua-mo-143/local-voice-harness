@@ -55,6 +55,12 @@ ROUTER_SYSTEM_PROMPT = (
     "current configuration, including requests about credentials, paths, executables, "
     "or unsupported settings; the first-party handler will enforce its read allow-list. "
     "Questions about general software configuration are not harness_config_inspect. "
+    "Use harness_config_change only when the original utterance explicitly asks to "
+    "change the harness's own configuration. Extract only the requested raw value into "
+    "raw_value; never produce a dotted key, infer a missing value, or use focused "
+    "metadata as authority. Examples include changing the voice, setting barge-in mode, "
+    "and enabling or disabling GitHub, Linear, or Zendesk. Unsupported changes still "
+    "use harness_config_change so the first-party allow-list can reject them. "
     "Use end_conversation when the user signals the exchange is over and nothing "
     "further is needed, for example saying goodbye, thanking you with no new "
     "request, answering that there is nothing else, or replying with only a short "
@@ -105,6 +111,7 @@ ROUTE_TOOL = {
                         "cursor_repeat",
                         "cursor_details",
                         "harness_config_inspect",
+                        "harness_config_change",
                         "question_consultation",
                         "conversation_continue",
                         "workspace_consultation",
@@ -117,6 +124,13 @@ ROUTE_TOOL = {
                 "confidence": {
                     "type": "string",
                     "enum": ["high", "medium", "low"],
+                },
+                "raw_value": {
+                    "type": ["string", "null"],
+                    "description": (
+                        "Only the value explicitly requested by the original utterance, "
+                        "or null when no value was supplied."
+                    ),
                 },
             },
             "required": ["intent", "confidence"],
@@ -143,6 +157,7 @@ class Intent(StrEnum):
     AGENT_REPEAT = "cursor_repeat"
     AGENT_DETAILS = "cursor_details"
     HARNESS_CONFIG_INSPECT = "harness_config_inspect"
+    HARNESS_CONFIG_CHANGE = "harness_config_change"
     QUESTION_CONSULTATION = "question_consultation"
     CONVERSATION_CONTINUE = "conversation_continue"
     WORKSPACE_CONSULTATION = "workspace_consultation"
@@ -173,6 +188,7 @@ class ForkIntent(StrEnum):
 class IntentRoute:
     intent: Intent
     confidence: str
+    raw_value: str | None = None
 
     @property
     def actionable(self) -> bool:
@@ -255,11 +271,14 @@ def _parse_route_message(message: object) -> IntentRoute:
         arguments = json.loads(str(function.get("arguments") or "{}"))
         intent = Intent(str(arguments.get("intent") or "uncertain"))
         confidence = str(arguments.get("confidence") or "low")
+        raw_value = arguments.get("raw_value")
     except (AttributeError, json.JSONDecodeError, ValueError):
         return FALLBACK_ROUTE
-    if confidence not in {"high", "medium", "low"}:
+    if confidence not in {"high", "medium", "low"} or (
+        raw_value is not None and not isinstance(raw_value, str)
+    ):
         return FALLBACK_ROUTE
-    return IntentRoute(intent, confidence)
+    return IntentRoute(intent, confidence, raw_value)
 
 
 def route_intent(

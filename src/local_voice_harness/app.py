@@ -252,6 +252,12 @@ def respond(text: str, *, user_config: UserConfig | None = None) -> None:
                     if route.actionable
                     else AssistantResponse.from_text(UNSUPPORTED_INSPECTION_RESPONSE)
                 )
+            elif route.intent == Intent.HARNESS_CONFIG_CHANGE:
+                response = AssistantResponse.from_text(
+                    "Configuration changes require a wake conversation so I can read "
+                    "back the exact change and receive confirmation. I didn't write "
+                    "anything."
+                )
             elif missing_ticket_scope:
                 response = MISSING_ISSUE_SCOPE_RESPONSE
             elif route.actionable and route.intent == Intent.QUESTION_CONSULTATION:

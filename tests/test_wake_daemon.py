@@ -18,6 +18,10 @@ from unittest import mock
 from local_voice_harness import llm, llm_transport, recorder
 from local_voice_harness.browser_context import RequestContext
 from local_voice_harness.config import load_backend_settings
+from local_voice_harness.config_management import (
+    ConfigChangeResult,
+    StaleConfigChangeError,
+)
 from local_voice_harness.cursor import service as cursor_service
 from local_voice_harness.cursor.delivery import DeliveryClaim
 from local_voice_harness.cursor.model import CursorJob, JobStatus
@@ -35,6 +39,12 @@ from local_voice_harness.questions import (
     QuestionSensitivity,
 )
 from local_voice_harness.responses import AssistantResponse
+from local_voice_harness.self_management import (
+    ChangePreparation,
+    ChangePreparationStatus,
+    PendingConfigChange,
+    SettingKey,
+)
 from local_voice_harness.speech import SpeechRenderer
 from local_voice_harness.tts.queue import PlaybackQueue, PlaybackRequest
 from local_voice_harness.user_config import default_user_config, load_user_config
@@ -135,6 +145,7 @@ def _bare_daemon() -> WakeConversationDaemon:
         maxlen=wake_daemon.RECENT_PLAYBACK_LIMIT
     )
     instance.pending_target_readback = None
+    instance.pending_config_change = None
     instance.conversation_deadline = 0.0
     instance.awaiting_followup = False
     instance.last_wake = 0.0
@@ -149,6 +160,22 @@ def _bare_daemon() -> WakeConversationDaemon:
     instance.pre_roll = collections.deque(maxlen=wake_daemon.PRE_ROLL_FRAMES)
     instance.wake_model = mock.Mock()
     return instance
+
+
+def _pending_config(
+    *,
+    raw_value: str = "new_voice",
+    new_value: str = "new_voice",
+) -> PendingConfigChange:
+    return PendingConfigChange(
+        trusted_utterance=f"Set voice to {raw_value}",
+        setting=SettingKey.VOICE,
+        raw_value=raw_value,
+        old_value="",
+        new_value=new_value,
+        stored_value="",
+        affected_services=("voice-harness-wake.service",),
+    )
 
 
 def _pending_choice_snapshot() -> wake_daemon.PendingQuestionSnapshot:
@@ -1855,6 +1882,254 @@ class InboxIntentRoutingTests(unittest.TestCase):
             integrations=mock.ANY,
         )
         qwen_turn.assert_not_called()
+
+
+class ConfigChangeConversationTests(unittest.TestCase):
+    def _run_turn(
+        self,
+        daemon: WakeConversationDaemon,
+        text: str,
+        *,
+        route: IntentRoute | None = None,
+        preparation: ChangePreparation | None = None,
+        commit_effect: object = None,
+    ) -> dict[str, mock.Mock]:
+        result = ConfigChangeResult(
+            config=daemon.user_config,
+            changed_keys=("audio.voice",),
+            restart_services=("voice-harness-wake.service",),
+        )
+        commit_error = (
+            commit_effect if isinstance(commit_effect, BaseException) else None
+        )
+        with (
+            mock.patch.object(wake_daemon, "transcribe", return_value=text),
+            mock.patch.object(wake_daemon, "start_components"),
+            mock.patch.object(
+                wake_daemon,
+                "route_intent",
+                return_value=route or IntentRoute(Intent.CONVERSATION, "high"),
+            ) as route_intent,
+            mock.patch.object(
+                wake_daemon,
+                "prepare_config_change",
+                return_value=preparation,
+            ) as prepare,
+            mock.patch.object(
+                wake_daemon,
+                "commit_pending_change",
+                return_value=None if commit_error is not None else result,
+                side_effect=commit_error,
+            ) as commit,
+            mock.patch.object(wake_daemon, "cursor_turn") as cursor_turn,
+            mock.patch.object(wake_daemon, "qwen_turn") as qwen_turn,
+            mock.patch.object(
+                daemon,
+                "play_response",
+                return_value=({"played_text": "ok"}, None),
+            ) as play,
+            mock.patch.object(wake_daemon, "notify"),
+        ):
+            daemon.process_utterance(AUDIO_GENERATION, woke=False)
+        return {
+            "route": route_intent,
+            "prepare": prepare,
+            "commit": commit,
+            "cursor": cursor_turn,
+            "qwen": qwen_turn,
+            "play": play,
+        }
+
+    def test_supported_request_installs_one_pending_change_without_writing(
+        self,
+    ) -> None:
+        daemon = _bare_daemon()
+        pending = _pending_config()
+        preparation = ChangePreparation(ChangePreparationStatus.READY, pending)
+
+        calls = self._run_turn(
+            daemon,
+            "Set the voice to new_voice",
+            route=IntentRoute(
+                Intent.HARNESS_CONFIG_CHANGE,
+                "high",
+                "new_voice",
+            ),
+            preparation=preparation,
+        )
+
+        self.assertIs(daemon.pending_config_change, pending)
+        calls["prepare"].assert_called_once()
+        calls["commit"].assert_not_called()
+        calls["cursor"].assert_not_called()
+        calls["qwen"].assert_not_called()
+
+    def test_affirmative_confirmation_commits_once_and_clears_pending(self) -> None:
+        daemon = _bare_daemon()
+        runtime_snapshot = daemon.user_config
+        pending = _pending_config()
+        daemon.pending_config_change = pending
+
+        calls = self._run_turn(daemon, "yes")
+
+        calls["route"].assert_not_called()
+        calls["commit"].assert_called_once_with(pending)
+        self.assertIsNone(daemon.pending_config_change)
+        self.assertIs(daemon.user_config, runtime_snapshot)
+        response = calls["play"].call_args.args[0]
+        self.assertIn(
+            "running configuration snapshot is unchanged", response.spoken_text
+        )
+
+    def test_duplicate_confirmation_turn_commits_only_once(self) -> None:
+        daemon = _bare_daemon()
+        pending = _pending_config()
+        daemon.pending_config_change = pending
+        result = ConfigChangeResult(
+            config=daemon.user_config,
+            changed_keys=("audio.voice",),
+            restart_services=("voice-harness-wake.service",),
+        )
+        with (
+            mock.patch.object(
+                wake_daemon,
+                "transcribe",
+                side_effect=["yes", "Is Linear enabled?"],
+            ),
+            mock.patch.object(wake_daemon, "start_components"),
+            mock.patch.object(
+                wake_daemon,
+                "route_intent",
+                return_value=IntentRoute(Intent.HARNESS_CONFIG_INSPECT, "high"),
+            ),
+            mock.patch.object(
+                wake_daemon,
+                "commit_pending_change",
+                return_value=result,
+            ) as commit,
+            mock.patch.object(wake_daemon, "cursor_turn") as cursor_turn,
+            mock.patch.object(wake_daemon, "qwen_turn") as qwen_turn,
+            mock.patch.object(
+                daemon,
+                "play_response",
+                return_value=({"played_text": "ok"}, None),
+            ),
+            mock.patch.object(wake_daemon, "notify"),
+        ):
+            daemon.process_utterance(AUDIO_GENERATION, woke=False)
+            daemon.process_utterance(AUDIO_GENERATION, woke=False)
+
+        commit.assert_called_once_with(pending)
+        cursor_turn.assert_not_called()
+        qwen_turn.assert_not_called()
+
+    def test_cancellation_commits_nothing_and_clears_pending(self) -> None:
+        daemon = _bare_daemon()
+        daemon.pending_config_change = _pending_config()
+
+        calls = self._run_turn(daemon, "no")
+
+        calls["route"].assert_not_called()
+        calls["commit"].assert_not_called()
+        self.assertIsNone(daemon.pending_config_change)
+        response = calls["play"].call_args.args[0]
+        self.assertIn("Nothing was written", response.spoken_text)
+
+    def test_ambiguous_confirmation_keeps_pending_and_asks_again(self) -> None:
+        daemon = _bare_daemon()
+        pending = _pending_config()
+        daemon.pending_config_change = pending
+
+        calls = self._run_turn(daemon, "maybe")
+
+        calls["commit"].assert_not_called()
+        self.assertIs(daemon.pending_config_change, pending)
+        response = calls["play"].call_args.args[0]
+        self.assertIn("say yes", response.spoken_text)
+        self.assertIn("or no", response.spoken_text)
+
+    def test_new_change_replaces_pending_without_committing_old_change(self) -> None:
+        daemon = _bare_daemon()
+        daemon.pending_config_change = _pending_config()
+        replacement = _pending_config(raw_value="replacement", new_value="replacement")
+
+        calls = self._run_turn(
+            daemon,
+            "Set the voice to replacement",
+            route=IntentRoute(
+                Intent.HARNESS_CONFIG_CHANGE,
+                "high",
+                "replacement",
+            ),
+            preparation=ChangePreparation(
+                ChangePreparationStatus.READY,
+                replacement,
+            ),
+        )
+
+        calls["commit"].assert_not_called()
+        self.assertIs(daemon.pending_config_change, replacement)
+
+    def test_stale_value_and_write_failure_clear_pending_without_committing(
+        self,
+    ) -> None:
+        cases = (
+            StaleConfigChangeError("stale"),
+            OSError("disk full"),
+        )
+        for error in cases:
+            with self.subTest(error=type(error).__name__):
+                daemon = _bare_daemon()
+                daemon.pending_config_change = _pending_config()
+
+                calls = self._run_turn(daemon, "confirm", commit_effect=error)
+
+                self.assertIsNone(daemon.pending_config_change)
+                response = calls["play"].call_args.args[0]
+                self.assertIn("didn't write anything", response.spoken_text)
+                if isinstance(error, OSError):
+                    self.assertIn(
+                        "running configuration snapshot is unchanged",
+                        response.spoken_text,
+                    )
+
+    def test_invalid_extraction_creates_no_pending_change_or_cursor_job(self) -> None:
+        daemon = _bare_daemon()
+        preparation = ChangePreparation(ChangePreparationStatus.INVALID)
+
+        calls = self._run_turn(
+            daemon,
+            "Set the voice executable to slash bin bash",
+            route=IntentRoute(
+                Intent.HARNESS_CONFIG_CHANGE,
+                "high",
+                "/bin/bash",
+            ),
+            preparation=preparation,
+        )
+
+        self.assertIsNone(daemon.pending_config_change)
+        calls["commit"].assert_not_called()
+        calls["cursor"].assert_not_called()
+        calls["qwen"].assert_not_called()
+
+    def test_timeout_and_process_exit_discard_pending_without_writing(self) -> None:
+        for action in ("timeout", "exit"):
+            with self.subTest(action=action):
+                daemon = _bare_daemon()
+                daemon.pending_config_change = _pending_config()
+                with (
+                    mock.patch.object(wake_daemon, "commit_pending_change") as commit,
+                    mock.patch.object(wake_daemon, "stop_components"),
+                    mock.patch.object(wake_daemon, "notify"),
+                ):
+                    if action == "timeout":
+                        daemon.close_conversation("inactivity")
+                    else:
+                        daemon.stop()
+
+                self.assertIsNone(daemon.pending_config_change)
+                commit.assert_not_called()
 
 
 class AnnounceJobTests(unittest.TestCase):

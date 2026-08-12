@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import tempfile
 import unittest
 from dataclasses import replace
 from pathlib import Path
+from unittest import mock
 
-from local_voice_harness import self_management
-from local_voice_harness.user_config import default_user_config
+from local_voice_harness import config_management, self_management
+from local_voice_harness.user_config import default_user_config, write_user_config
 
 
 class ConfigInspectionTests(unittest.TestCase):
@@ -127,6 +129,209 @@ class ConfigInspectionTests(unittest.TestCase):
             response.spoken_text,
             "My configured voice is the configured default.",
         )
+
+
+class ConfigChangeTests(unittest.TestCase):
+    HOME = Path("/home/example")
+
+    def setUp(self) -> None:
+        config = default_user_config(home=self.HOME)
+        self.config = replace(
+            config,
+            audio=replace(config.audio, voice="old_voice", barge_in_mode="wake"),
+            integrations=replace(
+                config.integrations,
+                github_enabled=True,
+                linear_enabled=True,
+                zendesk_enabled=False,
+            ),
+        )
+
+    def paths(self, root: Path) -> config_management.ConfigPaths:
+        return config_management.ConfigPaths(
+            config=root / "voice-harness" / "config.toml",
+            backends=root / "voice-harness" / "backends.toml",
+            backend_env=root / "dictation" / "backend.env",
+            home=self.HOME,
+        )
+
+    def prepare(
+        self,
+        utterance: str,
+        raw_value: str | None,
+        *,
+        active_config=None,
+    ) -> self_management.ChangePreparation:
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = self.paths(Path(temporary))
+            write_user_config(self.config, paths.config)
+            return self_management.prepare_config_change(
+                self_management.ConfigChangeRequest(utterance, raw_value),
+                active_config or self.config,
+                paths=paths,
+            )
+
+    def test_initial_allow_list_preflights_exact_old_and_new_values(self) -> None:
+        cases = (
+            ("Set the voice to new_voice", "new_voice", "old_voice", "new_voice"),
+            ("Set barge-in mode to off", "off", "wake", "off"),
+            ("Disable GitHub", "disabled", True, False),
+            ("Disable Linear", "false", True, False),
+            ("Enable Zendesk", "enabled", False, True),
+        )
+        for utterance, raw_value, old_value, new_value in cases:
+            with self.subTest(utterance=utterance):
+                preparation = self.prepare(utterance, raw_value)
+
+                self.assertEqual(
+                    preparation.status,
+                    self_management.ChangePreparationStatus.READY,
+                )
+                pending = preparation.pending
+                assert pending is not None
+                self.assertEqual(pending.old_value, old_value)
+                self.assertEqual(pending.new_value, new_value)
+                self.assertEqual(
+                    pending.affected_services,
+                    ("voice-harness-wake.service",),
+                )
+                response = self_management.render_change_preparation(preparation)
+                old_text = (
+                    "enabled"
+                    if old_value is True
+                    else "disabled"
+                    if old_value is False
+                    else str(old_value)
+                )
+                new_text = (
+                    "enabled"
+                    if new_value is True
+                    else "disabled"
+                    if new_value is False
+                    else str(new_value)
+                )
+                self.assertIn(old_text, response.spoken_text)
+                self.assertIn(new_text, response.spoken_text)
+
+    def test_malformed_unsupported_ambiguous_and_unsafe_changes_fail_closed(
+        self,
+    ) -> None:
+        cases = (
+            (
+                "Set the wake threshold to point seven",
+                "0.7",
+                self_management.ChangePreparationStatus.UNSUPPORTED,
+            ),
+            (
+                "Set voice and Linear to something",
+                "something",
+                self_management.ChangePreparationStatus.AMBIGUOUS,
+            ),
+            (
+                "Change the voice",
+                None,
+                self_management.ChangePreparationStatus.MALFORMED,
+            ),
+            (
+                "Set the voice to the API key credential",
+                "secret",
+                self_management.ChangePreparationStatus.MALFORMED,
+            ),
+            (
+                "Set the voice executable path to bash",
+                "/bin/bash",
+                self_management.ChangePreparationStatus.MALFORMED,
+            ),
+            (
+                "Set the voice to slash",
+                "../voice",
+                self_management.ChangePreparationStatus.INVALID,
+            ),
+            (
+                "Set barge-in mode to loud",
+                "loud",
+                self_management.ChangePreparationStatus.INVALID,
+            ),
+        )
+        for utterance, raw_value, status in cases:
+            with self.subTest(utterance=utterance):
+                preparation = self.prepare(utterance, raw_value)
+                self.assertEqual(preparation.status, status)
+                self.assertIsNone(preparation.pending)
+
+    def test_active_and_stored_snapshot_mismatch_fails_closed(self) -> None:
+        active = replace(
+            self.config,
+            audio=replace(self.config.audio, voice="environment_override"),
+        )
+
+        preparation = self.prepare(
+            "Set the voice to new_voice",
+            "new_voice",
+            active_config=active,
+        )
+
+        self.assertEqual(
+            preparation.status,
+            self_management.ChangePreparationStatus.CONFLICT,
+        )
+        self.assertIsNone(preparation.pending)
+
+    def test_strict_confirmation_parser_rejects_partial_or_combined_answers(
+        self,
+    ) -> None:
+        for utterance in ("yes", "confirm", "go ahead", "save it"):
+            with self.subTest(utterance=utterance):
+                self.assertEqual(
+                    self_management.resolve_confirmation(utterance),
+                    self_management.ConfirmationDecision.CONFIRM,
+                )
+        for utterance in ("no", "cancel", "never mind", "do not"):
+            with self.subTest(utterance=utterance):
+                self.assertEqual(
+                    self_management.resolve_confirmation(utterance),
+                    self_management.ConfirmationDecision.CANCEL,
+                )
+        for utterance in ("maybe", "yes but change Linear", "the ticket says yes"):
+            with self.subTest(utterance=utterance):
+                self.assertEqual(
+                    self_management.resolve_confirmation(utterance),
+                    self_management.ConfirmationDecision.AMBIGUOUS,
+                )
+
+    def test_commit_preserves_runtime_snapshot_and_reports_manual_restart(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = self.paths(Path(temporary))
+            write_user_config(self.config, paths.config)
+            preparation = self_management.prepare_config_change(
+                self_management.ConfigChangeRequest(
+                    "Set the voice to new_voice",
+                    "new_voice",
+                ),
+                self.config,
+                paths=paths,
+            )
+            pending = preparation.pending
+            assert pending is not None
+            with mock.patch.object(
+                config_management,
+                "active_services",
+                return_value=("voice-harness-wake.service",),
+            ):
+                result = self_management.commit_pending_change(pending, paths=paths)
+
+            stored = config_management.load_managed_config(paths)
+
+        self.assertEqual(self.config.audio.voice, "old_voice")
+        self.assertEqual(stored.audio.voice, "new_voice")
+        response = self_management.render_change_committed(pending, result)
+        self.assertIn(
+            "running configuration snapshot is unchanged", response.spoken_text
+        )
+        self.assertIn(
+            "Restart voice-harness-wake.service manually", response.spoken_text
+        )
+        self.assertIn("Active affected services", response.spoken_text)
 
 
 if __name__ == "__main__":

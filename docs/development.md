@@ -53,6 +53,44 @@ Its command surface is intentionally limited to `text`, `wake`, and the branch-l
 configuration helpers (`setup`, `config`, and `integrations`) and the side-effect-free
 `pronounce` preview, so it does not expose service or credential management.
 
+### Conversational configuration-change smoke
+
+This smoke uses the microphone. Before starting it, tell the user that the foreground
+wake listener will capture audio and pause until they explicitly confirm they are
+ready. Do not infer readiness from an earlier message.
+
+After acknowledgement, record the current branch-local value, stop the installed
+listener, and start the checkout listener:
+
+```fish
+set original_voice (scripts/dev.sh config show audio.voice)
+echo $original_voice
+systemctl --user stop voice-harness-wake.service
+scripts/dev.sh wake
+```
+
+Say “Set the voice to issue_273_smoke.” Verify that the assistant reads back
+`audio.voice`, the exact old value, and `issue_273_smoke`, and asks for yes or no without
+writing. Say “no” and verify the value is unchanged. Repeat the request, say “yes”,
+and verify that it reports the running snapshot is unchanged and names
+`voice-harness-wake.service` as requiring a manual restart. In another terminal,
+confirm the persisted branch-local value:
+
+```fish
+scripts/dev.sh config show audio.voice
+```
+
+For a stale-confirmation check, request another voice, change `audio.voice` through
+the branch-local `config set` command before answering, then say “yes.” The wake
+conversation must reject the stale confirmation and preserve the intervening value.
+Press Ctrl-C, restore the original branch-local value if needed, and restart the
+installed listener:
+
+```fish
+scripts/dev.sh config set audio.voice "$original_voice"
+systemctl --user start voice-harness-wake.service
+```
+
 This is branch testing isolation, not a complete runtime profile:
 
 - `XDG_RUNTIME_DIR` is preserved. Runtime sockets, recording paths, locks, and
