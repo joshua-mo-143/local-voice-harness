@@ -7,6 +7,7 @@ import sys
 import tempfile
 import types
 import unittest
+import urllib.error
 import wave
 from dataclasses import replace
 from email.message import Message
@@ -202,7 +203,7 @@ class ServerStreamingTests(unittest.TestCase):
                 server, "get_venice_api_key", return_value="venice-secret"
             ),
             mock.patch.object(
-                server.urllib.request, "urlopen", return_value=response
+                server, "pooled_urlopen", return_value=response
             ) as urlopen,
         ):
             audio, rate, duration, _elapsed = server._venice_audio("Hello.")
@@ -223,6 +224,33 @@ class ServerStreamingTests(unittest.TestCase):
         )
         self.assertEqual(request.get_header("Authorization"), "Bearer venice-secret")
         self.assertEqual(urlopen.call_args.kwargs["timeout"], 19)
+
+    def test_venice_http_error_is_closed_after_bounded_detail_read(self) -> None:
+        settings = replace(
+            load_backend_settings({}),
+            tts_provider="venice",
+            tts_endpoint="https://api.venice.ai/api/v1/audio/speech",
+        )
+        error = urllib.error.HTTPError(
+            settings.tts_endpoint,
+            429,
+            "Too Many Requests",
+            Message(),
+            io.BytesIO(b'{"error":"slow down"}'),
+        )
+
+        with (
+            mock.patch.object(server, "SETTINGS", settings),
+            mock.patch.object(
+                server, "get_venice_api_key", return_value="venice-secret"
+            ),
+            mock.patch.object(server, "pooled_urlopen", side_effect=error),
+            self.assertRaisesRegex(RuntimeError, "HTTP 429"),
+        ):
+            server._venice_audio("Hello.")
+
+        assert error.fp is not None
+        self.assertTrue(error.fp.closed)
 
     def test_venice_speed_is_applied_locally_without_changing_pitch(self) -> None:
         source = io.BytesIO()

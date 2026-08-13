@@ -606,8 +606,8 @@ class QwenClientTests(unittest.TestCase):
                 llm_transport, "get_venice_api_key", return_value="venice-secret"
             ) as get_key,
             mock.patch.object(
-                llm_transport.urllib.request,
-                "urlopen",
+                llm_transport,
+                "pooled_urlopen",
                 return_value=_stream_response(
                     {"content": "hello "},
                     {"content": "there."},
@@ -647,8 +647,8 @@ class QwenClientTests(unittest.TestCase):
                 llm_transport, "get_venice_api_key", return_value="secret"
             ),
             mock.patch.object(
-                llm_transport.urllib.request,
-                "urlopen",
+                llm_transport,
+                "pooled_urlopen",
                 side_effect=[
                     _stream_response(
                         {
@@ -711,8 +711,8 @@ class QwenClientTests(unittest.TestCase):
                 llm_transport, "get_venice_api_key", return_value="secret"
             ),
             mock.patch.object(
-                llm_transport.urllib.request,
-                "urlopen",
+                llm_transport,
+                "pooled_urlopen",
                 return_value=_stream_response(
                     {"content": "Submitting a Cursor job for all three tickets."}
                 ),
@@ -747,8 +747,8 @@ class QwenClientTests(unittest.TestCase):
                 llm_transport, "get_venice_api_key", return_value="secret"
             ),
             mock.patch.object(
-                llm_transport.urllib.request,
-                "urlopen",
+                llm_transport,
+                "pooled_urlopen",
                 side_effect=[
                     _stream_response(
                         {
@@ -831,8 +831,8 @@ class QwenClientTests(unittest.TestCase):
                 llm_transport, "get_venice_api_key", return_value="secret"
             ),
             mock.patch.object(
-                llm_transport.urllib.request,
-                "urlopen",
+                llm_transport,
+                "pooled_urlopen",
                 side_effect=[
                     _stream_response(
                         {

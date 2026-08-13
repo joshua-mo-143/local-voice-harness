@@ -24,6 +24,7 @@ from ..config import (
 )
 from ..credentials import get_venice_api_key
 from ..diagnostic_safety import redact_diagnostic
+from ..http_pool import urlopen as pooled_urlopen
 from ..user_config import default_user_config, load_user_config
 
 SOCKET_PATH = TTS_SOCKET
@@ -202,9 +203,21 @@ def _venice_audio(text: str) -> tuple[bytes, int, float, float]:
     )
     started = time.perf_counter()
     try:
-        with urllib.request.urlopen(request, timeout=settings.tts_timeout) as response:
+        with pooled_urlopen(request, timeout=settings.tts_timeout) as response:
             content_type = response.headers.get_content_type()
             audio = response.read(MAX_AUDIO_BYTES + 1)
+    except urllib.error.HTTPError as exc:
+        try:
+            detail = exc.read(4096).decode("utf-8", errors="replace").strip()
+        except OSError:
+            detail = ""
+        finally:
+            exc.close()
+        detail = redact_diagnostic(detail)
+        suffix = f": {detail}" if detail else ""
+        raise RuntimeError(
+            f"Venice TTS request failed: HTTP {exc.code} {exc.reason}{suffix}"
+        ) from exc
     except (OSError, urllib.error.URLError) as exc:
         raise RuntimeError(f"Venice TTS request failed: {exc}") from exc
     elapsed = time.perf_counter() - started

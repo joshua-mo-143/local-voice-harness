@@ -82,7 +82,7 @@ class LlmTransportContractTests(unittest.TestCase):
             provider="venice", api_key="venice-secret", timeout=17
         )
         with mock.patch(
-            "local_voice_harness.llm_transport.urllib.request.urlopen",
+            "local_voice_harness.llm_transport.pooled_urlopen",
             return_value=_stream_response({"content": "hello"}),
         ) as urlopen:
             message = transport.chat_completion(
@@ -164,7 +164,7 @@ class LlmTransportContractTests(unittest.TestCase):
         )
         with (
             mock.patch(
-                "local_voice_harness.llm_transport.urllib.request.urlopen",
+                "local_voice_harness.llm_transport.pooled_urlopen",
                 side_effect=error,
             ),
             self.assertRaisesRegex(HarnessError, "HTTP 401") as ctx,
@@ -174,6 +174,8 @@ class LlmTransportContractTests(unittest.TestCase):
             )
 
         self.assertNotIn("secret-token", str(ctx.exception))
+        assert error.fp is not None
+        self.assertTrue(error.fp.closed)
 
     def test_transport_errors_are_wrapped(self) -> None:
         transport = self._transport()
@@ -353,7 +355,7 @@ class LlmTransportContractTests(unittest.TestCase):
     def test_streamed_tool_call_fragments_are_aggregated(self) -> None:
         transport = self._transport(provider="venice", api_key="secret")
         with mock.patch(
-            "local_voice_harness.llm_transport.urllib.request.urlopen",
+            "local_voice_harness.llm_transport.pooled_urlopen",
             return_value=_stream_response(
                 {
                     "tool_calls": [
@@ -390,7 +392,7 @@ class LlmTransportContractTests(unittest.TestCase):
     def test_truncated_streamed_tool_arguments_surface_as_malformed(self) -> None:
         transport = self._transport(provider="venice", api_key="secret")
         with mock.patch(
-            "local_voice_harness.llm_transport.urllib.request.urlopen",
+            "local_voice_harness.llm_transport.pooled_urlopen",
             return_value=_stream_response(
                 {
                     "tool_calls": [
@@ -423,7 +425,7 @@ class LlmTransportContractTests(unittest.TestCase):
         output = io.StringIO()
         with (
             mock.patch(
-                "local_voice_harness.llm_transport.urllib.request.urlopen",
+                "local_voice_harness.llm_transport.pooled_urlopen",
                 return_value=_stream_response({"content": "hello"}),
             ),
             mock.patch("sys.stdout", output),
