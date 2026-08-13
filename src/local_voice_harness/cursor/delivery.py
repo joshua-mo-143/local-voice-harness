@@ -8,10 +8,12 @@ from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 
+from .lifecycle import LifecycleTransitionError
 from .model import (
     SUPPRESSED_ANNOUNCEMENT_ACKS,
     CursorJob,
     JobStatus,
+    JobValidationError,
 )
 from .store import JobStore
 
@@ -77,7 +79,14 @@ def claim_delivery(
             return None
         if _claim_is_live(job, claimed_at):
             return None
-        return job.claim_delivery(uuid.uuid4().hex, claimed_at=claimed_at)
+        try:
+            return job.claim_delivery(
+                uuid.uuid4().hex,
+                claimed_at=claimed_at,
+                lease_seconds=DELIVERY_CLAIM_SECONDS,
+            )
+        except (JobValidationError, LifecycleTransitionError):
+            return None
 
     if job_id is not None:
         updated = store.update(job_id, claim)
@@ -114,7 +123,14 @@ def renew_delivery(
             or not _claim_is_live(job, renewed_at)
         ):
             return None
-        return job.renew_delivery(claimed_at=renewed_at)
+        try:
+            return job.renew_delivery(
+                token,
+                claimed_at=renewed_at,
+                lease_seconds=DELIVERY_CLAIM_SECONDS,
+            )
+        except (JobValidationError, LifecycleTransitionError):
+            return None
 
     return store.update(job_id, renew) is not None
 
@@ -135,7 +151,14 @@ def acknowledge_delivery(
             or not _claim_is_live(job, delivered_at)
         ):
             return None
-        return job.acknowledge_delivery(delivered_at=delivered_at)
+        try:
+            return job.acknowledge_delivery(
+                token,
+                delivered_at=delivered_at,
+                lease_seconds=DELIVERY_CLAIM_SECONDS,
+            )
+        except (JobValidationError, LifecycleTransitionError):
+            return None
 
     return store.update(job_id, acknowledge) is not None
 
@@ -144,11 +167,26 @@ def acknowledge_desktop_delivery(
     store: JobStore,
     job_id: str,
     token: str,
+    *,
+    now: float | None = None,
 ) -> bool:
+    acknowledged_at = time.time() if now is None else now
+
     def acknowledge(job: CursorJob) -> CursorJob | None:
-        if job.delivery_claim_token != token or job.delivered:
+        if (
+            job.delivery_claim_token != token
+            or job.delivered
+            or not _claim_is_live(job, acknowledged_at)
+        ):
             return None
-        return job.acknowledge_desktop_delivery()
+        try:
+            return job.acknowledge_desktop_delivery(
+                token,
+                acknowledged_at=acknowledged_at,
+                lease_seconds=DELIVERY_CLAIM_SECONDS,
+            )
+        except (JobValidationError, LifecycleTransitionError):
+            return None
 
     return store.update(job_id, acknowledge) is not None
 
@@ -157,11 +195,26 @@ def acknowledge_deferred_delivery(
     store: JobStore,
     job_id: str,
     token: str,
+    *,
+    now: float | None = None,
 ) -> bool:
+    acknowledged_at = time.time() if now is None else now
+
     def acknowledge(job: CursorJob) -> CursorJob | None:
-        if job.delivery_claim_token != token or job.delivered:
+        if (
+            job.delivery_claim_token != token
+            or job.delivered
+            or not _claim_is_live(job, acknowledged_at)
+        ):
             return None
-        return job.acknowledge_deferred_delivery()
+        try:
+            return job.acknowledge_deferred_delivery(
+                token,
+                acknowledged_at=acknowledged_at,
+                lease_seconds=DELIVERY_CLAIM_SECONDS,
+            )
+        except (JobValidationError, LifecycleTransitionError):
+            return None
 
     return store.update(job_id, acknowledge) is not None
 
@@ -180,7 +233,10 @@ def release_delivery(
         if job.delivery_claim_token != token or job.delivered:
             return None
         retry_at = released_at + DELIVERY_RETRY_SECONDS if retry else 0
-        return job.release_delivery(retry_at=retry_at)
+        try:
+            return job.release_delivery(token, retry_at=retry_at)
+        except (JobValidationError, LifecycleTransitionError):
+            return None
 
     return store.update(job_id, release) is not None
 

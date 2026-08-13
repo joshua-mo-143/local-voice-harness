@@ -68,7 +68,6 @@ from .model import (
     ACTIVE_STATUSES,
     TERMINAL_STATUSES,
     WORKER_STATUSES,
-    AnnouncementAck,
     CursorJob,
     JobStatus,
     JobValidationError,
@@ -257,18 +256,12 @@ def run_worker(job_id: str, claim_token: str | None = None) -> None:
 def launch_worker(job_id: str) -> None:
     def prepare_failure(job: CursorJob, message: str, failed_at: float) -> CursorJob:
         diagnostic = redact_diagnostic(message, limit=500)
-        return job.evolve(
+        return job.evolve_for_delivery(
+            now=failed_at,
             status=JobStatus.FAILED,
             error=diagnostic,
             result="Cursor job failed to start. Check the job log for details.",
             completed_at=failed_at,
-            delivered=False,
-            delivery_generation=job.delivery_generation + 1,
-            delivery_claim_token=None,
-            delivery_claimed_at=None,
-            delivery_retry_at=0,
-            delivery_attempts=0,
-            updated_at=failed_at,
             worker_token=None,
             worker_pid=None,
             worker_boot_id=None,
@@ -1507,10 +1500,7 @@ def reply_job(
         if resolution.outcome == AnswerOutcome.DEFERRED:
             immediate = "Okay, I'll keep that question for later."
             should_launch = False
-            return job.evolve(
-                delivered=True,
-                delivery_claim_token=None,
-                delivery_claimed_at=None,
+            return job.mark_delivered(
                 updated_at=now,
                 voice_question=questions.envelope(
                     question, QuestionState.DEFERRED, job=job
@@ -1865,12 +1855,7 @@ def resolve_manual_reconciliation(
 
 def mark_delivered(job_id: str) -> CursorJob:
     def deliver(job: CursorJob) -> CursorJob:
-        return job.evolve(
-            delivered=True,
-            delivery_claim_token=None,
-            delivery_claimed_at=None,
-            delivery_retry_at=0,
-        )
+        return job.mark_delivered()
 
     delivered = _job_store().update(job_id, deliver)
     assert delivered is not None
@@ -2298,15 +2283,7 @@ def dismiss_announcement(job_id: str) -> str:
     def dismiss(job: CursorJob) -> CursorJob | None:
         if job.announcement_dismissed and job.delivered:
             return None
-        return job.evolve(
-            announcement_dismissed=True,
-            announcement_ack=AnnouncementAck.DISMISSED.value,
-            delivered=True,
-            delivery_claim_token=None,
-            delivery_claimed_at=None,
-            delivery_retry_at=0,
-            delivered_at=now,
-        )
+        return job.dismiss_announcement(delivered_at=now)
 
     updated = _job_store().update(job_id, dismiss)
     label = inbox.speakable_label_for(updated or read_job(job_id))
@@ -2319,11 +2296,7 @@ def repeat_announcement(job_id: str) -> str:
     def repeat(job: CursorJob) -> CursorJob | None:
         if job.status not in ANNOUNCEABLE_STATUSES:
             return None
-        return job.evolve_for_delivery(
-            now=now,
-            announcement_repeated=True,
-            announcement_dismissed=False,
-        )
+        return job.repeat_announcement(now=now)
 
     updated = _job_store().update(job_id, repeat)
     if updated is None:

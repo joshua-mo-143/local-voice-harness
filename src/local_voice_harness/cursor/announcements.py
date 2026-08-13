@@ -221,17 +221,18 @@ def _apply_desktop(
     *,
     render_job: Callable[[CursorJob], AssistantResponse],
     notify: Callable[..., None],
+    now: float,
 ) -> bool:
     rendered = render_job(claim.job)
     notify(
         rendered.display_text,
         error=classify(claim.job) == AnnouncementKind.FAILURE,
     )
-    return acknowledge_desktop_delivery(store, claim.job.id, claim.token)
+    return acknowledge_desktop_delivery(store, claim.job.id, claim.token, now=now)
 
 
-def _apply_deferred(store: JobStore, claim: DeliveryClaim) -> bool:
-    return acknowledge_deferred_delivery(store, claim.job.id, claim.token)
+def _apply_deferred(store: JobStore, claim: DeliveryClaim, *, now: float) -> bool:
+    return acknowledge_deferred_delivery(store, claim.job.id, claim.token, now=now)
 
 
 def drain_background_announcements(
@@ -247,6 +248,7 @@ def drain_background_announcements(
     from .service import render_job_announcement
 
     renderer = render_job or render_job_announcement
+    applied_at = time.time() if now is None else now
     with announcement_drain_lock(store) as acquired:
         if not acquired:
             return DrainResult()
@@ -264,9 +266,15 @@ def drain_background_announcements(
             if chosen == AnnouncementDisposition.SPEAK:
                 speak.append(claim)
             elif chosen == AnnouncementDisposition.DESKTOP:
-                if _apply_desktop(store, claim, render_job=renderer, notify=notify):
+                if _apply_desktop(
+                    store,
+                    claim,
+                    render_job=renderer,
+                    notify=notify,
+                    now=applied_at,
+                ):
                     desktop.append(claim)
-            elif _apply_deferred(store, claim):
+            elif _apply_deferred(store, claim, now=applied_at):
                 deferred.append(claim)
         return DrainResult(
             speak=tuple(speak),

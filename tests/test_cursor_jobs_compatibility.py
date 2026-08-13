@@ -75,8 +75,10 @@ def test_legacy_helpers_keep_dict_mutation_and_confirmation_contract() -> None:
         agent_status="idle",
     )
 
-    assert job["status"] == "completed"
-    assert job["result"] == "completed"
+    assert job["status"] == "reconciling"
+    assert job["terminal_intent_status"] == "completed"
+    assert job["terminal_intent_result"] == "completed"
+    assert job["target_release_pending"] is True
     assert jobs.decide_fork_confirmation("Yes, please!") is True
     assert jobs.decide_fork_confirmation("no thanks") is False
     assert jobs.decide_fork_confirmation("maybe") is None

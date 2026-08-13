@@ -4803,11 +4803,17 @@ class CursorJobStateTests(unittest.TestCase):
             self.assertEqual(manual["agent_dispatch_state"], "manual_required")
             self.assertEqual(manual["agent_reconcile_attempts"], 6)
             self.assertTrue(manual["target_release_pending"])
-            self.assertIn(
-                "manual reconciliation required for Herdr agent late-agent",
-                str(manual["error"]),
+            self.assertEqual(
+                manual["error"],
+                "agent startup failed; external operation reconciliation is pending",
             )
-            self.assertNotIn("reconciliation is pending", str(manual["result"]))
+            self.assertEqual(
+                manual["result"],
+                "agent startup failed; external operation reconciliation is pending",
+            )
+            self.assertEqual(
+                manual["reconciliation_base_error"], "agent startup failed"
+            )
 
             with mock.patch("time.time", return_value=10_000):
                 service.recover_jobs()
@@ -4870,7 +4876,10 @@ class CursorJobStateTests(unittest.TestCase):
             "123456789abc", "fork", token, "confirmed_absent"
         )
         self.assertEqual(resolved.fork_operation_state, "confirmed_absent")
-        self.assertEqual(resolved.error, "fork outcome unknown")
+        self.assertEqual(
+            resolved.error,
+            "fork outcome unknown; external operation reconciliation is pending",
+        )
         self.assertEqual(github.reconcile_fork.call_count, 1)
 
     def test_manual_materialized_agent_is_retained_without_external_action(
@@ -4907,8 +4916,20 @@ class CursorJobStateTests(unittest.TestCase):
         self.assertEqual(resolved.herdr_target, "retained-agent")
         self.assertFalse(resolved.target_release_pending)
         self.assertFalse(resolved.cancellation_reconciliation_pending)
-        self.assertEqual(resolved.error, "agent startup failed")
-        self.assertEqual(resolved.result, "agent startup failed")
+        self.assertEqual(
+            resolved.error,
+            (
+                "agent startup failed; manual reconciliation required for "
+                "Herdr agent retained-agent"
+            ),
+        )
+        self.assertEqual(
+            resolved.result,
+            (
+                "agent startup failed; manual reconciliation required for "
+                "Herdr agent retained-agent"
+            ),
+        )
 
     def test_quarantined_worktree_releases_target_but_blocks_path(self) -> None:
         repository = Path(self.temporary.name) / "repository"
@@ -5048,7 +5069,13 @@ class CursorJobStateTests(unittest.TestCase):
         )
         client = mock.Mock()
         with (
-            mock.patch.object(jobs, "_process_identity", return_value=None),
+            mock.patch.object(
+                service.worker_lifecycle,
+                "process_identity",
+                side_effect=lambda pid: (
+                    "current-process" if pid == os.getpid() else None
+                ),
+            ),
             mock.patch.object(jobs, "HerdrClient", return_value=client),
         ):
             service.recover_jobs()

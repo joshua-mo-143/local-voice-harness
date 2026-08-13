@@ -4250,7 +4250,9 @@ class CompletedFollowupContextTests(unittest.TestCase):
     def test_recent_details_fail_closed_when_rendering_changed(self) -> None:
         daemon = _bare_daemon()
         announced = _delivery_claim("job2", "completed", result="original").job
-        changed = announced.evolve(result="different")
+        changed_values = announced.to_dict()
+        changed_values.update(result="different", revision=announced.revision + 1)
+        changed = CursorJob.from_dict(changed_values)
         context = self._completed_context(announced)
         daemon.completed_followup = context
         with mock.patch.object(wake_daemon.CURSOR_STORE, "get", return_value=changed):

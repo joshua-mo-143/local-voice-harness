@@ -887,12 +887,13 @@ def test_uncertain_followup_agent_wrong_cwd_is_failed_and_cancelled(
         herdr_factory=lambda: cast(HerdrClient, client),
     )
 
-    failed = store.get(job.id)
-    assert failed.status == JobStatus.FAILED
-    assert failed.agent_dispatch_state == "ready"
-    assert failed.target_release_pending
-    assert failed.cancellation_reconciliation_pending
-    assert failed.worktree_path == str(checkout)
+    staged = store.get(job.id)
+    assert staged.status == JobStatus.RECONCILING
+    assert staged.terminal_intent_status == JobStatus.FAILED
+    assert staged.agent_dispatch_state == "ready"
+    assert staged.target_release_pending
+    assert staged.cancellation_reconciliation_pending
+    assert staged.worktree_path == str(checkout)
 
     recovery.recover_jobs(
         store,

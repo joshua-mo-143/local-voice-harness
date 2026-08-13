@@ -527,13 +527,13 @@ class CursorStoreIntegrationTests(unittest.TestCase):
                         self.assertNotIn("schema_version", legacy)
                     else:
                         self.assertEqual(legacy["schema_version"], version)
-                    legacy.update({"result": "new result", "revision": 1})
+                    legacy.update({"revision": 1})
                     write_unlocked(path, legacy)
 
                 persisted = json.loads(path.read_text())
                 self.assertEqual(persisted["schema_version"], CURRENT_SCHEMA_VERSION)
                 self.assertEqual(persisted["revision"], 1)
-                self.assertEqual(persisted["result"], "new result")
+                self.assertEqual(persisted["result"], "old result")
                 self.assertIn("created_at", persisted)
                 self.assertIn("delivered", persisted)
 
@@ -1098,16 +1098,17 @@ class CursorStoreIntegrationTests(unittest.TestCase):
         with self.assertWarns(JobQuarantineWarning):
             updated = store.update(
                 "aaaaaaaaaaaa",
-                lambda current: transition(
+                lambda current: stage_terminal_intent(
                     current,
                     JobStatus.CANCELLED,
+                    now=2,
                     result="cancelled",
-                    completed_at=2,
-                    target_release_pending=True,
                 ),
             )
 
         assert updated is not None
+        self.assertEqual(updated.status, JobStatus.RECONCILING)
+        self.assertEqual(updated.terminal_intent_status, JobStatus.CANCELLED)
         self.assertTrue(updated.target_release_pending)
 
     def test_unknown_quarantine_blocks_any_new_reservation(self) -> None:

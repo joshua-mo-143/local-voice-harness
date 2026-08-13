@@ -34,6 +34,19 @@ from ..prompt_operations import (
 from ..questions import PromptOperationState, QuestionState
 from ..user_config import default_user_config
 from . import questions as question_adapter
+from .lifecycle import (
+    CleanupOwned,
+    LifecycleTransitionError,
+    MaterializedTerminalOutcome,
+    TerminalIntent,
+    abandon_cleanup_owner,
+    begin_cleanup,
+    claim_cleanup,
+    cleanup_fields,
+    finish_cleanup_reconciliation,
+    settle_cleanup,
+    take_over_cleanup,
+)
 from .model import (
     TERMINAL_STATUSES,
     CursorJob,
@@ -203,11 +216,6 @@ def reconcile_uncertain_agent(
                 or current.herdr_target != target
             ):
                 return None
-            status = (
-                current.status
-                if current.status in TERMINAL_STATUSES
-                else JobStatus.FAILED
-            )
             changes: dict[str, object] = {
                 "agent_dispatch_state": "ready",
                 "agent_name": str(agent.get("name") or target),
@@ -219,21 +227,23 @@ def reconcile_uncertain_agent(
                 ),
                 "worker_operation": None,
                 "agent_next_reconcile_at": None,
-                "target_release_pending": True,
-                "cancellation_reconciliation_pending": True,
+                "reconciliation_base_error": message,
             }
-            if status == JobStatus.FAILED:
-                changes.update(
-                    error=message,
-                    result=message,
-                    reconciliation_base_error=message,
-                    completed_at=current.completed_at or now,
+            if current.status in TERMINAL_STATUSES:
+                return current.evolve_recovery(
+                    changes,
+                    now=now,
+                    prepare_delivery=True,
                 )
-            return current.evolve_recovery(
-                changes,
+            if current.terminal_intent_status is not None:
+                return current.evolve_recovery(changes, now=now)
+            return stage_terminal_intent(
+                current,
+                JobStatus.FAILED,
                 now=now,
-                status=status,
-                prepare_delivery=current.status not in TERMINAL_STATUSES,
+                result=message,
+                error=message,
+                job_changes=changes,
             )
 
         store.update(job.id, reject_mismatch)
@@ -555,7 +565,7 @@ def reconcile_uncertain_worktree(
                 ),
                 worktree_manual_inspection_required=True,
                 worker_operation=None,
-                cancellation_reconciliation_pending=False,
+                **cleanup_fields(finish_cleanup_reconciliation(current.cleanup_state)),
             )
         return current.evolve_recovery(
             now=now,
@@ -565,7 +575,7 @@ def reconcile_uncertain_worktree(
             worker_operation=None,
             worktree_manual_inspection_required=False,
             worktree_next_reconcile_at=None,
-            cancellation_reconciliation_pending=False,
+            **cleanup_fields(finish_cleanup_reconciliation(current.cleanup_state)),
         )
 
     store.update(job.id, reconciled)
@@ -755,6 +765,8 @@ def stage_terminal_intent(
 ) -> CursorJob:
     if status not in TERMINAL_STATUSES:
         raise HarnessError("terminal cleanup requires a terminal intent")
+    if job.terminal_state is not None:
+        raise HarnessError("terminal outcome or intent is already fixed")
     if (
         job.manual_reconcile_operation == "pane"
         and job.participant_creation_state == "manual_required"
@@ -764,20 +776,16 @@ def stage_terminal_intent(
         result = _append_manual_action(result, action)
         if error is not None:
             error = _append_manual_action(error, action)
+    intent = TerminalIntent(status.value, result, error, now)
+    cleanup = begin_cleanup(uuid.uuid4().hex)
     changes: dict[str, object] = {
-        "terminal_intent_status": status.value,
-        "terminal_intent_result": result,
-        "terminal_intent_error": error,
-        "terminal_intent_completed_at": now,
+        "terminal_intent_status": intent.status,
+        "terminal_intent_result": intent.result,
+        "terminal_intent_error": intent.error,
+        "terminal_intent_completed_at": intent.completed_at,
         "voice_question": (
             job.voice_question if voice_question is None else voice_question
         ),
-        "target_release_pending": True,
-        "target_release_token": uuid.uuid4().hex,
-        "target_release_owner_pid": None,
-        "target_release_owner_boot_id": None,
-        "target_release_owner_start": None,
-        "cancellation_reconciliation_pending": True,
         "worker_operation": (
             job.worker_operation if preserve_worker_operation else "target_cleanup"
         ),
@@ -793,6 +801,7 @@ def stage_terminal_intent(
         "worker_process_start": None if clear_worker else job.worker_process_start,
         "worker_token": None if clear_worker else job.worker_token,
     }
+    changes.update(cleanup_fields(cleanup))
     changes.update(job_changes or {})
     changes["status"] = JobStatus.RECONCILING.value
     return job._updated(**changes)
@@ -955,26 +964,30 @@ def cancel_target_and_release(
             and not _infrastructure_uncertain_for_release(job)
         ):
             if job.terminal_intent_status is not None:
-                terminal = job.terminal_intent_status
-                completed_at = job.terminal_intent_completed_at or time.time()
-                result = job.terminal_intent_result or ""
-                error = job.terminal_intent_error
+                intent = job.terminal_state
+                if not isinstance(intent, TerminalIntent):
+                    return None
+                try:
+                    settled = settle_cleanup(job.cleanup_state, release_token)
+                except LifecycleTransitionError:
+                    return None
+                outcome = MaterializedTerminalOutcome(
+                    intent.status,
+                    intent.result,
+                    intent.error,
+                    intent.completed_at,
+                )
                 return job.evolve_for_delivery(
-                    now=completed_at,
-                    status=terminal,
-                    result=result,
-                    error=str(error) if error is not None else None,
-                    completed_at=completed_at,
+                    now=outcome.completed_at,
+                    status=JobStatus(outcome.status),
+                    result=outcome.result,
+                    error=outcome.error,
+                    completed_at=outcome.completed_at,
                     terminal_intent_status=None,
                     terminal_intent_result=None,
                     terminal_intent_error=None,
                     terminal_intent_completed_at=None,
-                    target_release_pending=False,
-                    target_release_token=None,
-                    target_release_owner_pid=None,
-                    target_release_owner_boot_id=None,
-                    target_release_owner_start=None,
-                    cancellation_reconciliation_pending=False,
+                    **cleanup_fields(settled),
                     worker_operation=None,
                     worker_pid=None,
                     worker_boot_id=None,
@@ -1004,17 +1017,16 @@ def cancel_target_and_release(
                     participant_creation_pane_id=None,
                     workflow_phase=(
                         "finished"
-                        if terminal == JobStatus.COMPLETED
+                        if outcome.status == JobStatus.COMPLETED.value
                         else job.workflow_phase.value
                     ),
                 )
+            try:
+                settled = settle_cleanup(job.cleanup_state, release_token)
+            except LifecycleTransitionError:
+                return None
             return job.evolve(
-                target_release_pending=False,
-                target_release_token=None,
-                target_release_owner_pid=None,
-                target_release_owner_boot_id=None,
-                target_release_owner_start=None,
-                cancellation_reconciliation_pending=False,
+                **cleanup_fields(settled),
                 worker_pid=None,
                 worker_boot_id=None,
                 worker_process_start=None,
@@ -1034,22 +1046,20 @@ def cancel_target_and_release(
                 participant_creation_label=None,
                 participant_creation_workspace_id=None,
                 participant_creation_pane_id=None,
-                result=(
-                    f"Cursor job {job_id} was cancelled."
-                    if job.status == JobStatus.CANCELLED
-                    else job.result
-                ),
                 participant_admission_state=(
                     "released"
                     if job.status in TERMINAL_STATUSES
                     else job.participant_admission_state
                 ),
             )
-        return job.evolve(
-            target_release_owner_pid=None,
-            target_release_owner_boot_id=None,
-            target_release_owner_start=None,
-        )
+        cleanup = job.cleanup_state
+        if not isinstance(cleanup, CleanupOwned):
+            return None
+        try:
+            pending = abandon_cleanup_owner(cleanup, release_token)
+        except LifecycleTransitionError:
+            return None
+        return job.evolve(**cleanup_fields(pending))
 
     store.update(job_id, release)
 
@@ -1484,20 +1494,47 @@ def recover_jobs(
             owner_pid = job.target_release_owner_pid
             owner_boot_id = job.target_release_owner_boot_id
             owner_start = job.target_release_owner_start
+            claimed_cleanup: CleanupOwned | None = None
             if take_release:
                 release_token = uuid.uuid4().hex
                 owner_pid = os.getpid()
                 owner_start = get_process_identity(owner_pid)
                 owner_pid = owner_pid if owner_start else None
                 owner_boot_id = get_boot_identity() if owner_start else None
-                release = (job.id, job.herdr_target or "", release_token)
+                if owner_pid is None or owner_boot_id is None or owner_start is None:
+                    take_release = False
+                else:
+                    try:
+                        cleanup = job.cleanup_state
+                        if isinstance(cleanup, CleanupOwned):
+                            claimed_cleanup = take_over_cleanup(
+                                cleanup,
+                                job.target_release_token or "",
+                                token=release_token,
+                                owner_pid=owner_pid,
+                                owner_boot_id=owner_boot_id,
+                                owner_start=owner_start,
+                            )
+                        else:
+                            claimed_cleanup = claim_cleanup(
+                                cleanup,
+                                job.target_release_token or "",
+                                token=release_token,
+                                owner_pid=owner_pid,
+                                owner_boot_id=owner_boot_id,
+                                owner_start=owner_start,
+                            )
+                    except LifecycleTransitionError:
+                        take_release = False
+                    else:
+                        assert claimed_cleanup.token is not None
+                        release_token = claimed_cleanup.token
+                        release = (job.id, job.herdr_target or "", release_token)
+            cleanup_updates = cleanup_fields(claimed_cleanup or job.cleanup_state)
             if job.terminal_intent_status is not None:
-                if take_release:
+                if take_release and claimed_cleanup is not None:
                     return job.evolve(
-                        target_release_token=release_token,
-                        target_release_owner_pid=owner_pid,
-                        target_release_owner_boot_id=owner_boot_id,
-                        target_release_owner_start=owner_start,
+                        **cleanup_fields(claimed_cleanup),
                         worker_pid=None,
                         worker_boot_id=None,
                         worker_process_start=None,
@@ -1527,10 +1564,7 @@ def recover_jobs(
             ):
                 if take_release:
                     return job.evolve(
-                        target_release_token=release_token,
-                        target_release_owner_pid=owner_pid,
-                        target_release_owner_boot_id=owner_boot_id,
-                        target_release_owner_start=owner_start,
+                        **cleanup_updates,
                         worker_pid=None,
                         worker_boot_id=None,
                         worker_process_start=None,
@@ -1567,10 +1601,7 @@ def recover_jobs(
                         reconcile=True,
                         queued_at=recovered_at,
                         next_reconcile_at=recovered_at + DELIVERY_RETRY_SECONDS,
-                        target_release_token=release_token,
-                        target_release_owner_pid=owner_pid,
-                        target_release_owner_boot_id=owner_boot_id,
-                        target_release_owner_start=owner_start,
+                        **cleanup_updates,
                         worker_pid=None,
                         worker_boot_id=None,
                         worker_process_start=None,
@@ -1581,10 +1612,7 @@ def recover_jobs(
                     should_launch = True
                     return job.evolve(
                         queued_at=job.queued_at or recovered_at,
-                        target_release_token=release_token,
-                        target_release_owner_pid=owner_pid,
-                        target_release_owner_boot_id=owner_boot_id,
-                        target_release_owner_start=owner_start,
+                        **cleanup_updates,
                         worker_pid=None,
                         worker_boot_id=None,
                         worker_process_start=None,
@@ -1600,10 +1628,7 @@ def recover_jobs(
                             status=JobStatus.QUEUED,
                             queued_at=recovered_at,
                             reconcile=True,
-                            target_release_token=release_token,
-                            target_release_owner_pid=owner_pid,
-                            target_release_owner_boot_id=owner_boot_id,
-                            target_release_owner_start=owner_start,
+                            **cleanup_updates,
                             worker_pid=None,
                             worker_boot_id=None,
                             worker_process_start=None,
@@ -1613,10 +1638,7 @@ def recover_jobs(
                         status=JobStatus.QUEUED,
                         remove=frozenset({"reconcile"}),
                         queued_at=recovered_at,
-                        target_release_token=release_token,
-                        target_release_owner_pid=owner_pid,
-                        target_release_owner_boot_id=owner_boot_id,
-                        target_release_owner_start=owner_start,
+                        **cleanup_updates,
                         worker_pid=None,
                         worker_boot_id=None,
                         worker_process_start=None,
@@ -1633,10 +1655,7 @@ def recover_jobs(
                                 status=JobStatus.QUEUED,
                                 remove=frozenset({"reconcile"}),
                                 queued_at=recovered_at,
-                                target_release_token=release_token,
-                                target_release_owner_pid=owner_pid,
-                                target_release_owner_boot_id=owner_boot_id,
-                                target_release_owner_start=owner_start,
+                                **cleanup_updates,
                                 worker_pid=None,
                                 worker_boot_id=None,
                                 worker_process_start=None,
@@ -1646,10 +1665,7 @@ def recover_jobs(
                             status=JobStatus.QUEUED,
                             reconcile=True,
                             queued_at=recovered_at,
-                            target_release_token=release_token,
-                            target_release_owner_pid=owner_pid,
-                            target_release_owner_boot_id=owner_boot_id,
-                            target_release_owner_start=owner_start,
+                            **cleanup_updates,
                             worker_pid=None,
                             worker_boot_id=None,
                             worker_process_start=None,
@@ -1661,10 +1677,7 @@ def recover_jobs(
                             status=JobStatus.QUEUED,
                             remove=frozenset({"reconcile"}),
                             queued_at=recovered_at,
-                            target_release_token=release_token,
-                            target_release_owner_pid=owner_pid,
-                            target_release_owner_boot_id=owner_boot_id,
-                            target_release_owner_start=owner_start,
+                            **cleanup_updates,
                             worker_pid=None,
                             worker_boot_id=None,
                             worker_process_start=None,
@@ -1679,10 +1692,7 @@ def recover_jobs(
                         error=message,
                         result=message,
                         completed_at=recovered_at,
-                        target_release_token=release_token,
-                        target_release_owner_pid=owner_pid,
-                        target_release_owner_boot_id=owner_boot_id,
-                        target_release_owner_start=owner_start,
+                        **cleanup_updates,
                         worker_pid=None,
                         worker_boot_id=None,
                         worker_process_start=None,
@@ -1690,10 +1700,7 @@ def recover_jobs(
                     )
             if take_release:
                 return job.evolve(
-                    target_release_token=release_token,
-                    target_release_owner_pid=owner_pid,
-                    target_release_owner_boot_id=owner_boot_id,
-                    target_release_owner_start=owner_start,
+                    **cleanup_updates,
                     worker_pid=None,
                     worker_boot_id=None,
                     worker_process_start=None,

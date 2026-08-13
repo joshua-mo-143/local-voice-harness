@@ -20,6 +20,40 @@ from ..prompt_operations import (
     load_prompt_operation,
 )
 from ..questions import Question, QuestionError
+from .lifecycle import (
+    AnnouncementAck,
+    CleanupOwned,
+    CleanupSettled,
+    CleanupState,
+    Delivered,
+    DeliveryState,
+    LifecycleTransitionError,
+    MaterializedTerminalOutcome,
+    PendingDelivery,
+    TerminalState,
+    abandon_cleanup_owner,
+    acknowledge_without_claim,
+    cleanup_fields,
+    delivery_fields,
+    dismiss_announcement,
+    finish_cleanup_reconciliation,
+    load_cleanup_state,
+    load_delivery_state,
+    load_terminal_state,
+    repeat_announcement,
+)
+from .lifecycle import (
+    acknowledge_delivery as transition_delivery_acknowledgement,
+)
+from .lifecycle import (
+    prepare_delivery as transition_prepare_delivery,
+)
+from .lifecycle import (
+    release_delivery as transition_delivery_release,
+)
+from .lifecycle import (
+    renew_delivery as transition_delivery_renewal,
+)
 
 CURRENT_SCHEMA_VERSION = 16
 LEGACY_SCHEMA_VERSIONS = frozenset(range(CURRENT_SCHEMA_VERSION))
@@ -40,20 +74,6 @@ class JobStatus(StrEnum):
     COMPLETED = "completed"
     FAILED = "failed"
     CANCELLED = "cancelled"
-
-
-class AnnouncementAck(StrEnum):
-    """How a background announcement was handled.
-
-    Spoken playback is the only state that means TTS succeeded. Desktop and
-    deferred delivery must not be recorded as spoken.
-    """
-
-    PENDING = "pending"
-    SPOKEN = "spoken"
-    DESKTOP = "desktop"
-    DEFERRED = "deferred"
-    DISMISSED = "dismissed"
 
 
 ANNOUNCEMENT_ACK_STATES = frozenset(item.value for item in AnnouncementAck)
@@ -1446,16 +1466,11 @@ class AgentJob:
         remove: frozenset[str] = frozenset(),
         **changes: object,
     ) -> CursorJob:
+        prepared = delivery_fields(transition_prepare_delivery(self.delivery_state))
         return self.evolve(
             status=status,
             remove=remove,
-            delivered=False,
-            delivery_generation=self.delivery_generation + 1,
-            delivery_claim_token=None,
-            delivery_claimed_at=None,
-            delivery_retry_at=0,
-            delivery_attempts=0,
-            announcement_ack=AnnouncementAck.PENDING.value,
+            **prepared,
             updated_at=now,
             **changes,
         )
@@ -1489,7 +1504,16 @@ class AgentJob:
         final_status = status or self.status
         values["status"] = final_status.value
         operation = str(values.get("manual_reconcile_operation") or "")
-        if final_status in TERMINAL_STATUSES and operation:
+        materialized = isinstance(self.terminal_state, MaterializedTerminalOutcome)
+        if materialized:
+            if operation or final_status == JobStatus.FAILED:
+                values["reconciliation_base_error"] = str(
+                    self.reconciliation_base_error
+                    or self.error
+                    or self.result
+                    or "Cursor job failed"
+                ).split("; external operation reconciliation", 1)[0]
+        elif final_status in TERMINAL_STATUSES and operation:
             base = str(
                 values.get("reconciliation_base_error")
                 or (
@@ -1553,17 +1577,18 @@ class AgentJob:
                 error=message,
                 result=message,
             )
+        if materialized:
+            values["status"] = self.status.value
+            for field in ("result", "error", "completed_at"):
+                if field in self._values:
+                    values[field] = self._values[field]
+                else:
+                    values.pop(field, None)
         if prepare_delivery:
             values.update(
-                delivered=False,
-                delivery_generation=self.delivery_generation + 1,
-                delivery_claim_token=None,
-                delivery_claimed_at=None,
-                delivery_retry_at=0,
-                delivery_attempts=0,
-                announcement_ack=AnnouncementAck.PENDING.value,
-                updated_at=now,
+                delivery_fields(transition_prepare_delivery(self.delivery_state))
             )
+            values["updated_at"] = now
         values["schema_version"] = CURRENT_SCHEMA_VERSION
         values["revision"] = self.revision + 1
         updated = CursorJob.from_dict(values)
@@ -1610,8 +1635,10 @@ class AgentJob:
                     f"{operation}_confirmed_absent_at": now,
                     f"{operation}_next_reconcile_at": None,
                     "worker_operation": None,
-                    "cancellation_reconciliation_pending": False,
                 }
+            )
+            changes.update(
+                cleanup_fields(finish_cleanup_reconciliation(self.cleanup_state))
             )
             if operation == "agent":
                 participant = self.active_participant
@@ -1642,8 +1669,10 @@ class AgentJob:
                     "manual_reconcile_token": uuid.uuid4().hex,
                     "manual_reconcile_required_at": now,
                     "worker_operation": None,
-                    "cancellation_reconciliation_pending": False,
                 }
+            )
+            changes.update(
+                cleanup_fields(finish_cleanup_reconciliation(self.cleanup_state))
             )
         else:
             changes[f"{operation}_next_reconcile_at"] = now + min(
@@ -1652,7 +1681,10 @@ class AgentJob:
         return self.evolve_recovery(
             changes,
             now=now,
-            prepare_delivery=changes.get(state_key) == "manual_required",
+            prepare_delivery=(
+                changes.get(state_key) == "manual_required"
+                and self.terminal_intent_status is None
+            ),
         )
 
     def _optional_string(self, field: str) -> str | None:
@@ -2175,6 +2207,40 @@ class AgentJob:
         return self._optional_float("terminal_intent_completed_at")
 
     @property
+    def terminal_state(self) -> TerminalState:
+        try:
+            return load_terminal_state(
+                status=self.status.value,
+                result=self.result,
+                error=self.error,
+                completed_at=self.completed_at,
+                intent_status=(
+                    self.terminal_intent_status.value
+                    if self.terminal_intent_status is not None
+                    else None
+                ),
+                intent_result=self.terminal_intent_result,
+                intent_error=self.terminal_intent_error,
+                intent_completed_at=self.terminal_intent_completed_at,
+            )
+        except LifecycleTransitionError as exc:
+            raise JobValidationError(str(exc)) from exc
+
+    @property
+    def cleanup_state(self) -> CleanupState:
+        try:
+            return load_cleanup_state(
+                pending=self.target_release_pending,
+                token=self.target_release_token,
+                owner_pid=self.target_release_owner_pid,
+                owner_boot_id=self.target_release_owner_boot_id,
+                owner_start=self.target_release_owner_start,
+                reconciliation_pending=self.cancellation_reconciliation_pending,
+            )
+        except LifecycleTransitionError as exc:
+            raise JobValidationError(str(exc)) from exc
+
+    @property
     def review_approved(self) -> bool:
         return self._boolean_field("review_approved")
 
@@ -2317,20 +2383,21 @@ class AgentJob:
             "manual_reconcile_token": None,
             "manual_reconcile_resolved_at": resolved_at,
             "manual_reconcile_outcome": outcome,
-            "cancellation_reconciliation_pending": False,
-            "target_release_pending": retain_terminal_release,
-            "target_release_token": (
-                self.target_release_token if retain_terminal_release else None
-            ),
-            "target_release_owner_pid": None,
-            "target_release_owner_boot_id": None,
-            "target_release_owner_start": None,
             "worker_operation": None,
             "worker_pid": None,
             "worker_boot_id": None,
             "worker_process_start": None,
             "worker_token": None,
         }
+        cleanup = self.cleanup_state
+        if isinstance(cleanup, CleanupOwned):
+            cleanup = abandon_cleanup_owner(cleanup, cleanup.token or "")
+        reconciled_cleanup = finish_cleanup_reconciliation(cleanup)
+        if not retain_terminal_release:
+            reconciled_cleanup = CleanupSettled()
+        changes.update(cleanup_fields(reconciled_cleanup))
+        if retain_terminal_release and not self.target_release_pending:
+            raise JobValidationError("terminal reconciliation requires release cleanup")
         if operation == "prompt":
             changes[state_key] = "submitted" if outcome == "materialized" else "none"
             if outcome == "confirmed_absent":
@@ -2411,47 +2478,130 @@ class AgentJob:
     def delivery_attempts(self) -> int:
         return _integer(self._values.get("delivery_attempts") or 0, "delivery_attempts")
 
-    def claim_delivery(self, token: str, *, claimed_at: float) -> CursorJob:
-        return self._updated(
-            delivery_claim_token=token,
-            delivery_claimed_at=claimed_at,
-            delivery_attempts=self.delivery_attempts + 1,
+    @property
+    def delivery_state(self) -> DeliveryState:
+        try:
+            return load_delivery_state(
+                delivered=self.delivered,
+                generation=self.delivery_generation,
+                claim_token=self.delivery_claim_token,
+                claimed_at=self.delivery_claimed_at,
+                retry_at=self.delivery_retry_at,
+                attempts=self.delivery_attempts,
+                delivered_at=self.delivered_at,
+                acknowledgement=self.announcement_ack,
+                dismissed=self.announcement_dismissed,
+                repeated=self.announcement_repeated,
+            )
+        except LifecycleTransitionError as exc:
+            raise JobValidationError(str(exc)) from exc
+
+    def claim_delivery(
+        self, token: str, *, claimed_at: float, lease_seconds: float
+    ) -> CursorJob:
+        from .lifecycle import claim_delivery
+
+        state = claim_delivery(
+            self.delivery_state,
+            token,
+            claimed_at,
+            lease_seconds=lease_seconds,
         )
+        return self._updated(**delivery_fields(state))
 
-    def renew_delivery(self, *, claimed_at: float) -> CursorJob:
-        return self._updated(delivery_claimed_at=claimed_at)
-
-    def acknowledge_delivery(self, *, delivered_at: float) -> CursorJob:
-        return self._updated(
-            delivered=True,
-            announcement_ack=AnnouncementAck.SPOKEN.value,
-            delivery_claim_token=None,
-            delivery_claimed_at=None,
-            delivery_retry_at=0,
-            delivered_at=delivered_at,
+    def renew_delivery(
+        self, token: str, *, claimed_at: float, lease_seconds: float
+    ) -> CursorJob:
+        state = transition_delivery_renewal(
+            self.delivery_state,
+            token,
+            claimed_at,
+            lease_seconds=lease_seconds,
         )
+        return self._updated(**delivery_fields(state))
 
-    def acknowledge_desktop_delivery(self) -> CursorJob:
-        return self._updated(
-            announcement_ack=AnnouncementAck.DESKTOP.value,
-            delivery_claim_token=None,
-            delivery_claimed_at=None,
-            delivery_retry_at=0,
+    def acknowledge_delivery(
+        self, token: str, *, delivered_at: float, lease_seconds: float
+    ) -> CursorJob:
+        state = transition_delivery_acknowledgement(
+            self.delivery_state,
+            token,
+            delivered_at,
+            AnnouncementAck.SPOKEN,
+            lease_seconds=lease_seconds,
         )
+        return self._updated(**delivery_fields(state))
 
-    def acknowledge_deferred_delivery(self) -> CursorJob:
-        return self._updated(
-            announcement_ack=AnnouncementAck.DEFERRED.value,
-            delivery_claim_token=None,
-            delivery_claimed_at=None,
-            delivery_retry_at=0,
+    def acknowledge_desktop_delivery(
+        self, token: str, *, acknowledged_at: float, lease_seconds: float
+    ) -> CursorJob:
+        state = transition_delivery_acknowledgement(
+            self.delivery_state,
+            token,
+            acknowledged_at,
+            AnnouncementAck.DESKTOP,
+            lease_seconds=lease_seconds,
         )
+        return self._updated(**delivery_fields(state))
 
-    def release_delivery(self, *, retry_at: float) -> CursorJob:
+    def acknowledge_deferred_delivery(
+        self, token: str, *, acknowledged_at: float, lease_seconds: float
+    ) -> CursorJob:
+        state = transition_delivery_acknowledgement(
+            self.delivery_state,
+            token,
+            acknowledged_at,
+            AnnouncementAck.DEFERRED,
+            lease_seconds=lease_seconds,
+        )
+        return self._updated(**delivery_fields(state))
+
+    def release_delivery(self, token: str, *, retry_at: float) -> CursorJob:
+        state = transition_delivery_release(
+            self.delivery_state,
+            token,
+            retry_at=retry_at,
+        )
+        return self._updated(**delivery_fields(state))
+
+    def mark_delivered(
+        self,
+        *,
+        delivered_at: float | None = None,
+        status: JobStatus | None = None,
+        **changes: object,
+    ) -> CursorJob:
+        state = acknowledge_without_claim(self.delivery_state, delivered_at)
+        values = dict(changes)
+        values.update(delivery_fields(state))
+        if status is not None:
+            values["status"] = status.value
+        return self._updated(**values)
+
+    def dismiss_announcement(self, *, delivered_at: float) -> CursorJob:
+        current = self.delivery_state
+        announcement = dismiss_announcement(current.announcement)
+        state = Delivered(
+            current.generation,
+            delivered_at,
+            current.attempts,
+            announcement,
+        )
+        return self._updated(**delivery_fields(state))
+
+    def repeat_announcement(self, *, now: float) -> CursorJob:
+        state = transition_prepare_delivery(self.delivery_state)
+        announcement = repeat_announcement(state.announcement)
         return self._updated(
-            delivery_claim_token=None,
-            delivery_claimed_at=None,
-            delivery_retry_at=retry_at,
+            **delivery_fields(
+                PendingDelivery(
+                    state.generation,
+                    state.retry_at,
+                    state.attempts,
+                    announcement,
+                )
+            ),
+            updated_at=now,
         )
 
     def _updated(self, **changes: object) -> CursorJob:
@@ -2464,6 +2614,14 @@ class AgentJob:
         return updated
 
     def validate_invariants(self, *, require_worker_owner: bool = False) -> None:
+        # Parse every compatibility field group through its typed adapter. Flat
+        # JSON remains the durable format, but invalid cross-field states fail
+        # at the model boundary.
+        _ = (
+            self.terminal_state,
+            self.cleanup_state,
+            self.delivery_state,
+        )
         if self.participant_admission_state not in {"waiting", "held", "released"}:
             raise JobValidationError("participant_admission_state has invalid value")
         if (
@@ -2999,6 +3157,35 @@ def validate_transition(before: CursorJob, after: CursorJob) -> None:
         raise JobValidationError("agent job transition cannot change harness_kind")
     if before.issue_provider != after.issue_provider:
         raise JobValidationError("agent job transition cannot change issue_provider")
+    before_terminal = before.terminal_state
+    after_terminal = after.terminal_state
+    if (
+        before.terminal_intent_status is not None
+        and after.terminal_intent_status is not None
+        and before.terminal_intent_status != after.terminal_intent_status
+    ):
+        raise JobValidationError("terminal intent status cannot be rewritten")
+    if (
+        isinstance(after_terminal, MaterializedTerminalOutcome)
+        and not isinstance(before_terminal, MaterializedTerminalOutcome)
+        and (
+            after.target_release_pending
+            or after.cancellation_reconciliation_pending
+            or any(
+                after._values.get(field)
+                for field in (
+                    "herdr_target",
+                    "planner_target",
+                    "reviewer_target",
+                    "implementer_target",
+                    "participant_creation_target",
+                )
+            )
+        )
+    ):
+        raise JobValidationError(
+            "terminal outcome cannot materialize before cleanup settles"
+        )
     if after.parent_job_id is not None:
         # A follow-up child inherits its parent's exact checkout. That identity
         # must never be substituted, removed, or reconstructed by recovery.
@@ -3059,6 +3246,10 @@ def validate_transition(before: CursorJob, after: CursorJob) -> None:
             "illegal Cursor job transition "
             f"{before.status.value} -> {after.status.value}"
         )
+    if isinstance(before_terminal, MaterializedTerminalOutcome) and (
+        after_terminal != before_terminal
+    ):
+        raise JobValidationError("materialized terminal outcome is immutable")
     admission_transitions = {
         "waiting": {"waiting", "held", "released"},
         "held": {"held", "released"},

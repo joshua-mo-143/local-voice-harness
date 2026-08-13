@@ -8,7 +8,9 @@ from pathlib import Path
 from local_voice_harness.cursor.delivery import (
     DELIVERY_CLAIM_SECONDS,
     DeliveryClaim,
+    acknowledge_deferred_delivery,
     acknowledge_delivery,
+    acknowledge_desktop_delivery,
     claim_delivery,
     pending_deliveries,
     release_delivery,
@@ -141,6 +143,45 @@ class CursorDeliveryTests(unittest.TestCase):
             acknowledge_delivery(self.store, claim.job.id, claim.token, now=expires_at)
         )
         self.assertEqual(self.store.get(claim.job.id).revision, 1)
+
+    def test_expired_lease_rejects_desktop_and_deferred_acknowledgements(
+        self,
+    ) -> None:
+        callbacks = (
+            acknowledge_desktop_delivery,
+            acknowledge_deferred_delivery,
+        )
+        for callback in callbacks:
+            with self.subTest(callback=callback.__name__):
+                temporary = tempfile.TemporaryDirectory()
+                self.addCleanup(temporary.cleanup)
+                root = Path(temporary.name)
+                store = JobStore(root / "jobs", root / "legacy")
+                store.create(
+                    CursorJob.from_dict(
+                        {
+                            "id": "123456789abc",
+                            "status": "completed",
+                            "request": "test",
+                            "result": "done",
+                            "created_at": 1,
+                            "completed_at": 1,
+                            "delivered": False,
+                        }
+                    )
+                )
+                claim = claim_delivery(store, now=100)
+                assert claim is not None
+
+                self.assertFalse(
+                    callback(
+                        store,
+                        claim.job.id,
+                        claim.token,
+                        now=100 + DELIVERY_CLAIM_SECONDS,
+                    )
+                )
+                self.assertEqual(store.get(claim.job.id).revision, 1)
 
     def test_reclaim_replaces_token_and_fences_old_acknowledgement(self) -> None:
         original = claim_delivery(self.store, now=100)
