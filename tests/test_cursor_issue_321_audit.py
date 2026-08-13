@@ -279,6 +279,72 @@ def test_cleanup_rejects_replacement_session_and_retains_reservation(
     assert store.get(job.id).target_release_pending
 
 
+def test_cleanup_accepts_created_participant_proof_without_known_root_pane(
+    tmp_path: Path,
+) -> None:
+    store = _store(tmp_path)
+    job = store.create(
+        _current_job(
+            status="cancelled",
+            completed_at=3,
+            result="cancelled",
+            worker_token=None,
+            worker_pid=None,
+            worker_boot_id=None,
+            worker_process_start=None,
+            worker_claim_operation=None,
+            worker_claimed_at=None,
+            worktree_branch=None,
+            worktree_workspace_id=None,
+            worktree_root_pane_id=None,
+            worktree_provision_state=None,
+            agent_dispatch_state="ready",
+            agent_provider="cursor/herdr",
+            agent_provider_session_id="owned-session",
+            agent_state_sequence=7,
+            participant_creation_state="created",
+            participant_creation_participant="planner",
+            participant_creation_target="agent",
+            participant_creation_label="audit-planner",
+            participant_creation_checkout="/checkout",
+            participant_creation_workspace_id="workspace",
+            participant_creation_pane_id="pane",
+            target_release_pending=True,
+            target_release_token="release",
+        )
+    )
+    client = mock.Mock()
+    client.reconcile_session.return_value = SessionReconciliation(
+        ReconciliationState.SETTLED,
+        HarnessSession(
+            "cursor/herdr",
+            "owned-session",
+            "agent",
+            8,
+            {
+                "cwd": "/checkout",
+                "workspace_id": "workspace",
+                "pane_id": "pane",
+            },
+        ),
+        "settled",
+        True,
+    )
+
+    cancel_target_and_release(
+        store,
+        job.id,
+        "agent",
+        "release",
+        herdr_factory=lambda: client,
+    )
+
+    client.close_owned_pane.assert_called_once_with("agent", "pane", "workspace")
+    current = store.get(job.id)
+    assert not current.target_release_pending
+    assert not current.target_release_manual_required
+
+
 def test_v17_cleanup_requires_live_binding_and_known_root_pane(
     tmp_path: Path,
 ) -> None:

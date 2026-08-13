@@ -1235,7 +1235,10 @@ def cancel_target_and_release(
                 checkout_workspace_id = (
                     checkout_operation.workspace_id
                     if checkout_operation is not None
-                    else current.worktree_workspace_id
+                    else (
+                        current.worktree_workspace_id
+                        or agent_operation.spec.workspace_id
+                    )
                 )
                 checkout_root_pane_id = (
                     checkout_operation.root_pane_id
@@ -1245,7 +1248,6 @@ def cancel_target_and_release(
                 if (
                     not checkout_path
                     or checkout_workspace_id is None
-                    or checkout_root_pane_id is None
                     or agent_operation.spec.checkout != checkout_path
                     or agent_operation.spec.workspace_id != checkout_workspace_id
                 ):
@@ -1291,19 +1293,28 @@ def cancel_target_and_release(
                     )
                 except OSError:
                     checkout_matches = False
+                try:
+                    creation_operation = current.participant_pane_operation
+                except JobValidationError:
+                    creation_operation = None
+                creation_proves_non_root = bool(
+                    creation_operation is not None
+                    and creation_operation.state == OperationState.SETTLED
+                    and creation_operation.spec.target == participant_target
+                    and creation_operation.pane_id == pane_id
+                    and creation_operation.spec.workspace_id == workspace_id
+                    and creation_operation.spec.checkout == checkout_path
+                )
                 if (
                     not agent_operation.accepts_observation(identity)
                     or pane_id != agent_operation.spec.pane_id
                     or workspace_id != agent_operation.spec.workspace_id
                     or not checkout_matches
-                    or pane_id == checkout_root_pane_id
+                    or (
+                        bool(checkout_root_pane_id) and pane_id == checkout_root_pane_id
+                    )
+                    or (not checkout_root_pane_id and not creation_proves_non_root)
                 ):
-                    cleanup_confirmed = False
-                    unverified_targets.add(participant_target)
-                    continue
-                try:
-                    creation_operation = current.participant_pane_operation
-                except JobValidationError:
                     cleanup_confirmed = False
                     unverified_targets.add(participant_target)
                     continue
