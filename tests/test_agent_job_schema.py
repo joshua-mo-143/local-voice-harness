@@ -189,8 +189,12 @@ def test_legacy_directory_import_rewrites_v8_record(tmp_path: Path) -> None:
     assert migrate_legacy_jobs(legacy, durable) == set()
 
     persisted = json.loads((durable / source.name).read_text())
-    expected = AgentJob.from_dict(fixture("cursor-v8.json")).to_record()
-    assert persisted == expected
+    canonical = AgentJob.from_dict(persisted)
+    assert canonical.loaded_schema_version == CURRENT_SCHEMA_VERSION
+    canonical.validate_invariants(require_worker_owner=True)
+    assert canonical.agent_dispatch_state == "ambiguous"
+    assert "migration_source_schema_version" not in canonical.to_dict()
+    assert "agent_identity_legacy_compatible" not in canonical.to_dict()
     assert not source.exists()
 
 

@@ -516,6 +516,14 @@ WORKFLOW_PLAN[token]: <bounded multiline implementation plan>
         ) -> None:
             events.append("worktree:settled")
 
+        def plan_participant(
+            _name: str,
+            _label: str,
+            _workspace: str | None,
+            participant_checkout: Path,
+        ) -> None:
+            events.append(f"participant:{participant_checkout}")
+
         def reserve_agent(_selection: herdr.AgentSelection, dispatching: bool) -> None:
             events.append(f"agent:reserved:{dispatching}")
 
@@ -556,6 +564,7 @@ WORKFLOW_PLAN[token]: <bounded multiline implementation plan>
                 settle=lambda _selection: events.append("agent:settled"),
                 reserve_worktree=reserve_worktree,
                 settle_worktree=settle_worktree,
+                plan_participant=plan_participant,
             )
 
         self.assertEqual(
@@ -564,6 +573,7 @@ WORKFLOW_PLAN[token]: <bounded multiline implementation plan>
                 "worktree:planned",
                 "worktree:dispatching",
                 "worktree:settled",
+                f"participant:{checkout}",
                 "agent:reserved:True",
                 "agent:started",
                 "agent:settled",
@@ -671,6 +681,43 @@ WORKFLOW_PLAN[token]: <bounded multiline implementation plan>
 
         self.assertEqual(outcome.status, "idle")
         self.assertEqual(outcome.summary, "finished")
+
+    def test_completion_ignores_sequence_churn_after_output_settles(self) -> None:
+        client = herdr.HerdrClient("herdr")
+        marker = "VOICE_SUMMARY[token]: finished"
+        with (
+            mock.patch.object(
+                client,
+                "get_agent",
+                side_effect=[
+                    {
+                        "agent_status": "done",
+                        "state_change_seq": 41,
+                        "revision": 1,
+                    },
+                    {
+                        "agent_status": "done",
+                        "state_change_seq": 42,
+                        "revision": 2,
+                    },
+                ],
+            ),
+            mock.patch.object(client, "run_text", return_value=marker),
+            mock.patch(
+                "local_voice_harness.integrations.herdr.transport.time.monotonic",
+                side_effect=[0, 0, 1],
+            ),
+            mock.patch("local_voice_harness.integrations.herdr.transport.time.sleep"),
+        ):
+            outcome = client.wait_for_stable_completion(
+                "agent",
+                token="token",
+                quiet_period=1,
+            )
+
+        self.assertEqual(outcome.status, "done")
+        self.assertEqual(outcome.summary, "finished")
+        self.assertEqual(outcome.state_change_sequence, 42)
 
     def test_active_plan_marker_returns_fenced_build_boundary(self) -> None:
         client = herdr.HerdrClient("herdr")

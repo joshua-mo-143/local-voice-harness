@@ -28,6 +28,7 @@ from ..job_lifecycle import (
 from .model import (
     ACTIVE_STATUSES,
     CURRENT_SCHEMA_VERSION,
+    LEGACY_BOOT_ID,
     TERMINAL_STATUSES,
     CursorJob,
     JobStatus,
@@ -1035,14 +1036,29 @@ def _normalize_for_durable_write(
             "absent",
             "stopped",
         }
-        values.update(
-            worker_token=None,
-            worker_pid=None,
-            worker_boot_id=None,
-            worker_process_start=None,
-            worker_claim_operation=None,
-            worker_claimed_at=None,
-        )
+        if active and legacy_worker_disposition is None and not legacy_unowned_active:
+            # Keep an unresolved imported owner as explicit canonical evidence.
+            # Cancellation/nuke must inspect this fence before releasing it.
+            values.update(
+                worker_token=candidate.worker_token or LEGACY_BOOT_ID,
+                worker_pid=candidate.worker_pid or 1,
+                worker_boot_id=LEGACY_BOOT_ID,
+                worker_process_start=(candidate.worker_process_start or LEGACY_BOOT_ID),
+                worker_claim_operation=(
+                    values.get("worker_claim_operation") or "legacy_import"
+                ),
+                worker_claimed_at=values.get("worker_claimed_at")
+                or candidate.created_at,
+            )
+        else:
+            values.update(
+                worker_token=None,
+                worker_pid=None,
+                worker_boot_id=None,
+                worker_process_start=None,
+                worker_claim_operation=None,
+                worker_claimed_at=None,
+            )
         if active and safely_cleared:
             values.update(
                 status=JobStatus.QUEUED.value,
@@ -1051,7 +1067,7 @@ def _normalize_for_durable_write(
                     candidate.herdr_target or candidate.has_uncertain_operation()
                 ),
             )
-        elif active:
+        elif active and legacy_worker_disposition is not None:
             message = (
                 "Legacy Cursor worker ownership could not be verified safely; "
                 "manual recovery is required."
@@ -1069,6 +1085,63 @@ def _normalize_for_durable_write(
             target_release_owner_boot_id=None,
             target_release_owner_start=None,
         )
+    if candidate.loaded_schema_version < CURRENT_SCHEMA_VERSION:
+        if (
+            values.get("agent_identity_legacy_compatible")
+            and values.get("agent_dispatch_state") in {"ready", "retained"}
+            and not (
+                values.get("agent_provider") and values.get("agent_provider_session_id")
+            )
+        ):
+            values["agent_dispatch_state"] = "ambiguous"
+        if (
+            values.get("agent_dispatch_state") is None
+            and values.get("herdr_target")
+            and values.get("herdr_workspace_id")
+            and values.get("herdr_pane_id")
+        ):
+            raw_owners = values.get("participant_session_owners")
+            owners = list(raw_owners) if isinstance(raw_owners, list) else []
+            if not any(
+                isinstance(owner, dict)
+                and owner.get("target") == values["herdr_target"]
+                for owner in owners
+            ):
+                owners.append(
+                    {
+                        "provider": str(values.get("harness_kind") or "cursor"),
+                        "session_id": str(
+                            values.get("session_id") or values["herdr_target"]
+                        ),
+                        "target": str(values["herdr_target"]),
+                        "state_sequence": 0,
+                        "checkout": str(
+                            values.get("worktree_path")
+                            or values.get("repository")
+                            or "legacy-unknown"
+                        ),
+                        "workspace_id": str(values["herdr_workspace_id"]),
+                        "pane_id": str(values["herdr_pane_id"]),
+                    }
+                )
+                values["participant_session_owners"] = owners
+        workspace_id = values.get("worktree_workspace_id")
+        root_pane_id = values.get("worktree_root_pane_id")
+        if bool(workspace_id) != bool(root_pane_id):
+            values.update(
+                worktree_workspace_id=workspace_id or LEGACY_BOOT_ID,
+                worktree_root_pane_id=root_pane_id or LEGACY_BOOT_ID,
+            )
+        if values.get("worktree_provision_state") in {"ready", "retained"} and (
+            not workspace_id or not root_pane_id
+        ):
+            values["worktree_provision_state"] = "ambiguous"
+    for field in (
+        "migration_source_schema_version",
+        "phase_prompt_active",
+        "agent_identity_legacy_compatible",
+    ):
+        values.pop(field, None)
     values["schema_version"] = CURRENT_SCHEMA_VERSION
     if candidate._compatibility_layout:
         values.pop("harness_kind", None)
@@ -2154,8 +2227,7 @@ class JobStore:
                         raise JobValidationError(
                             "Cursor job id must match its filename"
                         )
-                    if not _has_legacy_worker_claim(candidate):
-                        _normalize_for_durable_write(candidate)
+                    _normalize_for_durable_write(candidate)
                 except JobValidationError as error:
                     blocked.add(source.stem)
                     invalid_sources.add(source)
@@ -2177,9 +2249,7 @@ class JobStore:
                         raise JobValidationError(
                             "Cursor job id must match its filename"
                         )
-                    preserve_legacy_owner = _has_legacy_worker_claim(candidate)
-                    if not preserve_legacy_owner:
-                        candidate = _normalize_for_durable_write(candidate)
+                    candidate = _normalize_for_durable_write(candidate)
                     try:
                         current_raw = self._db.load_job(connection, candidate.id)
                     except FileNotFoundError:
@@ -2213,14 +2283,19 @@ class JobStore:
                         _validate_quarantine_reservation_unlocked(
                             self.durable_dir, candidate, "worktree"
                         )
-                    if preserve_legacy_owner:
-                        self._db.save_job(
-                            connection,
-                            candidate.to_dict(preserve_loaded_version=True),
-                            reservations=self._reservation_rows(candidate),
+                    self._save(connection, candidate)
+                    projected = CursorJob.from_dict(
+                        self._db.load_job(connection, candidate.id)
+                    )
+                    projected.validate_invariants(require_worker_owner=True)
+                    if (
+                        projected.loaded_schema_version != CURRENT_SCHEMA_VERSION
+                        or projected.to_dict() != candidate.to_dict()
+                    ):
+                        raise JobValidationError(
+                            "legacy import relational projection is not a "
+                            "lossless native schema-v18 job"
                         )
-                    else:
-                        self._save(connection, candidate)
                     archived.append(source)
                 except (JobValidationError, sqlite3.IntegrityError) as error:
                     blocked.add(source.stem)
@@ -2282,7 +2357,7 @@ class JobStore:
         with _SQLITE_OPEN_LOCK:
             if self._ready:
                 return
-            self._db.initialize()
+            self._db.initialize(normalize_legacy=_normalize_for_durable_write)
             with self._locked_legacy_and_durable():
                 with self._db.transaction() as connection:
                     complete = self._db.meta(connection, "cutover_complete") == "1"

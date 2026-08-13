@@ -1065,7 +1065,9 @@ def test_foreground_timeout_confirms_new_job_by_channel(
     assert job.id not in response.spoken_text
     assert job.id in response.display_text
     assert "local-voice-harness issue 149" in response.display_text
-    assert service.read_job(job.id).foreground_until == 0
+    persisted = service.read_job(job.id)
+    assert persisted.foreground_until == job.foreground_until
+    assert persisted.revision == job.revision
 
 
 def test_foreground_timeout_acknowledges_repeated_answers_as_continuations(
@@ -1886,7 +1888,7 @@ def test_nuke_jobs_checks_legacy_claim_before_modern_token(
     inspect.assert_called_once()
     stop.assert_not_called()
     store = JobStore(jobs_dir, tmp_path / "legacy")
-    assert store.get("aaaaaaaaaaaa").loaded_schema_version == 5
+    assert store.get("aaaaaaaaaaaa").loaded_schema_version == CURRENT_SCHEMA_VERSION
     assert (jobs_dir / "aaaaaaaaaaaa.json.imported").exists()
 
 

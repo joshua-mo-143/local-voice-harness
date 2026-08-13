@@ -1,15 +1,418 @@
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import sqlite3
-from collections.abc import Iterable, Iterator, Mapping
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
-DATABASE_SCHEMA_VERSION = 1
+DATABASE_SCHEMA_VERSION = 2
 DATABASE_FILENAME = "jobs.sqlite3"
+BOOTSTRAP_LOCK_FILENAME = ".sqlite-bootstrap.lock"
+
+# Schema-v18 inventory.  Every canonical value belongs to exactly one named
+# row.  The four compatibility values are accepted only by the JSON/EAV import
+# adapter and are never lifecycle state in schema v2.
+_NAMED_TABLE_FIELDS: dict[str, tuple[str, ...]] = {
+    "job_identity": (
+        "parent_job_id",
+        "revision",
+        "status",
+        "harness_kind",
+        "issue_provider",
+        "request",
+        "utterance",
+        "trusted_utterance",
+        "created_at",
+        "updated_at",
+        "queued_at",
+        "started_at",
+        "completed_at",
+        "foreground_until",
+        "continuation",
+        "continuation_answer",
+        "reconcile",
+        "context_repository",
+        "repository_hint",
+        "speakable_label",
+        "grouped_repository_targets",
+        "grouped_repository_candidates",
+        "grouped_repository_launches",
+        "grouped_repository_coordinator_id",
+    ),
+    "job_prompt_question": (
+        "clarification_kind",
+        "clarifications",
+        "interactive_questionnaire_blocked",
+        "prompt_baseline_sequence",
+        "prompt_context_sessions",
+        "prompt_manifest",
+        "prompt_operation_agent_session",
+        "prompt_operation_phase",
+        "prompt_operation_state",
+        "prompt_operation_target",
+        "prompt_operation_turn",
+        "question",
+        "turn",
+        "turn_token",
+        "voice_question",
+    ),
+    "job_terminal_cleanup": (
+        "error",
+        "result",
+        "terminal_intent_completed_at",
+        "terminal_intent_error",
+        "terminal_intent_result",
+        "terminal_intent_status",
+    ),
+    "job_delivery_announcement": (
+        "announcement_ack",
+        "announcement_dismissed",
+        "announcement_repeated",
+        "delivered",
+        "delivered_at",
+        "delivery_attempts",
+        "delivery_claim_token",
+        "delivery_claimed_at",
+        "delivery_generation",
+        "delivery_retry_at",
+    ),
+    "job_workflow_review_approval_participant": (
+        "active_participant",
+        "implementer_target",
+        "participant_admission_state",
+        "participant_creation_checkout",
+        "participant_creation_label",
+        "participant_creation_pane_id",
+        "participant_creation_participant",
+        "participant_creation_state",
+        "participant_creation_target",
+        "participant_creation_workspace_id",
+        "participant_session_owners",
+        "plan_approval_agent_session",
+        "plan_approval_completion_pending",
+        "plan_approval_counted",
+        "plan_approval_id",
+        "plan_approval_plan_artifact",
+        "plan_approval_review_artifact",
+        "plan_approval_revision",
+        "plan_approval_source",
+        "plan_approval_state",
+        "plan_approval_state_change_sequence",
+        "plan_artifact",
+        "planner_target",
+        "review_approval_source",
+        "review_approved",
+        "review_artifact",
+        "review_decision",
+        "review_round",
+        "reviewer_target",
+        "workflow_classification_reason",
+        "workflow_phase",
+        "workflow_tier",
+        "workflow_turn_phase",
+    ),
+    "job_checkout_fork": (
+        "fork_absent_observations",
+        "fork_automatic_reconcile_stopped_at",
+        "fork_committed",
+        "fork_committed_at",
+        "fork_confirmed",
+        "fork_confirmed_absent_at",
+        "fork_dispatch_exited",
+        "fork_exists",
+        "fork_last_reconciled_at",
+        "fork_next_reconcile_at",
+        "fork_operation_login",
+        "fork_operation_source",
+        "fork_operation_source_default_branch",
+        "fork_operation_source_parent",
+        "fork_operation_source_private",
+        "fork_operation_source_url",
+        "fork_operation_state",
+        "fork_operation_target",
+        "fork_reconcile_attempts",
+        "fork_repository",
+        "fork_requested",
+        "fork_retained_at",
+        "pull_request_branch",
+        "pull_request_head_oid",
+        "pull_request_head_ref",
+        "pull_request_remote_url",
+        "pull_request_worktree_error",
+        "pull_request_worktree_state",
+        "repository",
+        "worktree_absent_observations",
+        "worktree_automatic_reconcile_stopped_at",
+        "worktree_branch",
+        "worktree_confirmed_absent_at",
+        "worktree_dispatch_exited",
+        "worktree_label",
+        "worktree_last_reconciled_at",
+        "worktree_manual_inspection_required",
+        "worktree_next_reconcile_at",
+        "worktree_path",
+        "worktree_provision_error",
+        "worktree_provision_state",
+        "worktree_quarantine_acknowledged_at",
+        "worktree_reconcile_attempts",
+        "worktree_retained_at",
+        "worktree_root_pane_id",
+        "worktree_workspace_id",
+    ),
+    "job_provider_ticket": (
+        "github_issue",
+        "github_issue_context",
+        "github_issue_create_body",
+        "github_issue_create_confirmed",
+        "github_issue_create_marker",
+        "github_issue_create_operation_state",
+        "github_issue_create_requested",
+        "github_issue_create_title",
+        "github_issue_created_number",
+        "github_issue_created_url",
+        "github_issue_url",
+        "github_pull_request",
+        "github_repository",
+        "issue_key",
+        "linear_ticket_create_baseline_sequence",
+        "linear_ticket_create_confirmed",
+        "linear_ticket_create_description",
+        "linear_ticket_create_marker",
+        "linear_ticket_create_operation_state",
+        "linear_ticket_create_prompt_session",
+        "linear_ticket_create_prompt_target",
+        "linear_ticket_create_prompt_token",
+        "linear_ticket_create_requested",
+        "linear_ticket_create_team",
+        "linear_ticket_create_team_id",
+        "linear_ticket_create_title",
+        "linear_ticket_created_identifier",
+        "linear_ticket_created_url",
+    ),
+    "job_session_pane": (
+        "agent_absent_observations",
+        "agent_automatic_reconcile_stopped_at",
+        "agent_confirmed_absent_at",
+        "agent_dispatch_exited",
+        "agent_dispatch_state",
+        "agent_hint",
+        "agent_last_reconciled_at",
+        "agent_name",
+        "agent_next_reconcile_at",
+        "agent_operation_checkout",
+        "agent_operation_pane_id",
+        "agent_operation_target",
+        "agent_operation_workspace_id",
+        "agent_provider",
+        "agent_provider_session_id",
+        "agent_reconcile_attempts",
+        "agent_retained_at",
+        "agent_state_sequence",
+        "attempt_started_at",
+        "cancellation_reconciliation_pending",
+        "herdr_pane_id",
+        "herdr_target",
+        "herdr_workspace_id",
+        "manual_reconcile_operation",
+        "manual_reconcile_outcome",
+        "manual_reconcile_required_at",
+        "manual_reconcile_resolved_at",
+        "manual_reconcile_token",
+        "next_reconcile_at",
+        "pane_retained_at",
+        "reconciliation_base_error",
+        "session_id",
+        "target_release_manual_required",
+        "target_release_owner_boot_id",
+        "target_release_owner_pid",
+        "target_release_owner_start",
+        "target_release_pending",
+        "target_release_token",
+        "target_release_unverified_targets",
+    ),
+    "job_worker": (
+        "worker_boot_id",
+        "worker_claim_operation",
+        "worker_claimed_at",
+        "worker_operation",
+        "worker_pid",
+        "worker_process_start",
+        "worker_token",
+    ),
+}
+_IMPORT_ONLY_FIELDS = frozenset(
+    {
+        "schema_version",
+        "migration_source_schema_version",
+        "phase_prompt_active",
+        "agent_identity_legacy_compatible",
+    }
+)
+_STRUCTURED_FIELDS = frozenset(
+    {
+        "voice_question",
+        "clarifications",
+        "prompt_context_sessions",
+        "prompt_manifest",
+        "grouped_repository_targets",
+        "grouped_repository_candidates",
+        "grouped_repository_launches",
+        "target_release_unverified_targets",
+        "participant_session_owners",
+    }
+)
+_BOOL_FIELDS = frozenset(
+    {
+        "agent_dispatch_exited",
+        "announcement_dismissed",
+        "announcement_repeated",
+        "cancellation_reconciliation_pending",
+        "continuation",
+        "delivered",
+        "fork_committed",
+        "fork_confirmed",
+        "fork_dispatch_exited",
+        "fork_exists",
+        "fork_operation_source_private",
+        "fork_requested",
+        "github_issue_create_confirmed",
+        "github_issue_create_requested",
+        "interactive_questionnaire_blocked",
+        "linear_ticket_create_confirmed",
+        "linear_ticket_create_requested",
+        "plan_approval_completion_pending",
+        "plan_approval_counted",
+        "reconcile",
+        "review_approved",
+        "target_release_manual_required",
+        "target_release_pending",
+        "worktree_dispatch_exited",
+        "worktree_manual_inspection_required",
+    }
+)
+_INTEGER_FIELDS = frozenset(
+    {
+        "agent_absent_observations",
+        "agent_reconcile_attempts",
+        "agent_state_sequence",
+        "delivery_attempts",
+        "delivery_generation",
+        "fork_absent_observations",
+        "fork_reconcile_attempts",
+        "github_issue",
+        "github_issue_created_number",
+        "github_pull_request",
+        "linear_ticket_create_baseline_sequence",
+        "plan_approval_revision",
+        "plan_approval_state_change_sequence",
+        "prompt_baseline_sequence",
+        "prompt_operation_turn",
+        "review_round",
+        "revision",
+        "target_release_owner_pid",
+        "turn",
+        "worker_pid",
+        "worktree_absent_observations",
+        "worktree_reconcile_attempts",
+    }
+)
+_REAL_FIELDS = frozenset(
+    {
+        "agent_automatic_reconcile_stopped_at",
+        "agent_confirmed_absent_at",
+        "agent_last_reconciled_at",
+        "agent_next_reconcile_at",
+        "agent_retained_at",
+        "attempt_started_at",
+        "completed_at",
+        "created_at",
+        "delivered_at",
+        "delivery_claimed_at",
+        "delivery_retry_at",
+        "foreground_until",
+        "fork_automatic_reconcile_stopped_at",
+        "fork_committed_at",
+        "fork_confirmed_absent_at",
+        "fork_last_reconciled_at",
+        "fork_next_reconcile_at",
+        "fork_retained_at",
+        "manual_reconcile_required_at",
+        "manual_reconcile_resolved_at",
+        "next_reconcile_at",
+        "pane_retained_at",
+        "queued_at",
+        "started_at",
+        "terminal_intent_completed_at",
+        "updated_at",
+        "worker_claimed_at",
+        "worktree_automatic_reconcile_stopped_at",
+        "worktree_confirmed_absent_at",
+        "worktree_last_reconciled_at",
+        "worktree_next_reconcile_at",
+        "worktree_quarantine_acknowledged_at",
+        "worktree_retained_at",
+    }
+)
+
+
+def _column_definition(field: str) -> str:
+    if field in _BOOL_FIELDS:
+        return f'"{field}" INTEGER CHECK("{field}" IN (0, 1))'
+    if field in _INTEGER_FIELDS:
+        if field == "review_round":
+            return '"review_round" INTEGER CHECK("review_round" BETWEEN 0 AND 2)'
+        if field == "revision":
+            return '"revision" INTEGER CHECK("revision" >= 0)'
+        return f'"{field}" INTEGER'
+    if field in _REAL_FIELDS:
+        return f'"{field}" REAL'
+    if field in _STRUCTURED_FIELDS:
+        return f'"{field}" TEXT CHECK("{field}" IS NULL OR json_valid("{field}"))'
+    return f'"{field}" TEXT'
+
+
+def _named_schema_statements() -> tuple[str, ...]:
+    statements = []
+    for table, fields in _NAMED_TABLE_FIELDS.items():
+        columns = ", ".join(_column_definition(field) for field in fields)
+        discriminator = (
+            ", lifecycle_kind TEXT NOT NULL CHECK(lifecycle_kind IN "
+            "('queued','routing','running','awaiting_user','blocked',"
+            "'reconciling','terminal'))"
+            if table == "job_identity"
+            else ""
+        )
+        statements.append(
+            f"CREATE TABLE IF NOT EXISTS {table} ("
+            "job_id TEXT PRIMARY KEY REFERENCES jobs(job_id) ON DELETE CASCADE"
+            f"{discriminator}, {columns}) STRICT"
+        )
+    statements.append(
+        "CREATE TABLE IF NOT EXISTS job_field_presence ("
+        "job_id TEXT NOT NULL REFERENCES jobs(job_id) ON DELETE CASCADE, "
+        "field_name TEXT NOT NULL, PRIMARY KEY(job_id, field_name)) STRICT"
+    )
+    return tuple(statements)
+
+
+def _schema_statements(script: str) -> tuple[str, ...]:
+    statements: list[str] = []
+    pending = ""
+    for line in script.splitlines():
+        pending += line + "\n"
+        if sqlite3.complete_statement(pending):
+            statement = pending.strip()
+            pending = ""
+            if statement and not statement.startswith("PRAGMA"):
+                statements.append(statement)
+    if pending.strip():
+        raise RuntimeError("incomplete SQLite schema statement")
+    return tuple(statements)
+
 
 _SCHEMA = """
 PRAGMA foreign_keys = ON;
@@ -186,27 +589,175 @@ class SQLiteJobDatabase:
                 pass
         return connection
 
-    def initialize(self) -> None:
-        with self.connect() as connection:
-            has_metadata = connection.execute(
-                "SELECT 1 FROM sqlite_schema "
-                "WHERE type = 'table' AND name = 'store_meta'"
-            ).fetchone()
-            if has_metadata is not None:
-                row = connection.execute(
-                    "SELECT value FROM store_meta WHERE key = 'schema_version'"
-                ).fetchone()
-                if row is None or str(row["value"]) != str(DATABASE_SCHEMA_VERSION):
-                    found = str(row["value"]) if row is not None else "missing"
-                    raise sqlite3.DatabaseError(
-                        f"unsupported job database schema version {found}"
-                    )
-            connection.executescript(_SCHEMA)
+    @contextmanager
+    def _bootstrap_lock(self) -> Iterator[None]:
+        self.jobs_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        self.jobs_dir.chmod(0o700)
+        path = self.jobs_dir / BOOTSTRAP_LOCK_FILENAME
+        with path.open("a+b") as lock:
+            path.chmod(0o600)
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+    def initialize(
+        self, *, normalize_legacy: Callable[[Any], Any] | None = None
+    ) -> None:
+        with self._bootstrap_lock(), self.connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            try:
+                self._initialize_transaction(
+                    connection, normalize_legacy=normalize_legacy
+                )
+                connection.commit()
+            except BaseException:
+                connection.rollback()
+                raise
+
+    def _initialize_transaction(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        normalize_legacy: Callable[[Any], Any] | None,
+    ) -> None:
+        has_metadata = connection.execute(
+            "SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = 'store_meta'"
+        ).fetchone()
+        if has_metadata is None:
+            existing_tables = {
+                str(row["name"])
+                for row in connection.execute(
+                    "SELECT name FROM sqlite_schema "
+                    "WHERE type = 'table' AND name NOT LIKE 'sqlite_%'"
+                )
+            }
+            if existing_tables:
+                raise sqlite3.DatabaseError(
+                    "job database schema marker is missing from a non-empty database"
+                )
+            self._create_schema(connection)
             connection.execute(
-                "INSERT INTO store_meta(key, value) VALUES('schema_version', ?) "
-                "ON CONFLICT(key) DO NOTHING",
+                "INSERT INTO store_meta(key, value) VALUES('schema_version', ?)",
                 (str(DATABASE_SCHEMA_VERSION),),
             )
+            return
+        row = connection.execute(
+            "SELECT value FROM store_meta WHERE key = 'schema_version'"
+        ).fetchone()
+        if row is None:
+            evidence_tables = {
+                str(item["name"])
+                for item in connection.execute(
+                    "SELECT name FROM sqlite_schema "
+                    "WHERE type = 'table' AND name NOT LIKE 'sqlite_%' "
+                    "AND name != 'store_meta'"
+                )
+            }
+            for table in evidence_tables:
+                try:
+                    populated = connection.execute(
+                        f'SELECT 1 FROM "{table}" LIMIT 1'
+                    ).fetchone()
+                except sqlite3.DatabaseError as exc:
+                    raise sqlite3.DatabaseError(
+                        "job database schema marker is missing and evidence "
+                        f"table {table} is unreadable"
+                    ) from exc
+                if populated is not None:
+                    raise sqlite3.DatabaseError(
+                        "job database schema marker is missing while persisted "
+                        "evidence exists"
+                    )
+            self._create_schema(connection)
+            connection.execute(
+                "INSERT INTO store_meta(key, value) VALUES('schema_version', ?)",
+                (str(DATABASE_SCHEMA_VERSION),),
+            )
+            return
+        found = str(row["value"])
+        if found == str(DATABASE_SCHEMA_VERSION):
+            self._create_schema(connection)
+            return
+        if found != "1":
+            raise sqlite3.DatabaseError(
+                f"unsupported job database schema version {found}"
+            )
+        if normalize_legacy is None:
+            raise sqlite3.DatabaseError(
+                "schema-v1 migration requires the canonical legacy normalizer"
+            )
+        self._migrate_v1(
+            connection,
+            normalize_legacy=normalize_legacy,
+        )
+
+    @staticmethod
+    def _create_schema(connection: sqlite3.Connection) -> None:
+        for statement in _schema_statements(_SCHEMA):
+            connection.execute(statement)
+        for statement in _named_schema_statements():
+            connection.execute(statement)
+
+    def _migrate_v1(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        normalize_legacy: Callable[[Any], Any],
+    ) -> None:
+        """Atomically normalize and project every complete v1 EAV record."""
+
+        from .model import CURRENT_SCHEMA_VERSION, CursorJob
+
+        for statement in _named_schema_statements():
+            connection.execute(statement)
+        job_ids = connection.execute(
+            "SELECT job_id FROM jobs ORDER BY job_id"
+        ).fetchall()
+        for row in job_ids:
+            job_id = str(row["job_id"])
+            raw = self._load_eav_job(connection, job_id)
+            imported = CursorJob.from_dict(raw)
+            candidate = normalize_legacy(imported)
+            candidate.validate_invariants(require_worker_owner=True)
+            values = candidate.to_dict()
+            self._save_job_core(connection, values)
+            self._save_named_state(connection, values)
+            projected = CursorJob.from_dict(self.load_job(connection, job_id))
+            if projected.loaded_schema_version != CURRENT_SCHEMA_VERSION:
+                raise sqlite3.DatabaseError(
+                    f"{job_id}: projected lifecycle is not native schema v18"
+                )
+            projected.validate_invariants(require_worker_owner=True)
+            if projected.to_dict() != candidate.to_dict():
+                raise sqlite3.DatabaseError(
+                    f"{job_id}: relational lifecycle projection is not lossless"
+                )
+            core = connection.execute(
+                """
+                SELECT parent_job_id, revision, status, harness_kind,
+                    issue_provider, created_at
+                FROM jobs WHERE job_id = ?
+                """,
+                (job_id,),
+            ).fetchone()
+            identity = connection.execute(
+                """
+                SELECT parent_job_id, revision, status, harness_kind,
+                    issue_provider, created_at
+                FROM job_identity WHERE job_id = ?
+                """,
+                (job_id,),
+            ).fetchone()
+            if core is None or identity is None or tuple(core) != tuple(identity):
+                raise sqlite3.DatabaseError(
+                    f"{job_id}: jobs core disagrees with canonical identity"
+                )
+        connection.execute(
+            "UPDATE store_meta SET value = ? WHERE key = 'schema_version'",
+            (str(DATABASE_SCHEMA_VERSION),),
+        )
 
     @contextmanager
     def transaction(self) -> Iterator[sqlite3.Connection]:
@@ -273,7 +824,7 @@ class SQLiteJobDatabase:
             return str(row["text_value"])
         return json.loads(str(row["json_value"]))
 
-    def load_job(
+    def _load_eav_job(
         self, connection: sqlite3.Connection, job_id: str
     ) -> dict[str, object]:
         if (
@@ -290,6 +841,136 @@ class SQLiteJobDatabase:
         )
         return {str(row["name"]): self._decoded(row) for row in rows}
 
+    @staticmethod
+    def _lifecycle_kind(status: object) -> str:
+        value = str(status)
+        if value in {"completed", "failed", "cancelled"}:
+            return "terminal"
+        if value == "awaiting_user":
+            return "awaiting_user"
+        if value in {"queued", "routing", "running", "blocked", "reconciling"}:
+            return value
+        raise ValueError(f"unsupported top-level lifecycle discriminator {value}")
+
+    @staticmethod
+    def _database_value(field: str, value: object) -> object:
+        if value is None:
+            return None
+        if field in _STRUCTURED_FIELDS:
+            return json.dumps(
+                value, allow_nan=False, separators=(",", ":"), sort_keys=True
+            )
+        if field in _BOOL_FIELDS:
+            return int(bool(value))
+        return value
+
+    @staticmethod
+    def _model_value(field: str, value: object) -> object:
+        if field in _STRUCTURED_FIELDS:
+            return json.loads(str(value))
+        if field in _BOOL_FIELDS:
+            return bool(value)
+        return value
+
+    def _save_named_state(
+        self, connection: sqlite3.Connection, values: Mapping[str, object]
+    ) -> None:
+        job_id = str(values["id"])
+        known = (
+            {field for fields in _NAMED_TABLE_FIELDS.values() for field in fields}
+            | _IMPORT_ONLY_FIELDS
+            | {"id"}
+        )
+        unknown = set(values) - known
+        if unknown:
+            raise ValueError(
+                "schema-v18 persistence inventory is incomplete: "
+                + ", ".join(sorted(unknown))
+            )
+        for table, fields in _NAMED_TABLE_FIELDS.items():
+            names = ["job_id"]
+            encoded: list[object] = [job_id]
+            if table == "job_identity":
+                names.append("lifecycle_kind")
+                encoded.append(self._lifecycle_kind(values["status"]))
+            names.extend(fields)
+            encoded.extend(
+                self._database_value(field, values.get(field)) for field in fields
+            )
+            columns = ", ".join(f'"{name}"' for name in names)
+            placeholders = ", ".join("?" for _ in names)
+            updates = ", ".join(f'"{name}" = excluded."{name}"' for name in names[1:])
+            connection.execute(
+                f"INSERT INTO {table} ({columns}) VALUES ({placeholders}) "
+                f"ON CONFLICT(job_id) DO UPDATE SET {updates}",
+                encoded,
+            )
+        connection.execute("DELETE FROM job_field_presence WHERE job_id = ?", (job_id,))
+        connection.executemany(
+            "INSERT INTO job_field_presence(job_id, field_name) VALUES(?, ?)",
+            (
+                (job_id, field)
+                for field in sorted(set(values) & (known - _IMPORT_ONLY_FIELDS))
+                if field != "id"
+            ),
+        )
+
+    def load_job(
+        self, connection: sqlite3.Connection, job_id: str
+    ) -> dict[str, object]:
+        identity = connection.execute(
+            "SELECT * FROM job_identity WHERE job_id = ?", (job_id,)
+        ).fetchone()
+        if identity is None:
+            if (
+                connection.execute(
+                    "SELECT 1 FROM jobs WHERE job_id = ?", (job_id,)
+                ).fetchone()
+                is None
+            ):
+                raise FileNotFoundError(job_id)
+            raise sqlite3.DatabaseError(f"{job_id}: missing schema-v2 identity state")
+        if str(identity["lifecycle_kind"]) != self._lifecycle_kind(identity["status"]):
+            raise sqlite3.DatabaseError(
+                f"{job_id}: top-level lifecycle discriminator disagrees with status"
+            )
+        present = {
+            str(row["field_name"])
+            for row in connection.execute(
+                "SELECT field_name FROM job_field_presence WHERE job_id = ?",
+                (job_id,),
+            )
+        }
+        known = {field for fields in _NAMED_TABLE_FIELDS.values() for field in fields}
+        if unknown := present - known:
+            raise sqlite3.DatabaseError(
+                f"{job_id}: unknown schema-v2 field presence "
+                + ", ".join(sorted(unknown))
+            )
+        values: dict[str, object] = {
+            "id": job_id,
+            "schema_version": 18,
+        }
+        for table, fields in _NAMED_TABLE_FIELDS.items():
+            row = (
+                identity
+                if table == "job_identity"
+                else connection.execute(
+                    f"SELECT * FROM {table} WHERE job_id = ?", (job_id,)
+                ).fetchone()
+            )
+            if row is None:
+                raise sqlite3.DatabaseError(
+                    f"{job_id}: missing schema-v2 {table} state"
+                )
+            for field in fields:
+                if field in present:
+                    raw = row[field]
+                    values[field] = (
+                        None if raw is None else self._model_value(field, raw)
+                    )
+        return values
+
     def list_jobs(self, connection: sqlite3.Connection) -> list[dict[str, object]]:
         ids = connection.execute("SELECT job_id FROM jobs ORDER BY job_id").fetchall()
         return [self.load_job(connection, str(row["job_id"])) for row in ids]
@@ -302,43 +983,8 @@ class SQLiteJobDatabase:
         reservations: Iterable[tuple[str, str, str]],
     ) -> None:
         job_id = str(values["id"])
-        connection.execute(
-            """
-            INSERT INTO jobs(
-                job_id, parent_job_id, revision, status, harness_kind,
-                issue_provider, created_at
-            ) VALUES(?, ?, ?, ?, ?, ?, ?)
-            ON CONFLICT(job_id) DO UPDATE SET
-                parent_job_id = excluded.parent_job_id,
-                revision = excluded.revision,
-                status = excluded.status,
-                harness_kind = excluded.harness_kind,
-                issue_provider = excluded.issue_provider,
-                created_at = excluded.created_at
-            """,
-            (
-                job_id,
-                values.get("parent_job_id"),
-                values["revision"],
-                values["status"],
-                values.get("harness_kind", "cursor"),
-                values.get("issue_provider"),
-                values["created_at"],
-            ),
-        )
-        connection.execute("DELETE FROM job_fields WHERE job_id = ?", (job_id,))
-        connection.executemany(
-            """
-            INSERT INTO job_fields(
-                job_id, name, value_kind, integer_value, real_value,
-                text_value, json_value
-            ) VALUES(?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                (job_id, name, *self._encoded(value))
-                for name, value in sorted(values.items())
-            ),
-        )
+        self._save_job_core(connection, values)
+        self._save_named_state(connection, values)
         connection.execute("DELETE FROM reservations WHERE job_id = ?", (job_id,))
         connection.executemany(
             "INSERT INTO reservations(resource_kind, resource_key, job_id, reason) "
@@ -406,6 +1052,36 @@ class SQLiteJobDatabase:
                 """,
                 (reference, job_id, kind, int(parts[1]), reference, parts[-1]),
             )
+
+    @staticmethod
+    def _save_job_core(
+        connection: sqlite3.Connection, values: Mapping[str, object]
+    ) -> None:
+        job_id = str(values["id"])
+        connection.execute(
+            """
+            INSERT INTO jobs(
+                job_id, parent_job_id, revision, status, harness_kind,
+                issue_provider, created_at
+            ) VALUES(?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(job_id) DO UPDATE SET
+                parent_job_id = excluded.parent_job_id,
+                revision = excluded.revision,
+                status = excluded.status,
+                harness_kind = excluded.harness_kind,
+                issue_provider = excluded.issue_provider,
+                created_at = excluded.created_at
+            """,
+            (
+                job_id,
+                values.get("parent_job_id"),
+                values["revision"],
+                values["status"],
+                values.get("harness_kind", "cursor"),
+                values.get("issue_provider"),
+                values["created_at"],
+            ),
+        )
 
     @staticmethod
     def delete_job(connection: sqlite3.Connection, job_id: str) -> None:

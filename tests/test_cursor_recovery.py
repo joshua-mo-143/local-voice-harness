@@ -617,7 +617,13 @@ class CursorRecoveryTests(unittest.TestCase):
 
         launch.assert_not_called()
         self.assertEqual(path.with_suffix(".json.imported").read_bytes(), before)
-        self.assertEqual(self.store.get("123456789abc").loaded_schema_version, 5)
+        recovered = self.store.get("123456789abc")
+        self.assertEqual(
+            recovered.loaded_schema_version,
+            CURRENT_SCHEMA_VERSION,
+        )
+        self.assertEqual(recovered.status, JobStatus.RUNNING)
+        self.assertEqual(recovered.worker_boot_id, "legacy-unknown")
 
     def test_all_uncertain_operations_reconcile_before_any_launch(self) -> None:
         base = {
@@ -679,7 +685,11 @@ class CursorRecoveryTests(unittest.TestCase):
         )
 
         launch.assert_not_called()
-        herdr.get_agent.assert_called_once_with("agent")
+        herdr.get_agent.assert_not_called()
+        self.assertEqual(
+            self.store.get("aaaaaaaaaaaa").agent_dispatch_state,
+            "manual_required",
+        )
         github.reconcile_fork.assert_called_once()
         herdr.run_json.assert_called_once()
         herdr.cancel_agent.assert_not_called()
@@ -855,18 +865,35 @@ class CursorRecoveryTests(unittest.TestCase):
                 "repository": "/repo",
                 "worktree_branch": "voice/task",
                 "worktree_path": "/repo-worktree",
+                "worktree_workspace_id": "workspace",
+                "worktree_root_pane_id": "root-pane",
                 "worktree_provision_state": "ready",
                 "herdr_target": "agent",
+                "herdr_pane_id": "pane",
+                "herdr_workspace_id": "workspace",
                 "agent_dispatch_state": "ambiguous",
+                "agent_provider": "cursor/herdr",
+                "agent_provider_session_id": "session",
+                "agent_state_sequence": 1,
             }
         )
         client = mock.Mock()
-        client.get_agent.return_value = {
-            "name": "agent",
-            "pane_id": "wrong-pane",
-            "workspace_id": "wrong-workspace",
-            "cwd": "/wrong-checkout",
-        }
+        client.reconcile_session.return_value = SessionReconciliation(
+            ReconciliationState.ACTIVE,
+            HarnessSession(
+                "cursor/herdr",
+                "session",
+                "agent",
+                2,
+                {
+                    "pane_id": "wrong-pane",
+                    "workspace_id": "wrong-workspace",
+                    "cwd": "/wrong-checkout",
+                },
+            ),
+            "active",
+            True,
+        )
 
         reconcile_uncertain_agent(
             self.store,
@@ -1195,7 +1222,7 @@ class CursorRecoveryTests(unittest.TestCase):
         acknowledge_worktree_quarantine(self.store, "123456789abc", now=100)
 
         acknowledged = self.store.get("123456789abc")
-        self.assertEqual(acknowledged.worktree_provision_state, "retained")
+        self.assertEqual(acknowledged.worktree_provision_state, "ambiguous")
         self.assertFalse(acknowledged.to_dict()["worktree_manual_inspection_required"])
 
     def test_prompt_submit_recovery_requires_positive_acceptance_evidence(self) -> None:

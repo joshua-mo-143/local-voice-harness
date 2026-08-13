@@ -91,7 +91,12 @@ from .model import (
     ACTIVE_STATUSES as MODEL_ACTIVE_STATUSES,
 )
 from .model import (
-    CURRENT_SCHEMA_VERSION,
+    TERMINAL_STATUSES as MODEL_TERMINAL_STATUSES,
+)
+from .model import (
+    WORKER_STATUSES as MODEL_WORKER_STATUSES,
+)
+from .model import (
     CursorJob,
     JobStatus,
     JobValidationError,
@@ -99,12 +104,6 @@ from .model import (
     WorkflowPhase,
     WorkflowTier,
     transition,
-)
-from .model import (
-    TERMINAL_STATUSES as MODEL_TERMINAL_STATUSES,
-)
-from .model import (
-    WORKER_STATUSES as MODEL_WORKER_STATUSES,
 )
 from .operations import (
     OperationState,
@@ -3150,6 +3149,7 @@ def _plan_participant_creation(
     target: str,
     label: str,
     workspace_id: str,
+    checkout: Path | None = None,
 ) -> CursorJob:
     planned = _worker_change(
         store,
@@ -3168,7 +3168,9 @@ def _plan_participant_creation(
                 ),
             ),
             participant_creation_checkout=(
-                current.worktree_path
+                str(checkout)
+                if checkout is not None
+                else current.worktree_path
                 or current.repository
                 or current.agent_operation_checkout
             ),
@@ -4345,7 +4347,6 @@ def run_claimed_worker(  # pyright: ignore[reportGeneralTypeIssues]
         if (
             target
             and job.agent_dispatch_state == "dispatching"
-            and job.loaded_schema_version < CURRENT_SCHEMA_VERSION
             and (
                 job.agent_session_operation is None
                 or job.agent_session_operation.session is None
@@ -5037,6 +5038,7 @@ def run_claimed_worker(  # pyright: ignore[reportGeneralTypeIssues]
                     name: str,
                     label: str,
                     workspace_id: str | None,
+                    checkout: Path,
                     target_holder: list[str] = planned_participant_target,
                     revision_state: list[int] = callback_revision,
                 ) -> None:
@@ -5050,6 +5052,7 @@ def run_claimed_worker(  # pyright: ignore[reportGeneralTypeIssues]
                         target=name,
                         label=label,
                         workspace_id=workspace_id or "",
+                        checkout=checkout,
                     )
                     revision_state[0] = job.revision
 

@@ -844,7 +844,7 @@ class CursorJobTests(unittest.TestCase):
         database = next(result for result in results if result.name == "jobs:database")
         self.assertIs(database.severity, Severity.OK)
         self.assertIn(str(store.db_path), database.detail)
-        self.assertIn("schema=1", database.detail)
+        self.assertIn("schema=2", database.detail)
         self.assertIn("migration=complete", database.detail)
         self.assertIn("integrity=ok", database.detail)
         self.assertEqual(after, before)

@@ -35,7 +35,7 @@ BeforePromptSubmit = Callable[[int], None]
 PromptAccepted = Callable[[], None]
 BeforePaneSubmit = Callable[[], None]
 PaneAccepted = Callable[[str, str], None]
-PlanParticipant = Callable[[str, str, str | None], None]
+PlanParticipant = Callable[[str, str, str | None, Path], None]
 
 
 class HerdrOperations(Protocol):
