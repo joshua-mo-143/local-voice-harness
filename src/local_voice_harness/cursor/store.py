@@ -10,6 +10,7 @@ import sqlite3
 import tempfile
 import threading
 import time
+import uuid
 import warnings
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
@@ -25,6 +26,7 @@ from ..job_lifecycle import (
     WorkerCallbackEvent,
     apply_follow_up,
 )
+from .coordinator import CoordinatorCommand, CoordinatorDecision
 from .model import (
     ACTIVE_STATUSES,
     CURRENT_SCHEMA_VERSION,
@@ -2473,7 +2475,18 @@ class JobStore:
             )
             self._validate_db_quarantine_reservation(connection, candidate, "target")
             self._validate_db_quarantine_reservation(connection, candidate, "worktree")
-            return self._save(connection, candidate)
+            saved = self._save(connection, candidate)
+            self._record_transition(
+                connection,
+                CoordinatorCommand(
+                    job_id=saved.id,
+                    expected_revision=0,
+                    command_id=f"store.create:{saved.id}",
+                    kind="admit",
+                ),
+                CoordinatorDecision(job=saved, event_kind="admit"),
+            )
+            return saved
 
     def claim_participant_capacity(self, limit: int) -> tuple[CursorJob, ...]:
         """Atomically admit the oldest waiting jobs up to the global limit."""
@@ -2550,6 +2563,27 @@ class JobStore:
                 self._save(connection, normalized)
             return candidate
 
+    def apply(
+        self,
+        command: CoordinatorCommand,
+        decide: Callable[[CursorJob], CoordinatorDecision | None],
+        *,
+        reservation: Literal["target", "worktree"] | None = None,
+        reject_maintenance: bool = False,
+    ) -> CursorJob | None:
+        """Commit one typed command, its event, and any admitted effects atomically."""
+
+        self._ensure_ready()
+        self._refresh_legacy_sources()
+        with self._db.transaction() as connection:
+            return self._apply_on_connection(
+                connection,
+                command,
+                decide,
+                reservation=reservation,
+                reject_maintenance=reject_maintenance,
+            )
+
     def update(self, job_id: str, command: JobCommand) -> CursorJob | None:
         return self._transaction(job_id, command)
 
@@ -2576,28 +2610,99 @@ class JobStore:
         reservation: Literal["target", "worktree"] | None = None,
         reject_maintenance: bool = False,
     ) -> CursorJob | None:
+        def decide(current: CursorJob) -> CoordinatorDecision | None:
+            candidate = command(current)
+            if candidate is None:
+                return None
+            return CoordinatorDecision(job=candidate, event_kind="store.update")
+
         self._ensure_ready()
         self._refresh_legacy_sources()
         with self._db.transaction() as connection:
             if reject_maintenance and self._read_maintenance_db(connection) is not None:
                 return None
             current = CursorJob.from_dict(self._db.load_job(connection, job_id))
-            candidate = command(current)
-            if candidate is None:
-                return None
-            candidate = _normalize_for_durable_write(candidate)
-            validate_transition(current, candidate)
-            _validate_candidate_artifacts_unlocked(
-                self.path(job_id), candidate, current
+            return self._apply_on_connection(
+                connection,
+                CoordinatorCommand(
+                    job_id=job_id,
+                    expected_revision=current.revision,
+                    command_id=f"store.update:{job_id}:{uuid.uuid4().hex}",
+                    kind="store.update",
+                ),
+                decide,
+                reservation=reservation,
+                current=current,
             )
-            if reservation is not None:
-                _validate_quarantine_reservation_unlocked(
-                    self.durable_dir, candidate, reservation
-                )
-                self._validate_db_quarantine_reservation(
-                    connection, candidate, reservation
-                )
-            return self._save(connection, candidate)
+
+    def _apply_on_connection(
+        self,
+        connection: sqlite3.Connection,
+        command: CoordinatorCommand,
+        decide: Callable[[CursorJob], CoordinatorDecision | None],
+        *,
+        reservation: Literal["target", "worktree"] | None = None,
+        reject_maintenance: bool = False,
+        current: CursorJob | None = None,
+    ) -> CursorJob | None:
+        if reject_maintenance and self._read_maintenance_db(connection) is not None:
+            return None
+        existing = self._db.load_command_event(connection, command.command_id)
+        if existing is not None:
+            return CursorJob.from_dict(
+                self._db.load_job(connection, str(existing["job_id"]))
+            )
+        if current is None:
+            current = CursorJob.from_dict(self._db.load_job(connection, command.job_id))
+        if current.revision != command.expected_revision:
+            return None
+        decision = decide(current)
+        if decision is None:
+            return None
+        candidate = _normalize_for_durable_write(decision.job)
+        validate_transition(current, candidate)
+        _validate_candidate_artifacts_unlocked(
+            self.path(command.job_id), candidate, current
+        )
+        if reservation is not None:
+            _validate_quarantine_reservation_unlocked(
+                self.durable_dir, candidate, reservation
+            )
+            self._validate_db_quarantine_reservation(connection, candidate, reservation)
+        decision = CoordinatorDecision(
+            job=candidate,
+            effects=decision.effects,
+            event_kind=decision.event_kind,
+            event_payload=decision.event_payload,
+        )
+        self._record_transition(connection, command, decision)
+        return self._save(connection, candidate)
+
+    def _record_transition(
+        self,
+        connection: sqlite3.Connection,
+        command: CoordinatorCommand,
+        decision: CoordinatorDecision,
+    ) -> None:
+        job = decision.job
+        self._db.insert_event(
+            connection,
+            event_id=uuid.uuid4().hex,
+            command_id=command.command_id,
+            job_id=job.id,
+            revision=job.revision,
+            kind=decision.event_kind,
+            payload={
+                "command_kind": command.kind,
+                "effects": [effect.kind for effect in decision.effects],
+                **dict(decision.event_payload),
+            },
+            created_at=time.time(),
+        )
+        try:
+            self._db.insert_outbox_effects(connection, job.id, decision.effects)
+        except sqlite3.IntegrityError as exc:
+            raise JobValidationError(f"SQLite outbox constraint failed: {exc}") from exc
 
     def write_artifact(
         self,

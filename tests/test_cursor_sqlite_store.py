@@ -339,6 +339,7 @@ def test_fresh_store_uses_normalized_private_wal_database(tmp_path: Path) -> Non
             "quarantine",
             "artifacts",
             "outbox",
+            "events",
         } <= tables
         columns = {row[1] for row in connection.execute("PRAGMA table_info(jobs)")}
         assert "payload_json" not in columns
@@ -570,6 +571,10 @@ def test_v1_eav_migration_round_trips_named_state_and_preserves_auxiliary_rows(
         assert connection.execute(
             "SELECT value FROM store_meta WHERE key = 'schema_version'"
         ).fetchone() == ("2",)
+        assert connection.execute(
+            "SELECT count(*) FROM sqlite_schema "
+            "WHERE type = 'table' AND name = 'events'"
+        ).fetchone() == (1,)
         assert connection.execute(
             "SELECT lifecycle_kind FROM job_identity ORDER BY job_id"
         ).fetchall() == [("queued",), ("terminal",)]

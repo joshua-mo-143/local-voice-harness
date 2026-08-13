@@ -4,10 +4,13 @@ import fcntl
 import json
 import os
 import sqlite3
+import uuid
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
+
+from .coordinator import DurableEffect
 
 DATABASE_SCHEMA_VERSION = 2
 DATABASE_FILENAME = "jobs.sqlite3"
@@ -548,6 +551,16 @@ CREATE TABLE IF NOT EXISTS outbox (
     CHECK((lease_token IS NULL) = (leased_at IS NULL))
 ) STRICT;
 
+CREATE TABLE IF NOT EXISTS events (
+    event_id TEXT PRIMARY KEY,
+    command_id TEXT NOT NULL UNIQUE,
+    job_id TEXT NOT NULL REFERENCES jobs(job_id) ON DELETE CASCADE,
+    revision INTEGER NOT NULL CHECK(revision >= 0),
+    kind TEXT NOT NULL,
+    payload_json TEXT NOT NULL,
+    created_at REAL NOT NULL
+) STRICT;
+
 CREATE INDEX IF NOT EXISTS jobs_status_idx ON jobs(status);
 CREATE INDEX IF NOT EXISTS reservations_job_idx ON reservations(job_id);
 CREATE INDEX IF NOT EXISTS quarantine_job_idx ON quarantine(job_id);
@@ -692,6 +705,7 @@ class SQLiteJobDatabase:
             connection,
             normalize_legacy=normalize_legacy,
         )
+        self._create_schema(connection)
 
     @staticmethod
     def _create_schema(connection: sqlite3.Connection) -> None:
@@ -1082,6 +1096,77 @@ class SQLiteJobDatabase:
                 values["created_at"],
             ),
         )
+
+    def load_command_event(
+        self, connection: sqlite3.Connection, command_id: str
+    ) -> sqlite3.Row | None:
+        return connection.execute(
+            "SELECT event_id, job_id, revision, kind FROM events WHERE command_id = ?",
+            (command_id,),
+        ).fetchone()
+
+    def insert_event(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        event_id: str,
+        command_id: str,
+        job_id: str,
+        revision: int,
+        kind: str,
+        payload: Mapping[str, object],
+        created_at: float,
+    ) -> None:
+        connection.execute(
+            """
+            INSERT INTO events(
+                event_id, command_id, job_id, revision, kind, payload_json,
+                created_at
+            ) VALUES(?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                event_id,
+                command_id,
+                job_id,
+                revision,
+                kind,
+                json.dumps(
+                    dict(payload),
+                    allow_nan=False,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ),
+                created_at,
+            ),
+        )
+
+    def insert_outbox_effects(
+        self,
+        connection: sqlite3.Connection,
+        job_id: str,
+        effects: Iterable[DurableEffect],
+    ) -> None:
+        for effect in effects:
+            connection.execute(
+                """
+                INSERT INTO outbox(
+                    effect_id, job_id, kind, idempotency_key, status, attempts,
+                    payload_json
+                ) VALUES(?, ?, ?, ?, 'pending', 0, ?)
+                """,
+                (
+                    uuid.uuid4().hex,
+                    job_id,
+                    effect.kind,
+                    effect.idempotency_key,
+                    json.dumps(
+                        dict(effect.payload),
+                        allow_nan=False,
+                        separators=(",", ":"),
+                        sort_keys=True,
+                    ),
+                ),
+            )
 
     @staticmethod
     def delete_job(connection: sqlite3.Connection, job_id: str) -> None:
