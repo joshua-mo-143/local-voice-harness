@@ -551,6 +551,11 @@ CREATE TABLE IF NOT EXISTS outbox (
     CHECK((lease_token IS NULL) = (leased_at IS NULL))
 ) STRICT;
 
+CREATE TABLE IF NOT EXISTS outbox_concurrency (
+    effect_id TEXT PRIMARY KEY REFERENCES outbox(effect_id) ON DELETE CASCADE,
+    concurrency_key TEXT NOT NULL
+) STRICT;
+
 CREATE TABLE IF NOT EXISTS events (
     event_id TEXT PRIMARY KEY,
     command_id TEXT NOT NULL UNIQUE,
@@ -713,6 +718,12 @@ class SQLiteJobDatabase:
             connection.execute(statement)
         for statement in _named_schema_statements():
             connection.execute(statement)
+        connection.execute(
+            """
+            INSERT OR IGNORE INTO outbox_concurrency(effect_id, concurrency_key)
+            SELECT effect_id, kind FROM outbox
+            """
+        )
 
     def _migrate_v1(
         self,
@@ -1148,6 +1159,7 @@ class SQLiteJobDatabase:
         effects: Iterable[DurableEffect],
     ) -> None:
         for effect in effects:
+            effect_id = uuid.uuid4().hex
             connection.execute(
                 """
                 INSERT INTO outbox(
@@ -1156,7 +1168,7 @@ class SQLiteJobDatabase:
                 ) VALUES(?, ?, ?, ?, 'pending', 0, ?)
                 """,
                 (
-                    uuid.uuid4().hex,
+                    effect_id,
                     job_id,
                     effect.kind,
                     effect.idempotency_key,
@@ -1167,6 +1179,13 @@ class SQLiteJobDatabase:
                         sort_keys=True,
                     ),
                 ),
+            )
+            connection.execute(
+                """
+                INSERT INTO outbox_concurrency(effect_id, concurrency_key)
+                VALUES(?, ?)
+                """,
+                (effect_id, effect.concurrency_key),
             )
 
     def claim_due_outbox(
@@ -1184,18 +1203,29 @@ class SQLiteJobDatabase:
         excluded = ""
         parameters: tuple[object, ...] = (*kinds, now)
         if exclude:
-            excluded = "AND effect_id NOT IN (" + ",".join("?" for _ in exclude) + ")"
+            excluded = "AND o.effect_id NOT IN (" + ",".join("?" for _ in exclude) + ")"
             parameters = (*kinds, *exclude, now)
         row = connection.execute(
             f"""
-            SELECT effect_id, job_id, kind, idempotency_key, payload_json, attempts
-            FROM outbox
-            WHERE kind IN ({kind_placeholders})
+            SELECT o.effect_id, o.job_id, o.kind, o.idempotency_key,
+                   o.payload_json, o.attempts, c.concurrency_key
+            FROM outbox AS o
+            JOIN outbox_concurrency AS c ON c.effect_id = o.effect_id
+            WHERE o.kind IN ({kind_placeholders})
               {excluded}
-              AND lease_token IS NULL
-              AND status IN ('pending', 'failed-retryable')
-              AND (next_at IS NULL OR next_at <= ?)
-            ORDER BY rowid
+              AND o.lease_token IS NULL
+              AND o.status IN ('pending', 'failed-retryable')
+              AND NOT EXISTS (
+                  SELECT 1
+                  FROM outbox AS running
+                  JOIN outbox_concurrency AS active
+                    ON active.effect_id = running.effect_id
+                  WHERE active.concurrency_key = c.concurrency_key
+                    AND running.status = 'running'
+                    AND running.lease_token IS NOT NULL
+              )
+              AND (o.next_at IS NULL OR o.next_at <= ?)
+            ORDER BY o.rowid
             LIMIT 1
             """,
             parameters,
@@ -1217,8 +1247,11 @@ class SQLiteJobDatabase:
             return None
         return connection.execute(
             """
-            SELECT effect_id, job_id, kind, idempotency_key, payload_json, attempts
-            FROM outbox WHERE effect_id = ?
+            SELECT o.effect_id, o.job_id, o.kind, o.idempotency_key,
+                   o.payload_json, o.attempts, c.concurrency_key
+            FROM outbox AS o
+            JOIN outbox_concurrency AS c ON c.effect_id = o.effect_id
+            WHERE o.effect_id = ?
             """,
             (str(row["effect_id"]),),
         ).fetchone()
@@ -1257,6 +1290,25 @@ class SQLiteJobDatabase:
         changed = connection.execute("SELECT changes() AS changed").fetchone()
         return changed is not None and int(changed["changed"]) == 1
 
+    def renew_outbox_lease(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        effect_id: str,
+        lease_token: str,
+        now: float,
+    ) -> bool:
+        connection.execute(
+            """
+            UPDATE outbox
+            SET leased_at = ?
+            WHERE effect_id = ? AND lease_token = ? AND status = 'running'
+            """,
+            (now, effect_id, lease_token),
+        )
+        changed = connection.execute("SELECT changes() AS changed").fetchone()
+        return changed is not None and int(changed["changed"]) == 1
+
     def complete_outbox_observation(
         self,
         connection: sqlite3.Connection,
@@ -1283,7 +1335,7 @@ class SQLiteJobDatabase:
             return "mismatch"
         current_status = str(existing["status"])
         if (
-            current_status in {"succeeded", "unknown"}
+            current_status in {"succeeded", "failed", "unknown"}
             and existing["lease_token"] is None
         ):
             return "duplicate"
@@ -1317,27 +1369,6 @@ class SQLiteJobDatabase:
         )
         return "applied"
 
-    def release_running_outbox(
-        self,
-        connection: sqlite3.Connection,
-        *,
-        effect_id: str,
-        lease_token: str,
-        now: float,
-        last_error: str | None,
-    ) -> bool:
-        connection.execute(
-            """
-            UPDATE outbox
-            SET status = 'pending', lease_token = NULL, leased_at = NULL,
-                next_at = ?, last_error = ?, outcome_json = NULL
-            WHERE effect_id = ? AND lease_token = ? AND status = 'running'
-            """,
-            (now, last_error, effect_id, lease_token),
-        )
-        changed = connection.execute("SELECT changes() AS changed").fetchone()
-        return changed is not None and int(changed["changed"]) == 1
-
     def expired_outbox_leases(
         self,
         connection: sqlite3.Connection,
@@ -1348,52 +1379,14 @@ class SQLiteJobDatabase:
         return list(
             connection.execute(
                 """
-                SELECT effect_id, attempts, outcome_json
+                SELECT effect_id, idempotency_key, lease_token, attempts,
+                       outcome_json
                 FROM outbox
                 WHERE status = 'running' AND lease_token IS NOT NULL
                   AND leased_at <= ?
                 """,
                 (now - lease_seconds,),
             )
-        )
-
-    def settle_expired_outbox(
-        self,
-        connection: sqlite3.Connection,
-        *,
-        effect_id: str,
-        unknown: bool,
-        now: float,
-        outcome: Mapping[str, object] | None,
-    ) -> None:
-        if unknown:
-            connection.execute(
-                """
-                UPDATE outbox
-                SET status = 'unknown', lease_token = NULL, leased_at = NULL,
-                    completed_at = ?, next_at = NULL, outcome_json = ?
-                WHERE effect_id = ? AND status = 'running'
-                """,
-                (
-                    now,
-                    json.dumps(
-                        dict(outcome or {}),
-                        allow_nan=False,
-                        separators=(",", ":"),
-                        sort_keys=True,
-                    ),
-                    effect_id,
-                ),
-            )
-            return
-        connection.execute(
-            """
-            UPDATE outbox
-            SET status = 'pending', lease_token = NULL, leased_at = NULL,
-                next_at = ?, outcome_json = NULL
-            WHERE effect_id = ? AND status = 'running'
-            """,
-            (now, effect_id),
         )
 
     @staticmethod

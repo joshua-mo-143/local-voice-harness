@@ -65,7 +65,7 @@ from .operations import (
     OperationTransitionError,
     SessionIdentity,
 )
-from .outbox import recover_outbox
+from .outbox import EffectHandler, recover_outbox
 from .store import JobStore, LegacyWorkerInspector
 from .worker_lifecycle import (
     boot_identity,
@@ -1768,6 +1768,7 @@ def recover_jobs(
     get_process_identity: Callable[[int], str | None] = process_identity,
     inspect_legacy_worker: LegacyWorkerInspector = inspect_and_stop_legacy_worker,
     require_issue_provider: RequireIssueProvider | None = None,
+    outbox_handlers: Mapping[str, EffectHandler] | None = None,
     now: float | None = None,
 ) -> None:
     if store.maintenance_active() is True:
@@ -1775,7 +1776,7 @@ def recover_jobs(
     blocked_legacy_jobs = store.migrate_legacy(inspect_worker=inspect_legacy_worker)
     store.prune(now=now)
     recovered_at = time.time() if now is None else now
-    recover_outbox(store, now=recovered_at)
+    recover_outbox(store, handlers=outbox_handlers, now=recovered_at)
 
     for existing in store.list():
         if not has_legacy_worker_claim(existing):

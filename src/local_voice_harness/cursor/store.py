@@ -2760,6 +2760,7 @@ class JobStore:
                 job_id=str(row["job_id"]),
                 kind=str(row["kind"]),
                 idempotency_key=str(row["idempotency_key"]),
+                concurrency_key=str(row["concurrency_key"]),
                 payload=payload,
                 lease_token=token,
                 attempts=int(row["attempts"]),
@@ -2772,6 +2773,21 @@ class JobStore:
         with self._db.transaction() as connection:
             return self._db.mark_outbox_dispatched(
                 connection, effect_id=lease.effect_id, lease_token=lease.lease_token
+            )
+
+    def renew_outbox_lease(
+        self, lease: OutboxLease, *, now: float | None = None
+    ) -> bool:
+        """Extend a running lease if this executor still owns it."""
+
+        renewed_at = time.time() if now is None else now
+        self._ensure_ready()
+        with self._db.transaction() as connection:
+            return self._db.renew_outbox_lease(
+                connection,
+                effect_id=lease.effect_id,
+                lease_token=lease.lease_token,
+                now=renewed_at,
             )
 
     def outbox_dispatched(self, lease: OutboxLease) -> bool:
@@ -2796,29 +2812,56 @@ class JobStore:
         """Record an effect observation without writing job lifecycle rows."""
 
         observed_at = time.time() if now is None else now
-        if observation.outcome in {"OutcomeUnknown", "ManualRequired"}:
-            status = "unknown"
-            next_at: float | None = None
-        elif observation.retryable and lease.attempts < OUTBOX_MAX_ATTEMPTS:
-            status = "failed-retryable"
-            next_at = observed_at + OUTBOX_RETRY_SECONDS
-        elif observation.retryable:
-            status = "unknown"
-            next_at = None
-        else:
-            status = "succeeded"
-            next_at = None
-        outcome = {
-            "outcome": observation.outcome,
-            "retryable": observation.retryable,
-            **dict(observation.detail),
-        }
-        last_error = None
-        if observation.outcome in {"Failed", "OutcomeUnknown", "ManualRequired"}:
-            detail = observation.detail.get("error")
-            last_error = str(detail) if detail is not None else observation.outcome
         self._ensure_ready()
         with self._db.transaction() as connection:
+            row = self._db.load_outbox(connection, lease.effect_id)
+            if row is None:
+                return "missing"
+            raw = row["outcome_json"]
+            fence = json.loads(str(raw)) if raw else {}
+            dispatched = isinstance(fence, dict) and fence.get("fence") == "submitted"
+            effective = observation
+            if observation.retryable and dispatched:
+                effective = EffectObservation(
+                    outcome="OutcomeUnknown",
+                    detail={
+                        **dict(observation.detail),
+                        "error": observation.detail.get(
+                            "error", "retry requested after submit fence"
+                        ),
+                    },
+                )
+            elif observation.retryable and lease.attempts >= OUTBOX_MAX_ATTEMPTS:
+                effective = EffectObservation(
+                    outcome="Failed",
+                    detail={
+                        **dict(observation.detail),
+                        "error": observation.detail.get(
+                            "error", "outbox retry attempts exhausted"
+                        ),
+                    },
+                )
+            if effective.outcome in {"OutcomeUnknown", "ManualRequired"}:
+                status = "unknown"
+                next_at: float | None = None
+            elif effective.retryable:
+                status = "failed-retryable"
+                next_at = observed_at + OUTBOX_RETRY_SECONDS
+            elif effective.outcome == "Failed":
+                status = "failed"
+                next_at = None
+            else:
+                status = "succeeded"
+                next_at = None
+            outcome = {
+                "outcome": effective.outcome,
+                "retryable": effective.retryable,
+                **dict(effective.detail),
+            }
+            last_error = None
+            if effective.outcome in {"Failed", "OutcomeUnknown", "ManualRequired"}:
+                detail = effective.detail.get("error")
+                last_error = str(detail) if detail is not None else effective.outcome
             return self._db.complete_outbox_observation(
                 connection,
                 effect_id=lease.effect_id,
@@ -2838,7 +2881,7 @@ class JobStore:
         error: str | None = None,
         now: float | None = None,
     ) -> bool:
-        """Return an undispatched running lease to pending for replay."""
+        """Schedule bounded retry for an undispatched handler failure."""
 
         released_at = time.time() if now is None else now
         self._ensure_ready()
@@ -2850,13 +2893,25 @@ class JobStore:
             payload = json.loads(str(raw)) if raw else {}
             if isinstance(payload, dict) and payload.get("fence") == "submitted":
                 return False
-            return self._db.release_running_outbox(
+            retryable = lease.attempts < OUTBOX_MAX_ATTEMPTS
+            status = "failed-retryable" if retryable else "failed"
+            next_at = released_at + OUTBOX_RETRY_SECONDS if retryable else None
+            result = self._db.complete_outbox_observation(
                 connection,
                 effect_id=lease.effect_id,
+                idempotency_key=lease.idempotency_key,
                 lease_token=lease.lease_token,
+                status=status,
+                outcome={
+                    "outcome": "Failed",
+                    "retryable": retryable,
+                    "error": error or "effect handler failed before dispatch",
+                },
                 now=released_at,
+                next_at=next_at,
                 last_error=error,
             )
+            return result == "applied"
 
     def reap_expired_outbox_leases(
         self,
@@ -2878,19 +2933,40 @@ class JobStore:
                 dispatched = (
                     isinstance(payload, dict) and payload.get("fence") == "submitted"
                 )
-                unknown = dispatched or int(row["attempts"]) >= OUTBOX_MAX_ATTEMPTS
-                self._db.settle_expired_outbox(
+                attempts = int(row["attempts"])
+                if dispatched:
+                    status = "unknown"
+                    outcome = {"outcome": "OutcomeUnknown", "retryable": False}
+                    next_at: float | None = None
+                elif attempts < OUTBOX_MAX_ATTEMPTS:
+                    status = "failed-retryable"
+                    outcome = {"outcome": "Failed", "retryable": True}
+                    next_at = recovered_at + OUTBOX_RETRY_SECONDS
+                else:
+                    status = "failed"
+                    outcome = {
+                        "outcome": "Failed",
+                        "retryable": False,
+                        "error": "outbox retry attempts exhausted",
+                    }
+                    next_at = None
+                result = self._db.complete_outbox_observation(
                     connection,
                     effect_id=str(row["effect_id"]),
-                    unknown=unknown,
+                    idempotency_key=str(row["idempotency_key"]),
+                    lease_token=str(row["lease_token"]),
+                    status=status,
+                    outcome=outcome,
                     now=recovered_at,
-                    outcome=(
-                        {"outcome": "OutcomeUnknown", "retryable": False}
-                        if unknown
+                    next_at=next_at,
+                    last_error=(
+                        "outbox retry attempts exhausted"
+                        if status == "failed"
                         else None
                     ),
                 )
-                reaped += 1
+                if result == "applied":
+                    reaped += 1
         return reaped
 
     def write_artifact(

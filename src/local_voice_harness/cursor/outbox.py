@@ -9,17 +9,49 @@ dispatch (replay-safe operations).
 
 from __future__ import annotations
 
+import threading
 from collections.abc import Callable, Mapping
 
-from .coordinator import EffectObservation, OutboxLease
+from .coordinator import (
+    OUTBOX_RENEW_SECONDS,
+    EffectObservation,
+    OutboxLease,
+    OutboxLeaseLost,
+)
 from .store import JobStore
 
-EffectHandler = Callable[[OutboxLease, Callable[[], bool]], EffectObservation]
+EffectHandler = Callable[[OutboxLease, Callable[[], None]], EffectObservation]
 
 
-def _bind_mark(store: JobStore, lease: OutboxLease) -> Callable[[], bool]:
-    def mark_dispatched() -> bool:
-        return store.mark_outbox_dispatched(lease)
+class _LeaseRenewer:
+    def __init__(self, store: JobStore, lease: OutboxLease) -> None:
+        self._store = store
+        self._lease = lease
+        self._stop = threading.Event()
+        self._thread = threading.Thread(
+            target=self._run,
+            name=f"outbox-renew-{lease.effect_id[:8]}",
+            daemon=True,
+        )
+
+    def __enter__(self) -> _LeaseRenewer:
+        self._thread.start()
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        self._stop.set()
+        self._thread.join()
+
+    def _run(self) -> None:
+        while not self._stop.wait(OUTBOX_RENEW_SECONDS):
+            if not self._store.renew_outbox_lease(self._lease):
+                return
+
+
+def _bind_mark(store: JobStore, lease: OutboxLease) -> Callable[[], None]:
+    def mark_dispatched() -> None:
+        if not store.mark_outbox_dispatched(lease):
+            raise OutboxLeaseLost(f"outbox lease lost for effect {lease.effect_id}")
 
     return mark_dispatched
 
@@ -46,7 +78,8 @@ def drain_outbox(
         handler = handlers[lease.kind]
         mark_dispatched = _bind_mark(store, lease)
         try:
-            observation = handler(lease, mark_dispatched)
+            with _LeaseRenewer(store, lease):
+                observation = handler(lease, mark_dispatched)
         except Exception as exc:
             error = str(exc)
             if store.outbox_dispatched(lease) or not store.release_outbox_lease(

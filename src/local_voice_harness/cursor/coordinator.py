@@ -22,6 +22,7 @@ ObservationOutcome = Literal[
     "ManualRequired",
 ]
 OUTBOX_LEASE_SECONDS = 30.0
+OUTBOX_RENEW_SECONDS = OUTBOX_LEASE_SECONDS / 3
 OUTBOX_RETRY_SECONDS = 5.0
 OUTBOX_MAX_ATTEMPTS = 8
 
@@ -30,17 +31,28 @@ class CoordinatorError(ValueError):
     """A coordinator command or effect is incomplete."""
 
 
+class OutboxLeaseLost(CoordinatorError):
+    """The executor no longer owns the effect lease."""
+
+
 @dataclass(frozen=True, slots=True)
 class DurableEffect:
     """One named outbox effect admitted with a state transition."""
 
     kind: str
     idempotency_key: str
+    concurrency_key: str
     payload: Mapping[str, object] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
-        if not self.kind.strip() or not self.idempotency_key.strip():
-            raise CoordinatorError("effect requires kind and idempotency_key")
+        if (
+            not self.kind.strip()
+            or not self.idempotency_key.strip()
+            or not self.concurrency_key.strip()
+        ):
+            raise CoordinatorError(
+                "effect requires kind, idempotency_key, and concurrency_key"
+            )
 
 
 @dataclass(frozen=True, slots=True)
@@ -76,6 +88,7 @@ class CoordinatorDecision:
             names = ", ".join(sorted(reserved))
             raise CoordinatorError(f"event payload cannot override {names}")
 
+
 @dataclass(frozen=True, slots=True)
 class OutboxLease:
     """A claimed outbox row held by one executor until observe or expiry."""
@@ -84,6 +97,7 @@ class OutboxLease:
     job_id: str
     kind: str
     idempotency_key: str
+    concurrency_key: str
     payload: Mapping[str, object]
     lease_token: str
     attempts: int
