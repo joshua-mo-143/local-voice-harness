@@ -9,6 +9,11 @@ from contextlib import redirect_stderr
 from pathlib import Path
 from unittest import mock
 
+from local_voice_harness.agents import (
+    HarnessSession,
+    ReconciliationState,
+    SessionReconciliation,
+)
 from local_voice_harness.cursor import delivery, provisioning, worker_lifecycle
 from local_voice_harness.cursor.model import (
     CursorJob,
@@ -968,10 +973,17 @@ class CursorRecoveryTests(unittest.TestCase):
         )
 
         visible = mock.Mock()
-        visible.get_agent.return_value = {
-            "state_change_seq": 8,
-            "agent_session": "planner-session",
-        }
+        visible.reconcile_session.return_value = SessionReconciliation(
+            ReconciliationState.ACTIVE,
+            HarnessSession(
+                "cursor/herdr",
+                "planner-session",
+                "planner",
+                8,
+            ),
+            "working",
+            True,
+        )
         reconcile_prompt_and_pane_operations(
             self.store,
             self.store.get("123456789abc"),

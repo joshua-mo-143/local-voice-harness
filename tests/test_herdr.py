@@ -905,8 +905,16 @@ WORKFLOW_PLAN[token]: <bounded multiline implementation plan>
                         client,
                         "get_agent",
                         side_effect=[
-                            {"agent_status": "idle", "state_change_seq": 1},
-                            {"agent_status": "working", "state_change_seq": 2},
+                            {
+                                "agent_status": "idle",
+                                "state_change_seq": 1,
+                                "agent_session": "session",
+                            },
+                            {
+                                "agent_status": "working",
+                                "state_change_seq": 2,
+                                "agent_session": "session",
+                            },
                         ],
                     ),
                     mock.patch.object(

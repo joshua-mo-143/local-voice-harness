@@ -6,6 +6,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from local_voice_harness.agents import HarnessCapability, HarnessSession
 from local_voice_harness.integrations.herdr import (
     AgentSelection,
     HerdrClient,
@@ -366,16 +367,18 @@ class HerdrComponentBoundaryTests(unittest.TestCase):
         for mode in (None, "ask", "plan"):
             with self.subTest(mode=mode):
                 operations = mock.Mock()
-                operations.run_json.return_value = {
-                    "agent": {
+                operations.create_session.return_value = HarnessSession(
+                    provider="cursor/herdr",
+                    session_id="session",
+                    target="participant",
+                    state_sequence=0,
+                    metadata={
                         "name": "participant",
                         "pane_id": "pane",
                         "workspace_id": "workspace",
                         "cwd": str(checkout),
-                        "agent_session": "session",
-                        "interactive_ready": True,
-                    }
-                }
+                    },
+                )
                 workspace = HerdrWorkspace(
                     operations,
                     cursor_mcp_auth_source=Path("/authenticated"),
@@ -392,7 +395,12 @@ class HerdrComponentBoundaryTests(unittest.TestCase):
                     )
 
                 link.assert_called_once_with(checkout)
-                self.assertIn("--approve-mcps", operations.run_json.call_args.args)
+                request = operations.create_session.call_args.args[0]
+                self.assertEqual(request.mode, mode)
+                self.assertEqual(
+                    request.required_capabilities,
+                    frozenset({HarnessCapability.MCP_CONNECTORS}),
+                )
 
 
 if __name__ == "__main__":
