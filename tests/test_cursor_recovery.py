@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import tempfile
 import threading
 import unittest
@@ -16,6 +17,7 @@ from local_voice_harness.agents import (
 )
 from local_voice_harness.cursor import delivery, provisioning, worker_lifecycle
 from local_voice_harness.cursor.model import (
+    CURRENT_SCHEMA_VERSION,
     CursorJob,
     JobStatus,
     WorkflowParticipant,
@@ -566,12 +568,15 @@ class CursorRecoveryTests(unittest.TestCase):
         self.create(
             {
                 "id": "123456789abc",
-                "status": "failed",
+                "schema_version": CURRENT_SCHEMA_VERSION,
+                "revision": 0,
+                "status": "reconciling",
                 "request": "test",
                 "created_at": 1,
-                "completed_at": 2,
-                "error": "fork visibility pending",
-                "result": "fork visibility pending",
+                "terminal_intent_status": "failed",
+                "terminal_intent_completed_at": 2,
+                "terminal_intent_error": "fork visibility pending",
+                "terminal_intent_result": "fork visibility pending",
                 "delivered": True,
                 "fork_committed": True,
                 "fork_operation_state": "failed_observing",
@@ -580,6 +585,7 @@ class CursorRecoveryTests(unittest.TestCase):
                 "fork_operation_source_default_branch": "main",
                 "fork_operation_target": "me/project",
                 "target_release_pending": True,
+                "target_release_token": "release",
             }
         )
         visible = GitHubRepository(
@@ -630,11 +636,14 @@ class CursorRecoveryTests(unittest.TestCase):
         job = self.create(
             {
                 "id": "123456789abc",
-                "status": "cancelled",
+                "schema_version": CURRENT_SCHEMA_VERSION,
+                "revision": 0,
+                "status": "reconciling",
                 "request": "test",
                 "created_at": 1,
-                "completed_at": 2,
-                "result": "cancelled",
+                "terminal_intent_status": "cancelled",
+                "terminal_intent_completed_at": 2,
+                "terminal_intent_result": "cancelled",
                 "delivered": True,
                 "fork_committed": True,
                 "fork_operation_state": "failed_observing",
@@ -642,6 +651,7 @@ class CursorRecoveryTests(unittest.TestCase):
                 "fork_reconcile_attempts": 5,
                 "fork_absent_observations": 5,
                 "target_release_pending": True,
+                "target_release_token": "release",
             }
         )
 
@@ -664,9 +674,135 @@ class CursorRecoveryTests(unittest.TestCase):
         self.assertEqual(updated.fork_operation_state, "manual_required")
         self.assertNotEqual(updated.fork_operation_state, "confirmed_absent")
         self.assertTrue(updated.target_release_pending)
-        self.assertFalse(updated.delivered)
+        self.assertTrue(updated.delivered)
 
-    def test_terminal_manual_escalations_create_at_least_once_delivery(self) -> None:
+    def test_dead_cleanup_owner_is_fenced_and_taken_over_for_release(self) -> None:
+        self.create(
+            {
+                "schema_version": CURRENT_SCHEMA_VERSION,
+                "id": "123456789abc",
+                "revision": 0,
+                "status": "reconciling",
+                "request": "test",
+                "created_at": 1,
+                "delivered": False,
+                "terminal_intent_status": "cancelled",
+                "terminal_intent_result": "cancelled",
+                "terminal_intent_completed_at": 2,
+                "target_release_pending": True,
+                "target_release_token": "stale-release",
+                "target_release_owner_pid": 999,
+                "target_release_owner_boot_id": "dead-boot",
+                "target_release_owner_start": "dead-start",
+                "herdr_target": "agent",
+                "herdr_pane_id": "pane",
+                "herdr_workspace_id": "workspace",
+                "agent_dispatch_state": "ready",
+            }
+        )
+        client = mock.Mock()
+        launch = mock.Mock()
+
+        recover_jobs(
+            self.store,
+            launch_worker=launch,
+            herdr_factory=lambda: client,
+            is_worker_alive=lambda _job: False,
+            get_boot_identity=lambda: "live-boot",
+            get_process_identity=lambda pid: (
+                "live-start" if pid == os.getpid() else None
+            ),
+            now=100,
+        )
+
+        recovered = self.store.get("123456789abc")
+        self.assertEqual(recovered.status, JobStatus.CANCELLED)
+        self.assertFalse(recovered.target_release_pending)
+        client.close_owned_pane.assert_called_once_with("agent", "pane", "workspace")
+        launch.assert_not_called()
+
+    def test_wrong_checkout_stages_failure_until_cleanup_settles(self) -> None:
+        self.create(
+            {
+                "id": "123456789abc",
+                "parent_job_id": "aaaaaaaaaaaa",
+                "status": "queued",
+                "request": "test",
+                "created_at": 1,
+                "queued_at": 1,
+                "delivered": False,
+                "repository": "/repo",
+                "worktree_branch": "voice/task",
+                "worktree_path": "/repo-worktree",
+                "worktree_provision_state": "ready",
+                "herdr_target": "agent",
+                "agent_dispatch_state": "ambiguous",
+            }
+        )
+        client = mock.Mock()
+        client.get_agent.return_value = {
+            "name": "agent",
+            "pane_id": "wrong-pane",
+            "workspace_id": "wrong-workspace",
+            "cwd": "/wrong-checkout",
+        }
+
+        reconcile_uncertain_agent(
+            self.store,
+            self.store.get("123456789abc"),
+            now=100,
+            herdr_factory=lambda: client,
+        )
+
+        staged = self.store.get("123456789abc")
+        self.assertEqual(staged.status, JobStatus.RECONCILING)
+        self.assertEqual(staged.terminal_intent_status, JobStatus.FAILED)
+        self.assertTrue(staged.target_release_pending)
+        self.assertIsNone(staged.completed_at)
+
+    def test_materialized_failure_reconciliation_preserves_outcome(self) -> None:
+        job = self.create(
+            {
+                "id": "123456789abc",
+                "status": "failed",
+                "request": "test",
+                "created_at": 1,
+                "completed_at": 2,
+                "error": "original failure",
+                "result": "original failure",
+                "delivered": True,
+                "delivery_generation": 3,
+                "agent_dispatch_state": "ambiguous",
+                "herdr_target": "agent",
+                "agent_reconcile_attempts": 5,
+            }
+        )
+
+        updated = self.store.update(
+            job.id,
+            lambda current: current.record_operation_observation(
+                "agent",
+                "agent_dispatch_state",
+                frozenset({"ambiguous"}),
+                now=100,
+                observed_absent=False,
+                failed_max_attempts=3,
+                uncertain_max_attempts=6,
+                base_seconds=5,
+                max_seconds=60,
+            ),
+        )
+
+        assert updated is not None
+        self.assertEqual(updated.status, JobStatus.FAILED)
+        self.assertEqual(updated.result, "original failure")
+        self.assertEqual(updated.error, "original failure")
+        self.assertEqual(updated.completed_at, 2)
+        self.assertEqual(updated.agent_dispatch_state, "manual_required")
+        self.assertFalse(updated.delivered)
+        self.assertEqual(updated.delivery_generation, 4)
+
+    def test_terminal_manual_escalations_remain_preterminal(self) -> None:
         operations = {
             "agent": {
                 "agent_dispatch_state": "ambiguous",
@@ -693,11 +829,16 @@ class CursorRecoveryTests(unittest.TestCase):
             self.create(
                 {
                     "id": job_id,
-                    "status": "cancelled",
+                    "schema_version": CURRENT_SCHEMA_VERSION,
+                    "revision": 0,
+                    "status": "reconciling",
                     "request": "test",
                     "created_at": 1,
-                    "completed_at": 2,
-                    "result": "cancelled",
+                    "terminal_intent_status": "cancelled",
+                    "terminal_intent_completed_at": 2,
+                    "terminal_intent_result": "cancelled",
+                    "target_release_pending": True,
+                    "target_release_token": "release",
                     "delivered": True,
                     "delivery_generation": 3,
                     f"{operation}_reconcile_attempts": 5,
@@ -722,27 +863,11 @@ class CursorRecoveryTests(unittest.TestCase):
 
             assert updated is not None
             self.assertEqual(updated.operation_state(operation), "manual_required")
-            self.assertFalse(updated.delivered)
-            self.assertEqual(updated.delivery_generation, 4)
-            self.assertIn("manual reconciliation required", updated.result or "")
-            first = delivery.claim_delivery(
-                self.store, job_id, foreground=True, now=101
+            self.assertTrue(updated.delivered)
+            self.assertEqual(updated.delivery_generation, 3)
+            self.assertIsNone(
+                delivery.claim_delivery(self.store, job_id, foreground=True, now=101)
             )
-            assert first is not None
-            self.assertTrue(
-                delivery.release_delivery(
-                    self.store,
-                    job_id,
-                    first.token,
-                    retry=False,
-                    now=101,
-                )
-            )
-            second = delivery.claim_delivery(
-                self.store, job_id, foreground=True, now=102
-            )
-            assert second is not None
-            self.assertNotEqual(first.token, second.token)
 
     def test_cancellation_release_is_idempotent_without_duplicate_cancel(self) -> None:
         self.create(

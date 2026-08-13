@@ -327,7 +327,12 @@ def resolve_job_repository(
 
 
 def complete_from_output(
-    job: CursorJob, *, output: str, agent_status: str, now: float | None = None
+    job: CursorJob,
+    *,
+    output: str,
+    agent_status: str,
+    now: float | None = None,
+    stage_terminal: bool = False,
 ) -> CursorJob:
     completed_at = time.time() if now is None else now
     token = job.turn_token or ""
@@ -372,6 +377,14 @@ def complete_from_output(
         else job.voice_question
     )
     if summary and summary_position > question_position:
+        if stage_terminal or job.herdr_target is not None:
+            return recovery.stage_terminal_intent(
+                job,
+                JobStatus.COMPLETED,
+                now=completed_at,
+                result=summary,
+                voice_question=resolved_question,
+            )
         return job.evolve_for_delivery(
             now=completed_at,
             status=JobStatus.COMPLETED,
@@ -1043,19 +1056,25 @@ def _worker_complete(
     def finish(job: CursorJob) -> CursorJob:
         now = time.time()
         outcome = complete_from_output(
-            job, output=output, agent_status=agent_status, now=now
+            job,
+            output=output,
+            agent_status=agent_status,
+            now=now,
+            stage_terminal=True,
         )
+        outcome_status = outcome.terminal_intent_status or outcome.status
         preserve = preserve_blocked_delivery and outcome.status == JobStatus.BLOCKED
         workflow_finished = (
-            outcome.status == JobStatus.COMPLETED and job.workflow_tier is not None
+            outcome_status == JobStatus.COMPLETED and job.workflow_tier is not None
         )
-        if outcome.status == JobStatus.COMPLETED:
+        if outcome_status == JobStatus.COMPLETED:
+            outcome_result = outcome.terminal_intent_result or outcome.result or ""
             if preference_update_failed and job.plan_approval_source == "explicit":
                 return job.evolve(
                     status=JobStatus.QUEUED,
                     reconcile=True,
                     queued_at=now,
-                    result=outcome.result or "Cursor implementation completed.",
+                    result=outcome_result or "Cursor implementation completed.",
                     voice_question=outcome.voice_question,
                     workflow_phase=WorkflowPhase.FINISHED.value,
                     active_participant=None,
@@ -1069,7 +1088,7 @@ def _worker_complete(
             return _finish_completed_workflow(
                 job,
                 preferences=preferences,
-                result=outcome.result or "",
+                result=outcome_result,
                 voice_question=outcome.voice_question,
                 now=now,
             )

@@ -634,7 +634,18 @@ class CursorJobModelTests(unittest.TestCase):
                 with self.subTest(source=source, target=target):
                     job = self.job_for_status(source)
                     fields = self.fields_for_status(target)
-                    if target == source or target in legal_transitions(source):
+                    immutable_same_status = (
+                        source
+                        in {JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED}
+                        and target == source
+                    )
+                    if immutable_same_status:
+                        with self.assertRaisesRegex(
+                            JobValidationError,
+                            "materialized terminal outcome is immutable",
+                        ):
+                            transition(job, target, **fields)
+                    elif target == source or target in legal_transitions(source):
                         updated = transition(job, target, **fields)
                         self.assertEqual(updated.status, target)
                         self.assertEqual(updated.revision, 1)
@@ -644,6 +655,46 @@ class CursorJobModelTests(unittest.TestCase):
                             f"illegal Cursor job transition {source} -> {target}",
                         ):
                             transition(job, target, **fields)
+
+    def test_materialized_terminal_outcome_rejects_every_payload_rewrite(self) -> None:
+        job = self.job_for_status(JobStatus.COMPLETED)
+
+        for rewrite in (
+            lambda current: current.evolve(result="replacement"),
+            lambda current: current.evolve(error="replacement"),
+            lambda current: current.evolve(completed_at=3),
+        ):
+            with (
+                self.subTest(rewrite=rewrite),
+                self.assertRaisesRegex(
+                    JobValidationError,
+                    "materialized terminal outcome is immutable",
+                ),
+            ):
+                rewrite(job)
+
+    def test_terminal_outcome_cannot_materialize_with_cleanup_fences(self) -> None:
+        job = self.job_for_status(JobStatus.RECONCILING).evolve(
+            terminal_intent_status="cancelled",
+            terminal_intent_result="cancelled",
+            terminal_intent_completed_at=2,
+            target_release_pending=True,
+            target_release_token="release",
+            cancellation_reconciliation_pending=True,
+        )
+
+        with self.assertRaisesRegex(
+            JobValidationError,
+            "cannot materialize before cleanup settles",
+        ):
+            job.evolve(
+                status=JobStatus.CANCELLED,
+                result="cancelled",
+                completed_at=2,
+                terminal_intent_status=None,
+                terminal_intent_result=None,
+                terminal_intent_completed_at=None,
+            )
 
     def test_schema_v10_prompt_boolean_migrates_fail_closed_in_place(self) -> None:
         job = CursorJob.from_dict(

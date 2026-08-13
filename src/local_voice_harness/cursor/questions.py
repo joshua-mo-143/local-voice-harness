@@ -232,13 +232,10 @@ def _queue_answer(
     linear_ticket_create_confirmed: bool | None = None,
     clear_target: bool = False,
 ) -> CursorJob:
-    return job.evolve(
+    return job.mark_delivered(
         status=JobStatus.QUEUED,
         question=None,
         clarification_kind=None,
-        delivered=True,
-        delivery_claim_token=None,
-        delivery_claimed_at=None,
         queued_at=context.now,
         updated_at=context.now,
         foreground_until=context.foreground_until,
