@@ -280,6 +280,28 @@ class LlmTransportContractTests(unittest.TestCase):
         self.assertEqual(message["content"], "First sentence. Second sentence. ")
         self.assertEqual(len(events), 1)
 
+    def test_cancellation_is_checked_for_every_sse_event(self) -> None:
+        events = [
+            'data: {"choices":[{"delta":{"content":"A long"}}]}\n',
+            'data: {"choices":[{"delta":{"content":" unfinished sentence"}}]}\n',
+            'data: {"choices":[{"delta":{"content":" keeps going"}}]}\n',
+        ]
+        checks = iter((False, True))
+
+        def stream() -> Iterator[str]:
+            while events:
+                yield events.pop(0)
+
+        message = streamed_message(
+            stream(),
+            mock.Mock(side_effect=AssertionError("no sentence should emit")),
+            emit_text_early=True,
+            should_cancel=lambda: next(checks),
+        )
+
+        self.assertEqual(message["content"], "A long")
+        self.assertEqual(len(events), 1)
+
     def test_tool_capable_stream_defers_speech_until_completion(self) -> None:
         events = [
             'data: {"choices":[{"delta":{"content":"First sentence. "}}]}\n',

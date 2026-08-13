@@ -60,6 +60,7 @@ def response_message(result: object) -> dict[str, object]:
 
 
 TextChunkCallback = Callable[[str], bool | None]
+CancellationCheck = Callable[[], bool]
 
 
 def _chunk_callback(
@@ -138,6 +139,7 @@ def streamed_message(
     *,
     content_filter: Callable[[str], str] | None = None,
     emit_text_early: bool = False,
+    should_cancel: CancellationCheck | None = None,
 ) -> dict[str, object]:
     content: list[str] = []
     tool_calls: dict[int, dict[str, object]] = {}
@@ -148,6 +150,9 @@ def streamed_message(
     received_event = False
     cancelled = False
     for raw_line in response:
+        if should_cancel is not None and should_cancel():
+            cancelled = True
+            break
         line = (
             raw_line.decode("utf-8") if isinstance(raw_line, bytes) else str(raw_line)
         ).strip()
@@ -298,6 +303,7 @@ class LlmTransport:
         request: ChatCompletionRequest,
         *,
         on_text_chunk: TextChunkCallback | None = None,
+        should_cancel: CancellationCheck | None = None,
         content_filter: Callable[[str], str] | None = None,
         telemetry_round: int | None = None,
     ) -> dict[str, object]:
@@ -327,6 +333,7 @@ class LlmTransport:
                         on_text_chunk,
                         content_filter=content_filter,
                         emit_text_early=request.tools is None,
+                        should_cancel=should_cancel,
                     )
                     if stream
                     else response_message(json.load(response))
