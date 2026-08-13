@@ -1065,7 +1065,9 @@ def test_foreground_timeout_confirms_new_job_by_channel(
     assert job.id not in response.spoken_text
     assert job.id in response.display_text
     assert "local-voice-harness issue 149" in response.display_text
-    assert service.read_job(job.id).foreground_until == 0
+    persisted = service.read_job(job.id)
+    assert persisted.foreground_until == job.foreground_until
+    assert persisted.revision == job.revision
 
 
 def test_foreground_timeout_acknowledges_repeated_answers_as_continuations(

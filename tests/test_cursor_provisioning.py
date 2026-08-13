@@ -1152,6 +1152,32 @@ class DurablePromptOperationTests(unittest.TestCase):
         self.assertEqual(current.terminal_intent_status, JobStatus.CANCELLED)
         self.assertEqual(current.prompt_operation_state, "planned")
 
+    def test_participant_plan_uses_observed_checkout_before_job_settlement(
+        self,
+    ) -> None:
+        job = self.create()
+        checkout = Path("/worktrees/voice-task")
+
+        planned = production_jobs._plan_participant_creation(
+            self.store,
+            job,
+            WORKER,
+            WorkflowParticipant.PLANNER,
+            target="planner",
+            label="task-planner",
+            workspace_id="workspace",
+            checkout=checkout,
+        )
+
+        self.assertEqual(planned.participant_creation_state, "planned")
+        self.assertEqual(planned.participant_creation_checkout, str(checkout))
+        operation = planned.participant_pane_operation
+        assert operation is not None
+        self.assertEqual(
+            operation.spec.checkout,
+            str(checkout),
+        )
+
     def test_terminal_intent_invalidates_pane_before_create_callback(self) -> None:
         job = self.create()
         planned = self.store.update(

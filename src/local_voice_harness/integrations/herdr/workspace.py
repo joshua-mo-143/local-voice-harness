@@ -431,7 +431,7 @@ class HerdrWorkspace:
                 checkpoint=checkpoint,
             )
         if plan_participant is not None:
-            plan_participant(name, label, workspace_id)
+            plan_participant(name, label, workspace_id, checkout)
         participant_pane, workspace_id = self._operations.new_pane(
             checkout,
             label,

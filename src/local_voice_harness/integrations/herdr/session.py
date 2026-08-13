@@ -583,7 +583,7 @@ class HerdrSession(AgentHarness):
 
         started = time.monotonic() if started_at is None else started_at
         last_activity = started
-        last_signature: tuple[object, str, str] | None = None
+        last_signature: tuple[str, str] | None = None
         initial_session: str | None = None
         settled_since: float | None = None
         boundary_since: float | None = None
@@ -624,7 +624,6 @@ class HerdrSession(AgentHarness):
                 )
 
             signature = (
-                agent.get("state_change_seq"),
                 status,
                 hashlib.sha256(output.encode()).hexdigest(),
             )

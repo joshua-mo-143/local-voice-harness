@@ -2745,11 +2745,10 @@ def _await_foreground(
                 )
             return result
         time.sleep(0.1)
-    updated = _job_store().update(
-        job_id,
-        lambda job: job.evolve(foreground_until=0, updated_at=time.time()),
-    )
-    job = updated if updated is not None else read_job(job_id)
+    # The timestamp expires naturally. Persisting a cosmetic zero here would
+    # advance the lifecycle revision while a worker is awaiting an external
+    # callback, causing that correctly fenced callback to look stale.
+    job = read_job(job_id)
     result = _foreground_delivery_result(job_id, job, delivery_claims)
     if result is not None:
         if job.status == JobStatus.COMPLETED:

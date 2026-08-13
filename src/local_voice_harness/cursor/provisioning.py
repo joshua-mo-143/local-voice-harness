@@ -3149,6 +3149,7 @@ def _plan_participant_creation(
     target: str,
     label: str,
     workspace_id: str,
+    checkout: Path | None = None,
 ) -> CursorJob:
     planned = _worker_change(
         store,
@@ -3167,7 +3168,9 @@ def _plan_participant_creation(
                 ),
             ),
             participant_creation_checkout=(
-                current.worktree_path
+                str(checkout)
+                if checkout is not None
+                else current.worktree_path
                 or current.repository
                 or current.agent_operation_checkout
             ),
@@ -5035,6 +5038,7 @@ def run_claimed_worker(  # pyright: ignore[reportGeneralTypeIssues]
                     name: str,
                     label: str,
                     workspace_id: str | None,
+                    checkout: Path,
                     target_holder: list[str] = planned_participant_target,
                     revision_state: list[int] = callback_revision,
                 ) -> None:
@@ -5048,6 +5052,7 @@ def run_claimed_worker(  # pyright: ignore[reportGeneralTypeIssues]
                         target=name,
                         label=label,
                         workspace_id=workspace_id or "",
+                        checkout=checkout,
                     )
                     revision_state[0] = job.revision
 
