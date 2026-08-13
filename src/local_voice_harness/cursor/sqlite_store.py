@@ -1101,7 +1101,8 @@ class SQLiteJobDatabase:
         self, connection: sqlite3.Connection, command_id: str
     ) -> sqlite3.Row | None:
         return connection.execute(
-            "SELECT event_id, job_id, revision, kind FROM events WHERE command_id = ?",
+            "SELECT event_id, job_id, revision, kind, payload_json "
+            "FROM events WHERE command_id = ?",
             (command_id,),
         ).fetchone()
 

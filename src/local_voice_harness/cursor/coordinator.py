@@ -57,3 +57,9 @@ class CoordinatorDecision:
     effects: tuple[DurableEffect, ...] = ()
     event_kind: str = "transition"
     event_payload: Mapping[str, object] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        reserved = {"command_kind", "effects"} & self.event_payload.keys()
+        if reserved:
+            names = ", ".join(sorted(reserved))
+            raise CoordinatorError(f"event payload cannot override {names}")

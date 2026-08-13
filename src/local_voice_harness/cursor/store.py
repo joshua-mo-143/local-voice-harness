@@ -2649,6 +2649,22 @@ class JobStore:
             return None
         existing = self._db.load_command_event(connection, command.command_id)
         if existing is not None:
+            try:
+                payload = json.loads(str(existing["payload_json"]))
+            except (TypeError, ValueError) as exc:
+                raise JobValidationError(
+                    f"command {command.command_id!r} has invalid audit identity"
+                ) from exc
+            if (
+                str(existing["job_id"]) != command.job_id
+                or int(existing["revision"]) != command.expected_revision + 1
+                or not isinstance(payload, dict)
+                or payload.get("command_kind") != command.kind
+            ):
+                raise JobValidationError(
+                    f"command {command.command_id!r} conflicts with a persisted "
+                    "command identity"
+                )
             return CursorJob.from_dict(
                 self._db.load_job(connection, str(existing["job_id"]))
             )
@@ -2693,9 +2709,9 @@ class JobStore:
             revision=job.revision,
             kind=decision.event_kind,
             payload={
+                **dict(decision.event_payload),
                 "command_kind": command.kind,
                 "effects": [effect.kind for effect in decision.effects],
-                **dict(decision.event_payload),
             },
             created_at=time.time(),
         )

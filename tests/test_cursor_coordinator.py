@@ -75,6 +75,16 @@ def test_command_and_effect_require_identity() -> None:
         )
     with pytest.raises(CoordinatorError, match="kind and idempotency_key"):
         DurableEffect(kind=" ", idempotency_key="session:a")
+    with pytest.raises(CoordinatorError, match="cannot override command_kind"):
+        CoordinatorDecision(
+            job=CursorJob.from_dict(_job("aaaaaaaaaaaa")),
+            event_payload={"command_kind": "forged"},
+        )
+    with pytest.raises(CoordinatorError, match="cannot override effects"):
+        CoordinatorDecision(
+            job=CursorJob.from_dict(_job("aaaaaaaaaaaa")),
+            event_payload={"effects": []},
+        )
 
 
 def test_apply_commits_state_event_and_outbox_atomically(tmp_path: Path) -> None:
@@ -216,6 +226,50 @@ def test_duplicate_command_does_not_apply_twice(tmp_path: Path) -> None:
             "SELECT count(*) FROM outbox WHERE idempotency_key = ?",
             ("session:aaaaaaaaaaaa:twice",),
         ).fetchone() == (0,)
+
+
+@pytest.mark.parametrize(
+    ("job_id", "expected_revision", "kind"),
+    [
+        ("bbbbbbbbbbbb", 0, "session.create"),
+        ("aaaaaaaaaaaa", 0, "task.submit"),
+        ("aaaaaaaaaaaa", 1, "session.create"),
+    ],
+)
+def test_duplicate_command_id_rejects_changed_identity(
+    tmp_path: Path,
+    job_id: str,
+    expected_revision: int,
+    kind: str,
+) -> None:
+    store = JobStore(tmp_path / "jobs", tmp_path / "legacy")
+    first = store.create(CursorJob.from_dict(_job("aaaaaaaaaaaa")))
+    store.create(CursorJob.from_dict(_job("bbbbbbbbbbbb")))
+    command = CoordinatorCommand(
+        job_id=first.id,
+        expected_revision=0,
+        command_id="cmd-shared",
+        kind="session.create",
+    )
+    result = store.apply(
+        command,
+        lambda job: CoordinatorDecision(job=job.evolve(speakable_label="first")),
+    )
+    assert result is not None
+
+    with pytest.raises(JobValidationError, match="persisted command identity"):
+        store.apply(
+            CoordinatorCommand(
+                job_id=job_id,
+                expected_revision=expected_revision,
+                command_id="cmd-shared",
+                kind=kind,
+            ),
+            lambda job: CoordinatorDecision(job=job.evolve(speakable_label="wrong")),
+        )
+
+    assert store.get("aaaaaaaaaaaa").speakable_label == "first"
+    assert store.get("bbbbbbbbbbbb").speakable_label is None
 
 
 def test_reservation_conflict_rolls_back_event_and_outbox(tmp_path: Path) -> None:
