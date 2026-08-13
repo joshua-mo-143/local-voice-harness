@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import http.client
 import json
 import unittest
 import urllib.request
@@ -71,9 +72,9 @@ class HttpPoolTests(unittest.TestCase):
                     "Content-Type": "application/json",
                 },
             )
-            with urllib.request.urlopen(request, timeout=5) as first:
+            with http_pool.urlopen(request, timeout=5) as first:
                 first.read()
-            with urllib.request.urlopen(request, timeout=5) as second:
+            with http_pool.urlopen(request, timeout=5) as second:
                 second.read()
 
         self.assertEqual(len(created), 1)
@@ -82,7 +83,7 @@ class HttpPoolTests(unittest.TestCase):
         self.assertEqual(first_headers["Connection"], "keep-alive")
         self.assertEqual(first_headers["Authorization"], "Bearer secret")
 
-    def test_tts_request_reuses_the_llm_connection_to_the_same_host(self) -> None:
+    def test_same_process_requests_to_same_host_share_connection(self) -> None:
         created: list[mock.Mock] = []
 
         def https_connection(
@@ -110,9 +111,9 @@ class HttpPoolTests(unittest.TestCase):
                 data=b"{}",
                 headers={"Content-Type": "application/json"},
             )
-            with urllib.request.urlopen(llm, timeout=5) as first:
+            with http_pool.urlopen(llm, timeout=5) as first:
                 first.read()
-            with urllib.request.urlopen(tts, timeout=11) as second:
+            with http_pool.urlopen(tts, timeout=11) as second:
                 second.read()
 
         self.assertEqual(len(created), 1)
@@ -138,12 +139,13 @@ class HttpPoolTests(unittest.TestCase):
                 data=b"{}",
                 headers={"Accept": "text/event-stream"},
             )
-            with urllib.request.urlopen(request, timeout=5) as stream:
+            with http_pool.urlopen(request, timeout=5) as stream:
                 received = [line for line in stream]
                 response.read.assert_not_called()
 
         self.assertEqual(received, lines[:2])
-        response.read.assert_called()
+        response.read.assert_not_called()
+        response.close.assert_called_once()
 
     def test_llm_transport_reuses_the_process_pool(self) -> None:
         created: list[mock.Mock] = []
@@ -185,3 +187,78 @@ class HttpPoolTests(unittest.TestCase):
 
         self.assertEqual(len(created), 1)
         self.assertEqual(created[0].request.call_count, 2)
+
+    def test_https_proxy_uses_tunnel_without_forwarding_credentials(self) -> None:
+        connection = mock.Mock()
+        connection.sock = None
+        connection.getresponse.return_value = _response()
+        request = urllib.request.Request(
+            "https://api.venice.ai/api/v1/chat/completions",
+            data=b"{}",
+            headers={"Proxy-Authorization": "Basic secret"},
+        )
+        request.set_proxy("proxy.example:8443", "https")
+
+        with mock.patch(
+            "http.client.HTTPSConnection", return_value=connection
+        ) as https_connection:
+            with http_pool.PooledHTTPSHandler().https_open(request) as response:
+                response.read()
+
+        https_connection.assert_called_once_with("proxy.example:8443", timeout=None)
+        connection.set_tunnel.assert_called_once_with(
+            "api.venice.ai",
+            headers={"Proxy-Authorization": "Basic secret"},
+        )
+        sent_headers = connection.request.call_args.args[3]
+        self.assertNotIn("Proxy-Authorization", sent_headers)
+
+    def test_reused_post_is_not_replayed_after_disconnect(self) -> None:
+        connection = mock.Mock()
+        connection.sock = None
+        connection.request.side_effect = http.client.RemoteDisconnected("closed")
+        key = ("https", "api.venice.ai", "")
+        http_pool._release(key, connection)
+        request = urllib.request.Request(
+            "https://api.venice.ai/api/v1/chat/completions",
+            data=b"{}",
+        )
+
+        with self.assertRaises(http.client.RemoteDisconnected):
+            http_pool.PooledHTTPSHandler().https_open(request)
+
+        connection.request.assert_called_once()
+        connection.close.assert_called_once()
+
+    def test_partial_response_close_discards_connection_without_draining(self) -> None:
+        response = _response(body=b"x" * 20)
+        connection = mock.Mock()
+        connection.sock = None
+        connection.getresponse.return_value = response
+        request = urllib.request.Request("https://api.venice.ai/stream")
+
+        with mock.patch("http.client.HTTPSConnection", return_value=connection):
+            opened = http_pool.PooledHTTPSHandler().https_open(request)
+            opened.read(10)
+            opened.close()
+
+        connection.close.assert_called_once()
+        response.read.assert_called_once_with(10)
+
+    def test_reused_connection_updates_socket_timeout(self) -> None:
+        connection = mock.Mock()
+        socket = mock.Mock()
+        connection.sock = socket
+        key = ("https", "api.venice.ai", "")
+        http_pool._release(key, connection)
+
+        checked_out, reused = http_pool._checkout(
+            key,
+            http.client.HTTPSConnection,
+            3,
+        )
+
+        self.assertTrue(reused)
+        self.assertIs(checked_out, connection)
+        self.assertEqual(connection.timeout, 3)
+        socket.settimeout.assert_called_once_with(3)

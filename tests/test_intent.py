@@ -186,8 +186,8 @@ class IntentRouterTests(LocalRouterTestCase):
                 llm_transport, "get_venice_api_key", return_value="venice-secret"
             ) as get_key,
             mock.patch.object(
-                llm_transport.urllib.request,
-                "urlopen",
+                llm_transport,
+                "pooled_urlopen",
                 return_value=_response("cursor_submit"),
             ) as urlopen,
         ):
@@ -283,8 +283,8 @@ class IntentRouterTests(LocalRouterTestCase):
                 llm_transport, "get_venice_api_key", return_value="secret-token"
             ),
             mock.patch.object(
-                llm_transport.urllib.request,
-                "urlopen",
+                llm_transport,
+                "pooled_urlopen",
                 return_value=_response("conversation"),
             ) as urlopen,
         ):

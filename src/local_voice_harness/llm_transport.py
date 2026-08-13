@@ -12,10 +12,8 @@ from .config import BackendSettings
 from .credentials import get_venice_api_key
 from .diagnostic_safety import redact_diagnostic, redact_fields
 from .errors import HarnessError
-from .http_pool import install as _install_http_pool
+from .http_pool import urlopen as pooled_urlopen
 from .user_config import default_user_config
-
-_install_http_pool()
 
 _SENTENCE = re.compile(r'^(.+?[.!?]["\']?)(?:\s+)', re.DOTALL)
 
@@ -327,9 +325,12 @@ class LlmTransport:
         )
         started = time.perf_counter()
         try:
-            with urllib.request.urlopen(
-                http_request, timeout=self._config.timeout
-            ) as response:
+            open_request = (
+                pooled_urlopen
+                if self._config.provider == "venice"
+                else urllib.request.urlopen
+            )
+            with open_request(http_request, timeout=self._config.timeout) as response:
                 message = (
                     streamed_message(
                         response,

@@ -202,7 +202,7 @@ class ServerStreamingTests(unittest.TestCase):
                 server, "get_venice_api_key", return_value="venice-secret"
             ),
             mock.patch.object(
-                server.urllib.request, "urlopen", return_value=response
+                server, "pooled_urlopen", return_value=response
             ) as urlopen,
         ):
             audio, rate, duration, _elapsed = server._venice_audio("Hello.")
