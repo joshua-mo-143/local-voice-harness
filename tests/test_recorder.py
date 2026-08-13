@@ -68,6 +68,109 @@ class RecorderTests(unittest.TestCase):
         self.assertIsNotNone(identity)
         self.assertTrue(identity and identity.isdigit())
 
+    def test_ready_recorder_returns_without_sleeping(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = _paths(Path(temporary))
+            paths.audio.write_bytes(b"RIFF" + b"\0" * 64)
+            process = mock.Mock()
+            process.poll.return_value = None
+
+            with mock.patch.object(recorder.time, "sleep") as sleep:
+                recorder._wait_for_recorder(paths, process)
+
+            sleep.assert_not_called()
+
+    def test_recorder_readiness_uses_short_conditional_polls(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = _paths(Path(temporary))
+            process = mock.Mock()
+            process.poll.return_value = None
+
+            def make_ready(_delay: float) -> None:
+                paths.audio.write_bytes(b"RIFF" + b"\0" * 64)
+
+            with mock.patch.object(
+                recorder.time, "sleep", side_effect=make_ready
+            ) as sleep:
+                recorder._wait_for_recorder(paths, process)
+
+            sleep.assert_called_once_with(recorder.RECORDER_POLL_INTERVAL)
+            self.assertLess(recorder.RECORDER_POLL_INTERVAL, 0.2)
+
+    def test_recorder_startup_failure_is_reported_without_waiting(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = _paths(Path(temporary))
+            paths.log.write_text("target node is unavailable\n")
+            process = mock.Mock()
+            process.poll.return_value = 23
+
+            with (
+                mock.patch.object(recorder.time, "sleep") as sleep,
+                self.assertRaisesRegex(HarnessError, "target node is unavailable"),
+            ):
+                recorder._wait_for_recorder(paths, process)
+
+            sleep.assert_not_called()
+
+    def test_recorder_readiness_timeout_is_bounded(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = _paths(Path(temporary))
+            process = mock.Mock()
+            process.poll.return_value = None
+
+            with (
+                mock.patch.object(recorder.time, "monotonic", side_effect=[10.0, 11.0]),
+                mock.patch.object(recorder.time, "sleep") as sleep,
+                self.assertRaisesRegex(HarnessError, "within 1 seconds"),
+            ):
+                recorder._wait_for_recorder(paths, process)
+
+            sleep.assert_not_called()
+
+    def test_start_publishes_ownership_only_after_recorder_is_ready(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = _paths(Path(temporary))
+            process = mock.Mock(pid=os.getpid(), returncode=None)
+            process.poll.return_value = None
+
+            def become_ready(_paths: object, _process: object) -> None:
+                self.assertFalse(paths.process.exists())
+                paths.audio.write_bytes(b"RIFF" + b"\0" * 64)
+
+            with (
+                mock.patch.object(recorder.subprocess, "Popen", return_value=process),
+                mock.patch.object(
+                    recorder, "_wait_for_recorder", side_effect=become_ready
+                ),
+            ):
+                recorder.start_recording(paths, source="", ready=lambda: True)
+
+            self.assertTrue(paths.process.exists())
+
+    def test_startup_timeout_stops_process_and_leaves_no_owner(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = _paths(Path(temporary))
+            process = mock.Mock(pid=os.getpid(), returncode=None)
+            process.poll.return_value = None
+
+            def time_out(_paths: object, _process: object) -> None:
+                paths.audio.write_bytes(b"partial")
+                raise HarnessError("startup timeout")
+
+            with (
+                mock.patch.object(recorder.subprocess, "Popen", return_value=process),
+                mock.patch.object(recorder, "_wait_for_recorder", side_effect=time_out),
+                mock.patch.object(
+                    recorder, "terminate_pidfd", return_value=True
+                ) as stop,
+                self.assertRaisesRegex(HarnessError, "startup timeout"),
+            ):
+                recorder.start_recording(paths, source="", ready=lambda: True)
+
+            stop.assert_called_once()
+            self.assertFalse(paths.process.exists())
+            self.assertFalse(paths.audio.exists())
+
     def test_pid_reuse_never_signals_mismatched_process(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             paths = _paths(Path(temporary))
@@ -127,7 +230,7 @@ class RecorderTests(unittest.TestCase):
                 mock.patch.object(
                     recorder.subprocess, "Popen", return_value=process
                 ) as popen,
-                mock.patch.object(recorder.time, "sleep"),
+                mock.patch.object(recorder, "_wait_for_recorder"),
             ):
                 threads = [threading.Thread(target=begin) for _ in range(2)]
                 for thread in threads:
@@ -152,7 +255,7 @@ class RecorderTests(unittest.TestCase):
             process.poll.return_value = None
             with (
                 mock.patch.object(recorder.subprocess, "Popen", return_value=process),
-                mock.patch.object(recorder.time, "sleep"),
+                mock.patch.object(recorder, "_wait_for_recorder"),
                 mock.patch.object(
                     recorder, "_write_state", side_effect=OSError("disk")
                 ),
@@ -215,7 +318,7 @@ class RecorderTests(unittest.TestCase):
                 mock.patch.object(
                     recorder.subprocess, "Popen", return_value=process
                 ) as popen,
-                mock.patch.object(recorder.time, "sleep"),
+                mock.patch.object(recorder, "_wait_for_recorder"),
             ):
                 recorder.start_recording(
                     dictation,
@@ -290,7 +393,7 @@ class RecorderTests(unittest.TestCase):
                 mock.patch.object(
                     recorder.subprocess, "Popen", return_value=process
                 ) as popen,
-                mock.patch.object(recorder.time, "sleep"),
+                mock.patch.object(recorder, "_wait_for_recorder"),
             ):
                 threads = [
                     threading.Thread(target=begin, args=(manual, dictation)),
@@ -543,7 +646,7 @@ class RecorderTests(unittest.TestCase):
             paths.audio.write_bytes(b"stale writable data")
             with (
                 mock.patch.object(recorder.subprocess, "Popen", return_value=process),
-                mock.patch.object(recorder.time, "sleep"),
+                mock.patch.object(recorder, "_wait_for_recorder"),
             ):
                 recorder.start_recording(paths, source="", ready=lambda: True)
 

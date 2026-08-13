@@ -33,6 +33,7 @@ tts = [
 
 [project.scripts]
 voice-harness = "local_voice_harness.cli:main"
+voice-harness-dictate = "local_voice_harness.dictation_cli:main"
 voice-harness-wake = "local_voice_harness.wake.daemon:main"
 voice-harness-dictation = "local_voice_harness.stt.launcher:main"
 voice-harness-llm = "local_voice_harness.llm_launcher:main"
