@@ -174,6 +174,8 @@ class LlmTransportContractTests(unittest.TestCase):
             )
 
         self.assertNotIn("secret-token", str(ctx.exception))
+        assert error.fp is not None
+        self.assertTrue(error.fp.closed)
 
     def test_transport_errors_are_wrapped(self) -> None:
         transport = self._transport()

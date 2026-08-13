@@ -150,10 +150,13 @@ def streamed_message(
     )
     received_event = False
     cancelled = False
+    stream_done = False
     for raw_line in response:
         if should_cancel is not None and should_cancel():
             cancelled = True
             break
+        if stream_done:
+            continue
         line = (
             raw_line.decode("utf-8") if isinstance(raw_line, bytes) else str(raw_line)
         ).strip()
@@ -161,7 +164,8 @@ def streamed_message(
             continue
         data = line.removeprefix("data:").strip()
         if data == "[DONE]":
-            break
+            stream_done = True
+            continue
         event = json.loads(data)
         if not isinstance(event, dict):
             raise HarnessError("LLM returned a malformed streaming event")
@@ -295,6 +299,8 @@ class LlmTransport:
             detail = exc.read(4096).decode("utf-8", errors="replace").strip()
         except OSError:
             detail = ""
+        finally:
+            exc.close()
         detail = redact_diagnostic(detail)
         suffix = f": {detail}" if detail else ""
         return HarnessError(f"LLM request failed: HTTP {exc.code} {exc.reason}{suffix}")

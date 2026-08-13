@@ -188,6 +188,58 @@ class HttpPoolTests(unittest.TestCase):
         self.assertEqual(len(created), 1)
         self.assertEqual(created[0].request.call_count, 2)
 
+    def test_completed_sse_response_returns_connection_to_pool(self) -> None:
+        created: list[mock.Mock] = []
+
+        def https_connection(
+            host: str,
+            port: int | None = None,
+            timeout: object = None,
+            **_kwargs: object,
+        ) -> mock.Mock:
+            connection = mock.Mock()
+            connection.sock = None
+            created.append(connection)
+            connection.getresponse.side_effect = [
+                _response(
+                    lines=[
+                        b'data: {"choices":[{"delta":{"content":"one"}}]}\n',
+                        b"data: [DONE]\n",
+                        b"",
+                    ]
+                ),
+                _response(
+                    lines=[
+                        b'data: {"choices":[{"delta":{"content":"two"}}]}\n',
+                        b"data: [DONE]\n",
+                        b"",
+                    ]
+                ),
+            ]
+            return connection
+
+        transport = LlmTransport(
+            LlmTransportConfig(
+                provider="venice",
+                model="test-model",
+                endpoint="https://api.venice.ai/api/v1/chat/completions",
+                timeout=9,
+                api_key="venice-secret",
+            )
+        )
+        with mock.patch("http.client.HTTPSConnection", side_effect=https_connection):
+            first = transport.chat_completion(
+                ChatCompletionRequest(messages=[], stream=True)
+            )
+            second = transport.chat_completion(
+                ChatCompletionRequest(messages=[], stream=True)
+            )
+
+        self.assertEqual(first["content"], "one")
+        self.assertEqual(second["content"], "two")
+        self.assertEqual(len(created), 1)
+        self.assertEqual(created[0].request.call_count, 2)
+
     def test_https_proxy_uses_tunnel_without_forwarding_credentials(self) -> None:
         connection = mock.Mock()
         connection.sock = None

@@ -206,6 +206,18 @@ def _venice_audio(text: str) -> tuple[bytes, int, float, float]:
         with pooled_urlopen(request, timeout=settings.tts_timeout) as response:
             content_type = response.headers.get_content_type()
             audio = response.read(MAX_AUDIO_BYTES + 1)
+    except urllib.error.HTTPError as exc:
+        try:
+            detail = exc.read(4096).decode("utf-8", errors="replace").strip()
+        except OSError:
+            detail = ""
+        finally:
+            exc.close()
+        detail = redact_diagnostic(detail)
+        suffix = f": {detail}" if detail else ""
+        raise RuntimeError(
+            f"Venice TTS request failed: HTTP {exc.code} {exc.reason}{suffix}"
+        ) from exc
     except (OSError, urllib.error.URLError) as exc:
         raise RuntimeError(f"Venice TTS request failed: {exc}") from exc
     elapsed = time.perf_counter() - started
