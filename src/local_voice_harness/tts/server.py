@@ -136,6 +136,18 @@ def _request_voice(request: dict[str, object]) -> Path | None:
     return voice
 
 
+def _request_bool(
+    request: dict[str, object],
+    name: str,
+    *,
+    default: bool,
+) -> bool:
+    value = request.get(name, default)
+    if not isinstance(value, bool):
+        raise ValueError(f"{name} must be a boolean")
+    return value
+
+
 def _generate(text: str, voice: Path | None) -> tuple[Any, float]:
     import torch
 
@@ -245,6 +257,15 @@ def _atempo_filter(speed: float) -> str:
     return ",".join(f"atempo={factor:g}" for factor in factors)
 
 
+def _require_ffmpeg() -> str:
+    ffmpeg = shutil.which("ffmpeg")
+    if ffmpeg is None:
+        raise RuntimeError(
+            "FFmpeg is required for pitch-preserving Venice TTS speed adjustment"
+        )
+    return ffmpeg
+
+
 def _apply_venice_speed(
     audio: bytes,
     output: Path,
@@ -256,11 +277,7 @@ def _apply_venice_speed(
     if speed == 1:
         output.write_bytes(audio)
     else:
-        ffmpeg = shutil.which("ffmpeg")
-        if ffmpeg is None:
-            raise RuntimeError(
-                "FFmpeg is required for pitch-preserving Venice TTS speed adjustment"
-            )
+        ffmpeg = _require_ffmpeg()
         source_path: Path | None = None
         try:
             with tempfile.NamedTemporaryFile(
@@ -315,6 +332,8 @@ def _synthesize(
     text: str,
     voice: Path | None,
     output: Path,
+    *,
+    apply_speed: bool = True,
 ) -> tuple[int, float, float]:
     if _settings().tts_provider == "venice":
         settings = _settings()
@@ -322,7 +341,7 @@ def _synthesize(
         sample_rate, duration, processing_elapsed = _apply_venice_speed(
             audio,
             output,
-            settings.tts_speed,
+            settings.tts_speed if apply_speed else 1,
             timeout=settings.tts_timeout,
         )
         return sample_rate, duration, generation_elapsed + processing_elapsed
@@ -368,6 +387,15 @@ def _stream_response(
     if not REQUEST_ID.fullmatch(request_id):
         raise ValueError("request_id must contain 1-64 letters, numbers, '_' or '-'")
     chunks = split_text(text)
+    skip_first_speed = _request_bool(request, "skip_first_speed", default=False)
+    preflight_speed = _request_bool(request, "preflight_speed", default=False)
+    settings = _settings()
+    if (
+        settings.tts_provider == "venice"
+        and settings.tts_speed != 1
+        and preflight_speed
+    ):
+        _require_ffmpeg()
     output_dir = OUTPUT_ROOT / f"stream-{request_id}"
     output_dir.mkdir(mode=0o700, parents=False, exist_ok=False)
     cancelled = threading.Event()
@@ -391,7 +419,12 @@ def _stream_response(
                 if cancelled.is_set():
                     break
                 output = output_dir / f"{index:04d}.wav"
-                rate, duration, elapsed = _synthesize(chunk, voice, output)
+                rate, duration, elapsed = _synthesize(
+                    chunk,
+                    voice,
+                    output,
+                    apply_speed=not (skip_first_speed and index == 0),
+                )
                 generation_seconds += elapsed
                 if cancelled.is_set():
                     output.unlink(missing_ok=True)

@@ -42,6 +42,8 @@ class PrefetchedUtterance:
 @dataclass
 class PlaybackRequest:
     text: str
+    skip_first_speed: bool = False
+    preflight_speed: bool = False
     job_id: str | None = None
     delivery_token: str | None = None
     job_status: str | None = None
@@ -50,9 +52,18 @@ class PlaybackRequest:
 
 
 class PrefetchHandle:
-    def __init__(self, text: str, settings: AudioSettings | None = None) -> None:
+    def __init__(
+        self,
+        text: str,
+        settings: AudioSettings | None = None,
+        *,
+        skip_first_speed: bool = False,
+        preflight_speed: bool = False,
+    ) -> None:
         self.text = text
         self.audio = settings or default_user_config().audio
+        self.skip_first_speed = skip_first_speed
+        self.preflight_speed = preflight_speed
         self.request_id = uuid.uuid4().hex
         self._event = threading.Event()
         self._result: PrefetchedUtterance | None = None
@@ -96,6 +107,8 @@ class PrefetchHandle:
                 clear_socket=self._clear_socket,
                 settings=self.audio,
                 on_chunk=self._note_chunk,
+                skip_first_speed=self.skip_first_speed,
+                preflight_speed=self.preflight_speed,
             )
         except BaseException as exc:
             self.cancel()
@@ -279,6 +292,8 @@ def _prefetch_utterance(
     clear_socket: Callable[[socket.socket], None],
     settings: AudioSettings | None = None,
     on_chunk: Callable[[Path, str, int], None] | None = None,
+    skip_first_speed: bool = False,
+    preflight_speed: bool = False,
 ) -> PrefetchedUtterance:
     from ..config import TTS_SOCKET
 
@@ -299,6 +314,8 @@ def _prefetch_utterance(
             "voice": (settings or default_user_config().audio).voice,
             "stream": True,
             "request_id": request_id,
+            "skip_first_speed": skip_first_speed,
+            "preflight_speed": preflight_speed,
         }
         submit_request(stream_socket, json.dumps(request).encode() + b"\n")
         while True:
@@ -450,9 +467,18 @@ class PlaybackQueue:
             active = sum(handle is not None for _, handle in self._items)
             prefetch = self._draining and active < PREFETCH_LIMIT
             handle = (
-                PrefetchHandle(request.text, self._audio)
+                PrefetchHandle(
+                    request.text,
+                    self._audio,
+                    skip_first_speed=request.skip_first_speed,
+                    preflight_speed=request.preflight_speed,
+                )
                 if prefetch and self._audio is not None
-                else PrefetchHandle(request.text)
+                else PrefetchHandle(
+                    request.text,
+                    skip_first_speed=request.skip_first_speed,
+                    preflight_speed=request.preflight_speed,
+                )
                 if prefetch
                 else None
             )
@@ -468,9 +494,18 @@ class PlaybackQueue:
                     break
                 if handle is None:
                     created = (
-                        PrefetchHandle(request.text, self._audio)
+                        PrefetchHandle(
+                            request.text,
+                            self._audio,
+                            skip_first_speed=request.skip_first_speed,
+                            preflight_speed=request.preflight_speed,
+                        )
                         if self._audio is not None
-                        else PrefetchHandle(request.text)
+                        else PrefetchHandle(
+                            request.text,
+                            skip_first_speed=request.skip_first_speed,
+                            preflight_speed=request.preflight_speed,
+                        )
                     )
                     self._items[index] = (request, created)
                     active += 1
@@ -525,9 +560,18 @@ class PlaybackQueue:
                         request, handle = self._items[0]
                         if handle is None:
                             handle = (
-                                PrefetchHandle(request.text, self._audio)
+                                PrefetchHandle(
+                                    request.text,
+                                    self._audio,
+                                    skip_first_speed=request.skip_first_speed,
+                                    preflight_speed=request.preflight_speed,
+                                )
                                 if self._audio is not None
-                                else PrefetchHandle(request.text)
+                                else PrefetchHandle(
+                                    request.text,
+                                    skip_first_speed=request.skip_first_speed,
+                                    preflight_speed=request.preflight_speed,
+                                )
                             )
                             self._items[0] = (request, handle)
                     item_started = time.perf_counter()

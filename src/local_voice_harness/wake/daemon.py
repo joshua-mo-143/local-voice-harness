@@ -866,9 +866,21 @@ class WakeConversationDaemon:
         played: list[dict[str, object]] = []
         playback_errors: list[BaseException] = []
         interruption: BargeIn | None = None
+        first_streamed_request = True
         stream_renderer = StreamingSpeechRenderer(
             getattr(self, "speech_renderer", SpeechRenderer())
         )
+
+        def enqueue_streamed_speech(spoken_text: str) -> None:
+            nonlocal first_streamed_request
+            self.playback_queue.enqueue(
+                PlaybackRequest(
+                    text=spoken_text,
+                    skip_first_speed=first_streamed_request,
+                    preflight_speed=first_streamed_request,
+                )
+            )
+            first_streamed_request = False
 
         def on_text_chunk(text: str) -> bool:
             nonlocal stopped
@@ -879,7 +891,7 @@ class WakeConversationDaemon:
                     return False
                 chunks.append(text.strip())
                 for spoken_text in stream_renderer.feed(text):
-                    self.playback_queue.enqueue(PlaybackRequest(text=spoken_text))
+                    enqueue_streamed_speech(spoken_text)
                 condition.notify()
                 return True
 
@@ -888,7 +900,7 @@ class WakeConversationDaemon:
                 if stopped:
                     return
                 for spoken_text in stream_renderer.flush():
-                    self.playback_queue.enqueue(PlaybackRequest(text=spoken_text))
+                    enqueue_streamed_speech(spoken_text)
                 condition.notify()
 
         def should_cancel_generation() -> bool:

@@ -38,7 +38,13 @@ class PlaybackQueueTests(unittest.TestCase):
 
         self.assertEqual(
             prefetch.call_args_list,
-            [mock.call("first")],
+            [
+                mock.call(
+                    "first",
+                    skip_first_speed=False,
+                    preflight_speed=False,
+                )
+            ],
         )
 
     def test_prefetch_wait_progress_can_be_interrupted(self) -> None:
@@ -117,7 +123,11 @@ class PlaybackQueueTests(unittest.TestCase):
         with mock.patch("local_voice_harness.tts.queue.PrefetchHandle") as prefetch:
             queue.enqueue(PlaybackRequest(text="arrived during playback"))
 
-        prefetch.assert_called_once_with("arrived during playback")
+        prefetch.assert_called_once_with(
+            "arrived during playback",
+            skip_first_speed=False,
+            preflight_speed=False,
+        )
         self.assertIs(queue._items[0][1], prefetch.return_value)
 
     def test_drain_removes_and_discards_terminal_prefetch_failure(self) -> None:
@@ -275,7 +285,11 @@ class PlaybackQueueTests(unittest.TestCase):
         queue.enqueue(PlaybackRequest(text="second"))
         created: list[str] = []
 
-        def fake_handle(text: str, settings: object | None = None) -> PrefetchHandle:
+        def fake_handle(
+            text: str,
+            settings: object | None = None,
+            **_options: object,
+        ) -> PrefetchHandle:
             created.append(text)
             handle = mock.create_autospec(PrefetchHandle, instance=True)
             handle.done_meta = {}
