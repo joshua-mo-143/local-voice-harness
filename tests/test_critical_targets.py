@@ -61,6 +61,37 @@ def test_affirmation_is_bound_to_current_focused_identity() -> None:
     assert changed.reply == ReadbackReply.EXPIRED
 
 
+def test_browser_scoped_number_requires_identity_bound_confirmation() -> None:
+    context = RequestContext(
+        "work on issue 42",
+        focused_repository="example/payments",
+        issue_scope_source="github",
+        issue_scope="example/payments",
+    )
+    extraction = extract_ticket_targets(
+        "work on issue 42",
+        scope_source=context.issue_scope_source,
+        scope=context.issue_scope,
+    )
+    selection = select_submit_target(extraction, context)
+
+    assert selection is not None
+    candidate = new_candidate(selection, origin_turn="turn-1", now=10)
+    assert candidate.target.canonical == "example/payments#42"
+    assert resolve_readback(candidate, "yes", context, now=11).reply == (
+        ReadbackReply.AFFIRMATIVE
+    )
+    changed = RequestContext(
+        "yes",
+        focused_repository="example/other",
+        issue_scope_source="github",
+        issue_scope="example/other",
+    )
+    assert resolve_readback(candidate, "yes", changed, now=11).reply == (
+        ReadbackReply.EXPIRED
+    )
+
+
 def test_number_correction_never_approves_original_target() -> None:
     context = RequestContext("work on example/payments#42")
     candidate = new_candidate(

@@ -8,6 +8,7 @@ from local_voice_harness.context_fragment import ContextFragment
 from local_voice_harness.focused_app_context import FocusedAppContext
 from local_voice_harness.integrations import github
 from local_voice_harness.integrations.registry import IntegrationRegistry
+from local_voice_harness.ticket_targets import extract_ticket_targets
 from local_voice_harness.user_config import IntegrationSettings, default_user_config
 
 USER_CONFIG = default_user_config()
@@ -19,14 +20,51 @@ GITHUB_DISABLED = IntegrationSettings(
 )
 
 
-class FirefoxUrlTests(unittest.TestCase):
-    def test_non_browser_window_is_ignored(self) -> None:
+class FocusedBrowserUrlTests(unittest.TestCase):
+    def test_supported_browser_classes_are_explicit_and_captured(self) -> None:
+        self.assertEqual(
+            browser_context.SUPPORTED_BROWSER_CLASSES,
+            {
+                "brave-browser",
+                "chromium",
+                "firefox",
+                "google-chrome",
+                "org.mozilla.firefox",
+            },
+        )
+        url = "https://github.com/example/project/issues/42"
+        for window_class in browser_context.SUPPORTED_BROWSER_CLASSES:
+            with self.subTest(window_class=window_class):
+                window = desktop.Window("42", window_class, 10)
+                backend = mock.Mock()
+                backend.has_clipboard.return_value = True
+                backend.active_window.return_value = window
+                backend.read_clipboard.side_effect = [
+                    (True, "previous"),
+                    (True, url),
+                    (True, url),
+                ]
+                backend.write_clipboard.return_value = True
+                backend.send_key.return_value = True
+                with (
+                    mock.patch.object(
+                        browser_context, "get_desktop", return_value=backend
+                    ),
+                    mock.patch.object(browser_context.time, "sleep"),
+                    mock.patch.object(
+                        browser_context.secrets, "token_hex", return_value="capture"
+                    ),
+                ):
+                    self.assertEqual(browser_context.focused_browser_url(), url)
+
+    def test_unsupported_browser_window_is_ignored(self) -> None:
         backend = mock.Mock()
         backend.has_clipboard.return_value = True
         backend.active_window.return_value = desktop.Window("42", "alacritty", 1)
         with mock.patch.object(browser_context, "get_desktop", return_value=backend):
-            self.assertIsNone(browser_context.focused_firefox_url())
+            self.assertIsNone(browser_context.focused_browser_url())
         backend.send_key.assert_not_called()
+        backend.read_clipboard.assert_not_called()
 
     def test_url_capture_restores_address_bar_and_clipboard(self) -> None:
         url = "https://github.com/example/project/issues/42"
@@ -39,12 +77,16 @@ class FirefoxUrlTests(unittest.TestCase):
             (True, url),
             (True, url),
         ]
+        backend.write_clipboard.return_value = True
         backend.send_key.return_value = True
         with (
             mock.patch.object(browser_context, "get_desktop", return_value=backend),
             mock.patch.object(browser_context.time, "sleep"),
+            mock.patch.object(
+                browser_context.secrets, "token_hex", return_value="capture"
+            ),
         ):
-            self.assertEqual(browser_context.focused_firefox_url(), url)
+            self.assertEqual(browser_context.focused_browser_url(), url)
 
         self.assertEqual(
             backend.send_key.call_args_list,
@@ -54,9 +96,15 @@ class FirefoxUrlTests(unittest.TestCase):
                 mock.call("Escape", window=window),
             ],
         )
-        backend.write_clipboard.assert_called_once_with("previous")
+        self.assertEqual(
+            backend.write_clipboard.call_args_list,
+            [
+                mock.call("voice-harness-url-capture"),
+                mock.call("previous"),
+            ],
+        )
 
-    def test_focus_change_aborts_capture_without_sending_more_keys(self) -> None:
+    def test_focus_change_aborts_and_restores_clipboard_without_more_keys(self) -> None:
         window = desktop.Window("42", "firefox", 10)
         changed = desktop.Window("99", "foot", 11)
         backend = mock.Mock()
@@ -64,21 +112,104 @@ class FirefoxUrlTests(unittest.TestCase):
         backend.active_window.side_effect = [window, changed, changed]
         backend.read_clipboard.side_effect = [
             (True, "previous"),
-            (True, "previous"),
+            (True, "voice-harness-url-capture"),
         ]
+        backend.write_clipboard.return_value = True
         backend.send_key.return_value = True
         with (
             mock.patch.object(browser_context, "get_desktop", return_value=backend),
             mock.patch.object(browser_context.time, "sleep"),
+            mock.patch.object(
+                browser_context.secrets, "token_hex", return_value="capture"
+            ),
         ):
-            self.assertIsNone(browser_context.focused_firefox_url())
+            self.assertIsNone(browser_context.focused_browser_url())
 
         backend.send_key.assert_called_once_with("ctrl+l", window=window)
-        backend.write_clipboard.assert_not_called()
+        self.assertEqual(
+            backend.write_clipboard.call_args_list,
+            [
+                mock.call("voice-harness-url-capture"),
+                mock.call("previous"),
+            ],
+        )
 
     def test_invalid_or_unsupported_desktop_omits_browser_context(self) -> None:
         with mock.patch.object(browser_context, "get_desktop", return_value=None):
-            self.assertIsNone(browser_context.focused_firefox_url())
+            self.assertIsNone(browser_context.focused_browser_url())
+
+    def test_stale_clipboard_fails_closed_and_is_restored(self) -> None:
+        window = desktop.Window("42", "chromium", 10)
+        backend = mock.Mock()
+        backend.has_clipboard.return_value = True
+        backend.active_window.return_value = window
+        backend.read_clipboard.side_effect = [
+            (True, "previous"),
+            (True, "voice-harness-url-capture"),
+            (True, "voice-harness-url-capture"),
+        ]
+        backend.write_clipboard.return_value = True
+        backend.send_key.return_value = True
+        with (
+            mock.patch.object(browser_context, "get_desktop", return_value=backend),
+            mock.patch.object(browser_context.time, "sleep"),
+            mock.patch.object(
+                browser_context.secrets, "token_hex", return_value="capture"
+            ),
+        ):
+            self.assertIsNone(browser_context.focused_browser_url())
+
+        backend.write_clipboard.assert_called_with("previous")
+
+    def test_malformed_url_diagnostic_does_not_expose_clipboard_contents(self) -> None:
+        sensitive_value = "not-a-url?token=super-secret"
+        window = desktop.Window("42", "firefox", 10)
+        backend = mock.Mock()
+        backend.has_clipboard.return_value = True
+        backend.active_window.return_value = window
+        backend.read_clipboard.side_effect = [
+            (True, "previous"),
+            (True, sensitive_value),
+            (True, sensitive_value),
+        ]
+        backend.write_clipboard.return_value = True
+        backend.send_key.return_value = True
+        with (
+            mock.patch.object(browser_context, "get_desktop", return_value=backend),
+            mock.patch.object(browser_context.time, "sleep"),
+            self.assertLogs(browser_context._LOGGER, level="WARNING") as logs,
+        ):
+            self.assertIsNone(browser_context.focused_browser_url())
+
+        diagnostic = "\n".join(logs.output)
+        self.assertIn("malformed_url", diagnostic)
+        self.assertNotIn(sensitive_value, diagnostic)
+
+    def test_concurrent_clipboard_change_is_preserved_and_capture_is_rejected(
+        self,
+    ) -> None:
+        url = "https://github.com/example/project/issues/42"
+        window = desktop.Window("42", "firefox", 10)
+        backend = mock.Mock()
+        backend.has_clipboard.return_value = True
+        backend.active_window.return_value = window
+        backend.read_clipboard.side_effect = [
+            (True, "previous"),
+            (True, url),
+            (True, "user copied this"),
+        ]
+        backend.write_clipboard.return_value = True
+        backend.send_key.return_value = True
+        with (
+            mock.patch.object(browser_context, "get_desktop", return_value=backend),
+            mock.patch.object(browser_context.time, "sleep"),
+            mock.patch.object(
+                browser_context.secrets, "token_hex", return_value="capture"
+            ),
+        ):
+            self.assertIsNone(browser_context.focused_browser_url())
+
+        backend.write_clipboard.assert_called_once_with("voice-harness-url-capture")
 
 
 class BrowserDispatchTests(unittest.TestCase):
@@ -87,7 +218,7 @@ class BrowserDispatchTests(unittest.TestCase):
         fragment = ContextFragment(source="stub", text="captured")
         with (
             mock.patch.object(
-                browser_context, "focused_firefox_url", return_value=url
+                browser_context, "focused_browser_url", return_value=url
             ) as focused_url,
             mock.patch.object(
                 browser_context, "capture_context", return_value=fragment
@@ -105,6 +236,7 @@ class BrowserDispatchTests(unittest.TestCase):
             issue_reference="example/project#42",
             repository_reference="example/project",
             issue_number=42,
+            issue_scope="example/project",
         )
         with (
             mock.patch.object(
@@ -112,7 +244,7 @@ class BrowserDispatchTests(unittest.TestCase):
             ),
             mock.patch.object(
                 browser_context,
-                "focused_firefox_url",
+                "focused_browser_url",
                 return_value="https://github.com/example/project/issues/42",
             ),
             mock.patch.object(
@@ -133,8 +265,16 @@ class BrowserDispatchTests(unittest.TestCase):
         self.assertEqual(context.github_repository, "example/project")
         self.assertEqual(context.github_issue, 42)
         self.assertEqual(context.github_issue_context, "Issue context")
+        self.assertEqual(context.issue_scope, "example/project")
+        self.assertEqual(context.issue_scope_source, "github")
         self.assertIsNone(context.external_issue_reference)
         self.assertIn("Issue context", context.text)
+        extraction = extract_ticket_targets(
+            "work on issue 223",
+            scope_source=context.issue_scope_source,
+            scope=context.issue_scope,
+        )
+        self.assertEqual(extraction.references[0].canonical, "example/project#223")
 
     def test_request_context_maps_pull_request_fragment_for_provisioning(self) -> None:
         fragment = ContextFragment(
@@ -149,7 +289,7 @@ class BrowserDispatchTests(unittest.TestCase):
             ),
             mock.patch.object(
                 browser_context,
-                "focused_firefox_url",
+                "focused_browser_url",
                 return_value="https://github.com/example/project/pull/7",
             ),
             mock.patch.object(
@@ -181,7 +321,7 @@ class BrowserDispatchTests(unittest.TestCase):
             mock.patch.object(
                 browser_context, "capture_text_context", return_value=fragment
             ),
-            mock.patch.object(browser_context, "focused_firefox_url") as focused_url,
+            mock.patch.object(browser_context, "focused_browser_url") as focused_url,
             mock.patch.object(
                 browser_context, "focused_app_context", return_value=None
             ),
@@ -209,7 +349,7 @@ class BrowserDispatchTests(unittest.TestCase):
             ),
             mock.patch.object(
                 browser_context,
-                "focused_firefox_url",
+                "focused_browser_url",
                 return_value="https://linear.app",
             ),
             mock.patch.object(
@@ -242,7 +382,7 @@ class BrowserDispatchTests(unittest.TestCase):
             ),
             mock.patch.object(
                 browser_context,
-                "focused_firefox_url",
+                "focused_browser_url",
                 return_value="https://linear.app/acme/team/ENG/active",
             ),
             mock.patch.object(
@@ -275,7 +415,7 @@ class BrowserDispatchTests(unittest.TestCase):
                 browser_context, "capture_text_context", return_value=None
             ),
             mock.patch.object(
-                browser_context, "focused_firefox_url", return_value=None
+                browser_context, "focused_browser_url", return_value=None
             ),
             mock.patch.object(
                 browser_context,
@@ -310,7 +450,7 @@ class BrowserDispatchTests(unittest.TestCase):
             ),
             mock.patch.object(
                 browser_context,
-                "focused_firefox_url",
+                "focused_browser_url",
                 return_value="https://github.com/browser/project/issues",
             ),
             mock.patch.object(
@@ -392,7 +532,7 @@ class BrowserDispatchTests(unittest.TestCase):
     def test_disabled_github_never_parses_or_calls_cli(self) -> None:
         url = "https://github.com/example/project/issues/42"
         with (
-            mock.patch.object(browser_context, "focused_firefox_url", return_value=url),
+            mock.patch.object(browser_context, "focused_browser_url", return_value=url),
             mock.patch.object(
                 browser_context, "focused_app_context", return_value=None
             ),
@@ -449,7 +589,7 @@ class FocusedAppRequestContextTests(unittest.TestCase):
                 browser_context, "capture_text_context", return_value=None
             ),
             mock.patch.object(
-                browser_context, "focused_firefox_url", return_value=None
+                browser_context, "focused_browser_url", return_value=None
             ),
             mock.patch.object(
                 browser_context, "focused_app_context", return_value=captured
@@ -475,7 +615,7 @@ class FocusedAppRequestContextTests(unittest.TestCase):
             ),
             mock.patch.object(
                 browser_context,
-                "focused_firefox_url",
+                "focused_browser_url",
                 return_value="https://github.com",
             ),
             mock.patch.object(
