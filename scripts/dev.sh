@@ -47,6 +47,7 @@ if [[ -z "${GH_CONFIG_DIR:-}" ]]; then
 fi
 export XDG_CONFIG_HOME="$PROJECT_DIR/.dev/config"
 export XDG_STATE_HOME="$PROJECT_DIR/.dev/state"
+export UV_PROJECT_ENVIRONMENT="$PROJECT_DIR/.dev/venv"
 mkdir -p -- "$XDG_CONFIG_HOME" "$XDG_STATE_HOME"
 
 if [[ "$command" == "text" || "$command" == "pronounce" ]]; then
@@ -79,4 +80,9 @@ EOF
   exit 1
 fi
 
+uv run \
+  --project "$PROJECT_DIR" \
+  --python "$python_version" \
+  --extra wake \
+  python -m local_voice_harness.wake.models >/dev/null
 exec uv run --project "$PROJECT_DIR" --python "$python_version" --extra wake voice-harness-wake

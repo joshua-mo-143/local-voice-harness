@@ -113,7 +113,7 @@ require uv git curl || {
 
 # --- 2. Management / wake environment ---------------------------------------
 step "Syncing management/wake environment (.venv)"
-uv sync --python "$PYTHON_VERSION" --extra wake --no-dev
+"$PROJECT_DIR/scripts/sync-wake.sh"
 mkdir -p "$HOME/.local/bin"
 ln -sfn "$PROJECT_DIR/.venv/bin/voice-harness" "$HOME/.local/bin/voice-harness"
 info "Linked voice-harness into ~/.local/bin"

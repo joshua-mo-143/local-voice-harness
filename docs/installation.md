@@ -100,10 +100,10 @@ gh auth status
 
 ## 1. Clone and install the management/wake package
 
-```bash
+```fish
 git clone <YOUR_GITHUB_REPOSITORY_URL> "$HOME/local-voice-harness"
 cd "$HOME/local-voice-harness"
-uv sync --python 3.11 --extra wake --no-dev
+scripts/sync-wake.sh
 mkdir -p "$HOME/.local/bin"
 ln -sfn "$HOME/local-voice-harness/.venv/bin/voice-harness" \
   "$HOME/.local/bin/voice-harness"
@@ -114,7 +114,8 @@ in `.venv`. Ensure `$HOME/.local/bin` is on `PATH`.
 The `wake`, `dictation`, and `tts` extras are intentionally installed into separate
 environments because their CUDA and NumPy constraints are not all compatible.
 
-OpenWakeWord includes the `hey_jarvis_v0.1.onnx` model used by the daemon.
+The wake sync downloads `hey_jarvis_v0.1.onnx` when it is missing and leaves an
+existing model untouched.
 
 ## 2. Create the bundled dictation environment
 

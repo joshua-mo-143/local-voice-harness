@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import signal
 import subprocess
 import sys
@@ -37,6 +38,7 @@ class DevLauncherTests(unittest.TestCase):
             """
 import json
 import os
+import shutil
 import signal
 import sys
 from pathlib import Path
@@ -50,11 +52,20 @@ record = {
             "XDG_CONFIG_HOME",
             "XDG_STATE_HOME",
             "XDG_RUNTIME_DIR",
+            "UV_PROJECT_ENVIRONMENT",
             "VOICE_HARNESS_WAKE_THRESHOLD",
         )
     },
 }
 Path(os.environ["FAKE_UV_RECORD"]).write_text(json.dumps(record))
+if os.environ.get("FAKE_UV_RECREATE_ENV") == "1":
+    project = Path(sys.argv[sys.argv.index("--project") + 1])
+    environment = Path(
+        os.environ.get("UV_PROJECT_ENVIRONMENT", str(project / ".venv"))
+    )
+    shutil.rmtree(environment, ignore_errors=True)
+    environment.mkdir(parents=True)
+    (environment / "synced").write_text("launcher")
 if os.environ.get("FAKE_UV_MODE") == "wait":
     Path(os.environ["FAKE_READY"]).write_text(str(os.getpid()))
     signal.pause()
@@ -148,12 +159,62 @@ raise SystemExit(int(os.environ.get("FAKE_SYSTEMCTL_EXIT", "3")))
                 "XDG_CONFIG_HOME": str(PROJECT_ROOT / ".dev" / "config"),
                 "XDG_STATE_HOME": str(PROJECT_ROOT / ".dev" / "state"),
                 "XDG_RUNTIME_DIR": str(self.test_root / "shared-runtime"),
+                "UV_PROJECT_ENVIRONMENT": str(PROJECT_ROOT / ".dev" / "venv"),
                 "VOICE_HARNESS_WAKE_THRESHOLD": "0.73",
             },
         )
         self.assertTrue((PROJECT_ROOT / ".dev" / "config").is_dir())
         self.assertTrue((PROJECT_ROOT / ".dev" / "state").is_dir())
         self.assertFalse(self.systemctl_record.exists())
+
+    def test_primary_checkout_launcher_preserves_installed_wake_environment(
+        self,
+    ) -> None:
+        checkout = self.test_root / "primary-checkout"
+        scripts = checkout / "scripts"
+        scripts.mkdir(parents=True)
+        launcher = scripts / "dev.sh"
+        shutil.copy2(LAUNCHER, launcher)
+        installed = checkout / ".venv"
+        interpreter = installed / "bin" / "python"
+        package = installed / "lib" / "openwakeword" / "__init__.py"
+        model = (
+            installed
+            / "lib"
+            / "openwakeword"
+            / "resources"
+            / "models"
+            / "hey_jarvis_v0.1.onnx"
+        )
+        for path, content in (
+            (interpreter, "installed interpreter"),
+            (package, "installed package"),
+            (model, "installed model"),
+        ):
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(content)
+
+        process = subprocess.run(
+            [str(launcher), "text", "request"],
+            cwd=self.test_root,
+            env=self._environment(FAKE_UV_RECREATE_ENV="1"),
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+
+        self.assertEqual(process.returncode, 0, process.stderr)
+        self.assertEqual(interpreter.read_text(), "installed interpreter")
+        self.assertEqual(package.read_text(), "installed package")
+        self.assertEqual(model.read_text(), "installed model")
+        self.assertEqual(
+            self._uv_environment()["UV_PROJECT_ENVIRONMENT"],
+            str(checkout / ".dev" / "venv"),
+        )
+        self.assertEqual(
+            (checkout / ".dev" / "venv" / "synced").read_text(), "launcher"
+        )
 
     def test_preserves_explicit_github_cli_config_directory(self) -> None:
         github_config = self.test_root / "github-config"
