@@ -59,6 +59,7 @@ from .model import (
     WORKER_STATUSES,
     CursorJob,
     JobStatus,
+    JobValidationError,
     NewCursorJob,
 )
 from .provisioning import run_claimed_worker
@@ -183,6 +184,13 @@ def _integration_registry(
 
 def read_job(job_id: str) -> CursorJob:
     return _job_store().get(job_id)
+
+
+def _speakable_label(job_id: str) -> str:
+    try:
+        return inbox.speakable_label_for(read_job(job_id))
+    except (FileNotFoundError, OSError, JobValidationError):
+        return "that job"
 
 
 def decide_fork_confirmation(utterance: str) -> bool | None:
@@ -1768,6 +1776,7 @@ def cancel_job(
 def job_status(job_id: str | None = None) -> str:
     if job_id:
         job = read_job(job_id)
+        label = inbox.speakable_label_for(job)
         if (
             job.manual_reconcile_operation == "pane"
             and job.participant_creation_state == "manual_required"
@@ -1775,7 +1784,7 @@ def job_status(job_id: str | None = None) -> str:
             participant = job.participant_creation_participant or "workflow"
             target = job.participant_creation_target or "unknown"
             return (
-                f"Cursor job {job_id} requires manual reconciliation for the "
+                f"{label} requires manual reconciliation for the "
                 f"{participant} pane target {target}. Inspect Herdr, then resolve "
                 "pane creation as materialized or confirmed absent using token "
                 f"{job.manual_reconcile_token}."
@@ -1784,7 +1793,7 @@ def job_status(job_id: str | None = None) -> str:
             f", {job.workflow_tier.value} tier" if job.workflow_tier is not None else ""
         )
         return (
-            f"Cursor job {job_id} is {job.status.value.replace('_', ' ')}, "
+            f"{label} is {job.status.value.replace('_', ' ')}, "
             f"in {job.workflow_phase.value.replace('_', ' ')}{workflow}."
         )
     jobs = [job for job in _job_store().list() if job.status in ACTIVE_STATUSES]
@@ -1793,7 +1802,8 @@ def job_status(job_id: str | None = None) -> str:
     return (
         "Active Cursor jobs: "
         + "; ".join(
-            f"{job.id} is {job.status.value.replace('_', ' ')} "
+            f"{inbox.speakable_label_for(job)} is "
+            f"{job.status.value.replace('_', ' ')} "
             f"({job.workflow_phase.value.replace('_', ' ')})"
             for job in jobs
         )
@@ -2369,7 +2379,14 @@ def cursor_turn(
         assert resolved.job_id is not None
         result = cancel_job(resolved.job_id, integrations=registry)
         _defer_or_acknowledge(resolved.job_id, delivery_claims)
-        return CursorTurnResult(result, None)
+        label = _speakable_label(resolved.job_id)
+        return CursorTurnResult(
+            AssistantResponse(
+                spoken_text=f"Cursor cancelled {label}.",
+                display_text=result,
+            ),
+            None,
+        )
     if action in {"dismiss", "repeat"}:
         resolved = _resolve_reference(
             reference or text,
@@ -2530,12 +2547,24 @@ def cursor_turn(
                 integrations=registry,
             )
         except ActiveTicketConflict as exc:
-            return CursorTurnResult(str(exc), None)
+            label = _speakable_label(exc.active_job_id)
+            return CursorTurnResult(
+                AssistantResponse(
+                    spoken_text=f"That ticket is already in progress as {label}.",
+                    display_text=str(exc),
+                ),
+                None,
+            )
         if on_job_started is not None:
             on_job_started()
-        if read_job(job_id).participant_admission_state == "waiting":
+        queued = read_job(job_id)
+        if queued.participant_admission_state == "waiting":
+            label = inbox.speakable_label_for(queued)
             return CursorTurnResult(
-                f"Cursor job {job_id} was accepted and queued.",
+                AssistantResponse(
+                    spoken_text=f"Cursor accepted {label} and queued it.",
+                    display_text=f"Cursor job {job_id} was accepted and queued.",
+                ),
                 None,
             )
     return _await_foreground(

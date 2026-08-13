@@ -87,8 +87,13 @@ def test_ambiguous_cancel_clarifies_without_cancelling(store: JobStore) -> None:
     _make(store, "bbbbbbbbbbbb", status="running", label="issue 43")
 
     result = cursor_turn(CursorTurnRequest("cancel the issue job", action="cancel"))
+    response = as_assistant_response(result.text)
 
-    assert "Which one" in as_assistant_response(result.text).display_text
+    assert "Which one" in response.display_text
+    assert "issue 42" in response.spoken_text
+    assert "issue 43" in response.spoken_text
+    assert "aaaa" not in response.spoken_text
+    assert "bbbb" not in response.spoken_text
     assert store.get("aaaaaaaaaaaa").status.value == "running"
     assert store.get("bbbbbbbbbbbb").status.value == "running"
 
@@ -98,7 +103,14 @@ def test_reference_cancel_targets_intended_job(store: JobStore) -> None:
     _make(store, "bbbbbbbbbbbb", status="running", label="venice fix")
 
     with mock.patch.object(service, "_stop_worker", return_value=True):
-        cursor_turn(CursorTurnRequest("cancel the venice fix", action="cancel"))
+        result = cursor_turn(
+            CursorTurnRequest("cancel the venice fix", action="cancel")
+        )
+
+    response = as_assistant_response(result.text)
+    assert response.spoken_text == "Cursor cancelled venice fix."
+    assert "bbbbbbbbbbbb" not in response.spoken_text
+    assert "bbbbbbbbbbbb" in response.display_text
 
     assert store.get("bbbbbbbbbbbb").status.value == "cancelled"
     assert store.get("aaaaaaaaaaaa").status.value == "running"
@@ -110,6 +122,21 @@ def test_status_reports_speakable_label(store: JobStore) -> None:
     result = cursor_turn(CursorTurnRequest("aaaa", action="status", reference="aaaa"))
 
     assert result.text == "issue 42 is running."
+
+
+def test_compatibility_status_uses_labels_instead_of_job_ids(store: JobStore) -> None:
+    _make(store, "aaaaaaaaaaaa", status="running", label="issue 42")
+    _make(store, "bbbbbbbbbbbb", status="running", label="readme update")
+
+    single = service.job_status("aaaaaaaaaaaa")
+    active = service.job_status()
+
+    assert "issue 42 is running" in single
+    assert "aaaaaaaaaaaa" not in single
+    assert "issue 42" in active
+    assert "readme update" in active
+    assert "aaaaaaaaaaaa" not in active
+    assert "bbbbbbbbbbbb" not in active
 
 
 def test_status_resolves_linear_ticket_over_same_github_number(

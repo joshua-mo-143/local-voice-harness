@@ -211,7 +211,7 @@ class InboxSummaryTests(unittest.TestCase):
         summary = inbox.describe_inbox(jobs)
         self.assertIn("2 more", summary)
 
-    def test_clarify_lists_options_with_short_ids(self) -> None:
+    def test_clarify_lists_distinct_labels_without_short_ids(self) -> None:
         summaries = inbox.summarize_all(
             [
                 _job("aaaaaaaaaaaa", speakable_label="issue 42"),
@@ -219,9 +219,25 @@ class InboxSummaryTests(unittest.TestCase):
             ]
         )
         prompt = inbox.clarify(summaries, "cancel")
-        self.assertIn("issue 42 (aaaa)", prompt)
-        self.assertIn("issue 43 (bbbb)", prompt)
+        self.assertIn("issue 42", prompt)
+        self.assertIn("issue 43", prompt)
+        self.assertNotIn("aaaa", prompt)
+        self.assertNotIn("bbbb", prompt)
         self.assertIn("cancel", prompt)
+
+    def test_clarify_includes_short_ids_only_when_labels_collide(self) -> None:
+        summaries = inbox.summarize_all(
+            [
+                _job("aaaaaaaaaaaa", speakable_label="readme update"),
+                _job("bbbbbbbbbbbb", speakable_label="readme update"),
+                _job("cccccccccccc", speakable_label="issue 42"),
+            ]
+        )
+        prompt = inbox.clarify(summaries, "cancel")
+        self.assertIn("readme update (aaaa)", prompt)
+        self.assertIn("readme update (bbbb)", prompt)
+        self.assertIn("issue 42", prompt)
+        self.assertNotIn("issue 42 (cccc)", prompt)
 
     def test_summary_detail_reflects_status(self) -> None:
         awaiting = inbox.summarize(_job("aaaaaaaaaaaa", status="awaiting_user"))

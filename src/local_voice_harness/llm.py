@@ -22,7 +22,7 @@ from .llm_transport import (
 )
 from .notifications import notify
 from .questions import AnswerProvenance
-from .responses import as_assistant_response
+from .responses import ResponseLike, as_assistant_response
 
 BASE_SYSTEM_PROMPT = (
     "You are a fast conversational voice assistant. Every spoken answer must be complete and "
@@ -41,9 +41,11 @@ TOOL_ENABLED_PROMPT = (
     "on a new or different ticket, always use submit, even when another job is awaiting a reply. "
     "Do not claim work was submitted, accepted, queued, started, or completed until the Cursor "
     "tool result confirms that outcome. When a submission succeeds, acknowledge it in one brief "
-    "sentence and include its identifier. When the tool reports that an issue or ticket is "
-    'complete, respond only with "I\'ve finished working on <identifier>" using its actual '
-    "identifier. Report rejected, failed, or ambiguous tool results without implying that work "
+    "sentence using the speakable job label from the spoken response in the tool result. Never "
+    "speak a hexadecimal job id. When the tool reports that an issue or ticket is complete, "
+    "respond only with "
+    '"I\'ve finished working on <label>" using that speakable label. Report rejected, failed, '
+    "or ambiguous tool results without implying that work "
     "started. Preserve a "
     "focused repository's owner/name in github_repository when delegating a request about it. "
     "For focused external issue context, preserve its issue key in the submitted task so Herdr "
@@ -120,6 +122,11 @@ _TOOL_FREE_ACTION_CLAIM = re.compile(
     r")",
     re.IGNORECASE | re.MULTILINE,
 )
+_INTERNAL_JOB_REFERENCE = re.compile(
+    r"(?P<prefix>\b(?:cursor\s+|active\s+)?job\s+)[0-9a-f]{12}\b",
+    re.IGNORECASE,
+)
+_INTERNAL_JOB_LOG = re.compile(r"(?<![0-9A-Za-z])[0-9a-f]{12}(?=\.log\b)")
 
 
 def _log_llm_event(event: str, **fields: object) -> None:
@@ -141,6 +148,22 @@ def _guard_unconfirmed_action_answer(answer: str) -> str:
         return answer
     _log_llm_event("unconfirmed_action_claim_blocked", response=answer)
     return TOOL_FREE_ACTION_RECOVERY
+
+
+def _cursor_tool_result(response: ResponseLike) -> str:
+    """Preserve detailed outcomes while removing internal job identities."""
+
+    rendered = as_assistant_response(response)
+    spoken = rendered.spoken_text.strip()
+    detail = _INTERNAL_JOB_REFERENCE.sub(
+        r"\g<prefix>[internal id omitted]", rendered.display_text
+    )
+    detail = _INTERNAL_JOB_LOG.sub("[internal job]", detail).strip()
+    if not detail or detail == spoken:
+        return spoken
+    if not spoken:
+        return detail
+    return f"Spoken response: {spoken}\nDetailed outcome: {detail}"
 
 
 def _message_tool_calls(message: dict[str, object]) -> list[dict[str, object]]:
@@ -330,7 +353,7 @@ def qwen_turn(
                                 ),
                                 delivery_claims=delivery_claims,
                             )
-                        tool_result = as_assistant_response(turn_response).display_text
+                        tool_result = _cursor_tool_result(turn_response)
                     except Exception as exc:
                         _log_llm_event(
                             "tool_failure",
