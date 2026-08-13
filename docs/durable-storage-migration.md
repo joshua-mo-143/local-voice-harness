@@ -383,19 +383,21 @@ delivery paths in `cursor/provisioning.py`, `cursor/recovery.py`,
 
 ### Coordinator process ownership
 
-The coordinator is a library with one SQLite writer connection serialized by
-`BEGIN IMMEDIATE`. It is not a new systemd unit.
+The coordinator is one logical writer API backed by SQLite transactions
+serialized with `BEGIN IMMEDIATE`. It is not one process or one permanently
+shared connection, and it is not a new systemd unit.
 
 In production the long-lived owner is the wake daemon
 (`voice-harness-wake.service` / `wake/daemon.py`). That process already owns
 startup recovery, delivery claims, speech playback, and desktop notification.
-CLI and `scripts/dev.sh text` admission use the same library for short writer
-transactions, as today's `JobStore` flock already allows when the daemon is
-idle or concurrent.
+CLI and `scripts/dev.sh text` admission use the same library through independent
+short-lived SQLite connections. Concurrent callers do not bypass the coordinator:
+`BEGIN IMMEDIATE` serializes their decisions with the wake daemon.
 
-Detached workers are leased effect executors. They may call a fenced
-observation API. They must not invoke typed transition helpers or write
-canonical job, reservation, or outbox rows except through that API.
+Detached workers are leased effect executors. They may call a fenced observation
+API through their own short-lived connection. They must not invoke typed
+transition helpers or write canonical job, reservation, or outbox rows except
+through that API.
 
 A dedicated coordinator service is rejected at cutover: it would add an
 operational boundary without changing the existing sole-writer invariant.
@@ -412,7 +414,8 @@ serialized stay serialized:
 | Delivery (`delivery.speak`, `delivery.desktop`) | In-process in the wake daemon, which owns TTS and PipeWire | One live delivery lease (`DELIVERY_WINDOW` remains 1) |
 | `AgentHarness` mutating calls | Detached worker | One lease per `(provider, target)` |
 | Herdr workspace / worktree / pane | Detached worker | One lease per repository or checkout path |
-| GitHub / Linear provider writes | Detached worker | One GitHub lease per clone root (existing `.voice-harness-github.lock`); one Linear lease for the shared router (existing `_router_owner`) |
+| GitHub provider writes | Detached worker | One durable concurrency key per canonical repository identity; local clone/materialization additionally retains the clone-root file lock |
+| Linear provider writes and read-only MCP observation prompts | Detached worker | One durable concurrency key for the shared router, retaining `_router_owner` as an in-process guard |
 | Artifact publish | Detached worker | Concurrent across distinct content-addressed references; exclusive-create per path |
 
 `herdr ensure_server` and detached-worker spawn are not job-scoped outbox
@@ -455,14 +458,17 @@ context (`pane_id`, `workspace_id`, checkout) is allocated before
 |---|---|---|
 | `AgentHarness` | `agents.AgentHarness` / `HerdrSession` | Session create, task/clarification submit, cancel, read-only reconcile and event streaming |
 | Herdr workspace/worktree | `HerdrWorkspace` | Worktree create/open, workspace/tab pane create, owned pane close, Cursor MCP-auth launch-context link |
-| Repository/provider | GitHub/Linear providers and `LocalGitRepository` | Fork, clone, pull-request ref checkout, GitHub issue create, Linear ticket create |
+| Repository/provider | GitHub/Linear providers and `LocalGitRepository` | Fork, clone, remote configuration, pull-request ref checkout, GitHub issue create, Linear ticket create/observe |
 | Delivery | `cursor/delivery.py` plus the wake daemon playback/notify path | Claimed speech and desktop notification |
 | Artifact handling | `JobStore.write_artifact` / `publish_artifact` | Immutable plan/review exclusive-create |
 
-Linear ticket creation may use the shared Linear router through
-`AgentHarness.submit_task` as a transport. The durable effect identity is the
-ticket plan and correlation marker, not the router's prompt. That job does not
-adopt the router as its `AgentHarness` session.
+Linear ticket creation and marker observation may use the shared Linear router
+through `AgentHarness.submit_task` as a transport. The provider effect identity
+is the ticket plan and correlation marker; the transport submission is a
+separate sequence-fenced `task.submit` effect using the router's provider,
+session ID, target, and baseline sequence. A timeout in that prompt is
+`OutcomeUnknown`, not a read-only observation that may be blindly repeated.
+The job does not adopt the router as its own `AgentHarness` session.
 
 ### Effect catalogue
 
@@ -474,7 +480,7 @@ Reconciliation is a read-only observation that may settle the outbox row.
 
 | Effect | Payload identity | Idempotency key | Provider guarantee | Confirmed | Failed | `OutcomeUnknown` | Replay / reconcile |
 |---|---|---|---|---|---|---|---|
-| `session.create` | `job_id`, planned `target` name, `pane_id`, `workspace_id`, optional mode | those fields | Herdr `agent start` is not idempotent; the planned name is the reuse handle | `reconcile(target, expected_session_id)` returns `active` or `settled` with matching session | Provider rejected before start (`invalid_session_request`, capability miss) | Timeout or missing session after start (`operation_ambiguous`) | Do not replay. Reconcile; if the planned target is missing after bounded attempts and the job is not terminal, `ManualRequired`. Today's `agent_dispatch_state` `dispatching` / `ambiguous` / `failed_observing` map here. |
+| `session.create` | `job_id`, planned `target` name, `pane_id`, `workspace_id`, optional mode | those fields | Herdr `agent start` is not idempotent; the planned name is only a correlation address, never durable session identity | The provider response supplies `(provider, session_id, target)` and a subsequent `reconcile(target, expected_session_id)` returns `active` or `settled` with that exact session | Provider rejected before start (`invalid_session_request`, capability miss) | Timeout or crash before the provider-issued `session_id` is durably observed, or missing session after start (`operation_ambiguous`) | Never adopt or replay from target alone. If the provider-issued session ID was durably observed, reconcile that exact identity. Otherwise inspect the planned target plus pane/workspace only to detect conflicts; absence is not replay proof and any present or indeterminate target becomes `ManualRequired`. A later command may admit a replacement only after operator-confirmed absence. Today's `agent_dispatch_state` `dispatching` / `ambiguous` / `failed_observing` map here. |
 | `task.submit` | `PromptIdentity`: `job_id`, phase, turn, `turn_token`, target, `session_id`, `baseline_sequence` | those fields | Not idempotent. `before_submit` / `accepted` remain the durable fence | Same session and `state_sequence != baseline` (`observe_prompt_submission`) | Pre-submit identity mismatch (`agent_session_changed`, interactive questionnaire) | Crash between `before_submit` and `accepted`, or observation failed | Never replay. Same-session sequence change is acceptance; changed/missing session or failed observation stays `OutcomeUnknown` / `ManualRequired`. |
 | `clarification.reply` | Same `PromptIdentity` shape on the fenced session | those fields | Same as `task.submit` | Same as `task.submit` | Same as `task.submit` | Same as `task.submit` | Same as `task.submit`. |
 | `session.cancel` | `(provider, session_id, target)` | those fields | Interrupt is safe to retry if the session still matches; already-stopped is success | Agent missing, or status is not `working` after wait | Ownership mismatch (target/session no longer bound) | Timeout while still `working` | Reconcile first. Replay cancel only when the same session is still observed. Do not cancel a reused target. |
@@ -498,16 +504,17 @@ observations, not outbox rows.
 |---|---|---|---|---|---|---|---|
 | `github.fork` | `GitHubForkPlan` (source, login, target) | source + login + target | `gh repo fork` is not natively idempotent; `observe_fork` reuses an existing fork whose parent is the source | `observe_fork` returns the target with accepted parent | Private source, invalid plan, or target exists and is not that fork | Timeout after `before_submit` (`GitHubOperationAmbiguous`) | Do not replay after unknown. Observe: matching fork is `Confirmed`; proven absence is `ConfirmedAbsent` and a later command may admit a new fork. Today's `fork_operation_state` `submitted` / `ambiguous` / `failed_observing` map here. |
 | `repository.clone` | clone root, relative destination, expected remote identity | those fields | `LocalGitRepository.materialize` reuses a verified existing checkout; clone uses a temp dir then `os.replace` | Destination exists and `verify_checkout` matches | Destination escapes root or remote mismatch | Timeout during clone (`LocalGitOperationAmbiguous` / `repository_clone_ambiguous`) | Replay is safe for a verified existing checkout. After unknown, do not assume absence: inspect destination and temp clone dirs; only `ConfirmedAbsent` of both allows a new clone. |
+| `repository.remote.ensure` | verified checkout path, remote name, canonical remote identity and URL | those fields | Setting a named Git remote to the same canonical identity is idempotent | `git remote get-url <name>` canonicalizes to the expected identity | Checkout identity changed, path escaped the clone root, or URL is invalid | Crash after adding or changing the remote | Re-verify the checkout and named remote. Matching identity is `Confirmed`; a missing remote permits replay; a different identity is `ManualRequired` and must never be overwritten automatically. |
 | `github.pull_request.checkout` | checkout path, `refs/pull/<n>/head`, expected OID, `voice/github-pr-<job-id>` branch | those fields | Fetch+`checkout -B` is idempotent when `HEAD` already equals the expected OID | `HEAD` OID matches persisted `pull_request_head_oid` | Invalid worktree, shared-clone refusal, or remote/ref/OID validation failure | Timeout during fetch/checkout | Replay is safe when inputs still match GitHub. `LocalGitRefChanged` refreshes the plan once; a second mismatch quarantines. |
 | `github.issue.create` | repository, title, body, `correlation_marker` | repository + marker | `gh api` create is not idempotent; marker HTML comment in the body is the observe key | Recent issues contain exactly one matching marker | Validation/auth error before submit, or marker not unique | Timeout or observe failure after submit | Never replay. `observe_issue_creation` settles `Confirmed`; failed observe is `ManualRequired`, not absence. |
-| `linear.ticket.create` | team id, team key, title, description, `correlation_marker` | team id + marker | Linear MCP create is not idempotent; marker in the description is the observe key | Read-only marker search finds exactly one ticket | Confirmation missing, capability miss, or invalid plan | Ambiguous router prompt or incomplete MCP result | Never replay. `observe_ticket_creation` `found` is `Confirmed`; `not_found` is not proof after a submit fence; `unknown`/`multiple` is `ManualRequired`. |
+| `linear.ticket.create` | team id, team key, title, description, `correlation_marker` | team id + marker | Linear MCP create is not idempotent; marker in the description is the observe key | A separately fenced Linear observation submission finds exactly one ticket | Confirmation missing, capability miss, or invalid plan | Ambiguous router prompt or incomplete MCP result | Never replay. Enqueue a sequence-fenced router `task.submit` to observe the marker; `found` is `Confirmed`, while `not_found` is not proof after a submit fence and `unknown`/`multiple` is `ManualRequired`. |
 
 #### Delivery
 
 | Effect | Payload identity | Idempotency key | Provider guarantee | Confirmed | Failed | `OutcomeUnknown` | Replay / reconcile |
 |---|---|---|---|---|---|---|---|
 | `delivery.speak` | `job_id`, `delivery_generation`, claim token | job + generation | TTS/PipeWire playback is at-least-once; ack only after successful playback | `acknowledge_delivery` under the live claim | Claim lost or job no longer deliverable | Crash during playback | Replay is allowed. Interrupted or unacked playback releases the claim for retry. Do not ack on interrupt. |
-| `delivery.desktop` | `job_id`, `delivery_generation`, claim token | job + generation | `notify-send` is at-least-once | `acknowledge_desktop_delivery` under the live claim | Claim lost | Crash after notify, before ack | Replay is allowed; the user may see a duplicate notification. |
+| `delivery.desktop` | `job_id`, `delivery_generation`, claim token | job + generation | `notify-send` is at-least-once | `notify-send` exits zero, then `acknowledge_desktop_delivery` succeeds under the live claim | Nonzero process exit, executable failure, or lost claim; do not acknowledge | Crash after successful process exit but before ack | Replay is allowed; the user may see a duplicate notification. |
 
 Deferred delivery acknowledgement is a coordinator command, not an external
 effect.
@@ -528,15 +535,16 @@ commit the earlier row without the later one.
 |---|---|
 | `HerdrWorkspace.ensure_agent` | `worktree.create` or `worktree.open`; `mcp_auth.link`; `pane.create` (workspace then tab are two pane effects when no workspace exists); `session.create` |
 | `_provision_followup_agent` / `_ensure_workflow_participant` | `pane.create`; `session.create`. Follow-ups do not create a worktree; they reuse the retained checkout. |
-| Fork provisioning in `run_claimed_worker` | `github.fork`; `repository.clone`; then the `ensure_agent` chain |
-| Pull-request provisioning | `repository.clone`; `worktree.create`; `github.pull_request.checkout`; then session/pane effects without a second worktree create |
-| GitHub issue provisioning (`provision_issue`) | `repository.clone` (or reuse a verified candidate); then the `ensure_agent` chain |
+| Fork provisioning in `run_claimed_worker` | `github.fork`; `repository.clone`; `repository.remote.ensure` for `upstream`; then the `ensure_agent` chain |
+| Pull-request provisioning | `repository.clone`; any required `repository.remote.ensure`; `worktree.create`; `github.pull_request.checkout`; then session/pane effects without a second worktree create |
+| GitHub issue provisioning (`provision_issue`) | `repository.clone` (or reuse a verified candidate); any required `repository.remote.ensure`; then the `ensure_agent` chain |
 | `cancel_target_and_release` per owned target | `session.cancel` when session identity is complete; then `pane.close`. Uncertain pane targets are not closed and remain unverified. |
 | `JobStore.publish_artifact` | `artifact.publish` file create, then coordinator reference commit from the `Confirmed` observation |
 
-GitHub issue creation and Linear ticket creation are already one mutating
-effect after the plan (including correlation marker) is persisted. Drafting
-and confirmation stay coordinator commands.
+GitHub issue creation is one provider mutation after the plan (including its
+correlation marker) is persisted. Linear ticket creation is one provider
+mutation plus separately fenced shared-router submissions for creation and
+observation. Drafting and confirmation stay coordinator commands.
 
 `ensure_agent` must not remain a single effect: worktree create, pane create,
 and session create each have a distinct unknown boundary and a distinct
