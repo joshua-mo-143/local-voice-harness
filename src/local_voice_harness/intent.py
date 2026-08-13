@@ -204,28 +204,23 @@ class IntentRoute:
 
 
 FALLBACK_ROUTE = IntentRoute(Intent.UNCERTAIN, "low")
-ROUTER_REQUIRED_PATTERN = re.compile(
-    r"\b(?:"
-    r"cursor|curser|cursa|agent|"
-    r"github|linear|zendesk|"
-    r"issue|ticket|jobs?|"
-    r"pull\s+request|pr|"
-    r"cancel|dismiss|repeat|status|submit|"
-    r"config(?:uration)?|settings?|voice|threshold|barge-?in|"
-    r"implement|refactor|commit|merge|deploy|"
-    r"work\s+on|handle\s+this|"
-    r"fix|create|enable|disable|"
-    r"inspect|repositor(?:y|ies)|codebase|checkout|"
-    r"harness|healthy|"
-    r"self[\s-]health"
-    r")\b",
+ROUTER_OPTIONAL_CONVERSATION_PATTERN = re.compile(
+    r"^\s*(?:"
+    r"(?:hello|hi|hey)(?:\s+there)?|"
+    r"what\s+time\s+is\s+it|"
+    r"what(?:'s|\s+is)\s+(?:the\s+)?(?:current\s+)?time|"
+    r"what(?:'s|\s+is)\s+(?:today's|the)\s+date|"
+    r"how\s+are\s+you|"
+    r"(?:please\s+)?tell\s+me\s+(?:a\s+)?joke|"
+    r"thanks|thank\s+you"
+    r")\s*[?!.]*\s*$",
     re.IGNORECASE,
 )
 
 
 def needs_intent_router(text: str) -> bool:
-    """Return whether classification must run before a mutating path can proceed."""
-    return ROUTER_REQUIRED_PATTERN.search(text) is not None
+    """Fail closed unless the whole utterance is known-safe conversation."""
+    return ROUTER_OPTIONAL_CONVERSATION_PATTERN.fullmatch(text) is None
 
 
 FORK_WORD = re.compile(r"\bfork(?:ed|ing|s)?\b", re.IGNORECASE)
