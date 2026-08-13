@@ -16,7 +16,7 @@ from ..integrations.github import (
 )
 from ..questions import Question, QuestionError
 
-CURRENT_SCHEMA_VERSION = 15
+CURRENT_SCHEMA_VERSION = 16
 LEGACY_SCHEMA_VERSIONS = frozenset(range(CURRENT_SCHEMA_VERSION))
 LEGACY_BOOT_ID = "legacy-unknown"
 
@@ -35,6 +35,29 @@ class JobStatus(StrEnum):
     COMPLETED = "completed"
     FAILED = "failed"
     CANCELLED = "cancelled"
+
+
+class AnnouncementAck(StrEnum):
+    """How a background announcement was handled.
+
+    Spoken playback is the only state that means TTS succeeded. Desktop and
+    deferred delivery must not be recorded as spoken.
+    """
+
+    PENDING = "pending"
+    SPOKEN = "spoken"
+    DESKTOP = "desktop"
+    DEFERRED = "deferred"
+    DISMISSED = "dismissed"
+
+
+ANNOUNCEMENT_ACK_STATES = frozenset(item.value for item in AnnouncementAck)
+SPOKEN_ANNOUNCEMENT_ACKS = frozenset(
+    {AnnouncementAck.SPOKEN.value, AnnouncementAck.DISMISSED.value}
+)
+SUPPRESSED_ANNOUNCEMENT_ACKS = frozenset(
+    {AnnouncementAck.DEFERRED.value, AnnouncementAck.DESKTOP.value}
+)
 
 
 class HarnessKind(StrEnum):
@@ -306,6 +329,7 @@ _STRING_FIELDS = frozenset(
         "herdr_target",
         "herdr_pane_id",
         "herdr_workspace_id",
+        "announcement_ack",
         "delivery_claim_token",
         "target_release_token",
         "target_release_owner_boot_id",
@@ -713,7 +737,45 @@ def _advance_legacy_version(values: dict[str, object], version: int) -> None:
     elif version == 14:
         values.setdefault("clarifications", [])
         values.setdefault("prompt_context_sessions", {})
+    elif version == 15:
+        _default_announcement_ack(values)
     values["schema_version"] = version + 1
+
+
+def _pair_announcement_ack(values: dict[str, object]) -> None:
+    """Keep spoken/dismissed acks paired with delivered, and reopen pending otherwise."""
+
+    ack = values.get("announcement_ack")
+    if values.get("delivered"):
+        if ack in {None, AnnouncementAck.PENDING.value}:
+            values["announcement_ack"] = (
+                AnnouncementAck.DISMISSED.value
+                if values.get("announcement_dismissed")
+                else AnnouncementAck.SPOKEN.value
+            )
+        return
+    if ack in SPOKEN_ANNOUNCEMENT_ACKS:
+        values["announcement_ack"] = AnnouncementAck.PENDING.value
+
+
+def _default_announcement_ack(values: dict[str, object]) -> None:
+    ack = values.get("announcement_ack")
+    if ack in ANNOUNCEMENT_ACK_STATES:
+        if values.get("delivered") and ack == AnnouncementAck.PENDING.value:
+            values["announcement_ack"] = (
+                AnnouncementAck.DISMISSED.value
+                if values.get("announcement_dismissed")
+                else AnnouncementAck.SPOKEN.value
+            )
+        return
+    if values.get("delivered"):
+        values["announcement_ack"] = (
+            AnnouncementAck.DISMISSED.value
+            if values.get("announcement_dismissed")
+            else AnnouncementAck.SPOKEN.value
+        )
+        return
+    values["announcement_ack"] = AnnouncementAck.PENDING.value
 
 
 def _infer_legacy_issue_provider(values: Mapping[str, object]) -> str | None:
@@ -789,6 +851,7 @@ def migrate_job_record(raw: Mapping[str, object]) -> tuple[dict[str, object], in
             "participant_admission_state",
             _default_participant_admission_state(values),
         )
+        _default_announcement_ack(values)
     values["schema_version"] = CURRENT_SCHEMA_VERSION
     return values, loaded_version
 
@@ -1336,6 +1399,7 @@ class AgentJob:
         for field in remove:
             values.pop(field, None)
         values.update(changes)
+        _pair_announcement_ack(values)
         if "prompt_operation_state" in changes:
             values.pop("phase_prompt_active", None)
         if (
@@ -1386,6 +1450,7 @@ class AgentJob:
             delivery_claimed_at=None,
             delivery_retry_at=0,
             delivery_attempts=0,
+            announcement_ack=AnnouncementAck.PENDING.value,
             updated_at=now,
             **changes,
         )
@@ -1491,6 +1556,7 @@ class AgentJob:
                 delivery_claimed_at=None,
                 delivery_retry_at=0,
                 delivery_attempts=0,
+                announcement_ack=AnnouncementAck.PENDING.value,
                 updated_at=now,
             )
         values["schema_version"] = CURRENT_SCHEMA_VERSION
@@ -1889,6 +1955,19 @@ class AgentJob:
     @property
     def speakable_label(self) -> str | None:
         return self._optional_string("speakable_label")
+
+    @property
+    def announcement_ack(self) -> str:
+        value = self._optional_string("announcement_ack")
+        if value in ANNOUNCEMENT_ACK_STATES:
+            return value
+        if self.delivered:
+            return (
+                AnnouncementAck.DISMISSED.value
+                if self.announcement_dismissed
+                else AnnouncementAck.SPOKEN.value
+            )
+        return AnnouncementAck.PENDING.value
 
     @property
     def announcement_dismissed(self) -> bool:
@@ -2313,10 +2392,27 @@ class AgentJob:
     def acknowledge_delivery(self, *, delivered_at: float) -> CursorJob:
         return self._updated(
             delivered=True,
+            announcement_ack=AnnouncementAck.SPOKEN.value,
             delivery_claim_token=None,
             delivery_claimed_at=None,
             delivery_retry_at=0,
             delivered_at=delivered_at,
+        )
+
+    def acknowledge_desktop_delivery(self) -> CursorJob:
+        return self._updated(
+            announcement_ack=AnnouncementAck.DESKTOP.value,
+            delivery_claim_token=None,
+            delivery_claimed_at=None,
+            delivery_retry_at=0,
+        )
+
+    def acknowledge_deferred_delivery(self) -> CursorJob:
+        return self._updated(
+            announcement_ack=AnnouncementAck.DEFERRED.value,
+            delivery_claim_token=None,
+            delivery_claimed_at=None,
+            delivery_retry_at=0,
         )
 
     def release_delivery(self, *, retry_at: float) -> CursorJob:
@@ -2457,6 +2553,17 @@ class AgentJob:
             )
         if self.delivered and self.delivery_claim_token:
             raise JobValidationError("delivered job cannot retain a delivery claim")
+        ack = self.announcement_ack
+        if ack not in ANNOUNCEMENT_ACK_STATES:
+            raise JobValidationError("announcement_ack has invalid value")
+        if ack in SPOKEN_ANNOUNCEMENT_ACKS and not self.delivered:
+            raise JobValidationError(
+                "spoken or dismissed announcement requires delivered"
+            )
+        if ack in SUPPRESSED_ANNOUNCEMENT_ACKS and self.delivered:
+            raise JobValidationError(
+                "desktop or deferred announcement cannot be marked delivered"
+            )
         if self.review_round < 0 or self.review_round > 2:
             raise JobValidationError("review_round must be between zero and two")
         if (

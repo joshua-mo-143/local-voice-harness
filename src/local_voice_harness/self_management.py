@@ -21,11 +21,12 @@ from .user_config import UserConfig, UserConfigurationError
 
 UNSUPPORTED_INSPECTION_RESPONSE = (
     "I can only inspect one supported harness setting at a time: voice, "
-    "barge-in mode, or whether GitHub, Linear, or Zendesk is enabled."
+    "barge-in mode, announcement policy, or whether GitHub, Linear, or Zendesk "
+    "is enabled."
 )
 AMBIGUOUS_INSPECTION_RESPONSE = (
     "I couldn't identify exactly one supported harness setting. Ask about voice, "
-    "barge-in mode, or one supported integration."
+    "barge-in mode, announcement policy, or one supported integration."
 )
 _MAX_SPOKEN_VALUE_CHARS = 80
 _SAFE_VOICE_VALUE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,79}$")
@@ -75,6 +76,7 @@ class SettingKey(StrEnum):
 
     VOICE = "audio.voice"
     BARGE_IN_MODE = "audio.barge_in_mode"
+    ANNOUNCEMENT_MODE = "announcements.mode"
     GITHUB = "integrations.github"
     LINEAR = "integrations.linear"
     ZENDESK = "integrations.zendesk"
@@ -152,6 +154,16 @@ SETTING_REGISTRY = (
         lambda config: config.audio.barge_in_mode,
     ),
     SettingSpec(
+        SettingKey.ANNOUNCEMENT_MODE,
+        (
+            "announcement policy",
+            "announcement mode",
+            "background announcements",
+            "quiet mode",
+        ),
+        lambda config: config.announcements.mode.value,
+    ),
+    SettingSpec(
         SettingKey.GITHUB,
         ("github", "git hub"),
         lambda config: config.integrations.github_enabled,
@@ -226,6 +238,20 @@ def _normalize_raw_value(setting: SettingKey, raw_value: str) -> str:
         return aliases.get(normalized, value)
     if setting == SettingKey.BARGE_IN_MODE and normalized == "wake word":
         return "wake"
+    if setting == SettingKey.ANNOUNCEMENT_MODE:
+        aliases = {
+            "all": "all",
+            "everything": "all",
+            "speak all": "all",
+            "action required": "action-required",
+            "action-required": "action-required",
+            "desktop only": "desktop-only",
+            "desktop-only": "desktop-only",
+            "notifications only": "desktop-only",
+            "quiet": "quiet",
+            "quiet mode": "quiet",
+        }
+        return aliases.get(normalized, value)
     return value
 
 
@@ -430,6 +456,12 @@ def render_inspection_result(result: InspectionResult) -> AssistantResponse:
         return AssistantResponse(
             spoken_text=f"Barge-in mode is {value}.",
             display_text=f"audio.barge_in_mode: {value}",
+        )
+    if result.setting == SettingKey.ANNOUNCEMENT_MODE:
+        value = _bounded_spoken_value(str(result.value or ""))
+        return AssistantResponse(
+            spoken_text=f"Background announcement policy is {value}.",
+            display_text=f"announcements.mode: {value}",
         )
     enabled = result.value is True
     name = {

@@ -5,6 +5,7 @@ from __future__ import annotations
 import fcntl
 import json
 import os
+import re
 import shutil
 import subprocess
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
@@ -16,6 +17,7 @@ from .config import PROJECT_ROOT, SERVICE_FILES, backend_config_path, xdg_config
 from .credentials import CredentialError, get_venice_api_key
 from .integrations.registry import capability_statuses
 from .user_config import (
+    AnnouncementMode,
     IntegrationSettings,
     UserConfig,
     UserConfigurationError,
@@ -85,6 +87,50 @@ def _parse_barge_in_mode(value: str) -> str:
             "audio.barge_in_mode must be one of: off, vad, wake"
         )
     return mode
+
+
+def _parse_announcement_mode(value: str) -> AnnouncementMode:
+    mode = value.strip().casefold().replace("_", "-").replace(" ", "-")
+    aliases = {
+        "all": AnnouncementMode.ALL,
+        "everything": AnnouncementMode.ALL,
+        "action-required": AnnouncementMode.ACTION_REQUIRED,
+        "actionrequired": AnnouncementMode.ACTION_REQUIRED,
+        "desktop-only": AnnouncementMode.DESKTOP_ONLY,
+        "desktoponly": AnnouncementMode.DESKTOP_ONLY,
+        "quiet": AnnouncementMode.QUIET,
+    }
+    parsed = aliases.get(mode)
+    if parsed is None:
+        raise UserConfigurationError(
+            "announcements.mode must be one of: all, action-required, "
+            "desktop-only, quiet"
+        )
+    return parsed
+
+
+def _parse_clock(value: str) -> str:
+    text = value.strip()
+    if not text:
+        return ""
+    if not re.fullmatch(r"([01]\d|2[0-3]):[0-5]\d", text):
+        raise UserConfigurationError("quiet hours must be HH:MM in 24-hour local time")
+    return text
+
+
+def _parse_timezone(value: str) -> str:
+    text = value.strip()
+    if not text:
+        return ""
+    from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+    try:
+        ZoneInfo(text)
+    except (ZoneInfoNotFoundError, KeyError, ValueError) as exc:
+        raise UserConfigurationError(
+            "announcements.timezone must be a valid IANA timezone name"
+        ) from exc
+    return text
 
 
 def _parse_int(value: str) -> int:
@@ -464,6 +510,30 @@ _CONFIG_FIELDS: dict[str, ConfigField] = {
         attribute="agent_job_start_concurrency",
         services=(_WAKE_SERVICE,),
     ),
+    "announcements.mode": _field(
+        parse=_parse_announcement_mode,
+        section="announcements",
+        attribute="mode",
+        services=(_WAKE_SERVICE,),
+    ),
+    "announcements.quiet_hours_start": _field(
+        parse=_parse_clock,
+        section="announcements",
+        attribute="quiet_hours_start",
+        services=(_WAKE_SERVICE,),
+    ),
+    "announcements.quiet_hours_end": _field(
+        parse=_parse_clock,
+        section="announcements",
+        attribute="quiet_hours_end",
+        services=(_WAKE_SERVICE,),
+    ),
+    "announcements.timezone": _field(
+        parse=_parse_timezone,
+        section="announcements",
+        attribute="timezone",
+        services=(_WAKE_SERVICE,),
+    ),
 }
 
 
@@ -716,10 +786,11 @@ def reset_config(
             "audio",
             "dictation",
             "platform",
+            "announcements",
         }:
             raise UserConfigurationError(
                 "section must be one of: providers, integrations, compute, audio, "
-                "dictation, platform"
+                "dictation, platform, announcements"
             )
         replacements: dict[str, str] = {}
         for name in _CONFIG_FIELDS:

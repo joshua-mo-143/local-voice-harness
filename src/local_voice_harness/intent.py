@@ -31,7 +31,9 @@ ROUTER_SYSTEM_PROMPT = (
     "cursor_status and cursor_cancel for requests about a specific job. Use "
     "cursor_list when the user asks what jobs exist or what is in progress. Use "
     "cursor_dismiss to silence or acknowledge a job announcement, and cursor_repeat "
-    "to hear a job update again. When several jobs run at once the user may name a "
+    "to hear a job update again. Use announcement_digest when the user asks what "
+    "they missed, for an inbox digest of suppressed background announcements, or "
+    "to catch up on quiet-hours results. When several jobs run at once the user may name a "
     "job by its label, issue number, or short id; still classify only the action. "
     "Use workspace_consultation for any read-only question whose answer requires "
     "inspecting the selected workspace, including factual questions about files or "
@@ -59,7 +61,9 @@ ROUTER_SYSTEM_PROMPT = (
     "change the harness's own configuration. Extract only the requested raw value into "
     "raw_value; never produce a dotted key, infer a missing value, or use focused "
     "metadata as authority. Examples include changing the voice, setting barge-in mode, "
-    "and enabling or disabling GitHub, Linear, or Zendesk. Unsupported changes still "
+    "and enabling or disabling GitHub, Linear, or Zendesk. Changing the background "
+    "announcement policy, quiet mode, or desktop-only announcements also uses "
+    "harness_config_change. Unsupported changes still "
     "use harness_config_change so the first-party allow-list can reject them. "
     "Use self_health only when the user explicitly asks whether the local voice harness "
     "itself is healthy, working, or having problems. Do not use self_health for code, "
@@ -113,6 +117,7 @@ ROUTE_TOOL = {
                         "cursor_dismiss",
                         "cursor_repeat",
                         "cursor_details",
+                        "announcement_digest",
                         "harness_config_inspect",
                         "harness_config_change",
                         "self_health",
@@ -160,6 +165,7 @@ class Intent(StrEnum):
     AGENT_DISMISS = "cursor_dismiss"
     AGENT_REPEAT = "cursor_repeat"
     AGENT_DETAILS = "cursor_details"
+    ANNOUNCEMENT_DIGEST = "announcement_digest"
     HARNESS_CONFIG_INSPECT = "harness_config_inspect"
     HARNESS_CONFIG_CHANGE = "harness_config_change"
     SELF_HEALTH = "self_health"

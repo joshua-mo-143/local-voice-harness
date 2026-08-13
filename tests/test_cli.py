@@ -33,6 +33,12 @@ class JobsCliTests(unittest.TestCase):
             CursorTurnRequest("", action="list"),
         )
 
+    def test_missed_maps_to_missed_action(self) -> None:
+        cursor_turn = self._dispatch(["jobs", "missed"])
+        cursor_turn.assert_called_once_with(
+            CursorTurnRequest("", action="missed"),
+        )
+
     def test_status_without_reference_summarizes(self) -> None:
         cursor_turn = self._dispatch(["jobs", "status"])
         cursor_turn.assert_called_once_with(

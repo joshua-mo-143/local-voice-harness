@@ -114,6 +114,7 @@ def _registry(value: RegistryInput) -> IntegrationRegistry:
             audio=defaults.audio,
             dictation=defaults.dictation,
             platform=defaults.platform,
+            announcements=defaults.announcements,
         )
     return build_integration_registry(defaults)
 

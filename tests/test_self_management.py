@@ -60,6 +60,11 @@ class ConfigInspectionTests(unittest.TestCase):
                 self_management.SettingKey.ZENDESK,
                 False,
             ),
+            (
+                "What announcement policy is configured?",
+                self_management.SettingKey.ANNOUNCEMENT_MODE,
+                "all",
+            ),
         )
         for utterance, setting, value in cases:
             with self.subTest(utterance=utterance):
@@ -175,6 +180,12 @@ class ConfigChangeTests(unittest.TestCase):
         cases = (
             ("Set the voice to new_voice", "new_voice", "old_voice", "new_voice"),
             ("Set barge-in mode to off", "off", "wake", "off"),
+            (
+                "Set the announcement policy to quiet",
+                "quiet",
+                "all",
+                "quiet",
+            ),
             ("Disable GitHub", "disabled", True, False),
             ("Disable Linear", "false", True, False),
             ("Enable Zendesk", "enabled", False, True),

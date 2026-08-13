@@ -22,6 +22,7 @@ from local_voice_harness.config_management import (
     ConfigChangeResult,
     StaleConfigChangeError,
 )
+from local_voice_harness.cursor import announcements as announcement_policy
 from local_voice_harness.cursor import service as cursor_service
 from local_voice_harness.cursor.delivery import DeliveryClaim
 from local_voice_harness.cursor.model import CursorJob, JobStatus
@@ -136,6 +137,7 @@ def _bare_daemon() -> WakeConversationDaemon:
     instance.user_config = USER_CONFIG
     instance.audio = USER_CONFIG.audio
     instance.platform = USER_CONFIG.platform
+    instance.announcements = USER_CONFIG.announcements
     instance.providers = USER_CONFIG.providers
     instance.integrations = build_integration_registry(USER_CONFIG)
     instance.history = []
@@ -2545,6 +2547,23 @@ class AnnounceJobTests(unittest.TestCase):
             wake_daemon._display_fingerprint(response.display_text),
         )
 
+    def test_announcement_batch_keeps_extra_delivery_claims(self) -> None:
+        daemon = _bare_daemon()
+        first = _delivery_claim("job1", "completed", result="one")
+        second = _delivery_claim("job2", "completed", result="two")
+        with contextlib.redirect_stdout(io.StringIO()):
+            daemon._enqueue_announcement_batch((first, second))
+
+        with daemon.playback_queue._lock:
+            queued_request = daemon.playback_queue._items[0][0]
+        self.assertEqual(queued_request.job_id, first.job.id)
+        self.assertEqual(queued_request.delivery_token, first.token)
+        self.assertEqual(
+            queued_request.extra_claims,
+            ((second.job.id, second.token, "completed"),),
+        )
+        self.assertIn("2 background updates", queued_request.text)
+
     def test_display_failure_does_not_queue_or_acknowledge_delivery(self) -> None:
         daemon = _bare_daemon()
         claim = _delivery_claim("job2", "completed", result="done")
@@ -3725,7 +3744,11 @@ class WakeRecordingHandoffTests(unittest.TestCase):
             ) as record,
             mock.patch.object(daemon, "begin_activation"),
             mock.patch.object(wake_daemon, "recover_jobs"),
-            mock.patch.object(wake_daemon, "pending_results", return_value=[]),
+            mock.patch.object(
+                wake_daemon,
+                "drain_pending_announcements",
+                return_value=announcement_policy.DrainResult(),
+            ),
             mock.patch.object(wake_daemon, "log"),
             mock.patch.object(wake_daemon, "notify"),
         ):
@@ -3807,7 +3830,11 @@ class WakeRecordingHandoffTests(unittest.TestCase):
                 mock.patch.object(daemon, "record_utterance") as record,
                 mock.patch.object(daemon, "begin_activation") as activate,
                 mock.patch.object(wake_daemon, "recover_jobs"),
-                mock.patch.object(wake_daemon, "pending_results", return_value=[]),
+                mock.patch.object(
+                    wake_daemon,
+                    "drain_pending_announcements",
+                    return_value=announcement_policy.DrainResult(),
+                ),
                 mock.patch.object(wake_daemon, "log") as log,
                 mock.patch.object(wake_daemon, "notify"),
             ):
@@ -3875,6 +3902,7 @@ class PeriodicCursorRecoveryTests(unittest.TestCase):
             with (
                 mock.patch.object(cursor_service, "JOBS_DIR", jobs_dir),
                 mock.patch.object(cursor_service, "LEGACY_JOBS_DIR", legacy_dir),
+                mock.patch.object(wake_daemon, "CURSOR_STORE", store),
                 mock.patch.object(
                     cursor_service, "_worker_is_alive", side_effect=lambda _job: alive
                 ),
@@ -3883,8 +3911,11 @@ class PeriodicCursorRecoveryTests(unittest.TestCase):
                 cursor_service.recover_jobs()
                 launch.assert_not_called()
                 alive = False
-                self.assertEqual(wake_daemon.pending_results(), [])
+                drained = wake_daemon.drain_pending_announcements(
+                    USER_CONFIG.announcements
+                )
 
+            self.assertEqual(drained.speak, ())
             launch.assert_called_once_with("123456789abc")
             self.assertEqual(
                 store.get("123456789abc").status,
@@ -3922,7 +3953,11 @@ class RunLoopFollowupTests(unittest.TestCase):
 
         with (
             mock.patch.object(wake_daemon, "recover_jobs") as recover,
-            mock.patch.object(wake_daemon, "pending_results", return_value=[]),
+            mock.patch.object(
+                wake_daemon,
+                "drain_pending_announcements",
+                return_value=announcement_policy.DrainResult(),
+            ),
         ):
             daemon.run()
 
@@ -3956,7 +3991,11 @@ class ForceListenTests(unittest.TestCase):
 
         with (
             mock.patch.object(wake_daemon, "recover_jobs"),
-            mock.patch.object(wake_daemon, "pending_results", return_value=[]),
+            mock.patch.object(
+                wake_daemon,
+                "drain_pending_announcements",
+                return_value=announcement_policy.DrainResult(),
+            ),
             mock.patch.object(
                 wake_daemon.recorder, "any_recording_active", return_value=False
             ),

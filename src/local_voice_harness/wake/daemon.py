@@ -66,6 +66,7 @@ from ..critical_targets import (
     resolve_readback,
     select_submit_target,
 )
+from ..cursor import announcements as announcement_policy
 from ..cursor import consultation as cursor_consultation
 from ..cursor import questions as cursor_questions
 from ..cursor import service as cursor_service
@@ -140,7 +141,7 @@ from ..speech import SpeechRenderer, StreamingSpeechRenderer
 from ..stt.client import transcribe
 from ..ticket_targets import MISSING_ISSUE_SCOPE_RESPONSE, extract_ticket_targets
 from ..tts.queue import PlaybackQueue, PlaybackRequest
-from ..user_config import UserConfig, load_user_config
+from ..user_config import AnnouncementSettings, UserConfig, load_user_config
 from ..vad import FRAME_BYTES, FRAME_MS, SAMPLE_RATE, SpeechDetector
 
 RECORDING_PATHS = recorder.RecorderPaths(
@@ -214,12 +215,15 @@ def release_deliveries(claims: DeliveryClaims) -> None:
     release_claims(CURSOR_STORE, claims)
 
 
-def pending_results(
+def drain_pending_announcements(
+    settings: AnnouncementSettings,
+    *,
     integrations: IntegrationRegistry | None = None,
-) -> list[DeliveryClaim]:
-    return cursor_service.pending_results(
-        limit=DELIVERY_WINDOW,
-        integrations=integrations,
+) -> announcement_policy.DrainResult:
+    recover_jobs(integrations=integrations)
+    return announcement_policy.drain_background_announcements(
+        CURSOR_STORE,
+        settings,
     )
 
 
@@ -230,6 +234,9 @@ class _DeliveryLeaseGuard:
             for request in requests
             if request.job_id and request.delivery_token
         }
+        for request in requests:
+            for job_id, token, _status in request.extra_claims:
+                self._claims.add((job_id, token))
         self._lock = threading.Lock()
         self._stop = threading.Event()
         self._error: HarnessError | None = None
@@ -273,11 +280,13 @@ class _DeliveryLeaseGuard:
                 raise self._error
 
     def complete(self, request: PlaybackRequest) -> None:
-        if request.job_id and request.delivery_token:
-            with self._lock:
+        with self._lock:
+            if request.job_id and request.delivery_token:
                 self._claims.discard((request.job_id, request.delivery_token))
-                if not self._claims:
-                    self._stop.set()
+            for job_id, token, _status in request.extra_claims:
+                self._claims.discard((job_id, token))
+            if not self._claims:
+                self._stop.set()
 
     def stop(self) -> None:
         self._stop.set()
@@ -429,6 +438,7 @@ class WakeConversationDaemon:
         self.user_config = user_config
         self.audio = user_config.audio
         self.platform = user_config.platform
+        self.announcements = user_config.announcements
         self.providers = user_config.providers
         self.speech_renderer = SpeechRenderer.from_local_config(
             local_checkout=PROJECT_ROOT
@@ -976,19 +986,34 @@ class WakeConversationDaemon:
         return cursor_service.render_job_announcement(job)
 
     def _enqueue_job_announcement(self, claim: DeliveryClaim) -> None:
-        job = claim.job
-        job_id = job.id
-        response = self._job_response(job)
-        log(f"job {job_id} completion queued: {response.display_text}")
+        self._enqueue_announcement_batch((claim,))
+
+    def _enqueue_announcement_batch(self, claims: tuple[DeliveryClaim, ...]) -> None:
+        if not claims:
+            return
+        if len(claims) == 1:
+            job = claims[0].job
+            response = self._job_response(job)
+        else:
+            response = announcement_policy.render_digest(
+                [claim.job for claim in claims],
+                render_job=cursor_service.render_job_announcement,
+            )
+        log(f"job announcement queued: {response.display_text}")
         print(f"Assistant: {response.display_text}", flush=True)
+        primary = claims[0]
+        extra = tuple(
+            (claim.job.id, claim.token, claim.job.status.value) for claim in claims[1:]
+        )
         self.playback_queue.enqueue(
             PlaybackRequest(
                 text=self._render_speech(response.spoken_text),
-                job_id=job_id,
-                delivery_token=claim.token,
-                job_status=job.status.value,
-                job_completed_at=job.completed_at,
+                job_id=primary.job.id,
+                delivery_token=primary.token,
+                job_status=primary.job.status.value,
+                job_completed_at=primary.job.completed_at,
                 display_fingerprint=_display_fingerprint(response.display_text),
+                extra_claims=extra,
             )
         )
 
@@ -1132,27 +1157,45 @@ class WakeConversationDaemon:
         *,
         interrupted: bool,
     ) -> None:
-        job_id = request.job_id or ""
-        delivery_token = request.delivery_token or ""
+        tokened: list[tuple[str, str, str]] = []
+        if request.job_id and request.delivery_token:
+            tokened.append(
+                (request.job_id, request.delivery_token, str(request.job_status or ""))
+            )
+        tokened.extend(request.extra_claims)
         if interrupted:
-            if delivery_token:
+            for job_id, delivery_token, _status in tokened:
                 release_delivery(job_id, delivery_token)
             return
-        acknowledged = (
-            acknowledge_delivery(job_id, delivery_token) if delivery_token else True
-        )
-        if not acknowledged:
-            if delivery_token:
+        acknowledged_all = True
+        for job_id, delivery_token, _status in tokened:
+            if not acknowledge_delivery(job_id, delivery_token):
+                acknowledged_all = False
                 release_delivery(job_id, delivery_token)
+        if tokened and not acknowledged_all:
             return
         played_text = str(playback.get("played_text") or "").strip() or request.text
-        self._enable_post_job_conversation(
-            job_id=job_id,
-            job_status=str(request.job_status or ""),
-            played_text=played_text,
-            job_completed_at=request.job_completed_at,
-            display_fingerprint=request.display_fingerprint,
-        )
+        if not request.extra_claims:
+            if request.job_id:
+                self._enable_post_job_conversation(
+                    job_id=request.job_id,
+                    job_status=str(request.job_status or ""),
+                    played_text=played_text,
+                    job_completed_at=request.job_completed_at,
+                    display_fingerprint=request.display_fingerprint,
+                )
+            return
+        if played_text:
+            self.history.append({"role": "assistant", "content": played_text})
+            self.history = self.history[-8:]
+        awaiting = [
+            job_id for job_id, _token, status in tokened if status == "awaiting_user"
+        ]
+        if len(awaiting) == 1:
+            self.cursor_session = awaiting[0]
+        self.conversation_deadline = time.monotonic() + CONVERSATION_TIMEOUT_SECONDS
+        self.awaiting_followup = True
+        notify("Listening for a follow-up…")
 
     def _play_pending_announcements(self) -> BargeIn | None:
         if len(self.playback_queue) == 0:
@@ -1169,6 +1212,14 @@ class WakeConversationDaemon:
             if request.job_id and request.delivery_token:
                 return request.job_id, request.delivery_token
             return id(request)
+
+        def release_unfinished(request: PlaybackRequest) -> None:
+            if request_key(request) in finished:
+                return
+            if request.delivery_token and request.job_id:
+                release_delivery(request.job_id, request.delivery_token)
+            for job_id, token, _status in request.extra_claims:
+                release_delivery(job_id, token)
 
         def finish_job(
             playback: dict[str, object],
@@ -1200,22 +1251,12 @@ class WakeConversationDaemon:
                 # announced again only after the interrupted turn completes.
                 self.playback_queue.clear()
                 for request in pending_requests:
-                    if (
-                        request_key(request) not in finished
-                        and request.delivery_token
-                        and request.job_id
-                    ):
-                        release_delivery(request.job_id, request.delivery_token)
+                    release_unfinished(request)
             return interruption
         except Exception as exc:
             self.playback_queue.clear()
             for request in pending_requests:
-                if (
-                    request_key(request) not in finished
-                    and request.delivery_token
-                    and request.job_id
-                ):
-                    release_delivery(request.job_id, request.delivery_token)
+                release_unfinished(request)
             log(f"queued playback failed: {type(exc).__name__}: {exc}")
             notify(PLAYBACK_FAILURE, error=True)
             return None
@@ -1813,6 +1854,16 @@ class WakeConversationDaemon:
                     delivery_claims=delivery_claims,
                     integrations=self.integrations,
                 )
+            elif route.actionable and route.intent == Intent.ANNOUNCEMENT_DIGEST:
+                response, next_cursor_session = cursor_turn(
+                    CursorTurnRequest(
+                        "",
+                        self.cursor_session,
+                        action="missed",
+                    ),
+                    delivery_claims=delivery_claims,
+                    integrations=self.integrations,
+                )
             elif route.actionable and route.intent == Intent.AGENT_CANCEL:
                 response, next_cursor_session = cursor_turn(
                     CursorTurnRequest(
@@ -2107,8 +2158,12 @@ class WakeConversationDaemon:
                 self.continue_after_barge_in(activation_interruption)
                 speech_streak = 0
                 continue
-            for job in pending_results(self.integrations):
-                self._enqueue_job_announcement(job)
+            batch = drain_pending_announcements(
+                self.announcements,
+                integrations=self.integrations,
+            )
+            if batch.speak:
+                self._enqueue_announcement_batch(batch.speak)
             if len(self.playback_queue) > 0:
                 self.continue_after_barge_in(self._play_pending_announcements())
                 speech_streak = 0

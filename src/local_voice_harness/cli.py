@@ -150,7 +150,14 @@ def parser() -> argparse.ArgumentParser:
     )
     config_reset.add_argument(
         "--section",
-        choices=("providers", "integrations", "compute", "audio", "platform"),
+        choices=(
+            "providers",
+            "integrations",
+            "compute",
+            "audio",
+            "platform",
+            "announcements",
+        ),
         help="reset only one section",
     )
 
@@ -200,6 +207,10 @@ def parser() -> argparse.ArgumentParser:
     jobs = commands.add_parser("jobs", help="manage background Cursor jobs")
     job_commands = jobs.add_subparsers(dest="jobs_command", required=True)
     job_commands.add_parser("list", help="summarize the Cursor job inbox")
+    job_commands.add_parser(
+        "missed",
+        help="show suppressed background announcements",
+    )
     job_status = job_commands.add_parser("status", help="report a job's status")
     job_status.add_argument("reference", nargs="*")
     for name, help_text in (
@@ -325,6 +336,8 @@ def run_job_command(args: argparse.Namespace) -> None:
         return
     if args.jobs_command == "list":
         request = CursorTurnRequest("", action="list")
+    elif args.jobs_command == "missed":
+        request = CursorTurnRequest("", action="missed")
     elif args.jobs_command == "reply":
         message = " ".join(args.message)
         request = CursorTurnRequest(
