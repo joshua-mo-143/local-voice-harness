@@ -34,6 +34,25 @@ If investigation cannot pin the outcome, file a spike or a problem ticket with e
 
 Do not restate always-on verification from `AGENTS.md` (format, lint, types, full CI matrix). Add only issue-specific tests, smokes, or hardware checks.
 
+## Scope and acceptance gate
+
+Before filing an implementation ticket, verify:
+
+- It has one primary outcome and one coherent ownership/review boundary.
+- It has 2–5 observable, pass/fail acceptance criteria.
+- Criteria describe required behavior, not suggested implementation steps.
+- Every criterion is necessary for the stated outcome.
+- No criterion is independently deliverable as a useful change. If one is, split it into its own issue.
+
+Epics use completion conditions rather than implementation acceptance criteria.
+Spikes use explicit questions or deliverables that determine when the investigation
+is complete.
+
+Treat a brief that combines several of `introduce`, `migrate`, `enforce`,
+`remove`, and `prove` as an epic candidate. If a split would create more than
+three child issues, present the proposed issue tree and sequencing to the user
+before filing any of them.
+
 ## What is not binding
 
 Put likely files, APIs, and implementation steps under **Suggested approach**, and mark that section non-binding.
