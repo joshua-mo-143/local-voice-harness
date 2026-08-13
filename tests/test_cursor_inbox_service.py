@@ -66,6 +66,8 @@ def _make(
             worker_pid=42,
             worker_boot_id="boot",
             worker_process_start="start",
+            worker_claim_operation="test",
+            worker_claimed_at=now,
         )
     return store.create(CursorJob.from_dict(values))
 

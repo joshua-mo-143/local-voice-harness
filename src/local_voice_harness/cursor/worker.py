@@ -22,6 +22,8 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Run one persisted Cursor job")
     parser.add_argument("job_id")
     parser.add_argument("--claim")
+    parser.add_argument("--claim-operation")
+    parser.add_argument("--claim-time", type=float)
     args = parser.parse_args()
     registry = build_integration_registry(load_user_config())
     factories = ClientFactories(
@@ -35,6 +37,8 @@ def main() -> None:
             args.job_id,
             args.claim,
             lambda context: run_claimed_worker(context, factories),
+            claim_operation=args.claim_operation,
+            claim_time=args.claim_time,
         )
     finally:
         dispatch_waiting_jobs(registry)

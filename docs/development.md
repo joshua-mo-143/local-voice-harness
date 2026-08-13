@@ -23,8 +23,9 @@ not require stopping the installed wake listener.
 The launcher sets `XDG_CONFIG_HOME` to `.dev/config` and `XDG_STATE_HOME` to
 `.dev/state`. For example, branch-specific backend configuration belongs at
 `.dev/config/voice-harness/backends.toml`, and durable jobs are stored below
-`.dev/state/voice-harness/`. Existing `VOICE_HARNESS_*` values are inherited, so
-temporary overrides remain available:
+`.dev/state/voice-harness/`. The checkout-local jobs database is explicitly
+`<checkout>/.dev/state/voice-harness/jobs/jobs.sqlite3`. Existing
+`VOICE_HARNESS_*` values are inherited, so temporary overrides remain available:
 
 ```bash
 VOICE_HARNESS_LLM_PROVIDER=venice scripts/dev.sh text "Summarize my open work"

@@ -17,6 +17,7 @@ from local_voice_harness.cursor.model import (
     JobValidationError,
     transition,
 )
+from local_voice_harness.cursor.operations import WorkerOwnership
 from local_voice_harness.cursor.recovery import stage_terminal_intent
 from local_voice_harness.cursor.store import (
     ActiveTicketConflict,
@@ -170,7 +171,14 @@ class CursorStoreIntegrationTests(unittest.TestCase):
             "plan",
             0,
             "Stale output.",
-            expected_worker_token="claim-123456789abc",
+            expected_worker_token=WorkerOwnership(
+                "claim-123456789abc",
+                42,
+                "boot",
+                "start-123456789abc",
+                "test",
+                1,
+            ),
             expected_turn_token="turn-1",
             expected_phase="planning",
             expected_prior_reference=None,
@@ -205,7 +213,14 @@ class CursorStoreIntegrationTests(unittest.TestCase):
             "plan",
             0,
             "Preserve the fence.",
-            expected_worker_token="claim-123456789abc",
+            expected_worker_token=WorkerOwnership(
+                "claim-123456789abc",
+                42,
+                "boot",
+                "start-123456789abc",
+                "test",
+                1,
+            ),
             expected_turn_token="turn-1",
             expected_phase="planning",
             expected_prior_reference=None,
@@ -338,9 +353,21 @@ class CursorStoreIntegrationTests(unittest.TestCase):
                     "worker_pid": 42,
                     "worker_boot_id": "boot",
                     "worker_process_start": f"start-{job_id}",
+                    "worker_claim_operation": "test",
+                    "worker_claimed_at": 1,
                 }
             )
         value.update(fields)
+        if value.get("agent_dispatch_state") is not None and value.get("herdr_target"):
+            value.setdefault("agent_operation_checkout", "/checkout")
+            value.setdefault("herdr_workspace_id", "workspace")
+            value.setdefault("herdr_pane_id", "pane")
+            value.setdefault("agent_provider", "cursor/herdr")
+            value.setdefault(
+                "agent_provider_session_id",
+                f"session-{value['herdr_target']}",
+            )
+            value.setdefault("agent_state_sequence", 1)
         return value
 
     def write(self, job: dict[str, object]) -> None:
@@ -542,7 +569,7 @@ class CursorStoreIntegrationTests(unittest.TestCase):
         job.pop("worker_boot_id")
 
         with self.assertRaisesRegex(
-            JobValidationError, "routing job requires complete worker ownership"
+            JobValidationError, "worker ownership is incomplete"
         ):
             self.write(job)
 
@@ -563,6 +590,8 @@ class CursorStoreIntegrationTests(unittest.TestCase):
             "worker_token": "claim",
             "worker_pid": 42,
             "worker_process_start": "start",
+            "worker_claim_operation": "test",
+            "worker_claimed_at": 1,
         }
 
         with locked(self.jobs_dir):
@@ -596,6 +625,8 @@ class CursorStoreIntegrationTests(unittest.TestCase):
                     "worker_token": "claim",
                     "worker_pid": 42,
                     "worker_process_start": "start",
+                    "worker_claim_operation": "test",
+                    "worker_claimed_at": 1,
                 }
             )
         )
@@ -752,6 +783,8 @@ class CursorStoreIntegrationTests(unittest.TestCase):
                     "delivered": False,
                     "worker_pid": 42,
                     "worker_process_start": "start",
+                    "worker_claim_operation": "test",
+                    "worker_claimed_at": 1,
                 }
             )
         )
@@ -951,6 +984,8 @@ class CursorStoreIntegrationTests(unittest.TestCase):
             worker_pid=42,
             worker_boot_id="boot",
             worker_process_start="start",
+            worker_claim_operation="test",
+            worker_claimed_at=1,
         )
         malformed["parent_job_id"] = "invalid"
         (self.jobs_dir / "aaaaaaaaaaaa.json").write_text(json.dumps(malformed))
@@ -1334,6 +1369,8 @@ class CursorStoreIntegrationTests(unittest.TestCase):
                     "worker_pid": 42,
                     "worker_boot_id": "boot",
                     "worker_process_start": "start",
+                    "worker_claim_operation": "test",
+                    "worker_claimed_at": 1,
                 },
             ),
         )
@@ -1497,6 +1534,8 @@ class CursorStoreIntegrationTests(unittest.TestCase):
                 worker_pid=42,
                 worker_boot_id="boot",
                 worker_process_start="start",
+                worker_claim_operation="test",
+                worker_claimed_at=1,
             ),
         )
 
@@ -1564,6 +1603,8 @@ class CursorStoreIntegrationTests(unittest.TestCase):
                         worker_pid=42,
                         worker_boot_id="boot",
                         worker_process_start="start",
+                        worker_claim_operation="test",
+                        worker_claimed_at=1,
                     ),
                 )
             )

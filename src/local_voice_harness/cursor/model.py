@@ -54,6 +54,21 @@ from .lifecycle import (
 from .lifecycle import (
     renew_delivery as transition_delivery_renewal,
 )
+from .operations import (
+    AgentSessionOperation,
+    AgentSessionSpec,
+    CheckoutOperation,
+    CheckoutSpec,
+    ForkOperation,
+    ForkSpec,
+    OperationState,
+    OperationTransitionError,
+    ParticipantPaneOperation,
+    ParticipantPaneSpec,
+    SessionIdentity,
+    WorkerOwnership,
+    load_worker_ownership,
+)
 from .workflow import (
     ArtifactReference,
     LegacyPlanApprovalProof,
@@ -76,7 +91,7 @@ from .workflow import (
     WorkflowTransitionError,
 )
 
-CURRENT_SCHEMA_VERSION = 17
+CURRENT_SCHEMA_VERSION = 18
 LEGACY_SCHEMA_VERSIONS = frozenset(range(CURRENT_SCHEMA_VERSION))
 LEGACY_BOOT_ID = "legacy-unknown"
 
@@ -207,6 +222,8 @@ _BOOL_FIELDS = frozenset(
         "agent_dispatch_exited",
         "worktree_dispatch_exited",
         "target_release_pending",
+        "target_release_manual_required",
+        "agent_identity_legacy_compatible",
         "cancellation_reconciliation_pending",
         "worktree_manual_inspection_required",
         "announcement_dismissed",
@@ -221,6 +238,7 @@ _BOOL_FIELDS = frozenset(
 _INT_FIELDS = frozenset(
     {
         "schema_version",
+        "migration_source_schema_version",
         "revision",
         "turn",
         "github_issue",
@@ -242,6 +260,7 @@ _INT_FIELDS = frozenset(
         "plan_approval_state_change_sequence",
         "plan_approval_revision",
         "linear_ticket_create_baseline_sequence",
+        "agent_state_sequence",
     }
 )
 _FLOAT_FIELDS = frozenset(
@@ -277,6 +296,7 @@ _FLOAT_FIELDS = frozenset(
         "manual_reconcile_resolved_at",
         "worktree_quarantine_acknowledged_at",
         "terminal_intent_completed_at",
+        "worker_claimed_at",
     }
 )
 _STRING_FIELDS = frozenset(
@@ -335,6 +355,7 @@ _STRING_FIELDS = frozenset(
         "worker_boot_id",
         "worker_process_start",
         "worker_operation",
+        "worker_claim_operation",
         "herdr_target",
         "herdr_pane_id",
         "herdr_workspace_id",
@@ -344,6 +365,12 @@ _STRING_FIELDS = frozenset(
         "target_release_owner_boot_id",
         "target_release_owner_start",
         "agent_dispatch_state",
+        "agent_provider",
+        "agent_provider_session_id",
+        "agent_operation_checkout",
+        "agent_operation_target",
+        "agent_operation_workspace_id",
+        "agent_operation_pane_id",
         "fork_operation_state",
         "fork_operation_source",
         "fork_operation_source_url",
@@ -386,6 +413,7 @@ _STRING_FIELDS = frozenset(
         "participant_creation_label",
         "participant_creation_workspace_id",
         "participant_creation_pane_id",
+        "participant_creation_checkout",
         "terminal_intent_status",
         "terminal_intent_result",
         "terminal_intent_error",
@@ -555,6 +583,13 @@ _HARNESS_STATE_FIELDS = frozenset(
         "herdr_workspace_id",
         "agent_name",
         "agent_dispatch_state",
+        "agent_provider",
+        "agent_provider_session_id",
+        "agent_operation_checkout",
+        "agent_operation_target",
+        "agent_operation_workspace_id",
+        "agent_operation_pane_id",
+        "agent_state_sequence",
         "agent_dispatch_exited",
         "agent_reconcile_attempts",
         "agent_absent_observations",
@@ -572,6 +607,9 @@ _HARNESS_STATE_FIELDS = frozenset(
         "target_release_owner_pid",
         "target_release_owner_boot_id",
         "target_release_owner_start",
+        "target_release_manual_required",
+        "target_release_unverified_targets",
+        "participant_session_owners",
     }
 )
 _CHECKOUT_STATE_FIELDS = frozenset(
@@ -684,6 +722,117 @@ def _flatten_structured_state(values: dict[str, object]) -> None:
         values.setdefault("herdr_target", values["session_id"])
 
 
+def _migrate_v17_typed_identities(values: dict[str, object]) -> None:
+    """Convert v17's optional identity fields into safe v18 typed states."""
+
+    worker_fields = (
+        "worker_token",
+        "worker_pid",
+        "worker_boot_id",
+        "worker_process_start",
+    )
+    worker_values = tuple(values.get(field) for field in worker_fields)
+    if any(value is not None for value in worker_values):
+        if all(value is not None for value in worker_values):
+            if not values.get("worker_claim_operation"):
+                values["worker_claim_operation"] = (
+                    f"legacy:{values.get('status') or 'worker'}"
+                )
+            if values.get("worker_claimed_at") is None:
+                values["worker_claimed_at"] = (
+                    values.get("attempt_started_at")
+                    or values.get("started_at")
+                    or values.get("created_at")
+                    or 0
+                )
+
+    worktree_state = values.get("worktree_provision_state")
+    if worktree_state is not None:
+        for field in ("repository", "worktree_branch", "worktree_path"):
+            if not values.get(field):
+                values[field] = LEGACY_BOOT_ID
+
+    agent_state = values.get("agent_dispatch_state")
+    if agent_state is not None:
+        values["agent_identity_legacy_compatible"] = True
+        values.setdefault("agent_operation_target", values.get("herdr_target"))
+        values.setdefault(
+            "agent_operation_workspace_id", values.get("herdr_workspace_id")
+        )
+        values.setdefault("agent_operation_pane_id", values.get("herdr_pane_id"))
+        if not values.get("agent_operation_checkout"):
+            values["agent_operation_checkout"] = (
+                values.get("worktree_path")
+                or values.get("repository")
+                or LEGACY_BOOT_ID
+            )
+        for field in ("herdr_target", "herdr_pane_id", "herdr_workspace_id"):
+            if not values.get(field):
+                values[field] = LEGACY_BOOT_ID
+                if (
+                    field == "herdr_target"
+                    and values.get("agent_dispatch_state") != "manual_required"
+                ):
+                    values["agent_dispatch_state"] = "ambiguous"
+        values["agent_operation_target"] = (
+            values.get("agent_operation_target") or values["herdr_target"]
+        )
+        values["agent_operation_workspace_id"] = (
+            values.get("agent_operation_workspace_id") or values["herdr_workspace_id"]
+        )
+        values["agent_operation_pane_id"] = (
+            values.get("agent_operation_pane_id") or values["herdr_pane_id"]
+        )
+        session_fields = (
+            "agent_provider",
+            "agent_provider_session_id",
+            "agent_state_sequence",
+        )
+        session_values = tuple(values.get(field) for field in session_fields)
+        session_complete = all(value is not None for value in session_values)
+        if any(value is not None for value in session_values) and not session_complete:
+            for field in session_fields:
+                values[field] = None
+
+    participant_state = values.get("participant_creation_state")
+    if participant_state not in {None, "none"}:
+        if not values.get("participant_creation_checkout"):
+            values["participant_creation_checkout"] = (
+                values.get("worktree_path")
+                or values.get("repository")
+                or LEGACY_BOOT_ID
+            )
+
+    fork_state = values.get("fork_operation_state")
+    if fork_state is not None:
+        target = values.get("fork_operation_target")
+        if (
+            not values.get("fork_operation_login")
+            and isinstance(target, str)
+            and "/" in target
+        ):
+            values["fork_operation_login"] = target.split("/", 1)[0]
+        required_fork_fields = (
+            "fork_operation_source",
+            "fork_operation_source_url",
+            "fork_operation_source_default_branch",
+            "fork_operation_login",
+            "fork_operation_target",
+        )
+        incomplete = any(not values.get(field) for field in required_fork_fields)
+        for field in required_fork_fields:
+            if not values.get(field):
+                values[field] = LEGACY_BOOT_ID
+        values.setdefault("fork_operation_source_private", False)
+        if incomplete and fork_state not in {"failed", "confirmed_absent"}:
+            values["fork_operation_state"] = "ambiguous"
+
+    values.setdefault("target_release_manual_required", False)
+    values.setdefault("agent_identity_legacy_compatible", False)
+    values.setdefault("target_release_unverified_targets", [])
+    values.setdefault("participant_session_owners", [])
+
+
 def _advance_legacy_version(values: dict[str, object], version: int) -> None:
     """Apply one compatibility step and advance exactly one schema version."""
 
@@ -754,6 +903,8 @@ def _advance_legacy_version(values: dict[str, object], version: int) -> None:
                 "plan_approval_review_artifact",
                 values.get("review_artifact"),
             )
+    elif version == 17:
+        _migrate_v17_typed_identities(values)
     values["schema_version"] = version + 1
 
 
@@ -791,6 +942,24 @@ def _default_announcement_ack(values: dict[str, object]) -> None:
         )
         return
     values["announcement_ack"] = AnnouncementAck.PENDING.value
+
+
+def _pair_worker_ownership(values: dict[str, object]) -> None:
+    """Keep newly typed worker claims all-or-nothing without rewriting legacy rows."""
+    if "worker_claimed_at" not in values:
+        return
+    if values.get("worker_token") is None:
+        for field in (
+            "worker_pid",
+            "worker_boot_id",
+            "worker_process_start",
+            "worker_claim_operation",
+            "worker_claimed_at",
+        ):
+            values[field] = None
+        return
+    if values.get("worker_claim_operation") is None:
+        values["worker_claim_operation"] = str(values.get("status") or "worker")
 
 
 def _infer_legacy_issue_provider(values: Mapping[str, object]) -> str | None:
@@ -831,22 +1000,32 @@ def migrate_job_record(raw: Mapping[str, object]) -> tuple[dict[str, object], in
     """Migrate a persisted record to the current in-memory representation."""
 
     values = dict(raw)
-    loaded_version = (
+    record_version = (
         _integer(values["schema_version"], "schema_version")
         if "schema_version" in values
         else 0
     )
-    if loaded_version not in LEGACY_SCHEMA_VERSIONS | {CURRENT_SCHEMA_VERSION}:
+    if record_version not in LEGACY_SCHEMA_VERSIONS | {CURRENT_SCHEMA_VERSION}:
         raise JobValidationError(
-            f"unsupported agent job schema version {loaded_version}"
+            f"unsupported agent job schema version {record_version}"
         )
+    source_version = values.get("migration_source_schema_version")
+    if source_version is None:
+        loaded_version = record_version
+    else:
+        loaded_version = _integer(source_version, "migration_source_schema_version")
+        if (
+            record_version != CURRENT_SCHEMA_VERSION
+            or loaded_version not in LEGACY_SCHEMA_VERSIONS
+        ):
+            raise JobValidationError("invalid migration source schema version")
     compatibility_input = not (
         "harness_state" in values
         or "checkout_state" in values
         or "provider_state" in values
     )
     _flatten_structured_state(values)
-    if loaded_version < CURRENT_SCHEMA_VERSION:
+    if record_version < CURRENT_SCHEMA_VERSION:
         if compatibility_input:
             values.setdefault("harness_kind", HarnessKind.CURSOR.value)
             if values.get("herdr_target") is not None:
@@ -854,8 +1033,9 @@ def migrate_job_record(raw: Mapping[str, object]) -> tuple[dict[str, object], in
             elif values.get("session_id") is not None:
                 values.setdefault("herdr_target", values["session_id"])
         _legacy_defaults(values)
-        for version in range(loaded_version, CURRENT_SCHEMA_VERSION):
+        for version in range(record_version, CURRENT_SCHEMA_VERSION):
             _advance_legacy_version(values, version)
+        values["migration_source_schema_version"] = record_version
     else:
         if compatibility_input:
             values.setdefault("harness_kind", HarnessKind.CURSOR.value)
@@ -1054,6 +1234,9 @@ class AgentJob:
     herdr_target: str | None
     worktree_path: str | None
     target_release_pending: bool
+    target_release_manual_required: bool
+    target_release_unverified_targets: tuple[str, ...]
+    participant_session_owners: tuple[dict[str, object], ...]
     cancellation_reconciliation_pending: bool
     agent_dispatch_state: str | None
     fork_operation_state: str | None
@@ -1077,7 +1260,7 @@ class AgentJob:
             else 0
         )
         compatibility_layout = (
-            raw_version == CURRENT_SCHEMA_VERSION
+            raw_version in {17, CURRENT_SCHEMA_VERSION}
             and "harness_kind" not in raw
             and "harness_state" not in raw
             and "provider_state" not in raw
@@ -1118,6 +1301,38 @@ class AgentJob:
                 raise JobValidationError(
                     "clarification records require question, answer, and turn identity"
                 )
+        unverified_targets = values.setdefault("target_release_unverified_targets", [])
+        if not isinstance(unverified_targets, list) or not all(
+            isinstance(target, str) and bool(target) for target in unverified_targets
+        ):
+            raise JobValidationError(
+                "target_release_unverified_targets must contain non-empty strings"
+            )
+        participant_session_owners = values.setdefault("participant_session_owners", [])
+        if not isinstance(participant_session_owners, list):
+            raise JobValidationError("participant_session_owners must be an array")
+        required_owner_fields = {
+            "provider",
+            "session_id",
+            "target",
+            "state_sequence",
+            "checkout",
+            "workspace_id",
+            "pane_id",
+        }
+        for owner in participant_session_owners:
+            if (
+                not isinstance(owner, dict)
+                or set(owner) != required_owner_fields
+                or not all(
+                    isinstance(owner.get(field), str) and bool(owner[field])
+                    for field in required_owner_fields - {"state_sequence"}
+                )
+                or not isinstance(owner.get("state_sequence"), int)
+                or isinstance(owner.get("state_sequence"), bool)
+                or int(owner["state_sequence"]) < 0
+            ):
+                raise JobValidationError("participant_session_owners is invalid")
         context_sessions = values.setdefault("prompt_context_sessions", {})
         if not isinstance(context_sessions, dict) or not all(
             key in {participant.value for participant in WorkflowParticipant}
@@ -1285,6 +1500,13 @@ class AgentJob:
                 else None
             ),
             target_release_pending=bool(values.get("target_release_pending", False)),
+            target_release_manual_required=bool(
+                values.get("target_release_manual_required", False)
+            ),
+            target_release_unverified_targets=tuple(unverified_targets),
+            participant_session_owners=tuple(
+                dict(owner) for owner in participant_session_owners
+            ),
             cancellation_reconciliation_pending=bool(
                 values.get("cancellation_reconciliation_pending", False)
             ),
@@ -1387,6 +1609,7 @@ class AgentJob:
             preserve_loaded_version
             and self.loaded_schema_version < CURRENT_SCHEMA_VERSION
         ):
+            values.pop("migration_source_schema_version", None)
             if self.loaded_schema_version == 0:
                 values.pop("schema_version", None)
             else:
@@ -1415,6 +1638,7 @@ class AgentJob:
             values.pop(field, None)
         values.update(changes)
         _pair_announcement_ack(values)
+        _pair_worker_ownership(values)
         if "prompt_operation_state" in changes:
             values.pop("phase_prompt_active", None)
         if (
@@ -1443,7 +1667,24 @@ class AgentJob:
             worker_boot_id=None,
             worker_process_start=None,
             worker_token=None,
+            worker_operation=None,
+            worker_claim_operation=None,
+            worker_claimed_at=None,
         )
+
+    @property
+    def worker_ownership(self) -> WorkerOwnership | None:
+        try:
+            return load_worker_ownership(
+                token=self.worker_token,
+                pid=self.worker_pid,
+                boot_id=self.worker_boot_id,
+                process_start=self.worker_process_start,
+                operation=self._optional_string("worker_claim_operation"),
+                claimed_at=self._optional_float("worker_claimed_at"),
+            )
+        except OperationTransitionError as exc:
+            raise JobValidationError(str(exc)) from exc
 
     def prepare_delivery(self, *, now: float) -> CursorJob:
         return self.evolve_for_delivery(now=now)
@@ -1481,6 +1722,7 @@ class AgentJob:
         if dynamic_changes is not None:
             values.update(dynamic_changes)
         values.update(changes)
+        _pair_worker_ownership(values)
         if "prompt_operation_state" in values:
             values.pop("phase_prompt_active", None)
         combined_changes = dict(dynamic_changes or {})
@@ -1642,13 +1884,6 @@ class AgentJob:
                 )
                 if participant is not None:
                     changes[f"{participant.value}_target"] = None
-            elif operation == "worktree":
-                if self.parent_job_id is None:
-                    changes.update(
-                        worktree_path=None,
-                        worktree_workspace_id=None,
-                        worktree_root_pane_id=None,
-                    )
         elif attempts >= uncertain_max_attempts:
             changes.update(
                 {
@@ -1936,6 +2171,53 @@ class AgentJob:
         return self._optional_string("worktree_root_pane_id")
 
     @property
+    def checkout_operation(self) -> CheckoutOperation | None:
+        if self.worktree_provision_state is None:
+            return None
+        state = {
+            "planned": OperationState.PLANNED,
+            "dispatching": OperationState.ACTIVE,
+            "ready": OperationState.SETTLED,
+            "retained": OperationState.SETTLED,
+            "quarantined": OperationState.UNKNOWN,
+            "ambiguous": OperationState.UNKNOWN,
+            "failed_observing": OperationState.UNKNOWN,
+            "confirmed_absent": OperationState.FAILED,
+            "manual_required": OperationState.MANUAL,
+        }[self.worktree_provision_state]
+        if (
+            self.loaded_schema_version < CURRENT_SCHEMA_VERSION
+            and state == OperationState.SETTLED
+            and (
+                not self.worktree_workspace_id
+                or not self.worktree_root_pane_id
+                or LEGACY_BOOT_ID
+                in {self.repository, self.worktree_branch, self.worktree_path}
+            )
+        ):
+            state = OperationState.UNKNOWN
+        workspace_id = self.worktree_workspace_id
+        root_pane_id = self.worktree_root_pane_id
+        if self.loaded_schema_version < CURRENT_SCHEMA_VERSION and bool(
+            workspace_id
+        ) != bool(root_pane_id):
+            workspace_id = None
+            root_pane_id = None
+        try:
+            return CheckoutOperation(
+                state,
+                CheckoutSpec(
+                    self.repository or "",
+                    self.worktree_branch or "",
+                    self.worktree_path or "",
+                ),
+                workspace_id,
+                root_pane_id,
+            )
+        except OperationTransitionError as exc:
+            raise JobValidationError(str(exc)) from exc
+
+    @property
     def worktree_provision_error(self) -> str | None:
         return self._optional_string("worktree_provision_error")
 
@@ -2035,6 +2317,97 @@ class AgentJob:
     @property
     def herdr_workspace_id(self) -> str | None:
         return self._optional_string("herdr_workspace_id")
+
+    @property
+    def agent_provider(self) -> str | None:
+        return self._optional_string("agent_provider")
+
+    @property
+    def agent_provider_session_id(self) -> str | None:
+        return self._optional_string("agent_provider_session_id")
+
+    @property
+    def agent_state_sequence(self) -> int | None:
+        return self._optional_int("agent_state_sequence")
+
+    @property
+    def agent_operation_checkout(self) -> str | None:
+        return self._optional_string("agent_operation_checkout")
+
+    @property
+    def agent_operation_target(self) -> str | None:
+        return self._optional_string("agent_operation_target")
+
+    @property
+    def agent_operation_workspace_id(self) -> str | None:
+        return self._optional_string("agent_operation_workspace_id")
+
+    @property
+    def agent_operation_pane_id(self) -> str | None:
+        return self._optional_string("agent_operation_pane_id")
+
+    @property
+    def agent_identity_legacy_compatible(self) -> bool:
+        return bool(self._values.get("agent_identity_legacy_compatible", False))
+
+    @property
+    def agent_session_operation(self) -> AgentSessionOperation | None:
+        if self.agent_dispatch_state is None:
+            return None
+        state = {
+            "dispatching": OperationState.ACTIVE,
+            "ready": OperationState.SETTLED,
+            "retained": OperationState.SETTLED,
+            "ambiguous": OperationState.UNKNOWN,
+            "failed_observing": OperationState.UNKNOWN,
+            "confirmed_absent": OperationState.FAILED,
+            "manual_required": OperationState.MANUAL,
+        }[self.agent_dispatch_state]
+        session_values = (
+            self.agent_provider,
+            self.agent_provider_session_id,
+            self.agent_state_sequence,
+        )
+        session = None
+        if any(value is not None for value in session_values):
+            if not all(value is not None for value in session_values):
+                raise JobValidationError(
+                    "agent provider session identity is incomplete"
+                )
+            assert self.agent_provider is not None
+            assert self.agent_provider_session_id is not None
+            assert self.agent_state_sequence is not None
+            session = SessionIdentity(
+                self.agent_provider,
+                self.agent_provider_session_id,
+                self.agent_operation_target or self.herdr_target or "",
+                self.agent_state_sequence,
+            )
+        if (
+            session is None
+            and self.loaded_schema_version < CURRENT_SCHEMA_VERSION
+            and state == OperationState.SETTLED
+        ):
+            # A migrated target-only operation is retained as explicitly unknown
+            # typed state. Only legacy reconciliation paths may use its old
+            # target/workspace evidence; native v18 rows remain strict.
+            state = OperationState.UNKNOWN
+        try:
+            return AgentSessionOperation(
+                state,
+                AgentSessionSpec(
+                    self.agent_operation_target or self.herdr_target or "",
+                    self.agent_operation_checkout
+                    or self.worktree_path
+                    or self.repository
+                    or "",
+                    self.agent_operation_workspace_id or self.herdr_workspace_id or "",
+                    self.agent_operation_pane_id or self.herdr_pane_id or "",
+                ),
+                session,
+            )
+        except OperationTransitionError as exc:
+            raise JobValidationError(str(exc)) from exc
 
     @property
     def delivery_generation(self) -> int:
@@ -2203,6 +2576,41 @@ class AgentJob:
     @property
     def participant_creation_pane_id(self) -> str | None:
         return self._optional_string("participant_creation_pane_id")
+
+    @property
+    def participant_creation_checkout(self) -> str | None:
+        return self._optional_string("participant_creation_checkout")
+
+    @property
+    def participant_pane_operation(self) -> ParticipantPaneOperation | None:
+        if self.participant_creation_state == "none":
+            return None
+        state = {
+            "planned": OperationState.PLANNED,
+            "submitting": OperationState.ACTIVE,
+            "created": OperationState.SETTLED,
+            "ambiguous": OperationState.UNKNOWN,
+            "failed": OperationState.FAILED,
+            "manual_required": OperationState.MANUAL,
+        }[self.participant_creation_state]
+        participant = self.participant_creation_participant
+        try:
+            return ParticipantPaneOperation(
+                state,
+                ParticipantPaneSpec(
+                    participant.value if participant is not None else "",
+                    self.participant_creation_target or "",
+                    self.participant_creation_label or "",
+                    self.participant_creation_checkout
+                    or self.worktree_path
+                    or self.repository
+                    or "",
+                    self.participant_creation_workspace_id or "",
+                ),
+                self.participant_creation_pane_id,
+            )
+        except OperationTransitionError as exc:
+            raise JobValidationError(str(exc)) from exc
 
     @property
     def terminal_intent_status(self) -> JobStatus | None:
@@ -2561,6 +2969,38 @@ class AgentJob:
         return self._optional_string("fork_repository")
 
     @property
+    def fork_operation(self) -> ForkOperation | None:
+        if self.fork_operation_state is None:
+            return None
+        state = {
+            "planned": OperationState.PLANNED,
+            "submitted": OperationState.ACTIVE,
+            "exists": OperationState.SETTLED,
+            "retained": OperationState.SETTLED,
+            "ambiguous": OperationState.UNKNOWN,
+            "failed_observing": OperationState.UNKNOWN,
+            "failed": OperationState.FAILED,
+            "confirmed_absent": OperationState.FAILED,
+            "manual_required": OperationState.MANUAL,
+        }[self.fork_operation_state]
+        try:
+            return ForkOperation(
+                state,
+                ForkSpec(
+                    self.fork_operation_source or "",
+                    self.fork_operation_source_url or "",
+                    self.fork_operation_source_default_branch or "",
+                    self.fork_operation_source_private,
+                    self.fork_operation_login
+                    or (self.fork_operation_target or "").split("/", 1)[0],
+                    self.fork_operation_target or "",
+                    self.fork_operation_source_parent,
+                ),
+            )
+        except OperationTransitionError as exc:
+            raise JobValidationError(str(exc)) from exc
+
+    @property
     def next_reconcile_at(self) -> float:
         return _number(self._values.get("next_reconcile_at") or 0, "next_reconcile_at")
 
@@ -2624,7 +3064,10 @@ class AgentJob:
         if isinstance(cleanup, CleanupOwned):
             cleanup = abandon_cleanup_owner(cleanup, cleanup.token or "")
         reconciled_cleanup = finish_cleanup_reconciliation(cleanup)
-        if not retain_terminal_release:
+        preserve_release = (
+            retain_terminal_release or self.target_release_manual_required
+        )
+        if not preserve_release:
             reconciled_cleanup = CleanupSettled()
         changes.update(cleanup_fields(reconciled_cleanup))
         if retain_terminal_release and not self.target_release_pending:
@@ -2684,6 +3127,14 @@ class AgentJob:
         elif operation == "agent":
             participant = self.active_participant
             changes.update(
+                agent_operation_target=self.agent_operation_target or self.herdr_target,
+                agent_operation_workspace_id=self.agent_operation_workspace_id
+                or self.herdr_workspace_id,
+                agent_operation_pane_id=self.agent_operation_pane_id
+                or self.herdr_pane_id,
+                agent_operation_checkout=self.agent_operation_checkout
+                or self.worktree_path
+                or self.repository,
                 herdr_target=None,
                 active_participant=None,
                 herdr_pane_id=None,
@@ -2845,6 +3296,7 @@ class AgentJob:
     def _updated(self, **changes: object) -> CursorJob:
         values = dict(self._values)
         values.update(changes)
+        _pair_worker_ownership(values)
         values["schema_version"] = CURRENT_SCHEMA_VERSION
         values["revision"] = self.revision + 1
         updated = CursorJob.from_dict(values)
@@ -2864,6 +3316,19 @@ class AgentJob:
             self.plan_approval,
             self.participant_lifecycle,
         )
+        if self.loaded_schema_version == CURRENT_SCHEMA_VERSION and (
+            self._values.get("worker_claimed_at") is not None
+            or self._values.get("worker_claim_operation") is not None
+        ):
+            _ = self.worker_ownership
+        if (
+            self.agent_provider is not None
+            or self.agent_provider_session_id is not None
+            or self.agent_state_sequence is not None
+        ):
+            _ = self.agent_session_operation
+        if self.participant_creation_checkout is not None:
+            _ = self.participant_pane_operation
         if self.participant_admission_state not in {"waiting", "held", "released"}:
             raise JobValidationError("participant_admission_state has invalid value")
         if (
@@ -2960,10 +3425,11 @@ class AgentJob:
             self.worker_pid,
             self.worker_boot_id,
             self.worker_process_start,
+            self._optional_string("worker_claim_operation"),
+            self._optional_float("worker_claimed_at"),
         )
         if (
             require_worker_owner
-            and self.terminal_intent_status is None
             and any(item is not None for item in worker_claim)
             and not all(item is not None for item in worker_claim)
         ):
@@ -3293,6 +3759,14 @@ class AgentJob:
             raise JobValidationError(
                 "manual reconciliation requires operation and token"
             )
+        if require_worker_owner and self.worktree_provision_state is not None:
+            _ = self.checkout_operation
+        if require_worker_owner and self.agent_dispatch_state is not None:
+            _ = self.agent_session_operation
+        if require_worker_owner and self.participant_creation_state != "none":
+            _ = self.participant_pane_operation
+        if require_worker_owner and self.fork_operation_state is not None:
+            _ = self.fork_operation
         if (
             self.cancellation_reconciliation_pending
             and not self.has_uncertain_operation()
@@ -3327,10 +3801,18 @@ class AgentJob:
                 "target_release_owner_pid",
                 "target_release_owner_boot_id",
                 "target_release_owner_start",
+                "target_release_manual_required",
+                "target_release_unverified_targets",
             )
         ):
             raise JobValidationError(
                 "released target cannot retain release ownership fields"
+            )
+        if self.target_release_manual_required != bool(
+            self.target_release_unverified_targets
+        ):
+            raise JobValidationError(
+                "manual target release requires unverified target identities"
             )
 
     def has_uncertain_operation(self) -> bool:
@@ -3354,6 +3836,124 @@ class AgentJob:
             raise JobValidationError(f"{field} has invalid value")
 
 
+def _validate_operation_transitions(before: CursorJob, after: CursorJob) -> None:
+    operations = (
+        ("checkout", before.checkout_operation, after.checkout_operation),
+        ("fork", before.fork_operation, after.fork_operation),
+        (
+            "agent session",
+            before.agent_session_operation,
+            after.agent_session_operation,
+        ),
+        (
+            "participant pane",
+            before.participant_pane_operation,
+            after.participant_pane_operation,
+        ),
+    )
+    for name, previous, current in operations:
+        if previous is None:
+            continue
+        if current is None:
+            if name == "participant pane":
+                continue
+            raise JobValidationError(f"{name} operation identity cannot be discarded")
+        if previous.spec != current.spec:
+            archived_agent = (
+                name == "agent session"
+                and isinstance(previous, AgentSessionOperation)
+                and previous.session is not None
+                and any(
+                    owner.get("provider") == previous.session.provider
+                    and owner.get("session_id") == previous.session.session_id
+                    and owner.get("target") == previous.session.target
+                    and owner.get("state_sequence") == previous.session.state_sequence
+                    and owner.get("checkout") == previous.spec.checkout
+                    and owner.get("workspace_id") == previous.spec.workspace_id
+                    and owner.get("pane_id") == previous.spec.pane_id
+                    for owner in after.participant_session_owners
+                )
+            )
+            replacement = (
+                (
+                    name == "agent session"
+                    and previous.state == OperationState.FAILED
+                    and current.state
+                    in {
+                        OperationState.PLANNED,
+                        OperationState.ACTIVE,
+                        OperationState.SETTLED,
+                    }
+                )
+                or (
+                    name == "participant pane"
+                    and previous.state == OperationState.FAILED
+                    and current.state == OperationState.PLANNED
+                )
+                or (
+                    LEGACY_BOOT_ID in repr(previous.spec)
+                    and previous.state
+                    in {OperationState.UNKNOWN, OperationState.MANUAL}
+                    and current.state == OperationState.SETTLED
+                )
+                or archived_agent
+            )
+            if not replacement:
+                raise JobValidationError(
+                    f"{name} operation identity cannot be rewritten"
+                )
+            continue
+        try:
+            if previous.state != current.state:
+                legacy_agent_materialized = bool(
+                    name == "agent session"
+                    and before.loaded_schema_version < CURRENT_SCHEMA_VERSION
+                    and before.agent_dispatch_state == "manual_required"
+                    and after.agent_dispatch_state == "retained"
+                    and previous.state == OperationState.MANUAL
+                    and current.state == OperationState.UNKNOWN
+                    and isinstance(current, AgentSessionOperation)
+                    and current.session is None
+                )
+                if legacy_agent_materialized:
+                    continue
+                if isinstance(previous, CheckoutOperation) and isinstance(
+                    current, CheckoutOperation
+                ):
+                    previous.transition(
+                        current.state,
+                        workspace_id=current.workspace_id,
+                        root_pane_id=current.root_pane_id,
+                    )
+                elif isinstance(previous, AgentSessionOperation) and isinstance(
+                    current, AgentSessionOperation
+                ):
+                    previous.transition(current.state, session=current.session)
+                elif isinstance(previous, ParticipantPaneOperation) and isinstance(
+                    current, ParticipantPaneOperation
+                ):
+                    previous.transition(current.state, pane_id=current.pane_id)
+                else:
+                    previous.transition(current.state)
+            if isinstance(previous, AgentSessionOperation) and isinstance(
+                current, AgentSessionOperation
+            ):
+                if previous.session is not None and current.session is None:
+                    raise OperationTransitionError(
+                        "agent session identity cannot be discarded"
+                    )
+                if (
+                    previous.session is not None
+                    and current.session is not None
+                    and not previous.accepts_observation(current.session)
+                ):
+                    raise OperationTransitionError(
+                        "agent session identity or sequence is stale"
+                    )
+        except OperationTransitionError as exc:
+            raise JobValidationError(str(exc)) from exc
+
+
 def validate_transition(before: CursorJob, after: CursorJob) -> None:
     if before.id != after.id:
         raise JobValidationError("Cursor job transition cannot change id")
@@ -3369,6 +3969,7 @@ def validate_transition(before: CursorJob, after: CursorJob) -> None:
         raise JobValidationError("agent job transition cannot change harness_kind")
     if before.issue_provider != after.issue_provider:
         raise JobValidationError("agent job transition cannot change issue_provider")
+    _validate_operation_transitions(before, after)
     before_terminal = before.terminal_state
     after_terminal = after.terminal_state
     if (
@@ -3390,7 +3991,6 @@ def validate_transition(before: CursorJob, after: CursorJob) -> None:
                     "planner_target",
                     "reviewer_target",
                     "implementer_target",
-                    "participant_creation_target",
                 )
             )
         )
@@ -3484,7 +4084,6 @@ def validate_transition(before: CursorJob, after: CursorJob) -> None:
                                 "planner_target",
                                 "reviewer_target",
                                 "implementer_target",
-                                "participant_creation_target",
                             )
                         )
                     )
@@ -3507,7 +4106,6 @@ def validate_transition(before: CursorJob, after: CursorJob) -> None:
             "planner_target",
             "reviewer_target",
             "implementer_target",
-            "participant_creation_target",
         )
         if (
             after.status not in TERMINAL_STATUSES
@@ -3556,8 +4154,26 @@ def transition(
     status: JobStatus,
     **changes: Any,
 ) -> CursorJob:
+    issue_recovery_edge = (
+        job.status == JobStatus.QUEUED
+        and (
+            job.github_issue_create_operation_state in {"submitted", "ambiguous"}
+            or job.linear_ticket_create_operation_state
+            in {"submitting", "submitted", "ambiguous"}
+        )
+        and status in {JobStatus.COMPLETED, JobStatus.BLOCKED}
+    )
+    if (
+        status != job.status
+        and status not in _LEGAL_TRANSITIONS[job.status]
+        and not issue_recovery_edge
+    ):
+        raise JobValidationError(
+            f"illegal Cursor job transition {job.status.value} -> {status.value}"
+        )
     values = job.to_dict()
     values.update(changes)
+    _pair_worker_ownership(values)
     if "herdr_target" in changes and "session_id" not in changes:
         values["session_id"] = changes["herdr_target"]
     elif "session_id" in changes and "herdr_target" not in changes:
@@ -3601,6 +4217,9 @@ def validate_reservations(jobs: list[CursorJob]) -> None:
             )
             if target
         }
+        job_targets.update(
+            str(owner["target"]) for owner in job.participant_session_owners
+        )
         if reserves:
             for target in job_targets:
                 owner = targets.setdefault(target, job.id)

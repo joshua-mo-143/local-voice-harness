@@ -10,6 +10,7 @@ from collections.abc import Callable, Mapping, Set
 from dataclasses import dataclass, replace
 from pathlib import Path
 
+from ..agents.harness import ReconciliationState
 from ..diagnostic_safety import redact_diagnostic
 from ..errors import HarnessError
 from ..github_issue_creation import draft_github_issue
@@ -89,12 +90,7 @@ from .model import (
     ACTIVE_STATUSES as MODEL_ACTIVE_STATUSES,
 )
 from .model import (
-    TERMINAL_STATUSES as MODEL_TERMINAL_STATUSES,
-)
-from .model import (
-    WORKER_STATUSES as MODEL_WORKER_STATUSES,
-)
-from .model import (
+    CURRENT_SCHEMA_VERSION,
     CursorJob,
     JobStatus,
     JobValidationError,
@@ -102,6 +98,17 @@ from .model import (
     WorkflowPhase,
     WorkflowTier,
     transition,
+)
+from .model import (
+    TERMINAL_STATUSES as MODEL_TERMINAL_STATUSES,
+)
+from .model import (
+    WORKER_STATUSES as MODEL_WORKER_STATUSES,
+)
+from .operations import (
+    OperationState,
+    SessionIdentity,
+    WorkerOwnership,
 )
 from .prompts import (
     PromptPayload,
@@ -130,6 +137,17 @@ FOREGROUND_GRACE_SECONDS = 2.0
 
 
 WorkerCancelled = worker_lifecycle.WorkerCancelled
+WorkerClaim = WorkerOwnership | str
+
+
+def _worker_owned(job: CursorJob, claim: WorkerClaim) -> bool:
+    if isinstance(claim, WorkerOwnership):
+        try:
+            return claim.matches(job.worker_ownership)
+        except JobValidationError:
+            return False
+    # Token-only callbacks never authorize a mutation, including legacy rows.
+    return False
 
 
 @dataclass(frozen=True, slots=True)
@@ -448,13 +466,13 @@ def read_agent_completion(
 def _worker_change(
     store: JobStore,
     job_id: str,
-    token: str,
+    claim: WorkerClaim,
     allowed_statuses: Set[JobStatus],
     change: Callable[[CursorJob], CursorJob],
 ) -> CursorJob | None:
     def guarded(job: CursorJob) -> CursorJob | None:
         if (
-            job.worker_token != token
+            not _worker_owned(job, claim)
             or job.status not in allowed_statuses
             or job.terminal_intent_status is not None
         ):
@@ -467,7 +485,7 @@ def _worker_change(
 def _worker_question(
     store: JobStore,
     job_id: str,
-    token: str,
+    token: WorkerClaim,
     question: str,
     *,
     clarification_kind: str,
@@ -496,7 +514,7 @@ def _worker_question(
 def _finish_github_issue_creation(
     store: JobStore,
     job_id: str,
-    token: str,
+    token: WorkerClaim,
     result: GitHubIssueCreationResult,
 ) -> None:
     issue = result.issue
@@ -534,7 +552,7 @@ def _finish_github_issue_creation(
 def _run_github_issue_creation(
     store: JobStore,
     job: CursorJob,
-    token: str,
+    token: WorkerClaim,
     clients: ClientFactories,
     checkpoint: Callable[[], None],
 ) -> None:
@@ -671,7 +689,7 @@ def _run_github_issue_creation(
 def _finish_linear_ticket_creation(
     store: JobStore,
     job_id: str,
-    token: str,
+    token: WorkerClaim,
     result: LinearTicketCreationResult,
 ) -> None:
     identifier = result.issue.identifier
@@ -706,7 +724,7 @@ def _finish_linear_ticket_creation(
 def _run_linear_ticket_creation(
     store: JobStore,
     job: CursorJob,
-    token: str,
+    token: WorkerClaim,
     clients: ClientFactories,
     checkpoint: Callable[[], None],
 ) -> None:
@@ -1051,7 +1069,7 @@ def _finish_completed_workflow(
 def _worker_complete(
     store: JobStore,
     job_id: str,
-    token: str,
+    token: WorkerClaim,
     *,
     output: str,
     agent_status: str,
@@ -1059,7 +1077,7 @@ def _worker_complete(
 ) -> None:
     snapshot = store.get(job_id)
     if (
-        snapshot.worker_token != token
+        not _worker_owned(snapshot, token)
         or snapshot.status not in {JobStatus.RUNNING, JobStatus.RECONCILING}
         or snapshot.terminal_intent_status is not None
     ):
@@ -1171,10 +1189,10 @@ def _worker_complete(
 def _resume_plan_approval_completion(
     store: JobStore,
     job: CursorJob,
-    worker_token: str,
+    worker_token: WorkerClaim,
 ) -> None:
     if (
-        job.worker_token != worker_token
+        not _worker_owned(job, worker_token)
         or job.status not in MODEL_WORKER_STATUSES
         or job.terminal_intent_status is not None
     ):
@@ -1220,7 +1238,7 @@ def _resume_plan_approval_completion(
 def _worker_fail(
     store: JobStore,
     job_id: str,
-    token: str,
+    token: WorkerClaim,
     exc: Exception,
     *,
     target_may_be_active: bool = False,
@@ -1245,7 +1263,7 @@ def _worker_fail(
 
     def guarded(job: CursorJob) -> CursorJob | None:
         if (
-            job.worker_token != token
+            not _worker_owned(job, token)
             or job.status not in MODEL_WORKER_STATUSES
             or job.terminal_intent_status is not None
         ):
@@ -1258,7 +1276,7 @@ def _worker_fail(
 def _worker_block_interactive(
     store: JobStore,
     job_id: str,
-    token: str,
+    token: WorkerClaim,
     message: str,
 ) -> None:
     def block(job: CursorJob) -> CursorJob:
@@ -1282,7 +1300,7 @@ def _worker_block_interactive(
 def _worker_error(
     store: JobStore,
     job_id: str,
-    token: str,
+    token: WorkerClaim,
     exc: Exception,
     *,
     prompt_may_be_active: bool,
@@ -1335,7 +1353,7 @@ def _worker_error(
 def _worker_block(
     store: JobStore,
     job_id: str,
-    token: str,
+    token: WorkerClaim,
     message: str,
 ) -> None:
     blocked_at = time.time()
@@ -1364,7 +1382,7 @@ def _pull_request_branch(job: CursorJob) -> str:
 def _prepare_pull_request_checkout(
     store: JobStore,
     job_id: str,
-    token: str,
+    token: WorkerClaim,
     job: CursorJob,
     checkpoint: Callable[[], None] | None = None,
     *,
@@ -1479,7 +1497,7 @@ def _prepare_pull_request_checkout(
 def _reserve_worker_target(
     store: JobStore,
     job_id: str,
-    token: str,
+    token: WorkerClaim,
     selection: AgentSelection,
     repository: Path,
     issue_key: str | None,
@@ -1488,10 +1506,23 @@ def _reserve_worker_target(
     participant: WorkflowParticipant | None = None,
 ) -> CursorJob | None:
     target = str(selection.target)
+    identity_complete = all(
+        value is not None
+        for value in (
+            selection.provider,
+            selection.provider_session_id,
+            selection.state_sequence,
+        )
+    )
+    dispatch_state = (
+        "dispatching"
+        if dispatching
+        else ("ready" if identity_complete else "manual_required")
+    )
 
     def reserve(job: CursorJob) -> CursorJob | None:
         if (
-            job.worker_token != token
+            not _worker_owned(job, token)
             or job.status not in MODEL_WORKER_STATUSES
             or job.terminal_intent_status is not None
         ):
@@ -1512,6 +1543,30 @@ def _reserve_worker_target(
                 "active_participant": participant.value,
                 f"{participant.value}_target": target,
             }
+        participant_session_owners = list(job.participant_session_owners)
+        previous_operation = job.agent_session_operation
+        if (
+            previous_operation is not None
+            and previous_operation.session is not None
+            and previous_operation.spec.target != target
+        ):
+            previous = previous_operation.session
+            participant_session_owners = [
+                owner
+                for owner in participant_session_owners
+                if owner.get("target") != previous_operation.spec.target
+            ]
+            participant_session_owners.append(
+                {
+                    "provider": previous.provider,
+                    "session_id": previous.session_id,
+                    "target": previous.target,
+                    "state_sequence": previous.state_sequence,
+                    "checkout": previous_operation.spec.checkout,
+                    "workspace_id": previous_operation.spec.workspace_id,
+                    "pane_id": previous_operation.spec.pane_id,
+                }
+            )
         return transition(
             job,
             job.status,
@@ -1520,10 +1575,32 @@ def _reserve_worker_target(
             herdr_target=target,
             herdr_pane_id=selection.pane_id,
             herdr_workspace_id=selection.workspace_id,
+            agent_operation_target=target,
+            agent_operation_pane_id=selection.pane_id,
+            agent_operation_workspace_id=selection.workspace_id,
             worktree_path=worktree_value,
+            agent_operation_checkout=worktree_value,
             agent_name=selection.name,
-            agent_dispatch_state="dispatching" if dispatching else "ready",
+            agent_dispatch_state=dispatch_state,
+            agent_identity_legacy_compatible=False,
+            agent_provider=selection.provider if identity_complete else None,
+            agent_provider_session_id=(
+                selection.provider_session_id if identity_complete else None
+            ),
+            agent_state_sequence=selection.state_sequence
+            if identity_complete
+            else None,
             worker_operation="agent_start" if dispatching else None,
+            manual_reconcile_operation=(
+                "agent" if dispatch_state == "manual_required" else None
+            ),
+            manual_reconcile_token=(
+                uuid.uuid4().hex if dispatch_state == "manual_required" else None
+            ),
+            manual_reconcile_required_at=(
+                time.time() if dispatch_state == "manual_required" else None
+            ),
+            participant_session_owners=participant_session_owners,
             **participant_changes,
         )
 
@@ -1539,33 +1616,58 @@ def _reserve_worker_target(
 def _settle_worker_agent(
     store: JobStore,
     job_id: str,
-    token: str,
+    token: WorkerClaim,
     selection: AgentSelection,
 ) -> CursorJob | None:
     def settle(job: CursorJob) -> CursorJob | None:
         if (
-            job.worker_token != token
+            not _worker_owned(job, token)
             or job.herdr_target != selection.target
             or job.agent_dispatch_state != "dispatching"
             or job.status
             not in MODEL_WORKER_STATUSES | {JobStatus.CANCELLED, JobStatus.FAILED}
         ):
             return None
+        operation = job.agent_session_operation
+        identity_values = (
+            selection.provider,
+            selection.provider_session_id,
+            selection.state_sequence,
+        )
+        if operation is None or not all(value is not None for value in identity_values):
+            return job.evolve(
+                agent_dispatch_state="ambiguous",
+                agent_dispatch_exited=True,
+                agent_reconcile_attempts=0,
+                agent_next_reconcile_at=time.time(),
+                worker_operation=None,
+            )
+        assert selection.provider is not None
+        assert selection.provider_session_id is not None
+        assert selection.state_sequence is not None
+        identity = SessionIdentity(
+            selection.provider,
+            selection.provider_session_id,
+            selection.target,
+            selection.state_sequence,
+        )
+        operation.transition(OperationState.SETTLED, session=identity)
         return transition(
             job,
             job.status,
             herdr_pane_id=selection.pane_id,
             herdr_workspace_id=selection.workspace_id,
+            agent_operation_target=selection.target,
+            agent_operation_pane_id=selection.pane_id,
+            agent_operation_workspace_id=selection.workspace_id,
             worktree_path=selection.worktree_path,
+            agent_operation_checkout=selection.worktree_path,
             agent_name=selection.name,
             agent_dispatch_state="ready",
+            agent_provider=selection.provider,
+            agent_provider_session_id=selection.provider_session_id,
+            agent_state_sequence=selection.state_sequence,
             worker_operation=None,
-            participant_creation_state="none",
-            participant_creation_participant=None,
-            participant_creation_target=None,
-            participant_creation_label=None,
-            participant_creation_workspace_id=None,
-            participant_creation_pane_id=None,
         )
 
     return store.update(job_id, settle)
@@ -1580,11 +1682,15 @@ def _failed_operation_state(exc: HerdrError) -> str:
 
 
 def _fail_worker_agent_dispatch(
-    store: JobStore, job_id: str, token: str, exc: HerdrError
+    store: JobStore, job_id: str, token: WorkerClaim, exc: HerdrError
 ) -> None:
     def fail(job: CursorJob) -> CursorJob | None:
-        if job.worker_token != token or job.agent_dispatch_state != "dispatching":
+        if not _worker_owned(job, token) or job.agent_dispatch_state != "dispatching":
             return None
+        operation = job.agent_session_operation
+        if operation is None:
+            return None
+        operation.transition(OperationState.UNKNOWN)
         return job.evolve(
             agent_dispatch_state=_failed_operation_state(exc),
             agent_dispatch_exited=True,
@@ -1599,7 +1705,7 @@ def _fail_worker_agent_dispatch(
 def _reserve_worker_worktree(
     store: JobStore,
     job_id: str,
-    token: str,
+    token: WorkerClaim,
     repository: Path,
     branch: str,
     checkout: Path,
@@ -1609,10 +1715,11 @@ def _reserve_worker_worktree(
     if state not in {"planned", "dispatching", "ready"}:
         raise HarnessError("invalid worktree provisioning state")
     checkout_value = str(checkout.resolve())
+    persisted_state = "planned" if state == "ready" else state
 
     def reserve(job: CursorJob) -> CursorJob | None:
         if (
-            job.worker_token != token
+            not _worker_owned(job, token)
             or job.status.value != "routing"
             or job.terminal_intent_status is not None
         ):
@@ -1623,8 +1730,10 @@ def _reserve_worker_worktree(
             repository=str(repository.resolve()),
             worktree_branch=branch,
             worktree_path=checkout_value,
-            worktree_provision_state=state,
-            worker_operation="worktree_create" if state == "dispatching" else None,
+            worktree_provision_state=persisted_state,
+            worker_operation=(
+                "worktree_create" if persisted_state == "dispatching" else None
+            ),
         )
 
     try:
@@ -1639,7 +1748,7 @@ def _reserve_worker_worktree(
 def _settle_worker_worktree(
     store: JobStore,
     job_id: str,
-    token: str,
+    token: WorkerClaim,
     checkout: Path,
     workspace_id: str | None,
     pane_id: str | None,
@@ -1648,11 +1757,30 @@ def _settle_worker_worktree(
 
     def settle(job: CursorJob) -> CursorJob | None:
         if (
-            job.worker_token != token
+            not _worker_owned(job, token)
             or job.worktree_path != checkout_value
             or job.status.value not in {"routing", "cancelled", "failed"}
         ):
             return None
+        operation = job.checkout_operation
+        if operation is None:
+            return None
+        if not workspace_id or not pane_id:
+            return transition(
+                job,
+                job.status,
+                worktree_provision_state="quarantined",
+                worktree_provision_error=(
+                    "worktree settled without paired workspace and root-pane identity"
+                ),
+                worktree_manual_inspection_required=True,
+                worker_operation=None,
+            )
+        operation.transition(
+            OperationState.SETTLED,
+            workspace_id=workspace_id,
+            root_pane_id=pane_id,
+        )
         return transition(
             job,
             job.status,
@@ -1672,11 +1800,18 @@ def _settle_worker_worktree(
 
 
 def _fail_worker_worktree(
-    store: JobStore, job_id: str, token: str, exc: HerdrError
+    store: JobStore, job_id: str, token: WorkerClaim, exc: HerdrError
 ) -> None:
     def fail(job: CursorJob) -> CursorJob | None:
-        if job.worker_token != token or job.worktree_provision_state != "dispatching":
+        if (
+            not _worker_owned(job, token)
+            or job.worktree_provision_state != "dispatching"
+        ):
             return None
+        operation = job.checkout_operation
+        if operation is None:
+            return None
+        operation.transition(OperationState.UNKNOWN)
         return job.evolve(
             worktree_provision_state=_failed_operation_state(exc),
             worktree_dispatch_exited=True,
@@ -1691,7 +1826,7 @@ def _fail_worker_worktree(
 def _begin_fork_operation(
     store: JobStore,
     job_id: str,
-    token: str,
+    token: WorkerClaim,
     source: GitHubRepository,
     login: str,
     target: str,
@@ -1716,12 +1851,15 @@ def _begin_fork_operation(
 def _persisted_fork_plan(job: CursorJob) -> GitHubForkPlan | None:
     if job.fork_operation_state is None:
         return None
-    source_name = job.fork_operation_source or ""
-    source_url = job.fork_operation_source_url or ""
-    target = job.fork_operation_target or ""
-    if not all((source_name, source_url, target)):
+    try:
+        operation = job.fork_operation
+    except JobValidationError as exc:
+        raise HarnessError("persisted GitHub fork operation is incomplete") from exc
+    if operation is None:
         raise HarnessError("persisted GitHub fork operation is incomplete")
-    login = job.fork_operation_login or target.split("/", 1)[0]
+    spec = operation.spec
+    source_name = spec.source
+    target = spec.target
     if (
         job.github_repository
         and job.github_repository.casefold() != source_name.casefold()
@@ -1730,18 +1868,22 @@ def _persisted_fork_plan(job: CursorJob) -> GitHubForkPlan | None:
     return GitHubForkPlan(
         source=GitHubRepository(
             name_with_owner=source_name,
-            url=source_url,
-            is_private=job.fork_operation_source_private,
-            default_branch=job.fork_operation_source_default_branch or "",
-            parent=job.fork_operation_source_parent,
+            url=spec.source_url,
+            is_private=spec.source_private,
+            default_branch=spec.source_default_branch,
+            parent=spec.source_parent,
         ),
-        login=login,
+        login=spec.login,
         target=target,
     )
 
 
-def _mark_fork_dispatching(store: JobStore, job_id: str, token: str) -> None:
+def _mark_fork_dispatching(store: JobStore, job_id: str, token: WorkerClaim) -> None:
     def dispatch(job: CursorJob) -> CursorJob:
+        operation = job.fork_operation
+        if operation is None:
+            raise WorkerCancelled
+        operation.transition(OperationState.ACTIVE)
         return job.evolve(
             fork_operation_state="submitted",
             fork_committed=True,
@@ -1756,7 +1898,7 @@ def _mark_fork_dispatching(store: JobStore, job_id: str, token: str) -> None:
 def _settle_fork_operation(
     store: JobStore,
     job_id: str,
-    token: str,
+    token: WorkerClaim,
     fork: GitHubRepository | None,
     *,
     ambiguous: bool = False,
@@ -1764,12 +1906,16 @@ def _settle_fork_operation(
 ) -> CursorJob | None:
     def settle(job: CursorJob) -> CursorJob | None:
         if (
-            job.worker_token != token
+            not _worker_owned(job, token)
             or job.fork_operation_state not in {"planned", "submitted"}
             or job.status.value not in {"routing", "cancelled", "failed"}
         ):
             return None
+        operation = job.fork_operation
+        if operation is None:
+            return None
         if fork is not None:
+            operation.transition(OperationState.SETTLED)
             return transition(
                 job,
                 job.status,
@@ -1779,6 +1925,7 @@ def _settle_fork_operation(
                 worker_operation=None,
             )
         if ambiguous or failed_observing:
+            operation.transition(OperationState.UNKNOWN)
             return transition(
                 job,
                 job.status,
@@ -1868,7 +2015,7 @@ def _validate_followup_agent_binding(
 def _provision_followup_agent(
     store: JobStore,
     job_id: str,
-    token: str,
+    token: WorkerClaim,
     job: CursorJob,
     client: HerdrClient,
     reserved: set[str],
@@ -2139,7 +2286,7 @@ def _auto_plan_approval_allowed(
 def _workflow_question(
     store: JobStore,
     job_id: str,
-    token: str,
+    token: WorkerClaim,
     question: str,
     *,
     clarification_kind: str = "workflow",
@@ -2167,7 +2314,8 @@ def _workflow_question(
             job,
             spec,
             owner=clarification_kind,
-            turn_token=job.turn_token or token,
+            turn_token=job.turn_token
+            or (token.token if isinstance(token, WorkerOwnership) else token),
             now=now,
             clear_worker=True,
             remove_reconcile=True,
@@ -2179,7 +2327,9 @@ def _workflow_question(
     _worker_change(store, job_id, token, MODEL_WORKER_STATUSES, ask)
 
 
-def _workflow_block(store: JobStore, job_id: str, token: str, message: str) -> None:
+def _workflow_block(
+    store: JobStore, job_id: str, token: WorkerClaim, message: str
+) -> None:
     def block(job: CursorJob) -> CursorJob:
         now = time.time()
         return job.evolve_for_delivery(
@@ -2199,7 +2349,7 @@ def _workflow_block(store: JobStore, job_id: str, token: str, message: str) -> N
 
 
 def _begin_phase_turn(
-    store: JobStore, job_id: str, worker_token: str
+    store: JobStore, job_id: str, worker_token: WorkerClaim
 ) -> CursorJob | None:
     def begin(job: CursorJob) -> CursorJob:
         turn = job.turn + 1
@@ -2221,7 +2371,7 @@ def _begin_phase_turn(
 def _record_plan_boundary(
     store: JobStore,
     job: CursorJob,
-    worker_token: str,
+    worker_token: WorkerClaim,
     output: str,
     *,
     agent_status: str,
@@ -2288,7 +2438,7 @@ def _accepted_explicit_plan_approval(job: CursorJob) -> bool:
 def _advance_workflow_output(
     store: JobStore,
     job: CursorJob,
-    worker_token: str,
+    worker_token: WorkerClaim,
     output: str,
     agent_status: str,
 ) -> CursorJob | None:
@@ -2677,7 +2827,7 @@ def _advance_workflow_output(
 def _plan_participant_creation(
     store: JobStore,
     job: CursorJob,
-    worker_token: str,
+    worker_token: WorkerClaim,
     participant: WorkflowParticipant,
     *,
     target: str,
@@ -2699,7 +2849,12 @@ def _plan_participant_creation(
                     label,
                     workspace_id,
                 ),
-            )
+            ),
+            participant_creation_checkout=(
+                current.worktree_path
+                or current.repository
+                or current.agent_operation_checkout
+            ),
         ),
     )
     if planned is None:
@@ -2710,21 +2865,28 @@ def _plan_participant_creation(
 def _participant_pane_callbacks(
     store: JobStore,
     job_id: str,
-    worker_token: str,
+    worker_token: WorkerClaim,
     target: str,
 ) -> tuple[Callable[[], None], Callable[[str, str], None]]:
     def before_submit() -> None:
+        def submit(current: CursorJob) -> CursorJob:
+            operation = current.participant_pane_operation
+            if operation is None:
+                raise WorkerCancelled
+            operation.transition(OperationState.ACTIVE)
+            return current.evolve_participant(
+                replace(
+                    current.participant_lifecycle,
+                    creation=current.participant_lifecycle.creation.begin(),
+                )
+            )
+
         updated = _worker_change(
             store,
             job_id,
             worker_token,
             MODEL_WORKER_STATUSES,
-            lambda current: current.evolve_participant(
-                replace(
-                    current.participant_lifecycle,
-                    creation=current.participant_lifecycle.creation.begin(),
-                )
-            ),
+            submit,
         )
         if updated is None:
             raise WorkerCancelled
@@ -2733,6 +2895,10 @@ def _participant_pane_callbacks(
         def accept(current: CursorJob) -> CursorJob:
             if current.participant_creation_target != target:
                 raise WorkerCancelled
+            operation = current.participant_pane_operation
+            if operation is None:
+                raise WorkerCancelled
+            operation.transition(OperationState.SETTLED, pane_id=pane_id)
             return current.evolve_participant(
                 replace(
                     current.participant_lifecycle,
@@ -2760,10 +2926,12 @@ def _participant_pane_callbacks(
 
 
 def _fence_participant_creation(
-    store: JobStore, job_id: str, worker_token: str, exc: HerdrError
+    store: JobStore, job_id: str, worker_token: WorkerClaim, exc: HerdrError
 ) -> None:
     def fence(current: CursorJob) -> CursorJob | None:
-        if current.participant_creation_state not in {"planned", "submitting"}:
+        if not _worker_owned(
+            current, worker_token
+        ) or current.participant_creation_state not in {"planned", "submitting"}:
             return None
         uncertain = current.participant_creation_state == "submitting" or exc.code in {
             "operation_timeout",
@@ -2780,10 +2948,17 @@ def _fence_participant_creation(
                 manual_reconcile_required_at=time.time(),
                 worker_operation=None,
             )
+        operation = current.participant_pane_operation
+        if operation is None:
+            return None
+        operation.transition(OperationState.FAILED)
         return current.evolve_participant(
             replace(
                 current.participant_lifecycle,
-                creation=ParticipantCreation(),
+                creation=replace(
+                    current.participant_lifecycle.creation,
+                    state=ParticipantCreationState.FAILED,
+                ),
             ),
             worker_operation=None,
         )
@@ -2794,7 +2969,7 @@ def _fence_participant_creation(
 def _ensure_workflow_participant(
     store: JobStore,
     job: CursorJob,
-    worker_token: str,
+    worker_token: WorkerClaim,
     client: HerdrClient,
     participant: WorkflowParticipant,
     checkpoint: Callable[[], None],
@@ -2824,36 +2999,59 @@ def _ensure_workflow_participant(
         )
     )
     for owned_target in owned_targets:
-        pane_id = ""
-        workspace_id = ""
-        if owned_target == job.herdr_target:
-            pane_id = job.herdr_pane_id or ""
-            workspace_id = job.herdr_workspace_id or ""
-        if not pane_id or not workspace_id:
-            try:
-                observed = client.get_agent(owned_target)
-            except HerdrError as exc:
-                if _agent_not_found(exc):
-                    continue
-                raise
-            observed_cwd = str(observed.get("cwd") or "")
-            observed_pane = str(observed.get("pane_id") or "")
-            observed_workspace = str(observed.get("workspace_id") or "")
-            try:
-                cwd_matches = Path(observed_cwd).resolve() == checkout
-            except OSError:
-                cwd_matches = False
-            if (
-                not cwd_matches
-                or observed_workspace != workspace
-                or not observed_pane
-                or observed_pane == job.worktree_root_pane_id
-            ):
-                raise HarnessError(
-                    f"could not verify ownership of previous {owned_target} pane"
-                )
-            pane_id = observed_pane
-            workspace_id = observed_workspace
+        if owned_target != job.herdr_target:
+            # Historical role targets do not carry a provider-session fence and
+            # therefore cannot authorize closing a potentially reused target.
+            continue
+        operation = job.agent_session_operation
+        if operation is None or operation.session is None:
+            raise HarnessError(
+                f"could not verify ownership of previous {owned_target} pane"
+            )
+        try:
+            observation = client.reconcile_session(
+                owned_target,
+                expected_session_id=operation.session.session_id,
+            )
+        except HerdrError as exc:
+            if _agent_not_found(exc):
+                continue
+            raise
+        observed_session = observation.session
+        if (
+            observation.state
+            not in {ReconciliationState.ACTIVE, ReconciliationState.SETTLED}
+            or observed_session is None
+        ):
+            if observation.state == ReconciliationState.MISSING:
+                continue
+            raise HarnessError(
+                f"could not verify ownership of previous {owned_target} pane"
+            )
+        observed_identity = SessionIdentity(
+            observed_session.provider,
+            observed_session.session_id,
+            observed_session.target,
+            observed_session.state_sequence,
+        )
+        observed_cwd = str(observed_session.metadata.get("cwd") or "")
+        pane_id = str(observed_session.metadata.get("pane_id") or "")
+        workspace_id = str(observed_session.metadata.get("workspace_id") or "")
+        try:
+            cwd_matches = Path(observed_cwd).resolve() == checkout
+        except OSError:
+            cwd_matches = False
+        if (
+            not operation.accepts_observation(observed_identity)
+            or pane_id != operation.spec.pane_id
+            or workspace_id != operation.spec.workspace_id
+            or not cwd_matches
+            or operation.spec.checkout != str(checkout)
+            or pane_id == job.worktree_root_pane_id
+        ):
+            raise HarnessError(
+                f"could not verify ownership of previous {owned_target} pane"
+            )
         if pane_id == job.worktree_root_pane_id:
             raise HarnessError("refusing to close the retained workspace anchor")
         try:
@@ -2868,11 +3066,11 @@ def _ensure_workflow_participant(
             or current.herdr_workspace_id != job.herdr_workspace_id
         ):
             raise WorkerCancelled
-        return current.evolve(
-            herdr_target=None,
-            herdr_pane_id=None,
-            herdr_workspace_id=None,
-            agent_name=None,
+        return current.evolve_participant(
+            replace(
+                current.participant_lifecycle,
+                creation=ParticipantCreation(),
+            ),
             agent_dispatch_state="confirmed_absent",
             active_participant=None,
             planner_target=None,
@@ -2932,6 +3130,10 @@ def _ensure_workflow_participant(
         )
         if reserved is None:
             raise WorkerCancelled
+        if not dispatching and reserved.agent_dispatch_state != "ready":
+            raise HarnessError(
+                "existing Cursor agent has no complete provider session identity"
+            )
         selection_holder["reserved"] = selection
 
     def settle(selection: AgentSelection) -> None:
@@ -2969,7 +3171,7 @@ def _ensure_workflow_participant(
 def _execute_phase_prompt(
     store: JobStore,
     job: CursorJob,
-    worker_token: str,
+    worker_token: WorkerClaim,
     client: HerdrClient,
     checkpoint: Callable[[], None],
     *,
@@ -3356,7 +3558,8 @@ def _execute_phase_prompt(
                     manual_reconcile_token=uuid.uuid4().hex,
                     manual_reconcile_required_at=time.time(),
                 )
-                if current.prompt_operation_state
+                if _worker_owned(current, worker_token)
+                and current.prompt_operation_state
                 in {"planned", "submitting", "submitted"}
                 else None
             ),
@@ -3392,7 +3595,7 @@ def _execute_phase_prompt(
 def _run_tiered_workflow(
     store: JobStore,
     job: CursorJob,
-    worker_token: str,
+    worker_token: WorkerClaim,
     client: HerdrClient,
     checkpoint: Callable[[], None],
     *,
@@ -3561,7 +3764,7 @@ def _state_change_sequence(agent: dict[str, object]) -> int | None:
 def _mark_prompt_boundary(
     store: JobStore,
     job_id: str,
-    worker_token: str,
+    worker_token: WorkerClaim,
     turn_token: str,
     *,
     state: PromptOperationState,
@@ -3625,7 +3828,12 @@ def run_claimed_worker(  # pyright: ignore[reportGeneralTypeIssues]
     store = context.store
     job_id = context.job.id
     job = context.job
-    worker_token = context.token
+    try:
+        worker_token = context.ownership or job.worker_ownership
+    except JobValidationError:
+        worker_token = None
+    if worker_token is None:
+        return
     client: HerdrClient | None = None
     target = ""
 
@@ -3721,7 +3929,15 @@ def run_claimed_worker(  # pyright: ignore[reportGeneralTypeIssues]
                 _validate_followup_checkout(client, job)
             )
             checkpoint()
-        if target and job.agent_dispatch_state == "dispatching":
+        if (
+            target
+            and job.agent_dispatch_state == "dispatching"
+            and job.loaded_schema_version < CURRENT_SCHEMA_VERSION
+            and (
+                job.agent_session_operation is None
+                or job.agent_session_operation.session is None
+            )
+        ):
             checkout_value = job.worktree_path or ""
             pane = job.herdr_pane_id or ""
             workspace = job.herdr_workspace_id or ""
@@ -3729,7 +3945,95 @@ def run_claimed_worker(  # pyright: ignore[reportGeneralTypeIssues]
             if checkout_value and pane and workspace and repository_value:
                 checkpoint()
                 try:
-                    agent = client.get_agent(target)
+                    legacy_agent = client.get_agent(target)
+                except HerdrError as exc:
+                    if not _agent_not_found(exc):
+
+                        def defer_legacy_dispatch(current: CursorJob) -> CursorJob:
+                            return current.evolve(
+                                status=JobStatus.QUEUED,
+                                queued_at=time.time(),
+                                worker_pid=None,
+                                worker_boot_id=None,
+                                worker_process_start=None,
+                                worker_token=None,
+                                worker_claim_operation=None,
+                                worker_claimed_at=None,
+                            )
+
+                        _worker_change(
+                            store,
+                            job_id,
+                            worker_token,
+                            {JobStatus.ROUTING},
+                            defer_legacy_dispatch,
+                        )
+                        return
+                    legacy_agent = None
+                if legacy_agent:
+                    session_id = str(legacy_agent.get("agent_session") or "") or None
+                    sequence_value = legacy_agent.get("state_change_seq")
+                    sequence = (
+                        int(sequence_value)
+                        if isinstance(sequence_value, int)
+                        and not isinstance(sequence_value, bool)
+                        else None
+                    )
+                    selection = AgentSelection(
+                        target=target,
+                        pane_id=str(legacy_agent.get("pane_id") or pane),
+                        workspace_id=str(legacy_agent.get("workspace_id") or workspace),
+                        cwd=str(legacy_agent.get("cwd") or checkout_value),
+                        name=str(legacy_agent.get("name") or target),
+                        worktree_path=checkout_value,
+                        provider="cursor/herdr" if session_id is not None else None,
+                        provider_session_id=session_id,
+                        state_sequence=sequence,
+                    )
+                else:
+                    selection = client.start_agent(
+                        Path(checkout_value),
+                        Path(repository_value).name,
+                        pane,
+                        workspace,
+                        name=job.agent_name or target,
+                        checkpoint=checkpoint,
+                    )
+                updated = _settle_worker_agent(store, job_id, worker_token, selection)
+                if updated is None:
+                    return
+                job = updated
+                target = selection.target
+                followup_target_verified = followup_checkout is not None
+                checkpoint()
+        if target and job.agent_dispatch_state == "dispatching":
+            checkout_value = job.worktree_path or ""
+            pane = job.herdr_pane_id or ""
+            workspace = job.herdr_workspace_id or ""
+            repository_value = job.repository or ""
+            if checkout_value and pane and workspace and repository_value:
+                checkpoint()
+                operation = job.agent_session_operation
+                if operation is None or operation.session is None:
+                    _worker_change(
+                        store,
+                        job_id,
+                        worker_token,
+                        {JobStatus.ROUTING},
+                        lambda current: current.evolve(
+                            agent_dispatch_state="manual_required",
+                            manual_reconcile_operation="agent",
+                            manual_reconcile_token=uuid.uuid4().hex,
+                            manual_reconcile_required_at=time.time(),
+                            worker_operation=None,
+                        ),
+                    )
+                    return
+                try:
+                    observation = client.reconcile_session(
+                        target,
+                        expected_session_id=operation.session.session_id,
+                    )
                 except HerdrError as exc:
                     if not _agent_not_found(exc):
 
@@ -3751,9 +4055,26 @@ def run_claimed_worker(  # pyright: ignore[reportGeneralTypeIssues]
                             defer_dispatch,
                         )
                         return
-                    agent = {}
+                    observation = None
                 checkpoint()
-                if agent:
+                observed_session = (
+                    observation.session if observation is not None else None
+                )
+                if (
+                    observation is not None
+                    and observation.state
+                    in {ReconciliationState.ACTIVE, ReconciliationState.SETTLED}
+                    and observed_session is not None
+                ):
+                    identity = SessionIdentity(
+                        observed_session.provider,
+                        observed_session.session_id,
+                        observed_session.target,
+                        observed_session.state_sequence,
+                    )
+                    if not operation.accepts_observation(identity):
+                        return
+                    agent = observed_session.metadata
                     if followup_checkout is not None:
                         _validate_followup_agent_binding(
                             followup_checkout,
@@ -3770,45 +4091,25 @@ def run_claimed_worker(  # pyright: ignore[reportGeneralTypeIssues]
                         cwd=str(agent.get("cwd") or checkout_value),
                         name=str(agent.get("name") or target),
                         worktree_path=checkout_value,
+                        provider=identity.provider,
+                        provider_session_id=identity.session_id,
+                        state_sequence=identity.state_sequence,
                     )
                 else:
-                    mode = (
-                        "plan"
-                        if job.active_participant == WorkflowParticipant.PLANNER
-                        else (
-                            "ask"
-                            if job.active_participant == WorkflowParticipant.REVIEWER
-                            else None
-                        )
+                    _worker_change(
+                        store,
+                        job_id,
+                        worker_token,
+                        {JobStatus.ROUTING},
+                        lambda current: current.evolve(
+                            agent_dispatch_state="manual_required",
+                            manual_reconcile_operation="agent",
+                            manual_reconcile_token=uuid.uuid4().hex,
+                            manual_reconcile_required_at=time.time(),
+                            worker_operation=None,
+                        ),
                     )
-                    if mode is None:
-                        selection = client.start_agent(
-                            Path(checkout_value),
-                            job.worktree_label or Path(repository_value).name,
-                            pane,
-                            workspace,
-                            name=target,
-                            checkpoint=checkpoint,
-                        )
-                    else:
-                        selection = client.start_agent(
-                            Path(checkout_value),
-                            job.worktree_label or Path(repository_value).name,
-                            pane,
-                            workspace,
-                            name=target,
-                            mode=mode,
-                            checkpoint=checkpoint,
-                        )
-                    if followup_checkout is not None:
-                        _validate_followup_agent_binding(
-                            followup_checkout,
-                            cwd=selection.cwd,
-                            pane_id=selection.pane_id,
-                            workspace_id=selection.workspace_id,
-                            expected_pane_id=pane or None,
-                            expected_workspace_id=workspace or None,
-                        )
+                    return
                 updated = _settle_worker_agent(store, job_id, worker_token, selection)
                 if updated is None:
                     return
@@ -4163,6 +4464,10 @@ def run_claimed_worker(  # pyright: ignore[reportGeneralTypeIssues]
                     if reservation is None:
                         checkpoint()
                         raise ReservationConflict
+                    if not dispatching and reservation.agent_dispatch_state != "ready":
+                        raise HarnessError(
+                            "existing Cursor agent has no complete provider session identity"
+                        )
                     job = reservation
                     target = selection.target
 

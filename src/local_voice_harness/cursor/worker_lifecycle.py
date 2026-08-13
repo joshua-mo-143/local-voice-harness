@@ -16,12 +16,13 @@ from typing import Literal
 from .. import process as _process
 from ..errors import HarnessError
 from .model import (
-    CURRENT_SCHEMA_VERSION,
     LEGACY_BOOT_ID,
     CursorJob,
     JobStatus,
+    JobValidationError,
     transition,
 )
+from .operations import WorkerOwnership, worker_ownership_fields
 from .store import JobStore
 
 boot_identity = _process.boot_identity
@@ -73,15 +74,22 @@ def legacy_worker_command_matches(job: CursorJob) -> bool:
 
 
 def has_legacy_worker_claim(job: CursorJob) -> bool:
-    ownership = (
-        job.worker_token,
-        job.worker_pid,
-        job.worker_boot_id,
-        job.worker_process_start,
-    )
-    return any(value is not None for value in ownership) and (
-        job.loaded_schema_version < CURRENT_SCHEMA_VERSION
-        or job.worker_boot_id == LEGACY_BOOT_ID
+    if not any(
+        value is not None
+        for value in (
+            job.worker_token,
+            job.worker_pid,
+            job.worker_boot_id,
+            job.worker_process_start,
+        )
+    ):
+        return False
+    try:
+        ownership = job.worker_ownership
+    except JobValidationError:
+        return True
+    return ownership is None or (
+        ownership.boot_id == LEGACY_BOOT_ID or ownership.operation.startswith("legacy:")
     )
 
 
@@ -259,15 +267,21 @@ class WorkerContext:
     job: CursorJob
     token: str
     cancellation_requested: threading.Event
+    ownership: WorkerOwnership | None = None
 
     def checkpoint(self) -> CursorJob:
         if self.cancellation_requested.is_set():
             raise WorkerCancelled
         current = self.store.get_unless_maintenance(self.job.id)
+        try:
+            expected = self.ownership or self.job.worker_ownership
+        except JobValidationError:
+            expected = None
         if (
             current is None
             or self.cancellation_requested.is_set()
-            or current.worker_token != self.token
+            or expected is None
+            or not expected.matches(current.worker_ownership)
             or current.terminal_intent_status is not None
             or current.status
             not in {
@@ -285,6 +299,8 @@ def begin_worker(
     job_id: str,
     claim_token: str | None,
     *,
+    claim_operation: str | None = None,
+    claim_time: float | None = None,
     pid: int | None = None,
     now: float | None = None,
     get_boot_identity: Callable[[], str | None] = boot_identity,
@@ -297,22 +313,46 @@ def begin_worker(
     if not owner_boot or not owner_start:
         raise HarnessError("could not establish Cursor worker process identity")
     started_at = time.time() if now is None else now
+    expected_claim = (
+        WorkerOwnership(
+            token,
+            owner_pid,
+            owner_boot,
+            owner_start,
+            claim_operation,
+            claim_time,
+        )
+        if claim_token and claim_operation is not None and claim_time is not None
+        else None
+    )
 
     def begin(job: CursorJob) -> CursorJob | None:
         if job.status != JobStatus.QUEUED:
             return None
-        if claim_token and job.worker_token != claim_token:
-            return None
+        if claim_token:
+            if expected_claim is None:
+                return None
+            try:
+                if not expected_claim.matches(job.worker_ownership):
+                    return None
+            except JobValidationError:
+                return None
         if not claim_token and job.worker_token:
             return None
         status = JobStatus.RECONCILING if job.reconcile else JobStatus.ROUTING
         return transition(
             job,
             status,
-            worker_token=token,
-            worker_pid=owner_pid,
-            worker_boot_id=owner_boot,
-            worker_process_start=owner_start,
+            **worker_ownership_fields(
+                WorkerOwnership(
+                    token,
+                    owner_pid,
+                    owner_boot,
+                    owner_start,
+                    status.value,
+                    started_at,
+                )
+            ),
             attempt_started_at=started_at,
             started_at=started_at,
         )
@@ -326,8 +366,17 @@ def run_worker(
     job_id: str,
     claim_token: str | None,
     runner: Callable[[WorkerContext], None],
+    *,
+    claim_operation: str | None = None,
+    claim_time: float | None = None,
 ) -> None:
-    claimed = begin_worker(store, job_id, claim_token)
+    claimed = begin_worker(
+        store,
+        job_id,
+        claim_token,
+        claim_operation=claim_operation,
+        claim_time=claim_time,
+    )
     if claimed is None:
         return
     job, token = claimed
@@ -351,6 +400,14 @@ def launch_worker(
     if not launcher_boot or not launcher_start:
         raise HarnessError("could not establish Cursor launcher process identity")
     reserved_at = time.time()
+    launcher_ownership = WorkerOwnership(
+        claim_token,
+        launcher_pid,
+        launcher_boot,
+        launcher_start,
+        "launch",
+        reserved_at,
+    )
 
     def reserve(job: CursorJob) -> CursorJob | None:
         if job.status != JobStatus.QUEUED or job.worker_token:
@@ -358,10 +415,7 @@ def launch_worker(
         return transition(
             job,
             JobStatus.QUEUED,
-            worker_token=claim_token,
-            worker_pid=launcher_pid,
-            worker_boot_id=launcher_boot,
-            worker_process_start=launcher_start,
+            **worker_ownership_fields(launcher_ownership),
             attempt_started_at=reserved_at,
         )
 
@@ -373,7 +427,9 @@ def launch_worker(
         failed_at = time.time()
 
         def fail(job: CursorJob) -> CursorJob | None:
-            if job.status != JobStatus.QUEUED or job.worker_token != claim_token:
+            if job.status != JobStatus.QUEUED or not launcher_ownership.matches(
+                job.worker_ownership
+            ):
                 return None
             return prepare_failure(job, message[:500], failed_at)
 
@@ -391,6 +447,10 @@ def launch_worker(
                 job_id,
                 "--claim",
                 claim_token,
+                "--claim-operation",
+                launcher_ownership.operation,
+                "--claim-time",
+                repr(launcher_ownership.claimed_at),
             ],
             stdin=subprocess.DEVNULL,
             stdout=log_handle,
@@ -446,14 +506,22 @@ def launch_worker(
         if child_start and child_boot:
 
             def hand_off(job: CursorJob) -> CursorJob | None:
-                if job.status != JobStatus.QUEUED or job.worker_token != claim_token:
+                if job.status != JobStatus.QUEUED or not launcher_ownership.matches(
+                    job.worker_ownership
+                ):
                     return None
+                child_ownership = WorkerOwnership(
+                    claim_token,
+                    process.pid,
+                    child_boot,
+                    child_start,
+                    launcher_ownership.operation,
+                    launcher_ownership.claimed_at,
+                )
                 return transition(
                     job,
                     JobStatus.QUEUED,
-                    worker_pid=process.pid,
-                    worker_boot_id=child_boot,
-                    worker_process_start=child_start,
+                    **worker_ownership_fields(child_ownership),
                 )
 
             handed_off = store.update_unless_maintenance(job_id, hand_off)
@@ -461,11 +529,13 @@ def launch_worker(
                 child_adopted = True
             else:
                 current = store.get(job_id)
-                child_adopted = (
-                    current.worker_token == claim_token
-                    and current.worker_pid == process.pid
-                    and current.worker_boot_id == child_boot
-                    and current.worker_process_start == child_start
+                child_adopted = current.worker_ownership == WorkerOwnership(
+                    claim_token,
+                    process.pid,
+                    child_boot,
+                    child_start,
+                    launcher_ownership.operation,
+                    launcher_ownership.claimed_at,
                 )
                 failure_message = (
                     "Cursor worker exited before ownership handoff completed"
@@ -479,18 +549,16 @@ def launch_worker(
             persist_launch_failure(failure_message)
 
             def clear_launcher(job: CursorJob) -> CursorJob | None:
-                if (
-                    job.worker_token != claim_token
-                    or job.worker_pid != launcher_pid
-                    or job.worker_boot_id != launcher_boot
-                    or job.worker_process_start != launcher_start
-                ):
+                if not launcher_ownership.matches(job.worker_ownership):
                     return None
                 return job.evolve(
                     worker_token=None,
                     worker_pid=None,
                     worker_boot_id=None,
                     worker_process_start=None,
+                    worker_operation=None,
+                    worker_claim_operation=None,
+                    worker_claimed_at=None,
                 )
 
             store.update(job_id, clear_launcher)

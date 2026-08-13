@@ -43,6 +43,12 @@ from pathlib import Path
 
 record = {
     "arguments": sys.argv[1:],
+    "jobs_database": str(
+        Path(os.environ["XDG_STATE_HOME"])
+        / "voice-harness"
+        / "jobs"
+        / "jobs.sqlite3"
+    ),
     "environment": {
         name: os.environ.get(name)
         for name in (
@@ -150,6 +156,17 @@ raise SystemExit(int(os.environ.get("FAKE_SYSTEMCTL_EXIT", "3")))
                 "XDG_RUNTIME_DIR": str(self.test_root / "shared-runtime"),
                 "VOICE_HARNESS_WAKE_THRESHOLD": "0.73",
             },
+        )
+        self.assertEqual(
+            invocation["jobs_database"],
+            str(
+                PROJECT_ROOT
+                / ".dev"
+                / "state"
+                / "voice-harness"
+                / "jobs"
+                / "jobs.sqlite3"
+            ),
         )
         self.assertTrue((PROJECT_ROOT / ".dev" / "config").is_dir())
         self.assertTrue((PROJECT_ROOT / ".dev" / "state").is_dir())

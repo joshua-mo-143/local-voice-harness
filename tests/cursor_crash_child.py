@@ -12,6 +12,7 @@ from unittest import mock
 from local_voice_harness.cursor import provisioning, worker_lifecycle
 from local_voice_harness.cursor.delivery import acknowledge_delivery, claim_delivery
 from local_voice_harness.cursor.model import CursorJob, WorkflowParticipant
+from local_voice_harness.cursor.operations import WorkerOwnership
 from local_voice_harness.cursor.recovery import recover_jobs
 from local_voice_harness.cursor.store import JobStore, migrate_legacy_jobs
 from local_voice_harness.integrations.github import GitHubClient, GitHubRepository
@@ -324,7 +325,7 @@ def _run_quarantine(root: Path, point: str) -> None:
         store.list()
 
 
-def _begin(store: JobStore, job_id: str) -> tuple[CursorJob, str]:
+def _begin(store: JobStore, job_id: str) -> tuple[CursorJob, WorkerOwnership]:
     claimed = worker_lifecycle.begin_worker(
         store,
         job_id,
@@ -335,7 +336,11 @@ def _begin(store: JobStore, job_id: str) -> tuple[CursorJob, str]:
     )
     if claimed is None:
         raise RuntimeError("could not claim crash-test job")
-    return claimed
+    job, _token = claimed
+    ownership = job.worker_ownership
+    if ownership is None:
+        raise RuntimeError("crash-test worker has no ownership")
+    return job, ownership
 
 
 def _run_effect(root: Path, effect: str, point: str) -> None:
@@ -373,6 +378,7 @@ def _run_effect(root: Path, effect: str, point: str) -> None:
                 "branch": "voice/issue-100",
                 "path": str(checkout.resolve()),
                 "open_workspace_id": "workspace-1",
+                "root_pane_id": "pane-1",
             },
         )
         kill("post-submit")
@@ -390,6 +396,9 @@ def _run_effect(root: Path, effect: str, point: str) -> None:
             str(checkout.resolve()),
             "voice-issue-100",
             str(checkout.resolve()),
+            provider="cursor/herdr",
+            provider_session_id="crash-session",
+            state_sequence=1,
         )
         provisioning._reserve_worker_target(
             store,
@@ -409,7 +418,10 @@ def _run_effect(root: Path, effect: str, point: str) -> None:
                 "pane_id": selection.pane_id,
                 "workspace_id": selection.workspace_id,
                 "cwd": selection.cwd,
-                "state_change_seq": 1,
+                "provider": "cursor/herdr",
+                "agent_session": "crash-session",
+                "state_change_seq": 2,
+                "agent_status": "idle",
             },
         )
         kill("post-submit")
@@ -448,6 +460,24 @@ def _run_effect(root: Path, effect: str, point: str) -> None:
         return
 
     if effect == "pane":
+        provisioning._reserve_worker_worktree(
+            store,
+            job.id,
+            token,
+            repository,
+            "voice/issue-100",
+            checkout,
+            state="planned",
+        )
+        provisioning._settle_worker_worktree(
+            store,
+            job.id,
+            token,
+            checkout,
+            "workspace-1",
+            "pane-root",
+        )
+        job = store.get(job.id)
         planned = provisioning._plan_participant_creation(
             store,
             job,
