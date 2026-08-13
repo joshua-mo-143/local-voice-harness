@@ -4,7 +4,7 @@ import math
 import re
 import uuid
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import StrEnum
 from typing import Any
 
@@ -14,9 +14,106 @@ from ..integrations.github import (
     dump_github_provider_state,
     load_github_provider_state,
 )
+from ..job_lifecycle import (
+    AwaitingUserJob,
+    BlockedJob,
+    ExecutionComponents,
+    JobEvent,
+    JobIdentity,
+    JobLifecycle,
+    JobLifecycleError,
+    JobState,
+    LifecycleEvent,
+    QueuedJob,
+    ReconcilingJob,
+    RecoveryEvent,
+    RoutingProvisioningJob,
+    RunningJob,
+    TerminalJob,
+    WorkerCallbackEvent,
+    WorkerClaim,
+    apply_event,
+    legal_edges,
+)
+from ..prompt_operations import (
+    PromptOperation,
+    PromptOperationError,
+    load_prompt_operation,
+)
 from ..questions import Question, QuestionError
+from .lifecycle import (
+    AnnouncementAck,
+    CleanupOwned,
+    CleanupSettled,
+    CleanupState,
+    Delivered,
+    DeliveryState,
+    LifecycleTransitionError,
+    MaterializedTerminalOutcome,
+    PendingDelivery,
+    TerminalIntent,
+    TerminalState,
+    abandon_cleanup_owner,
+    acknowledge_without_claim,
+    cleanup_fields,
+    delivery_fields,
+    dismiss_announcement,
+    finish_cleanup_reconciliation,
+    load_cleanup_state,
+    load_delivery_state,
+    load_terminal_state,
+    repeat_announcement,
+)
+from .lifecycle import (
+    acknowledge_delivery as transition_delivery_acknowledgement,
+)
+from .lifecycle import (
+    prepare_delivery as transition_prepare_delivery,
+)
+from .lifecycle import (
+    release_delivery as transition_delivery_release,
+)
+from .lifecycle import (
+    renew_delivery as transition_delivery_renewal,
+)
+from .operations import (
+    AgentSessionOperation,
+    AgentSessionSpec,
+    CheckoutOperation,
+    CheckoutSpec,
+    ForkOperation,
+    ForkSpec,
+    OperationState,
+    OperationTransitionError,
+    ParticipantPaneOperation,
+    ParticipantPaneSpec,
+    SessionIdentity,
+    WorkerOwnership,
+    load_worker_ownership,
+)
+from .workflow import (
+    ArtifactReference,
+    LegacyPlanApprovalProof,
+    ParticipantAdmissionState,
+    ParticipantCreation,
+    ParticipantCreationState,
+    ParticipantLifecycle,
+    PlanApproval,
+    PlanApprovalProof,
+    PlanApprovalSource,
+    PlanApprovalState,
+    ReviewApprovalSource,
+    ReviewDecision,
+    ReviewState,
+    WorkflowClassification,
+    WorkflowParticipant,
+    WorkflowPhase,
+    WorkflowState,
+    WorkflowTier,
+    WorkflowTransitionError,
+)
 
-CURRENT_SCHEMA_VERSION = 16
+CURRENT_SCHEMA_VERSION = 18
 LEGACY_SCHEMA_VERSIONS = frozenset(range(CURRENT_SCHEMA_VERSION))
 LEGACY_BOOT_ID = "legacy-unknown"
 
@@ -37,20 +134,6 @@ class JobStatus(StrEnum):
     CANCELLED = "cancelled"
 
 
-class AnnouncementAck(StrEnum):
-    """How a background announcement was handled.
-
-    Spoken playback is the only state that means TTS succeeded. Desktop and
-    deferred delivery must not be recorded as spoken.
-    """
-
-    PENDING = "pending"
-    SPOKEN = "spoken"
-    DESKTOP = "desktop"
-    DEFERRED = "deferred"
-    DISMISSED = "dismissed"
-
-
 ANNOUNCEMENT_ACK_STATES = frozenset(item.value for item in AnnouncementAck)
 SPOKEN_ANNOUNCEMENT_ACKS = frozenset(
     {AnnouncementAck.SPOKEN.value, AnnouncementAck.DISMISSED.value}
@@ -64,43 +147,6 @@ class HarnessKind(StrEnum):
     """Coding-agent harness responsible for a durable job."""
 
     CURSOR = "cursor"
-
-
-class WorkflowTier(StrEnum):
-    SIMPLE = "simple"
-    MEDIUM = "medium"
-    HIGH_RISK = "high-risk"
-
-
-class WorkflowPhase(StrEnum):
-    CLASSIFYING = "classifying"
-    PLANNING = "planning"
-    REVIEWING = "reviewing"
-    REVISING = "revising"
-    IMPLEMENTING = "implementing"
-    FINISHED = "finished"
-
-
-class WorkflowParticipant(StrEnum):
-    PLANNER = "planner"
-    REVIEWER = "reviewer"
-    IMPLEMENTER = "implementer"
-
-
-_LEGAL_WORKFLOW_TRANSITIONS: dict[WorkflowPhase, frozenset[WorkflowPhase]] = {
-    WorkflowPhase.CLASSIFYING: frozenset(
-        {WorkflowPhase.PLANNING, WorkflowPhase.IMPLEMENTING}
-    ),
-    WorkflowPhase.PLANNING: frozenset({WorkflowPhase.REVIEWING}),
-    WorkflowPhase.REVIEWING: frozenset(
-        {WorkflowPhase.REVISING, WorkflowPhase.IMPLEMENTING}
-    ),
-    WorkflowPhase.REVISING: frozenset({WorkflowPhase.REVIEWING}),
-    WorkflowPhase.IMPLEMENTING: frozenset(
-        {WorkflowPhase.PLANNING, WorkflowPhase.FINISHED}
-    ),
-    WorkflowPhase.FINISHED: frozenset(),
-}
 
 
 ACTIVE_STATUSES = frozenset(
@@ -125,59 +171,10 @@ TERMINAL_STATUSES = frozenset(
 )
 
 _LEGAL_TRANSITIONS: dict[JobStatus, frozenset[JobStatus]] = {
-    JobStatus.QUEUED: frozenset(
-        {
-            JobStatus.ROUTING,
-            JobStatus.RECONCILING,
-            JobStatus.FAILED,
-            JobStatus.CANCELLED,
-        }
-    ),
-    JobStatus.ROUTING: frozenset(
-        {
-            JobStatus.QUEUED,
-            JobStatus.RUNNING,
-            JobStatus.RECONCILING,
-            JobStatus.AWAITING_USER,
-            JobStatus.FAILED,
-            JobStatus.CANCELLED,
-        }
-    ),
-    JobStatus.RUNNING: frozenset(
-        {
-            JobStatus.QUEUED,
-            JobStatus.AWAITING_USER,
-            JobStatus.BLOCKED,
-            JobStatus.RECONCILING,
-            JobStatus.COMPLETED,
-            JobStatus.FAILED,
-            JobStatus.CANCELLED,
-        }
-    ),
-    JobStatus.RECONCILING: frozenset(
-        {
-            JobStatus.QUEUED,
-            JobStatus.AWAITING_USER,
-            JobStatus.BLOCKED,
-            JobStatus.COMPLETED,
-            JobStatus.FAILED,
-            JobStatus.CANCELLED,
-        }
-    ),
-    JobStatus.AWAITING_USER: frozenset(
-        {
-            JobStatus.QUEUED,
-            JobStatus.RECONCILING,
-            JobStatus.COMPLETED,
-            JobStatus.CANCELLED,
-        }
-    ),
-    JobStatus.BLOCKED: frozenset(
-        {JobStatus.QUEUED, JobStatus.RECONCILING, JobStatus.CANCELLED}
-    ),
-    JobStatus.COMPLETED: frozenset(),
-    JobStatus.FAILED: frozenset(),
-    JobStatus.CANCELLED: frozenset(),
+    JobStatus(source.value): frozenset(
+        JobStatus(target.value) for target in legal_edges(source)
+    )
+    for source in JobState
 }
 
 _BOOL_FIELDS = frozenset(
@@ -198,6 +195,8 @@ _BOOL_FIELDS = frozenset(
         "agent_dispatch_exited",
         "worktree_dispatch_exited",
         "target_release_pending",
+        "target_release_manual_required",
+        "agent_identity_legacy_compatible",
         "cancellation_reconciliation_pending",
         "worktree_manual_inspection_required",
         "announcement_dismissed",
@@ -212,6 +211,7 @@ _BOOL_FIELDS = frozenset(
 _INT_FIELDS = frozenset(
     {
         "schema_version",
+        "migration_source_schema_version",
         "revision",
         "turn",
         "github_issue",
@@ -233,6 +233,7 @@ _INT_FIELDS = frozenset(
         "plan_approval_state_change_sequence",
         "plan_approval_revision",
         "linear_ticket_create_baseline_sequence",
+        "agent_state_sequence",
     }
 )
 _FLOAT_FIELDS = frozenset(
@@ -264,10 +265,12 @@ _FLOAT_FIELDS = frozenset(
         "worktree_confirmed_absent_at",
         "worktree_automatic_reconcile_stopped_at",
         "worktree_retained_at",
+        "pane_retained_at",
         "manual_reconcile_required_at",
         "manual_reconcile_resolved_at",
         "worktree_quarantine_acknowledged_at",
         "terminal_intent_completed_at",
+        "worker_claimed_at",
     }
 )
 _STRING_FIELDS = frozenset(
@@ -279,6 +282,7 @@ _STRING_FIELDS = frozenset(
         "trusted_utterance",
         "repository_hint",
         "context_repository",
+        "grouped_repository_coordinator_id",
         "repository",
         "github_repository",
         "github_issue_url",
@@ -326,6 +330,7 @@ _STRING_FIELDS = frozenset(
         "worker_boot_id",
         "worker_process_start",
         "worker_operation",
+        "worker_claim_operation",
         "herdr_target",
         "herdr_pane_id",
         "herdr_workspace_id",
@@ -335,6 +340,12 @@ _STRING_FIELDS = frozenset(
         "target_release_owner_boot_id",
         "target_release_owner_start",
         "agent_dispatch_state",
+        "agent_provider",
+        "agent_provider_session_id",
+        "agent_operation_checkout",
+        "agent_operation_target",
+        "agent_operation_workspace_id",
+        "agent_operation_pane_id",
         "fork_operation_state",
         "fork_operation_source",
         "fork_operation_source_url",
@@ -363,6 +374,8 @@ _STRING_FIELDS = frozenset(
         "plan_approval_id",
         "plan_approval_source",
         "plan_approval_agent_session",
+        "plan_approval_plan_artifact",
+        "plan_approval_review_artifact",
         "workflow_turn_phase",
         "prompt_operation_state",
         "prompt_operation_phase",
@@ -375,6 +388,7 @@ _STRING_FIELDS = frozenset(
         "participant_creation_label",
         "participant_creation_workspace_id",
         "participant_creation_pane_id",
+        "participant_creation_checkout",
         "terminal_intent_status",
         "terminal_intent_result",
         "terminal_intent_error",
@@ -435,17 +449,6 @@ _UNCERTAIN_OPERATION_STATES = frozenset(
 )
 _PROMPT_OPERATION_STATES = frozenset(
     {"none", "planned", "submitting", "submitted", "ambiguous"}
-)
-_PLAN_APPROVAL_STATES = frozenset(
-    {"none", "boundary", "awaiting", "approved", "observed", "rejected"}
-)
-_PARTICIPANT_CREATION_STATES = frozenset(
-    {"none", "planned", "submitting", "created", "ambiguous", "manual_required"}
-)
-_WORKFLOW_ARTIFACT_REFERENCE = re.compile(
-    r"^\.artifacts/(?P<job>[0-9a-f]{12})/"
-    r"(?P<kind>plan|review)-(?P<round>[0-2])"
-    r"(?:-(?P<digest>[0-9a-f]{64}))?\.json$"
 )
 
 
@@ -555,6 +558,13 @@ _HARNESS_STATE_FIELDS = frozenset(
         "herdr_workspace_id",
         "agent_name",
         "agent_dispatch_state",
+        "agent_provider",
+        "agent_provider_session_id",
+        "agent_operation_checkout",
+        "agent_operation_target",
+        "agent_operation_workspace_id",
+        "agent_operation_pane_id",
+        "agent_state_sequence",
         "agent_dispatch_exited",
         "agent_reconcile_attempts",
         "agent_absent_observations",
@@ -572,6 +582,9 @@ _HARNESS_STATE_FIELDS = frozenset(
         "target_release_owner_pid",
         "target_release_owner_boot_id",
         "target_release_owner_start",
+        "target_release_manual_required",
+        "target_release_unverified_targets",
+        "participant_session_owners",
     }
 )
 _CHECKOUT_STATE_FIELDS = frozenset(
@@ -684,6 +697,117 @@ def _flatten_structured_state(values: dict[str, object]) -> None:
         values.setdefault("herdr_target", values["session_id"])
 
 
+def _migrate_v17_typed_identities(values: dict[str, object]) -> None:
+    """Convert v17's optional identity fields into safe v18 typed states."""
+
+    worker_fields = (
+        "worker_token",
+        "worker_pid",
+        "worker_boot_id",
+        "worker_process_start",
+    )
+    worker_values = tuple(values.get(field) for field in worker_fields)
+    if any(value is not None for value in worker_values):
+        if all(value is not None for value in worker_values):
+            if not values.get("worker_claim_operation"):
+                values["worker_claim_operation"] = (
+                    f"legacy:{values.get('status') or 'worker'}"
+                )
+            if values.get("worker_claimed_at") is None:
+                values["worker_claimed_at"] = (
+                    values.get("attempt_started_at")
+                    or values.get("started_at")
+                    or values.get("created_at")
+                    or 0
+                )
+
+    worktree_state = values.get("worktree_provision_state")
+    if worktree_state is not None:
+        for field in ("repository", "worktree_branch", "worktree_path"):
+            if not values.get(field):
+                values[field] = LEGACY_BOOT_ID
+
+    agent_state = values.get("agent_dispatch_state")
+    if agent_state is not None:
+        values["agent_identity_legacy_compatible"] = True
+        values.setdefault("agent_operation_target", values.get("herdr_target"))
+        values.setdefault(
+            "agent_operation_workspace_id", values.get("herdr_workspace_id")
+        )
+        values.setdefault("agent_operation_pane_id", values.get("herdr_pane_id"))
+        if not values.get("agent_operation_checkout"):
+            values["agent_operation_checkout"] = (
+                values.get("worktree_path")
+                or values.get("repository")
+                or LEGACY_BOOT_ID
+            )
+        for field in ("herdr_target", "herdr_pane_id", "herdr_workspace_id"):
+            if not values.get(field):
+                values[field] = LEGACY_BOOT_ID
+                if (
+                    field == "herdr_target"
+                    and values.get("agent_dispatch_state") != "manual_required"
+                ):
+                    values["agent_dispatch_state"] = "ambiguous"
+        values["agent_operation_target"] = (
+            values.get("agent_operation_target") or values["herdr_target"]
+        )
+        values["agent_operation_workspace_id"] = (
+            values.get("agent_operation_workspace_id") or values["herdr_workspace_id"]
+        )
+        values["agent_operation_pane_id"] = (
+            values.get("agent_operation_pane_id") or values["herdr_pane_id"]
+        )
+        session_fields = (
+            "agent_provider",
+            "agent_provider_session_id",
+            "agent_state_sequence",
+        )
+        session_values = tuple(values.get(field) for field in session_fields)
+        session_complete = all(value is not None for value in session_values)
+        if any(value is not None for value in session_values) and not session_complete:
+            for field in session_fields:
+                values[field] = None
+
+    participant_state = values.get("participant_creation_state")
+    if participant_state not in {None, "none"}:
+        if not values.get("participant_creation_checkout"):
+            values["participant_creation_checkout"] = (
+                values.get("worktree_path")
+                or values.get("repository")
+                or LEGACY_BOOT_ID
+            )
+
+    fork_state = values.get("fork_operation_state")
+    if fork_state is not None:
+        target = values.get("fork_operation_target")
+        if (
+            not values.get("fork_operation_login")
+            and isinstance(target, str)
+            and "/" in target
+        ):
+            values["fork_operation_login"] = target.split("/", 1)[0]
+        required_fork_fields = (
+            "fork_operation_source",
+            "fork_operation_source_url",
+            "fork_operation_source_default_branch",
+            "fork_operation_login",
+            "fork_operation_target",
+        )
+        incomplete = any(not values.get(field) for field in required_fork_fields)
+        for field in required_fork_fields:
+            if not values.get(field):
+                values[field] = LEGACY_BOOT_ID
+        values.setdefault("fork_operation_source_private", False)
+        if incomplete and fork_state not in {"failed", "confirmed_absent"}:
+            values["fork_operation_state"] = "ambiguous"
+
+    values.setdefault("target_release_manual_required", False)
+    values.setdefault("agent_identity_legacy_compatible", False)
+    values.setdefault("target_release_unverified_targets", [])
+    values.setdefault("participant_session_owners", [])
+
+
 def _advance_legacy_version(values: dict[str, object], version: int) -> None:
     """Apply one compatibility step and advance exactly one schema version."""
 
@@ -721,6 +845,7 @@ def _advance_legacy_version(values: dict[str, object], version: int) -> None:
             values.setdefault("plan_approval_source", "legacy")
             values.setdefault("plan_approval_agent_session", LEGACY_BOOT_ID)
             values.setdefault("plan_approval_state_change_sequence", -1)
+            values.setdefault("plan_approval_revision", -1)
         else:
             values.setdefault("plan_approval_state", "none")
     elif version == 11:
@@ -739,6 +864,22 @@ def _advance_legacy_version(values: dict[str, object], version: int) -> None:
         values.setdefault("prompt_context_sessions", {})
     elif version == 15:
         _default_announcement_ack(values)
+    elif version == 16:
+        if values.get("plan_approval_state") in {
+            PlanApprovalState.AWAITING.value,
+            PlanApprovalState.APPROVED.value,
+            PlanApprovalState.OBSERVED.value,
+        }:
+            values.setdefault(
+                "plan_approval_plan_artifact",
+                values.get("plan_artifact"),
+            )
+            values.setdefault(
+                "plan_approval_review_artifact",
+                values.get("review_artifact"),
+            )
+    elif version == 17:
+        _migrate_v17_typed_identities(values)
     values["schema_version"] = version + 1
 
 
@@ -776,6 +917,24 @@ def _default_announcement_ack(values: dict[str, object]) -> None:
         )
         return
     values["announcement_ack"] = AnnouncementAck.PENDING.value
+
+
+def _pair_worker_ownership(values: dict[str, object]) -> None:
+    """Keep newly typed worker claims all-or-nothing without rewriting legacy rows."""
+    if "worker_claimed_at" not in values:
+        return
+    if values.get("worker_token") is None:
+        for field in (
+            "worker_pid",
+            "worker_boot_id",
+            "worker_process_start",
+            "worker_claim_operation",
+            "worker_claimed_at",
+        ):
+            values[field] = None
+        return
+    if values.get("worker_claim_operation") is None:
+        values["worker_claim_operation"] = str(values.get("status") or "worker")
 
 
 def _infer_legacy_issue_provider(values: Mapping[str, object]) -> str | None:
@@ -816,22 +975,32 @@ def migrate_job_record(raw: Mapping[str, object]) -> tuple[dict[str, object], in
     """Migrate a persisted record to the current in-memory representation."""
 
     values = dict(raw)
-    loaded_version = (
+    record_version = (
         _integer(values["schema_version"], "schema_version")
         if "schema_version" in values
         else 0
     )
-    if loaded_version not in LEGACY_SCHEMA_VERSIONS | {CURRENT_SCHEMA_VERSION}:
+    if record_version not in LEGACY_SCHEMA_VERSIONS | {CURRENT_SCHEMA_VERSION}:
         raise JobValidationError(
-            f"unsupported agent job schema version {loaded_version}"
+            f"unsupported agent job schema version {record_version}"
         )
+    source_version = values.get("migration_source_schema_version")
+    if source_version is None:
+        loaded_version = record_version
+    else:
+        loaded_version = _integer(source_version, "migration_source_schema_version")
+        if (
+            record_version != CURRENT_SCHEMA_VERSION
+            or loaded_version not in LEGACY_SCHEMA_VERSIONS
+        ):
+            raise JobValidationError("invalid migration source schema version")
     compatibility_input = not (
         "harness_state" in values
         or "checkout_state" in values
         or "provider_state" in values
     )
     _flatten_structured_state(values)
-    if loaded_version < CURRENT_SCHEMA_VERSION:
+    if record_version < CURRENT_SCHEMA_VERSION:
         if compatibility_input:
             values.setdefault("harness_kind", HarnessKind.CURSOR.value)
             if values.get("herdr_target") is not None:
@@ -839,8 +1008,9 @@ def migrate_job_record(raw: Mapping[str, object]) -> tuple[dict[str, object], in
             elif values.get("session_id") is not None:
                 values.setdefault("herdr_target", values["session_id"])
         _legacy_defaults(values)
-        for version in range(loaded_version, CURRENT_SCHEMA_VERSION):
+        for version in range(record_version, CURRENT_SCHEMA_VERSION):
             _advance_legacy_version(values, version)
+        values["migration_source_schema_version"] = record_version
     else:
         if compatibility_input:
             values.setdefault("harness_kind", HarnessKind.CURSOR.value)
@@ -1039,6 +1209,9 @@ class AgentJob:
     herdr_target: str | None
     worktree_path: str | None
     target_release_pending: bool
+    target_release_manual_required: bool
+    target_release_unverified_targets: tuple[str, ...]
+    participant_session_owners: tuple[dict[str, object], ...]
     cancellation_reconciliation_pending: bool
     agent_dispatch_state: str | None
     fork_operation_state: str | None
@@ -1051,6 +1224,7 @@ class AgentJob:
     active_participant: WorkflowParticipant | None
     _compatibility_layout: bool
     _values: dict[str, object]
+    _lifecycle_event: JobEvent | None = None
 
     @classmethod
     def from_dict(cls, raw: dict[str, object]) -> CursorJob:
@@ -1062,7 +1236,7 @@ class AgentJob:
             else 0
         )
         compatibility_layout = (
-            raw_version == CURRENT_SCHEMA_VERSION
+            raw_version in {17, CURRENT_SCHEMA_VERSION}
             and "harness_kind" not in raw
             and "harness_state" not in raw
             and "provider_state" not in raw
@@ -1103,6 +1277,38 @@ class AgentJob:
                 raise JobValidationError(
                     "clarification records require question, answer, and turn identity"
                 )
+        unverified_targets = values.setdefault("target_release_unverified_targets", [])
+        if not isinstance(unverified_targets, list) or not all(
+            isinstance(target, str) and bool(target) for target in unverified_targets
+        ):
+            raise JobValidationError(
+                "target_release_unverified_targets must contain non-empty strings"
+            )
+        participant_session_owners = values.setdefault("participant_session_owners", [])
+        if not isinstance(participant_session_owners, list):
+            raise JobValidationError("participant_session_owners must be an array")
+        required_owner_fields = {
+            "provider",
+            "session_id",
+            "target",
+            "state_sequence",
+            "checkout",
+            "workspace_id",
+            "pane_id",
+        }
+        for owner in participant_session_owners:
+            if (
+                not isinstance(owner, dict)
+                or set(owner) != required_owner_fields
+                or not all(
+                    isinstance(owner.get(field), str) and bool(owner[field])
+                    for field in required_owner_fields - {"state_sequence"}
+                )
+                or not isinstance(owner.get("state_sequence"), int)
+                or isinstance(owner.get("state_sequence"), bool)
+                or int(owner["state_sequence"]) < 0
+            ):
+                raise JobValidationError("participant_session_owners is invalid")
         context_sessions = values.setdefault("prompt_context_sessions", {})
         if not isinstance(context_sessions, dict) or not all(
             key in {participant.value for participant in WorkflowParticipant}
@@ -1270,6 +1476,13 @@ class AgentJob:
                 else None
             ),
             target_release_pending=bool(values.get("target_release_pending", False)),
+            target_release_manual_required=bool(
+                values.get("target_release_manual_required", False)
+            ),
+            target_release_unverified_targets=tuple(unverified_targets),
+            participant_session_owners=tuple(
+                dict(owner) for owner in participant_session_owners
+            ),
             cancellation_reconciliation_pending=bool(
                 values.get("cancellation_reconciliation_pending", False)
             ),
@@ -1304,6 +1517,7 @@ class AgentJob:
             active_participant=active_participant,
             _compatibility_layout=compatibility_layout,
             _values=values,
+            _lifecycle_event=None,
         )
         job.validate_invariants(
             require_worker_owner=loaded_version == CURRENT_SCHEMA_VERSION
@@ -1372,6 +1586,7 @@ class AgentJob:
             preserve_loaded_version
             and self.loaded_schema_version < CURRENT_SCHEMA_VERSION
         ):
+            values.pop("migration_source_schema_version", None)
             if self.loaded_schema_version == 0:
                 values.pop("schema_version", None)
             else:
@@ -1400,6 +1615,7 @@ class AgentJob:
             values.pop(field, None)
         values.update(changes)
         _pair_announcement_ack(values)
+        _pair_worker_ownership(values)
         if "prompt_operation_state" in changes:
             values.pop("phase_prompt_active", None)
         if (
@@ -1428,7 +1644,24 @@ class AgentJob:
             worker_boot_id=None,
             worker_process_start=None,
             worker_token=None,
+            worker_operation=None,
+            worker_claim_operation=None,
+            worker_claimed_at=None,
         )
+
+    @property
+    def worker_ownership(self) -> WorkerOwnership | None:
+        try:
+            return load_worker_ownership(
+                token=self.worker_token,
+                pid=self.worker_pid,
+                boot_id=self.worker_boot_id,
+                process_start=self.worker_process_start,
+                operation=self._optional_string("worker_claim_operation"),
+                claimed_at=self._optional_float("worker_claimed_at"),
+            )
+        except OperationTransitionError as exc:
+            raise JobValidationError(str(exc)) from exc
 
     def prepare_delivery(self, *, now: float) -> CursorJob:
         return self.evolve_for_delivery(now=now)
@@ -1441,16 +1674,11 @@ class AgentJob:
         remove: frozenset[str] = frozenset(),
         **changes: object,
     ) -> CursorJob:
+        prepared = delivery_fields(transition_prepare_delivery(self.delivery_state))
         return self.evolve(
             status=status,
             remove=remove,
-            delivered=False,
-            delivery_generation=self.delivery_generation + 1,
-            delivery_claim_token=None,
-            delivery_claimed_at=None,
-            delivery_retry_at=0,
-            delivery_attempts=0,
-            announcement_ack=AnnouncementAck.PENDING.value,
+            **prepared,
             updated_at=now,
             **changes,
         )
@@ -1471,6 +1699,7 @@ class AgentJob:
         if dynamic_changes is not None:
             values.update(dynamic_changes)
         values.update(changes)
+        _pair_worker_ownership(values)
         if "prompt_operation_state" in values:
             values.pop("phase_prompt_active", None)
         combined_changes = dict(dynamic_changes or {})
@@ -1484,7 +1713,16 @@ class AgentJob:
         final_status = status or self.status
         values["status"] = final_status.value
         operation = str(values.get("manual_reconcile_operation") or "")
-        if final_status in TERMINAL_STATUSES and operation:
+        materialized = isinstance(self.terminal_state, MaterializedTerminalOutcome)
+        if materialized:
+            if operation or final_status == JobStatus.FAILED:
+                values["reconciliation_base_error"] = str(
+                    self.reconciliation_base_error
+                    or self.error
+                    or self.result
+                    or "Cursor job failed"
+                ).split("; external operation reconciliation", 1)[0]
+        elif final_status in TERMINAL_STATUSES and operation:
             base = str(
                 values.get("reconciliation_base_error")
                 or (
@@ -1548,20 +1786,25 @@ class AgentJob:
                 error=message,
                 result=message,
             )
+        if materialized:
+            values["status"] = self.status.value
+            for field in ("result", "error", "completed_at"):
+                if field in self._values:
+                    values[field] = self._values[field]
+                else:
+                    values.pop(field, None)
         if prepare_delivery:
             values.update(
-                delivered=False,
-                delivery_generation=self.delivery_generation + 1,
-                delivery_claim_token=None,
-                delivery_claimed_at=None,
-                delivery_retry_at=0,
-                delivery_attempts=0,
-                announcement_ack=AnnouncementAck.PENDING.value,
-                updated_at=now,
+                delivery_fields(transition_prepare_delivery(self.delivery_state))
             )
+            values["updated_at"] = now
         values["schema_version"] = CURRENT_SCHEMA_VERSION
         values["revision"] = self.revision + 1
         updated = CursorJob.from_dict(values)
+        updated = replace(
+            updated,
+            _lifecycle_event=RecoveryEvent(self.revision, updated.lifecycle),
+        )
         validate_transition(self, updated)
         return updated
 
@@ -1605,8 +1848,10 @@ class AgentJob:
                     f"{operation}_confirmed_absent_at": now,
                     f"{operation}_next_reconcile_at": None,
                     "worker_operation": None,
-                    "cancellation_reconciliation_pending": False,
                 }
+            )
+            changes.update(
+                cleanup_fields(finish_cleanup_reconciliation(self.cleanup_state))
             )
             if operation == "agent":
                 participant = self.active_participant
@@ -1620,13 +1865,6 @@ class AgentJob:
                 )
                 if participant is not None:
                     changes[f"{participant.value}_target"] = None
-            elif operation == "worktree":
-                if self.parent_job_id is None:
-                    changes.update(
-                        worktree_path=None,
-                        worktree_workspace_id=None,
-                        worktree_root_pane_id=None,
-                    )
         elif attempts >= uncertain_max_attempts:
             changes.update(
                 {
@@ -1637,8 +1875,10 @@ class AgentJob:
                     "manual_reconcile_token": uuid.uuid4().hex,
                     "manual_reconcile_required_at": now,
                     "worker_operation": None,
-                    "cancellation_reconciliation_pending": False,
                 }
+            )
+            changes.update(
+                cleanup_fields(finish_cleanup_reconciliation(self.cleanup_state))
             )
         else:
             changes[f"{operation}_next_reconcile_at"] = now + min(
@@ -1647,7 +1887,10 @@ class AgentJob:
         return self.evolve_recovery(
             changes,
             now=now,
-            prepare_delivery=changes.get(state_key) == "manual_required",
+            prepare_delivery=(
+                changes.get(state_key) == "manual_required"
+                and self.terminal_intent_status is None
+            ),
         )
 
     def _optional_string(self, field: str) -> str | None:
@@ -1909,6 +2152,53 @@ class AgentJob:
         return self._optional_string("worktree_root_pane_id")
 
     @property
+    def checkout_operation(self) -> CheckoutOperation | None:
+        if self.worktree_provision_state is None:
+            return None
+        state = {
+            "planned": OperationState.PLANNED,
+            "dispatching": OperationState.ACTIVE,
+            "ready": OperationState.SETTLED,
+            "retained": OperationState.SETTLED,
+            "quarantined": OperationState.UNKNOWN,
+            "ambiguous": OperationState.UNKNOWN,
+            "failed_observing": OperationState.UNKNOWN,
+            "confirmed_absent": OperationState.FAILED,
+            "manual_required": OperationState.MANUAL,
+        }[self.worktree_provision_state]
+        if (
+            self.loaded_schema_version < CURRENT_SCHEMA_VERSION
+            and state == OperationState.SETTLED
+            and (
+                not self.worktree_workspace_id
+                or not self.worktree_root_pane_id
+                or LEGACY_BOOT_ID
+                in {self.repository, self.worktree_branch, self.worktree_path}
+            )
+        ):
+            state = OperationState.UNKNOWN
+        workspace_id = self.worktree_workspace_id
+        root_pane_id = self.worktree_root_pane_id
+        if self.loaded_schema_version < CURRENT_SCHEMA_VERSION and bool(
+            workspace_id
+        ) != bool(root_pane_id):
+            workspace_id = None
+            root_pane_id = None
+        try:
+            return CheckoutOperation(
+                state,
+                CheckoutSpec(
+                    self.repository or "",
+                    self.worktree_branch or "",
+                    self.worktree_path or "",
+                ),
+                workspace_id,
+                root_pane_id,
+            )
+        except OperationTransitionError as exc:
+            raise JobValidationError(str(exc)) from exc
+
+    @property
     def worktree_provision_error(self) -> str | None:
         return self._optional_string("worktree_provision_error")
 
@@ -2010,6 +2300,97 @@ class AgentJob:
         return self._optional_string("herdr_workspace_id")
 
     @property
+    def agent_provider(self) -> str | None:
+        return self._optional_string("agent_provider")
+
+    @property
+    def agent_provider_session_id(self) -> str | None:
+        return self._optional_string("agent_provider_session_id")
+
+    @property
+    def agent_state_sequence(self) -> int | None:
+        return self._optional_int("agent_state_sequence")
+
+    @property
+    def agent_operation_checkout(self) -> str | None:
+        return self._optional_string("agent_operation_checkout")
+
+    @property
+    def agent_operation_target(self) -> str | None:
+        return self._optional_string("agent_operation_target")
+
+    @property
+    def agent_operation_workspace_id(self) -> str | None:
+        return self._optional_string("agent_operation_workspace_id")
+
+    @property
+    def agent_operation_pane_id(self) -> str | None:
+        return self._optional_string("agent_operation_pane_id")
+
+    @property
+    def agent_identity_legacy_compatible(self) -> bool:
+        return bool(self._values.get("agent_identity_legacy_compatible", False))
+
+    @property
+    def agent_session_operation(self) -> AgentSessionOperation | None:
+        if self.agent_dispatch_state is None:
+            return None
+        state = {
+            "dispatching": OperationState.ACTIVE,
+            "ready": OperationState.SETTLED,
+            "retained": OperationState.SETTLED,
+            "ambiguous": OperationState.UNKNOWN,
+            "failed_observing": OperationState.UNKNOWN,
+            "confirmed_absent": OperationState.FAILED,
+            "manual_required": OperationState.MANUAL,
+        }[self.agent_dispatch_state]
+        session_values = (
+            self.agent_provider,
+            self.agent_provider_session_id,
+            self.agent_state_sequence,
+        )
+        session = None
+        if any(value is not None for value in session_values):
+            if not all(value is not None for value in session_values):
+                raise JobValidationError(
+                    "agent provider session identity is incomplete"
+                )
+            assert self.agent_provider is not None
+            assert self.agent_provider_session_id is not None
+            assert self.agent_state_sequence is not None
+            session = SessionIdentity(
+                self.agent_provider,
+                self.agent_provider_session_id,
+                self.agent_operation_target or self.herdr_target or "",
+                self.agent_state_sequence,
+            )
+        if (
+            session is None
+            and self.loaded_schema_version < CURRENT_SCHEMA_VERSION
+            and state == OperationState.SETTLED
+        ):
+            # A migrated target-only operation is retained as explicitly unknown
+            # typed state. Only legacy reconciliation paths may use its old
+            # target/workspace evidence; native v18 rows remain strict.
+            state = OperationState.UNKNOWN
+        try:
+            return AgentSessionOperation(
+                state,
+                AgentSessionSpec(
+                    self.agent_operation_target or self.herdr_target or "",
+                    self.agent_operation_checkout
+                    or self.worktree_path
+                    or self.repository
+                    or "",
+                    self.agent_operation_workspace_id or self.herdr_workspace_id or "",
+                    self.agent_operation_pane_id or self.herdr_pane_id or "",
+                ),
+                session,
+            )
+        except OperationTransitionError as exc:
+            raise JobValidationError(str(exc)) from exc
+
+    @property
     def delivery_generation(self) -> int:
         return _integer(
             self._values.get("delivery_generation") or 0, "delivery_generation"
@@ -2040,6 +2421,38 @@ class AgentJob:
         return self._optional_string("workflow_classification_reason")
 
     @property
+    def workflow_state(self) -> WorkflowState:
+        try:
+            classification = (
+                WorkflowClassification(
+                    self.workflow_tier,
+                    self.workflow_classification_reason or "",
+                )
+                if self.workflow_tier is not None
+                else None
+            )
+            return WorkflowState(self.workflow_phase, classification)
+        except WorkflowTransitionError as exc:
+            raise JobValidationError(str(exc)) from exc
+
+    def evolve_workflow(
+        self,
+        state: WorkflowState,
+        **changes: Any,
+    ) -> CursorJob:
+        classification = state.classification
+        return self.evolve(
+            workflow_phase=state.phase.value,
+            workflow_tier=(
+                classification.tier.value if classification is not None else None
+            ),
+            workflow_classification_reason=(
+                classification.reason if classification is not None else None
+            ),
+            **changes,
+        )
+
+    @property
     def plan_artifact(self) -> str | None:
         return self._optional_string("plan_artifact")
 
@@ -2050,6 +2463,33 @@ class AgentJob:
     @property
     def prompt_operation_state(self) -> str:
         return self._optional_string("prompt_operation_state") or "none"
+
+    @property
+    def prompt_operation(self) -> PromptOperation:
+        try:
+            return load_prompt_operation(
+                state=self.prompt_operation_state,
+                job_id=self.id,
+                phase=(
+                    self.prompt_operation_phase.value
+                    if self.prompt_operation_phase is not None
+                    else None
+                ),
+                turn=self.prompt_operation_turn,
+                turn_token=(
+                    self.turn_token
+                    or (
+                        f"{self.id}-{self.prompt_operation_turn}"
+                        if self.prompt_operation_turn > 0
+                        else None
+                    )
+                ),
+                target=self.prompt_operation_target,
+                agent_session=self.prompt_operation_agent_session,
+                baseline_sequence=self.prompt_baseline_sequence,
+            )
+        except PromptOperationError as exc:
+            raise JobValidationError(str(exc)) from exc
 
     @property
     def prompt_operation_phase(self) -> WorkflowPhase | None:
@@ -2119,6 +2559,41 @@ class AgentJob:
         return self._optional_string("participant_creation_pane_id")
 
     @property
+    def participant_creation_checkout(self) -> str | None:
+        return self._optional_string("participant_creation_checkout")
+
+    @property
+    def participant_pane_operation(self) -> ParticipantPaneOperation | None:
+        if self.participant_creation_state == "none":
+            return None
+        state = {
+            "planned": OperationState.PLANNED,
+            "submitting": OperationState.ACTIVE,
+            "created": OperationState.SETTLED,
+            "ambiguous": OperationState.UNKNOWN,
+            "failed": OperationState.FAILED,
+            "manual_required": OperationState.MANUAL,
+        }[self.participant_creation_state]
+        participant = self.participant_creation_participant
+        try:
+            return ParticipantPaneOperation(
+                state,
+                ParticipantPaneSpec(
+                    participant.value if participant is not None else "",
+                    self.participant_creation_target or "",
+                    self.participant_creation_label or "",
+                    self.participant_creation_checkout
+                    or self.worktree_path
+                    or self.repository
+                    or "",
+                    self.participant_creation_workspace_id or "",
+                ),
+                self.participant_creation_pane_id,
+            )
+        except OperationTransitionError as exc:
+            raise JobValidationError(str(exc)) from exc
+
+    @property
     def terminal_intent_status(self) -> JobStatus | None:
         value = self._optional_string("terminal_intent_status")
         if value is None:
@@ -2141,6 +2616,145 @@ class AgentJob:
     @property
     def terminal_intent_completed_at(self) -> float | None:
         return self._optional_float("terminal_intent_completed_at")
+
+    @property
+    def terminal_state(self) -> TerminalState:
+        try:
+            return load_terminal_state(
+                status=self.status.value,
+                result=self.result,
+                error=self.error,
+                completed_at=self.completed_at,
+                intent_status=(
+                    self.terminal_intent_status.value
+                    if self.terminal_intent_status is not None
+                    else None
+                ),
+                intent_result=self.terminal_intent_result,
+                intent_error=self.terminal_intent_error,
+                intent_completed_at=self.terminal_intent_completed_at,
+            )
+        except LifecycleTransitionError as exc:
+            raise JobValidationError(str(exc)) from exc
+
+    @property
+    def lifecycle(self) -> JobLifecycle:
+        """Adapt the flat compatibility record to the active typed lifecycle."""
+
+        try:
+            identity = JobIdentity(
+                self.id,
+                self.created_at,
+                self.parent_job_id,
+                self.request,
+                self.harness_kind.value,
+                self.issue_provider,
+                self.revision,
+            )
+            worker = (
+                WorkerClaim(
+                    ownership.token,
+                    ownership.pid,
+                    ownership.boot_id,
+                    ownership.process_start,
+                    ownership.operation,
+                    ownership.claimed_at,
+                )
+                if (ownership := self.worker_ownership) is not None
+                else None
+            )
+            try:
+                prompt_operation = self.prompt_operation
+            except JobValidationError:
+                # The flat adapter still accepts a narrow set of historical
+                # current-schema records whose prompt session was not stored.
+                # They remain compatibility records, not typed prompt states.
+                prompt_operation = None
+            execution = ExecutionComponents(
+                prompt_operation,
+                self.workflow_state,
+            )
+            state = JobState(self.status.value)
+            if state == JobState.QUEUED:
+                if self.queued_at is None:
+                    raise JobLifecycleError("queued job requires a finite queued time")
+                return QueuedJob(identity, self.queued_at, execution, worker)
+            if state == JobState.ROUTING:
+                if worker is None:
+                    raise JobLifecycleError("routing job requires worker identity")
+                return RoutingProvisioningJob(identity, worker, execution)
+            if state == JobState.RUNNING:
+                if worker is None:
+                    raise JobLifecycleError("running job requires worker identity")
+                return RunningJob(identity, worker, execution)
+            if state == JobState.AWAITING_USER:
+                return AwaitingUserJob(
+                    identity, self.question or "", self.result or "", execution
+                )
+            if state == JobState.BLOCKED:
+                if self.completed_at is None:
+                    raise JobLifecycleError("blocked job requires blocked time")
+                return BlockedJob(
+                    identity, self.result or "", self.completed_at, execution
+                )
+            if state == JobState.RECONCILING:
+                terminal_state = self.terminal_state
+                intent = (
+                    terminal_state
+                    if isinstance(terminal_state, TerminalIntent)
+                    else None
+                )
+                return ReconcilingJob(
+                    identity,
+                    execution,
+                    self.cleanup_state,
+                    intent,
+                    worker,
+                )
+            if self.completed_at is None:
+                raise JobLifecycleError("terminal job requires completion time")
+            terminal_state = self.terminal_state
+            if not isinstance(terminal_state, MaterializedTerminalOutcome):
+                raise JobLifecycleError("terminal job requires materialized outcome")
+            return TerminalJob(identity, execution, terminal_state)
+        except (JobLifecycleError, OperationTransitionError, ValueError) as exc:
+            raise JobValidationError(str(exc)) from exc
+
+    def validate_lifecycle_event(
+        self,
+        updated: CursorJob,
+        event: JobEvent,
+    ) -> None:
+        """Validate a typed event against this exact persisted revision."""
+
+        if (
+            self.loaded_schema_version != CURRENT_SCHEMA_VERSION
+            or updated.loaded_schema_version != CURRENT_SCHEMA_VERSION
+        ):
+            # Compatibility imports may lack worker/session evidence that the
+            # active v18 constructors require. Existing transition validation
+            # remains the fail-closed boundary until such a row is normalized.
+            return
+        try:
+            if event.next_state != updated.lifecycle:
+                raise JobLifecycleError("lifecycle event payload does not match update")
+            apply_event(self.lifecycle, event)
+        except JobLifecycleError as exc:
+            raise JobValidationError(str(exc)) from exc
+
+    @property
+    def cleanup_state(self) -> CleanupState:
+        try:
+            return load_cleanup_state(
+                pending=self.target_release_pending,
+                token=self.target_release_token,
+                owner_pid=self.target_release_owner_pid,
+                owner_boot_id=self.target_release_owner_boot_id,
+                owner_start=self.target_release_owner_start,
+                reconciliation_pending=self.cancellation_reconciliation_pending,
+            )
+        except LifecycleTransitionError as exc:
+            raise JobValidationError(str(exc)) from exc
 
     @property
     def review_approved(self) -> bool:
@@ -2171,6 +2785,14 @@ class AgentJob:
         return self._optional_string("plan_approval_agent_session")
 
     @property
+    def plan_approval_plan_artifact(self) -> str | None:
+        return self._optional_string("plan_approval_plan_artifact")
+
+    @property
+    def plan_approval_review_artifact(self) -> str | None:
+        return self._optional_string("plan_approval_review_artifact")
+
+    @property
     def plan_approval_state_change_sequence(self) -> int | None:
         return self._optional_int("plan_approval_state_change_sequence")
 
@@ -2185,6 +2807,207 @@ class AgentJob:
     @property
     def plan_approval_completion_pending(self) -> bool:
         return self._boolean_field("plan_approval_completion_pending")
+
+    @property
+    def review_state(self) -> ReviewState:
+        try:
+            plan = (
+                ArtifactReference.parse(
+                    self.plan_artifact,
+                    job_id=self.id,
+                    kind="plan",
+                )
+                if self.plan_artifact is not None
+                else None
+            )
+            review = (
+                ArtifactReference.parse(
+                    self.review_artifact,
+                    job_id=self.id,
+                    kind="review",
+                )
+                if self.review_artifact is not None
+                else None
+            )
+            return ReviewState(
+                self.workflow_tier,
+                self.review_round,
+                plan,
+                review,
+                (
+                    ReviewDecision(self.review_decision)
+                    if self.review_decision is not None
+                    else None
+                ),
+                (
+                    ReviewApprovalSource(self.review_approval_source)
+                    if self.review_approval_source is not None
+                    else None
+                ),
+            )
+        except (ValueError, WorkflowTransitionError) as exc:
+            raise JobValidationError(str(exc)) from exc
+
+    def evolve_review(
+        self,
+        review: ReviewState,
+        **changes: Any,
+    ) -> CursorJob:
+        return self.evolve(
+            review_round=review.round,
+            plan_artifact=review.plan.value if review.plan is not None else None,
+            review_artifact=(
+                review.review.value if review.review is not None else None
+            ),
+            review_decision=(
+                review.decision.value if review.decision is not None else None
+            ),
+            review_approved=review.approved,
+            review_approval_source=(
+                review.approval_source.value
+                if review.approval_source is not None
+                else None
+            ),
+            **changes,
+        )
+
+    @property
+    def plan_approval(self) -> PlanApproval:
+        try:
+            state = PlanApprovalState(self.plan_approval_state)
+            source = (
+                PlanApprovalSource(self.plan_approval_source)
+                if self.plan_approval_source is not None
+                else None
+            )
+            proof_values = (
+                self.plan_approval_id,
+                self.plan_approval_agent_session,
+                self.plan_approval_state_change_sequence,
+                self.plan_approval_revision,
+            )
+            if state != PlanApprovalState.NONE and not all(
+                value is not None for value in proof_values
+            ):
+                raise WorkflowTransitionError(
+                    "active plan approval requires gate ID, agent session, and "
+                    "sequence; revision proof is also required"
+                )
+            proof = None
+            if state != PlanApprovalState.NONE:
+                assert self.plan_approval_id is not None
+                assert self.plan_approval_agent_session is not None
+                assert self.plan_approval_state_change_sequence is not None
+                assert self.plan_approval_revision is not None
+                if source == PlanApprovalSource.LEGACY:
+                    proof = LegacyPlanApprovalProof(
+                        self.plan_approval_id,
+                        self.plan_approval_agent_session,
+                        self.plan_approval_state_change_sequence,
+                        self.plan_approval_revision,
+                    )
+                else:
+                    proof = PlanApprovalProof(
+                        self.plan_approval_id,
+                        self.plan_approval_agent_session,
+                        self.plan_approval_state_change_sequence,
+                        self.plan_approval_revision,
+                    )
+            question = (
+                Question.from_dict(self.voice_question)
+                if state == PlanApprovalState.AWAITING
+                and self.voice_question is not None
+                else None
+            )
+            approval = PlanApproval(
+                state=state,
+                proof=proof,
+                source=source,
+                counted=self.plan_approval_counted,
+                plan_reference=self.plan_approval_plan_artifact,
+                review_reference=self.plan_approval_review_artifact,
+                review_accepted=self.review_approved,
+                question_id=question.id if question is not None else None,
+                question_turn_token=(
+                    question.origin.turn_token if question is not None else None
+                ),
+            )
+            if state in {
+                PlanApprovalState.AWAITING,
+                PlanApprovalState.APPROVED,
+                PlanApprovalState.OBSERVED,
+            } and (
+                approval.plan_reference != self.plan_artifact
+                or approval.review_reference != self.review_artifact
+            ):
+                raise WorkflowTransitionError(
+                    "accepted plan approval artifacts cannot be replaced"
+                )
+            return approval
+        except (ValueError, WorkflowTransitionError, QuestionError) as exc:
+            raise JobValidationError(str(exc)) from exc
+
+    def evolve_plan_approval(
+        self,
+        approval: PlanApproval,
+        **changes: Any,
+    ) -> CursorJob:
+        proof = approval.proof
+        return self.evolve(
+            plan_approval_state=approval.state.value,
+            plan_approval_id=proof.gate_id if proof is not None else None,
+            plan_approval_source=(
+                approval.source.value if approval.source is not None else None
+            ),
+            plan_approval_agent_session=(
+                proof.agent_session if proof is not None else None
+            ),
+            plan_approval_plan_artifact=approval.plan_reference,
+            plan_approval_review_artifact=approval.review_reference,
+            plan_approval_state_change_sequence=(
+                proof.state_change_sequence if proof is not None else None
+            ),
+            plan_approval_revision=proof.revision if proof is not None else None,
+            plan_approval_counted=approval.counted,
+            **changes,
+        )
+
+    @property
+    def participant_lifecycle(self) -> ParticipantLifecycle:
+        try:
+            creation = ParticipantCreation(
+                ParticipantCreationState(self.participant_creation_state),
+                self.participant_creation_participant,
+                self.participant_creation_target,
+                self.participant_creation_label,
+                self.participant_creation_workspace_id,
+                self.participant_creation_pane_id,
+            )
+            return ParticipantLifecycle(
+                ParticipantAdmissionState(self.participant_admission_state),
+                creation,
+            )
+        except (ValueError, WorkflowTransitionError) as exc:
+            raise JobValidationError(str(exc)) from exc
+
+    def evolve_participant(
+        self,
+        lifecycle: ParticipantLifecycle,
+        **changes: Any,
+    ) -> CursorJob:
+        creation = lifecycle.creation
+        return self.evolve(
+            participant_admission_state=lifecycle.admission.value,
+            participant_creation_state=creation.state.value,
+            participant_creation_participant=(
+                creation.participant.value if creation.participant is not None else None
+            ),
+            participant_creation_target=creation.target,
+            participant_creation_label=creation.label,
+            participant_creation_workspace_id=creation.workspace_id,
+            participant_creation_pane_id=creation.pane_id,
+            **changes,
+        )
 
     @property
     def workflow_turn_phase(self) -> WorkflowPhase | None:
@@ -2230,6 +3053,38 @@ class AgentJob:
     @property
     def fork_repository(self) -> str | None:
         return self._optional_string("fork_repository")
+
+    @property
+    def fork_operation(self) -> ForkOperation | None:
+        if self.fork_operation_state is None:
+            return None
+        state = {
+            "planned": OperationState.PLANNED,
+            "submitted": OperationState.ACTIVE,
+            "exists": OperationState.SETTLED,
+            "retained": OperationState.SETTLED,
+            "ambiguous": OperationState.UNKNOWN,
+            "failed_observing": OperationState.UNKNOWN,
+            "failed": OperationState.FAILED,
+            "confirmed_absent": OperationState.FAILED,
+            "manual_required": OperationState.MANUAL,
+        }[self.fork_operation_state]
+        try:
+            return ForkOperation(
+                state,
+                ForkSpec(
+                    self.fork_operation_source or "",
+                    self.fork_operation_source_url or "",
+                    self.fork_operation_source_default_branch or "",
+                    self.fork_operation_source_private,
+                    self.fork_operation_login
+                    or (self.fork_operation_target or "").split("/", 1)[0],
+                    self.fork_operation_target or "",
+                    self.fork_operation_source_parent,
+                ),
+            )
+        except OperationTransitionError as exc:
+            raise JobValidationError(str(exc)) from exc
 
     @property
     def next_reconcile_at(self) -> float:
@@ -2285,20 +3140,24 @@ class AgentJob:
             "manual_reconcile_token": None,
             "manual_reconcile_resolved_at": resolved_at,
             "manual_reconcile_outcome": outcome,
-            "cancellation_reconciliation_pending": False,
-            "target_release_pending": retain_terminal_release,
-            "target_release_token": (
-                self.target_release_token if retain_terminal_release else None
-            ),
-            "target_release_owner_pid": None,
-            "target_release_owner_boot_id": None,
-            "target_release_owner_start": None,
             "worker_operation": None,
             "worker_pid": None,
             "worker_boot_id": None,
             "worker_process_start": None,
             "worker_token": None,
         }
+        cleanup = self.cleanup_state
+        if isinstance(cleanup, CleanupOwned):
+            cleanup = abandon_cleanup_owner(cleanup, cleanup.token or "")
+        reconciled_cleanup = finish_cleanup_reconciliation(cleanup)
+        preserve_release = (
+            retain_terminal_release or self.target_release_manual_required
+        )
+        if not preserve_release:
+            reconciled_cleanup = CleanupSettled()
+        changes.update(cleanup_fields(reconciled_cleanup))
+        if retain_terminal_release and not self.target_release_pending:
+            raise JobValidationError("terminal reconciliation requires release cleanup")
         if operation == "prompt":
             changes[state_key] = "submitted" if outcome == "materialized" else "none"
             if outcome == "confirmed_absent":
@@ -2314,10 +3173,17 @@ class AgentJob:
             if outcome == "materialized":
                 if not resolved_pane or not resolved_workspace:
                     return None
+                try:
+                    creation = self.participant_lifecycle.creation.created(
+                        pane_id=resolved_pane,
+                        workspace_id=resolved_workspace,
+                    )
+                except WorkflowTransitionError:
+                    return None
                 changes.update(
-                    participant_creation_state="created",
-                    participant_creation_pane_id=resolved_pane,
-                    participant_creation_workspace_id=resolved_workspace,
+                    participant_creation_state=creation.state.value,
+                    participant_creation_pane_id=creation.pane_id,
+                    participant_creation_workspace_id=creation.workspace_id,
                     herdr_pane_id=resolved_pane,
                     herdr_workspace_id=resolved_workspace,
                     agent_name=self.participant_creation_target,
@@ -2340,13 +3206,28 @@ class AgentJob:
                     fork_exists=True,
                     fork_repository=self.fork_operation_target,
                 )
-            elif operation == "agent" and not self.herdr_target:
-                return None
+            elif operation == "agent":
+                if not self.herdr_target:
+                    return None
+                if (
+                    self.agent_provider is None
+                    or self.agent_provider_session_id is None
+                    or self.agent_state_sequence is None
+                ):
+                    return None
             elif operation == "worktree" and not self.worktree_path:
                 return None
         elif operation == "agent":
             participant = self.active_participant
             changes.update(
+                agent_operation_target=self.agent_operation_target or self.herdr_target,
+                agent_operation_workspace_id=self.agent_operation_workspace_id
+                or self.herdr_workspace_id,
+                agent_operation_pane_id=self.agent_operation_pane_id
+                or self.herdr_pane_id,
+                agent_operation_checkout=self.agent_operation_checkout
+                or self.worktree_path
+                or self.repository,
                 herdr_target=None,
                 active_participant=None,
                 herdr_pane_id=None,
@@ -2379,52 +3260,136 @@ class AgentJob:
     def delivery_attempts(self) -> int:
         return _integer(self._values.get("delivery_attempts") or 0, "delivery_attempts")
 
-    def claim_delivery(self, token: str, *, claimed_at: float) -> CursorJob:
-        return self._updated(
-            delivery_claim_token=token,
-            delivery_claimed_at=claimed_at,
-            delivery_attempts=self.delivery_attempts + 1,
+    @property
+    def delivery_state(self) -> DeliveryState:
+        try:
+            return load_delivery_state(
+                delivered=self.delivered,
+                generation=self.delivery_generation,
+                claim_token=self.delivery_claim_token,
+                claimed_at=self.delivery_claimed_at,
+                retry_at=self.delivery_retry_at,
+                attempts=self.delivery_attempts,
+                delivered_at=self.delivered_at,
+                acknowledgement=self.announcement_ack,
+                dismissed=self.announcement_dismissed,
+                repeated=self.announcement_repeated,
+            )
+        except LifecycleTransitionError as exc:
+            raise JobValidationError(str(exc)) from exc
+
+    def claim_delivery(
+        self, token: str, *, claimed_at: float, lease_seconds: float
+    ) -> CursorJob:
+        from .lifecycle import claim_delivery
+
+        state = claim_delivery(
+            self.delivery_state,
+            token,
+            claimed_at,
+            lease_seconds=lease_seconds,
         )
+        return self._updated(**delivery_fields(state))
 
-    def renew_delivery(self, *, claimed_at: float) -> CursorJob:
-        return self._updated(delivery_claimed_at=claimed_at)
-
-    def acknowledge_delivery(self, *, delivered_at: float) -> CursorJob:
-        return self._updated(
-            delivered=True,
-            announcement_ack=AnnouncementAck.SPOKEN.value,
-            delivery_claim_token=None,
-            delivery_claimed_at=None,
-            delivery_retry_at=0,
-            delivered_at=delivered_at,
+    def renew_delivery(
+        self, token: str, *, claimed_at: float, lease_seconds: float
+    ) -> CursorJob:
+        state = transition_delivery_renewal(
+            self.delivery_state,
+            token,
+            claimed_at,
+            lease_seconds=lease_seconds,
         )
+        return self._updated(**delivery_fields(state))
 
-    def acknowledge_desktop_delivery(self) -> CursorJob:
-        return self._updated(
-            announcement_ack=AnnouncementAck.DESKTOP.value,
-            delivery_claim_token=None,
-            delivery_claimed_at=None,
-            delivery_retry_at=0,
+    def acknowledge_delivery(
+        self, token: str, *, delivered_at: float, lease_seconds: float
+    ) -> CursorJob:
+        state = transition_delivery_acknowledgement(
+            self.delivery_state,
+            token,
+            delivered_at,
+            AnnouncementAck.SPOKEN,
+            lease_seconds=lease_seconds,
         )
+        return self._updated(**delivery_fields(state))
 
-    def acknowledge_deferred_delivery(self) -> CursorJob:
-        return self._updated(
-            announcement_ack=AnnouncementAck.DEFERRED.value,
-            delivery_claim_token=None,
-            delivery_claimed_at=None,
-            delivery_retry_at=0,
+    def acknowledge_desktop_delivery(
+        self, token: str, *, acknowledged_at: float, lease_seconds: float
+    ) -> CursorJob:
+        state = transition_delivery_acknowledgement(
+            self.delivery_state,
+            token,
+            acknowledged_at,
+            AnnouncementAck.DESKTOP,
+            lease_seconds=lease_seconds,
         )
+        return self._updated(**delivery_fields(state))
 
-    def release_delivery(self, *, retry_at: float) -> CursorJob:
+    def acknowledge_deferred_delivery(
+        self, token: str, *, acknowledged_at: float, lease_seconds: float
+    ) -> CursorJob:
+        state = transition_delivery_acknowledgement(
+            self.delivery_state,
+            token,
+            acknowledged_at,
+            AnnouncementAck.DEFERRED,
+            lease_seconds=lease_seconds,
+        )
+        return self._updated(**delivery_fields(state))
+
+    def release_delivery(self, token: str, *, retry_at: float) -> CursorJob:
+        state = transition_delivery_release(
+            self.delivery_state,
+            token,
+            retry_at=retry_at,
+        )
+        return self._updated(**delivery_fields(state))
+
+    def mark_delivered(
+        self,
+        *,
+        delivered_at: float | None = None,
+        status: JobStatus | None = None,
+        **changes: object,
+    ) -> CursorJob:
+        state = acknowledge_without_claim(self.delivery_state, delivered_at)
+        values = dict(changes)
+        values.update(delivery_fields(state))
+        if status is not None:
+            values["status"] = status.value
+        return self._updated(**values)
+
+    def dismiss_announcement(self, *, delivered_at: float) -> CursorJob:
+        current = self.delivery_state
+        announcement = dismiss_announcement(current.announcement)
+        state = Delivered(
+            current.generation,
+            delivered_at,
+            current.attempts,
+            announcement,
+        )
+        return self._updated(**delivery_fields(state))
+
+    def repeat_announcement(self, *, now: float) -> CursorJob:
+        state = transition_prepare_delivery(self.delivery_state)
+        announcement = repeat_announcement(state.announcement)
         return self._updated(
-            delivery_claim_token=None,
-            delivery_claimed_at=None,
-            delivery_retry_at=retry_at,
+            **delivery_fields(
+                PendingDelivery(
+                    state.generation,
+                    state.retry_at,
+                    state.attempts,
+                    announcement,
+                )
+            ),
+            updated_at=now,
         )
 
     def _updated(self, **changes: object) -> CursorJob:
         values = dict(self._values)
         values.update(changes)
+        _pair_worker_ownership(values)
         values["schema_version"] = CURRENT_SCHEMA_VERSION
         values["revision"] = self.revision + 1
         updated = CursorJob.from_dict(values)
@@ -2432,6 +3397,31 @@ class AgentJob:
         return updated
 
     def validate_invariants(self, *, require_worker_owner: bool = False) -> None:
+        # Parse every compatibility field group through its typed adapter. Flat
+        # JSON remains the durable format, but invalid cross-field states fail
+        # at the model boundary.
+        _ = (
+            self.terminal_state,
+            self.cleanup_state,
+            self.delivery_state,
+            self.workflow_state,
+            self.review_state,
+            self.plan_approval,
+            self.participant_lifecycle,
+        )
+        if self.loaded_schema_version == CURRENT_SCHEMA_VERSION and (
+            self._values.get("worker_claimed_at") is not None
+            or self._values.get("worker_claim_operation") is not None
+        ):
+            _ = self.worker_ownership
+        if (
+            self.agent_provider is not None
+            or self.agent_provider_session_id is not None
+            or self.agent_state_sequence is not None
+        ):
+            _ = self.agent_session_operation
+        if self.participant_creation_checkout is not None:
+            _ = self.participant_pane_operation
         if self.participant_admission_state not in {"waiting", "held", "released"}:
             raise JobValidationError("participant_admission_state has invalid value")
         if (
@@ -2528,10 +3518,11 @@ class AgentJob:
             self.worker_pid,
             self.worker_boot_id,
             self.worker_process_start,
+            self._optional_string("worker_claim_operation"),
+            self._optional_float("worker_claimed_at"),
         )
         if (
             require_worker_owner
-            and self.terminal_intent_status is None
             and any(item is not None for item in worker_claim)
             and not all(item is not None for item in worker_claim)
         ):
@@ -2586,10 +3577,6 @@ class AgentJob:
             raise JobValidationError("simple workflow cannot enter planning or review")
         if self.workflow_tier == WorkflowTier.MEDIUM and self.review_round > 1:
             raise JobValidationError("medium workflow allows only one review")
-        if self.workflow_phase == WorkflowPhase.REVISING and self.review_round >= 2:
-            raise JobValidationError(
-                "round-two workflow cannot remain in revising phase"
-            )
         review_decision = self._optional_string("review_decision")
         if review_decision not in {None, "approve", "revise"}:
             raise JobValidationError("review_decision has invalid value")
@@ -2615,7 +3602,7 @@ class AgentJob:
                 "user approval requires an exhausted high-risk rejected review"
             )
         plan_approval_state = self.plan_approval_state
-        if plan_approval_state not in _PLAN_APPROVAL_STATES:
+        if plan_approval_state not in {state.value for state in PlanApprovalState}:
             raise JobValidationError("plan_approval_state has invalid value")
         plan_approval_source = self.plan_approval_source
         if plan_approval_source not in {None, "explicit", "auto", "legacy"}:
@@ -2739,7 +3726,7 @@ class AgentJob:
         self._validate_operation_state(
             "participant_creation_state",
             self.participant_creation_state,
-            _PARTICIPANT_CREATION_STATES,
+            frozenset(state.value for state in ParticipantCreationState),
         )
         if self.prompt_operation_state != "none":
             if (
@@ -2783,32 +3770,6 @@ class AgentJob:
                 raise JobValidationError(
                     "terminal intent requires reconciling status and release fence"
                 )
-        artifact_rounds: dict[str, int] = {}
-        for field, kind in (
-            ("plan_artifact", "plan"),
-            ("review_artifact", "review"),
-        ):
-            reference = self._optional_string(field)
-            if reference is None:
-                continue
-            match = _WORKFLOW_ARTIFACT_REFERENCE.fullmatch(reference)
-            if (
-                match is None
-                or match.group("job") != self.id
-                or match.group("kind") != kind
-            ):
-                raise JobValidationError(
-                    f"{field} has invalid workflow artifact reference"
-                )
-            artifact_rounds[kind] = int(match.group("round"))
-        if self.review_approved and (
-            artifact_rounds.get("plan") != self.review_round
-            or artifact_rounds.get("review") != self.review_round
-        ):
-            raise JobValidationError(
-                "approved review artifacts must match the current review round"
-            )
-
         self._validate_operation_state(
             "agent_dispatch_state",
             self.agent_dispatch_state,
@@ -2891,6 +3852,14 @@ class AgentJob:
             raise JobValidationError(
                 "manual reconciliation requires operation and token"
             )
+        if require_worker_owner and self.worktree_provision_state is not None:
+            _ = self.checkout_operation
+        if require_worker_owner and self.agent_dispatch_state is not None:
+            _ = self.agent_session_operation
+        if require_worker_owner and self.participant_creation_state != "none":
+            _ = self.participant_pane_operation
+        if require_worker_owner and self.fork_operation_state is not None:
+            _ = self.fork_operation
         if (
             self.cancellation_reconciliation_pending
             and not self.has_uncertain_operation()
@@ -2925,10 +3894,18 @@ class AgentJob:
                 "target_release_owner_pid",
                 "target_release_owner_boot_id",
                 "target_release_owner_start",
+                "target_release_manual_required",
+                "target_release_unverified_targets",
             )
         ):
             raise JobValidationError(
                 "released target cannot retain release ownership fields"
+            )
+        if self.target_release_manual_required != bool(
+            self.target_release_unverified_targets
+        ):
+            raise JobValidationError(
+                "manual target release requires unverified target identities"
             )
 
     def has_uncertain_operation(self) -> bool:
@@ -2952,6 +3929,124 @@ class AgentJob:
             raise JobValidationError(f"{field} has invalid value")
 
 
+def _validate_operation_transitions(before: CursorJob, after: CursorJob) -> None:
+    operations = (
+        ("checkout", before.checkout_operation, after.checkout_operation),
+        ("fork", before.fork_operation, after.fork_operation),
+        (
+            "agent session",
+            before.agent_session_operation,
+            after.agent_session_operation,
+        ),
+        (
+            "participant pane",
+            before.participant_pane_operation,
+            after.participant_pane_operation,
+        ),
+    )
+    for name, previous, current in operations:
+        if previous is None:
+            continue
+        if current is None:
+            if name == "participant pane":
+                continue
+            raise JobValidationError(f"{name} operation identity cannot be discarded")
+        if previous.spec != current.spec:
+            archived_agent = (
+                name == "agent session"
+                and isinstance(previous, AgentSessionOperation)
+                and previous.session is not None
+                and any(
+                    owner.get("provider") == previous.session.provider
+                    and owner.get("session_id") == previous.session.session_id
+                    and owner.get("target") == previous.session.target
+                    and owner.get("state_sequence") == previous.session.state_sequence
+                    and owner.get("checkout") == previous.spec.checkout
+                    and owner.get("workspace_id") == previous.spec.workspace_id
+                    and owner.get("pane_id") == previous.spec.pane_id
+                    for owner in after.participant_session_owners
+                )
+            )
+            replacement = (
+                (
+                    name == "agent session"
+                    and previous.state == OperationState.FAILED
+                    and current.state
+                    in {
+                        OperationState.PLANNED,
+                        OperationState.ACTIVE,
+                        OperationState.SETTLED,
+                    }
+                )
+                or (
+                    name == "participant pane"
+                    and previous.state == OperationState.FAILED
+                    and current.state == OperationState.PLANNED
+                )
+                or (
+                    LEGACY_BOOT_ID in repr(previous.spec)
+                    and previous.state
+                    in {OperationState.UNKNOWN, OperationState.MANUAL}
+                    and current.state == OperationState.SETTLED
+                )
+                or archived_agent
+            )
+            if not replacement:
+                raise JobValidationError(
+                    f"{name} operation identity cannot be rewritten"
+                )
+            continue
+        try:
+            if previous.state != current.state:
+                legacy_agent_materialized = bool(
+                    name == "agent session"
+                    and before.loaded_schema_version < CURRENT_SCHEMA_VERSION
+                    and before.agent_dispatch_state == "manual_required"
+                    and after.agent_dispatch_state == "retained"
+                    and previous.state == OperationState.MANUAL
+                    and current.state == OperationState.UNKNOWN
+                    and isinstance(current, AgentSessionOperation)
+                    and current.session is None
+                )
+                if legacy_agent_materialized:
+                    continue
+                if isinstance(previous, CheckoutOperation) and isinstance(
+                    current, CheckoutOperation
+                ):
+                    previous.transition(
+                        current.state,
+                        workspace_id=current.workspace_id,
+                        root_pane_id=current.root_pane_id,
+                    )
+                elif isinstance(previous, AgentSessionOperation) and isinstance(
+                    current, AgentSessionOperation
+                ):
+                    previous.transition(current.state, session=current.session)
+                elif isinstance(previous, ParticipantPaneOperation) and isinstance(
+                    current, ParticipantPaneOperation
+                ):
+                    previous.transition(current.state, pane_id=current.pane_id)
+                else:
+                    previous.transition(current.state)
+            if isinstance(previous, AgentSessionOperation) and isinstance(
+                current, AgentSessionOperation
+            ):
+                if previous.session is not None and current.session is None:
+                    raise OperationTransitionError(
+                        "agent session identity cannot be discarded"
+                    )
+                if (
+                    previous.session is not None
+                    and current.session is not None
+                    and not previous.accepts_observation(current.session)
+                ):
+                    raise OperationTransitionError(
+                        "agent session identity or sequence is stale"
+                    )
+        except OperationTransitionError as exc:
+            raise JobValidationError(str(exc)) from exc
+
+
 def validate_transition(before: CursorJob, after: CursorJob) -> None:
     if before.id != after.id:
         raise JobValidationError("Cursor job transition cannot change id")
@@ -2967,6 +4062,35 @@ def validate_transition(before: CursorJob, after: CursorJob) -> None:
         raise JobValidationError("agent job transition cannot change harness_kind")
     if before.issue_provider != after.issue_provider:
         raise JobValidationError("agent job transition cannot change issue_provider")
+    _validate_operation_transitions(before, after)
+    before_terminal = before.terminal_state
+    after_terminal = after.terminal_state
+    if (
+        before.terminal_intent_status is not None
+        and after.terminal_intent_status is not None
+        and before.terminal_intent_status != after.terminal_intent_status
+    ):
+        raise JobValidationError("terminal intent status cannot be rewritten")
+    if (
+        isinstance(after_terminal, MaterializedTerminalOutcome)
+        and not isinstance(before_terminal, MaterializedTerminalOutcome)
+        and (
+            after.target_release_pending
+            or after.cancellation_reconciliation_pending
+            or any(
+                after._values.get(field)
+                for field in (
+                    "herdr_target",
+                    "planner_target",
+                    "reviewer_target",
+                    "implementer_target",
+                )
+            )
+        )
+    ):
+        raise JobValidationError(
+            "terminal outcome cannot materialize before cleanup settles"
+        )
     if after.parent_job_id is not None:
         # A follow-up child inherits its parent's exact checkout. That identity
         # must never be substituted, removed, or reconstructed by recovery.
@@ -2988,55 +4112,56 @@ def validate_transition(before: CursorJob, after: CursorJob) -> None:
             "Cursor job revision must increase by exactly one "
             f"({before.revision} -> {after.revision})"
         )
-    github_issue_creation_recovery_transition = (
-        before.status == JobStatus.QUEUED
-        and before.github_issue_create_operation_state in {"submitted", "ambiguous"}
-        and (
-            (
-                after.status == JobStatus.COMPLETED
-                and after.github_issue_create_operation_state == "created"
-            )
-            or (
-                after.status == JobStatus.BLOCKED
-                and after.github_issue_create_operation_state == "manual_required"
-            )
-        )
-    )
-    linear_ticket_creation_recovery_transition = (
-        before.status == JobStatus.QUEUED
-        and before.linear_ticket_create_operation_state
-        in {"submitting", "submitted", "ambiguous"}
-        and (
-            (
-                after.status == JobStatus.COMPLETED
-                and after.linear_ticket_create_operation_state == "created"
-            )
-            or (
-                after.status == JobStatus.BLOCKED
-                and after.linear_ticket_create_operation_state == "manual_required"
-            )
-        )
-    )
+    recovery_event = isinstance(after._lifecycle_event, RecoveryEvent)
     if (
         before.status != after.status
         and after.status not in _LEGAL_TRANSITIONS[before.status]
-        and not github_issue_creation_recovery_transition
-        and not linear_ticket_creation_recovery_transition
+        and not recovery_event
     ):
         raise JobValidationError(
             "illegal Cursor job transition "
             f"{before.status.value} -> {after.status.value}"
         )
-    admission_transitions = {
-        "waiting": {"waiting", "held", "released"},
-        "held": {"held", "released"},
-        "released": {"released"},
-    }
-    if (
-        after.participant_admission_state
-        not in admission_transitions[before.participant_admission_state]
+    if isinstance(before_terminal, MaterializedTerminalOutcome) and (
+        after_terminal != before_terminal
     ):
-        raise JobValidationError("participant admission state cannot move backward")
+        raise JobValidationError("materialized terminal outcome is immutable")
+    try:
+        if (
+            before.participant_lifecycle.admission
+            != after.participant_lifecycle.admission
+        ):
+            if after.participant_lifecycle.admission == ParticipantAdmissionState.HELD:
+                before.participant_lifecycle.admit()
+            elif (
+                after.participant_lifecycle.admission
+                == ParticipantAdmissionState.RELEASED
+            ):
+                before.participant_lifecycle.release(
+                    cleanup_confirmed=bool(
+                        after.status in TERMINAL_STATUSES
+                        and not after.target_release_pending
+                        and not any(
+                            after._values.get(field)
+                            for field in (
+                                "herdr_target",
+                                "planner_target",
+                                "reviewer_target",
+                                "implementer_target",
+                            )
+                        )
+                    )
+                )
+            else:
+                raise WorkflowTransitionError(
+                    "participant admission state cannot move backward"
+                )
+        before.participant_lifecycle.creation.validate_transition(
+            after.participant_lifecycle.creation
+        )
+        before.plan_approval.validate_transition(after.plan_approval)
+    except WorkflowTransitionError as exc:
+        raise JobValidationError(str(exc)) from exc
     if before.participant_admission_state == "held" and (
         after.participant_admission_state == "released"
     ):
@@ -3045,7 +4170,6 @@ def validate_transition(before: CursorJob, after: CursorJob) -> None:
             "planner_target",
             "reviewer_target",
             "implementer_target",
-            "participant_creation_target",
         )
         if (
             after.status not in TERMINAL_STATUSES
@@ -3055,24 +4179,42 @@ def validate_transition(before: CursorJob, after: CursorJob) -> None:
             raise JobValidationError(
                 "held participant capacity requires confirmed terminal cleanup"
             )
-    if (
-        before.workflow_phase != after.workflow_phase
-        and after.workflow_phase
-        not in _LEGAL_WORKFLOW_TRANSITIONS[before.workflow_phase]
-    ):
-        raise JobValidationError(
-            "illegal Cursor workflow transition "
-            f"{before.workflow_phase.value} -> {after.workflow_phase.value}"
-        )
-    if before.workflow_tier is not None and after.workflow_tier is not None:
-        tier_order = {
-            WorkflowTier.SIMPLE: 0,
-            WorkflowTier.MEDIUM: 1,
-            WorkflowTier.HIGH_RISK: 2,
-        }
-        if tier_order[after.workflow_tier] < tier_order[before.workflow_tier]:
-            raise JobValidationError("Cursor workflow tier cannot be downgraded")
+    try:
+        before_workflow = before.workflow_state
+        after_workflow = after.workflow_state
+        if before_workflow.classification is None:
+            if after_workflow.classification is not None:
+                expected = before_workflow.classify(
+                    after_workflow.classification.tier,
+                    after_workflow.classification.reason,
+                )
+                if expected != after_workflow:
+                    raise WorkflowTransitionError(
+                        "classification selected an invalid workflow phase"
+                    )
+            elif before_workflow.phase != after_workflow.phase:
+                before_workflow.transition(after_workflow.phase)
+        else:
+            classification = before_workflow.classification
+            if after_workflow.classification != classification:
+                if after_workflow.classification is None:
+                    raise WorkflowTransitionError(
+                        "classified workflow cannot discard classification"
+                    )
+                classification = classification.promote(
+                    after_workflow.classification.tier,
+                    after_workflow.classification.reason,
+                )
+            WorkflowState(before_workflow.phase, classification).transition(
+                after_workflow.phase
+            )
+    except WorkflowTransitionError as exc:
+        raise JobValidationError(str(exc)) from exc
     after.validate_invariants(require_worker_owner=True)
+    lifecycle_event = after._lifecycle_event or LifecycleEvent(
+        before.revision, after.lifecycle
+    )
+    before.validate_lifecycle_event(after, lifecycle_event)
 
 
 def transition(
@@ -3080,8 +4222,13 @@ def transition(
     status: JobStatus,
     **changes: Any,
 ) -> CursorJob:
+    if status != job.status and status not in _LEGAL_TRANSITIONS[job.status]:
+        raise JobValidationError(
+            f"illegal Cursor job transition {job.status.value} -> {status.value}"
+        )
     values = job.to_dict()
     values.update(changes)
+    _pair_worker_ownership(values)
     if "herdr_target" in changes and "session_id" not in changes:
         values["session_id"] = changes["herdr_target"]
     elif "session_id" in changes and "herdr_target" not in changes:
@@ -3094,6 +4241,31 @@ def transition(
     updated = CursorJob.from_dict(values)
     validate_transition(job, updated)
     return updated
+
+
+def worker_callback_transition(
+    job: CursorJob,
+    expected_revision: int,
+    expected_worker: WorkerOwnership,
+    status: JobStatus,
+    **changes: Any,
+) -> CursorJob:
+    """Apply a callback only to the exact worker revision and ownership."""
+
+    updated = transition(job, status, **changes)
+    event = WorkerCallbackEvent(
+        expected_revision,
+        updated.lifecycle,
+        expected_worker,
+    )
+    job.validate_lifecycle_event(
+        updated,
+        event,
+    )
+    return replace(
+        updated,
+        _lifecycle_event=event,
+    )
 
 
 def legal_transitions(status: JobStatus) -> frozenset[JobStatus]:
@@ -3125,6 +4297,9 @@ def validate_reservations(jobs: list[CursorJob]) -> None:
             )
             if target
         }
+        job_targets.update(
+            str(owner["target"]) for owner in job.participant_session_owners
+        )
         if reserves:
             for target in job_targets:
                 owner = targets.setdefault(target, job.id)

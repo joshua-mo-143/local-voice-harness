@@ -39,7 +39,13 @@ def test_v8_cursor_fixture_migrates_to_structured_agent_schema() -> None:
     assert record["workflow_phase"] == "implementing"
     assert record["active_participant"] == "implementer"
     assert record["implementer_target"] == "cursor-agent-61"
-    assert record["harness_state"] == fixture("agent-v9.json")["harness_state"]
+    expected_harness = fixture("agent-v9.json")["harness_state"]
+    assert isinstance(expected_harness, dict)
+    harness_state = record["harness_state"]
+    assert isinstance(harness_state, dict)
+    assert {key: harness_state[key] for key in expected_harness} == expected_harness
+    assert harness_state["agent_operation_target"] == "cursor-agent-61"
+    assert harness_state["agent_operation_checkout"] == "/repo-worktree"
     assert record["checkout_state"] == fixture("agent-v9.json")["checkout_state"]
     assert record["provider_state"] == {
         "github": {
@@ -183,8 +189,12 @@ def test_legacy_directory_import_rewrites_v8_record(tmp_path: Path) -> None:
     assert migrate_legacy_jobs(legacy, durable) == set()
 
     persisted = json.loads((durable / source.name).read_text())
-    expected = AgentJob.from_dict(fixture("cursor-v8.json")).to_record()
-    assert persisted == expected
+    canonical = AgentJob.from_dict(persisted)
+    assert canonical.loaded_schema_version == CURRENT_SCHEMA_VERSION
+    canonical.validate_invariants(require_worker_owner=True)
+    assert canonical.agent_dispatch_state == "ambiguous"
+    assert "migration_source_schema_version" not in canonical.to_dict()
+    assert "agent_identity_legacy_compatible" not in canonical.to_dict()
     assert not source.exists()
 
 

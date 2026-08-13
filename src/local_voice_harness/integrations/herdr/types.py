@@ -35,7 +35,7 @@ BeforePromptSubmit = Callable[[int], None]
 PromptAccepted = Callable[[], None]
 BeforePaneSubmit = Callable[[], None]
 PaneAccepted = Callable[[str, str], None]
-PlanParticipant = Callable[[str, str, str | None], None]
+PlanParticipant = Callable[[str, str, str | None, Path], None]
 
 
 class HerdrOperations(Protocol):
@@ -107,6 +107,9 @@ class AgentSelection:
     cwd: str
     name: str
     worktree_path: str | None = None
+    provider: str | None = None
+    provider_session_id: str | None = None
+    state_sequence: int | None = None
 
 
 @dataclass(frozen=True)

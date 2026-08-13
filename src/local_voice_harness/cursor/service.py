@@ -39,6 +39,8 @@ from ..questions import (
     AnswerOutcome,
     AnswerProvenance,
     Question,
+    QuestionError,
+    QuestionIdentity,
     QuestionKind,
     QuestionOrigin,
     QuestionSensitivity,
@@ -47,6 +49,7 @@ from ..questions import (
     choices_prompt,
     question_prompt,
     resolve_answer,
+    validate_question_identity,
 )
 from ..responses import AssistantResponse, ResponseLike
 from ..ticket_targets import TicketExtraction, TicketReference, extract_ticket_targets
@@ -65,7 +68,6 @@ from .model import (
     ACTIVE_STATUSES,
     TERMINAL_STATUSES,
     WORKER_STATUSES,
-    AnnouncementAck,
     CursorJob,
     JobStatus,
     JobValidationError,
@@ -142,6 +144,7 @@ class CursorTurnRequest:
     expected_question_id: str | None = None
     expected_question_turn: str | None = None
     answer_provenance: AnswerProvenance = AnswerProvenance.USER_TEXT
+    expected_parent_revision: int | None = None
     expected_completed_at: float | None = None
     on_follow_up_started: Callable[[], None] | None = None
     on_job_started: Callable[[], None] | None = None
@@ -254,18 +257,12 @@ def run_worker(job_id: str, claim_token: str | None = None) -> None:
 def launch_worker(job_id: str) -> None:
     def prepare_failure(job: CursorJob, message: str, failed_at: float) -> CursorJob:
         diagnostic = redact_diagnostic(message, limit=500)
-        return job.evolve(
+        return job.evolve_for_delivery(
+            now=failed_at,
             status=JobStatus.FAILED,
             error=diagnostic,
             result="Cursor job failed to start. Check the job log for details.",
             completed_at=failed_at,
-            delivered=False,
-            delivery_generation=job.delivery_generation + 1,
-            delivery_claim_token=None,
-            delivery_claimed_at=None,
-            delivery_retry_at=0,
-            delivery_attempts=0,
-            updated_at=failed_at,
             worker_token=None,
             worker_pid=None,
             worker_boot_id=None,
@@ -1216,10 +1213,16 @@ def _reply_grouped_repository(
     question = questions.current(job)
     if question is None:
         raise HarnessError(f"Cursor job {job.id} has no grouped clarification")
-    if (expected_question_id is not None and question.id != expected_question_id) or (
-        expected_question_turn is not None
-        and question.origin.turn_token != expected_question_turn
-    ):
+    try:
+        validate_question_identity(
+            question,
+            QuestionIdentity(
+                job.id,
+                expected_question_id or question.id,
+                expected_question_turn or question.origin.turn_token,
+            ),
+        )
+    except QuestionError:
         return "That answer belongs to an older question, so I did not use it."
     raw_targets = job.grouped_repository_targets
     raw_candidates = job.grouped_repository_candidates
@@ -1331,6 +1334,7 @@ def _reply_grouped_repository(
             voice_question=questions.envelope(
                 pending,
                 QuestionState.RESOLVED,
+                job=current,
                 answer=text,
                 trusted_answer=trusted_utterance or text,
                 answered_at=now,
@@ -1471,12 +1475,16 @@ def reply_job(
         question = questions.current(job)
         if question is None:
             return None
-        if (
-            expected_question_id is not None and question.id != expected_question_id
-        ) or (
-            expected_question_turn is not None
-            and question.origin.turn_token != expected_question_turn
-        ):
+        try:
+            validate_question_identity(
+                question,
+                QuestionIdentity(
+                    job.id,
+                    expected_question_id or question.id,
+                    expected_question_turn or question.origin.turn_token,
+                ),
+            )
+        except QuestionError:
             immediate = "That answer belongs to an older question, so I did not use it."
             should_launch = False
             return None
@@ -1493,12 +1501,11 @@ def reply_job(
         if resolution.outcome == AnswerOutcome.DEFERRED:
             immediate = "Okay, I'll keep that question for later."
             should_launch = False
-            return job.evolve(
-                delivered=True,
-                delivery_claim_token=None,
-                delivery_claimed_at=None,
+            return job.mark_delivered(
                 updated_at=now,
-                voice_question=questions.envelope(question, QuestionState.DEFERRED),
+                voice_question=questions.envelope(
+                    question, QuestionState.DEFERRED, job=job
+                ),
             )
         if resolution.outcome == AnswerOutcome.AMBIGUOUS:
             immediate = (
@@ -1539,7 +1546,9 @@ def reply_job(
                 JobStatus.CANCELLED,
                 now=now,
                 result=f"Cursor job {job_id} was cancelled.",
-                voice_question=questions.envelope(question, QuestionState.CANCELLED),
+                voice_question=questions.envelope(
+                    question, QuestionState.CANCELLED, job=job
+                ),
                 job_changes=(
                     {"plan_approval_state": "rejected"}
                     if question.owner == "workflow_plan_approval"
@@ -1558,6 +1567,7 @@ def reply_job(
                 voice_question=questions.envelope(
                     question,
                     QuestionState.RESOLVED,
+                    job=job,
                     answer=resolution.answer,
                     trusted_answer=resolution.trusted_answer,
                     answered_at=now,
@@ -1605,6 +1615,7 @@ def start_follow_up(
     parent_job_id: str,
     text: str,
     *,
+    expected_parent_revision: int,
     expected_completed_at: float | None = None,
     utterance: str | None = None,
     on_created: Callable[[], None] | None = None,
@@ -1656,7 +1667,10 @@ def start_follow_up(
         )
 
     created = store.create_follow_up(
-        parent_job_id, build, expected_completed_at=expected_completed_at
+        parent_job_id,
+        build,
+        expected_parent_revision=expected_parent_revision,
+        expected_completed_at=expected_completed_at,
     )
     if on_created is not None:
         on_created()
@@ -1747,7 +1761,7 @@ def cancel_job(
             result=f"Cursor job {job_id} was cancelled.",
             clear_worker=legacy_worker_stopped,
             voice_question=(
-                questions.envelope(question, QuestionState.CANCELLED)
+                questions.envelope(question, QuestionState.CANCELLED, job=job)
                 if question is not None
                 else None
             ),
@@ -1846,12 +1860,7 @@ def resolve_manual_reconciliation(
 
 def mark_delivered(job_id: str) -> CursorJob:
     def deliver(job: CursorJob) -> CursorJob:
-        return job.evolve(
-            delivered=True,
-            delivery_claim_token=None,
-            delivery_claimed_at=None,
-            delivery_retry_at=0,
-        )
+        return job.mark_delivered()
 
     delivered = _job_store().update(job_id, deliver)
     assert delivered is not None
@@ -2279,15 +2288,7 @@ def dismiss_announcement(job_id: str) -> str:
     def dismiss(job: CursorJob) -> CursorJob | None:
         if job.announcement_dismissed and job.delivered:
             return None
-        return job.evolve(
-            announcement_dismissed=True,
-            announcement_ack=AnnouncementAck.DISMISSED.value,
-            delivered=True,
-            delivery_claim_token=None,
-            delivery_claimed_at=None,
-            delivery_retry_at=0,
-            delivered_at=now,
-        )
+        return job.dismiss_announcement(delivered_at=now)
 
     updated = _job_store().update(job_id, dismiss)
     label = inbox.speakable_label_for(updated or read_job(job_id))
@@ -2300,11 +2301,7 @@ def repeat_announcement(job_id: str) -> str:
     def repeat(job: CursorJob) -> CursorJob | None:
         if job.status not in ANNOUNCEABLE_STATUSES:
             return None
-        return job.evolve_for_delivery(
-            now=now,
-            announcement_repeated=True,
-            announcement_dismissed=False,
-        )
+        return job.repeat_announcement(now=now)
 
     updated = _job_store().update(job_id, repeat)
     if updated is None:
@@ -2370,11 +2367,13 @@ def cursor_turn(
         expected_question_turn = request.expected_question_turn
         answer_provenance = request.answer_provenance
         expected_completed_at = request.expected_completed_at
+        expected_parent_revision = request.expected_parent_revision
         on_follow_up_started = request.on_follow_up_started
         on_job_started = request.on_job_started
     else:
         text = request
         expected_completed_at = None
+        expected_parent_revision = None
     if action == "list":
         return CursorTurnResult(list_jobs(), session_id)
     if action == "missed":
@@ -2481,9 +2480,14 @@ def cursor_turn(
                 "I don't have a recent completed Cursor job to follow up on.", None
             )
         try:
+            if expected_parent_revision is None:
+                raise FollowUpUnavailable(
+                    "follow-up parent revision identity is required"
+                )
             job_id = start_follow_up(
                 job_id,
                 text,
+                expected_parent_revision=expected_parent_revision,
                 expected_completed_at=expected_completed_at,
                 utterance=utterance,
                 on_created=on_follow_up_started,
@@ -2741,11 +2745,10 @@ def _await_foreground(
                 )
             return result
         time.sleep(0.1)
-    updated = _job_store().update(
-        job_id,
-        lambda job: job.evolve(foreground_until=0, updated_at=time.time()),
-    )
-    job = updated if updated is not None else read_job(job_id)
+    # The timestamp expires naturally. Persisting a cosmetic zero here would
+    # advance the lifecycle revision while a worker is awaiting an external
+    # callback, causing that correctly fenced callback to look stale.
+    job = read_job(job_id)
     result = _foreground_delivery_result(job_id, job, delivery_claims)
     if result is not None:
         if job.status == JobStatus.COMPLETED:

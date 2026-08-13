@@ -25,6 +25,8 @@ The launcher sets `XDG_CONFIG_HOME` to `.dev/config`, `XDG_STATE_HOME` to
 branch-specific backend configuration belongs at
 `.dev/config/voice-harness/backends.toml`, durable jobs are stored below
 `.dev/state/voice-harness/`, and launcher dependencies stay in `.dev/venv`.
+The checkout-local jobs database is explicitly
+`<checkout>/.dev/state/voice-harness/jobs/jobs.sqlite3`.
 Existing `VOICE_HARNESS_*` values are inherited, so temporary overrides remain
 available:
 

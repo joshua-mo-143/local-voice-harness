@@ -17,6 +17,7 @@ from local_voice_harness.cursor.model import (
     JobValidationError,
     transition,
 )
+from local_voice_harness.cursor.operations import WorkerOwnership
 from local_voice_harness.cursor.recovery import stage_terminal_intent
 from local_voice_harness.cursor.store import (
     ActiveTicketConflict,
@@ -128,6 +129,51 @@ class CursorStoreIntegrationTests(unittest.TestCase):
             0,
             "Stale output.",
             expected_worker_token="old-worker",
+            expected_revision=0,
+            expected_turn_token="turn-1",
+            expected_phase="planning",
+            expected_prior_reference=None,
+            change=lambda job, reference: job.evolve(plan_artifact=reference),
+        )
+
+        self.assertIsNone(published)
+        self.assertFalse((self.jobs_dir / ".artifacts").exists())
+
+    def test_same_owner_stale_revision_cannot_publish_artifact(self) -> None:
+        store = JobStore(self.jobs_dir, self.jobs_dir / "legacy")
+        store.create(
+            CursorJob.from_dict(
+                self.job(
+                    "123456789abc",
+                    status="running",
+                    workflow_tier="medium",
+                    workflow_classification_reason="cross-component",
+                    workflow_phase="planning",
+                    active_participant="planner",
+                    planner_target="planner",
+                    herdr_target="planner",
+                    turn_token="turn-1",
+                    workflow_turn_phase="planning",
+                )
+            )
+        )
+        store.update("123456789abc", lambda job: job.evolve(reconcile=True))
+        ownership = WorkerOwnership(
+            "claim-123456789abc",
+            42,
+            "boot",
+            "start-123456789abc",
+            "test",
+            1,
+        )
+
+        published = store.publish_artifact(
+            "123456789abc",
+            "plan",
+            0,
+            "Stale output.",
+            expected_worker_token=ownership,
+            expected_revision=0,
             expected_turn_token="turn-1",
             expected_phase="planning",
             expected_prior_reference=None,
@@ -170,7 +216,15 @@ class CursorStoreIntegrationTests(unittest.TestCase):
             "plan",
             0,
             "Stale output.",
-            expected_worker_token="claim-123456789abc",
+            expected_worker_token=WorkerOwnership(
+                "claim-123456789abc",
+                42,
+                "boot",
+                "start-123456789abc",
+                "test",
+                1,
+            ),
+            expected_revision=0,
             expected_turn_token="turn-1",
             expected_phase="planning",
             expected_prior_reference=None,
@@ -205,7 +259,15 @@ class CursorStoreIntegrationTests(unittest.TestCase):
             "plan",
             0,
             "Preserve the fence.",
-            expected_worker_token="claim-123456789abc",
+            expected_worker_token=WorkerOwnership(
+                "claim-123456789abc",
+                42,
+                "boot",
+                "start-123456789abc",
+                "test",
+                1,
+            ),
+            expected_revision=0,
             expected_turn_token="turn-1",
             expected_phase="planning",
             expected_prior_reference=None,
@@ -338,9 +400,21 @@ class CursorStoreIntegrationTests(unittest.TestCase):
                     "worker_pid": 42,
                     "worker_boot_id": "boot",
                     "worker_process_start": f"start-{job_id}",
+                    "worker_claim_operation": "test",
+                    "worker_claimed_at": 1,
                 }
             )
         value.update(fields)
+        if value.get("agent_dispatch_state") is not None and value.get("herdr_target"):
+            value.setdefault("agent_operation_checkout", "/checkout")
+            value.setdefault("herdr_workspace_id", "workspace")
+            value.setdefault("herdr_pane_id", "pane")
+            value.setdefault("agent_provider", "cursor/herdr")
+            value.setdefault(
+                "agent_provider_session_id",
+                f"session-{value['herdr_target']}",
+            )
+            value.setdefault("agent_state_sequence", 1)
         return value
 
     def write(self, job: dict[str, object]) -> None:
@@ -527,13 +601,13 @@ class CursorStoreIntegrationTests(unittest.TestCase):
                         self.assertNotIn("schema_version", legacy)
                     else:
                         self.assertEqual(legacy["schema_version"], version)
-                    legacy.update({"result": "new result", "revision": 1})
+                    legacy.update({"revision": 1})
                     write_unlocked(path, legacy)
 
                 persisted = json.loads(path.read_text())
                 self.assertEqual(persisted["schema_version"], CURRENT_SCHEMA_VERSION)
                 self.assertEqual(persisted["revision"], 1)
-                self.assertEqual(persisted["result"], "new result")
+                self.assertEqual(persisted["result"], "old result")
                 self.assertIn("created_at", persisted)
                 self.assertIn("delivered", persisted)
 
@@ -542,7 +616,7 @@ class CursorStoreIntegrationTests(unittest.TestCase):
         job.pop("worker_boot_id")
 
         with self.assertRaisesRegex(
-            JobValidationError, "routing job requires complete worker ownership"
+            JobValidationError, "worker ownership is incomplete"
         ):
             self.write(job)
 
@@ -563,6 +637,8 @@ class CursorStoreIntegrationTests(unittest.TestCase):
             "worker_token": "claim",
             "worker_pid": 42,
             "worker_process_start": "start",
+            "worker_claim_operation": "test",
+            "worker_claimed_at": 1,
         }
 
         with locked(self.jobs_dir):
@@ -570,11 +646,10 @@ class CursorStoreIntegrationTests(unittest.TestCase):
             persisted = read_unlocked(path)
 
         self.assertEqual(persisted["schema_version"], CURRENT_SCHEMA_VERSION)
-        self.assertEqual(persisted["status"], "failed")
-        self.assertIsNone(persisted["worker_token"])
-        self.assertIsNone(persisted["worker_pid"])
-        self.assertIsNone(persisted["worker_boot_id"])
-        self.assertIn("manual recovery", str(persisted["error"]))
+        self.assertEqual(persisted["status"], "running")
+        self.assertEqual(persisted["worker_token"], "claim")
+        self.assertEqual(persisted["worker_pid"], 42)
+        self.assertEqual(persisted["worker_boot_id"], "legacy-unknown")
 
     def test_legacy_runtime_import_is_idempotent_and_leaves_logs_transient(
         self,
@@ -596,6 +671,8 @@ class CursorStoreIntegrationTests(unittest.TestCase):
                     "worker_token": "claim",
                     "worker_pid": 42,
                     "worker_process_start": "start",
+                    "worker_claim_operation": "test",
+                    "worker_claimed_at": 1,
                 }
             )
         )
@@ -752,6 +829,8 @@ class CursorStoreIntegrationTests(unittest.TestCase):
                     "delivered": False,
                     "worker_pid": 42,
                     "worker_process_start": "start",
+                    "worker_claim_operation": "test",
+                    "worker_claimed_at": 1,
                 }
             )
         )
@@ -951,6 +1030,8 @@ class CursorStoreIntegrationTests(unittest.TestCase):
             worker_pid=42,
             worker_boot_id="boot",
             worker_process_start="start",
+            worker_claim_operation="test",
+            worker_claimed_at=1,
         )
         malformed["parent_job_id"] = "invalid"
         (self.jobs_dir / "aaaaaaaaaaaa.json").write_text(json.dumps(malformed))
@@ -1098,16 +1179,17 @@ class CursorStoreIntegrationTests(unittest.TestCase):
         with self.assertWarns(JobQuarantineWarning):
             updated = store.update(
                 "aaaaaaaaaaaa",
-                lambda current: transition(
+                lambda current: stage_terminal_intent(
                     current,
                     JobStatus.CANCELLED,
+                    now=2,
                     result="cancelled",
-                    completed_at=2,
-                    target_release_pending=True,
                 ),
             )
 
         assert updated is not None
+        self.assertEqual(updated.status, JobStatus.RECONCILING)
+        self.assertEqual(updated.terminal_intent_status, JobStatus.CANCELLED)
         self.assertTrue(updated.target_release_pending)
 
     def test_unknown_quarantine_blocks_any_new_reservation(self) -> None:
@@ -1333,6 +1415,8 @@ class CursorStoreIntegrationTests(unittest.TestCase):
                     "worker_pid": 42,
                     "worker_boot_id": "boot",
                     "worker_process_start": "start",
+                    "worker_claim_operation": "test",
+                    "worker_claimed_at": 1,
                 },
             ),
         )
@@ -1496,6 +1580,8 @@ class CursorStoreIntegrationTests(unittest.TestCase):
                 worker_pid=42,
                 worker_boot_id="boot",
                 worker_process_start="start",
+                worker_claim_operation="test",
+                worker_claimed_at=1,
             ),
         )
 
@@ -1563,6 +1649,8 @@ class CursorStoreIntegrationTests(unittest.TestCase):
                         worker_pid=42,
                         worker_boot_id="boot",
                         worker_process_start="start",
+                        worker_claim_operation="test",
+                        worker_claimed_at=1,
                     ),
                 )
             )

@@ -12,7 +12,8 @@ import pytest
 from local_voice_harness import user_config
 from local_voice_harness.cursor import provisioning, questions, recovery, service
 from local_voice_harness.cursor.delivery import claim_delivery
-from local_voice_harness.cursor.model import CursorJob, JobStatus
+from local_voice_harness.cursor.model import CursorJob, JobStatus, JobValidationError
+from local_voice_harness.cursor.operations import WorkerOwnership
 from local_voice_harness.cursor.service import CursorTurnRequest, cursor_turn
 from local_voice_harness.cursor.store import JobStore
 from local_voice_harness.errors import HarnessError
@@ -42,6 +43,12 @@ def store(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> JobStore:
     monkeypatch.setattr(service, "JOBS_DIR", jobs)
     monkeypatch.setattr(service, "LEGACY_JOBS_DIR", legacy)
     return JobStore(jobs, legacy)
+
+
+def _owner(job: CursorJob) -> WorkerOwnership:
+    owner = job.worker_ownership
+    assert owner is not None
+    return owner
 
 
 def _question(
@@ -183,6 +190,11 @@ def _plan_approval_awaiting(store: JobStore) -> CursorJob:
                 "planner_target": "planner",
                 "active_participant": "planner",
                 "voice_question": pending.to_dict(),
+                "plan_approval_state": "boundary",
+                "plan_approval_id": "gate-id",
+                "plan_approval_agent_session": "planner-session",
+                "plan_approval_state_change_sequence": 7,
+                "plan_approval_revision": 3,
             }
         )
     )
@@ -204,9 +216,8 @@ def _plan_approval_awaiting(store: JobStore) -> CursorJob:
             review_approved=True,
             review_approval_source="reviewer",
             plan_approval_state="awaiting",
-            plan_approval_id="gate-id",
-            plan_approval_agent_session="planner-session",
-            plan_approval_state_change_sequence=7,
+            plan_approval_plan_artifact=plan_reference,
+            plan_approval_review_artifact=review_reference,
         ),
     )
     assert updated is not None
@@ -407,6 +418,37 @@ def test_answer_later_persists_without_launching(store: JobStore) -> None:
     assert deferred.state == QuestionState.DEFERRED
 
 
+def test_answer_later_is_idempotent_for_deferred_question(store: JobStore) -> None:
+    original = _awaiting(store)
+    first = cursor_turn(
+        CursorTurnRequest(
+            "answer later",
+            action="reply",
+            job_id=original.id,
+            expected_question_id="question-1",
+            expected_question_turn="aaaaaaaaaaaa-1",
+        )
+    )
+
+    with mock.patch.object(service, "launch_worker") as launch:
+        second = cursor_turn(
+            CursorTurnRequest(
+                "answer later",
+                action="reply",
+                job_id=original.id,
+                expected_question_id="question-1",
+                expected_question_turn="aaaaaaaaaaaa-1",
+            )
+        )
+
+    launch.assert_not_called()
+    assert first.session_id is None
+    assert second.session_id is None
+    deferred = questions.current(store.get(original.id))
+    assert deferred is not None
+    assert deferred.state == QuestionState.DEFERRED
+
+
 def test_repeat_returns_same_question_without_mutation(store: JobStore) -> None:
     original = _awaiting(store)
 
@@ -445,6 +487,42 @@ def test_natural_plan_approval_queues_fenced_planner_prompt(
     assert updated.plan_approval_source == "explicit"
     assert updated.herdr_target == "planner"
     launch.assert_called_once_with(original.id)
+
+
+def test_awaiting_plan_approval_rejects_replacement_artifacts(
+    store: JobStore,
+) -> None:
+    original = _plan_approval_awaiting(store)
+    replacement_plan = "Implement a materially different feature."
+    plan_reference = store.write_artifact(
+        original.id,
+        "plan",
+        0,
+        replacement_plan,
+    )
+    review_reference = store.write_artifact(
+        original.id,
+        "review",
+        0,
+        "The replacement is safe.",
+        source_text=replacement_plan,
+    )
+
+    with pytest.raises(
+        JobValidationError,
+        match="accepted plan approval artifacts cannot be replaced",
+    ):
+        store.update(
+            original.id,
+            lambda current: current.evolve(
+                plan_artifact=plan_reference,
+                review_artifact=review_reference,
+            ),
+        )
+
+    unchanged = store.get(original.id)
+    assert unchanged.plan_artifact == original.plan_artifact
+    assert unchanged.review_artifact == original.review_artifact
 
 
 def test_ambiguous_plan_approval_reprompts_without_mutation(store: JobStore) -> None:
@@ -616,6 +694,7 @@ def test_third_accepted_approval_offers_auto_after_implementation(
                 "plan_approval_id": "gate-id",
                 "plan_approval_agent_session": "planner-session",
                 "plan_approval_state_change_sequence": 7,
+                "plan_approval_revision": 3,
             }
         )
     )
@@ -628,7 +707,7 @@ def test_third_accepted_approval_offers_auto_after_implementation(
         "The plan is safe.",
         source_text=plan,
     )
-    job = store.update(
+    approved = store.update(
         created.id,
         lambda current: current.evolve(
             workflow_phase="implementing",
@@ -638,19 +717,27 @@ def test_third_accepted_approval_offers_auto_after_implementation(
             review_decision="approve",
             review_approved=True,
             review_approval_source="reviewer",
-            plan_approval_state="observed",
+            plan_approval_state="approved",
             plan_approval_source="explicit",
             plan_approval_counted=True,
+            plan_approval_plan_artifact=plan_reference,
+            plan_approval_review_artifact=review_reference,
         ),
+    )
+    assert approved is not None
+    job = store.update(
+        created.id,
+        lambda current: current.evolve_plan_approval(current.plan_approval.observe()),
     )
     assert job is not None
 
     provisioning._worker_complete(
         store,
         job.id,
-        "worker",
+        _owner(job),
         output="VOICE_SUMMARY[aaaaaaaaaaaa-4]: done",
         agent_status="idle",
+        expected_revision=job.revision,
     )
 
     offered = store.get(job.id)
@@ -889,6 +976,8 @@ def test_planned_dispatch_recovers_same_turn_and_answer(
             worker_pid=42,
             worker_boot_id="old-boot",
             worker_process_start="old-start",
+            worker_claim_operation="test-recovery",
+            worker_claimed_at=2,
         ),
     )
     assert crashed is not None
@@ -933,6 +1022,8 @@ def test_submitted_dispatch_retries_only_after_repeated_absence(
             worker_pid=42,
             worker_boot_id="old-boot",
             worker_process_start="old-start",
+            worker_claim_operation="test-recovery",
+            worker_claimed_at=2,
         ),
     )
     running = store.update(
@@ -990,6 +1081,8 @@ def test_observed_dispatch_recovers_by_reading_without_resubmission(
             worker_pid=42,
             worker_boot_id="old-boot",
             worker_process_start="old-start",
+            worker_claim_operation="test-recovery",
+            worker_claimed_at=2,
         ),
     )
     store.update(
@@ -1084,15 +1177,54 @@ def test_successful_cleanup_resolves_dispatched_question(store: JobStore) -> Non
     provisioning._worker_complete(
         store,
         job.id,
-        "worker",
+        _owner(job),
         output="VOICE_SUMMARY[aaaaaaaaaaaa-2]: completed",
         agent_status="idle",
+        expected_revision=job.revision,
     )
 
     resolved = questions.current(store.get(job.id))
     assert resolved is not None
     assert resolved.state == QuestionState.RESOLVED
     assert resolved.prompt_state == PromptOperationState.RESOLVED
+
+
+def test_same_owner_stale_worker_revision_cannot_ask_question(
+    store: JobStore,
+) -> None:
+    job = store.create(
+        CursorJob.from_dict(
+            {
+                "id": "aaaaaaaaaaaa",
+                "request": "build the feature",
+                "status": JobStatus.RUNNING.value,
+                "created_at": 1,
+                "turn": 1,
+                "turn_token": "aaaaaaaaaaaa-1",
+                "worker_token": "worker",
+                "worker_pid": 42,
+                "worker_boot_id": "boot",
+                "worker_process_start": "start",
+                "worker_claim_operation": "run",
+                "worker_claimed_at": 1,
+                "herdr_target": "retained-agent",
+            }
+        )
+    )
+    store.update(job.id, lambda current: current.evolve(reconcile=True))
+
+    provisioning._worker_question(
+        store,
+        job.id,
+        _owner(job),
+        "Which approach should I use?",
+        expected_revision=job.revision,
+        clarification_kind="agent",
+    )
+
+    current = store.get(job.id)
+    assert current.status == JobStatus.RUNNING
+    assert current.question is None
 
 
 def test_structured_agent_question_becomes_durable_envelope() -> None:
@@ -1248,8 +1380,9 @@ def test_interactive_questionnaire_error_persists_blocked_status(
     provisioning._worker_error(
         store,
         running.id,
-        "worker",
+        _owner(running),
         HerdrError("questionnaire", code="interactive_questionnaire"),
+        expected_revision=running.revision,
         prompt_may_be_active=True,
     )
 

@@ -5,16 +5,19 @@ from __future__ import annotations
 import re
 import uuid
 from collections.abc import Mapping
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from typing import Any, Protocol
 
 from ..integrations.linear import LinearError, LinearIntegration
 from ..questions import (
     AnswerResolution,
     Question,
+    QuestionIdentity,
     QuestionOrigin,
     QuestionSpec,
     QuestionState,
+    question_identity,
+    transition_question,
 )
 from ..user_config import (
     PlanApprovalMode,
@@ -28,6 +31,7 @@ from .model import (
     WorkflowPhase,
     WorkflowTier,
 )
+from .workflow import PlanApprovalSource, ReviewApprovalSource
 
 FIELD = "voice_question"
 
@@ -91,6 +95,26 @@ def ask(
         ),
     }
     changes.update(job_changes or {})
+    if (
+        owner == "workflow_plan_approval"
+        and changes.get("plan_approval_state") == "awaiting"
+    ):
+        approval = job.plan_approval.await_question(
+            question_id=question.id,
+            question_turn_token=question.origin.turn_token,
+            plan_reference=str(changes.get("plan_artifact") or job.plan_artifact or ""),
+            review_reference=str(
+                changes.get("review_artifact") or job.review_artifact or ""
+            ),
+            review_accepted=bool(changes.get("review_approved", job.review_approved)),
+        )
+        changes.update(
+            plan_approval_state=approval.state.value,
+            plan_approval_source=None,
+            plan_approval_plan_artifact=approval.plan_reference,
+            plan_approval_review_artifact=approval.review_reference,
+            plan_approval_counted=approval.counted,
+        )
     if clear_worker:
         return job.evolve_for_delivery(
             now=now,
@@ -116,14 +140,30 @@ def with_state(
     state: QuestionState,
     **changes: object,
 ) -> CursorJob:
-    updated = replace(question, state=state, **changes)
+    updated = transition_question(
+        question,
+        state,
+        QuestionIdentity(job.id, question.id, question.origin.turn_token),
+        **changes,
+    )
     return job.evolve(voice_question=updated.to_dict())
 
 
 def envelope(
-    question: Question, state: QuestionState, **changes: object
+    question: Question,
+    state: QuestionState,
+    *,
+    job: CursorJob | None = None,
+    **changes: object,
 ) -> dict[str, object]:
-    return replace(question, state=state, **changes).to_dict()
+    identity = question_identity(question)
+    if job is not None:
+        identity = QuestionIdentity(
+            job.id,
+            identity.question_id,
+            identity.turn_token,
+        )
+    return transition_question(question, state, identity, **changes).to_dict()
 
 
 @dataclass(frozen=True, slots=True)
@@ -154,6 +194,7 @@ class AnswerHandler(Protocol):
 
 
 def _answered_envelope(
+    job: CursorJob,
     question: Question,
     resolution: AnswerResolution,
     now: float,
@@ -161,6 +202,7 @@ def _answered_envelope(
     return envelope(
         question,
         QuestionState.ANSWERED,
+        job=job,
         answer=resolution.answer,
         trusted_answer=resolution.trusted_answer,
         answered_at=now,
@@ -211,13 +253,10 @@ def _queue_answer(
     linear_ticket_create_confirmed: bool | None = None,
     clear_target: bool = False,
 ) -> CursorJob:
-    return job.evolve(
+    return job.mark_delivered(
         status=JobStatus.QUEUED,
         question=None,
         clarification_kind=None,
-        delivered=True,
-        delivery_claim_token=None,
-        delivery_claimed_at=None,
         queued_at=context.now,
         updated_at=context.now,
         foreground_until=context.foreground_until,
@@ -256,7 +295,7 @@ def _queue_answer(
             *job.clarifications,
             _clarification_record(job, question, resolution, context),
         ],
-        voice_question=_answered_envelope(question, resolution, context.now),
+        voice_question=_answered_envelope(job, question, resolution, context.now),
     )
 
 
@@ -440,6 +479,7 @@ def _fork_confirmation_answer(
         voice_question=envelope(
             question,
             QuestionState.RESOLVED,
+            job=job,
             answer="no",
             trusted_answer=context.trusted_text or context.text,
             answered_at=context.now,
@@ -496,6 +536,7 @@ def _github_issue_create_confirmation_answer(
         voice_question=envelope(
             question,
             QuestionState.RESOLVED,
+            job=job,
             answer="no",
             trusted_answer=context.trusted_text,
             answered_at=context.now,
@@ -588,6 +629,7 @@ def _linear_ticket_create_confirmation_answer(
         voice_question=envelope(
             question,
             QuestionState.RESOLVED,
+            job=job,
             answer="no",
             trusted_answer=context.trusted_text,
             answered_at=context.now,
@@ -668,7 +710,7 @@ def _workflow_queue_answer(
         "prompt_operation_turn": None,
         "prompt_operation_target": None,
         "prompt_baseline_sequence": None,
-        "voice_question": _answered_envelope(question, resolution, context.now),
+        "voice_question": _answered_envelope(job, question, resolution, context.now),
     }
     if workflow_phase is not None:
         changes["workflow_phase"] = workflow_phase
@@ -736,6 +778,8 @@ def _workflow_review_answer(
                 "plan_approval_id": None,
                 "plan_approval_source": None,
                 "plan_approval_agent_session": None,
+                "plan_approval_plan_artifact": None,
+                "plan_approval_review_artifact": None,
                 "plan_approval_state_change_sequence": None,
                 "plan_approval_revision": None,
                 "plan_approval_counted": False,
@@ -767,6 +811,13 @@ def _workflow_review_exhausted_answer(
             None,
             message="The reviewed Plan Mode boundary is no longer available.",
         )
+    approved_review = job.review_state.approve_exhausted()
+    approval = job.plan_approval.approve(
+        PlanApprovalSource.EXPLICIT,
+        plan_reference=job.plan_artifact or "",
+        review_reference=job.review_artifact or "",
+        review_accepted=approved_review.approved,
+    )
     return AnswerTransition(
         _workflow_queue_answer(
             job,
@@ -775,12 +826,14 @@ def _workflow_review_exhausted_answer(
             context,
             continuation=False,
             workflow_phase=WorkflowPhase.IMPLEMENTING.value,
-            review_approved=True,
-            review_approval_source="user",
+            review_approved=approved_review.approved,
+            review_approval_source=ReviewApprovalSource.USER.value,
             extra_changes={
-                "plan_approval_state": "approved",
-                "plan_approval_source": "explicit",
-                "plan_approval_counted": False,
+                "plan_approval_state": approval.state.value,
+                "plan_approval_source": PlanApprovalSource.EXPLICIT.value,
+                "plan_approval_plan_artifact": approval.plan_reference,
+                "plan_approval_review_artifact": approval.review_reference,
+                "plan_approval_counted": approval.counted,
             },
         ),
         launch=True,
@@ -813,6 +866,14 @@ def _workflow_plan_approval_answer(
             None,
             message="That reviewed Plan Mode boundary is no longer available.",
         )
+    approval = job.plan_approval.approve(
+        PlanApprovalSource.EXPLICIT,
+        plan_reference=job.plan_artifact,
+        review_reference=job.review_artifact or "",
+        review_accepted=job.review_approved,
+        question_id=question.id,
+        question_turn_token=question.origin.turn_token,
+    )
     return AnswerTransition(
         _workflow_queue_answer(
             job,
@@ -822,9 +883,11 @@ def _workflow_plan_approval_answer(
             continuation=False,
             workflow_phase=WorkflowPhase.IMPLEMENTING.value,
             extra_changes={
-                "plan_approval_state": "approved",
-                "plan_approval_source": "explicit",
-                "plan_approval_counted": False,
+                "plan_approval_state": approval.state.value,
+                "plan_approval_source": PlanApprovalSource.EXPLICIT.value,
+                "plan_approval_plan_artifact": approval.plan_reference,
+                "plan_approval_review_artifact": approval.review_reference,
+                "plan_approval_counted": approval.counted,
             },
         ),
         launch=True,

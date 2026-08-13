@@ -13,14 +13,22 @@ import time
 import warnings
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Literal
 
 from ..integrations.github import GitHubError, load_github_provider_state
+from ..job_lifecycle import (
+    FollowUpEvent,
+    JobLifecycleError,
+    QueuedJob,
+    WorkerCallbackEvent,
+    apply_follow_up,
+)
 from .model import (
     ACTIVE_STATUSES,
     CURRENT_SCHEMA_VERSION,
+    LEGACY_BOOT_ID,
     TERMINAL_STATUSES,
     CursorJob,
     JobStatus,
@@ -28,6 +36,7 @@ from .model import (
     validate_reservations,
     validate_transition,
 )
+from .operations import WorkerOwnership
 from .sqlite_store import SQLiteJobDatabase, fsync_database_directory
 
 DELIVERED_JOB_RETENTION_SECONDS = 7 * 24 * 60 * 60
@@ -826,7 +835,17 @@ def _read_model_unlocked(path: Path) -> CursorJob:
 
 
 def read_unlocked(path: Path) -> dict[str, object]:
-    return _read_model_unlocked(path).to_dict(preserve_loaded_version=True)
+    model = _read_model_unlocked(path)
+    raw = json.loads(path.read_text())
+    assert isinstance(raw, dict)
+    persisted_version = raw.get("schema_version", 0)
+    return model.to_dict(
+        preserve_loaded_version=(
+            isinstance(persisted_version, int)
+            and not isinstance(persisted_version, bool)
+            and persisted_version < CURRENT_SCHEMA_VERSION
+        )
+    )
 
 
 def _peer_models_unlocked(path: Path) -> list[CursorJob]:
@@ -991,6 +1010,7 @@ def _normalize_for_durable_write(
         candidate.loaded_schema_version < CURRENT_SCHEMA_VERSION
         and candidate.status
         in {JobStatus.ROUTING, JobStatus.RUNNING, JobStatus.RECONCILING}
+        and candidate.terminal_intent_status is None
         and not any(
             value is not None
             for value in (
@@ -1016,12 +1036,29 @@ def _normalize_for_durable_write(
             "absent",
             "stopped",
         }
-        values.update(
-            worker_token=None,
-            worker_pid=None,
-            worker_boot_id=None,
-            worker_process_start=None,
-        )
+        if active and legacy_worker_disposition is None and not legacy_unowned_active:
+            # Keep an unresolved imported owner as explicit canonical evidence.
+            # Cancellation/nuke must inspect this fence before releasing it.
+            values.update(
+                worker_token=candidate.worker_token or LEGACY_BOOT_ID,
+                worker_pid=candidate.worker_pid or 1,
+                worker_boot_id=LEGACY_BOOT_ID,
+                worker_process_start=(candidate.worker_process_start or LEGACY_BOOT_ID),
+                worker_claim_operation=(
+                    values.get("worker_claim_operation") or "legacy_import"
+                ),
+                worker_claimed_at=values.get("worker_claimed_at")
+                or candidate.created_at,
+            )
+        else:
+            values.update(
+                worker_token=None,
+                worker_pid=None,
+                worker_boot_id=None,
+                worker_process_start=None,
+                worker_claim_operation=None,
+                worker_claimed_at=None,
+            )
         if active and safely_cleared:
             values.update(
                 status=JobStatus.QUEUED.value,
@@ -1030,7 +1067,7 @@ def _normalize_for_durable_write(
                     candidate.herdr_target or candidate.has_uncertain_operation()
                 ),
             )
-        elif active:
+        elif active and legacy_worker_disposition is not None:
             message = (
                 "Legacy Cursor worker ownership could not be verified safely; "
                 "manual recovery is required."
@@ -1048,13 +1085,70 @@ def _normalize_for_durable_write(
             target_release_owner_boot_id=None,
             target_release_owner_start=None,
         )
+    if candidate.loaded_schema_version < CURRENT_SCHEMA_VERSION:
+        if (
+            values.get("agent_identity_legacy_compatible")
+            and values.get("agent_dispatch_state") in {"ready", "retained"}
+            and not (
+                values.get("agent_provider") and values.get("agent_provider_session_id")
+            )
+        ):
+            values["agent_dispatch_state"] = "ambiguous"
+        if (
+            values.get("agent_dispatch_state") is None
+            and values.get("herdr_target")
+            and values.get("herdr_workspace_id")
+            and values.get("herdr_pane_id")
+        ):
+            raw_owners = values.get("participant_session_owners")
+            owners = list(raw_owners) if isinstance(raw_owners, list) else []
+            if not any(
+                isinstance(owner, dict)
+                and owner.get("target") == values["herdr_target"]
+                for owner in owners
+            ):
+                owners.append(
+                    {
+                        "provider": str(values.get("harness_kind") or "cursor"),
+                        "session_id": str(
+                            values.get("session_id") or values["herdr_target"]
+                        ),
+                        "target": str(values["herdr_target"]),
+                        "state_sequence": 0,
+                        "checkout": str(
+                            values.get("worktree_path")
+                            or values.get("repository")
+                            or "legacy-unknown"
+                        ),
+                        "workspace_id": str(values["herdr_workspace_id"]),
+                        "pane_id": str(values["herdr_pane_id"]),
+                    }
+                )
+                values["participant_session_owners"] = owners
+        workspace_id = values.get("worktree_workspace_id")
+        root_pane_id = values.get("worktree_root_pane_id")
+        if bool(workspace_id) != bool(root_pane_id):
+            values.update(
+                worktree_workspace_id=workspace_id or LEGACY_BOOT_ID,
+                worktree_root_pane_id=root_pane_id or LEGACY_BOOT_ID,
+            )
+        if values.get("worktree_provision_state") in {"ready", "retained"} and (
+            not workspace_id or not root_pane_id
+        ):
+            values["worktree_provision_state"] = "ambiguous"
+    for field in (
+        "migration_source_schema_version",
+        "phase_prompt_active",
+        "agent_identity_legacy_compatible",
+    ):
+        values.pop(field, None)
     values["schema_version"] = CURRENT_SCHEMA_VERSION
     if candidate._compatibility_layout:
         values.pop("harness_kind", None)
         values.pop("session_id", None)
     normalized = CursorJob.from_dict(values)
     normalized.validate_invariants(require_worker_owner=True)
-    return normalized
+    return replace(normalized, _lifecycle_event=candidate._lifecycle_event)
 
 
 def write_unlocked(path: Path, job: dict[str, object]) -> None:
@@ -1264,9 +1358,15 @@ def _validate_follow_up_source(
         raise FollowUpUnavailable(
             f"Cursor job {parent.id} completion identity has changed"
         )
-    if not (parent.repository and parent.worktree_branch and parent.worktree_path):
+    if not (
+        parent.repository
+        and parent.worktree_branch
+        and parent.worktree_path
+        and parent.worktree_workspace_id
+        and parent.worktree_root_pane_id
+    ):
         raise FollowUpUnavailable(
-            f"Cursor job {parent.id} has no isolated worktree to reuse"
+            f"Cursor job {parent.id} has no complete isolated workspace to reuse"
         )
     if parent.worktree_provision_state not in {"ready", "retained"}:
         raise FollowUpUnavailable(
@@ -1292,9 +1392,45 @@ def _validate_follow_up_source(
         )
 
 
+def _validate_follow_up_event(
+    parent: CursorJob,
+    child: CursorJob,
+    expected_parent_revision: int,
+    expected_completed_at: float | None,
+) -> None:
+    child_lifecycle = child.lifecycle
+    if not isinstance(child_lifecycle, QueuedJob):
+        raise JobValidationError("follow-up child must begin queued")
+    assert parent.completed_at is not None
+    try:
+        apply_follow_up(
+            parent.lifecycle,
+            FollowUpEvent(
+                expected_parent_revision,
+                (
+                    expected_completed_at
+                    if expected_completed_at is not None
+                    else parent.completed_at
+                ),
+                child_lifecycle,
+            ),
+        )
+    except JobLifecycleError as exc:
+        raise JobValidationError(str(exc)) from exc
+
+
 JobCommand = Callable[[CursorJob], CursorJob | None]
 FollowUpBuilder = Callable[[CursorJob], CursorJob]
 ArtifactCommand = Callable[[CursorJob, str], CursorJob]
+
+
+def _worker_claim_matches(job: CursorJob, expected: WorkerOwnership | str) -> bool:
+    if isinstance(expected, WorkerOwnership):
+        try:
+            return expected.matches(job.worker_ownership)
+        except JobValidationError:
+            return False
+    return False
 
 
 class JsonJobStore:
@@ -1484,7 +1620,8 @@ class JsonJobStore:
         round_number: int,
         text: str,
         *,
-        expected_worker_token: str,
+        expected_worker_token: WorkerOwnership | str,
+        expected_revision: int,
         expected_turn_token: str,
         expected_phase: str,
         expected_prior_reference: str | None,
@@ -1510,7 +1647,8 @@ class JsonJobStore:
             field = "plan_artifact" if kind == "plan" else "review_artifact"
             if (
                 current.terminal_intent_status is not None
-                or current.worker_token != expected_worker_token
+                or current.revision != expected_revision
+                or not _worker_claim_matches(current, expected_worker_token)
                 or current.turn_token != expected_turn_token
                 or current.workflow_phase.value != expected_phase
                 or current.review_round != round_number
@@ -1547,6 +1685,14 @@ class JsonJobStore:
             _ensure_artifact_directory_unlocked(self.durable_dir, job_id)
             _exclusive_bytes(artifact_path, serialized)
             candidate = change(current, reference)
+            if isinstance(expected_worker_token, WorkerOwnership):
+                event = WorkerCallbackEvent(
+                    expected_revision,
+                    candidate.lifecycle,
+                    expected_worker_token,
+                )
+                current.validate_lifecycle_event(candidate, event)
+                candidate = replace(candidate, _lifecycle_event=event)
             if candidate.to_dict().get(field) != reference:
                 raise JobValidationError(
                     f"artifact publication must set {field} to the new reference"
@@ -1601,6 +1747,7 @@ class JsonJobStore:
         parent_job_id: str,
         build: FollowUpBuilder,
         *,
+        expected_parent_revision: int,
         expected_completed_at: float | None = None,
     ) -> CursorJob:
         """Atomically create a child job that reuses a completed parent checkout.
@@ -1624,6 +1771,9 @@ class JsonJobStore:
                 ) from exc
             _validate_follow_up_source(parent, expected_completed_at)
             child = build(parent)
+            _validate_follow_up_event(
+                parent, child, expected_parent_revision, expected_completed_at
+            )
             if child.parent_job_id != parent.id:
                 raise JobValidationError(
                     "follow-up child must reference its parent job id"
@@ -1929,6 +2079,7 @@ class JobStore:
             )
             if isinstance(value, str) and value
         }
+        targets.update(str(owner["target"]) for owner in job.participant_session_owners)
         rows.extend(
             ("target", target, "active or recovery-fenced target")
             for target in sorted(targets)
@@ -2076,8 +2227,7 @@ class JobStore:
                         raise JobValidationError(
                             "Cursor job id must match its filename"
                         )
-                    if not _has_legacy_worker_claim(candidate):
-                        _normalize_for_durable_write(candidate)
+                    _normalize_for_durable_write(candidate)
                 except JobValidationError as error:
                     blocked.add(source.stem)
                     invalid_sources.add(source)
@@ -2099,9 +2249,7 @@ class JobStore:
                         raise JobValidationError(
                             "Cursor job id must match its filename"
                         )
-                    preserve_legacy_owner = _has_legacy_worker_claim(candidate)
-                    if not preserve_legacy_owner:
-                        candidate = _normalize_for_durable_write(candidate)
+                    candidate = _normalize_for_durable_write(candidate)
                     try:
                         current_raw = self._db.load_job(connection, candidate.id)
                     except FileNotFoundError:
@@ -2135,14 +2283,19 @@ class JobStore:
                         _validate_quarantine_reservation_unlocked(
                             self.durable_dir, candidate, "worktree"
                         )
-                    if preserve_legacy_owner:
-                        self._db.save_job(
-                            connection,
-                            candidate.to_dict(preserve_loaded_version=True),
-                            reservations=self._reservation_rows(candidate),
+                    self._save(connection, candidate)
+                    projected = CursorJob.from_dict(
+                        self._db.load_job(connection, candidate.id)
+                    )
+                    projected.validate_invariants(require_worker_owner=True)
+                    if (
+                        projected.loaded_schema_version != CURRENT_SCHEMA_VERSION
+                        or projected.to_dict() != candidate.to_dict()
+                    ):
+                        raise JobValidationError(
+                            "legacy import relational projection is not a "
+                            "lossless native schema-v18 job"
                         )
-                    else:
-                        self._save(connection, candidate)
                     archived.append(source)
                 except (JobValidationError, sqlite3.IntegrityError) as error:
                     blocked.add(source.stem)
@@ -2204,7 +2357,7 @@ class JobStore:
         with _SQLITE_OPEN_LOCK:
             if self._ready:
                 return
-            self._db.initialize()
+            self._db.initialize(normalize_legacy=_normalize_for_durable_write)
             with self._locked_legacy_and_durable():
                 with self._db.transaction() as connection:
                     complete = self._db.meta(connection, "cutover_complete") == "1"
@@ -2347,7 +2500,7 @@ class JobStore:
             )
             claimed: list[CursorJob] = []
             for job in waiting[:free]:
-                candidate = job.evolve(participant_admission_state="held")
+                candidate = job.evolve_participant(job.participant_lifecycle.admit())
                 self._save(connection, candidate)
                 claimed.append(candidate)
             return tuple(claimed)
@@ -2490,7 +2643,8 @@ class JobStore:
         round_number: int,
         text: str,
         *,
-        expected_worker_token: str,
+        expected_worker_token: WorkerOwnership | str,
+        expected_revision: int,
         expected_turn_token: str,
         expected_phase: str,
         expected_prior_reference: str | None,
@@ -2505,7 +2659,8 @@ class JobStore:
             field = "plan_artifact" if kind == "plan" else "review_artifact"
             if (
                 current.terminal_intent_status is not None
-                or current.worker_token != expected_worker_token
+                or current.revision != expected_revision
+                or not _worker_claim_matches(current, expected_worker_token)
                 or current.turn_token != expected_turn_token
                 or current.workflow_phase.value != expected_phase
                 or current.review_round != round_number
@@ -2540,6 +2695,14 @@ class JobStore:
             _ensure_artifact_directory_unlocked(self.durable_dir, job_id)
             _exclusive_bytes(artifact_path, serialized)
             candidate = change(current, reference)
+            if isinstance(expected_worker_token, WorkerOwnership):
+                event = WorkerCallbackEvent(
+                    expected_revision,
+                    candidate.lifecycle,
+                    expected_worker_token,
+                )
+                current.validate_lifecycle_event(candidate, event)
+                candidate = replace(candidate, _lifecycle_event=event)
             if candidate.to_dict().get(field) != reference:
                 raise JobValidationError(
                     f"artifact publication must set {field} to the new reference"
@@ -2589,6 +2752,7 @@ class JobStore:
         parent_job_id: str,
         build: FollowUpBuilder,
         *,
+        expected_parent_revision: int,
         expected_completed_at: float | None = None,
     ) -> CursorJob:
         self._ensure_ready()
@@ -2608,6 +2772,9 @@ class JobStore:
                 ) from exc
             _validate_follow_up_source(parent, expected_completed_at)
             child = build(parent)
+            _validate_follow_up_event(
+                parent, child, expected_parent_revision, expected_completed_at
+            )
             if child.parent_job_id != parent.id:
                 raise JobValidationError(
                     "follow-up child must reference its parent job id"

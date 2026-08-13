@@ -8,11 +8,17 @@ import tempfile
 import threading
 import unittest
 from collections.abc import Callable
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, cast
 from unittest import mock
 
 from local_voice_harness import user_config
+from local_voice_harness.agents.harness import (
+    HarnessSession,
+    ReconciliationState,
+    SessionReconciliation,
+)
 from local_voice_harness.cursor import provisioning as production_jobs
 from local_voice_harness.cursor import service, worker_lifecycle
 from local_voice_harness.cursor.delivery import DeliveryClaim, DeliveryClaims
@@ -21,7 +27,9 @@ from local_voice_harness.cursor.model import (
     CursorJob,
     JobStatus,
     WorkflowParticipant,
+    WorkflowPhase,
 )
+from local_voice_harness.cursor.operations import WorkerOwnership
 from local_voice_harness.cursor.recovery import stage_terminal_intent
 from local_voice_harness.cursor.store import JobQuarantineWarning, JobStore
 from local_voice_harness.github_issue_creation import GitHubIssueDraft
@@ -47,6 +55,10 @@ from local_voice_harness.integrations.linear import (
 )
 from local_voice_harness.linear_ticket_creation import LinearTicketDraft
 from local_voice_harness.local_git import LocalGitRefChanged
+
+WORKER = WorkerOwnership("worker", 42, "boot", "start", "test", 1)
+WORKER_2 = WorkerOwnership("worker-2", 43, "boot-2", "start-2", "test", 1)
+LEGACY_WORKER = WorkerOwnership("worker", 42, "test-boot", "start", "test", 1)
 
 
 class _ProvisioningTestAdapter:
@@ -200,10 +212,14 @@ class _ProvisioningTestAdapter:
         *args: object,
         **kwargs: object,
     ) -> dict[str, object] | None:
+        owner = self._store().get(job_id).worker_ownership
+        if owner is None:
+            return None
+        claim = cast(Any, owner)
         result = production_jobs._prepare_pull_request_checkout(
             self._store(),
             job_id,
-            token,
+            claim,
             self._typed(raw),
             *cast(Any, args),
             **cast(Any, kwargs),
@@ -253,6 +269,33 @@ def configure_tiered_outcomes(
     tier: str = "simple",
 ) -> None:
     job_id = "123456789abc"
+    owned: dict[str, AgentSelection] = {}
+    initial = client.ensure_agent.return_value
+    if isinstance(initial, AgentSelection):
+        initial = replace(
+            initial,
+            worktree_path=initial.cwd,
+        )
+        owned[initial.target] = initial
+
+        def ensure_agent(repository: Path, **kwargs: object) -> AgentSelection:
+            branch = str(kwargs.get("worktree_branch") or "voice/test-checkout")
+            reserve_worktree = cast(Callable[..., None], kwargs["reserve_worktree"])
+            settle_worktree = cast(Callable[..., None], kwargs["settle_worktree"])
+            reserve = cast(Callable[[AgentSelection, bool], None], kwargs["reserve"])
+            settle = cast(Callable[[AgentSelection], None], kwargs["settle"])
+            checkout = Path(initial.worktree_path or initial.cwd)
+            reserve_worktree(repository, branch, checkout, "planned")
+            settle_worktree(
+                checkout,
+                initial.workspace_id,
+                f"root-{initial.pane_id}",
+            )
+            reserve(initial, True)
+            settle(initial)
+            return initial
+
+        client.ensure_agent.side_effect = ensure_agent
     outcomes = [
         PromptOutcome(
             "idle",
@@ -295,6 +338,27 @@ def configure_tiered_outcomes(
     )
     client.prompt_and_wait.side_effect = outcomes
 
+    def reconcile(target: str, *, expected_session_id: str) -> SessionReconciliation:
+        selection = owned[target]
+        return SessionReconciliation(
+            ReconciliationState.ACTIVE,
+            HarnessSession(
+                selection.provider or "cursor/herdr",
+                expected_session_id,
+                target,
+                (selection.state_sequence or 0) + 1,
+                {
+                    "pane_id": selection.pane_id,
+                    "workspace_id": selection.workspace_id,
+                    "cwd": selection.cwd,
+                },
+            ),
+            "active",
+            True,
+        )
+
+    client.reconcile_session.side_effect = reconcile
+
     def start_fresh(
         _checkout: Path,
         _label: str,
@@ -305,15 +369,24 @@ def configure_tiered_outcomes(
         settle: Callable[[AgentSelection], None],
         **_kwargs: object,
     ) -> AgentSelection:
+        target = str(_kwargs.get("name") or role)
         selection = AgentSelection(
-            role,
+            target,
             f"pane-{role}",
             workspace,
             str(checkout),
             role,
             str(checkout),
+            provider="cursor/herdr",
+            provider_session_id="test-session",
+            state_sequence=7,
         )
+        owned[selection.target] = selection
+        before_pane_submit = cast(Callable[[], None], _kwargs["before_pane_submit"])
+        pane_accepted = cast(Callable[[str, str], None], _kwargs["pane_accepted"])
         reserve(selection, True)
+        before_pane_submit()
+        pane_accepted(selection.pane_id, selection.workspace_id)
         settle(selection)
         return selection
 
@@ -342,11 +415,19 @@ class DurablePromptOperationTests(unittest.TestCase):
             "worker_pid": 42,
             "worker_boot_id": "boot",
             "worker_process_start": "start",
+            "worker_claim_operation": "test",
+            "worker_claimed_at": 1,
             "workflow_phase": "classifying",
             "turn": 1,
             "turn_token": "123456789abc-1",
             "workflow_turn_phase": "classifying",
             "herdr_target": "planner",
+            "herdr_pane_id": "planner-pane",
+            "herdr_workspace_id": "workspace",
+            "agent_operation_checkout": "/checkout",
+            "agent_provider": "cursor/herdr",
+            "agent_provider_session_id": "planner-session",
+            "agent_state_sequence": 7,
             "planner_target": "planner",
             "active_participant": "planner",
             "agent_dispatch_state": "ready",
@@ -376,6 +457,8 @@ class DurablePromptOperationTests(unittest.TestCase):
                     "worker_pid": 42,
                     "worker_boot_id": "boot",
                     "worker_process_start": "start",
+                    "worker_claim_operation": "test",
+                    "worker_claimed_at": 1,
                     "workflow_tier": "medium",
                     "workflow_classification_reason": "reviewed",
                     "workflow_phase": "reviewing",
@@ -384,6 +467,12 @@ class DurablePromptOperationTests(unittest.TestCase):
                     "turn_token": "123456789abc-4",
                     "workflow_turn_phase": "reviewing",
                     "herdr_target": "planner",
+                    "herdr_pane_id": "planner-pane",
+                    "herdr_workspace_id": "workspace",
+                    "agent_operation_checkout": "/checkout",
+                    "agent_provider": "cursor/herdr",
+                    "agent_provider_session_id": "planner-session",
+                    "agent_state_sequence": 7,
                     "planner_target": "planner",
                     "active_participant": "planner",
                     "agent_dispatch_state": "ready",
@@ -418,6 +507,8 @@ class DurablePromptOperationTests(unittest.TestCase):
                 review_approval_source="reviewer",
                 plan_approval_state="approved",
                 plan_approval_source="explicit",
+                plan_approval_plan_artifact=plan_reference,
+                plan_approval_review_artifact=review_reference,
             ),
         )
         assert updated is not None
@@ -461,7 +552,7 @@ class DurablePromptOperationTests(unittest.TestCase):
             outcome = production_jobs._execute_phase_prompt(
                 self.store,
                 job,
-                "worker",
+                WORKER,
                 client,
                 lambda: None,
                 target="planner",
@@ -512,7 +603,7 @@ class DurablePromptOperationTests(unittest.TestCase):
             production_jobs._execute_phase_prompt(
                 self.store,
                 job,
-                "worker",
+                WORKER,
                 client,
                 lambda: None,
                 target="planner",
@@ -563,7 +654,7 @@ class DurablePromptOperationTests(unittest.TestCase):
             outcome = production_jobs._execute_phase_prompt(
                 self.store,
                 job,
-                "worker",
+                WORKER,
                 client,
                 lambda: None,
                 target="planner",
@@ -585,6 +676,48 @@ class DurablePromptOperationTests(unittest.TestCase):
             ).explicit_approval_count,
             1,
         )
+
+    def test_stale_same_owner_prompt_observation_is_rejected(self) -> None:
+        created = self.create_approved_plan()
+        job = self.store.update(
+            created.id,
+            lambda current: current.evolve(
+                prompt_operation_state="submitting",
+                prompt_operation_phase="implementing",
+                prompt_operation_turn=4,
+                prompt_operation_target="planner",
+                prompt_operation_agent_session="planner-session",
+                prompt_baseline_sequence=7,
+            ),
+        )
+        assert job is not None
+        client = mock.Mock()
+
+        def observe(_target: str) -> dict[str, object]:
+            self.store.update(job.id, lambda current: current.evolve(reconcile=True))
+            return {
+                "state_change_seq": 8,
+                "agent_session": "planner-session",
+            }
+
+        client.get_agent.side_effect = observe
+
+        outcome = production_jobs._execute_phase_prompt(
+            self.store,
+            job,
+            WORKER,
+            client,
+            lambda: None,
+            target="planner",
+            prompt="lgtm. Implement the approved plan.",
+            token="123456789abc-4",
+        )
+
+        self.assertIsNone(outcome)
+        current = self.store.get(job.id)
+        self.assertTrue(current.reconcile)
+        self.assertEqual(current.prompt_operation_state, "submitting")
+        client.wait_for_stable_completion.assert_not_called()
 
     def test_approval_submit_recovery_rejects_replaced_agent_session(self) -> None:
         created = self.create_approved_plan()
@@ -612,7 +745,7 @@ class DurablePromptOperationTests(unittest.TestCase):
             production_jobs._execute_phase_prompt(
                 self.store,
                 job,
-                "worker",
+                WORKER,
                 client,
                 lambda: None,
                 target="planner",
@@ -649,9 +782,10 @@ class DurablePromptOperationTests(unittest.TestCase):
             production_jobs._worker_complete(
                 self.store,
                 job.id,
-                "worker",
+                WORKER,
                 output="VOICE_SUMMARY[123456789abc-4]: done",
                 agent_status="idle",
+                expected_revision=job.revision,
             )
 
         deferred = self.store.get(job.id)
@@ -671,6 +805,8 @@ class DurablePromptOperationTests(unittest.TestCase):
                 worker_pid=43,
                 worker_boot_id="boot-2",
                 worker_process_start="start-2",
+                worker_claim_operation="test",
+                worker_claimed_at=1,
             ),
         )
         assert reclaimed is not None
@@ -687,7 +823,7 @@ class DurablePromptOperationTests(unittest.TestCase):
             production_jobs._run_tiered_workflow(
                 self.store,
                 reclaimed,
-                "worker-2",
+                WORKER_2,
                 client,
                 lambda: None,
             )
@@ -722,9 +858,10 @@ class DurablePromptOperationTests(unittest.TestCase):
             production_jobs._worker_complete(
                 self.store,
                 job.id,
-                "worker",
+                WORKER,
                 output="VOICE_SUMMARY[123456789abc-4]: done",
                 agent_status="idle",
+                expected_revision=job.revision,
             )
 
         deferred = self.store.get(job.id)
@@ -738,6 +875,8 @@ class DurablePromptOperationTests(unittest.TestCase):
                 worker_pid=43,
                 worker_boot_id="boot-2",
                 worker_process_start="start-2",
+                worker_claim_operation="test",
+                worker_claimed_at=1,
             ),
         )
         assert reclaimed is not None
@@ -753,7 +892,7 @@ class DurablePromptOperationTests(unittest.TestCase):
             production_jobs._run_tiered_workflow(
                 self.store,
                 reclaimed,
-                "worker-2",
+                WORKER_2,
                 client,
                 lambda: None,
             )
@@ -788,7 +927,7 @@ class DurablePromptOperationTests(unittest.TestCase):
         outcome = production_jobs._execute_phase_prompt(
             self.store,
             job,
-            "worker",
+            WORKER,
             client,
             lambda: None,
             target="planner",
@@ -838,7 +977,7 @@ class DurablePromptOperationTests(unittest.TestCase):
         production_jobs._execute_phase_prompt(
             self.store,
             job,
-            "worker",
+            WORKER,
             client,
             lambda: None,
             target="planner",
@@ -931,7 +1070,7 @@ class DurablePromptOperationTests(unittest.TestCase):
             production_jobs._execute_phase_prompt(
                 self.store,
                 job,
-                "worker",
+                WORKER,
                 client,
                 lambda: None,
                 target="planner",
@@ -957,7 +1096,7 @@ class DurablePromptOperationTests(unittest.TestCase):
             production_jobs._execute_phase_prompt(
                 self.store,
                 job,
-                "worker",
+                WORKER,
                 client,
                 lambda: None,
                 target="planner",
@@ -1000,7 +1139,7 @@ class DurablePromptOperationTests(unittest.TestCase):
             production_jobs._execute_phase_prompt(
                 self.store,
                 job,
-                "worker",
+                WORKER,
                 client,
                 lambda: None,
                 target="planner",
@@ -1013,6 +1152,32 @@ class DurablePromptOperationTests(unittest.TestCase):
         self.assertEqual(current.terminal_intent_status, JobStatus.CANCELLED)
         self.assertEqual(current.prompt_operation_state, "planned")
 
+    def test_participant_plan_uses_observed_checkout_before_job_settlement(
+        self,
+    ) -> None:
+        job = self.create()
+        checkout = Path("/worktrees/voice-task")
+
+        planned = production_jobs._plan_participant_creation(
+            self.store,
+            job,
+            WORKER,
+            WorkflowParticipant.PLANNER,
+            target="planner",
+            label="task-planner",
+            workspace_id="workspace",
+            checkout=checkout,
+        )
+
+        self.assertEqual(planned.participant_creation_state, "planned")
+        self.assertEqual(planned.participant_creation_checkout, str(checkout))
+        operation = planned.participant_pane_operation
+        assert operation is not None
+        self.assertEqual(
+            operation.spec.checkout,
+            str(checkout),
+        )
+
     def test_terminal_intent_invalidates_pane_before_create_callback(self) -> None:
         job = self.create()
         planned = self.store.update(
@@ -1023,14 +1188,18 @@ class DurablePromptOperationTests(unittest.TestCase):
                 participant_creation_target="reviewer",
                 participant_creation_label="task-reviewer",
                 participant_creation_workspace_id="workspace",
+                participant_creation_checkout="/checkout",
             ),
         )
         assert planned is not None
-        before_create, _accepted = production_jobs._participant_pane_callbacks(
-            self.store,
-            job.id,
-            "worker",
-            "reviewer",
+        before_create, _accepted, _revision = (
+            production_jobs._participant_pane_callbacks(
+                self.store,
+                job.id,
+                WORKER,
+                "reviewer",
+                revision_state=[planned.revision],
+            )
         )
         self.store.update(
             job.id,
@@ -1050,6 +1219,41 @@ class DurablePromptOperationTests(unittest.TestCase):
         self.assertEqual(current.terminal_intent_status, JobStatus.FAILED)
         self.assertEqual(current.participant_creation_state, "planned")
 
+    def test_stale_same_owner_participant_callback_is_rejected(self) -> None:
+        job = self.create()
+        planned = self.store.update(
+            job.id,
+            lambda current: current.evolve(
+                participant_creation_state="planned",
+                participant_creation_participant="reviewer",
+                participant_creation_target="reviewer",
+                participant_creation_label="task-reviewer",
+                participant_creation_workspace_id="workspace",
+                participant_creation_checkout="/checkout",
+            ),
+        )
+        assert planned is not None
+        before_create, _accepted, _revision = (
+            production_jobs._participant_pane_callbacks(
+                self.store,
+                job.id,
+                WORKER,
+                "reviewer",
+                revision_state=[planned.revision],
+            )
+        )
+        mutated = self.store.update(
+            job.id, lambda current: current.evolve(reconcile=True)
+        )
+        assert mutated is not None
+
+        with self.assertRaises(production_jobs.WorkerCancelled):
+            before_create()
+
+        current = self.store.get(job.id)
+        self.assertEqual(current.revision, mutated.revision)
+        self.assertEqual(current.participant_creation_state, "planned")
+
     def test_submitted_prompt_observes_without_resubmitting(self) -> None:
         job = self.create("submitted")
         client = mock.Mock()
@@ -1063,7 +1267,7 @@ class DurablePromptOperationTests(unittest.TestCase):
         outcome = production_jobs._execute_phase_prompt(
             self.store,
             job,
-            "worker",
+            WORKER,
             client,
             lambda: None,
             target="planner",
@@ -1085,7 +1289,7 @@ class DurablePromptOperationTests(unittest.TestCase):
             production_jobs._execute_phase_prompt(
                 self.store,
                 job,
-                "worker",
+                WORKER,
                 client,
                 lambda: None,
                 target="planner",
@@ -1142,7 +1346,7 @@ class CursorJobStateTests(unittest.TestCase):
                 "workflow_tier": "high-risk",
                 "workflow_classification_reason": "recovery",
                 "workflow_phase": "reviewing",
-                "review_round": 1,
+                "review_round": 2,
                 "review_decision": "revise",
                 "herdr_target": "planner",
                 "planner_target": "planner",
@@ -1151,6 +1355,7 @@ class CursorJobStateTests(unittest.TestCase):
                 "plan_approval_id": "gate-id",
                 "plan_approval_agent_session": "planner-session",
                 "plan_approval_state_change_sequence": 2,
+                "plan_approval_revision": 2,
             }
         )
         store = jobs._store()
@@ -1158,13 +1363,13 @@ class CursorJobStateTests(unittest.TestCase):
         plan_reference = store.write_artifact(
             "123456789abc",
             "plan",
-            1,
+            2,
             plan,
         )
         review_reference = store.write_artifact(
             "123456789abc",
             "review",
-            1,
+            2,
             "Ownership remains unresolved.",
             source_text=plan,
         )
@@ -1246,6 +1451,8 @@ class CursorJobStateTests(unittest.TestCase):
                 "worker_token": "worker",
                 "worker_pid": 42,
                 "worker_process_start": "start",
+                "worker_claim_operation": "test",
+                "worker_claimed_at": 1,
                 "workflow_tier": "medium",
                 "workflow_classification_reason": "cross-component",
                 "workflow_phase": "reviewing",
@@ -1267,7 +1474,7 @@ class CursorJobStateTests(unittest.TestCase):
         production_jobs._advance_workflow_output(
             store,
             store.get("123456789abc"),
-            "worker",
+            LEGACY_WORKER,
             "WORKFLOW_REVIEW_DECISION[turn]: revise\n"
             "WORKFLOW_REVIEW[turn]: choose the compatibility policy",
             "idle",
@@ -1301,6 +1508,8 @@ class CursorJobStateTests(unittest.TestCase):
                 "worker_token": "worker",
                 "worker_pid": 42,
                 "worker_process_start": "start",
+                "worker_claim_operation": "test",
+                "worker_claimed_at": 1,
                 "workflow_tier": "medium",
                 "workflow_classification_reason": "cross-component",
                 "workflow_phase": "reviewing",
@@ -1313,6 +1522,7 @@ class CursorJobStateTests(unittest.TestCase):
                 "plan_approval_id": "gate-id",
                 "plan_approval_agent_session": "planner-session",
                 "plan_approval_state_change_sequence": 7,
+                "plan_approval_revision": 3,
             }
         )
         store = jobs._store()
@@ -1334,7 +1544,7 @@ class CursorJobStateTests(unittest.TestCase):
             advanced = production_jobs._advance_workflow_output(
                 store,
                 before_review,
-                "worker",
+                LEGACY_WORKER,
                 "WORKFLOW_REVIEW_DECISION[turn]: approve\n"
                 "WORKFLOW_REVIEW[turn]: plan is safe",
                 "idle",
@@ -1357,6 +1567,8 @@ class CursorJobStateTests(unittest.TestCase):
                 "worker_token": "worker",
                 "worker_pid": 42,
                 "worker_process_start": "start",
+                "worker_claim_operation": "test",
+                "worker_claimed_at": 1,
                 "workflow_tier": "medium",
                 "workflow_classification_reason": "cross-component",
                 "workflow_phase": "reviewing",
@@ -1369,6 +1581,7 @@ class CursorJobStateTests(unittest.TestCase):
                 "plan_approval_id": "gate-id",
                 "plan_approval_agent_session": "planner-session",
                 "plan_approval_state_change_sequence": 7,
+                "plan_approval_revision": 3,
             }
         )
         store = jobs._store()
@@ -1388,7 +1601,7 @@ class CursorJobStateTests(unittest.TestCase):
             advanced = production_jobs._advance_workflow_output(
                 store,
                 before_review,
-                "worker",
+                LEGACY_WORKER,
                 "WORKFLOW_REVIEW_DECISION[turn]: approve\n"
                 "WORKFLOW_REVIEW[turn]: plan is safe",
                 "idle",
@@ -1415,6 +1628,8 @@ class CursorJobStateTests(unittest.TestCase):
                 "worker_pid": 42,
                 "worker_boot_id": "boot",
                 "worker_process_start": "start",
+                "worker_claim_operation": "test",
+                "worker_claimed_at": 1,
                 "workflow_tier": "high-risk",
                 "workflow_classification_reason": "irreversible data loss",
                 "workflow_phase": "reviewing",
@@ -1427,6 +1642,7 @@ class CursorJobStateTests(unittest.TestCase):
                 "plan_approval_id": "gate-id",
                 "plan_approval_agent_session": "planner-session",
                 "plan_approval_state_change_sequence": 7,
+                "plan_approval_revision": 3,
             }
         )
 
@@ -1557,6 +1773,8 @@ class CursorJobStateTests(unittest.TestCase):
                 "worker_token": "worker",
                 "worker_pid": 42,
                 "worker_process_start": "start",
+                "worker_claim_operation": "test",
+                "worker_claimed_at": 1,
                 "workflow_phase": "classifying",
                 "planner_target": "planner",
                 "active_participant": "planner",
@@ -1569,7 +1787,7 @@ class CursorJobStateTests(unittest.TestCase):
         production_jobs._advance_workflow_output(
             store,
             store.get("123456789abc"),
-            "worker",
+            LEGACY_WORKER,
             "WORKFLOW_TIER[stale]: simple\nWORKFLOW_REASON[stale]: old",
             "idle",
         )
@@ -1587,6 +1805,8 @@ class CursorJobStateTests(unittest.TestCase):
                 "worker_token": "worker",
                 "worker_pid": 42,
                 "worker_process_start": "start",
+                "worker_claim_operation": "test",
+                "worker_claimed_at": 1,
                 "workflow_phase": "classifying",
                 "planner_target": "planner",
                 "active_participant": "planner",
@@ -1600,7 +1820,7 @@ class CursorJobStateTests(unittest.TestCase):
         production_jobs._advance_workflow_output(
             store,
             store.get("123456789abc"),
-            "worker",
+            LEGACY_WORKER,
             "VOICE_QUESTION[current]: Which behavior should win?",
             "idle",
         )
@@ -1608,6 +1828,42 @@ class CursorJobStateTests(unittest.TestCase):
         updated = store.get("123456789abc")
         self.assertEqual(updated.status, JobStatus.AWAITING_USER)
         self.assertEqual(updated.prompt_operation_state, "none")
+
+    def test_same_owner_stale_workflow_callback_cannot_advance_phase(self) -> None:
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "rename text",
+                "status": "running",
+                "worker_token": "worker",
+                "worker_pid": 42,
+                "worker_process_start": "start",
+                "worker_claim_operation": "test",
+                "worker_claimed_at": 1,
+                "workflow_phase": "classifying",
+                "planner_target": "planner",
+                "active_participant": "planner",
+                "herdr_target": "planner",
+                "turn_token": "current",
+            }
+        )
+        store = jobs._store()
+        observed = store.get("123456789abc")
+        store.update(observed.id, lambda current: current.evolve(reconcile=True))
+
+        advanced = production_jobs._advance_workflow_output(
+            store,
+            observed,
+            LEGACY_WORKER,
+            "WORKFLOW_TIER[current]: simple\n"
+            "WORKFLOW_REASON[current]: localized change",
+            "idle",
+        )
+
+        self.assertIsNone(advanced)
+        self.assertEqual(
+            store.get(observed.id).workflow_phase, WorkflowPhase.CLASSIFYING
+        )
 
     def test_malformed_review_output_blocks_approval_gate(self) -> None:
         jobs.write_job(
@@ -1618,6 +1874,8 @@ class CursorJobStateTests(unittest.TestCase):
                 "worker_token": "worker",
                 "worker_pid": 42,
                 "worker_process_start": "start",
+                "worker_claim_operation": "test",
+                "worker_claimed_at": 1,
                 "workflow_tier": "high-risk",
                 "workflow_classification_reason": "recovery",
                 "workflow_phase": "reviewing",
@@ -1632,7 +1890,7 @@ class CursorJobStateTests(unittest.TestCase):
         production_jobs._advance_workflow_output(
             store,
             store.get("123456789abc"),
-            "worker",
+            LEGACY_WORKER,
             "WORKFLOW_REVIEW_DECISION[current]: maybe",
             "idle",
         )
@@ -1648,6 +1906,8 @@ class CursorJobStateTests(unittest.TestCase):
                 "worker_token": "worker",
                 "worker_pid": 42,
                 "worker_process_start": "start",
+                "worker_claim_operation": "test",
+                "worker_claimed_at": 1,
                 "workflow_tier": "simple",
                 "workflow_classification_reason": "localized",
                 "workflow_phase": "implementing",
@@ -1663,7 +1923,7 @@ class CursorJobStateTests(unittest.TestCase):
         production_jobs._advance_workflow_output(
             store,
             store.get("123456789abc"),
-            "worker",
+            LEGACY_WORKER,
             "WORKFLOW_PROMOTE[current]: simple\n"
             "WORKFLOW_REASON[current]: no additional risk",
             "idle",
@@ -1680,6 +1940,8 @@ class CursorJobStateTests(unittest.TestCase):
                 "worker_token": "worker",
                 "worker_pid": 42,
                 "worker_process_start": "start",
+                "worker_claim_operation": "test",
+                "worker_claimed_at": 1,
                 "workflow_tier": "simple",
                 "workflow_classification_reason": "localized",
                 "workflow_phase": "implementing",
@@ -1696,7 +1958,7 @@ class CursorJobStateTests(unittest.TestCase):
         production_jobs._advance_workflow_output(
             store,
             store.get("123456789abc"),
-            "worker",
+            LEGACY_WORKER,
             "WORKFLOW_PROMOTE[current]: medium\n"
             "WORKFLOW_REASON[current]: cross-component compatibility risk",
             "idle",
@@ -1713,7 +1975,7 @@ class CursorJobStateTests(unittest.TestCase):
         self.assertIn("preserve compatibility", str(promoted.continuation_answer))
         self.assertFalse(promoted.continuation)
 
-    def test_high_risk_final_rejected_review_awaits_explicit_decision(self) -> None:
+    def test_high_risk_round_one_rejection_advances_to_round_two(self) -> None:
         jobs.write_job(
             {
                 "id": "123456789abc",
@@ -1722,6 +1984,8 @@ class CursorJobStateTests(unittest.TestCase):
                 "worker_token": "worker",
                 "worker_pid": 42,
                 "worker_process_start": "start",
+                "worker_claim_operation": "test",
+                "worker_claimed_at": 1,
                 "workflow_tier": "high-risk",
                 "workflow_classification_reason": "recovery",
                 "workflow_phase": "reviewing",
@@ -1744,20 +2008,17 @@ class CursorJobStateTests(unittest.TestCase):
         production_jobs._advance_workflow_output(
             store,
             store.get("123456789abc"),
-            "worker",
+            LEGACY_WORKER,
             "WORKFLOW_REVIEW_DECISION[turn]: revise\n"
             "WORKFLOW_REVIEW[turn]: unresolved ownership",
             "idle",
         )
 
         updated = store.get("123456789abc")
-        self.assertEqual(updated.status, JobStatus.AWAITING_USER)
-        self.assertEqual(updated.review_round, 1)
-        self.assertEqual(
-            updated.clarification_kind,
-            "workflow_review_exhausted",
-        )
-        self.assertEqual(updated.workflow_phase.value, "reviewing")
+        self.assertEqual(updated.status, JobStatus.RUNNING)
+        self.assertEqual(updated.review_round, 2)
+        self.assertIsNone(updated.clarification_kind)
+        self.assertEqual(updated.workflow_phase.value, "revising")
 
     def test_exhausted_review_approve_queues_unchanged_plan_for_implementation(
         self,
@@ -1896,6 +2157,9 @@ class CursorJobStateTests(unittest.TestCase):
             str(worktree),
             "agent",
             str(worktree),
+            provider="cursor/herdr",
+            provider_session_id="test-session",
+            state_sequence=7,
         )
         configure_tiered_outcomes(client, worktree)
 
@@ -1956,6 +2220,8 @@ class CursorJobStateTests(unittest.TestCase):
                 "worker_token": "worker",
                 "worker_pid": 42,
                 "worker_process_start": "worker-start",
+                "worker_claim_operation": "test",
+                "worker_claimed_at": 1,
                 "repository": str(repository),
                 "worktree_path": str(repository),
                 "github_pull_request": 42,
@@ -1971,7 +2237,7 @@ class CursorJobStateTests(unittest.TestCase):
         ):
             jobs._prepare_pull_request_checkout(
                 "123456789abc",
-                "worker",
+                LEGACY_WORKER,
                 jobs.read_job("123456789abc"),
             )
 
@@ -1993,6 +2259,8 @@ class CursorJobStateTests(unittest.TestCase):
                 "worker_token": "worker",
                 "worker_pid": 42,
                 "worker_process_start": "worker-start",
+                "worker_claim_operation": "test",
+                "worker_claimed_at": 1,
                 "repository": str(repository),
                 "worktree_path": str(worktree),
                 "github_repository": "source/project",
@@ -2017,7 +2285,7 @@ class CursorJobStateTests(unittest.TestCase):
         with mock.patch.object(jobs, "GitHubClient", return_value=github):
             jobs._prepare_pull_request_checkout(
                 "123456789abc",
-                "worker",
+                LEGACY_WORKER,
                 jobs.read_job("123456789abc"),
             )
 
@@ -2044,6 +2312,8 @@ class CursorJobStateTests(unittest.TestCase):
                 "worker_token": "worker",
                 "worker_pid": 42,
                 "worker_process_start": "worker-start",
+                "worker_claim_operation": "test",
+                "worker_claimed_at": 1,
                 "repository": str(repository),
                 "worktree_path": str(worktree),
                 "github_repository": "source/project",
@@ -2072,7 +2342,7 @@ class CursorJobStateTests(unittest.TestCase):
         with mock.patch.object(jobs, "GitHubClient", return_value=github):
             jobs._prepare_pull_request_checkout(
                 "123456789abc",
-                "worker",
+                LEGACY_WORKER,
                 jobs.read_job("123456789abc"),
             )
 
@@ -2095,6 +2365,8 @@ class CursorJobStateTests(unittest.TestCase):
                 "worker_token": "worker",
                 "worker_pid": 42,
                 "worker_process_start": "worker-start",
+                "worker_claim_operation": "test",
+                "worker_claimed_at": 1,
                 "repository": str(repository),
                 "worktree_path": str(worktree),
                 "github_repository": "source/project",
@@ -2114,7 +2386,7 @@ class CursorJobStateTests(unittest.TestCase):
         ):
             jobs._prepare_pull_request_checkout(
                 "123456789abc",
-                "worker",
+                LEGACY_WORKER,
                 jobs.read_job("123456789abc"),
             )
 
@@ -2139,6 +2411,8 @@ class CursorJobStateTests(unittest.TestCase):
                     "worker_token": job_id,
                     "worker_pid": 42,
                     "worker_process_start": f"start-{job_id}",
+                    "worker_claim_operation": "test",
+                    "worker_claimed_at": 1,
                     "repository": str(repository),
                     "worktree_path": str(worktree),
                     "github_repository": "source/project",
@@ -2246,6 +2520,9 @@ class CursorJobStateTests(unittest.TestCase):
             str(repository),
             "agent",
             "/worktree",
+            provider="cursor/herdr",
+            provider_session_id="test-session",
+            state_sequence=7,
         )
         configure_tiered_outcomes(client, repository, tier="high-risk")
         with (
@@ -2324,12 +2601,15 @@ class CursorJobStateTests(unittest.TestCase):
             [call.kwargs["mode"] for call in client.start_fresh_agent.call_args_list],
             ["ask", None],
         )
+        participant_targets = [
+            call.kwargs["name"] for call in client.start_fresh_agent.call_args_list
+        ]
         self.assertEqual(
             client.close_owned_pane.call_args_list,
             [
                 mock.call("agent", "pane", "workspace"),
-                mock.call("reviewer", "pane-reviewer", "workspace"),
-                mock.call("implementer", "pane-implementer", "workspace"),
+                mock.call(participant_targets[0], "pane-reviewer", "workspace"),
+                mock.call(participant_targets[1], "pane-implementer", "workspace"),
             ],
         )
         implementation_prompt_text = client.prompt_and_wait.call_args_list[-1].args[1]
@@ -2386,6 +2666,9 @@ class CursorJobStateTests(unittest.TestCase):
             str(repository),
             "agent",
             "/worktree",
+            provider="cursor/herdr",
+            provider_session_id="test-session",
+            state_sequence=7,
         )
         configure_tiered_outcomes(client, repository)
 
@@ -2518,6 +2801,57 @@ class CursorJobStateTests(unittest.TestCase):
         self.assertEqual(updated["github_issue_created_number"], 42)
         self.assertEqual(updated["github_issue_create_operation_state"], "created")
         herdr.assert_not_called()
+
+    def test_stale_same_owner_issue_submission_result_is_rejected(self) -> None:
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "create an issue about startup",
+                "trusted_utterance": "create an issue about startup",
+                "issue_provider": "github",
+                "github_repository": "source/project",
+                "github_issue_create_requested": True,
+                "github_issue_create_confirmed": True,
+                "github_issue_create_title": "Fix startup",
+                "github_issue_create_body": "Startup fails after reboot.",
+                "github_issue_create_marker": "a" * 32,
+                "github_issue_create_operation_state": "planned",
+                "status": "queued",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        result = GitHubIssueCreationResult(
+            GitHubIssue("source", "project", 42),
+            "https://github.com/source/project/issues/42",
+            "a" * 32,
+        )
+        github = mock.Mock()
+        github.inspect_repository.return_value = GitHubRepository(
+            "source/project",
+            "https://github.com/source/project",
+            False,
+            "main",
+        )
+
+        def submit_issue(
+            *_args: object, **_kwargs: object
+        ) -> GitHubIssueCreationResult:
+            jobs._store().update(
+                "123456789abc", lambda current: current.evolve(reconcile=True)
+            )
+            return result
+
+        github.submit_issue.side_effect = submit_issue
+
+        with mock.patch.object(jobs, "GitHubClient", return_value=github):
+            service.run_worker("123456789abc")
+
+        updated = jobs.read_job("123456789abc")
+        self.assertEqual(updated["status"], "running")
+        self.assertEqual(updated["github_issue_create_operation_state"], "submitted")
+        self.assertIsNone(updated.get("github_issue_created_number"))
+        self.assertTrue(updated["reconcile"])
 
     def test_timed_out_issue_creation_is_reconciled_without_resubmission(self) -> None:
         jobs.write_job(
@@ -2959,6 +3293,9 @@ class CursorJobStateTests(unittest.TestCase):
             str(repository),
             "agent",
             "/worktree/issue-42",
+            provider="cursor/herdr",
+            provider_session_id="test-session",
+            state_sequence=7,
         )
         configure_tiered_outcomes(client, repository)
         with (
@@ -3008,6 +3345,8 @@ class CursorJobStateTests(unittest.TestCase):
                 "worker_token": "first-worker",
                 "worker_pid": 41,
                 "worker_process_start": "first-start",
+                "worker_claim_operation": "test",
+                "worker_claimed_at": 1,
                 "herdr_target": "first-agent",
                 "worktree_path": "/worktree/issue-42",
             }
@@ -3019,6 +3358,8 @@ class CursorJobStateTests(unittest.TestCase):
                 "worker_token": "worker-token",
                 "worker_pid": 42,
                 "worker_process_start": "second-start",
+                "worker_claim_operation": "test",
+                "worker_claimed_at": 1,
             }
         )
         selection = AgentSelection(
@@ -3028,6 +3369,9 @@ class CursorJobStateTests(unittest.TestCase):
             "/repo",
             "second-agent",
             "/worktree/issue-42",
+            provider="cursor/herdr",
+            provider_session_id="test-session",
+            state_sequence=7,
         )
 
         reserved = jobs._reserve_worker_target(
@@ -3036,6 +3380,7 @@ class CursorJobStateTests(unittest.TestCase):
             selection,
             Path("/repo"),
             None,
+            expected_revision=0,
         )
 
         self.assertIsNone(reserved)
@@ -3214,6 +3559,9 @@ class CursorJobStateTests(unittest.TestCase):
             cwd=str(repository),
             name="cursor-agent",
             worktree_path=str(repository),
+            provider="cursor/herdr",
+            provider_session_id="test-session",
+            state_sequence=7,
         )
         configure_tiered_outcomes(client, repository)
 
@@ -3348,6 +3696,9 @@ class CursorJobStateTests(unittest.TestCase):
             str(intended),
             "cursor-agent",
             str(intended),
+            provider="cursor/herdr",
+            provider_session_id="test-session",
+            state_sequence=7,
         )
 
         def resolve(
@@ -3454,6 +3805,9 @@ class CursorJobStateTests(unittest.TestCase):
             str(hinted),
             "cursor-agent",
             str(hinted),
+            provider="cursor/herdr",
+            provider_session_id="test-session",
+            state_sequence=7,
         )
         configure_tiered_outcomes(client, hinted)
 
@@ -3596,6 +3950,8 @@ class CursorJobStateTests(unittest.TestCase):
                 "created_at": 1,
                 "worker_pid": 999999,
                 "worker_process_start": "old-worker",
+                "worker_claim_operation": "test",
+                "worker_claimed_at": 1,
                 "worker_token": "old-claim",
                 "herdr_target": "cursor-agent",
                 "delivered": False,
@@ -3621,6 +3977,9 @@ class CursorJobStateTests(unittest.TestCase):
             str(worktree),
             "planned-agent",
             str(worktree),
+            provider="cursor/herdr",
+            provider_session_id="test-session",
+            state_sequence=7,
         )
         jobs.write_job(
             {
@@ -3628,7 +3987,11 @@ class CursorJobStateTests(unittest.TestCase):
                 "request": "fix it",
                 "status": "queued",
                 "repository": str(repository),
+                "worktree_branch": "voice/test-checkout",
                 "worktree_path": str(worktree),
+                "worktree_workspace_id": "workspace",
+                "worktree_root_pane_id": "root-pane",
+                "worktree_provision_state": "ready",
                 "herdr_target": "planned-agent",
                 "herdr_pane_id": "pane",
                 "herdr_workspace_id": "workspace",
@@ -3644,6 +4007,22 @@ class CursorJobStateTests(unittest.TestCase):
             {"state_change_seq": 1, "agent_session": "planned-session"},
         ]
         client.start_agent.return_value = selection
+        client.reconcile_session.return_value = SessionReconciliation(
+            ReconciliationState.ACTIVE,
+            HarnessSession(
+                "cursor/herdr",
+                "test-session",
+                "planned-agent",
+                8,
+                {
+                    "pane_id": "pane",
+                    "workspace_id": "workspace",
+                    "cwd": str(worktree),
+                },
+            ),
+            "active",
+            True,
+        )
         client.prompt_and_wait.return_value = PromptOutcome(
             "idle",
             "done",
@@ -3704,6 +4083,8 @@ class CursorJobStateTests(unittest.TestCase):
                 "worker_token": "worker-claim",
                 "worker_pid": 42,
                 "worker_process_start": "old-worker",
+                "worker_claim_operation": "test",
+                "worker_claimed_at": 1,
                 "delivered": False,
             }
         )
@@ -3714,6 +4095,7 @@ class CursorJobStateTests(unittest.TestCase):
             "worker-claim",
             output="VOICE_SUMMARY[turn]: stale success",
             agent_status="idle",
+            expected_revision=0,
         )
 
         updated = jobs.read_job("123456789abc")
@@ -3804,6 +4186,7 @@ class CursorJobStateTests(unittest.TestCase):
             token: str,
             value: GitHubRepository | None,
             *,
+            expected_revision: int,
             ambiguous: bool = False,
             failed_observing: bool = False,
         ) -> dict[str, object] | None:
@@ -3812,6 +4195,7 @@ class CursorJobStateTests(unittest.TestCase):
                 job_id,
                 token,
                 value,
+                expected_revision=expected_revision,
                 ambiguous=ambiguous,
                 failed_observing=failed_observing,
             )
@@ -4030,6 +4414,12 @@ class CursorJobStateTests(unittest.TestCase):
                 "id": "123456789abc",
                 "request": "fix it",
                 "repository_hint": str(repository),
+                "repository": str(repository),
+                "worktree_branch": "voice/test-checkout",
+                "worktree_path": str(repository),
+                "worktree_workspace_id": "workspace",
+                "worktree_root_pane_id": "root-pane",
+                "worktree_provision_state": "ready",
                 "status": "queued",
                 "created_at": 1,
                 "delivered": False,
@@ -4045,10 +4435,34 @@ class CursorJobStateTests(unittest.TestCase):
             str(repository),
             "planned-agent",
             str(repository),
+            provider="cursor/herdr",
+            provider_session_id="test-session",
+            state_sequence=7,
         )
         client = mock.Mock()
         client.repository_roots.return_value = [repository]
         client.resolve_repository.return_value = (repository, [repository])
+        client.get_agent.return_value = {
+            "pane_id": "pane",
+            "workspace_id": "workspace",
+            "cwd": str(repository),
+        }
+        client.reconcile_session.return_value = SessionReconciliation(
+            ReconciliationState.ACTIVE,
+            HarnessSession(
+                "cursor/herdr",
+                "test-session",
+                "planned-agent",
+                8,
+                {
+                    "pane_id": "pane",
+                    "workspace_id": "workspace",
+                    "cwd": str(repository),
+                },
+            ),
+            "active",
+            True,
+        )
 
         def ensure_agent(*_args: object, **kwargs: object) -> AgentSelection:
             reserve = cast(Callable[[AgentSelection, bool], None], kwargs["reserve"])
@@ -4080,7 +4494,7 @@ class CursorJobStateTests(unittest.TestCase):
         )
         client.prompt_and_wait.assert_not_called()
 
-    def test_late_agent_visibility_after_cancelled_startup(self) -> None:
+    def test_stale_agent_failure_after_cancelled_startup_is_rejected(self) -> None:
         repository = Path(self.temporary.name) / "project"
         jobs.write_job(
             {
@@ -4101,6 +4515,9 @@ class CursorJobStateTests(unittest.TestCase):
             str(repository),
             "planned-agent",
             str(repository),
+            provider="cursor/herdr",
+            provider_session_id="test-session",
+            state_sequence=7,
         )
         client = mock.Mock()
         client.repository_roots.return_value = [repository]
@@ -4116,7 +4533,16 @@ class CursorJobStateTests(unittest.TestCase):
 
         def ensure_agent(*_args: object, **kwargs: object) -> AgentSelection:
             reserve = cast(Callable[[AgentSelection, bool], None], kwargs["reserve"])
+            reserve_worktree = cast(Callable[..., None], kwargs["reserve_worktree"])
+            settle_worktree = cast(Callable[..., None], kwargs["settle_worktree"])
             fail_agent = cast(Callable[[HerdrError], None], kwargs["fail_agent"])
+            reserve_worktree(
+                repository,
+                "voice/test-checkout",
+                repository,
+                "planned",
+            )
+            settle_worktree(repository, "workspace", "root-pane")
             reserve(selection, True)
             entered.set()
             self.assertTrue(release.wait(2))
@@ -4125,6 +4551,39 @@ class CursorJobStateTests(unittest.TestCase):
             raise error
 
         client.ensure_agent.side_effect = ensure_agent
+        reconciliation_count = 0
+
+        def reconcile_session(
+            target: str, *, expected_session_id: str
+        ) -> SessionReconciliation:
+            nonlocal reconciliation_count
+            reconciliation_count += 1
+            if reconciliation_count == 1:
+                return SessionReconciliation(
+                    ReconciliationState.MISSING,
+                    None,
+                    "not yet visible",
+                    False,
+                )
+            return SessionReconciliation(
+                ReconciliationState.ACTIVE,
+                HarnessSession(
+                    "cursor/herdr",
+                    expected_session_id,
+                    target,
+                    8,
+                    {
+                        "name": target,
+                        "pane_id": "pane",
+                        "workspace_id": "workspace",
+                        "cwd": str(repository),
+                    },
+                ),
+                "active",
+                True,
+            )
+
+        client.reconcile_session.side_effect = reconcile_session
         worker = threading.Thread(target=service.run_worker, args=("123456789abc",))
         with (
             mock.patch.object(jobs, "HerdrClient", return_value=client),
@@ -4138,9 +4597,10 @@ class CursorJobStateTests(unittest.TestCase):
             worker.join(2)
 
         self.assertFalse(worker.is_alive())
-        self.assertEqual(
-            jobs.read_job("123456789abc")["agent_dispatch_state"], "ambiguous"
-        )
+        cancelled = jobs.read_job("123456789abc")
+        self.assertEqual(cancelled["status"], "reconciling")
+        self.assertEqual(cancelled["terminal_intent_status"], "cancelled")
+        self.assertEqual(cancelled["agent_dispatch_state"], "dispatching")
         with (
             mock.patch.object(jobs, "HerdrClient", return_value=client),
             mock.patch.object(jobs, "_worker_is_alive", return_value=False),
@@ -4154,7 +4614,7 @@ class CursorJobStateTests(unittest.TestCase):
         self.assertEqual(updated["agent_dispatch_state"], "confirmed_absent")
         self.assertEqual(updated["status"], "cancelled")
         self.assertFalse(updated["target_release_pending"])
-        self.assertEqual(client.close_owned_pane.call_count, 2)
+        self.assertEqual(client.close_owned_pane.call_count, 1)
 
     def test_cancellation_during_pr_checkout_prevents_prompt_submission(self) -> None:
         repository = Path(self.temporary.name) / "source" / "project"
@@ -4200,6 +4660,9 @@ class CursorJobStateTests(unittest.TestCase):
             str(worktree),
             "agent",
             str(worktree),
+            provider="cursor/herdr",
+            provider_session_id="test-session",
+            state_sequence=7,
         )
         client = mock.Mock()
 
@@ -4249,6 +4712,9 @@ class CursorJobStateTests(unittest.TestCase):
             str(repository),
             "agent",
             str(repository),
+            provider="cursor/herdr",
+            provider_session_id="test-session",
+            state_sequence=7,
         )
         client = mock.Mock()
         client.repository_roots.return_value = [repository]
@@ -4279,13 +4745,16 @@ class CursorJobStateTests(unittest.TestCase):
 
         self.assertFalse(worker.is_alive())
         self.assertFalse(submitted.is_set())
-        client.close_owned_pane.assert_called_once()
+        client.close_owned_pane.assert_not_called()
+        self.assertTrue(jobs.read_job("123456789abc")["target_release_pending"])
 
     def test_worker_signal_requires_full_process_identity(self) -> None:
         job = {
             "id": "123456789abc",
             "worker_pid": 42,
             "worker_process_start": "start",
+            "worker_claim_operation": "test",
+            "worker_claimed_at": 1,
             "worker_token": "claim",
         }
         wrong_command = b"\0".join(
@@ -4315,6 +4784,8 @@ class CursorJobStateTests(unittest.TestCase):
             "id": "123456789abc",
             "worker_pid": 42,
             "worker_process_start": "start",
+            "worker_claim_operation": "test",
+            "worker_claimed_at": 1,
             "worker_token": "claim",
             "worker_operation": "fork_create",
         }
@@ -4452,6 +4923,8 @@ class CursorJobStateTests(unittest.TestCase):
                 "worker_token": "old",
                 "worker_pid": 999999,
                 "worker_process_start": "old-worker",
+                "worker_claim_operation": "test",
+                "worker_claimed_at": 1,
                 "created_at": 1,
                 "delivered": False,
             }
@@ -4487,9 +4960,12 @@ class CursorJobStateTests(unittest.TestCase):
     def test_worker_liveness_requires_matching_linux_boot_identity(self) -> None:
         job = {
             "id": "123456789abc",
+            "worker_token": "claim",
             "worker_pid": 42,
             "worker_boot_id": "old-boot",
             "worker_process_start": "start",
+            "worker_claim_operation": "test",
+            "worker_claimed_at": 1,
         }
         with (
             mock.patch.object(jobs, "_boot_identity", return_value="new-boot"),
@@ -4515,6 +4991,8 @@ class CursorJobStateTests(unittest.TestCase):
                 "worker_token": "worker",
                 "worker_pid": 42,
                 "worker_process_start": "old-worker",
+                "worker_claim_operation": "test",
+                "worker_claimed_at": 1,
                 "github_pull_request": 42,
                 "worktree_path": "/worktree/pr-42",
                 "pull_request_worktree_state": "provisioning",
@@ -4522,6 +5000,11 @@ class CursorJobStateTests(unittest.TestCase):
             }
         )
         client = mock.Mock()
+        client.get_agent.return_value = {
+            "pane_id": "pane",
+            "workspace_id": "workspace",
+            "cwd": "/worktree/pr-42",
+        }
         reserved_during_cancel: set[str] = set()
 
         def inspect_reservation(_target: str) -> None:
@@ -4556,12 +5039,24 @@ class CursorJobStateTests(unittest.TestCase):
                 "worker_token": "worker",
                 "worker_pid": 42,
                 "worker_process_start": "old-worker",
+                "worker_claim_operation": "test",
+                "worker_claimed_at": 1,
                 "delivered": False,
             }
         )
         failing = mock.Mock()
+        failing.get_agent.return_value = {
+            "pane_id": "pane",
+            "workspace_id": "workspace",
+            "cwd": "/worktree/task",
+        }
         failing.close_owned_pane.side_effect = HerdrError("still working")
         recovered = mock.Mock()
+        recovered.get_agent.return_value = {
+            "pane_id": "pane",
+            "workspace_id": "workspace",
+            "cwd": "/worktree/task",
+        }
         with (
             mock.patch.object(jobs, "_stop_worker", return_value=True),
             mock.patch.object(jobs, "HerdrClient", side_effect=[failing, recovered]),
@@ -4592,6 +5087,8 @@ class CursorJobStateTests(unittest.TestCase):
                 "worker_token": "worker",
                 "worker_pid": 42,
                 "worker_process_start": "old-worker",
+                "worker_claim_operation": "test",
+                "worker_claimed_at": 1,
                 "delivered": False,
             }
         )
@@ -4611,6 +5108,19 @@ class CursorJobStateTests(unittest.TestCase):
                 "name": "planned-agent",
                 "pane_id": "pane",
                 "workspace_id": "workspace",
+                "cwd": "/worktree/task",
+            },
+            {
+                "name": "planned-agent",
+                "pane_id": "pane",
+                "workspace_id": "workspace",
+                "cwd": "/worktree/task",
+            },
+            {
+                "name": "planned-agent",
+                "pane_id": "pane",
+                "workspace_id": "workspace",
+                "cwd": "/worktree/task",
             },
         ]
         with (
@@ -4624,13 +5134,11 @@ class CursorJobStateTests(unittest.TestCase):
             self.assertTrue(jobs.read_job("123456789abc")["target_release_pending"])
             with mock.patch("time.time", return_value=104):
                 service.recover_jobs()
-            self.assertEqual(client.close_owned_pane.call_count, 1)
-            with mock.patch("time.time", return_value=105):
-                service.recover_jobs()
+            client.close_owned_pane.assert_not_called()
 
-        self.assertFalse(jobs.read_job("123456789abc")["target_release_pending"])
-        self.assertEqual(client.get_agent.call_count, 2)
-        self.assertGreaterEqual(client.close_owned_pane.call_count, 2)
+        unresolved = jobs.read_job("123456789abc")
+        self.assertTrue(unresolved["target_release_pending"])
+        self.assertEqual(unresolved["agent_dispatch_state"], "ambiguous")
 
     def test_truly_absent_agent_releases_after_bounded_backoff(self) -> None:
         jobs.write_job(
@@ -4803,11 +5311,17 @@ class CursorJobStateTests(unittest.TestCase):
             self.assertEqual(manual["agent_dispatch_state"], "manual_required")
             self.assertEqual(manual["agent_reconcile_attempts"], 6)
             self.assertTrue(manual["target_release_pending"])
-            self.assertIn(
-                "manual reconciliation required for Herdr agent late-agent",
-                str(manual["error"]),
+            self.assertEqual(
+                manual["error"],
+                "agent startup failed; external operation reconciliation is pending",
             )
-            self.assertNotIn("reconciliation is pending", str(manual["result"]))
+            self.assertEqual(
+                manual["result"],
+                "agent startup failed; external operation reconciliation is pending",
+            )
+            self.assertEqual(
+                manual["reconciliation_base_error"], "agent startup failed"
+            )
 
             with mock.patch("time.time", return_value=10_000):
                 service.recover_jobs()
@@ -4855,7 +5369,8 @@ class CursorJobStateTests(unittest.TestCase):
 
         manual = jobs.read_job("123456789abc")
         self.assertEqual(manual["fork_operation_state"], "manual_required")
-        self.assertFalse(manual["target_release_pending"])
+        self.assertTrue(manual["target_release_pending"])
+        self.assertTrue(manual["target_release_manual_required"])
         client.close_owned_pane.assert_not_called()
         token = str(manual["manual_reconcile_token"])
         with self.assertRaisesRegex(jobs.HarnessError, "fence is stale"):
@@ -4870,7 +5385,10 @@ class CursorJobStateTests(unittest.TestCase):
             "123456789abc", "fork", token, "confirmed_absent"
         )
         self.assertEqual(resolved.fork_operation_state, "confirmed_absent")
-        self.assertEqual(resolved.error, "fork outcome unknown")
+        self.assertEqual(
+            resolved.error,
+            "fork outcome unknown; external operation reconciliation is pending",
+        )
         self.assertEqual(github.reconcile_fork.call_count, 1)
 
     def test_manual_materialized_agent_is_retained_without_external_action(
@@ -4891,6 +5409,9 @@ class CursorJobStateTests(unittest.TestCase):
                 "reconciliation_base_error": "agent startup failed",
                 "herdr_target": "retained-agent",
                 "agent_dispatch_state": "manual_required",
+                "agent_provider": "cursor/herdr",
+                "agent_provider_session_id": "retained-session",
+                "agent_state_sequence": 1,
                 "manual_reconcile_operation": "agent",
                 "manual_reconcile_token": "manual-token",
                 "target_release_pending": True,
@@ -4907,8 +5428,20 @@ class CursorJobStateTests(unittest.TestCase):
         self.assertEqual(resolved.herdr_target, "retained-agent")
         self.assertFalse(resolved.target_release_pending)
         self.assertFalse(resolved.cancellation_reconciliation_pending)
-        self.assertEqual(resolved.error, "agent startup failed")
-        self.assertEqual(resolved.result, "agent startup failed")
+        self.assertEqual(
+            resolved.error,
+            (
+                "agent startup failed; manual reconciliation required for "
+                "Herdr agent retained-agent"
+            ),
+        )
+        self.assertEqual(
+            resolved.result,
+            (
+                "agent startup failed; manual reconciliation required for "
+                "Herdr agent retained-agent"
+            ),
+        )
 
     def test_quarantined_worktree_releases_target_but_blocks_path(self) -> None:
         repository = Path(self.temporary.name) / "repository"
@@ -4938,7 +5471,8 @@ class CursorJobStateTests(unittest.TestCase):
         quarantined = jobs.read_job("123456789abc")
         self.assertEqual(quarantined["worktree_provision_state"], "quarantined")
         self.assertTrue(quarantined["worktree_manual_inspection_required"])
-        self.assertFalse(quarantined["target_release_pending"])
+        self.assertTrue(quarantined["target_release_pending"])
+        self.assertTrue(quarantined["target_release_manual_required"])
         client.close_owned_pane.assert_not_called()
 
         jobs.write_job(
@@ -4948,15 +5482,18 @@ class CursorJobStateTests(unittest.TestCase):
                 "worker_token": "worker",
                 "worker_pid": 42,
                 "worker_process_start": "worker-start",
+                "worker_claim_operation": "test",
+                "worker_claimed_at": 1,
             }
         )
         self.assertIsNone(
             jobs._reserve_worker_worktree(
                 "bbbbbbbbbbbb",
-                "worker",
+                WorkerOwnership("worker", 42, "test-boot", "worker-start", "test", 1),
                 repository,
                 "voice/task",
                 checkout,
+                expected_revision=0,
                 state="planned",
             )
         )
@@ -4964,15 +5501,16 @@ class CursorJobStateTests(unittest.TestCase):
         service.acknowledge_worktree_quarantine("123456789abc")
         self.assertEqual(
             jobs.read_job("123456789abc")["worktree_provision_state"],
-            "retained",
+            "ambiguous",
         )
-        self.assertIsNotNone(
+        self.assertIsNone(
             jobs._reserve_worker_worktree(
                 "bbbbbbbbbbbb",
-                "worker",
+                WorkerOwnership("worker", 42, "test-boot", "worker-start", "test", 1),
                 repository,
                 "voice/task",
                 checkout,
+                expected_revision=0,
                 state="planned",
             )
         )
@@ -4985,6 +5523,8 @@ class CursorJobStateTests(unittest.TestCase):
                 "worker_token": "worker",
                 "worker_pid": 42,
                 "worker_process_start": "worker-start",
+                "worker_claim_operation": "test",
+                "worker_claimed_at": 1,
                 "delivered": False,
             }
         )
@@ -5048,13 +5588,20 @@ class CursorJobStateTests(unittest.TestCase):
         )
         client = mock.Mock()
         with (
-            mock.patch.object(jobs, "_process_identity", return_value=None),
+            mock.patch.object(
+                service.worker_lifecycle,
+                "process_identity",
+                side_effect=lambda pid: (
+                    "current-process" if pid == os.getpid() else None
+                ),
+            ),
             mock.patch.object(jobs, "HerdrClient", return_value=client),
         ):
             service.recover_jobs()
 
         updated = jobs.read_job("123456789abc")
-        self.assertFalse(updated["target_release_pending"])
+        self.assertTrue(updated["target_release_pending"])
+        self.assertTrue(updated["target_release_manual_required"])
         client.close_owned_pane.assert_not_called()
 
     def test_foreground_delivery_is_acknowledged_explicitly(self) -> None:

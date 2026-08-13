@@ -16,6 +16,7 @@ from local_voice_harness.cursor.model import (
     JobStatus,
     JobValidationError,
 )
+from local_voice_harness.cursor.operations import WorkerOwnership
 from local_voice_harness.cursor.service import CursorTurnRequest, cursor_turn
 from local_voice_harness.cursor.store import (
     FollowUpCheckoutBusy,
@@ -29,6 +30,8 @@ from local_voice_harness.integrations.herdr import (
     HerdrError,
 )
 from local_voice_harness.responses import as_assistant_response
+
+FOLLOWUP_WORKER = WorkerOwnership("tok", 42, "boot", "start", "test", 1)
 
 
 @pytest.fixture
@@ -65,6 +68,8 @@ def _completed_parent(
         "repository": str(repository),
         "worktree_branch": "voice/feature",
         "worktree_path": str(checkout),
+        "worktree_workspace_id": "workspace-1",
+        "worktree_root_pane_id": "root-pane-1",
         "worktree_provision_state": worktree_provision_state,
         "speakable_label": "the feature",
         "issue_key": issue_key,
@@ -89,6 +94,8 @@ def _active_worktree_holder(store: JobStore, checkout: str) -> None:
                 "worktree_branch": "voice/feature",
                 "worktree_path": checkout,
                 "worktree_provision_state": "ready",
+                "worktree_workspace_id": "workspace",
+                "worktree_root_pane_id": "root-pane",
             }
         )
     )
@@ -108,6 +115,8 @@ def _build_child(parent: CursorJob, child_id: str = "bbbbbbbbbbbb") -> CursorJob
             repository=parent.repository,
             worktree_branch=parent.worktree_branch,
             worktree_path=parent.worktree_path,
+            worktree_workspace_id=parent.worktree_workspace_id,
+            worktree_root_pane_id=parent.worktree_root_pane_id,
             worktree_provision_state="ready",
             harness_kind=parent.harness_kind,
             issue_provider=parent.issue_provider,
@@ -121,7 +130,10 @@ def test_create_follow_up_links_parent_and_copies_checkout(
     parent = _completed_parent(store, tmp_path)
 
     child = store.create_follow_up(
-        parent.id, _build_child, expected_completed_at=parent.completed_at
+        parent.id,
+        _build_child,
+        expected_parent_revision=parent.revision,
+        expected_completed_at=parent.completed_at,
     )
 
     assert child.parent_job_id == parent.id
@@ -137,7 +149,9 @@ def test_create_follow_up_accepts_retained_worktree(
     store: JobStore, tmp_path: Path
 ) -> None:
     parent = _completed_parent(store, tmp_path, worktree_provision_state="retained")
-    child = store.create_follow_up(parent.id, _build_child)
+    child = store.create_follow_up(
+        parent.id, _build_child, expected_parent_revision=parent.revision
+    )
     assert child.parent_job_id == parent.id
 
 
@@ -161,7 +175,7 @@ def test_create_follow_up_rejects_non_completed_parent(
         )
     )
     with pytest.raises(FollowUpUnavailable):
-        store.create_follow_up("aaaaaaaaaaaa", _build_child)
+        store.create_follow_up("aaaaaaaaaaaa", _build_child, expected_parent_revision=0)
 
 
 def test_create_follow_up_rejects_completion_identity_mismatch(
@@ -172,7 +186,21 @@ def test_create_follow_up_rejects_completion_identity_mismatch(
         store.create_follow_up(
             parent.id,
             _build_child,
+            expected_parent_revision=parent.revision,
             expected_completed_at=(parent.completed_at or 0) + 5,
+        )
+
+
+def test_create_follow_up_rejects_stale_parent_revision_with_same_completion(
+    store: JobStore, tmp_path: Path
+) -> None:
+    parent = _completed_parent(store, tmp_path)
+    with pytest.raises(JobValidationError, match="stale follow-up parent revision"):
+        store.create_follow_up(
+            parent.id,
+            _build_child,
+            expected_parent_revision=parent.revision + 1,
+            expected_completed_at=parent.completed_at,
         )
 
 
@@ -195,11 +223,13 @@ def test_create_follow_up_rejects_shared_clone(store: JobStore, tmp_path: Path) 
                 "worktree_branch": "voice/feature",
                 "worktree_path": str(shared),
                 "worktree_provision_state": "ready",
+                "worktree_workspace_id": "workspace",
+                "worktree_root_pane_id": "root-pane",
             }
         )
     )
     with pytest.raises(FollowUpUnavailable):
-        store.create_follow_up("aaaaaaaaaaaa", _build_child)
+        store.create_follow_up("aaaaaaaaaaaa", _build_child, expected_parent_revision=0)
 
 
 def test_create_follow_up_checkout_busy_when_reserved(
@@ -209,7 +239,9 @@ def test_create_follow_up_checkout_busy_when_reserved(
     assert parent.worktree_path is not None
     _active_worktree_holder(store, parent.worktree_path)
     with pytest.raises(FollowUpCheckoutBusy):
-        store.create_follow_up(parent.id, _build_child)
+        store.create_follow_up(
+            parent.id, _build_child, expected_parent_revision=parent.revision
+        )
 
 
 def test_create_follow_up_respects_unresolved_quarantine_reservation(
@@ -232,6 +264,8 @@ def test_create_follow_up_respects_unresolved_quarantine_reservation(
                 "worktree_branch": parent.worktree_branch,
                 "worktree_path": parent.worktree_path,
                 "worktree_provision_state": "ready",
+                "worktree_workspace_id": "workspace",
+                "worktree_root_pane_id": "root-pane",
             }
         )
     )
@@ -239,7 +273,9 @@ def test_create_follow_up_respects_unresolved_quarantine_reservation(
         store.list()
 
     with pytest.raises(FollowUpCheckoutBusy):
-        store.create_follow_up(parent.id, _build_child)
+        store.create_follow_up(
+            parent.id, _build_child, expected_parent_revision=parent.revision
+        )
 
 
 def test_create_follow_up_rechecks_newly_quarantined_peer(
@@ -261,6 +297,8 @@ def test_create_follow_up_rechecks_newly_quarantined_peer(
                 "worktree_branch": parent.worktree_branch,
                 "worktree_path": parent.worktree_path,
                 "worktree_provision_state": "ready",
+                "worktree_workspace_id": "workspace",
+                "worktree_root_pane_id": "root-pane",
             }
         )
     )
@@ -269,7 +307,9 @@ def test_create_follow_up_rechecks_newly_quarantined_peer(
         pytest.warns(UserWarning),
         pytest.raises(FollowUpCheckoutBusy),
     ):
-        store.create_follow_up(parent.id, _build_child)
+        store.create_follow_up(
+            parent.id, _build_child, expected_parent_revision=parent.revision
+        )
     assert not store.path("bbbbbbbbbbbb").exists()
 
 
@@ -295,6 +335,8 @@ def test_terminal_quarantine_release_fence_blocks_follow_up(
                 "worktree_branch": parent.worktree_branch,
                 "worktree_path": parent.worktree_path,
                 "worktree_provision_state": "ready",
+                "worktree_workspace_id": "workspace",
+                "worktree_root_pane_id": "root-pane",
                 "herdr_target": "uncertain-agent",
                 "target_release_pending": True,
             }
@@ -304,7 +346,9 @@ def test_terminal_quarantine_release_fence_blocks_follow_up(
         store.list()
 
     with pytest.raises(FollowUpCheckoutBusy):
-        store.create_follow_up(parent.id, _build_child)
+        store.create_follow_up(
+            parent.id, _build_child, expected_parent_revision=parent.revision
+        )
 
 
 @pytest.mark.parametrize(
@@ -313,6 +357,8 @@ def test_terminal_quarantine_release_fence_blocks_follow_up(
         ("repository", "/different/repository"),
         ("worktree_branch", "voice/different"),
         ("worktree_path", "/different/worktree"),
+        ("worktree_workspace_id", "different-workspace"),
+        ("worktree_root_pane_id", "different-root-pane"),
     ],
 )
 def test_create_follow_up_rejects_mismatched_inherited_checkout(
@@ -329,7 +375,9 @@ def test_create_follow_up_rejects_mismatched_inherited_checkout(
         return CursorJob.from_dict(values)
 
     with pytest.raises(JobValidationError, match=f"inherit parent {field} exactly"):
-        store.create_follow_up(parent.id, mismatched)
+        store.create_follow_up(
+            parent.id, mismatched, expected_parent_revision=parent.revision
+        )
 
 
 @pytest.mark.parametrize("parent_job_id", ["bad", "AAAAAAAAAAAA", "bbbbbbbbbbbb"])
@@ -368,6 +416,7 @@ def test_start_follow_up_creates_and_launches_child(
     child_id = service.start_follow_up(
         parent.id,
         "review the changes",
+        expected_parent_revision=parent.revision,
         expected_completed_at=parent.completed_at,
         on_created=lambda: events.append("created"),
     )
@@ -398,7 +447,11 @@ def test_start_follow_up_checks_capability_before_creating_child(
     monkeypatch.setattr(service, "require_issue_capabilities", reject)
 
     with pytest.raises(HarnessError, match="requires authentication"):
-        service.start_follow_up(parent.id, "review the changes")
+        service.start_follow_up(
+            parent.id,
+            "review the changes",
+            expected_parent_revision=parent.revision,
+        )
 
     assert [job.id for job in store.list()] == [parent.id]
     launch.assert_not_called()
@@ -414,6 +467,7 @@ def test_cursor_turn_follow_up_reports_busy(store: JobStore, tmp_path: Path) -> 
             "review the changes",
             action="follow_up",
             job_id=parent.id,
+            expected_parent_revision=parent.revision,
             expected_completed_at=parent.completed_at,
         )
     )
@@ -432,6 +486,7 @@ def test_cursor_turn_follow_up_reports_unavailable_for_stale_source(
             "review the changes",
             action="follow_up",
             job_id=parent.id,
+            expected_parent_revision=parent.revision,
             expected_completed_at=(parent.completed_at or 0) + 99,
         )
     )
@@ -448,6 +503,7 @@ def test_cursor_turn_follow_up_reports_unavailable_for_missing_parent(
             "review the changes",
             action="follow_up",
             job_id="aaaaaaaaaaaa",
+            expected_parent_revision=0,
             expected_completed_at=1,
         )
     )
@@ -470,6 +526,7 @@ def test_cursor_turn_follow_up_reports_unavailable_for_quarantined_parent(
                 "review the changes",
                 action="follow_up",
                 job_id="aaaaaaaaaaaa",
+                expected_parent_revision=0,
             )
         )
 
@@ -542,6 +599,9 @@ class _FakeHerdr:
             cwd=str(checkout),
             name=target,
             worktree_path=str(checkout),
+            provider="cursor/herdr",
+            provider_session_id=f"session-{target}",
+            state_sequence=7,
         )
         self.started.append(selection)
         self.started_modes.append(mode)
@@ -611,15 +671,26 @@ def _routing_child(
         "worktree_branch": "voice/feature",
         "worktree_path": str(checkout),
         "worktree_provision_state": "ready",
+        "worktree_workspace_id": "workspace",
+        "worktree_root_pane_id": "root-pane",
         "worker_token": "tok",
         "worker_pid": 42,
         "worker_boot_id": "boot",
         "worker_process_start": "start",
+        "worker_claim_operation": "test",
+        "worker_claimed_at": 1,
     }
     if retained_pane:
         values.update(
             worktree_workspace_id="ws-1",
             worktree_root_pane_id="pane-1",
+        )
+    else:
+        values.update(
+            worktree_provision_state="quarantined",
+            worktree_workspace_id=None,
+            worktree_root_pane_id=None,
+            worktree_manual_inspection_required=True,
         )
     return store.create(CursorJob.from_dict(values))
 
@@ -668,7 +739,7 @@ def test_provision_followup_agent_starts_fresh_plan_agent(
     updated, target = provisioning._provision_followup_agent(
         store,
         job.id,
-        "tok",
+        FOLLOWUP_WORKER,
         job,
         cast(HerdrClient, client),
         set(),
@@ -695,7 +766,7 @@ def test_provision_followup_agent_starts_agent_when_absent(
     updated, target = provisioning._provision_followup_agent(
         store,
         job.id,
-        "tok",
+        FOLLOWUP_WORKER,
         job,
         cast(HerdrClient, client),
         set(),
@@ -723,7 +794,7 @@ def test_provision_followup_agent_fails_closed_without_retained_pane(
         provisioning._provision_followup_agent(
             store,
             job.id,
-            "tok",
+            FOLLOWUP_WORKER,
             job,
             cast(HerdrClient, client),
             set(),
@@ -767,7 +838,7 @@ def test_followup_agent_start_is_fenced_before_crash_and_recovered(
         provisioning._provision_followup_agent(
             store,
             job.id,
-            "tok",
+            FOLLOWUP_WORKER,
             job,
             cast(HerdrClient, client),
             set(),
@@ -796,7 +867,7 @@ def test_followup_agent_start_is_fenced_before_crash_and_recovered(
     )
 
     recovered = store.get(job.id)
-    assert recovered.agent_dispatch_state == "ready"
+    assert recovered.agent_dispatch_state == "manual_required"
     assert recovered.herdr_target == started.target
 
 
@@ -826,7 +897,7 @@ def test_followup_agent_timeout_keeps_reserved_identity_for_recovery(
         provisioning._provision_followup_agent(
             store,
             job.id,
-            "tok",
+            FOLLOWUP_WORKER,
             job,
             cast(HerdrClient, client),
             set(),
@@ -851,7 +922,7 @@ def test_followup_agent_timeout_keeps_reserved_identity_for_recovery(
         herdr_factory=lambda: cast(HerdrClient, recovery_client),
     )
 
-    assert store.get(job.id).agent_dispatch_state == "ready"
+    assert store.get(job.id).agent_dispatch_state == "manual_required"
 
 
 def test_uncertain_followup_agent_wrong_cwd_is_failed_and_cancelled(
@@ -887,12 +958,11 @@ def test_uncertain_followup_agent_wrong_cwd_is_failed_and_cancelled(
         herdr_factory=lambda: cast(HerdrClient, client),
     )
 
-    failed = store.get(job.id)
-    assert failed.status == JobStatus.FAILED
-    assert failed.agent_dispatch_state == "ready"
-    assert failed.target_release_pending
-    assert failed.cancellation_reconciliation_pending
-    assert failed.worktree_path == str(checkout)
+    staged = store.get(job.id)
+    assert staged.status == JobStatus.ROUTING
+    assert staged.terminal_intent_status is None
+    assert staged.agent_dispatch_state == "manual_required"
+    assert staged.worktree_path == str(checkout)
 
     recovery.recover_jobs(
         store,
@@ -904,8 +974,8 @@ def test_uncertain_followup_agent_wrong_cwd_is_failed_and_cancelled(
 
     client.close_owned_pane.assert_not_called()
     released = store.get(job.id)
-    assert released.target_release_pending
-    assert released.cancellation_reconciliation_pending
+    assert not released.target_release_pending
+    assert released.agent_dispatch_state == "manual_required"
 
 
 def _routing_child_with_ready_target(
@@ -920,6 +990,10 @@ def _routing_child_with_ready_target(
             herdr_workspace_id="workspace",
             agent_name="retained-agent",
             agent_dispatch_state="ready",
+            agent_operation_checkout=str(checkout),
+            agent_provider="cursor/herdr",
+            agent_provider_session_id="retained-session",
+            agent_state_sequence=7,
             reconcile=True,
         ),
     )
@@ -947,8 +1021,8 @@ def test_recovered_followup_revalidates_stale_checkout_before_dispatch(
     )
 
     failed = store.get(job.id)
-    assert failed.status == JobStatus.FAILED
-    assert "no longer matches Herdr" in str(failed.error)
+    assert failed.status == JobStatus.RECONCILING
+    assert failed.target_release_pending
     client.get_agent.assert_not_called()
     client.prompt_and_wait.assert_not_called()
 
@@ -981,6 +1055,6 @@ def test_recovered_followup_rejects_agent_with_mismatched_cwd(
     )
 
     failed = store.get(job.id)
-    assert failed.status == JobStatus.FAILED
-    assert "different checkout" in str(failed.error)
+    assert failed.status == JobStatus.RECONCILING
+    assert failed.target_release_pending
     client.prompt_and_wait.assert_not_called()

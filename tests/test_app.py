@@ -947,6 +947,192 @@ class AppConsultationTests(unittest.TestCase):
 
         play.assert_called_once_with("A conversational answer.", settings=mock.ANY)
 
+    def test_use_your_recommendation_submits_the_stored_choice(self) -> None:
+        snapshot = mock.Mock(
+            job_id="aaaaaaaaaaaa",
+            question_id="question-1",
+            turn_token="turn-1",
+            text="Which design?",
+            owner="agent",
+        )
+        with (
+            mock.patch.object(app, "start_components"),
+            mock.patch.object(
+                app.cursor_consultation,
+                "pending_question_snapshot",
+                return_value=snapshot,
+            ),
+            mock.patch.object(
+                app.cursor_consultation,
+                "applicable_choice_id",
+                return_value="safe",
+            ) as applicable,
+            mock.patch.object(
+                app,
+                "route_intent",
+                return_value=IntentRoute(Intent.CONVERSATION, "high"),
+            ),
+            mock.patch.object(
+                app, "cursor_turn", return_value=("Queued the safe design.", None)
+            ) as cursor,
+            mock.patch.object(app, "qwen_response") as qwen,
+            mock.patch.object(app, "stream_and_play") as play,
+        ):
+            app.respond("use your recommendation")
+
+        applicable.assert_called_once_with(app.CURSOR_STORE, "aaaaaaaaaaaa")
+        request = cursor.call_args.args[0]
+        self.assertEqual(request.text, "safe")
+        self.assertEqual(request.utterance, "safe")
+        self.assertEqual(request.action, "reply")
+        self.assertEqual(request.job_id, "aaaaaaaaaaaa")
+        self.assertEqual(request.expected_question_id, "question-1")
+        self.assertEqual(request.expected_question_turn, "turn-1")
+        self.assertEqual(request.answer_provenance, AnswerProvenance.USER_TEXT)
+        qwen.assert_not_called()
+        play.assert_called_once_with("Queued the safe design.", settings=mock.ANY)
+
+    def test_generic_acknowledgment_does_not_apply_a_recommendation(self) -> None:
+        snapshot = mock.Mock(
+            job_id="aaaaaaaaaaaa",
+            question_id="question-1",
+            turn_token="turn-1",
+            text="Which design?",
+            owner="agent",
+        )
+        with (
+            mock.patch.object(app, "start_components"),
+            mock.patch.object(
+                app.cursor_consultation,
+                "pending_question_snapshot",
+                return_value=snapshot,
+            ),
+            mock.patch.object(
+                app.cursor_consultation,
+                "applicable_choice_id",
+                return_value="safe",
+            ) as applicable,
+            mock.patch.object(
+                app,
+                "route_intent",
+                return_value=IntentRoute(Intent.CONVERSATION, "high"),
+            ),
+            mock.patch.object(app, "cursor_turn") as cursor,
+            mock.patch.object(app, "qwen_response", return_value="Okay."),
+            mock.patch.object(app, "stream_and_play"),
+        ):
+            app.respond("okay")
+
+        applicable.assert_not_called()
+        cursor.assert_not_called()
+
+    def test_stale_recommendation_reference_fails_closed(self) -> None:
+        snapshot = mock.Mock(
+            job_id="aaaaaaaaaaaa",
+            question_id="question-1",
+            turn_token="turn-1",
+            text="Which design?",
+            owner="agent",
+        )
+        with (
+            mock.patch.object(app, "start_components"),
+            mock.patch.object(
+                app.cursor_consultation,
+                "pending_question_snapshot",
+                return_value=snapshot,
+            ),
+            mock.patch.object(
+                app.cursor_consultation,
+                "applicable_choice_id",
+                return_value=None,
+            ),
+            mock.patch.object(
+                app,
+                "route_intent",
+                return_value=IntentRoute(Intent.AGENT_REPLY, "high"),
+            ),
+            mock.patch.object(app, "cursor_turn") as cursor,
+            mock.patch.object(app, "stream_and_play") as play,
+        ):
+            app.respond("use your recommendation")
+
+        cursor.assert_not_called()
+        play.assert_called_once_with(
+            consultation.RECOMMENDATION_UNAVAILABLE,
+            settings=mock.ANY,
+        )
+
+    def test_use_your_recommendation_is_not_intercepted_by_router_intent(self) -> None:
+        snapshot = mock.Mock(
+            job_id="aaaaaaaaaaaa",
+            question_id="question-1",
+            turn_token="turn-1",
+            text="Which design?",
+            owner="agent",
+        )
+        with (
+            mock.patch.object(app, "start_components"),
+            mock.patch.object(
+                app.cursor_consultation,
+                "pending_question_snapshot",
+                return_value=snapshot,
+            ),
+            mock.patch.object(
+                app.cursor_consultation,
+                "applicable_choice_id",
+                return_value="safe",
+            ),
+            mock.patch.object(
+                app,
+                "route_intent",
+                return_value=IntentRoute(Intent.HARNESS_CONFIG_CHANGE, "high"),
+            ),
+            mock.patch.object(
+                app, "cursor_turn", return_value=("Queued the safe design.", None)
+            ) as cursor,
+            mock.patch.object(app, "qwen_response") as qwen,
+            mock.patch.object(app, "stream_and_play"),
+        ):
+            app.respond("use your recommendation")
+
+        request = cursor.call_args.args[0]
+        self.assertEqual(request.text, "safe")
+        self.assertEqual(request.action, "reply")
+        qwen.assert_not_called()
+
+    def test_use_your_recommendation_without_a_pending_question_fails_closed(
+        self,
+    ) -> None:
+        with (
+            mock.patch.object(app, "start_components"),
+            mock.patch.object(
+                app.cursor_consultation,
+                "pending_question_snapshot",
+                return_value=None,
+            ),
+            mock.patch.object(
+                app.cursor_consultation,
+                "applicable_choice_id",
+            ) as applicable,
+            mock.patch.object(
+                app,
+                "route_intent",
+                return_value=IntentRoute(Intent.CONVERSATION, "high"),
+            ),
+            mock.patch.object(app, "cursor_turn") as cursor,
+            mock.patch.object(app, "qwen_response") as qwen,
+            mock.patch.object(app, "stream_and_play") as play,
+        ):
+            app.respond("use your recommendation")
+
+        applicable.assert_not_called()
+        cursor.assert_not_called()
+        qwen.assert_not_called()
+        play.assert_called_once_with(
+            consultation.RECOMMENDATION_UNAVAILABLE,
+            settings=mock.ANY,
+        )
+
 
 class CursorFastPathTests(unittest.TestCase):
     def test_coding_request_does_not_need_to_name_cursor(self) -> None:

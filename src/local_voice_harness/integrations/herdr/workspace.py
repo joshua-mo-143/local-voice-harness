@@ -23,6 +23,7 @@ from .types import (
     ReserveWorktree,
     SettleAgent,
     SettleWorktree,
+    agent_session_identity,
     normalize_name,
 )
 
@@ -104,6 +105,8 @@ class HerdrWorkspace:
         target = self.target(agent)
         if not target:
             raise HerdrError("Herdr agent has no usable target")
+        session_id = agent_session_identity(agent.get("agent_session"))
+        sequence = agent.get("state_change_seq")
         return AgentSelection(
             target=target,
             pane_id=str(agent.get("pane_id") or ""),
@@ -111,6 +114,13 @@ class HerdrWorkspace:
             cwd=str(agent.get("cwd") or ""),
             name=str(agent.get("name") or target),
             worktree_path=worktree,
+            provider="cursor/herdr" if session_id is not None else None,
+            provider_session_id=session_id,
+            state_sequence=(
+                sequence
+                if isinstance(sequence, int) and not isinstance(sequence, bool)
+                else None
+            ),
         )
 
     def find_agent(
@@ -259,6 +269,9 @@ class HerdrWorkspace:
                     cwd=session.metadata.get("cwd", str(checkout)),
                     name=name,
                     worktree_path=str(checkout),
+                    provider=session.provider,
+                    provider_session_id=session.session_id,
+                    state_sequence=session.state_sequence,
                 )
             except HerdrError as exc:
                 if exc.code != "agent_pane_busy" or time.monotonic() >= deadline:
@@ -418,7 +431,7 @@ class HerdrWorkspace:
                 checkpoint=checkpoint,
             )
         if plan_participant is not None:
-            plan_participant(name, label, workspace_id)
+            plan_participant(name, label, workspace_id, checkout)
         participant_pane, workspace_id = self._operations.new_pane(
             checkout,
             label,

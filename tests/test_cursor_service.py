@@ -1065,7 +1065,9 @@ def test_foreground_timeout_confirms_new_job_by_channel(
     assert job.id not in response.spoken_text
     assert job.id in response.display_text
     assert "local-voice-harness issue 149" in response.display_text
-    assert service.read_job(job.id).foreground_until == 0
+    persisted = service.read_job(job.id)
+    assert persisted.foreground_until == job.foreground_until
+    assert persisted.revision == job.revision
 
 
 def test_foreground_timeout_acknowledges_repeated_answers_as_continuations(
@@ -1540,6 +1542,19 @@ def _write_queued_job(jobs_dir: Path, job_id: str, **fields: object) -> None:
         "delivered": False,
     }
     value.update(fields)
+    if value["status"] in {"routing", "running", "reconciling"}:
+        value.setdefault("worker_claim_operation", "test")
+        value.setdefault("worker_claimed_at", 1)
+    if value.get("agent_dispatch_state") is not None:
+        value.setdefault("repository", "/repositories/example")
+        value.setdefault("worktree_path", "/worktrees/example")
+        value.setdefault("herdr_target", "agent-target")
+        value.setdefault("herdr_workspace_id", "workspace")
+        value.setdefault("herdr_pane_id", "pane")
+        value.setdefault("agent_operation_checkout", "/worktrees/example")
+        value.setdefault("agent_operation_target", value["herdr_target"])
+        value.setdefault("agent_operation_workspace_id", "workspace")
+        value.setdefault("agent_operation_pane_id", "pane")
     (jobs_dir / f"{job_id}.json").write_text(json.dumps(value))
 
 
@@ -1873,7 +1888,7 @@ def test_nuke_jobs_checks_legacy_claim_before_modern_token(
     inspect.assert_called_once()
     stop.assert_not_called()
     store = JobStore(jobs_dir, tmp_path / "legacy")
-    assert store.get("aaaaaaaaaaaa").loaded_schema_version == 5
+    assert store.get("aaaaaaaaaaaa").loaded_schema_version == CURRENT_SCHEMA_VERSION
     assert (jobs_dir / "aaaaaaaaaaaa.json.imported").exists()
 
 

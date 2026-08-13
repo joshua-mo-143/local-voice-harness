@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import unittest
 
+from local_voice_harness.cursor.lifecycle import CleanupReconciling
 from local_voice_harness.cursor.model import (
     CURRENT_SCHEMA_VERSION,
     CursorJob,
@@ -13,6 +14,8 @@ from local_voice_harness.cursor.model import (
     transition,
     validate_reservations,
 )
+from local_voice_harness.cursor.workflow import LegacyPlanApprovalProof
+from local_voice_harness.job_lifecycle import ReconcilingJob
 
 
 class FollowUpLineageTests(unittest.TestCase):
@@ -30,6 +33,8 @@ class FollowUpLineageTests(unittest.TestCase):
             "repository": "/repo",
             "worktree_branch": "voice/feature",
             "worktree_path": "/repo-wt",
+            "worktree_workspace_id": "workspace",
+            "worktree_root_pane_id": "root-pane",
             "worktree_provision_state": "ready",
         }
         value.update(fields)
@@ -102,6 +107,8 @@ class CursorJobModelTests(unittest.TestCase):
                     "worker_pid": 42,
                     "worker_boot_id": "boot",
                     "worker_process_start": "start",
+                    "worker_claim_operation": status.value,
+                    "worker_claimed_at": 1,
                 }
             )
         if status == JobStatus.AWAITING_USER:
@@ -131,6 +138,8 @@ class CursorJobModelTests(unittest.TestCase):
                     "worker_pid": 43,
                     "worker_boot_id": "next-boot",
                     "worker_process_start": "next-start",
+                    "worker_claim_operation": status.value,
+                    "worker_claimed_at": 3,
                 }
             )
         if status == JobStatus.AWAITING_USER:
@@ -367,6 +376,10 @@ class CursorJobModelTests(unittest.TestCase):
                 "revision": 3,
                 "request": "change recovery",
                 "status": "running",
+                "worker_token": "worker",
+                "worker_pid": 42,
+                "worker_boot_id": "boot",
+                "worker_process_start": "start",
                 "created_at": 1,
                 "delivered": False,
                 "workflow_tier": "high-risk",
@@ -383,6 +396,15 @@ class CursorJobModelTests(unittest.TestCase):
         self.assertEqual(job.review_approval_source, "reviewer")
         self.assertEqual(job.plan_approval_state, "observed")
         self.assertEqual(job.plan_approval_source, "legacy")
+        self.assertIsInstance(job.plan_approval.proof, LegacyPlanApprovalProof)
+        self.assertEqual(job.plan_approval_state_change_sequence, -1)
+        self.assertEqual(job.plan_approval_revision, -1)
+        self.assertEqual(job.plan_approval.plan_reference, job.plan_artifact)
+        self.assertEqual(job.plan_approval.review_reference, job.review_artifact)
+        self.assertEqual(
+            CursorJob.from_dict(job.to_dict()).plan_approval,
+            job.plan_approval,
+        )
 
     def test_v9_exhausted_review_migrates_to_explicit_clarification(self) -> None:
         job = CursorJob.from_dict(
@@ -412,29 +434,28 @@ class CursorJobModelTests(unittest.TestCase):
             "workflow_review_exhausted",
         )
 
-    def test_v9_round_two_revising_state_fails_closed(self) -> None:
-        with self.assertRaisesRegex(
-            JobValidationError,
-            "round-two workflow cannot remain in revising",
-        ):
-            CursorJob.from_dict(
-                {
-                    "schema_version": 9,
-                    "id": "123456789abc",
-                    "revision": 3,
-                    "request": "change recovery",
-                    "status": "running",
-                    "created_at": 1,
-                    "delivered": False,
-                    "workflow_tier": "high-risk",
-                    "workflow_classification_reason": "recovery",
-                    "workflow_phase": "revising",
-                    "review_round": 2,
-                    "plan_artifact": ".artifacts/123456789abc/plan-1.json",
-                    "review_artifact": ".artifacts/123456789abc/review-1.json",
-                    "review_decision": "revise",
-                }
-            )
+    def test_v9_round_two_revising_state_is_preserved(self) -> None:
+        job = CursorJob.from_dict(
+            {
+                "schema_version": 9,
+                "id": "123456789abc",
+                "revision": 3,
+                "request": "change recovery",
+                "status": "running",
+                "created_at": 1,
+                "delivered": False,
+                "workflow_tier": "high-risk",
+                "workflow_classification_reason": "recovery",
+                "workflow_phase": "revising",
+                "review_round": 2,
+                "plan_artifact": ".artifacts/123456789abc/plan-1.json",
+                "review_artifact": ".artifacts/123456789abc/review-1.json",
+                "review_decision": "revise",
+            }
+        )
+
+        self.assertEqual(job.workflow_phase, WorkflowPhase.REVISING)
+        self.assertEqual(job.review_round, 2)
 
     def test_workflow_tier_can_only_be_promoted(self) -> None:
         job = CursorJob.from_dict(
@@ -634,7 +655,18 @@ class CursorJobModelTests(unittest.TestCase):
                 with self.subTest(source=source, target=target):
                     job = self.job_for_status(source)
                     fields = self.fields_for_status(target)
-                    if target == source or target in legal_transitions(source):
+                    immutable_same_status = (
+                        source
+                        in {JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED}
+                        and target == source
+                    )
+                    if immutable_same_status:
+                        with self.assertRaisesRegex(
+                            JobValidationError,
+                            "materialized terminal outcome is immutable",
+                        ):
+                            transition(job, target, **fields)
+                    elif target == source or target in legal_transitions(source):
                         updated = transition(job, target, **fields)
                         self.assertEqual(updated.status, target)
                         self.assertEqual(updated.revision, 1)
@@ -644,6 +676,80 @@ class CursorJobModelTests(unittest.TestCase):
                             f"illegal Cursor job transition {source} -> {target}",
                         ):
                             transition(job, target, **fields)
+
+    def test_generic_evolve_cannot_infer_recovery_only_edge(self) -> None:
+        queued = self.job_for_status(JobStatus.QUEUED).evolve(
+            github_repository="owner/repository",
+            github_issue_create_title="Recovered issue",
+            github_issue_create_marker="marker",
+            github_issue_create_operation_state="submitted",
+        )
+
+        with self.assertRaisesRegex(
+            JobValidationError, "illegal Cursor job transition queued -> completed"
+        ):
+            queued.evolve(
+                status=JobStatus.COMPLETED,
+                result="Created issue",
+                completed_at=2,
+                github_issue_create_operation_state="created",
+            )
+
+    def test_current_reconciling_adapter_accepts_cleanup_reconciliation(self) -> None:
+        job = self.job_for_status(JobStatus.RECONCILING).evolve(
+            cancellation_reconciliation_pending=True,
+            github_repository="owner/repository",
+            github_issue_create_title="Issue",
+            github_issue_create_marker="marker",
+            github_issue_create_operation_state="submitted",
+        )
+
+        lifecycle = job.lifecycle
+        self.assertEqual(job.loaded_schema_version, CURRENT_SCHEMA_VERSION)
+        self.assertIsInstance(lifecycle, ReconcilingJob)
+        assert isinstance(lifecycle, ReconcilingJob)
+        self.assertIsInstance(lifecycle.cleanup, CleanupReconciling)
+        self.assertIsNone(lifecycle.terminal_intent)
+
+    def test_materialized_terminal_outcome_rejects_every_payload_rewrite(self) -> None:
+        job = self.job_for_status(JobStatus.COMPLETED)
+
+        for rewrite in (
+            lambda current: current.evolve(result="replacement"),
+            lambda current: current.evolve(error="replacement"),
+            lambda current: current.evolve(completed_at=3),
+        ):
+            with (
+                self.subTest(rewrite=rewrite),
+                self.assertRaisesRegex(
+                    JobValidationError,
+                    "materialized terminal outcome is immutable",
+                ),
+            ):
+                rewrite(job)
+
+    def test_terminal_outcome_cannot_materialize_with_cleanup_fences(self) -> None:
+        job = self.job_for_status(JobStatus.RECONCILING).evolve(
+            terminal_intent_status="cancelled",
+            terminal_intent_result="cancelled",
+            terminal_intent_completed_at=2,
+            target_release_pending=True,
+            target_release_token="release",
+            cancellation_reconciliation_pending=True,
+        )
+
+        with self.assertRaisesRegex(
+            JobValidationError,
+            "cannot materialize before cleanup settles",
+        ):
+            job.evolve(
+                status=JobStatus.CANCELLED,
+                result="cancelled",
+                completed_at=2,
+                terminal_intent_status=None,
+                terminal_intent_result=None,
+                terminal_intent_completed_at=None,
+            )
 
     def test_schema_v10_prompt_boolean_migrates_fail_closed_in_place(self) -> None:
         job = CursorJob.from_dict(
