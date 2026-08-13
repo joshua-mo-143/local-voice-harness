@@ -315,6 +315,8 @@ def _synthesize(
     text: str,
     voice: Path | None,
     output: Path,
+    *,
+    apply_speed: bool = True,
 ) -> tuple[int, float, float]:
     if _settings().tts_provider == "venice":
         settings = _settings()
@@ -322,7 +324,7 @@ def _synthesize(
         sample_rate, duration, processing_elapsed = _apply_venice_speed(
             audio,
             output,
-            settings.tts_speed,
+            settings.tts_speed if apply_speed else 1,
             timeout=settings.tts_timeout,
         )
         return sample_rate, duration, generation_elapsed + processing_elapsed
@@ -391,7 +393,9 @@ def _stream_response(
                 if cancelled.is_set():
                     break
                 output = output_dir / f"{index:04d}.wav"
-                rate, duration, elapsed = _synthesize(chunk, voice, output)
+                rate, duration, elapsed = _synthesize(
+                    chunk, voice, output, apply_speed=index > 0
+                )
                 generation_seconds += elapsed
                 if cancelled.is_set():
                     output.unlink(missing_ok=True)
