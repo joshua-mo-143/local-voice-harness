@@ -53,7 +53,7 @@ class PlaybackQueueTests(unittest.TestCase):
 
         with (
             mock.patch("local_voice_harness.tts.queue.STREAM_POLL_SECONDS", 0.001),
-            mock.patch.object(handle, "discard") as discard,
+            mock.patch.object(handle, "cancel") as cancel,
         ):
             result = handle.wait_progress(
                 0, timeout=1, should_interrupt=should_interrupt
@@ -61,7 +61,7 @@ class PlaybackQueueTests(unittest.TestCase):
 
         self.assertIsNone(result)
         should_interrupt.assert_called()
-        discard.assert_called_once()
+        cancel.assert_called_once()
 
     def test_prefetch_wait_can_be_interrupted(self) -> None:
         handle = PrefetchHandle.__new__(PrefetchHandle)
@@ -77,13 +77,13 @@ class PlaybackQueueTests(unittest.TestCase):
 
         with (
             mock.patch("local_voice_harness.tts.queue.STREAM_POLL_SECONDS", 0.001),
-            mock.patch.object(handle, "discard") as discard,
+            mock.patch.object(handle, "cancel") as cancel,
         ):
             result = handle.wait(timeout=1, should_interrupt=should_interrupt)
 
         self.assertIsNone(result)
         should_interrupt.assert_called_once()
-        discard.assert_called_once()
+        cancel.assert_called_once()
 
     def test_drain_reports_interruption_while_prefetching(self) -> None:
         queue = PlaybackQueue()
@@ -109,6 +109,16 @@ class PlaybackQueueTests(unittest.TestCase):
         self.assertEqual(batch[0][1:], (True, request))
         self.assertEqual(batch[0][0]["played_text"], "")
         on_played.assert_called_once_with(batch[0][0], True, request)
+
+    def test_enqueue_during_drain_starts_prefetch_immediately(self) -> None:
+        queue = PlaybackQueue()
+        queue._draining = True
+
+        with mock.patch("local_voice_harness.tts.queue.PrefetchHandle") as prefetch:
+            queue.enqueue(PlaybackRequest(text="arrived during playback"))
+
+        prefetch.assert_called_once_with("arrived during playback")
+        self.assertIs(queue._items[0][1], prefetch.return_value)
 
     def test_drain_removes_and_discards_terminal_prefetch_failure(self) -> None:
         queue = PlaybackQueue()
@@ -219,6 +229,45 @@ class PlaybackQueueTests(unittest.TestCase):
         self.assertFalse(interrupted)
         self.assertIs(request, first)
         second_handle.discard.assert_called_once()
+
+    def test_partial_synthesis_failure_releases_delivery_claim(self) -> None:
+        queue = PlaybackQueue()
+        request = PlaybackRequest(
+            text="partially delivered",
+            job_id="aaaaaaaaaaaa",
+            delivery_token="claim",
+            job_status="completed",
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            chunk = _write_wav(Path(temporary) / "first.wav")
+            handle = mock.create_autospec(PrefetchHandle, instance=True)
+            handle.done_meta = {}
+            handle.wait_progress.side_effect = [
+                (16_000, [chunk], ["partial"], False),
+                HarnessError("later synthesis failed"),
+            ]
+            queue._items.append((request, handle))
+            process = mock.Mock()
+            process.stdin = mock.Mock()
+            process.wait.return_value = 0
+            process.poll.return_value = 0
+            on_played = mock.Mock()
+
+            with (
+                mock.patch(
+                    "local_voice_harness.tts.queue._open_playback",
+                    return_value=process,
+                ),
+                self.assertRaisesRegex(HarnessError, "later synthesis failed"),
+            ):
+                queue.drain(on_played=on_played)
+
+        on_played.assert_called_once()
+        result, interrupted, played_request = on_played.call_args.args
+        self.assertTrue(interrupted)
+        self.assertTrue(result["interrupted"])
+        self.assertEqual(result["played_text"], "partial")
+        self.assertIs(played_request, request)
 
     def test_drain_prefetches_next_item_before_playing_current(self) -> None:
         queue = PlaybackQueue()

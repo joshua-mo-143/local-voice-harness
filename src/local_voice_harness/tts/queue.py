@@ -23,6 +23,7 @@ from .stream import STREAM_POLL_SECONDS, STREAM_TIMEOUT_SECONDS, TTSStreamParser
 
 PREFETCH_JOIN_SECONDS = 3.0
 PREFETCH_CONNECT_SECONDS = 2.0
+PREFETCH_LIMIT = 2
 
 
 @dataclass
@@ -130,7 +131,7 @@ class PrefetchHandle:
             if on_poll is not None:
                 on_poll()
             if should_interrupt is not None and should_interrupt():
-                self.discard()
+                self.cancel()
                 return None
             if time.monotonic() >= deadline:
                 self.discard()
@@ -179,7 +180,7 @@ class PrefetchHandle:
             if on_poll is not None:
                 on_poll()
             if should_interrupt is not None and should_interrupt():
-                self.discard()
+                self.cancel()
                 return None
         self.discard()
         raise HarnessError("TTS prefetch timed out")
@@ -442,10 +443,20 @@ class PlaybackQueue:
             tuple[PlaybackRequest, PrefetchHandle | None]
         ] = collections.deque()
         self._lock = threading.Lock()
+        self._draining = False
 
     def enqueue(self, request: PlaybackRequest) -> None:
         with self._lock:
-            self._items.append((request, None))
+            active = sum(handle is not None for _, handle in self._items)
+            prefetch = self._draining and active < PREFETCH_LIMIT
+            handle = (
+                PrefetchHandle(request.text, self._audio)
+                if prefetch and self._audio is not None
+                else PrefetchHandle(request.text)
+                if prefetch
+                else None
+            )
+            self._items.append((request, handle))
 
     def start_prefetch(self, *, limit: int = 1) -> None:
         if limit <= 0:
@@ -499,13 +510,15 @@ class PlaybackQueue:
         played: list[tuple[dict[str, object], bool, PlaybackRequest]] = []
         deferred_error: Exception | None = None
         started = time.perf_counter()
+        with self._lock:
+            self._draining = True
         with playback_slot():
             process: subprocess.Popen[bytes] | None = None
             sample_rate = 0
             interrupted = False
             try:
                 while not interrupted:
-                    self.start_prefetch(limit=2)
+                    self.start_prefetch(limit=PREFETCH_LIMIT)
                     with self._lock:
                         if not self._items:
                             break
@@ -524,7 +537,7 @@ class PlaybackQueue:
                         have = 0
                         finished = False
                         while not interrupted and not finished:
-                            self.start_prefetch(limit=2)
+                            self.start_prefetch(limit=PREFETCH_LIMIT)
                             try:
                                 progress = handle.wait_progress(
                                     have,
@@ -578,10 +591,18 @@ class PlaybackQueue:
                                     break
                                 chunk_texts.append(texts[have])
                                 have += 1
-                                self.start_prefetch(limit=2)
+                                self.start_prefetch(limit=PREFETCH_LIMIT)
                     except Exception as exc:
                         deferred_error = exc
                     finally:
+                        if (
+                            interrupted
+                            and process is not None
+                            and process.poll() is None
+                        ):
+                            with contextlib.suppress(subprocess.TimeoutExpired):
+                                process.terminate()
+                                process.wait(timeout=1)
                         handle.discard()
                         _cleanup_chunks(chunks_seen)
                         with self._lock:
@@ -608,11 +629,13 @@ class PlaybackQueue:
                         "ok": True,
                         "stage": "tts",
                         "request_seconds": round(time.perf_counter() - item_started, 3),
-                        "interrupted": interrupted,
+                        "interrupted": interrupted or deferred_error is not None,
                         "played_text": " ".join(chunk_texts).strip(),
                     }
                     print(json.dumps(result))
-                    played.append((result, interrupted, request))
+                    played.append(
+                        (result, interrupted or deferred_error is not None, request)
+                    )
                     if deferred_error is not None or interrupted:
                         break
                 if process is not None:
@@ -637,6 +660,8 @@ class PlaybackQueue:
                     with contextlib.suppress(subprocess.TimeoutExpired):
                         process.terminate()
                         process.wait(timeout=1)
+                with self._lock:
+                    self._draining = False
         if played:
             played[-1][0]["request_seconds"] = round(time.perf_counter() - started, 3)
         # Delivery callbacks may acknowledge durable announcements. Do not run
