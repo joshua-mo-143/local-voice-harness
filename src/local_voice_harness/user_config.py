@@ -28,6 +28,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from . import config
 from .config import (
@@ -45,6 +46,7 @@ _TOP_LEVEL_SECTIONS = (
     "audio",
     "dictation",
     "platform",
+    "announcements",
 )
 _PROVIDER_TABLES = ("llm", "tts", "venice")
 _LLM_KEYS = ("provider", "model", "endpoint", "timeout")
@@ -100,6 +102,14 @@ _PLATFORM_KEYS = (
     "cursor_mcp_auth_source",
     "agent_job_start_concurrency",
 )
+_ANNOUNCEMENT_KEYS = (
+    "mode",
+    "quiet_hours_start",
+    "quiet_hours_end",
+    "timezone",
+)
+_ANNOUNCEMENT_MODES = {"all", "action-required", "desktop-only", "quiet"}
+_CLOCK_TIME = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
 
 _TRUTHY = {"1", "true", "yes", "on"}
 _FALSY = {"0", "false", "no", "off"}
@@ -122,6 +132,15 @@ class PlanApprovalMode(StrEnum):
 
     ASK = "ask"
     AUTO = "auto"
+
+
+class AnnouncementMode(StrEnum):
+    """When background job results may interrupt with speech."""
+
+    ALL = "all"
+    ACTION_REQUIRED = "action-required"
+    DESKTOP_ONLY = "desktop-only"
+    QUIET = "quiet"
 
 
 class DictationDevice(StrEnum):
@@ -242,6 +261,16 @@ class PlatformSettings:
 
 
 @dataclass(frozen=True)
+class AnnouncementSettings:
+    """When and how background job results interrupt the user."""
+
+    mode: AnnouncementMode = AnnouncementMode.ALL
+    quiet_hours_start: str = ""
+    quiet_hours_end: str = ""
+    timezone: str = ""
+
+
+@dataclass(frozen=True)
 class UserConfig:
     """The complete, validated user configuration."""
 
@@ -251,6 +280,7 @@ class UserConfig:
     audio: AudioSettings
     dictation: DictationSettings
     platform: PlatformSettings
+    announcements: AnnouncementSettings
 
 
 def user_config_path(
@@ -1013,6 +1043,80 @@ def _load_platform(
     return settings
 
 
+def _load_announcements(
+    section: Mapping[str, object], environment: Mapping[str, str]
+) -> AnnouncementSettings:
+    _reject_unknown(section, _ANNOUNCEMENT_KEYS, label="[announcements]")
+    mode_text = (
+        str(
+            _resolve(
+                environment,
+                "VOICE_HARNESS_ANNOUNCEMENT_MODE",
+                section,
+                "mode",
+                AnnouncementMode.ALL.value,
+            )
+        )
+        .strip()
+        .casefold()
+    )
+    if mode_text not in _ANNOUNCEMENT_MODES:
+        raise UserConfigurationError(
+            "announcements.mode must be one of: all, action-required, "
+            "desktop-only, quiet"
+        )
+    start = str(
+        _resolve(
+            environment,
+            "VOICE_HARNESS_QUIET_HOURS_START",
+            section,
+            "quiet_hours_start",
+            "",
+        )
+    ).strip()
+    end = str(
+        _resolve(
+            environment,
+            "VOICE_HARNESS_QUIET_HOURS_END",
+            section,
+            "quiet_hours_end",
+            "",
+        )
+    ).strip()
+    if bool(start) != bool(end):
+        raise UserConfigurationError(
+            "announcements.quiet_hours_start and quiet_hours_end must be set together"
+        )
+    for label, value in (
+        ("announcements.quiet_hours_start", start),
+        ("announcements.quiet_hours_end", end),
+    ):
+        if value and not _CLOCK_TIME.fullmatch(value):
+            raise UserConfigurationError(f"{label} must be HH:MM in 24-hour local time")
+    timezone = str(
+        _resolve(
+            environment,
+            "VOICE_HARNESS_ANNOUNCEMENT_TIMEZONE",
+            section,
+            "timezone",
+            "",
+        )
+    ).strip()
+    if timezone:
+        try:
+            ZoneInfo(timezone)
+        except (ZoneInfoNotFoundError, KeyError, ValueError) as exc:
+            raise UserConfigurationError(
+                "announcements.timezone must be a valid IANA timezone name"
+            ) from exc
+    return AnnouncementSettings(
+        mode=AnnouncementMode(mode_text),
+        quiet_hours_start=start,
+        quiet_hours_end=end,
+        timezone=timezone,
+    )
+
+
 def _load_providers(
     section: Mapping[str, object],
     environment: Mapping[str, str],
@@ -1087,6 +1191,7 @@ def load_user_config(
         platform=_load_platform(
             _section(raw, "platform"), environment, home=resolved_home
         ),
+        announcements=_load_announcements(_section(raw, "announcements"), environment),
     )
 
 
@@ -1230,6 +1335,16 @@ def render_user_config(user_config: UserConfig) -> str:
                 else ""
             ),
             "agent_job_start_concurrency": platform.agent_job_start_concurrency,
+        },
+    )
+    announcements = user_config.announcements
+    lines += _render_table(
+        "announcements",
+        {
+            "mode": announcements.mode.value,
+            "quiet_hours_start": announcements.quiet_hours_start,
+            "quiet_hours_end": announcements.quiet_hours_end,
+            "timezone": announcements.timezone,
         },
     )
     return "\n".join(lines).rstrip("\n") + "\n"

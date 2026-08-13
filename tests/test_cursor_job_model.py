@@ -282,6 +282,39 @@ class CursorJobModelTests(unittest.TestCase):
         self.assertFalse(job.announcement_repeated)
         self.assertIsNone(job.speakable_label)
 
+    def test_v15_delivered_job_migrates_to_spoken_or_dismissed_ack(self) -> None:
+        spoken = CursorJob.from_dict(
+            {
+                "schema_version": 15,
+                "id": "123456789abc",
+                "revision": 0,
+                "request": "do it",
+                "status": "completed",
+                "created_at": 1,
+                "completed_at": 2,
+                "result": "done",
+                "delivered": True,
+            }
+        )
+        dismissed = CursorJob.from_dict(
+            {
+                "schema_version": 15,
+                "id": "bbbbbbbbbbbb",
+                "revision": 0,
+                "request": "do it",
+                "status": "completed",
+                "created_at": 1,
+                "completed_at": 2,
+                "result": "done",
+                "delivered": True,
+                "announcement_dismissed": True,
+            }
+        )
+
+        self.assertEqual(spoken.announcement_ack, "spoken")
+        self.assertEqual(dismissed.announcement_ack, "dismissed")
+        self.assertEqual(spoken.to_dict()["schema_version"], CURRENT_SCHEMA_VERSION)
+
     def test_v7_announcement_fields_round_trip(self) -> None:
         job = CursorJob.from_dict(
             {

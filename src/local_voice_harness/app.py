@@ -64,6 +64,7 @@ CURSOR_MANAGEMENT_ACTIONS = {
     Intent.AGENT_CANCEL: "cancel",
     Intent.AGENT_DISMISS: "dismiss",
     Intent.AGENT_REPEAT: "repeat",
+    Intent.ANNOUNCEMENT_DIGEST: "missed",
 }
 
 

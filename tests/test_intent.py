@@ -305,6 +305,7 @@ class InboxIntentTests(LocalRouterTestCase):
         self.assertIn("cursor_list", enum)
         self.assertIn("cursor_dismiss", enum)
         self.assertIn("cursor_repeat", enum)
+        self.assertIn("announcement_digest", enum)
 
     def test_inbox_intents_are_actionable_at_high_confidence(self) -> None:
         for name in ("cursor_list", "cursor_dismiss", "cursor_repeat"):

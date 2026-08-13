@@ -75,6 +75,12 @@ cursor_agent_inactivity_seconds = 900
 cursor_agent_max_runtime_seconds = 3600
 cursor_mcp_auth_source = ""
 agent_job_start_concurrency = 3
+
+[announcements]
+mode = "all"
+quiet_hours_start = ""
+quiet_hours_end = ""
+timezone = ""
 ```
 
 GitHub is enabled by default for compatibility. Setting `github = false` prevents
@@ -387,6 +393,21 @@ never survives a restart. Awaiting-clarification replies always take precedence,
 and opening a pull request remains unsupported. Set
 `VOICE_HARNESS_CURSOR_FOLLOWUP=0` to disable the feature entirely without affecting
 clarification replies or fresh submissions.
+
+Background job completions, questions, failures, cancellations, and blocked
+updates follow `[announcements]`. `mode` is `all` (speak every eligible result),
+`action-required` (speak questions, failures, and blocked jobs; queue ordinary
+completions and cancellations), `desktop-only` (detailed notifications without
+TTS), or `quiet` (queue everything for later). Optional `quiet_hours_start` and
+`quiet_hours_end` are a local-time `HH:MM` window; both must be set together.
+`timezone` is an IANA name, or empty for the system local zone. Quiet hours and
+`quiet` mode keep results durable: they stay in `voice-harness jobs missed` and
+the spoken “what did I miss?” digest until they are spoken, dismissed, or
+handled. Desktop-only and deferred delivery are recorded as distinct states and
+never counted as successful TTS. Foreground conversational replies stay
+immediate. Environment overrides are `VOICE_HARNESS_ANNOUNCEMENT_MODE`,
+`VOICE_HARNESS_QUIET_HOURS_START`, `VOICE_HARNESS_QUIET_HOURS_END`, and
+`VOICE_HARNESS_ANNOUNCEMENT_TIMEZONE`.
 
 An explicit multi-ticket request starts one ordinary durable job per unique,
 validated target. Bare GitHub numbers require a focused repository issue-list page;

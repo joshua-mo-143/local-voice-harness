@@ -46,6 +46,7 @@ class PlaybackRequest:
     job_status: str | None = None
     job_completed_at: float | None = None
     display_fingerprint: str | None = None
+    extra_claims: tuple[tuple[str, str, str], ...] = ()
 
 
 class PrefetchHandle:

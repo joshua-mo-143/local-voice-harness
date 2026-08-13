@@ -51,6 +51,10 @@ class UserConfigDefaultsTests(unittest.TestCase):
         self.assertEqual(config.platform.cursor_agent_max_runtime_seconds, 3600)
         self.assertIsNone(config.platform.cursor_mcp_auth_source)
         self.assertEqual(config.platform.agent_job_start_concurrency, 3)
+        self.assertEqual(config.announcements.mode.value, "all")
+        self.assertEqual(config.announcements.quiet_hours_start, "")
+        self.assertEqual(config.announcements.quiet_hours_end, "")
+        self.assertEqual(config.announcements.timezone, "")
 
     def test_config_path_lives_under_xdg_config_home(self) -> None:
         path = user_config.user_config_path({"XDG_CONFIG_HOME": "/cfg"}, home=self.HOME)
@@ -399,6 +403,36 @@ class UserConfigValidationTests(unittest.TestCase):
     def test_invalid_barge_in_mode_is_rejected(self) -> None:
         with self.assertRaisesRegex(UserConfigurationError, "off, vad, wake"):
             self._load('[audio]\nbarge_in_mode = "loud"\n')
+
+    def test_announcement_mode_and_quiet_hours_are_validated(self) -> None:
+        with self.assertRaisesRegex(UserConfigurationError, "all, action-required"):
+            self._load('[announcements]\nmode = "silent"\n')
+        with self.assertRaisesRegex(UserConfigurationError, "set together"):
+            self._load('[announcements]\nquiet_hours_start = "22:00"\n')
+        with self.assertRaisesRegex(UserConfigurationError, "HH:MM"):
+            self._load(
+                "[announcements]\n"
+                'quiet_hours_start = "10pm"\n'
+                'quiet_hours_end = "07:00"\n'
+            )
+        with self.assertRaisesRegex(UserConfigurationError, "IANA timezone"):
+            self._load('[announcements]\ntimezone = "Not/AZone"\n')
+
+    def test_announcement_policy_loads_from_config_and_environment(self) -> None:
+        loaded = self._load(
+            "[announcements]\n"
+            'mode = "action-required"\n'
+            'quiet_hours_start = "22:00"\n'
+            'quiet_hours_end = "07:00"\n'
+            'timezone = "America/New_York"\n'
+        )
+        self.assertEqual(loaded.announcements.mode.value, "action-required")
+        self.assertEqual(loaded.announcements.quiet_hours_start, "22:00")
+        overridden = self._load(
+            '[announcements]\nmode = "quiet"\n',
+            {"VOICE_HARNESS_ANNOUNCEMENT_MODE": "desktop-only"},
+        )
+        self.assertEqual(overridden.announcements.mode.value, "desktop-only")
 
     def test_empty_dictation_compute_values_are_rejected(self) -> None:
         for key in (

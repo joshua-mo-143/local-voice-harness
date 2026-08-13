@@ -51,12 +51,21 @@ from ..questions import (
 from ..responses import AssistantResponse, ResponseLike
 from ..ticket_targets import TicketExtraction, TicketReference, extract_ticket_targets
 from ..user_config import PlatformSettings, default_user_config
-from . import delivery, inbox, provisioning, questions, recovery, worker_lifecycle
+from . import (
+    announcements,
+    delivery,
+    inbox,
+    provisioning,
+    questions,
+    recovery,
+    worker_lifecycle,
+)
 from .delivery import DeliveryClaim, DeliveryClaims
 from .model import (
     ACTIVE_STATUSES,
     TERMINAL_STATUSES,
     WORKER_STATUSES,
+    AnnouncementAck,
     CursorJob,
     JobStatus,
     NewCursorJob,
@@ -1988,6 +1997,21 @@ def list_jobs() -> str:
     return inbox.describe_inbox(_job_store().list())
 
 
+def missed_announcements(claims: DeliveryClaims | None) -> AssistantResponse:
+    store = _job_store()
+    if claims is None:
+        jobs = announcements.inspect_missed_announcements(store)
+    else:
+        claimed = announcements.claim_missed_announcements(store)
+        claims.extend(claimed)
+        jobs = [claim.job for claim in claimed]
+    return announcements.render_digest(
+        jobs,
+        missed=True,
+        render_job=render_job_announcement,
+    )
+
+
 def count_jobs() -> int:
     """Return how many durable Cursor jobs currently exist."""
     return len(_job_store().list())
@@ -2247,6 +2271,7 @@ def dismiss_announcement(job_id: str) -> str:
             return None
         return job.evolve(
             announcement_dismissed=True,
+            announcement_ack=AnnouncementAck.DISMISSED.value,
             delivered=True,
             delivery_claim_token=None,
             delivery_claimed_at=None,
@@ -2342,6 +2367,11 @@ def cursor_turn(
         expected_completed_at = None
     if action == "list":
         return CursorTurnResult(list_jobs(), session_id)
+    if action == "missed":
+        return CursorTurnResult(
+            missed_announcements(delivery_claims),
+            session_id,
+        )
     if action == "status":
         resolved = _resolve_reference(
             reference or text,
