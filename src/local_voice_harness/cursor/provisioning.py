@@ -52,6 +52,21 @@ from ..integrations.registry import (
 )
 from ..linear_ticket_creation import draft_linear_ticket
 from ..local_git import LocalGitRefChanged
+from ..prompt_operations import (
+    AmbiguousPrompt,
+    PlannedPrompt,
+    PromptIdentity,
+    SubmittedPrompt,
+    SubmittingPrompt,
+    accept_prompt_submission,
+    begin_prompt_submission,
+    legacy_prompt_fields,
+    mark_prompt_ambiguous,
+    observe_prompt_submission,
+)
+from ..prompt_operations import (
+    plan_prompt as transition_prompt_plan,
+)
 from ..questions import (
     PromptOperationState,
     QuestionError,
@@ -345,6 +360,7 @@ def complete_from_output(
         question_adapter.envelope(
             pending,
             QuestionState.RESOLVED,
+            job=job,
             prompt_state=(
                 PromptOperationState.RESOLVED
                 if pending.prompt_state is not None
@@ -2931,13 +2947,20 @@ def _execute_phase_prompt(
                 or current.herdr_target != target
             ):
                 raise WorkerCancelled
+            operation = transition_prompt_plan(
+                current.prompt_operation,
+                PromptIdentity(
+                    job_id=current.id,
+                    phase=phase.value,
+                    turn=current.turn,
+                    turn_token=current.turn_token or "",
+                    target=target,
+                    agent_session=baseline_session,
+                    baseline_sequence=baseline,
+                ),
+            )
             return current.evolve(
-                prompt_operation_state="planned",
-                prompt_operation_phase=phase.value,
-                prompt_operation_turn=current.turn,
-                prompt_operation_target=target,
-                prompt_operation_agent_session=baseline_session,
-                prompt_baseline_sequence=baseline,
+                **legacy_prompt_fields(operation),
                 prompt_manifest=planned_manifest,
                 continuation=(
                     False
@@ -2964,21 +2987,34 @@ def _execute_phase_prompt(
         checkpoint()
         sequence = int(observed.get("state_change_seq") or 0)
         observed_session = agent_session_identity(observed.get("agent_session"))
-        if (
-            observed_session == job.prompt_operation_agent_session
-            and observed_session is not None
-            and job.prompt_baseline_sequence is not None
-            and job.prompt_baseline_sequence >= 0
-            and sequence != job.prompt_baseline_sequence
-        ):
+        operation = job.prompt_operation
+        if not isinstance(operation, SubmittingPrompt):
+            raise HarnessError(f"invalid durable prompt state {operation.state.value}")
+        identity = operation.identity
+        observed_operation = observe_prompt_submission(
+            operation,
+            identity,
+            target=target,
+            agent_session=observed_session,
+            state_sequence=sequence,
+        )
+        if isinstance(observed_operation, SubmittedPrompt):
+            assert observed_session is not None
             counted = _accepted_explicit_plan_approval(job)
 
             def mark_observed_submission(current: CursorJob) -> CursorJob:
+                submitted_operation = observe_prompt_submission(
+                    current.prompt_operation,
+                    identity,
+                    target=target,
+                    agent_session=observed_session,
+                    state_sequence=sequence,
+                )
                 sessions = current.prompt_context_sessions
                 if current.active_participant is not None:
                     sessions[current.active_participant.value] = observed_session
                 return current.evolve(
-                    prompt_operation_state="submitted",
+                    **legacy_prompt_fields(submitted_operation),
                     plan_approval_counted=(current.plan_approval_counted or counted),
                     prompt_context_sessions=sessions,
                 )
@@ -2995,13 +3031,22 @@ def _execute_phase_prompt(
             job = submitted
             state = "submitted"
         else:
+            assert isinstance(observed_operation, AmbiguousPrompt)
             _worker_change(
                 store,
                 job.id,
                 worker_token,
                 MODEL_WORKER_STATUSES,
                 lambda current: current.evolve(
-                    prompt_operation_state="ambiguous",
+                    **legacy_prompt_fields(
+                        observe_prompt_submission(
+                            current.prompt_operation,
+                            identity,
+                            target=target,
+                            agent_session=observed_session,
+                            state_sequence=sequence,
+                        )
+                    ),
                     manual_reconcile_operation="prompt",
                     manual_reconcile_token=uuid.uuid4().hex,
                     manual_reconcile_required_at=time.time(),
@@ -3094,6 +3139,12 @@ def _execute_phase_prompt(
         raise HarnessError(f"invalid durable prompt state {state}")
 
     operation_baseline = job.prompt_baseline_sequence
+    planned_operation = job.prompt_operation
+    if not isinstance(planned_operation, PlannedPrompt):
+        raise HarnessError(
+            f"invalid durable prompt state {planned_operation.state.value}"
+        )
+    prompt_identity = planned_operation.identity
     if payload is None:
         session_identity = job.prompt_operation_agent_session
         manifest = job.prompt_manifest
@@ -3113,9 +3164,11 @@ def _execute_phase_prompt(
             raise HarnessError("Cursor prompt baseline changed before submission")
 
         def mark_submitting(current: CursorJob) -> CursorJob:
-            if current.prompt_operation_state != "planned":
-                raise WorkerCancelled
-            return current.evolve(prompt_operation_state="submitting")
+            operation = begin_prompt_submission(
+                current.prompt_operation,
+                prompt_identity,
+            )
+            return current.evolve(**legacy_prompt_fields(operation))
 
         if (
             _worker_change(
@@ -3133,8 +3186,10 @@ def _execute_phase_prompt(
         counted = _accepted_explicit_plan_approval(job)
 
         def mark_submitted(current: CursorJob) -> CursorJob:
-            if current.prompt_operation_state != "submitting":
-                raise WorkerCancelled
+            operation = accept_prompt_submission(
+                current.prompt_operation,
+                prompt_identity,
+            )
             sessions = current.prompt_context_sessions
             if (
                 current.active_participant is not None
@@ -3144,7 +3199,7 @@ def _execute_phase_prompt(
                     current.prompt_operation_agent_session
                 )
             return current.evolve(
-                prompt_operation_state="submitted",
+                **legacy_prompt_fields(operation),
                 plan_approval_counted=(current.plan_approval_counted or counted),
                 prompt_context_sessions=sessions,
             )
@@ -3193,7 +3248,12 @@ def _execute_phase_prompt(
             job.id,
             lambda current: (
                 current.evolve(
-                    prompt_operation_state="ambiguous",
+                    **legacy_prompt_fields(
+                        mark_prompt_ambiguous(
+                            current.prompt_operation,
+                            prompt_identity,
+                        )
+                    ),
                     manual_reconcile_operation="prompt",
                     manual_reconcile_token=uuid.uuid4().hex,
                     manual_reconcile_required_at=time.time(),
@@ -3361,6 +3421,7 @@ def _begin_prompt_turn(job: CursorJob, turn: int, turn_token: str) -> CursorJob:
             question_envelope = question_adapter.envelope(
                 question,
                 QuestionState.DISPATCHING,
+                job=job,
                 dispatch_token=turn_token,
                 prompt_state=PromptOperationState.PLANNED,
                 prompt_baseline_seq=None,
@@ -3368,7 +3429,9 @@ def _begin_prompt_turn(job: CursorJob, turn: int, turn_token: str) -> CursorJob:
                 prompt_absent_observations=0,
             )
     elif question is not None and question.state == QuestionState.ANSWERED:
-        question_envelope = question_adapter.envelope(question, QuestionState.RESOLVED)
+        question_envelope = question_adapter.envelope(
+            question, QuestionState.RESOLVED, job=job
+        )
     return job.evolve(
         turn=turn,
         turn_token=turn_token,
@@ -3421,6 +3484,7 @@ def _mark_prompt_boundary(
             voice_question=question_adapter.envelope(
                 question,
                 QuestionState.DISPATCHING,
+                job=job,
                 prompt_state=state,
                 prompt_baseline_seq=baseline,
                 prompt_submitted_at=(

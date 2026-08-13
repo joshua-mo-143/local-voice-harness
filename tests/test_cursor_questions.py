@@ -407,6 +407,37 @@ def test_answer_later_persists_without_launching(store: JobStore) -> None:
     assert deferred.state == QuestionState.DEFERRED
 
 
+def test_answer_later_is_idempotent_for_deferred_question(store: JobStore) -> None:
+    original = _awaiting(store)
+    first = cursor_turn(
+        CursorTurnRequest(
+            "answer later",
+            action="reply",
+            job_id=original.id,
+            expected_question_id="question-1",
+            expected_question_turn="aaaaaaaaaaaa-1",
+        )
+    )
+
+    with mock.patch.object(service, "launch_worker") as launch:
+        second = cursor_turn(
+            CursorTurnRequest(
+                "answer later",
+                action="reply",
+                job_id=original.id,
+                expected_question_id="question-1",
+                expected_question_turn="aaaaaaaaaaaa-1",
+            )
+        )
+
+    launch.assert_not_called()
+    assert first.session_id is None
+    assert second.session_id is None
+    deferred = questions.current(store.get(original.id))
+    assert deferred is not None
+    assert deferred.state == QuestionState.DEFERRED
+
+
 def test_repeat_returns_same_question_without_mutation(store: JobStore) -> None:
     original = _awaiting(store)
 

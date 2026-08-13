@@ -39,6 +39,8 @@ from ..questions import (
     AnswerOutcome,
     AnswerProvenance,
     Question,
+    QuestionError,
+    QuestionIdentity,
     QuestionKind,
     QuestionOrigin,
     QuestionSensitivity,
@@ -47,6 +49,7 @@ from ..questions import (
     choices_prompt,
     question_prompt,
     resolve_answer,
+    validate_question_identity,
 )
 from ..responses import AssistantResponse, ResponseLike
 from ..ticket_targets import TicketExtraction, TicketReference, extract_ticket_targets
@@ -1216,10 +1219,16 @@ def _reply_grouped_repository(
     question = questions.current(job)
     if question is None:
         raise HarnessError(f"Cursor job {job.id} has no grouped clarification")
-    if (expected_question_id is not None and question.id != expected_question_id) or (
-        expected_question_turn is not None
-        and question.origin.turn_token != expected_question_turn
-    ):
+    try:
+        validate_question_identity(
+            question,
+            QuestionIdentity(
+                job.id,
+                expected_question_id or question.id,
+                expected_question_turn or question.origin.turn_token,
+            ),
+        )
+    except QuestionError:
         return "That answer belongs to an older question, so I did not use it."
     raw_targets = job.grouped_repository_targets
     raw_candidates = job.grouped_repository_candidates
@@ -1331,6 +1340,7 @@ def _reply_grouped_repository(
             voice_question=questions.envelope(
                 pending,
                 QuestionState.RESOLVED,
+                job=current,
                 answer=text,
                 trusted_answer=trusted_utterance or text,
                 answered_at=now,
@@ -1471,12 +1481,16 @@ def reply_job(
         question = questions.current(job)
         if question is None:
             return None
-        if (
-            expected_question_id is not None and question.id != expected_question_id
-        ) or (
-            expected_question_turn is not None
-            and question.origin.turn_token != expected_question_turn
-        ):
+        try:
+            validate_question_identity(
+                question,
+                QuestionIdentity(
+                    job.id,
+                    expected_question_id or question.id,
+                    expected_question_turn or question.origin.turn_token,
+                ),
+            )
+        except QuestionError:
             immediate = "That answer belongs to an older question, so I did not use it."
             should_launch = False
             return None
@@ -1498,7 +1512,9 @@ def reply_job(
                 delivery_claim_token=None,
                 delivery_claimed_at=None,
                 updated_at=now,
-                voice_question=questions.envelope(question, QuestionState.DEFERRED),
+                voice_question=questions.envelope(
+                    question, QuestionState.DEFERRED, job=job
+                ),
             )
         if resolution.outcome == AnswerOutcome.AMBIGUOUS:
             immediate = (
@@ -1539,7 +1555,9 @@ def reply_job(
                 JobStatus.CANCELLED,
                 now=now,
                 result=f"Cursor job {job_id} was cancelled.",
-                voice_question=questions.envelope(question, QuestionState.CANCELLED),
+                voice_question=questions.envelope(
+                    question, QuestionState.CANCELLED, job=job
+                ),
                 job_changes=(
                     {"plan_approval_state": "rejected"}
                     if question.owner == "workflow_plan_approval"
@@ -1558,6 +1576,7 @@ def reply_job(
                 voice_question=questions.envelope(
                     question,
                     QuestionState.RESOLVED,
+                    job=job,
                     answer=resolution.answer,
                     trusted_answer=resolution.trusted_answer,
                     answered_at=now,
@@ -1747,7 +1766,7 @@ def cancel_job(
             result=f"Cursor job {job_id} was cancelled.",
             clear_worker=legacy_worker_stopped,
             voice_question=(
-                questions.envelope(question, QuestionState.CANCELLED)
+                questions.envelope(question, QuestionState.CANCELLED, job=job)
                 if question is not None
                 else None
             ),
