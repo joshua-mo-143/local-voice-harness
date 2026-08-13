@@ -995,6 +995,48 @@ class CursorRecoveryTests(unittest.TestCase):
             "submitted",
         )
 
+    def test_incomplete_prompt_submit_identity_fails_closed_without_replay(
+        self,
+    ) -> None:
+        self.create(
+            {
+                "id": "123456789abc",
+                "status": "running",
+                "request": "test",
+                "created_at": 1,
+                "delivered": False,
+                "worker_token": "worker",
+                "worker_pid": 42,
+                "worker_boot_id": "boot",
+                "worker_process_start": "start",
+                "workflow_phase": "classifying",
+                "turn": 1,
+                "workflow_turn_phase": "classifying",
+                "herdr_target": "planner",
+                "planner_target": "planner",
+                "active_participant": "planner",
+                "prompt_operation_state": "submitting",
+                "prompt_operation_phase": "classifying",
+                "prompt_operation_turn": 1,
+                "prompt_operation_target": "planner",
+                "prompt_baseline_sequence": -1,
+            }
+        )
+        client = mock.Mock()
+
+        reconcile_prompt_and_pane_operations(
+            self.store,
+            self.store.get("123456789abc"),
+            now=10,
+            herdr_factory=lambda: client,
+        )
+
+        client.ensure_server.assert_not_called()
+        recovered = self.store.get("123456789abc")
+        self.assertEqual(recovered.prompt_operation_state, "ambiguous")
+        self.assertEqual(recovered.manual_reconcile_operation, "prompt")
+        self.assertIsNotNone(recovered.manual_reconcile_token)
+
     def test_plan_approval_recovery_rejects_replaced_agent_session(self) -> None:
         created = self.create(
             {

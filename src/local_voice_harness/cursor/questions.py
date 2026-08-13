@@ -5,16 +5,19 @@ from __future__ import annotations
 import re
 import uuid
 from collections.abc import Mapping
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from typing import Any, Protocol
 
 from ..integrations.linear import LinearError, LinearIntegration
 from ..questions import (
     AnswerResolution,
     Question,
+    QuestionIdentity,
     QuestionOrigin,
     QuestionSpec,
     QuestionState,
+    question_identity,
+    transition_question,
 )
 from ..user_config import (
     PlanApprovalMode,
@@ -116,14 +119,30 @@ def with_state(
     state: QuestionState,
     **changes: object,
 ) -> CursorJob:
-    updated = replace(question, state=state, **changes)
+    updated = transition_question(
+        question,
+        state,
+        QuestionIdentity(job.id, question.id, question.origin.turn_token),
+        **changes,
+    )
     return job.evolve(voice_question=updated.to_dict())
 
 
 def envelope(
-    question: Question, state: QuestionState, **changes: object
+    question: Question,
+    state: QuestionState,
+    *,
+    job: CursorJob | None = None,
+    **changes: object,
 ) -> dict[str, object]:
-    return replace(question, state=state, **changes).to_dict()
+    identity = question_identity(question)
+    if job is not None:
+        identity = QuestionIdentity(
+            job.id,
+            identity.question_id,
+            identity.turn_token,
+        )
+    return transition_question(question, state, identity, **changes).to_dict()
 
 
 @dataclass(frozen=True, slots=True)
@@ -154,6 +173,7 @@ class AnswerHandler(Protocol):
 
 
 def _answered_envelope(
+    job: CursorJob,
     question: Question,
     resolution: AnswerResolution,
     now: float,
@@ -161,6 +181,7 @@ def _answered_envelope(
     return envelope(
         question,
         QuestionState.ANSWERED,
+        job=job,
         answer=resolution.answer,
         trusted_answer=resolution.trusted_answer,
         answered_at=now,
@@ -256,7 +277,7 @@ def _queue_answer(
             *job.clarifications,
             _clarification_record(job, question, resolution, context),
         ],
-        voice_question=_answered_envelope(question, resolution, context.now),
+        voice_question=_answered_envelope(job, question, resolution, context.now),
     )
 
 
@@ -440,6 +461,7 @@ def _fork_confirmation_answer(
         voice_question=envelope(
             question,
             QuestionState.RESOLVED,
+            job=job,
             answer="no",
             trusted_answer=context.trusted_text or context.text,
             answered_at=context.now,
@@ -496,6 +518,7 @@ def _github_issue_create_confirmation_answer(
         voice_question=envelope(
             question,
             QuestionState.RESOLVED,
+            job=job,
             answer="no",
             trusted_answer=context.trusted_text,
             answered_at=context.now,
@@ -588,6 +611,7 @@ def _linear_ticket_create_confirmation_answer(
         voice_question=envelope(
             question,
             QuestionState.RESOLVED,
+            job=job,
             answer="no",
             trusted_answer=context.trusted_text,
             answered_at=context.now,
@@ -668,7 +692,7 @@ def _workflow_queue_answer(
         "prompt_operation_turn": None,
         "prompt_operation_target": None,
         "prompt_baseline_sequence": None,
-        "voice_question": _answered_envelope(question, resolution, context.now),
+        "voice_question": _answered_envelope(job, question, resolution, context.now),
     }
     if workflow_phase is not None:
         changes["workflow_phase"] = workflow_phase

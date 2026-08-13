@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import StrEnum
 from typing import Any
 
@@ -36,6 +36,13 @@ class QuestionState(StrEnum):
     DISPATCHING = "dispatching"
     RESOLVED = "resolved"
     CANCELLED = "cancelled"
+
+
+@dataclass(frozen=True, slots=True)
+class QuestionIdentity:
+    job_id: str
+    question_id: str
+    turn_token: str
 
 
 class AnswerOutcome(StrEnum):
@@ -211,6 +218,83 @@ class AnswerResolution:
     answer: str | None = None
     trusted_answer: str | None = None
     choice_label: str | None = None
+
+
+_LEGAL_QUESTION_TRANSITIONS = {
+    QuestionState.PENDING: frozenset(
+        {
+            QuestionState.DEFERRED,
+            QuestionState.ANSWERED,
+            QuestionState.RESOLVED,
+            QuestionState.CANCELLED,
+        }
+    ),
+    QuestionState.DEFERRED: frozenset(
+        {
+            QuestionState.DEFERRED,
+            QuestionState.ANSWERED,
+            QuestionState.RESOLVED,
+            QuestionState.CANCELLED,
+        }
+    ),
+    QuestionState.ANSWERED: frozenset(
+        {
+            QuestionState.DISPATCHING,
+            QuestionState.RESOLVED,
+            QuestionState.CANCELLED,
+        }
+    ),
+    QuestionState.DISPATCHING: frozenset(
+        {
+            QuestionState.DISPATCHING,
+            QuestionState.RESOLVED,
+            QuestionState.CANCELLED,
+        }
+    ),
+    QuestionState.RESOLVED: frozenset(),
+    QuestionState.CANCELLED: frozenset(),
+}
+_IMMUTABLE_QUESTION_FIELDS = frozenset(
+    {"id", "text", "kind", "sensitivity", "origin", "choices", "owner", "asked_at"}
+)
+
+
+def question_identity(question: Question) -> QuestionIdentity:
+    return QuestionIdentity(
+        job_id=question.origin.job_id,
+        question_id=question.id,
+        turn_token=question.origin.turn_token,
+    )
+
+
+def validate_question_identity(question: Question, identity: QuestionIdentity) -> None:
+    if identity != question_identity(question):
+        raise QuestionError("stale question identity")
+
+
+def transition_question(
+    question: Question,
+    state: QuestionState,
+    identity: QuestionIdentity,
+    **changes: object,
+) -> Question:
+    """Apply a legal question transition after checking its originating fence."""
+    validate_question_identity(question, identity)
+    immutable_changes = _IMMUTABLE_QUESTION_FIELDS.intersection(changes)
+    if immutable_changes:
+        fields = ", ".join(sorted(immutable_changes))
+        raise QuestionError(
+            f"question transition cannot change identity fields: {fields}"
+        )
+    if state not in _LEGAL_QUESTION_TRANSITIONS[question.state]:
+        raise QuestionError(
+            f"illegal question transition {question.state.value} -> {state.value}"
+        )
+    if state == QuestionState.DISPATCHING and (
+        not question.answer or question.answered_at is None
+    ):
+        raise QuestionError("dispatching question requires an answer and answered_at")
+    return replace(question, state=state, **changes)
 
 
 _REPEAT = frozenset({"repeat", "repeat that", "say that again", "what was that"})
@@ -448,8 +532,25 @@ def _validate_question(question: Question) -> None:
             question.sensitivity,
         )
     )
+    if not all(
+        value.strip()
+        for value in (
+            question.id,
+            question.owner,
+            question.origin.provider,
+            question.origin.job_id,
+            question.origin.turn_token,
+        )
+    ):
+        raise QuestionError("question identity fields must not be empty")
     if question.prompt_absent_observations < 0:
         raise QuestionError("prompt absent observations must not be negative")
+    if question.state == QuestionState.ANSWERED and (
+        not question.answer or question.answered_at is None
+    ):
+        raise QuestionError(
+            f"{question.state.value} question requires an answer and answered_at"
+        )
     if question.state == QuestionState.DISPATCHING and (
         not question.dispatch_token or question.prompt_state is None
     ):

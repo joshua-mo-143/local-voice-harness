@@ -24,6 +24,13 @@ from ..integrations.herdr import (
 )
 from ..integrations.linear import LinearError, LinearIntegration
 from ..integrations.registry import build_integration_registry, issue_provider
+from ..prompt_operations import (
+    PromptOperationError,
+    SubmittedPrompt,
+    SubmittingPrompt,
+    legacy_prompt_fields,
+    observe_prompt_submission,
+)
 from ..questions import PromptOperationState, QuestionState
 from ..user_config import default_user_config
 from . import questions as question_adapter
@@ -31,6 +38,7 @@ from .model import (
     TERMINAL_STATUSES,
     CursorJob,
     JobStatus,
+    JobValidationError,
     WorkflowParticipant,
 )
 from .store import JobStore, LegacyWorkerInspector
@@ -603,6 +611,28 @@ def reconcile_prompt_and_pane_operations(
 ) -> None:
     """Resolve only externally observable acceptance; never replay a submit."""
     if job.prompt_operation_state == "submitting":
+        try:
+            operation = job.prompt_operation
+        except (PromptOperationError, JobValidationError):
+            # Older or manually repaired rows may satisfy the flat schema without
+            # carrying the complete typed identity. Crossing the submit boundary
+            # without that fence is permanently ambiguous and must never replay.
+            def fence_incomplete_prompt(current: CursorJob) -> CursorJob | None:
+                if current.prompt_operation_state != "submitting":
+                    return None
+                return current.evolve_recovery(
+                    now=now,
+                    prompt_operation_state="ambiguous",
+                    manual_reconcile_operation="prompt",
+                    manual_reconcile_token=uuid.uuid4().hex,
+                    manual_reconcile_required_at=now,
+                )
+
+            store.update(job.id, fence_incomplete_prompt)
+            return
+        if not isinstance(operation, SubmittingPrompt):
+            return
+        identity = operation.identity
         target = job.prompt_operation_target or ""
         try:
             client = herdr_factory()
@@ -617,6 +647,11 @@ def reconcile_prompt_and_pane_operations(
                 observation.session.state_sequence
                 if observation.session is not None
                 else 0
+            )
+            observed_target = (
+                observation.session.target
+                if observation.session is not None
+                else target
             )
             session = (
                 observation.session.session_id
@@ -633,16 +668,20 @@ def reconcile_prompt_and_pane_operations(
                 or current.prompt_operation_target != target
             ):
                 return None
-            accepted = (
-                session is not None
-                and session == current.prompt_operation_agent_session
-                and current.prompt_baseline_sequence is not None
-                and current.prompt_baseline_sequence >= 0
-                and sequence != current.prompt_baseline_sequence
-            )
+            try:
+                observed = observe_prompt_submission(
+                    current.prompt_operation,
+                    identity,
+                    target=observed_target,
+                    agent_session=session,
+                    state_sequence=sequence,
+                )
+            except PromptOperationError:
+                return None
+            accepted = isinstance(observed, SubmittedPrompt)
             return current.evolve_recovery(
                 now=now,
-                prompt_operation_state="submitted" if accepted else "ambiguous",
+                **legacy_prompt_fields(observed),
                 manual_reconcile_operation=None if accepted else "prompt",
                 manual_reconcile_token=None if accepted else uuid.uuid4().hex,
                 manual_reconcile_required_at=None if accepted else now,
@@ -1165,6 +1204,7 @@ def _reconcile_question_prompt(
                 voice_question=question_adapter.envelope(
                     current_question,
                     QuestionState.DISPATCHING,
+                    job=current,
                     prompt_state=PromptOperationState.OBSERVED,
                 ),
             )
@@ -1193,6 +1233,7 @@ def _reconcile_question_prompt(
                 voice_question=question_adapter.envelope(
                     current_question,
                     QuestionState.DISPATCHING,
+                    job=current,
                     prompt_absent_observations=observations,
                 )
             )
@@ -1207,6 +1248,7 @@ def _reconcile_question_prompt(
             voice_question=question_adapter.envelope(
                 current_question,
                 QuestionState.DISPATCHING,
+                job=current,
                 prompt_state=PromptOperationState.PLANNED,
                 prompt_baseline_seq=None,
                 prompt_submitted_at=None,

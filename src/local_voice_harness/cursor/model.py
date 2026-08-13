@@ -14,6 +14,11 @@ from ..integrations.github import (
     dump_github_provider_state,
     load_github_provider_state,
 )
+from ..prompt_operations import (
+    PromptOperation,
+    PromptOperationError,
+    load_prompt_operation,
+)
 from ..questions import Question, QuestionError
 
 CURRENT_SCHEMA_VERSION = 16
@@ -2050,6 +2055,33 @@ class AgentJob:
     @property
     def prompt_operation_state(self) -> str:
         return self._optional_string("prompt_operation_state") or "none"
+
+    @property
+    def prompt_operation(self) -> PromptOperation:
+        try:
+            return load_prompt_operation(
+                state=self.prompt_operation_state,
+                job_id=self.id,
+                phase=(
+                    self.prompt_operation_phase.value
+                    if self.prompt_operation_phase is not None
+                    else None
+                ),
+                turn=self.prompt_operation_turn,
+                turn_token=(
+                    self.turn_token
+                    or (
+                        f"{self.id}-{self.prompt_operation_turn}"
+                        if self.prompt_operation_turn > 0
+                        else None
+                    )
+                ),
+                target=self.prompt_operation_target,
+                agent_session=self.prompt_operation_agent_session,
+                baseline_sequence=self.prompt_baseline_sequence,
+            )
+        except PromptOperationError as exc:
+            raise JobValidationError(str(exc)) from exc
 
     @property
     def prompt_operation_phase(self) -> WorkflowPhase | None:
