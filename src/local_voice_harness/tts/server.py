@@ -24,7 +24,10 @@ from ..config import (
 )
 from ..credentials import get_venice_api_key
 from ..diagnostic_safety import redact_diagnostic
+from ..http_pool import install as _install_http_pool
 from ..user_config import default_user_config, load_user_config
+
+_install_http_pool()
 
 SOCKET_PATH = TTS_SOCKET
 OUTPUT_ROOT = STATE_DIR

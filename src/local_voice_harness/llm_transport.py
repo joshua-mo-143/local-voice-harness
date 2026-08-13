@@ -12,7 +12,10 @@ from .config import BackendSettings
 from .credentials import get_venice_api_key
 from .diagnostic_safety import redact_diagnostic, redact_fields
 from .errors import HarnessError
+from .http_pool import install as _install_http_pool
 from .user_config import default_user_config
+
+_install_http_pool()
 
 _SENTENCE = re.compile(r'^(.+?[.!?]["\']?)(?:\s+)', re.DOTALL)
 
