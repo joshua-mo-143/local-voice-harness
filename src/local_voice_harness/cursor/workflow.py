@@ -67,6 +67,7 @@ class ParticipantCreationState(StrEnum):
     SUBMITTING = "submitting"
     CREATED = "created"
     AMBIGUOUS = "ambiguous"
+    FAILED = "failed"
     MANUAL_REQUIRED = "manual_required"
 
 
@@ -636,6 +637,7 @@ class ParticipantCreation:
                 ParticipantCreationState.PLANNED,
                 ParticipantCreationState.SUBMITTING,
                 ParticipantCreationState.NONE,
+                ParticipantCreationState.FAILED,
                 ParticipantCreationState.MANUAL_REQUIRED,
             },
             ParticipantCreationState.SUBMITTING: {
@@ -657,6 +659,11 @@ class ParticipantCreation:
                 ParticipantCreationState.CREATED,
                 ParticipantCreationState.NONE,
             },
+            ParticipantCreationState.FAILED: {
+                ParticipantCreationState.FAILED,
+                ParticipantCreationState.NONE,
+                ParticipantCreationState.PLANNED,
+            },
         }
         if after.state not in legal[self.state]:
             raise WorkflowTransitionError(
@@ -664,7 +671,8 @@ class ParticipantCreation:
                 f"{after.state.value}"
             )
         if (
-            self.state != ParticipantCreationState.NONE
+            self.state
+            not in {ParticipantCreationState.NONE, ParticipantCreationState.FAILED}
             and after.state != ParticipantCreationState.NONE
             and (
                 self.participant,

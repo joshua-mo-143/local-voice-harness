@@ -13,6 +13,7 @@ from local_voice_harness import user_config
 from local_voice_harness.cursor import provisioning, questions, recovery, service
 from local_voice_harness.cursor.delivery import claim_delivery
 from local_voice_harness.cursor.model import CursorJob, JobStatus, JobValidationError
+from local_voice_harness.cursor.operations import WorkerOwnership
 from local_voice_harness.cursor.service import CursorTurnRequest, cursor_turn
 from local_voice_harness.cursor.store import JobStore
 from local_voice_harness.errors import HarnessError
@@ -42,6 +43,12 @@ def store(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> JobStore:
     monkeypatch.setattr(service, "JOBS_DIR", jobs)
     monkeypatch.setattr(service, "LEGACY_JOBS_DIR", legacy)
     return JobStore(jobs, legacy)
+
+
+def _owner(job: CursorJob) -> WorkerOwnership:
+    owner = job.worker_ownership
+    assert owner is not None
+    return owner
 
 
 def _question(
@@ -727,7 +734,7 @@ def test_third_accepted_approval_offers_auto_after_implementation(
     provisioning._worker_complete(
         store,
         job.id,
-        "worker",
+        _owner(job),
         output="VOICE_SUMMARY[aaaaaaaaaaaa-4]: done",
         agent_status="idle",
     )
@@ -968,6 +975,8 @@ def test_planned_dispatch_recovers_same_turn_and_answer(
             worker_pid=42,
             worker_boot_id="old-boot",
             worker_process_start="old-start",
+            worker_claim_operation="test-recovery",
+            worker_claimed_at=2,
         ),
     )
     assert crashed is not None
@@ -1012,6 +1021,8 @@ def test_submitted_dispatch_retries_only_after_repeated_absence(
             worker_pid=42,
             worker_boot_id="old-boot",
             worker_process_start="old-start",
+            worker_claim_operation="test-recovery",
+            worker_claimed_at=2,
         ),
     )
     running = store.update(
@@ -1069,6 +1080,8 @@ def test_observed_dispatch_recovers_by_reading_without_resubmission(
             worker_pid=42,
             worker_boot_id="old-boot",
             worker_process_start="old-start",
+            worker_claim_operation="test-recovery",
+            worker_claimed_at=2,
         ),
     )
     store.update(
@@ -1163,7 +1176,7 @@ def test_successful_cleanup_resolves_dispatched_question(store: JobStore) -> Non
     provisioning._worker_complete(
         store,
         job.id,
-        "worker",
+        _owner(job),
         output="VOICE_SUMMARY[aaaaaaaaaaaa-2]: completed",
         agent_status="idle",
     )
@@ -1327,7 +1340,7 @@ def test_interactive_questionnaire_error_persists_blocked_status(
     provisioning._worker_error(
         store,
         running.id,
-        "worker",
+        _owner(running),
         HerdrError("questionnaire", code="interactive_questionnaire"),
         prompt_may_be_active=True,
     )

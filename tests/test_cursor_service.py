@@ -1540,6 +1540,19 @@ def _write_queued_job(jobs_dir: Path, job_id: str, **fields: object) -> None:
         "delivered": False,
     }
     value.update(fields)
+    if value["status"] in {"routing", "running", "reconciling"}:
+        value.setdefault("worker_claim_operation", "test")
+        value.setdefault("worker_claimed_at", 1)
+    if value.get("agent_dispatch_state") is not None:
+        value.setdefault("repository", "/repositories/example")
+        value.setdefault("worktree_path", "/worktrees/example")
+        value.setdefault("herdr_target", "agent-target")
+        value.setdefault("herdr_workspace_id", "workspace")
+        value.setdefault("herdr_pane_id", "pane")
+        value.setdefault("agent_operation_checkout", "/worktrees/example")
+        value.setdefault("agent_operation_target", value["herdr_target"])
+        value.setdefault("agent_operation_workspace_id", "workspace")
+        value.setdefault("agent_operation_pane_id", "pane")
     (jobs_dir / f"{job_id}.json").write_text(json.dumps(value))
 
 

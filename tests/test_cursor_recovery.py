@@ -23,6 +23,7 @@ from local_voice_harness.cursor.model import (
     WorkflowParticipant,
     transition,
 )
+from local_voice_harness.cursor.operations import WorkerOwnership
 from local_voice_harness.cursor.recovery import (
     acknowledge_worktree_quarantine,
     cancel_target_and_release,
@@ -55,6 +56,8 @@ from local_voice_harness.integrations.linear import (
     LinearTicketCreationResult,
 )
 
+WORKER = WorkerOwnership("worker", 42, "boot", "start", "test", 1)
+
 
 class CursorRecoveryTests(unittest.TestCase):
     def setUp(self) -> None:
@@ -66,7 +69,118 @@ class CursorRecoveryTests(unittest.TestCase):
         self.temporary.cleanup()
 
     def create(self, values: dict[str, object]) -> CursorJob:
+        values = dict(values)
+        agent_state = values.get("agent_dispatch_state")
+        if agent_state is not None and values.get("herdr_target"):
+            values.setdefault("agent_operation_target", values["herdr_target"])
+            values.setdefault(
+                "agent_operation_checkout",
+                values.get("worktree_path") or values.get("repository") or "/worktree",
+            )
+            values.setdefault("herdr_workspace_id", "workspace")
+            values.setdefault("herdr_pane_id", "pane")
+            values.setdefault(
+                "agent_operation_workspace_id", values["herdr_workspace_id"]
+            )
+            values.setdefault("agent_operation_pane_id", values["herdr_pane_id"])
+            if agent_state in {"ready", "retained"}:
+                values.setdefault("agent_provider", "cursor/herdr")
+                values.setdefault("agent_provider_session_id", "session")
+                values.setdefault("agent_state_sequence", 1)
+        if values.get("fork_operation_state") is not None and values.get(
+            "fork_operation_target"
+        ):
+            values.setdefault("fork_operation_source", "source/project")
+            values.setdefault(
+                "fork_operation_source_url",
+                "https://github.com/source/project",
+            )
+            values.setdefault("fork_operation_source_default_branch", "main")
+            values.setdefault("fork_operation_source_private", False)
+        if values.get("participant_creation_state") not in {None, "none"}:
+            values.setdefault(
+                "participant_creation_checkout",
+                values.get("worktree_path") or values.get("repository") or "/worktree",
+            )
         return self.store.create(CursorJob.from_dict(values))
+
+    def observe_owned_sessions(
+        self, client: mock.Mock, job_id: str = "123456789abc"
+    ) -> None:
+        def get_agent(target: str) -> dict[str, object]:
+            current = self.store.get(job_id)
+            if target == current.herdr_target:
+                return {
+                    "pane_id": current.herdr_pane_id,
+                    "workspace_id": current.herdr_workspace_id,
+                    "cwd": current.worktree_path or current.repository,
+                }
+            if target == current.participant_creation_target:
+                return {
+                    "pane_id": current.participant_creation_pane_id,
+                    "workspace_id": current.participant_creation_workspace_id,
+                    "cwd": current.participant_creation_checkout,
+                }
+            owner = next(
+                item
+                for item in current.participant_session_owners
+                if item["target"] == target
+            )
+            return {
+                "pane_id": owner["pane_id"],
+                "workspace_id": owner["workspace_id"],
+                "cwd": owner["checkout"],
+            }
+
+        def reconcile(
+            target: str, *, expected_session_id: str
+        ) -> SessionReconciliation:
+            current = self.store.get(job_id)
+            operation = current.agent_session_operation
+            if operation is not None and operation.spec.target == target:
+                provider = (
+                    operation.session.provider if operation.session else "cursor/herdr"
+                )
+                sequence = (
+                    operation.session.state_sequence + 1 if operation.session else 1
+                )
+                pane_id = operation.spec.pane_id
+                workspace_id = operation.spec.workspace_id
+                checkout = operation.spec.checkout
+            else:
+                owner = next(
+                    item
+                    for item in current.participant_session_owners
+                    if item["target"] == target
+                )
+                provider = str(owner["provider"])
+                state_sequence = owner["state_sequence"]
+                assert isinstance(state_sequence, int) and not isinstance(
+                    state_sequence, bool
+                )
+                sequence = state_sequence + 1
+                pane_id = str(owner["pane_id"])
+                workspace_id = str(owner["workspace_id"])
+                checkout = str(owner["checkout"])
+            return SessionReconciliation(
+                ReconciliationState.ACTIVE,
+                HarnessSession(
+                    provider,
+                    expected_session_id,
+                    target,
+                    sequence,
+                    {
+                        "pane_id": pane_id,
+                        "workspace_id": workspace_id,
+                        "cwd": checkout,
+                    },
+                ),
+                "active",
+                True,
+            )
+
+        client.get_agent.side_effect = get_agent
+        client.reconcile_session.side_effect = reconcile
 
     def test_reconciles_ambiguous_issue_creation_without_resubmitting(self) -> None:
         job = self.create(
@@ -338,6 +452,8 @@ class CursorRecoveryTests(unittest.TestCase):
                     worker_pid=42,
                     worker_boot_id="boot",
                     worker_process_start="start",
+                    worker_claim_operation="test",
+                    worker_claimed_at=1,
                 ),
             )
 
@@ -448,6 +564,8 @@ class CursorRecoveryTests(unittest.TestCase):
                     "delivered": False,
                     "worker_pid": 42,
                     "worker_process_start": "start",
+                    "worker_claim_operation": "test",
+                    "worker_claimed_at": 1,
                 }
             )
         )
@@ -482,6 +600,8 @@ class CursorRecoveryTests(unittest.TestCase):
                     "worker_token": "legacy-claim",
                     "worker_pid": 42,
                     "worker_process_start": "start",
+                    "worker_claim_operation": "test",
+                    "worker_claimed_at": 1,
                 }
             )
         )
@@ -716,9 +836,10 @@ class CursorRecoveryTests(unittest.TestCase):
         )
 
         recovered = self.store.get("123456789abc")
-        self.assertEqual(recovered.status, JobStatus.CANCELLED)
-        self.assertFalse(recovered.target_release_pending)
-        client.close_owned_pane.assert_called_once_with("agent", "pane", "workspace")
+        self.assertEqual(recovered.status, JobStatus.RECONCILING)
+        self.assertTrue(recovered.target_release_pending)
+        self.assertTrue(recovered.target_release_manual_required)
+        client.close_owned_pane.assert_not_called()
         launch.assert_not_called()
 
     def test_wrong_checkout_stages_failure_until_cleanup_settles(self) -> None:
@@ -882,6 +1003,7 @@ class CursorRecoveryTests(unittest.TestCase):
                 "herdr_target": "agent",
                 "herdr_pane_id": "pane-agent",
                 "herdr_workspace_id": "workspace",
+                "worktree_path": "/worktree",
                 "worktree_workspace_id": "workspace",
                 "worktree_root_pane_id": "pane-anchor",
                 "target_release_pending": True,
@@ -889,6 +1011,7 @@ class CursorRecoveryTests(unittest.TestCase):
             }
         )
         client = mock.Mock()
+        self.observe_owned_sessions(client)
         factory = mock.Mock(return_value=client)
 
         for _ in range(2):
@@ -924,6 +1047,27 @@ class CursorRecoveryTests(unittest.TestCase):
                 "planner_target": "planner",
                 "reviewer_target": "reviewer",
                 "implementer_target": "implementer",
+                "agent_dispatch_state": "ready",
+                "participant_session_owners": [
+                    {
+                        "provider": "cursor/herdr",
+                        "session_id": "planner-session",
+                        "target": "planner",
+                        "state_sequence": 1,
+                        "checkout": "/worktree",
+                        "workspace_id": "workspace",
+                        "pane_id": "pane-planner",
+                    },
+                    {
+                        "provider": "cursor/herdr",
+                        "session_id": "reviewer-session",
+                        "target": "reviewer",
+                        "state_sequence": 1,
+                        "checkout": "/worktree",
+                        "workspace_id": "workspace",
+                        "pane_id": "pane-reviewer",
+                    },
+                ],
                 "target_release_pending": True,
                 "target_release_token": "release",
             }
@@ -935,6 +1079,7 @@ class CursorRecoveryTests(unittest.TestCase):
             "workspace_id": "workspace",
             "cwd": "/worktree",
         }
+        self.observe_owned_sessions(client)
 
         cancel_target_and_release(
             self.store,
@@ -1065,12 +1210,15 @@ class CursorRecoveryTests(unittest.TestCase):
                 "worker_pid": 42,
                 "worker_boot_id": "boot",
                 "worker_process_start": "start",
+                "worker_claim_operation": "test",
+                "worker_claimed_at": 1,
                 "workflow_phase": "classifying",
                 "turn": 1,
                 "workflow_turn_phase": "classifying",
                 "herdr_target": "planner",
                 "herdr_pane_id": "pane-planner",
                 "herdr_workspace_id": "workspace",
+                "worktree_path": "/worktree",
                 "worktree_workspace_id": "workspace",
                 "worktree_root_pane_id": "pane-anchor",
                 "planner_target": "planner",
@@ -1134,6 +1282,8 @@ class CursorRecoveryTests(unittest.TestCase):
                 "worker_pid": 42,
                 "worker_boot_id": "boot",
                 "worker_process_start": "start",
+                "worker_claim_operation": "test",
+                "worker_claimed_at": 1,
                 "workflow_phase": "classifying",
                 "turn": 1,
                 "workflow_turn_phase": "classifying",
@@ -1174,6 +1324,8 @@ class CursorRecoveryTests(unittest.TestCase):
                 "worker_pid": 42,
                 "worker_boot_id": "boot",
                 "worker_process_start": "start",
+                "worker_claim_operation": "test",
+                "worker_claimed_at": 1,
                 "workflow_tier": "medium",
                 "workflow_classification_reason": "cross-component",
                 "workflow_phase": "reviewing",
@@ -1183,6 +1335,7 @@ class CursorRecoveryTests(unittest.TestCase):
                 "herdr_target": "planner",
                 "herdr_pane_id": "pane-planner",
                 "herdr_workspace_id": "workspace",
+                "worktree_path": "/worktree",
                 "worktree_workspace_id": "workspace",
                 "worktree_root_pane_id": "pane-anchor",
                 "planner_target": "planner",
@@ -1255,6 +1408,8 @@ class CursorRecoveryTests(unittest.TestCase):
                 "worker_pid": 42,
                 "worker_boot_id": "boot",
                 "worker_process_start": "start",
+                "worker_claim_operation": "test",
+                "worker_claimed_at": 1,
                 "participant_creation_state": "submitting",
                 "participant_creation_participant": "reviewer",
                 "participant_creation_target": "reviewer",
@@ -1286,9 +1441,12 @@ class CursorRecoveryTests(unittest.TestCase):
                 "worker_pid": 42,
                 "worker_boot_id": "boot",
                 "worker_process_start": "start",
+                "worker_claim_operation": "test",
+                "worker_claimed_at": 1,
                 "herdr_target": "planner",
                 "herdr_pane_id": "pane-planner",
                 "herdr_workspace_id": "workspace",
+                "worktree_path": "/worktree",
                 "worktree_workspace_id": "workspace",
                 "worktree_root_pane_id": "pane-anchor",
                 "planner_target": "planner",
@@ -1316,6 +1474,7 @@ class CursorRecoveryTests(unittest.TestCase):
         )
         assert staged is not None and staged.target_release_token
         client = mock.Mock()
+        self.observe_owned_sessions(client)
 
         cancel_target_and_release(
             self.store,
@@ -1349,6 +1508,8 @@ class CursorRecoveryTests(unittest.TestCase):
                 "worker_pid": 42,
                 "worker_boot_id": "boot",
                 "worker_process_start": "start",
+                "worker_claim_operation": "test",
+                "worker_claimed_at": 1,
                 "herdr_target": "planner",
                 "herdr_pane_id": "pane-planner",
                 "herdr_workspace_id": "workspace",
@@ -1400,6 +1561,7 @@ class CursorRecoveryTests(unittest.TestCase):
             "workspace_id": "workspace",
             "cwd": "/worktree",
         }
+        self.observe_owned_sessions(client)
         cancel_target_and_release(
             self.store,
             created.id,
@@ -1430,6 +1592,8 @@ class CursorRecoveryTests(unittest.TestCase):
                 "worker_pid": 42,
                 "worker_boot_id": "boot",
                 "worker_process_start": "start",
+                "worker_claim_operation": "test",
+                "worker_claimed_at": 1,
                 "herdr_target": "planner",
                 "planner_target": "planner",
                 "active_participant": "planner",
@@ -1439,7 +1603,7 @@ class CursorRecoveryTests(unittest.TestCase):
         planned = provisioning._plan_participant_creation(
             self.store,
             created,
-            "worker",
+            WORKER,
             WorkflowParticipant.REVIEWER,
             target="reviewer-pending",
             label="task-reviewer",
@@ -1448,7 +1612,7 @@ class CursorRecoveryTests(unittest.TestCase):
         before_submit, accepted = provisioning._participant_pane_callbacks(
             self.store,
             planned.id,
-            "worker",
+            WORKER,
             "reviewer-pending",
         )
         before_submit()
@@ -1494,6 +1658,8 @@ class CursorRecoveryTests(unittest.TestCase):
                 "worker_pid": 42,
                 "worker_boot_id": "boot",
                 "worker_process_start": "start",
+                "worker_claim_operation": "test",
+                "worker_claimed_at": 1,
             }
         )
         staged = self.store.update(
@@ -1557,6 +1723,8 @@ class CursorRecoveryTests(unittest.TestCase):
                         "worker_pid": 42,
                         "worker_boot_id": "boot",
                         "worker_process_start": f"start-{job_id}",
+                        "worker_claim_operation": "test",
+                        "worker_claimed_at": 1,
                         "workflow_phase": "implementing",
                         "workflow_tier": "simple",
                         "workflow_classification_reason": "localized",
@@ -1571,6 +1739,26 @@ class CursorRecoveryTests(unittest.TestCase):
                         "reviewer_target": f"reviewer-{job_id}",
                         "implementer_target": f"implementer-{job_id}",
                         "agent_dispatch_state": "ready",
+                        "participant_session_owners": [
+                            {
+                                "provider": "cursor/herdr",
+                                "session_id": f"planner-session-{job_id}",
+                                "target": f"planner-{job_id}",
+                                "state_sequence": 1,
+                                "checkout": "/worktree",
+                                "workspace_id": "workspace",
+                                "pane_id": f"pane-planner-{job_id}",
+                            },
+                            {
+                                "provider": "cursor/herdr",
+                                "session_id": f"reviewer-session-{job_id}",
+                                "target": f"reviewer-{job_id}",
+                                "state_sequence": 1,
+                                "checkout": "/worktree",
+                                "workspace_id": "workspace",
+                                "pane_id": f"pane-reviewer-{job_id}",
+                            },
+                        ],
                     }
                 )
 
@@ -1598,6 +1786,7 @@ class CursorRecoveryTests(unittest.TestCase):
                     "workspace_id": "workspace",
                     "cwd": "/worktree",
                 }
+                self.observe_owned_sessions(client, job.id)
 
                 cancel_target_and_release(
                     self.store,
@@ -1637,10 +1826,15 @@ class CursorRecoveryTests(unittest.TestCase):
                 "planner_target": "planner-agent",
                 "active_participant": "planner",
                 "agent_dispatch_state": "ready",
+                "worktree_path": "/worktree",
+                "worktree_workspace_id": "workspace",
+                "worktree_root_pane_id": "root-pane",
                 "worker_token": "worker-token",
                 "worker_pid": 42,
                 "worker_boot_id": "boot",
                 "worker_process_start": "start",
+                "worker_claim_operation": "test",
+                "worker_claimed_at": 1,
             }
         )
 
@@ -1671,12 +1865,14 @@ class CursorRecoveryTests(unittest.TestCase):
         staged = self.store.update(job.id, mark_prompt_ambiguous)
         assert staged is not None and staged.target_release_token
 
+        client = mock.Mock()
+        self.observe_owned_sessions(client)
         cancel_target_and_release(
             self.store,
             job.id,
             "planner-agent",
             staged.target_release_token,
-            herdr_factory=mock.Mock(),
+            herdr_factory=lambda: client,
         )
 
         released = self.store.get(job.id)
@@ -1685,6 +1881,96 @@ class CursorRecoveryTests(unittest.TestCase):
         self.assertFalse(released.cancellation_reconciliation_pending)
         self.assertIsNone(released.manual_reconcile_operation)
         self.assertEqual(released.prompt_operation_state, "none")
+
+    def test_typed_session_reconciliation_rejects_stale_sequence(self) -> None:
+        job = self.create(
+            {
+                "id": "123456789abc",
+                "schema_version": CURRENT_SCHEMA_VERSION,
+                "revision": 0,
+                "status": "queued",
+                "request": "test",
+                "created_at": 1,
+                "queued_at": 1,
+                "delivered": False,
+                "worktree_path": "/worktree",
+                "herdr_target": "agent",
+                "herdr_pane_id": "pane",
+                "herdr_workspace_id": "workspace",
+                "agent_dispatch_state": "ambiguous",
+                "agent_provider": "cursor/herdr",
+                "agent_provider_session_id": "session",
+                "agent_state_sequence": 7,
+            }
+        )
+        client = mock.Mock()
+        client.reconcile_session.return_value = SessionReconciliation(
+            ReconciliationState.ACTIVE,
+            HarnessSession("cursor/herdr", "session", "agent", 6),
+            "working",
+            True,
+        )
+
+        reconcile_uncertain_agent(
+            self.store,
+            job,
+            now=10,
+            herdr_factory=lambda: client,
+        )
+
+        self.assertEqual(
+            self.store.get(job.id).agent_dispatch_state,
+            "ambiguous",
+        )
+        client.reconcile_session.assert_called_once_with(
+            "agent",
+            expected_session_id="session",
+        )
+
+    def test_typed_cleanup_never_closes_mismatched_checkout(self) -> None:
+        job = self.create(
+            {
+                "id": "123456789abc",
+                "schema_version": CURRENT_SCHEMA_VERSION,
+                "revision": 0,
+                "status": "cancelled",
+                "request": "test",
+                "created_at": 1,
+                "completed_at": 2,
+                "result": "cancelled",
+                "delivered": False,
+                "worktree_path": "/worktree",
+                "worktree_workspace_id": "workspace",
+                "worktree_root_pane_id": "root-pane",
+                "herdr_target": "agent",
+                "herdr_pane_id": "pane",
+                "herdr_workspace_id": "workspace",
+                "agent_dispatch_state": "ready",
+                "agent_provider": "cursor/herdr",
+                "agent_provider_session_id": "session",
+                "agent_state_sequence": 7,
+                "target_release_pending": True,
+                "target_release_token": "release",
+            }
+        )
+        client = mock.Mock()
+        client.get_agent.return_value = {
+            "name": "agent",
+            "pane_id": "pane",
+            "workspace_id": "workspace",
+            "cwd": "/different-worktree",
+        }
+
+        cancel_target_and_release(
+            self.store,
+            job.id,
+            "agent",
+            "release",
+            herdr_factory=lambda: client,
+        )
+
+        client.close_owned_pane.assert_not_called()
+        self.assertTrue(self.store.get(job.id).target_release_pending)
 
 
 if __name__ == "__main__":

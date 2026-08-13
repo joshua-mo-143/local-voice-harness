@@ -28,6 +28,7 @@ from .model import (
     validate_reservations,
     validate_transition,
 )
+from .operations import WorkerOwnership
 from .sqlite_store import SQLiteJobDatabase, fsync_database_directory
 
 DELIVERED_JOB_RETENTION_SECONDS = 7 * 24 * 60 * 60
@@ -826,7 +827,17 @@ def _read_model_unlocked(path: Path) -> CursorJob:
 
 
 def read_unlocked(path: Path) -> dict[str, object]:
-    return _read_model_unlocked(path).to_dict(preserve_loaded_version=True)
+    model = _read_model_unlocked(path)
+    raw = json.loads(path.read_text())
+    assert isinstance(raw, dict)
+    persisted_version = raw.get("schema_version", 0)
+    return model.to_dict(
+        preserve_loaded_version=(
+            isinstance(persisted_version, int)
+            and not isinstance(persisted_version, bool)
+            and persisted_version < CURRENT_SCHEMA_VERSION
+        )
+    )
 
 
 def _peer_models_unlocked(path: Path) -> list[CursorJob]:
@@ -991,6 +1002,7 @@ def _normalize_for_durable_write(
         candidate.loaded_schema_version < CURRENT_SCHEMA_VERSION
         and candidate.status
         in {JobStatus.ROUTING, JobStatus.RUNNING, JobStatus.RECONCILING}
+        and candidate.terminal_intent_status is None
         and not any(
             value is not None
             for value in (
@@ -1021,6 +1033,8 @@ def _normalize_for_durable_write(
             worker_pid=None,
             worker_boot_id=None,
             worker_process_start=None,
+            worker_claim_operation=None,
+            worker_claimed_at=None,
         )
         if active and safely_cleared:
             values.update(
@@ -1264,9 +1278,15 @@ def _validate_follow_up_source(
         raise FollowUpUnavailable(
             f"Cursor job {parent.id} completion identity has changed"
         )
-    if not (parent.repository and parent.worktree_branch and parent.worktree_path):
+    if not (
+        parent.repository
+        and parent.worktree_branch
+        and parent.worktree_path
+        and parent.worktree_workspace_id
+        and parent.worktree_root_pane_id
+    ):
         raise FollowUpUnavailable(
-            f"Cursor job {parent.id} has no isolated worktree to reuse"
+            f"Cursor job {parent.id} has no complete isolated workspace to reuse"
         )
     if parent.worktree_provision_state not in {"ready", "retained"}:
         raise FollowUpUnavailable(
@@ -1295,6 +1315,15 @@ def _validate_follow_up_source(
 JobCommand = Callable[[CursorJob], CursorJob | None]
 FollowUpBuilder = Callable[[CursorJob], CursorJob]
 ArtifactCommand = Callable[[CursorJob, str], CursorJob]
+
+
+def _worker_claim_matches(job: CursorJob, expected: WorkerOwnership | str) -> bool:
+    if isinstance(expected, WorkerOwnership):
+        try:
+            return expected.matches(job.worker_ownership)
+        except JobValidationError:
+            return False
+    return False
 
 
 class JsonJobStore:
@@ -1484,7 +1513,7 @@ class JsonJobStore:
         round_number: int,
         text: str,
         *,
-        expected_worker_token: str,
+        expected_worker_token: WorkerOwnership | str,
         expected_turn_token: str,
         expected_phase: str,
         expected_prior_reference: str | None,
@@ -1510,7 +1539,7 @@ class JsonJobStore:
             field = "plan_artifact" if kind == "plan" else "review_artifact"
             if (
                 current.terminal_intent_status is not None
-                or current.worker_token != expected_worker_token
+                or not _worker_claim_matches(current, expected_worker_token)
                 or current.turn_token != expected_turn_token
                 or current.workflow_phase.value != expected_phase
                 or current.review_round != round_number
@@ -1929,6 +1958,7 @@ class JobStore:
             )
             if isinstance(value, str) and value
         }
+        targets.update(str(owner["target"]) for owner in job.participant_session_owners)
         rows.extend(
             ("target", target, "active or recovery-fenced target")
             for target in sorted(targets)
@@ -2490,7 +2520,7 @@ class JobStore:
         round_number: int,
         text: str,
         *,
-        expected_worker_token: str,
+        expected_worker_token: WorkerOwnership | str,
         expected_turn_token: str,
         expected_phase: str,
         expected_prior_reference: str | None,
@@ -2505,7 +2535,7 @@ class JobStore:
             field = "plan_artifact" if kind == "plan" else "review_artifact"
             if (
                 current.terminal_intent_status is not None
-                or current.worker_token != expected_worker_token
+                or not _worker_claim_matches(current, expected_worker_token)
                 or current.turn_token != expected_turn_token
                 or current.workflow_phase.value != expected_phase
                 or current.review_round != round_number

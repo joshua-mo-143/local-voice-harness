@@ -31,6 +31,8 @@ class FollowUpLineageTests(unittest.TestCase):
             "repository": "/repo",
             "worktree_branch": "voice/feature",
             "worktree_path": "/repo-wt",
+            "worktree_workspace_id": "workspace",
+            "worktree_root_pane_id": "root-pane",
             "worktree_provision_state": "ready",
         }
         value.update(fields)
@@ -103,6 +105,8 @@ class CursorJobModelTests(unittest.TestCase):
                     "worker_pid": 42,
                     "worker_boot_id": "boot",
                     "worker_process_start": "start",
+                    "worker_claim_operation": status.value,
+                    "worker_claimed_at": 1,
                 }
             )
         if status == JobStatus.AWAITING_USER:
@@ -132,6 +136,8 @@ class CursorJobModelTests(unittest.TestCase):
                     "worker_pid": 43,
                     "worker_boot_id": "next-boot",
                     "worker_process_start": "next-start",
+                    "worker_claim_operation": status.value,
+                    "worker_claimed_at": 3,
                 }
             )
         if status == JobStatus.AWAITING_USER:
