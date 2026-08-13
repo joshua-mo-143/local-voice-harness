@@ -18,6 +18,15 @@ from local_voice_harness.tts.queue import (
 )
 
 
+def _write_wav(path: Path) -> Path:
+    with wave.open(str(path), "wb") as output:
+        output.setnchannels(1)
+        output.setsampwidth(2)
+        output.setframerate(16_000)
+        output.writeframes(b"\x00\x00" * 8)
+    return path
+
+
 class PlaybackQueueTests(unittest.TestCase):
     def test_enqueue_defers_prefetch_until_explicitly_started(self) -> None:
         queue = PlaybackQueue()
@@ -31,6 +40,28 @@ class PlaybackQueueTests(unittest.TestCase):
             prefetch.call_args_list,
             [mock.call("first")],
         )
+
+    def test_prefetch_wait_progress_can_be_interrupted(self) -> None:
+        handle = PrefetchHandle.__new__(PrefetchHandle)
+        handle._progress = threading.Condition()
+        handle._chunks = []
+        handle._chunk_texts = []
+        handle._sample_rate = 0
+        handle._stream_done = False
+        handle._stream_error = None
+        should_interrupt = mock.Mock(return_value=True)
+
+        with (
+            mock.patch("local_voice_harness.tts.queue.STREAM_POLL_SECONDS", 0.001),
+            mock.patch.object(handle, "discard") as discard,
+        ):
+            result = handle.wait_progress(
+                0, timeout=1, should_interrupt=should_interrupt
+            )
+
+        self.assertIsNone(result)
+        should_interrupt.assert_called()
+        discard.assert_called_once()
 
     def test_prefetch_wait_can_be_interrupted(self) -> None:
         handle = PrefetchHandle.__new__(PrefetchHandle)
@@ -58,7 +89,7 @@ class PlaybackQueueTests(unittest.TestCase):
         queue = PlaybackQueue()
         request = PlaybackRequest(text="slow response")
         handle = mock.create_autospec(PrefetchHandle, instance=True)
-        handle.wait.return_value = None
+        handle.wait_progress.return_value = None
         queue._items.append((request, handle))
         on_played = mock.Mock()
         should_interrupt = mock.Mock(return_value=True)
@@ -68,7 +99,8 @@ class PlaybackQueueTests(unittest.TestCase):
             on_played=on_played,
         )
 
-        handle.wait.assert_called_once_with(
+        handle.wait_progress.assert_called_once_with(
+            0,
             should_interrupt=should_interrupt,
             on_poll=None,
         )
@@ -82,7 +114,7 @@ class PlaybackQueueTests(unittest.TestCase):
         queue = PlaybackQueue()
         request = PlaybackRequest(text="failed response")
         handle = mock.create_autospec(PrefetchHandle, instance=True)
-        handle.wait.side_effect = HarnessError("socket refused")
+        handle.wait_progress.side_effect = HarnessError("socket refused")
         queue._items.append((request, handle))
 
         with self.assertRaisesRegex(HarnessError, "socket refused"):
@@ -106,13 +138,13 @@ class PlaybackQueueTests(unittest.TestCase):
                 output.setsampwidth(2)
                 output.setframerate(16_000)
                 output.writeframes(b"\x00\x00" * 8)
-            prefetched = PrefetchedUtterance(
-                sample_rate=16_000,
-                chunks=[chunk],
-                chunk_texts=["completed"],
-            )
             handle = mock.create_autospec(PrefetchHandle, instance=True)
-            handle.wait.return_value = prefetched
+            handle.wait_progress.return_value = (
+                16_000,
+                [chunk],
+                ["completed"],
+                True,
+            )
             queue._items.append((request, handle))
             process = mock.Mock()
             process.stdin = mock.Mock()
@@ -155,13 +187,16 @@ class PlaybackQueueTests(unittest.TestCase):
                 output.setframerate(16_000)
                 output.writeframes(b"\x00\x00" * 8)
             first_handle = mock.create_autospec(PrefetchHandle, instance=True)
-            first_handle.wait.return_value = PrefetchedUtterance(
-                sample_rate=16_000,
-                chunks=[chunk],
-                chunk_texts=["first"],
+            first_handle.wait_progress.return_value = (
+                16_000,
+                [chunk],
+                ["first"],
+                True,
             )
             second_handle = mock.create_autospec(PrefetchHandle, instance=True)
-            second_handle.wait.side_effect = HarnessError("second prefetch failed")
+            second_handle.wait_progress.side_effect = HarnessError(
+                "second prefetch failed"
+            )
             queue._items.extend([(first, first_handle), (second, second_handle)])
             process = mock.Mock()
             process.stdin = mock.Mock()
@@ -185,12 +220,128 @@ class PlaybackQueueTests(unittest.TestCase):
         self.assertIs(request, first)
         second_handle.discard.assert_called_once()
 
+    def test_drain_prefetches_next_item_before_playing_current(self) -> None:
+        queue = PlaybackQueue()
+        queue.enqueue(PlaybackRequest(text="first"))
+        queue.enqueue(PlaybackRequest(text="second"))
+        created: list[str] = []
+
+        def fake_handle(text: str, settings: object | None = None) -> PrefetchHandle:
+            created.append(text)
+            handle = mock.create_autospec(PrefetchHandle, instance=True)
+            handle.done_meta = {}
+            chunk = first_chunk if text == "first" else second_chunk
+
+            def wait_progress(
+                have: int,
+                **_kwargs: object,
+            ) -> tuple[int, list[Path], list[str], bool]:
+                if text == "first":
+                    self.assertIn("second", created)
+                return 16_000, [chunk], [text], True
+
+            handle.wait_progress.side_effect = wait_progress
+            return handle
+
+        with tempfile.TemporaryDirectory() as temporary:
+            first_chunk = _write_wav(Path(temporary) / "first.wav")
+            second_chunk = _write_wav(Path(temporary) / "second.wav")
+            process = mock.Mock()
+            process.stdin = mock.Mock()
+            process.wait.return_value = 0
+            process.poll.return_value = 0
+            with (
+                mock.patch(
+                    "local_voice_harness.tts.queue.PrefetchHandle",
+                    side_effect=fake_handle,
+                ),
+                mock.patch(
+                    "local_voice_harness.tts.queue._open_playback",
+                    return_value=process,
+                ),
+            ):
+                queue.drain()
+
+        self.assertEqual(created, ["first", "second"])
+
+    def test_drain_starts_playback_on_first_chunk_before_later_chunks(self) -> None:
+        queue = PlaybackQueue()
+        request = PlaybackRequest(text="two clauses")
+        playback_opened = mock.Mock()
+
+        with tempfile.TemporaryDirectory() as temporary:
+            first = _write_wav(Path(temporary) / "first.wav")
+            second = _write_wav(Path(temporary) / "second.wav")
+            handle = mock.create_autospec(PrefetchHandle, instance=True)
+            handle.done_meta = {}
+
+            def wait_progress(
+                have: int,
+                **_kwargs: object,
+            ) -> tuple[int, list[Path], list[str], bool]:
+                if have == 0:
+                    playback_opened.assert_not_called()
+                    return 16_000, [first], ["one"], False
+                playback_opened.assert_called_once()
+                return 16_000, [first, second], ["one", "two"], True
+
+            handle.wait_progress.side_effect = wait_progress
+            queue._items.append((request, handle))
+            process = mock.Mock()
+            process.stdin = mock.Mock()
+            process.wait.return_value = 0
+            process.poll.return_value = 0
+
+            def open_playback(*_args: object, **_kwargs: object) -> mock.Mock:
+                playback_opened()
+                return process
+
+            with mock.patch(
+                "local_voice_harness.tts.queue._open_playback",
+                side_effect=open_playback,
+            ):
+                batch = queue.drain()
+
+        self.assertEqual(batch[0][0]["played_text"], "one two")
+        self.assertFalse(batch[0][1])
+
+    def test_drain_interrupt_before_later_chunks_discards_prefetch(self) -> None:
+        queue = PlaybackQueue()
+        request = PlaybackRequest(text="two clauses")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            first = _write_wav(Path(temporary) / "first.wav")
+            handle = mock.create_autospec(PrefetchHandle, instance=True)
+            handle.done_meta = {}
+            handle.wait_progress.side_effect = [
+                (16_000, [first], ["one"], False),
+                None,
+            ]
+            queue._items.append((request, handle))
+            process = mock.Mock()
+            process.stdin = mock.Mock()
+            process.wait.return_value = 0
+            process.poll.return_value = 0
+
+            with mock.patch(
+                "local_voice_harness.tts.queue._open_playback",
+                return_value=process,
+            ):
+                batch = queue.drain()
+
+        self.assertTrue(batch[0][1])
+        self.assertEqual(batch[0][0]["played_text"], "one")
+        handle.discard.assert_called()
+        self.assertEqual(len(queue), 0)
+
     def test_failed_handle_discard_cleans_partial_chunks_safely(self) -> None:
         handle = PrefetchHandle.__new__(PrefetchHandle)
         handle.text = "failed response"
         handle._event = threading.Event()
         handle._discard_lock = threading.Lock()
         handle._discarded = False
+        handle._progress = threading.Condition()
+        handle._chunks = []
         handle._thread = mock.Mock()
         handle._thread.is_alive.return_value = False
         with tempfile.TemporaryDirectory() as temporary:

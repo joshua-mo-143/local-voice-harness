@@ -63,12 +63,26 @@ class PrefetchHandle:
         self._cancel_lock = threading.Lock()
         self._state_lock = threading.Lock()
         self._socket: socket.socket | None = None
+        self._progress = threading.Condition()
+        self._chunks: list[Path] = []
+        self._chunk_texts: list[str] = []
+        self._sample_rate = 0
+        self._stream_done = False
+        self._stream_error: BaseException | None = None
+        self.done_meta: dict[str, object] = {}
         self._thread = threading.Thread(
             target=self._run,
             name=f"voice-prefetch-{self.request_id[:8]}",
             daemon=True,
         )
         self._thread.start()
+
+    def _note_chunk(self, path: Path, text: str, sample_rate: int) -> None:
+        with self._progress:
+            self._sample_rate = sample_rate
+            self._chunks.append(path)
+            self._chunk_texts.append(text)
+            self._progress.notify_all()
 
     def _run(self) -> None:
         try:
@@ -80,6 +94,7 @@ class PrefetchHandle:
                 submit_request=self._submit_request,
                 clear_socket=self._clear_socket,
                 settings=self.audio,
+                on_chunk=self._note_chunk,
             )
         except BaseException as exc:
             self.cancel()
@@ -90,6 +105,13 @@ class PrefetchHandle:
                 error=exc,
             )
         finally:
+            with self._progress:
+                if self._result is not None and self._result.error is not None:
+                    self._stream_error = self._result.error
+                elif self._result is not None:
+                    self.done_meta = self._result.done_meta
+                self._stream_done = True
+                self._progress.notify_all()
             self._event.set()
 
     def wait(
@@ -122,6 +144,45 @@ class PrefetchHandle:
                 f"{self._result.error}"
             )
         return self._result
+
+    def wait_progress(
+        self,
+        have: int,
+        timeout: float = STREAM_TIMEOUT_SECONDS,
+        *,
+        should_interrupt: Callable[[], bool] | None = None,
+        on_poll: Callable[[], None] | None = None,
+    ) -> tuple[int, list[Path], list[str], bool] | None:
+        deadline = time.monotonic() + timeout
+        if on_poll is not None:
+            on_poll()
+        while True:
+            with self._progress:
+                if self._stream_error is not None:
+                    raise HarnessError(
+                        "TTS prefetch failed: "
+                        f"{type(self._stream_error).__name__}: {self._stream_error}"
+                    )
+                if len(self._chunks) > have or self._stream_done:
+                    return (
+                        self._sample_rate,
+                        list(self._chunks),
+                        list(self._chunk_texts),
+                        self._stream_done,
+                    )
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                self._progress.wait(
+                    min(STREAM_POLL_SECONDS, max(0.0, remaining)),
+                )
+            if on_poll is not None:
+                on_poll()
+            if should_interrupt is not None and should_interrupt():
+                self.discard()
+                return None
+        self.discard()
+        raise HarnessError("TTS prefetch timed out")
 
     def _register_socket(self, stream_socket: socket.socket) -> None:
         with self._state_lock:
@@ -188,8 +249,12 @@ class PrefetchHandle:
             with self._discard_lock:
                 self._discarded = False
             raise HarnessError("TTS prefetch worker did not stop after cancellation")
-        assert self._result is not None
-        _cleanup_chunks(self._result.chunks)
+        chunks: list[Path] = []
+        with self._progress:
+            chunks = list(self._chunks)
+        if self._result is not None:
+            chunks = list(self._result.chunks)
+        _cleanup_chunks(chunks)
 
 
 def _cleanup_chunks(chunks: list[Path]) -> None:
@@ -212,6 +277,7 @@ def _prefetch_utterance(
     submit_request: Callable[[socket.socket, bytes], None],
     clear_socket: Callable[[socket.socket], None],
     settings: AudioSettings | None = None,
+    on_chunk: Callable[[Path, str, int], None] | None = None,
 ) -> PrefetchedUtterance:
     from ..config import TTS_SOCKET
 
@@ -251,6 +317,8 @@ def _prefetch_utterance(
                 if kind == "chunk":
                     chunks.append(Path(str(event["output"])))
                     chunk_texts.append(str(event["text"]))
+                    if on_chunk is not None:
+                        on_chunk(chunks[-1], chunk_texts[-1], parser.sample_rate)
         done_meta = parser.finish()
         return PrefetchedUtterance(
             sample_rate=parser.sample_rate,
@@ -437,6 +505,7 @@ class PlaybackQueue:
             interrupted = False
             try:
                 while not interrupted:
+                    self.start_prefetch(limit=2)
                     with self._lock:
                         if not self._items:
                             break
@@ -448,24 +517,77 @@ class PlaybackQueue:
                                 else PrefetchHandle(request.text)
                             )
                             self._items[0] = (request, handle)
+                    item_started = time.perf_counter()
+                    chunk_texts: list[str] = []
+                    chunks_seen: list[Path] = []
                     try:
-                        prefetched = handle.wait(
-                            should_interrupt=should_interrupt,
-                            on_poll=on_poll,
-                        )
+                        have = 0
+                        finished = False
+                        while not interrupted and not finished:
+                            self.start_prefetch(limit=2)
+                            try:
+                                progress = handle.wait_progress(
+                                    have,
+                                    should_interrupt=should_interrupt,
+                                    on_poll=on_poll,
+                                )
+                            except Exception as exc:
+                                deferred_error = exc
+                                break
+                            if progress is None:
+                                interrupted = True
+                                break
+                            sample_rate_now, chunks_seen, texts, finished = progress
+                            if process is None and have < len(chunks_seen):
+                                sample_rate = sample_rate_now
+                                process = _open_playback(sample_rate, self._audio)
+                            if process is not None and process.stdin is None:
+                                raise HarnessError("pw-play stdin is unavailable")
+                            while have < len(chunks_seen) and not interrupted:
+                                output = chunks_seen[have]
+                                if on_poll is not None:
+                                    on_poll()
+                                if should_interrupt is not None and should_interrupt():
+                                    interrupted = True
+                                    break
+                                if process is None or process.stdin is None:
+                                    raise HarnessError("pw-play stdin is unavailable")
+                                with wave.open(str(output), "rb") as source:
+                                    if (
+                                        source.getnchannels() != 1
+                                        or source.getsampwidth() != 2
+                                        or source.getframerate() != sample_rate
+                                    ):
+                                        raise HarnessError(
+                                            f"unexpected streaming WAV format: {output}"
+                                        )
+                                    while True:
+                                        if on_poll is not None:
+                                            on_poll()
+                                        if (
+                                            should_interrupt is not None
+                                            and should_interrupt()
+                                        ):
+                                            interrupted = True
+                                            break
+                                        audio = source.readframes(4096)
+                                        if not audio:
+                                            break
+                                        process.stdin.write(audio)
+                                if interrupted:
+                                    break
+                                chunk_texts.append(texts[have])
+                                have += 1
+                                self.start_prefetch(limit=2)
                     except Exception as exc:
-                        handle.discard()
-                        with self._lock:
-                            if self._items and self._items[0][0] is request:
-                                self._items.popleft()
                         deferred_error = exc
-                        break
-                    if prefetched is None:
-                        interrupted = True
+                    finally:
                         handle.discard()
+                        _cleanup_chunks(chunks_seen)
                         with self._lock:
                             if self._items and self._items[0][0] is request:
                                 self._items.popleft()
+                    if interrupted and not chunk_texts and deferred_error is None:
                         result = {
                             "ok": True,
                             "stage": "tts",
@@ -476,56 +598,13 @@ class PlaybackQueue:
                         print(json.dumps(result))
                         played.append((result, True, request))
                         break
-                    item_started = time.perf_counter()
-                    chunk_texts: list[str] = []
-                    try:
-                        if process is None:
-                            sample_rate = prefetched.sample_rate
-                            process = _open_playback(sample_rate, self._audio)
-                        if process.stdin is None:
-                            raise HarnessError("pw-play stdin is unavailable")
-                        for index, output in enumerate(prefetched.chunks):
-                            if on_poll is not None:
-                                on_poll()
-                            if should_interrupt is not None and should_interrupt():
-                                interrupted = True
-                                break
-                            with wave.open(str(output), "rb") as source:
-                                if (
-                                    source.getnchannels() != 1
-                                    or source.getsampwidth() != 2
-                                    or source.getframerate() != sample_rate
-                                ):
-                                    raise HarnessError(
-                                        f"unexpected streaming WAV format: {output}"
-                                    )
-                                while True:
-                                    if on_poll is not None:
-                                        on_poll()
-                                    if (
-                                        should_interrupt is not None
-                                        and should_interrupt()
-                                    ):
-                                        interrupted = True
-                                        break
-                                    audio = source.readframes(4096)
-                                    if not audio:
-                                        break
-                                    process.stdin.write(audio)
-                            if interrupted:
-                                break
-                            chunk_texts.append(prefetched.chunk_texts[index])
-                    except Exception as exc:
-                        deferred_error = exc
-                    finally:
-                        _cleanup_chunks(prefetched.chunks)
-                        with self._lock:
-                            if self._items and self._items[0][0] is request:
-                                self._items.popleft()
-                    if deferred_error is not None:
+                    if deferred_error is not None and not chunk_texts:
                         break
+                    done_meta = getattr(handle, "done_meta", {})
+                    if not isinstance(done_meta, dict):
+                        done_meta = {}
                     result = {
-                        **prefetched.done_meta,
+                        **done_meta,
                         "ok": True,
                         "stage": "tts",
                         "request_seconds": round(time.perf_counter() - item_started, 3),
@@ -534,7 +613,7 @@ class PlaybackQueue:
                     }
                     print(json.dumps(result))
                     played.append((result, interrupted, request))
-                    if interrupted:
+                    if deferred_error is not None or interrupted:
                         break
                 if process is not None:
                     if interrupted:
