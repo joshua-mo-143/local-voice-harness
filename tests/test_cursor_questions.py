@@ -12,7 +12,7 @@ import pytest
 from local_voice_harness import user_config
 from local_voice_harness.cursor import provisioning, questions, recovery, service
 from local_voice_harness.cursor.delivery import claim_delivery
-from local_voice_harness.cursor.model import CursorJob, JobStatus
+from local_voice_harness.cursor.model import CursorJob, JobStatus, JobValidationError
 from local_voice_harness.cursor.service import CursorTurnRequest, cursor_turn
 from local_voice_harness.cursor.store import JobStore
 from local_voice_harness.errors import HarnessError
@@ -183,6 +183,11 @@ def _plan_approval_awaiting(store: JobStore) -> CursorJob:
                 "planner_target": "planner",
                 "active_participant": "planner",
                 "voice_question": pending.to_dict(),
+                "plan_approval_state": "boundary",
+                "plan_approval_id": "gate-id",
+                "plan_approval_agent_session": "planner-session",
+                "plan_approval_state_change_sequence": 7,
+                "plan_approval_revision": 3,
             }
         )
     )
@@ -204,9 +209,8 @@ def _plan_approval_awaiting(store: JobStore) -> CursorJob:
             review_approved=True,
             review_approval_source="reviewer",
             plan_approval_state="awaiting",
-            plan_approval_id="gate-id",
-            plan_approval_agent_session="planner-session",
-            plan_approval_state_change_sequence=7,
+            plan_approval_plan_artifact=plan_reference,
+            plan_approval_review_artifact=review_reference,
         ),
     )
     assert updated is not None
@@ -478,6 +482,42 @@ def test_natural_plan_approval_queues_fenced_planner_prompt(
     launch.assert_called_once_with(original.id)
 
 
+def test_awaiting_plan_approval_rejects_replacement_artifacts(
+    store: JobStore,
+) -> None:
+    original = _plan_approval_awaiting(store)
+    replacement_plan = "Implement a materially different feature."
+    plan_reference = store.write_artifact(
+        original.id,
+        "plan",
+        0,
+        replacement_plan,
+    )
+    review_reference = store.write_artifact(
+        original.id,
+        "review",
+        0,
+        "The replacement is safe.",
+        source_text=replacement_plan,
+    )
+
+    with pytest.raises(
+        JobValidationError,
+        match="accepted plan approval artifacts cannot be replaced",
+    ):
+        store.update(
+            original.id,
+            lambda current: current.evolve(
+                plan_artifact=plan_reference,
+                review_artifact=review_reference,
+            ),
+        )
+
+    unchanged = store.get(original.id)
+    assert unchanged.plan_artifact == original.plan_artifact
+    assert unchanged.review_artifact == original.review_artifact
+
+
 def test_ambiguous_plan_approval_reprompts_without_mutation(store: JobStore) -> None:
     original = _plan_approval_awaiting(store)
 
@@ -647,6 +687,7 @@ def test_third_accepted_approval_offers_auto_after_implementation(
                 "plan_approval_id": "gate-id",
                 "plan_approval_agent_session": "planner-session",
                 "plan_approval_state_change_sequence": 7,
+                "plan_approval_revision": 3,
             }
         )
     )
@@ -659,7 +700,7 @@ def test_third_accepted_approval_offers_auto_after_implementation(
         "The plan is safe.",
         source_text=plan,
     )
-    job = store.update(
+    approved = store.update(
         created.id,
         lambda current: current.evolve(
             workflow_phase="implementing",
@@ -669,10 +710,17 @@ def test_third_accepted_approval_offers_auto_after_implementation(
             review_decision="approve",
             review_approved=True,
             review_approval_source="reviewer",
-            plan_approval_state="observed",
+            plan_approval_state="approved",
             plan_approval_source="explicit",
             plan_approval_counted=True,
+            plan_approval_plan_artifact=plan_reference,
+            plan_approval_review_artifact=review_reference,
         ),
+    )
+    assert approved is not None
+    job = store.update(
+        created.id,
+        lambda current: current.evolve_plan_approval(current.plan_approval.observe()),
     )
     assert job is not None
 

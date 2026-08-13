@@ -13,6 +13,7 @@ from local_voice_harness.cursor.model import (
     transition,
     validate_reservations,
 )
+from local_voice_harness.cursor.workflow import LegacyPlanApprovalProof
 
 
 class FollowUpLineageTests(unittest.TestCase):
@@ -367,6 +368,10 @@ class CursorJobModelTests(unittest.TestCase):
                 "revision": 3,
                 "request": "change recovery",
                 "status": "running",
+                "worker_token": "worker",
+                "worker_pid": 42,
+                "worker_boot_id": "boot",
+                "worker_process_start": "start",
                 "created_at": 1,
                 "delivered": False,
                 "workflow_tier": "high-risk",
@@ -383,6 +388,15 @@ class CursorJobModelTests(unittest.TestCase):
         self.assertEqual(job.review_approval_source, "reviewer")
         self.assertEqual(job.plan_approval_state, "observed")
         self.assertEqual(job.plan_approval_source, "legacy")
+        self.assertIsInstance(job.plan_approval.proof, LegacyPlanApprovalProof)
+        self.assertEqual(job.plan_approval_state_change_sequence, -1)
+        self.assertEqual(job.plan_approval_revision, -1)
+        self.assertEqual(job.plan_approval.plan_reference, job.plan_artifact)
+        self.assertEqual(job.plan_approval.review_reference, job.review_artifact)
+        self.assertEqual(
+            CursorJob.from_dict(job.to_dict()).plan_approval,
+            job.plan_approval,
+        )
 
     def test_v9_exhausted_review_migrates_to_explicit_clarification(self) -> None:
         job = CursorJob.from_dict(
@@ -412,29 +426,28 @@ class CursorJobModelTests(unittest.TestCase):
             "workflow_review_exhausted",
         )
 
-    def test_v9_round_two_revising_state_fails_closed(self) -> None:
-        with self.assertRaisesRegex(
-            JobValidationError,
-            "round-two workflow cannot remain in revising",
-        ):
-            CursorJob.from_dict(
-                {
-                    "schema_version": 9,
-                    "id": "123456789abc",
-                    "revision": 3,
-                    "request": "change recovery",
-                    "status": "running",
-                    "created_at": 1,
-                    "delivered": False,
-                    "workflow_tier": "high-risk",
-                    "workflow_classification_reason": "recovery",
-                    "workflow_phase": "revising",
-                    "review_round": 2,
-                    "plan_artifact": ".artifacts/123456789abc/plan-1.json",
-                    "review_artifact": ".artifacts/123456789abc/review-1.json",
-                    "review_decision": "revise",
-                }
-            )
+    def test_v9_round_two_revising_state_is_preserved(self) -> None:
+        job = CursorJob.from_dict(
+            {
+                "schema_version": 9,
+                "id": "123456789abc",
+                "revision": 3,
+                "request": "change recovery",
+                "status": "running",
+                "created_at": 1,
+                "delivered": False,
+                "workflow_tier": "high-risk",
+                "workflow_classification_reason": "recovery",
+                "workflow_phase": "revising",
+                "review_round": 2,
+                "plan_artifact": ".artifacts/123456789abc/plan-1.json",
+                "review_artifact": ".artifacts/123456789abc/review-1.json",
+                "review_decision": "revise",
+            }
+        )
+
+        self.assertEqual(job.workflow_phase, WorkflowPhase.REVISING)
+        self.assertEqual(job.review_round, 2)
 
     def test_workflow_tier_can_only_be_promoted(self) -> None:
         job = CursorJob.from_dict(

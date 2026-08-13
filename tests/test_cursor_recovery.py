@@ -1191,6 +1191,7 @@ class CursorRecoveryTests(unittest.TestCase):
                 "plan_approval_id": "gate-id",
                 "plan_approval_agent_session": "original-session",
                 "plan_approval_state_change_sequence": 7,
+                "plan_approval_revision": 3,
             }
         )
         plan = "Implement reviewed behavior."
@@ -1214,6 +1215,8 @@ class CursorRecoveryTests(unittest.TestCase):
                 review_approval_source="reviewer",
                 plan_approval_state="approved",
                 plan_approval_source="explicit",
+                plan_approval_plan_artifact=plan_reference,
+                plan_approval_review_artifact=review_reference,
                 prompt_operation_state="submitting",
                 prompt_operation_phase="implementing",
                 prompt_operation_turn=4,
@@ -1256,6 +1259,7 @@ class CursorRecoveryTests(unittest.TestCase):
                 "participant_creation_participant": "reviewer",
                 "participant_creation_target": "reviewer",
                 "participant_creation_label": "task-reviewer",
+                "participant_creation_workspace_id": "workspace",
             }
         )
 

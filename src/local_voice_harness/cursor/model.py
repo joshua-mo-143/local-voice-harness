@@ -54,8 +54,29 @@ from .lifecycle import (
 from .lifecycle import (
     renew_delivery as transition_delivery_renewal,
 )
+from .workflow import (
+    ArtifactReference,
+    LegacyPlanApprovalProof,
+    ParticipantAdmissionState,
+    ParticipantCreation,
+    ParticipantCreationState,
+    ParticipantLifecycle,
+    PlanApproval,
+    PlanApprovalProof,
+    PlanApprovalSource,
+    PlanApprovalState,
+    ReviewApprovalSource,
+    ReviewDecision,
+    ReviewState,
+    WorkflowClassification,
+    WorkflowParticipant,
+    WorkflowPhase,
+    WorkflowState,
+    WorkflowTier,
+    WorkflowTransitionError,
+)
 
-CURRENT_SCHEMA_VERSION = 16
+CURRENT_SCHEMA_VERSION = 17
 LEGACY_SCHEMA_VERSIONS = frozenset(range(CURRENT_SCHEMA_VERSION))
 LEGACY_BOOT_ID = "legacy-unknown"
 
@@ -89,43 +110,6 @@ class HarnessKind(StrEnum):
     """Coding-agent harness responsible for a durable job."""
 
     CURSOR = "cursor"
-
-
-class WorkflowTier(StrEnum):
-    SIMPLE = "simple"
-    MEDIUM = "medium"
-    HIGH_RISK = "high-risk"
-
-
-class WorkflowPhase(StrEnum):
-    CLASSIFYING = "classifying"
-    PLANNING = "planning"
-    REVIEWING = "reviewing"
-    REVISING = "revising"
-    IMPLEMENTING = "implementing"
-    FINISHED = "finished"
-
-
-class WorkflowParticipant(StrEnum):
-    PLANNER = "planner"
-    REVIEWER = "reviewer"
-    IMPLEMENTER = "implementer"
-
-
-_LEGAL_WORKFLOW_TRANSITIONS: dict[WorkflowPhase, frozenset[WorkflowPhase]] = {
-    WorkflowPhase.CLASSIFYING: frozenset(
-        {WorkflowPhase.PLANNING, WorkflowPhase.IMPLEMENTING}
-    ),
-    WorkflowPhase.PLANNING: frozenset({WorkflowPhase.REVIEWING}),
-    WorkflowPhase.REVIEWING: frozenset(
-        {WorkflowPhase.REVISING, WorkflowPhase.IMPLEMENTING}
-    ),
-    WorkflowPhase.REVISING: frozenset({WorkflowPhase.REVIEWING}),
-    WorkflowPhase.IMPLEMENTING: frozenset(
-        {WorkflowPhase.PLANNING, WorkflowPhase.FINISHED}
-    ),
-    WorkflowPhase.FINISHED: frozenset(),
-}
 
 
 ACTIVE_STATUSES = frozenset(
@@ -388,6 +372,8 @@ _STRING_FIELDS = frozenset(
         "plan_approval_id",
         "plan_approval_source",
         "plan_approval_agent_session",
+        "plan_approval_plan_artifact",
+        "plan_approval_review_artifact",
         "workflow_turn_phase",
         "prompt_operation_state",
         "prompt_operation_phase",
@@ -460,17 +446,6 @@ _UNCERTAIN_OPERATION_STATES = frozenset(
 )
 _PROMPT_OPERATION_STATES = frozenset(
     {"none", "planned", "submitting", "submitted", "ambiguous"}
-)
-_PLAN_APPROVAL_STATES = frozenset(
-    {"none", "boundary", "awaiting", "approved", "observed", "rejected"}
-)
-_PARTICIPANT_CREATION_STATES = frozenset(
-    {"none", "planned", "submitting", "created", "ambiguous", "manual_required"}
-)
-_WORKFLOW_ARTIFACT_REFERENCE = re.compile(
-    r"^\.artifacts/(?P<job>[0-9a-f]{12})/"
-    r"(?P<kind>plan|review)-(?P<round>[0-2])"
-    r"(?:-(?P<digest>[0-9a-f]{64}))?\.json$"
 )
 
 
@@ -746,6 +721,7 @@ def _advance_legacy_version(values: dict[str, object], version: int) -> None:
             values.setdefault("plan_approval_source", "legacy")
             values.setdefault("plan_approval_agent_session", LEGACY_BOOT_ID)
             values.setdefault("plan_approval_state_change_sequence", -1)
+            values.setdefault("plan_approval_revision", -1)
         else:
             values.setdefault("plan_approval_state", "none")
     elif version == 11:
@@ -764,6 +740,20 @@ def _advance_legacy_version(values: dict[str, object], version: int) -> None:
         values.setdefault("prompt_context_sessions", {})
     elif version == 15:
         _default_announcement_ack(values)
+    elif version == 16:
+        if values.get("plan_approval_state") in {
+            PlanApprovalState.AWAITING.value,
+            PlanApprovalState.APPROVED.value,
+            PlanApprovalState.OBSERVED.value,
+        }:
+            values.setdefault(
+                "plan_approval_plan_artifact",
+                values.get("plan_artifact"),
+            )
+            values.setdefault(
+                "plan_approval_review_artifact",
+                values.get("review_artifact"),
+            )
     values["schema_version"] = version + 1
 
 
@@ -2077,6 +2067,38 @@ class AgentJob:
         return self._optional_string("workflow_classification_reason")
 
     @property
+    def workflow_state(self) -> WorkflowState:
+        try:
+            classification = (
+                WorkflowClassification(
+                    self.workflow_tier,
+                    self.workflow_classification_reason or "",
+                )
+                if self.workflow_tier is not None
+                else None
+            )
+            return WorkflowState(self.workflow_phase, classification)
+        except WorkflowTransitionError as exc:
+            raise JobValidationError(str(exc)) from exc
+
+    def evolve_workflow(
+        self,
+        state: WorkflowState,
+        **changes: Any,
+    ) -> CursorJob:
+        classification = state.classification
+        return self.evolve(
+            workflow_phase=state.phase.value,
+            workflow_tier=(
+                classification.tier.value if classification is not None else None
+            ),
+            workflow_classification_reason=(
+                classification.reason if classification is not None else None
+            ),
+            **changes,
+        )
+
+    @property
     def plan_artifact(self) -> str | None:
         return self._optional_string("plan_artifact")
 
@@ -2269,6 +2291,14 @@ class AgentJob:
         return self._optional_string("plan_approval_agent_session")
 
     @property
+    def plan_approval_plan_artifact(self) -> str | None:
+        return self._optional_string("plan_approval_plan_artifact")
+
+    @property
+    def plan_approval_review_artifact(self) -> str | None:
+        return self._optional_string("plan_approval_review_artifact")
+
+    @property
     def plan_approval_state_change_sequence(self) -> int | None:
         return self._optional_int("plan_approval_state_change_sequence")
 
@@ -2283,6 +2313,207 @@ class AgentJob:
     @property
     def plan_approval_completion_pending(self) -> bool:
         return self._boolean_field("plan_approval_completion_pending")
+
+    @property
+    def review_state(self) -> ReviewState:
+        try:
+            plan = (
+                ArtifactReference.parse(
+                    self.plan_artifact,
+                    job_id=self.id,
+                    kind="plan",
+                )
+                if self.plan_artifact is not None
+                else None
+            )
+            review = (
+                ArtifactReference.parse(
+                    self.review_artifact,
+                    job_id=self.id,
+                    kind="review",
+                )
+                if self.review_artifact is not None
+                else None
+            )
+            return ReviewState(
+                self.workflow_tier,
+                self.review_round,
+                plan,
+                review,
+                (
+                    ReviewDecision(self.review_decision)
+                    if self.review_decision is not None
+                    else None
+                ),
+                (
+                    ReviewApprovalSource(self.review_approval_source)
+                    if self.review_approval_source is not None
+                    else None
+                ),
+            )
+        except (ValueError, WorkflowTransitionError) as exc:
+            raise JobValidationError(str(exc)) from exc
+
+    def evolve_review(
+        self,
+        review: ReviewState,
+        **changes: Any,
+    ) -> CursorJob:
+        return self.evolve(
+            review_round=review.round,
+            plan_artifact=review.plan.value if review.plan is not None else None,
+            review_artifact=(
+                review.review.value if review.review is not None else None
+            ),
+            review_decision=(
+                review.decision.value if review.decision is not None else None
+            ),
+            review_approved=review.approved,
+            review_approval_source=(
+                review.approval_source.value
+                if review.approval_source is not None
+                else None
+            ),
+            **changes,
+        )
+
+    @property
+    def plan_approval(self) -> PlanApproval:
+        try:
+            state = PlanApprovalState(self.plan_approval_state)
+            source = (
+                PlanApprovalSource(self.plan_approval_source)
+                if self.plan_approval_source is not None
+                else None
+            )
+            proof_values = (
+                self.plan_approval_id,
+                self.plan_approval_agent_session,
+                self.plan_approval_state_change_sequence,
+                self.plan_approval_revision,
+            )
+            if state != PlanApprovalState.NONE and not all(
+                value is not None for value in proof_values
+            ):
+                raise WorkflowTransitionError(
+                    "active plan approval requires gate ID, agent session, and "
+                    "sequence; revision proof is also required"
+                )
+            proof = None
+            if state != PlanApprovalState.NONE:
+                assert self.plan_approval_id is not None
+                assert self.plan_approval_agent_session is not None
+                assert self.plan_approval_state_change_sequence is not None
+                assert self.plan_approval_revision is not None
+                if source == PlanApprovalSource.LEGACY:
+                    proof = LegacyPlanApprovalProof(
+                        self.plan_approval_id,
+                        self.plan_approval_agent_session,
+                        self.plan_approval_state_change_sequence,
+                        self.plan_approval_revision,
+                    )
+                else:
+                    proof = PlanApprovalProof(
+                        self.plan_approval_id,
+                        self.plan_approval_agent_session,
+                        self.plan_approval_state_change_sequence,
+                        self.plan_approval_revision,
+                    )
+            question = (
+                Question.from_dict(self.voice_question)
+                if state == PlanApprovalState.AWAITING
+                and self.voice_question is not None
+                else None
+            )
+            approval = PlanApproval(
+                state=state,
+                proof=proof,
+                source=source,
+                counted=self.plan_approval_counted,
+                plan_reference=self.plan_approval_plan_artifact,
+                review_reference=self.plan_approval_review_artifact,
+                review_accepted=self.review_approved,
+                question_id=question.id if question is not None else None,
+                question_turn_token=(
+                    question.origin.turn_token if question is not None else None
+                ),
+            )
+            if state in {
+                PlanApprovalState.AWAITING,
+                PlanApprovalState.APPROVED,
+                PlanApprovalState.OBSERVED,
+            } and (
+                approval.plan_reference != self.plan_artifact
+                or approval.review_reference != self.review_artifact
+            ):
+                raise WorkflowTransitionError(
+                    "accepted plan approval artifacts cannot be replaced"
+                )
+            return approval
+        except (ValueError, WorkflowTransitionError, QuestionError) as exc:
+            raise JobValidationError(str(exc)) from exc
+
+    def evolve_plan_approval(
+        self,
+        approval: PlanApproval,
+        **changes: Any,
+    ) -> CursorJob:
+        proof = approval.proof
+        return self.evolve(
+            plan_approval_state=approval.state.value,
+            plan_approval_id=proof.gate_id if proof is not None else None,
+            plan_approval_source=(
+                approval.source.value if approval.source is not None else None
+            ),
+            plan_approval_agent_session=(
+                proof.agent_session if proof is not None else None
+            ),
+            plan_approval_plan_artifact=approval.plan_reference,
+            plan_approval_review_artifact=approval.review_reference,
+            plan_approval_state_change_sequence=(
+                proof.state_change_sequence if proof is not None else None
+            ),
+            plan_approval_revision=proof.revision if proof is not None else None,
+            plan_approval_counted=approval.counted,
+            **changes,
+        )
+
+    @property
+    def participant_lifecycle(self) -> ParticipantLifecycle:
+        try:
+            creation = ParticipantCreation(
+                ParticipantCreationState(self.participant_creation_state),
+                self.participant_creation_participant,
+                self.participant_creation_target,
+                self.participant_creation_label,
+                self.participant_creation_workspace_id,
+                self.participant_creation_pane_id,
+            )
+            return ParticipantLifecycle(
+                ParticipantAdmissionState(self.participant_admission_state),
+                creation,
+            )
+        except (ValueError, WorkflowTransitionError) as exc:
+            raise JobValidationError(str(exc)) from exc
+
+    def evolve_participant(
+        self,
+        lifecycle: ParticipantLifecycle,
+        **changes: Any,
+    ) -> CursorJob:
+        creation = lifecycle.creation
+        return self.evolve(
+            participant_admission_state=lifecycle.admission.value,
+            participant_creation_state=creation.state.value,
+            participant_creation_participant=(
+                creation.participant.value if creation.participant is not None else None
+            ),
+            participant_creation_target=creation.target,
+            participant_creation_label=creation.label,
+            participant_creation_workspace_id=creation.workspace_id,
+            participant_creation_pane_id=creation.pane_id,
+            **changes,
+        )
 
     @property
     def workflow_turn_phase(self) -> WorkflowPhase | None:
@@ -2413,10 +2644,17 @@ class AgentJob:
             if outcome == "materialized":
                 if not resolved_pane or not resolved_workspace:
                     return None
+                try:
+                    creation = self.participant_lifecycle.creation.created(
+                        pane_id=resolved_pane,
+                        workspace_id=resolved_workspace,
+                    )
+                except WorkflowTransitionError:
+                    return None
                 changes.update(
-                    participant_creation_state="created",
-                    participant_creation_pane_id=resolved_pane,
-                    participant_creation_workspace_id=resolved_workspace,
+                    participant_creation_state=creation.state.value,
+                    participant_creation_pane_id=creation.pane_id,
+                    participant_creation_workspace_id=creation.workspace_id,
                     herdr_pane_id=resolved_pane,
                     herdr_workspace_id=resolved_workspace,
                     agent_name=self.participant_creation_target,
@@ -2621,6 +2859,10 @@ class AgentJob:
             self.terminal_state,
             self.cleanup_state,
             self.delivery_state,
+            self.workflow_state,
+            self.review_state,
+            self.plan_approval,
+            self.participant_lifecycle,
         )
         if self.participant_admission_state not in {"waiting", "held", "released"}:
             raise JobValidationError("participant_admission_state has invalid value")
@@ -2776,10 +3018,6 @@ class AgentJob:
             raise JobValidationError("simple workflow cannot enter planning or review")
         if self.workflow_tier == WorkflowTier.MEDIUM and self.review_round > 1:
             raise JobValidationError("medium workflow allows only one review")
-        if self.workflow_phase == WorkflowPhase.REVISING and self.review_round >= 2:
-            raise JobValidationError(
-                "round-two workflow cannot remain in revising phase"
-            )
         review_decision = self._optional_string("review_decision")
         if review_decision not in {None, "approve", "revise"}:
             raise JobValidationError("review_decision has invalid value")
@@ -2805,7 +3043,7 @@ class AgentJob:
                 "user approval requires an exhausted high-risk rejected review"
             )
         plan_approval_state = self.plan_approval_state
-        if plan_approval_state not in _PLAN_APPROVAL_STATES:
+        if plan_approval_state not in {state.value for state in PlanApprovalState}:
             raise JobValidationError("plan_approval_state has invalid value")
         plan_approval_source = self.plan_approval_source
         if plan_approval_source not in {None, "explicit", "auto", "legacy"}:
@@ -2929,7 +3167,7 @@ class AgentJob:
         self._validate_operation_state(
             "participant_creation_state",
             self.participant_creation_state,
-            _PARTICIPANT_CREATION_STATES,
+            frozenset(state.value for state in ParticipantCreationState),
         )
         if self.prompt_operation_state != "none":
             if (
@@ -2973,32 +3211,6 @@ class AgentJob:
                 raise JobValidationError(
                     "terminal intent requires reconciling status and release fence"
                 )
-        artifact_rounds: dict[str, int] = {}
-        for field, kind in (
-            ("plan_artifact", "plan"),
-            ("review_artifact", "review"),
-        ):
-            reference = self._optional_string(field)
-            if reference is None:
-                continue
-            match = _WORKFLOW_ARTIFACT_REFERENCE.fullmatch(reference)
-            if (
-                match is None
-                or match.group("job") != self.id
-                or match.group("kind") != kind
-            ):
-                raise JobValidationError(
-                    f"{field} has invalid workflow artifact reference"
-                )
-            artifact_rounds[kind] = int(match.group("round"))
-        if self.review_approved and (
-            artifact_rounds.get("plan") != self.review_round
-            or artifact_rounds.get("review") != self.review_round
-        ):
-            raise JobValidationError(
-                "approved review artifacts must match the current review round"
-            )
-
         self._validate_operation_state(
             "agent_dispatch_state",
             self.agent_dispatch_state,
@@ -3250,16 +3462,43 @@ def validate_transition(before: CursorJob, after: CursorJob) -> None:
         after_terminal != before_terminal
     ):
         raise JobValidationError("materialized terminal outcome is immutable")
-    admission_transitions = {
-        "waiting": {"waiting", "held", "released"},
-        "held": {"held", "released"},
-        "released": {"released"},
-    }
-    if (
-        after.participant_admission_state
-        not in admission_transitions[before.participant_admission_state]
-    ):
-        raise JobValidationError("participant admission state cannot move backward")
+    try:
+        if (
+            before.participant_lifecycle.admission
+            != after.participant_lifecycle.admission
+        ):
+            if after.participant_lifecycle.admission == ParticipantAdmissionState.HELD:
+                before.participant_lifecycle.admit()
+            elif (
+                after.participant_lifecycle.admission
+                == ParticipantAdmissionState.RELEASED
+            ):
+                before.participant_lifecycle.release(
+                    cleanup_confirmed=bool(
+                        after.status in TERMINAL_STATUSES
+                        and not after.target_release_pending
+                        and not any(
+                            after._values.get(field)
+                            for field in (
+                                "herdr_target",
+                                "planner_target",
+                                "reviewer_target",
+                                "implementer_target",
+                                "participant_creation_target",
+                            )
+                        )
+                    )
+                )
+            else:
+                raise WorkflowTransitionError(
+                    "participant admission state cannot move backward"
+                )
+        before.participant_lifecycle.creation.validate_transition(
+            after.participant_lifecycle.creation
+        )
+        before.plan_approval.validate_transition(after.plan_approval)
+    except WorkflowTransitionError as exc:
+        raise JobValidationError(str(exc)) from exc
     if before.participant_admission_state == "held" and (
         after.participant_admission_state == "released"
     ):
@@ -3278,23 +3517,37 @@ def validate_transition(before: CursorJob, after: CursorJob) -> None:
             raise JobValidationError(
                 "held participant capacity requires confirmed terminal cleanup"
             )
-    if (
-        before.workflow_phase != after.workflow_phase
-        and after.workflow_phase
-        not in _LEGAL_WORKFLOW_TRANSITIONS[before.workflow_phase]
-    ):
-        raise JobValidationError(
-            "illegal Cursor workflow transition "
-            f"{before.workflow_phase.value} -> {after.workflow_phase.value}"
-        )
-    if before.workflow_tier is not None and after.workflow_tier is not None:
-        tier_order = {
-            WorkflowTier.SIMPLE: 0,
-            WorkflowTier.MEDIUM: 1,
-            WorkflowTier.HIGH_RISK: 2,
-        }
-        if tier_order[after.workflow_tier] < tier_order[before.workflow_tier]:
-            raise JobValidationError("Cursor workflow tier cannot be downgraded")
+    try:
+        before_workflow = before.workflow_state
+        after_workflow = after.workflow_state
+        if before_workflow.classification is None:
+            if after_workflow.classification is not None:
+                expected = before_workflow.classify(
+                    after_workflow.classification.tier,
+                    after_workflow.classification.reason,
+                )
+                if expected != after_workflow:
+                    raise WorkflowTransitionError(
+                        "classification selected an invalid workflow phase"
+                    )
+            elif before_workflow.phase != after_workflow.phase:
+                before_workflow.transition(after_workflow.phase)
+        else:
+            classification = before_workflow.classification
+            if after_workflow.classification != classification:
+                if after_workflow.classification is None:
+                    raise WorkflowTransitionError(
+                        "classified workflow cannot discard classification"
+                    )
+                classification = classification.promote(
+                    after_workflow.classification.tier,
+                    after_workflow.classification.reason,
+                )
+            WorkflowState(before_workflow.phase, classification).transition(
+                after_workflow.phase
+            )
+    except WorkflowTransitionError as exc:
+        raise JobValidationError(str(exc)) from exc
     after.validate_invariants(require_worker_owner=True)
 
 

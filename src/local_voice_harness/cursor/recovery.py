@@ -5,6 +5,7 @@ import secrets
 import time
 import uuid
 from collections.abc import Callable, Mapping
+from dataclasses import replace
 from pathlib import Path
 from typing import cast
 
@@ -719,9 +720,13 @@ def reconcile_prompt_and_pane_operations(
                 terminal_result = _append_manual_action(terminal_result, action)
                 if terminal_error is not None:
                     terminal_error = _append_manual_action(terminal_error, action)
+            lifecycle = replace(
+                candidate.participant_lifecycle,
+                creation=candidate.participant_lifecycle.creation.require_manual(),
+            )
             return candidate.evolve_recovery(
                 now=now,
-                participant_creation_state="manual_required",
+                participant_creation_state=lifecycle.creation.state.value,
                 manual_reconcile_operation="pane",
                 manual_reconcile_token=token,
                 manual_reconcile_required_at=now,

@@ -2347,7 +2347,7 @@ class JobStore:
             )
             claimed: list[CursorJob] = []
             for job in waiting[:free]:
-                candidate = job.evolve(participant_admission_state="held")
+                candidate = job.evolve_participant(job.participant_lifecycle.admit())
                 self._save(connection, candidate)
                 claimed.append(candidate)
             return tuple(claimed)
