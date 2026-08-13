@@ -146,6 +146,7 @@ def respond(text: str, *, user_config: UserConfig | None = None) -> None:
         try:
             start_components(settings.providers)
             print(f"You: {text}")
+            recommendation_playback = False
             routing_context = RequestContext(text)
             grouped_reply = (
                 _pending_grouped_repository_question()
@@ -219,7 +220,31 @@ def respond(text: str, *, user_config: UserConfig | None = None) -> None:
                 Intent.AGENT_SUBMIT,
                 Intent.UNCERTAIN,
             }
-            if route.actionable and route.intent == Intent.GITHUB_ISSUE_CREATE:
+            if cursor_consultation.is_apply_recommendation_request(text):
+                choice_id = (
+                    cursor_consultation.applicable_choice_id(
+                        CURSOR_STORE, pending.job_id
+                    )
+                    if pending is not None
+                    else None
+                )
+                if pending is None or choice_id is None:
+                    response = cursor_consultation.RECOMMENDATION_UNAVAILABLE
+                else:
+                    response = cursor_turn(
+                        CursorTurnRequest(
+                            choice_id,
+                            action="reply",
+                            utterance=choice_id,
+                            job_id=pending.job_id,
+                            expected_question_id=pending.question_id,
+                            expected_question_turn=pending.turn_token,
+                            answer_provenance=AnswerProvenance.USER_TEXT,
+                        ),
+                        delivery_claims=delivery_claims,
+                        integrations=integrations,
+                    )[0]
+            elif route.actionable and route.intent == Intent.GITHUB_ISSUE_CREATE:
                 response = cursor_turn(
                     CursorTurnRequest(
                         context.text,
@@ -276,6 +301,7 @@ def respond(text: str, *, user_config: UserConfig | None = None) -> None:
                             pending,
                             context.text,
                         )
+                        recommendation_playback = True
                     except Exception as exc:  # noqa: BLE001 - consultation fails closed
                         response = (
                             str(exc)
@@ -371,10 +397,18 @@ def respond(text: str, *, user_config: UserConfig | None = None) -> None:
                 )
             rendered_response = as_assistant_response(response)
             print(f"Assistant: {rendered_response.display_text}")
-            stream_and_play(
+            playback = stream_and_play(
                 speech_renderer.render(rendered_response.spoken_text),
                 settings=settings.audio,
             )
+            if recommendation_playback:
+                interrupted = isinstance(playback, dict) and bool(
+                    playback.get("interrupted")
+                )
+                cursor_consultation.complete_recommendation_delivery(
+                    summary=rendered_response.spoken_text,
+                    interrupted=interrupted,
+                )
             acknowledge_deliveries(delivery_claims)
         except Exception:
             release_deliveries(delivery_claims)

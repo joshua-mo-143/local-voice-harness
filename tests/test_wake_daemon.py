@@ -1311,6 +1311,312 @@ class ProcessUtteranceTests(unittest.TestCase):
         self.assertEqual(daemon.cursor_session, "oldjob123456")
         self.assertTrue(daemon.awaiting_followup)
 
+    def test_use_your_recommendation_submits_the_stored_choice(self) -> None:
+        daemon = _bare_daemon()
+        daemon.cursor_session = "oldjob123456"
+        pending = _pending_choice_snapshot()
+        snapshot = mock.Mock(
+            job_id=pending.job_id,
+            question_id=pending.question_id,
+            turn_token=pending.turn_token,
+        )
+
+        with (
+            mock.patch.object(
+                wake_daemon, "transcribe", return_value="use your recommendation"
+            ),
+            mock.patch.object(wake_daemon, "start_components"),
+            mock.patch.object(
+                wake_daemon,
+                "request_context",
+                return_value=RequestContext("use your recommendation"),
+            ),
+            mock.patch.object(daemon, "_pending_cursor_question", return_value=pending),
+            mock.patch.object(
+                wake_daemon,
+                "route_intent",
+                return_value=IntentRoute(Intent.CONVERSATION, "high"),
+            ),
+            mock.patch.object(
+                wake_daemon.cursor_consultation,
+                "pending_question_snapshot",
+                return_value=snapshot,
+            ),
+            mock.patch.object(
+                wake_daemon.cursor_consultation,
+                "applicable_choice_id",
+                return_value="sqlite",
+            ) as applicable,
+            mock.patch.object(
+                wake_daemon,
+                "cursor_turn",
+                return_value=("Queued the SQLite choice.", pending.job_id),
+            ) as cursor_turn,
+            mock.patch.object(wake_daemon, "qwen_turn") as qwen_turn,
+            mock.patch.object(
+                daemon,
+                "play_response",
+                return_value=({"played_text": "queued", "interrupted": False}, None),
+            ),
+            mock.patch.object(wake_daemon, "notify"),
+        ):
+            daemon.process_utterance(AUDIO_GENERATION, woke=False)
+
+        applicable.assert_called_once_with(wake_daemon.CURSOR_STORE, pending.job_id)
+        request = cursor_turn.call_args.args[0]
+        self.assertEqual(request.text, "sqlite")
+        self.assertEqual(request.utterance, "sqlite")
+        self.assertEqual(request.action, "reply")
+        self.assertEqual(request.job_id, pending.job_id)
+        self.assertEqual(request.expected_question_id, pending.question_id)
+        self.assertEqual(request.expected_question_turn, pending.turn_token)
+        self.assertEqual(request.answer_provenance, AnswerProvenance.USER_VOICE)
+        qwen_turn.assert_not_called()
+
+    def test_use_your_recommendation_applies_without_cursor_session(self) -> None:
+        daemon = _bare_daemon()
+        daemon.cursor_session = None
+        snapshot = mock.Mock(
+            job_id="oldjob123456",
+            question_id="question-1",
+            turn_token="turn-1",
+        )
+
+        with (
+            mock.patch.object(
+                wake_daemon, "transcribe", return_value="use your recommendation"
+            ),
+            mock.patch.object(wake_daemon, "start_components"),
+            mock.patch.object(
+                wake_daemon,
+                "request_context",
+                return_value=RequestContext("use your recommendation"),
+            ),
+            mock.patch.object(daemon, "_pending_cursor_question", return_value=None),
+            mock.patch.object(
+                wake_daemon,
+                "route_intent",
+                return_value=IntentRoute(Intent.CONVERSATION, "high"),
+            ),
+            mock.patch.object(
+                wake_daemon.cursor_consultation,
+                "pending_question_snapshot",
+                return_value=snapshot,
+            ) as consultation_pending,
+            mock.patch.object(
+                wake_daemon.cursor_consultation,
+                "applicable_choice_id",
+                return_value="sqlite",
+            ) as applicable,
+            mock.patch.object(
+                wake_daemon,
+                "cursor_turn",
+                return_value=("Queued the SQLite choice.", "oldjob123456"),
+            ) as cursor_turn,
+            mock.patch.object(wake_daemon, "qwen_turn") as qwen_turn,
+            mock.patch.object(
+                daemon,
+                "play_response",
+                return_value=({"played_text": "queued", "interrupted": False}, None),
+            ),
+            mock.patch.object(wake_daemon, "notify"),
+        ):
+            daemon.process_utterance(AUDIO_GENERATION, woke=True)
+
+        consultation_pending.assert_called_once_with(wake_daemon.CURSOR_STORE, None)
+        applicable.assert_called_once_with(wake_daemon.CURSOR_STORE, "oldjob123456")
+        request = cursor_turn.call_args.args[0]
+        self.assertEqual(request.text, "sqlite")
+        self.assertEqual(request.job_id, "oldjob123456")
+        self.assertEqual(request.expected_question_id, "question-1")
+        self.assertEqual(request.expected_question_turn, "turn-1")
+        qwen_turn.assert_not_called()
+
+    def test_use_your_recommendation_without_consultation_snapshot_fails_closed(
+        self,
+    ) -> None:
+        daemon = _bare_daemon()
+        daemon.cursor_session = None
+
+        with (
+            mock.patch.object(
+                wake_daemon, "transcribe", return_value="use your recommendation"
+            ),
+            mock.patch.object(wake_daemon, "start_components"),
+            mock.patch.object(
+                wake_daemon,
+                "request_context",
+                return_value=RequestContext("use your recommendation"),
+            ),
+            mock.patch.object(daemon, "_pending_cursor_question", return_value=None),
+            mock.patch.object(
+                wake_daemon,
+                "route_intent",
+                return_value=IntentRoute(Intent.CONVERSATION, "high"),
+            ),
+            mock.patch.object(
+                wake_daemon.cursor_consultation,
+                "pending_question_snapshot",
+                return_value=None,
+            ),
+            mock.patch.object(
+                wake_daemon.cursor_consultation,
+                "applicable_choice_id",
+            ) as applicable,
+            mock.patch.object(wake_daemon, "cursor_turn") as cursor_turn,
+            mock.patch.object(wake_daemon, "qwen_turn") as qwen_turn,
+            mock.patch.object(
+                daemon,
+                "play_response",
+                return_value=(
+                    {"played_text": "unavailable", "interrupted": False},
+                    None,
+                ),
+            ) as play,
+            mock.patch.object(wake_daemon, "notify"),
+        ):
+            daemon.process_utterance(AUDIO_GENERATION, woke=True)
+
+        applicable.assert_not_called()
+        cursor_turn.assert_not_called()
+        qwen_turn.assert_not_called()
+        play.assert_called_once()
+        self.assertEqual(
+            play.call_args.args[0].spoken_text,
+            wake_daemon.cursor_consultation.RECOMMENDATION_UNAVAILABLE,
+        )
+
+    def test_generic_acknowledgment_does_not_apply_a_recommendation(self) -> None:
+        daemon = _bare_daemon()
+        daemon.cursor_session = "oldjob123456"
+
+        with (
+            mock.patch.object(wake_daemon, "transcribe", return_value="okay"),
+            mock.patch.object(wake_daemon, "start_components"),
+            mock.patch.object(
+                wake_daemon,
+                "request_context",
+                return_value=RequestContext("okay"),
+            ),
+            mock.patch.object(
+                daemon,
+                "_pending_cursor_question",
+                return_value=_pending_choice_snapshot(),
+            ),
+            mock.patch.object(
+                wake_daemon,
+                "route_intent",
+                return_value=IntentRoute(Intent.CONVERSATION, "high"),
+            ),
+            mock.patch.object(
+                wake_daemon.cursor_consultation,
+                "applicable_choice_id",
+                return_value="sqlite",
+            ) as applicable,
+            mock.patch.object(wake_daemon, "cursor_turn") as cursor_turn,
+            mock.patch.object(
+                wake_daemon, "qwen_turn", return_value=("Okay.", "oldjob123456")
+            ),
+            mock.patch.object(
+                daemon,
+                "play_response",
+                return_value=({"played_text": "Okay.", "interrupted": False}, None),
+            ),
+            mock.patch.object(wake_daemon, "notify"),
+        ):
+            daemon.process_utterance(AUDIO_GENERATION, woke=True)
+
+        applicable.assert_not_called()
+        cursor_turn.assert_not_called()
+
+    def test_interrupted_consultation_playback_does_not_deliver_recommendation(
+        self,
+    ) -> None:
+        daemon = _bare_daemon()
+        daemon.cursor_session = "oldjob123456"
+        summary = "SQLite is simpler for a local tool."
+        snapshot = mock.Mock(
+            job_id="oldjob123456",
+            question_id="question-1",
+            turn_token="turn-1",
+            choices=(
+                Choice("sqlite", "Use SQLite"),
+                Choice("postgres", "Use PostgreSQL"),
+            ),
+            text="Which database should I use?",
+            owner="agent",
+            checkout=Path("/worktrees/oldjob123456"),
+            workspace_id="workspace-1",
+            label="job",
+        )
+        interruption = wake_daemon.BargeIn(initial=[b"user"], woke=False)
+        plays = 0
+
+        def consult(
+            _client: object,
+            _store: object,
+            _snapshot: object,
+            _text: str,
+        ) -> str:
+            wake_daemon.cursor_consultation.record_pending_recommendation(
+                snapshot, choice_id="sqlite", summary=summary
+            )
+            return summary
+
+        def play(response: AssistantResponse) -> tuple[dict[str, object], object]:
+            nonlocal plays
+            plays += 1
+            if plays == 1:
+                return {"played_text": response.spoken_text, "interrupted": False}, None
+            return (
+                {"played_text": "SQLite is", "interrupted": True},
+                interruption,
+            )
+
+        with (
+            mock.patch.object(
+                wake_daemon,
+                "transcribe",
+                return_value="which option would you recommend",
+            ),
+            mock.patch.object(wake_daemon, "start_components"),
+            mock.patch.object(
+                wake_daemon,
+                "request_context",
+                return_value=RequestContext("which option would you recommend"),
+            ),
+            mock.patch.object(
+                daemon,
+                "_pending_cursor_question",
+                return_value=_pending_choice_snapshot(),
+            ),
+            mock.patch.object(
+                wake_daemon,
+                "route_intent",
+                return_value=IntentRoute(Intent.QUESTION_CONSULTATION, "high"),
+            ),
+            mock.patch.object(
+                wake_daemon.cursor_consultation,
+                "pending_question_snapshot",
+                return_value=snapshot,
+            ),
+            mock.patch.object(
+                wake_daemon.cursor_consultation,
+                "consult_pending_question",
+                side_effect=consult,
+            ),
+            mock.patch.object(daemon, "play_response", side_effect=play),
+            mock.patch.object(wake_daemon, "notify"),
+        ):
+            result = daemon.process_utterance(AUDIO_GENERATION, woke=False)
+
+        self.assertIs(result, interruption)
+        self.assertIsNone(
+            wake_daemon.cursor_consultation.applicable_choice_id(
+                wake_daemon.CURSOR_STORE, "oldjob123456"
+            )
+        )
+
     def test_pending_question_snapshot_uses_one_store_read(self) -> None:
         daemon = _bare_daemon()
         daemon.cursor_session = "aaaaaaaaaaaa"

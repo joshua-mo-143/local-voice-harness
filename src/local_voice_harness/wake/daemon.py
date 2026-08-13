@@ -1489,6 +1489,7 @@ class WakeConversationDaemon:
             next_history = list(self.history)
             remember_response = False
             streamed_playback = False
+            recommendation_playback = False
             playback: dict[str, object] = {}
             interruption: BargeIn | None = None
             readback_result: AssistantResponse | None = None
@@ -1547,6 +1548,12 @@ class WakeConversationDaemon:
                     recent_completion=active_completed is not None,
                     settings=self.providers,
                 )
+                apply_recommendation = (
+                    pending_config is None
+                    and cursor_consultation.is_apply_recommendation_request(text)
+                )
+                if apply_recommendation:
+                    route = IntentRoute(Intent.AGENT_REPLY, "high")
                 if pending is not None and pending_config is None:
                     deterministic_answer = (
                         resolve_answer(
@@ -1571,12 +1578,14 @@ class WakeConversationDaemon:
                     )
                     if (
                         resolved_as_answer
+                        or apply_recommendation
                         or grouped_repository_answer
                         or question_control(text) is not None
                     ):
                         route = IntentRoute(Intent.AGENT_REPLY, "high")
                     invalid_pending_reply = (
                         not resolved_as_answer
+                        and not apply_recommendation
                         and route.intent == Intent.AGENT_REPLY
                         and (
                             (
@@ -1724,6 +1733,35 @@ class WakeConversationDaemon:
                 response = self_health_response()
             elif missing_ticket_scope:
                 response = MISSING_ISSUE_SCOPE_RESPONSE
+            elif cursor_consultation.is_apply_recommendation_request(text):
+                snapshot = cursor_consultation.pending_question_snapshot(
+                    CURSOR_STORE,
+                    pending.job_id if pending is not None else None,
+                )
+                choice_id = (
+                    cursor_consultation.applicable_choice_id(
+                        CURSOR_STORE, snapshot.job_id
+                    )
+                    if snapshot is not None
+                    else None
+                )
+                if snapshot is None or choice_id is None:
+                    response = cursor_consultation.RECOMMENDATION_UNAVAILABLE
+                else:
+                    response, next_cursor_session = cursor_turn(
+                        CursorTurnRequest(
+                            choice_id,
+                            snapshot.job_id,
+                            utterance=choice_id,
+                            action="reply",
+                            job_id=snapshot.job_id,
+                            expected_question_id=snapshot.question_id,
+                            expected_question_turn=snapshot.turn_token,
+                            answer_provenance=AnswerProvenance.USER_VOICE,
+                        ),
+                        delivery_claims=delivery_claims,
+                        integrations=self.integrations,
+                    )
             elif route.actionable and route.intent == Intent.QUESTION_CONSULTATION:
                 snapshot = cursor_consultation.pending_question_snapshot(
                     CURSOR_STORE,
@@ -1743,6 +1781,7 @@ class WakeConversationDaemon:
                             snapshot,
                             context.text,
                         )
+                        recommendation_playback = True
                     except Exception as exc:  # noqa: BLE001 - consultation fails closed
                         response = (
                             str(exc)
@@ -2009,6 +2048,11 @@ class WakeConversationDaemon:
                 if played_text:
                     next_history.append({"role": "assistant", "content": played_text})
                 next_history = next_history[-8:]
+            if recommendation_playback:
+                cursor_consultation.complete_recommendation_delivery(
+                    summary=rendered_response.spoken_text,
+                    interrupted=interruption is not None,
+                )
             if interruption is not None:
                 release_deliveries(delivery_claims)
                 self.history = next_history
