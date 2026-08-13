@@ -241,6 +241,9 @@ class ServerStreamingTests(unittest.TestCase):
 
         with (
             mock.patch.object(server, "SETTINGS", settings),
+            mock.patch.object(
+                server, "get_venice_api_key", return_value="venice-secret"
+            ),
             mock.patch.object(server, "pooled_urlopen", side_effect=error),
             self.assertRaisesRegex(RuntimeError, "HTTP 429"),
         ):
