@@ -830,9 +830,12 @@ class ProcessUtteranceTests(unittest.TestCase):
         daemon.providers = replace(daemon.providers, llm_provider="venice")
 
         def fake_stream(
-            generate: Callable[[Callable[[str], None]], tuple[str, str | None]],
+            generate: Callable[
+                [Callable[[str], bool], Callable[[], bool]],
+                tuple[str, str | None],
+            ],
         ) -> tuple[str, str | None, dict[str, object], None]:
-            response, session = generate(lambda _chunk: None)
+            response, session = generate(lambda _chunk: True, lambda: False)
             return response, session, {"played_text": response}, None
 
         with (
