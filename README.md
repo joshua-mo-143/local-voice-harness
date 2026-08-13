@@ -188,17 +188,21 @@ for approval before implementation. See
 
 ### Dictation mode
 
-Bind `voice-harness dictate toggle` to a compositor key for push-to-talk recording.
+Bind `voice-harness-dictate toggle` to a compositor key for push-to-talk recording.
 For example, in i3:
 
 ```text
-bindsym $mod+d exec --no-startup-id $HOME/.local/bin/voice-harness dictate toggle
+bindsym $mod+d exec --no-startup-id $HOME/.local/bin/voice-harness-dictate toggle
 ```
 
-Press once to start and again to stop. Bind `voice-harness dictate vad` for an
+Press once to start and again to stop. Bind `voice-harness-dictate vad` for an
 always-on listener that transcribes each utterance after silence; invoke it again to
 disable the listener. Sway and Hyprland examples and required compositor environment
 imports are documented in [Context capture](docs/context-capture.md).
+
+The general-purpose `voice-harness dictate <command>` form remains available for
+compatibility, but the dedicated entrypoint avoids loading unrelated application
+commands on latency-sensitive activations.
 
 ### Useful commands
 

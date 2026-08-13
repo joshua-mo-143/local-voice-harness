@@ -234,6 +234,7 @@ class ServiceManagementTests(unittest.TestCase):
     def test_all_console_entry_points_load(self) -> None:
         expected = {
             "voice-harness",
+            "voice-harness-dictate",
             "voice-harness-wake",
             "voice-harness-dictation",
             "voice-harness-llm",
@@ -255,6 +256,7 @@ class ServiceManagementTests(unittest.TestCase):
         scripts = Path(sys.executable).parent
         commands = {
             "voice-harness": ["--help"],
+            "voice-harness-dictate": ["--help"],
             "voice-harness-wake": ["--check"],
             "voice-harness-dictation": ["--check"],
             "voice-harness-llm": ["--check"],

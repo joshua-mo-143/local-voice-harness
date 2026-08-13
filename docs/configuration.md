@@ -412,7 +412,7 @@ cannot start a job. A follow-up reuses a settled exact-checkout agent or the com
 parent's retained Herdr workspace and root pane; if neither identity is safely
 available, the child fails closed without opening another pane.
 
-`voice-harness dictate vad` reads its `DICTATION_VAD_*` settings from the process
+`voice-harness-dictate vad` reads its `DICTATION_VAD_*` settings from the process
 that enables it. The listener waits indefinitely for speech, transcribes after the
 configured silence, and then rearms. Another invocation while it is active disables
 the listener. Configure any desktop keybind or wrapper outside the harness.

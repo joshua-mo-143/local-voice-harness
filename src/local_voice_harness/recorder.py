@@ -17,6 +17,10 @@ from pathlib import Path
 from .errors import HarnessError
 from .process import pidfd_exited, pidfd_send, process_identity, terminate_pidfd
 
+RECORDER_START_TIMEOUT = 1.0
+RECORDER_POLL_INTERVAL = 0.005
+WAV_HEADER_SIZE = 44
+
 
 @dataclass(frozen=True)
 class RecorderPaths:
@@ -403,6 +407,38 @@ def any_recording_active(paths: tuple[RecorderPaths, ...]) -> bool:
     return False
 
 
+def _recorder_failure(paths: RecorderPaths, returncode: int) -> HarnessError:
+    try:
+        detail = paths.log.read_text(errors="replace").strip()
+    except OSError:
+        detail = ""
+    return HarnessError(f"pw-record failed: {detail or returncode}")
+
+
+def _wait_for_recorder(
+    paths: RecorderPaths,
+    process: subprocess.Popen[bytes],
+    *,
+    timeout: float = RECORDER_START_TIMEOUT,
+) -> None:
+    deadline = time.monotonic() + timeout
+    while True:
+        returncode = process.poll()
+        if returncode is not None:
+            raise _recorder_failure(paths, returncode)
+        try:
+            if paths.audio.stat().st_size > WAV_HEADER_SIZE:
+                return
+        except FileNotFoundError:
+            pass
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise HarnessError(
+                f"pw-record did not become ready within {timeout:g} seconds"
+            )
+        time.sleep(min(RECORDER_POLL_INTERVAL, remaining))
+
+
 def start_recording(
     paths: RecorderPaths,
     *,
@@ -448,23 +484,30 @@ def start_recording(
             )
         finally:
             log_handle.close()
-        time.sleep(0.2)
-        if process.poll() is not None:
-            detail = paths.log.read_text(errors="replace").strip()
-            raise HarnessError(f"pw-record failed: {detail or process.returncode}")
         try:
             pidfd = os.pidfd_open(process.pid)
         except ProcessLookupError as exc:
+            returncode = process.poll()
+            if returncode is not None:
+                raise _recorder_failure(paths, returncode) from exc
             raise HarnessError("recorder exited during startup") from exc
         try:
-            if process.poll() is not None:
-                raise HarnessError("recorder exited during startup")
-            identity = process_identity(process.pid)
-            if identity is None:
-                _pidfd_send(pidfd, signal.SIGTERM)
-                raise HarnessError("could not establish recorder process identity")
-            if _pidfd_exited(pidfd, 0):
-                raise HarnessError("recorder exited during startup")
+            try:
+                _wait_for_recorder(paths, process)
+                if process.poll() is not None:
+                    raise HarnessError("recorder exited during startup")
+                identity = process_identity(process.pid)
+                if identity is None:
+                    raise HarnessError("could not establish recorder process identity")
+                if _pidfd_exited(pidfd, 0):
+                    raise HarnessError("recorder exited during startup")
+            except Exception:
+                if not _pidfd_exited(pidfd, 0) and not terminate_pidfd(pidfd):
+                    raise HarnessError(
+                        "could not stop recorder after startup failed"
+                    ) from None
+                paths.audio.unlink(missing_ok=True)
+                raise
             try:
                 _write_state(paths, process.pid, identity)
             except Exception:
@@ -472,6 +515,7 @@ def start_recording(
                     raise HarnessError(
                         "could not stop recorder after ownership write failed"
                     ) from None
+                paths.audio.unlink(missing_ok=True)
                 raise
         finally:
             os.close(pidfd)
