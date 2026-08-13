@@ -25,6 +25,7 @@ from ..integrations.herdr import (
 )
 from ..integrations.linear import LinearError, LinearIntegration
 from ..integrations.registry import build_integration_registry, issue_provider
+from ..job_lifecycle import CancellationEvent, RecoveryEvent
 from ..prompt_operations import (
     PromptOperationError,
     SubmittedPrompt,
@@ -941,7 +942,14 @@ def stage_terminal_intent(
     changes.update(cleanup_fields(cleanup))
     changes.update(job_changes or {})
     changes["status"] = JobStatus.RECONCILING.value
-    return job._updated(**changes)
+    updated = job._updated(**changes)
+    event = (
+        CancellationEvent(job.revision, updated.lifecycle)
+        if status == JobStatus.CANCELLED
+        else RecoveryEvent(job.revision, updated.lifecycle)
+    )
+    job.validate_lifecycle_event(updated, event)
+    return replace(updated, _lifecycle_event=event)
 
 
 def _infrastructure_uncertain_for_release(job: CursorJob) -> bool:

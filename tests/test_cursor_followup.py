@@ -130,7 +130,10 @@ def test_create_follow_up_links_parent_and_copies_checkout(
     parent = _completed_parent(store, tmp_path)
 
     child = store.create_follow_up(
-        parent.id, _build_child, expected_completed_at=parent.completed_at
+        parent.id,
+        _build_child,
+        expected_parent_revision=parent.revision,
+        expected_completed_at=parent.completed_at,
     )
 
     assert child.parent_job_id == parent.id
@@ -146,7 +149,9 @@ def test_create_follow_up_accepts_retained_worktree(
     store: JobStore, tmp_path: Path
 ) -> None:
     parent = _completed_parent(store, tmp_path, worktree_provision_state="retained")
-    child = store.create_follow_up(parent.id, _build_child)
+    child = store.create_follow_up(
+        parent.id, _build_child, expected_parent_revision=parent.revision
+    )
     assert child.parent_job_id == parent.id
 
 
@@ -170,7 +175,7 @@ def test_create_follow_up_rejects_non_completed_parent(
         )
     )
     with pytest.raises(FollowUpUnavailable):
-        store.create_follow_up("aaaaaaaaaaaa", _build_child)
+        store.create_follow_up("aaaaaaaaaaaa", _build_child, expected_parent_revision=0)
 
 
 def test_create_follow_up_rejects_completion_identity_mismatch(
@@ -181,7 +186,21 @@ def test_create_follow_up_rejects_completion_identity_mismatch(
         store.create_follow_up(
             parent.id,
             _build_child,
+            expected_parent_revision=parent.revision,
             expected_completed_at=(parent.completed_at or 0) + 5,
+        )
+
+
+def test_create_follow_up_rejects_stale_parent_revision_with_same_completion(
+    store: JobStore, tmp_path: Path
+) -> None:
+    parent = _completed_parent(store, tmp_path)
+    with pytest.raises(JobValidationError, match="stale follow-up parent revision"):
+        store.create_follow_up(
+            parent.id,
+            _build_child,
+            expected_parent_revision=parent.revision + 1,
+            expected_completed_at=parent.completed_at,
         )
 
 
@@ -210,7 +229,7 @@ def test_create_follow_up_rejects_shared_clone(store: JobStore, tmp_path: Path) 
         )
     )
     with pytest.raises(FollowUpUnavailable):
-        store.create_follow_up("aaaaaaaaaaaa", _build_child)
+        store.create_follow_up("aaaaaaaaaaaa", _build_child, expected_parent_revision=0)
 
 
 def test_create_follow_up_checkout_busy_when_reserved(
@@ -220,7 +239,9 @@ def test_create_follow_up_checkout_busy_when_reserved(
     assert parent.worktree_path is not None
     _active_worktree_holder(store, parent.worktree_path)
     with pytest.raises(FollowUpCheckoutBusy):
-        store.create_follow_up(parent.id, _build_child)
+        store.create_follow_up(
+            parent.id, _build_child, expected_parent_revision=parent.revision
+        )
 
 
 def test_create_follow_up_respects_unresolved_quarantine_reservation(
@@ -252,7 +273,9 @@ def test_create_follow_up_respects_unresolved_quarantine_reservation(
         store.list()
 
     with pytest.raises(FollowUpCheckoutBusy):
-        store.create_follow_up(parent.id, _build_child)
+        store.create_follow_up(
+            parent.id, _build_child, expected_parent_revision=parent.revision
+        )
 
 
 def test_create_follow_up_rechecks_newly_quarantined_peer(
@@ -284,7 +307,9 @@ def test_create_follow_up_rechecks_newly_quarantined_peer(
         pytest.warns(UserWarning),
         pytest.raises(FollowUpCheckoutBusy),
     ):
-        store.create_follow_up(parent.id, _build_child)
+        store.create_follow_up(
+            parent.id, _build_child, expected_parent_revision=parent.revision
+        )
     assert not store.path("bbbbbbbbbbbb").exists()
 
 
@@ -321,7 +346,9 @@ def test_terminal_quarantine_release_fence_blocks_follow_up(
         store.list()
 
     with pytest.raises(FollowUpCheckoutBusy):
-        store.create_follow_up(parent.id, _build_child)
+        store.create_follow_up(
+            parent.id, _build_child, expected_parent_revision=parent.revision
+        )
 
 
 @pytest.mark.parametrize(
@@ -348,7 +375,9 @@ def test_create_follow_up_rejects_mismatched_inherited_checkout(
         return CursorJob.from_dict(values)
 
     with pytest.raises(JobValidationError, match=f"inherit parent {field} exactly"):
-        store.create_follow_up(parent.id, mismatched)
+        store.create_follow_up(
+            parent.id, mismatched, expected_parent_revision=parent.revision
+        )
 
 
 @pytest.mark.parametrize("parent_job_id", ["bad", "AAAAAAAAAAAA", "bbbbbbbbbbbb"])
@@ -387,6 +416,7 @@ def test_start_follow_up_creates_and_launches_child(
     child_id = service.start_follow_up(
         parent.id,
         "review the changes",
+        expected_parent_revision=parent.revision,
         expected_completed_at=parent.completed_at,
         on_created=lambda: events.append("created"),
     )
@@ -417,7 +447,11 @@ def test_start_follow_up_checks_capability_before_creating_child(
     monkeypatch.setattr(service, "require_issue_capabilities", reject)
 
     with pytest.raises(HarnessError, match="requires authentication"):
-        service.start_follow_up(parent.id, "review the changes")
+        service.start_follow_up(
+            parent.id,
+            "review the changes",
+            expected_parent_revision=parent.revision,
+        )
 
     assert [job.id for job in store.list()] == [parent.id]
     launch.assert_not_called()
@@ -433,6 +467,7 @@ def test_cursor_turn_follow_up_reports_busy(store: JobStore, tmp_path: Path) -> 
             "review the changes",
             action="follow_up",
             job_id=parent.id,
+            expected_parent_revision=parent.revision,
             expected_completed_at=parent.completed_at,
         )
     )
@@ -451,6 +486,7 @@ def test_cursor_turn_follow_up_reports_unavailable_for_stale_source(
             "review the changes",
             action="follow_up",
             job_id=parent.id,
+            expected_parent_revision=parent.revision,
             expected_completed_at=(parent.completed_at or 0) + 99,
         )
     )
@@ -467,6 +503,7 @@ def test_cursor_turn_follow_up_reports_unavailable_for_missing_parent(
             "review the changes",
             action="follow_up",
             job_id="aaaaaaaaaaaa",
+            expected_parent_revision=0,
             expected_completed_at=1,
         )
     )
@@ -489,6 +526,7 @@ def test_cursor_turn_follow_up_reports_unavailable_for_quarantined_parent(
                 "review the changes",
                 action="follow_up",
                 job_id="aaaaaaaaaaaa",
+                expected_parent_revision=0,
             )
         )
 

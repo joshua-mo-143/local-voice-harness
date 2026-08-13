@@ -129,6 +129,51 @@ class CursorStoreIntegrationTests(unittest.TestCase):
             0,
             "Stale output.",
             expected_worker_token="old-worker",
+            expected_revision=0,
+            expected_turn_token="turn-1",
+            expected_phase="planning",
+            expected_prior_reference=None,
+            change=lambda job, reference: job.evolve(plan_artifact=reference),
+        )
+
+        self.assertIsNone(published)
+        self.assertFalse((self.jobs_dir / ".artifacts").exists())
+
+    def test_same_owner_stale_revision_cannot_publish_artifact(self) -> None:
+        store = JobStore(self.jobs_dir, self.jobs_dir / "legacy")
+        store.create(
+            CursorJob.from_dict(
+                self.job(
+                    "123456789abc",
+                    status="running",
+                    workflow_tier="medium",
+                    workflow_classification_reason="cross-component",
+                    workflow_phase="planning",
+                    active_participant="planner",
+                    planner_target="planner",
+                    herdr_target="planner",
+                    turn_token="turn-1",
+                    workflow_turn_phase="planning",
+                )
+            )
+        )
+        store.update("123456789abc", lambda job: job.evolve(reconcile=True))
+        ownership = WorkerOwnership(
+            "claim-123456789abc",
+            42,
+            "boot",
+            "start-123456789abc",
+            "test",
+            1,
+        )
+
+        published = store.publish_artifact(
+            "123456789abc",
+            "plan",
+            0,
+            "Stale output.",
+            expected_worker_token=ownership,
+            expected_revision=0,
             expected_turn_token="turn-1",
             expected_phase="planning",
             expected_prior_reference=None,
@@ -179,6 +224,7 @@ class CursorStoreIntegrationTests(unittest.TestCase):
                 "test",
                 1,
             ),
+            expected_revision=0,
             expected_turn_token="turn-1",
             expected_phase="planning",
             expected_prior_reference=None,
@@ -221,6 +267,7 @@ class CursorStoreIntegrationTests(unittest.TestCase):
                 "test",
                 1,
             ),
+            expected_revision=0,
             expected_turn_token="turn-1",
             expected_phase="planning",
             expected_prior_reference=None,

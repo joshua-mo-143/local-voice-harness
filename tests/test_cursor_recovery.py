@@ -1609,11 +1609,12 @@ class CursorRecoveryTests(unittest.TestCase):
             label="task-reviewer",
             workspace_id="workspace",
         )
-        before_submit, accepted = provisioning._participant_pane_callbacks(
+        before_submit, accepted, _revision = provisioning._participant_pane_callbacks(
             self.store,
             planned.id,
             WORKER,
             "reviewer-pending",
+            revision_state=[planned.revision],
         )
         before_submit()
         staged = self.store.update(

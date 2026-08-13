@@ -4093,6 +4093,7 @@ class CompletedFollowupContextTests(unittest.TestCase):
         response = wake_daemon.cursor_service.render_job_announcement(job)
         return wake_daemon.CompletedFollowup(
             job_id=job.id,
+            parent_revision=job.revision,
             completed_at=job.completed_at,
             expires_at=time.monotonic() + 60,
             display_fingerprint=wake_daemon._display_fingerprint(response.display_text),
@@ -4210,6 +4211,7 @@ class CompletedFollowupContextTests(unittest.TestCase):
         daemon = _bare_daemon()
         daemon.completed_followup = wake_daemon.CompletedFollowup(
             job_id="bbbbbbbbbbbb",
+            parent_revision=0,
             completed_at=1.0,
             expires_at=time.monotonic() - 1,
         )
@@ -4333,6 +4335,7 @@ class CompletedFollowupContextTests(unittest.TestCase):
         daemon = _bare_daemon()
         daemon.completed_followup = wake_daemon.CompletedFollowup(
             job_id="bbbbbbbbbbbb",
+            parent_revision=0,
             completed_at=9.0,
             expires_at=time.monotonic() + 60,
         )
@@ -4378,6 +4381,7 @@ class CompletedFollowupContextTests(unittest.TestCase):
         daemon = _bare_daemon()
         retained = wake_daemon.CompletedFollowup(
             job_id="bbbbbbbbbbbb",
+            parent_revision=0,
             completed_at=9.0,
             expires_at=time.monotonic() + 60,
         )
@@ -4399,6 +4403,7 @@ class CompletedFollowupContextTests(unittest.TestCase):
         daemon = _bare_daemon()
         daemon.completed_followup = wake_daemon.CompletedFollowup(
             job_id="bbbbbbbbbbbb",
+            parent_revision=0,
             completed_at=9.0,
             expires_at=time.monotonic() + 60,
         )
@@ -4421,6 +4426,7 @@ class CompletedFollowupContextTests(unittest.TestCase):
         daemon.cursor_session = "aaaaaaaaaaaa"
         retained = wake_daemon.CompletedFollowup(
             job_id="bbbbbbbbbbbb",
+            parent_revision=0,
             completed_at=9.0,
             expires_at=time.monotonic() + 60,
         )
@@ -4461,6 +4467,7 @@ class CompletedFollowupContextTests(unittest.TestCase):
         daemon = _bare_daemon()
         daemon.completed_followup = wake_daemon.CompletedFollowup(
             job_id="bbbbbbbbbbbb",
+            parent_revision=0,
             completed_at=9.0,
             expires_at=time.monotonic() + 60,
         )

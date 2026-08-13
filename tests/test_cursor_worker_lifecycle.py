@@ -9,7 +9,12 @@ from pathlib import Path
 from unittest import mock
 
 from local_voice_harness.cursor import provisioning
-from local_voice_harness.cursor.model import CursorJob, JobStatus, transition
+from local_voice_harness.cursor.model import (
+    CURRENT_SCHEMA_VERSION,
+    CursorJob,
+    JobStatus,
+    transition,
+)
 from local_voice_harness.cursor.store import JobStore, MaintenanceLease
 from local_voice_harness.cursor.worker_lifecycle import (
     WorkerCancelled,
@@ -374,6 +379,66 @@ class CursorWorkerLifecycleTests(unittest.TestCase):
         self.assertIsNone(self.store.get("123456789abc").worker_token)
         self.assertTrue(self.store.abort_maintenance(lease.token))
 
+    def test_same_launcher_owner_stale_revision_cannot_adopt_child(self) -> None:
+        self.store.create(
+            CursorJob.from_dict(
+                {
+                    "schema_version": CURRENT_SCHEMA_VERSION,
+                    "revision": 0,
+                    "id": "123456789abc",
+                    "harness_kind": "cursor",
+                    "status": "queued",
+                    "request": "test",
+                    "created_at": 1,
+                    "queued_at": 1,
+                    "delivered": False,
+                }
+            )
+        )
+        process = mock.Mock(spec=subprocess.Popen)
+        process.pid = 43
+        process.poll.return_value = None
+        process.wait.return_value = 0
+        child_identity_requested = threading.Event()
+        allow_identity = threading.Event()
+
+        def process_identity(pid: int) -> str | None:
+            if pid != 43:
+                return f"start-{pid}"
+            child_identity_requested.set()
+            self.assertTrue(allow_identity.wait(2))
+            return "start-43"
+
+        def launch() -> None:
+            launch_worker(
+                self.store,
+                self.root / "logs",
+                "123456789abc",
+                prepare_failure=lambda job, _message, _failed_at: job,
+                get_boot_identity=lambda: "boot",
+                get_process_identity=process_identity,
+            )
+
+        with mock.patch(
+            "local_voice_harness.cursor.worker_lifecycle.subprocess.Popen",
+            return_value=process,
+        ):
+            launcher = threading.Thread(target=launch)
+            launcher.start()
+            self.assertTrue(child_identity_requested.wait(2))
+            mutated = self.store.update(
+                "123456789abc", lambda current: current.evolve(reconcile=True)
+            )
+            assert mutated is not None
+            self.assertEqual(mutated.revision, 2)
+            self.assertEqual(mutated.loaded_schema_version, CURRENT_SCHEMA_VERSION)
+            allow_identity.set()
+            launcher.join(2)
+
+        self.assertFalse(launcher.is_alive())
+        process.terminate.assert_called_once()
+        self.assertNotEqual(self.store.get("123456789abc").worker_pid, 43)
+
     def test_maintenance_fences_concurrent_critical_operation_commit(self) -> None:
         self.create_queued()
         claimed = begin_worker(
@@ -421,6 +486,7 @@ class CursorWorkerLifecycleTests(unittest.TestCase):
                     selection,
                     Path("/repo"),
                     None,
+                    expected_revision=_job.revision,
                     dispatching=True,
                 )
             )

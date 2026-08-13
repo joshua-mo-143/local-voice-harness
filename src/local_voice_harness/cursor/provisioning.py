@@ -51,6 +51,7 @@ from ..integrations.registry import (
     resolve_issue_reference,
     route_issue_repository,
 )
+from ..job_lifecycle import WorkerCallbackEvent
 from ..linear_ticket_creation import draft_linear_ticket
 from ..local_git import LocalGitRefChanged
 from ..prompt_operations import (
@@ -148,6 +149,16 @@ def _worker_owned(job: CursorJob, claim: WorkerClaim) -> bool:
             return False
     # Token-only callbacks never authorize a mutation, including legacy rows.
     return False
+
+
+def _carry_observed_revision(exc: Exception, job: CursorJob | None) -> None:
+    if job is not None:
+        exc.__dict__["_worker_expected_revision"] = job.revision
+
+
+def _observed_revision(exc: Exception, fallback: int) -> int:
+    revision = exc.__dict__.get("_worker_expected_revision", fallback)
+    return revision if isinstance(revision, int) else fallback
 
 
 @dataclass(frozen=True, slots=True)
@@ -468,16 +479,30 @@ def _worker_change(
     job_id: str,
     claim: WorkerClaim,
     allowed_statuses: Set[JobStatus],
-    change: Callable[[CursorJob], CursorJob],
+    change: Callable[[CursorJob], CursorJob | None],
+    *,
+    expected_revision: int,
 ) -> CursorJob | None:
     def guarded(job: CursorJob) -> CursorJob | None:
         if (
             not _worker_owned(job, claim)
+            or job.revision != expected_revision
             or job.status not in allowed_statuses
             or job.terminal_intent_status is not None
         ):
             return None
-        return change(job)
+        updated = change(job)
+        if updated is None:
+            return None
+        if isinstance(claim, WorkerOwnership):
+            event = WorkerCallbackEvent(
+                expected_revision,
+                updated.lifecycle,
+                claim,
+            )
+            job.validate_lifecycle_event(updated, event)
+            return replace(updated, _lifecycle_event=event)
+        return updated
 
     return store.update_unless_maintenance(job_id, guarded)
 
@@ -488,6 +513,7 @@ def _worker_question(
     token: WorkerClaim,
     question: str,
     *,
+    expected_revision: int,
     clarification_kind: str,
     job_changes: Mapping[str, object] | None = None,
     sensitivity: QuestionSensitivity = QuestionSensitivity.ROUTINE,
@@ -508,7 +534,14 @@ def _worker_question(
             job_changes=job_changes,
         )
 
-    _worker_change(store, job_id, token, {JobStatus.ROUTING, JobStatus.RUNNING}, ask)
+    _worker_change(
+        store,
+        job_id,
+        token,
+        {JobStatus.ROUTING, JobStatus.RUNNING},
+        ask,
+        expected_revision=expected_revision,
+    )
 
 
 def _finish_github_issue_creation(
@@ -516,6 +549,8 @@ def _finish_github_issue_creation(
     job_id: str,
     token: WorkerClaim,
     result: GitHubIssueCreationResult,
+    *,
+    expected_revision: int,
 ) -> None:
     issue = result.issue
     url = str(result.url)
@@ -546,6 +581,7 @@ def _finish_github_issue_creation(
         token,
         {JobStatus.ROUTING, JobStatus.RUNNING},
         finish,
+        expected_revision=expected_revision,
     )
 
 
@@ -564,6 +600,7 @@ def _run_github_issue_creation(
             token,
             "Which GitHub repository should I create the issue in? "
             "Please say its owner and repository name.",
+            expected_revision=job.revision,
             clarification_kind="github_repository",
         )
         return
@@ -596,7 +633,12 @@ def _run_github_issue_creation(
             )
 
         updated = _worker_change(
-            store, job.id, token, {JobStatus.ROUTING}, persist_draft
+            store,
+            job.id,
+            token,
+            {JobStatus.ROUTING},
+            persist_draft,
+            expected_revision=job.revision,
         )
         if updated is None:
             return
@@ -618,6 +660,7 @@ def _run_github_issue_creation(
             job.id,
             token,
             preview,
+            expected_revision=job.revision,
             clarification_kind="github_issue_create_confirmation",
             sensitivity=QuestionSensitivity.DESTRUCTIVE,
         )
@@ -633,7 +676,12 @@ def _run_github_issue_creation(
         )
 
     submitted = _worker_change(
-        store, job.id, token, {JobStatus.ROUTING}, mark_submitted
+        store,
+        job.id,
+        token,
+        {JobStatus.ROUTING},
+        mark_submitted,
+        expected_revision=job.revision,
     )
     if submitted is None:
         return
@@ -649,7 +697,13 @@ def _run_github_issue_creation(
             visible = None
             observation_failed = True
         if visible is not None:
-            _finish_github_issue_creation(store, job.id, token, visible)
+            _finish_github_issue_creation(
+                store,
+                job.id,
+                token,
+                visible,
+                expected_revision=submitted.revision,
+            )
             return
         if isinstance(exc, GitHubOperationAmbiguous) or observation_failed:
 
@@ -666,7 +720,14 @@ def _run_github_issue_creation(
                     worker_operation=None,
                 )
 
-            _worker_change(store, job.id, token, {JobStatus.RUNNING}, ambiguous)
+            _worker_change(
+                store,
+                job.id,
+                token,
+                {JobStatus.RUNNING},
+                ambiguous,
+                expected_revision=submitted.revision,
+            )
             return
 
         def failed_before_creation(current: CursorJob) -> CursorJob:
@@ -675,15 +736,23 @@ def _run_github_issue_creation(
                 worker_operation=None,
             )
 
-        _worker_change(
+        fenced = _worker_change(
             store,
             job.id,
             token,
             {JobStatus.RUNNING},
             failed_before_creation,
+            expected_revision=submitted.revision,
         )
+        _carry_observed_revision(exc, fenced)
         raise
-    _finish_github_issue_creation(store, job.id, token, result)
+    _finish_github_issue_creation(
+        store,
+        job.id,
+        token,
+        result,
+        expected_revision=submitted.revision,
+    )
 
 
 def _finish_linear_ticket_creation(
@@ -691,6 +760,8 @@ def _finish_linear_ticket_creation(
     job_id: str,
     token: WorkerClaim,
     result: LinearTicketCreationResult,
+    *,
+    expected_revision: int,
 ) -> None:
     identifier = result.issue.identifier
     url = result.url
@@ -718,6 +789,7 @@ def _finish_linear_ticket_creation(
         token,
         {JobStatus.ROUTING, JobStatus.RUNNING},
         finish,
+        expected_revision=expected_revision,
     )
 
 
@@ -735,6 +807,7 @@ def _run_linear_ticket_creation(
             job.id,
             token,
             "Which Linear team should I create the ticket in? Please say its team key.",
+            expected_revision=job.revision,
             clarification_kind="linear_team",
         )
         return
@@ -771,6 +844,7 @@ def _run_linear_ticket_creation(
                 token,
                 MODEL_WORKER_STATUSES,
                 finish_missing_team,
+                expected_revision=job.revision,
             )
             return
 
@@ -786,6 +860,7 @@ def _run_linear_ticket_creation(
             token,
             {JobStatus.ROUTING},
             persist_team,
+            expected_revision=job.revision,
         )
         if updated is None:
             return
@@ -820,7 +895,12 @@ def _run_linear_ticket_creation(
             )
 
         updated = _worker_change(
-            store, job.id, token, {JobStatus.ROUTING}, persist_draft
+            store,
+            job.id,
+            token,
+            {JobStatus.ROUTING},
+            persist_draft,
+            expected_revision=job.revision,
         )
         if updated is None:
             return
@@ -843,6 +923,7 @@ def _run_linear_ticket_creation(
             job.id,
             token,
             preview,
+            expected_revision=job.revision,
             clarification_kind="linear_ticket_create_confirmation",
             sensitivity=QuestionSensitivity.DESTRUCTIVE,
         )
@@ -858,9 +939,17 @@ def _run_linear_ticket_creation(
             worker_operation="linear_ticket_create",
         )
 
-    running = _worker_change(store, job.id, token, {JobStatus.ROUTING}, mark_running)
+    running = _worker_change(
+        store,
+        job.id,
+        token,
+        {JobStatus.ROUTING},
+        mark_running,
+        expected_revision=job.revision,
+    )
     if running is None:
         return
+    callback_revision = running.revision
 
     def persist_submit_fence(
         target: str,
@@ -868,6 +957,8 @@ def _run_linear_ticket_creation(
         prompt_token: str,
         baseline: int,
     ) -> None:
+        nonlocal callback_revision
+
         def fence(current: CursorJob) -> CursorJob:
             return current.evolve(
                 linear_ticket_create_operation_state="submitting",
@@ -884,12 +975,16 @@ def _run_linear_ticket_creation(
                 token,
                 {JobStatus.RUNNING},
                 fence,
+                expected_revision=callback_revision,
             )
             is None
         ):
             raise WorkerCancelled
+        callback_revision += 1
 
     def persist_prompt_acceptance() -> None:
+        nonlocal callback_revision
+
         def accepted(current: CursorJob) -> CursorJob:
             if current.linear_ticket_create_operation_state != "submitting":
                 raise JobValidationError(
@@ -906,10 +1001,12 @@ def _run_linear_ticket_creation(
                 token,
                 {JobStatus.RUNNING},
                 accepted,
+                expected_revision=callback_revision,
             )
             is None
         ):
             raise WorkerCancelled
+        callback_revision += 1
 
     def queue_ambiguous() -> None:
         def ambiguous(current: CursorJob) -> CursorJob:
@@ -925,7 +1022,14 @@ def _run_linear_ticket_creation(
                 worker_operation=None,
             )
 
-        _worker_change(store, job.id, token, {JobStatus.RUNNING}, ambiguous)
+        _worker_change(
+            store,
+            job.id,
+            token,
+            {JobStatus.RUNNING},
+            ambiguous,
+            expected_revision=callback_revision,
+        )
 
     try:
         checkpoint()
@@ -953,7 +1057,13 @@ def _run_linear_ticket_creation(
             except LinearError:
                 visible = None
             if visible is not None:
-                _finish_linear_ticket_creation(store, job.id, token, visible)
+                _finish_linear_ticket_creation(
+                    store,
+                    job.id,
+                    token,
+                    visible,
+                    expected_revision=callback_revision,
+                )
                 return
             queue_ambiguous()
             return
@@ -963,13 +1073,15 @@ def _run_linear_ticket_creation(
                 worker_operation=None,
             )
 
-        _worker_change(
+        fenced = _worker_change(
             store,
             job.id,
             token,
             {JobStatus.RUNNING},
             failed_before_submit,
+            expected_revision=callback_revision,
         )
+        _carry_observed_revision(exc, fenced)
         raise
     current = store.get(job.id)
     if current.linear_ticket_create_operation_state != "submitted":
@@ -986,7 +1098,13 @@ def _run_linear_ticket_creation(
     if visible is None:
         queue_ambiguous()
         return
-    _finish_linear_ticket_creation(store, job.id, token, visible)
+    _finish_linear_ticket_creation(
+        store,
+        job.id,
+        token,
+        visible,
+        expected_revision=callback_revision,
+    )
 
 
 def _completion_preferences(
@@ -1073,11 +1191,13 @@ def _worker_complete(
     *,
     output: str,
     agent_status: str,
+    expected_revision: int,
     preserve_blocked_delivery: bool = False,
 ) -> None:
     snapshot = store.get(job_id)
     if (
         not _worker_owned(snapshot, token)
+        or snapshot.revision != expected_revision
         or snapshot.status not in {JobStatus.RUNNING, JobStatus.RECONCILING}
         or snapshot.terminal_intent_status is not None
     ):
@@ -1183,6 +1303,7 @@ def _worker_complete(
         token,
         {JobStatus.RUNNING, JobStatus.RECONCILING},
         finish,
+        expected_revision=expected_revision,
     )
 
 
@@ -1212,6 +1333,7 @@ def _resume_plan_approval_completion(
                 worker_process_start=None,
                 worker_token=None,
             ),
+            expected_revision=job.revision,
         )
         return
 
@@ -1232,6 +1354,7 @@ def _resume_plan_approval_completion(
         worker_token,
         MODEL_WORKER_STATUSES,
         finish,
+        expected_revision=job.revision,
     )
 
 
@@ -1241,6 +1364,7 @@ def _worker_fail(
     token: WorkerClaim,
     exc: Exception,
     *,
+    expected_revision: int,
     target_may_be_active: bool = False,
 ) -> None:
     del target_may_be_active  # Terminal intent always retains the cleanup fence.
@@ -1261,16 +1385,14 @@ def _worker_fail(
             error=diagnostic,
         )
 
-    def guarded(job: CursorJob) -> CursorJob | None:
-        if (
-            not _worker_owned(job, token)
-            or job.status not in MODEL_WORKER_STATUSES
-            or job.terminal_intent_status is not None
-        ):
-            return None
-        return fail(job)
-
-    store.update(job_id, guarded)
+    _worker_change(
+        store,
+        job_id,
+        token,
+        MODEL_WORKER_STATUSES,
+        fail,
+        expected_revision=expected_revision,
+    )
 
 
 def _worker_block_interactive(
@@ -1278,6 +1400,8 @@ def _worker_block_interactive(
     job_id: str,
     token: WorkerClaim,
     message: str,
+    *,
+    expected_revision: int,
 ) -> None:
     def block(job: CursorJob) -> CursorJob:
         now = time.time()
@@ -1294,7 +1418,14 @@ def _worker_block_interactive(
             worker_token=None,
         )
 
-    _worker_change(store, job_id, token, MODEL_WORKER_STATUSES, block)
+    _worker_change(
+        store,
+        job_id,
+        token,
+        MODEL_WORKER_STATUSES,
+        block,
+        expected_revision=expected_revision,
+    )
 
 
 def _worker_error(
@@ -1303,6 +1434,7 @@ def _worker_error(
     token: WorkerClaim,
     exc: Exception,
     *,
+    expected_revision: int,
     prompt_may_be_active: bool,
     client: HerdrClient | None = None,
     target: str = "",
@@ -1315,6 +1447,7 @@ def _worker_error(
             token,
             "Cursor opened an interactive questionnaire and is blocked for "
             "manual attention.",
+            expected_revision=expected_revision,
         )
         return
     if (
@@ -1336,16 +1469,24 @@ def _worker_error(
                 job_id,
                 token,
                 cancel_exc,
+                expected_revision=expected_revision,
                 target_may_be_active=True,
             )
             return
-        _worker_block(store, job_id, token, str(exc))
+        _worker_block(
+            store,
+            job_id,
+            token,
+            str(exc),
+            expected_revision=expected_revision,
+        )
         return
     _worker_fail(
         store,
         job_id,
         token,
         exc,
+        expected_revision=expected_revision,
         target_may_be_active=prompt_may_be_active,
     )
 
@@ -1355,6 +1496,8 @@ def _worker_block(
     job_id: str,
     token: WorkerClaim,
     message: str,
+    *,
+    expected_revision: int,
 ) -> None:
     blocked_at = time.time()
     diagnostic = redact_diagnostic(message, limit=500)
@@ -1368,7 +1511,14 @@ def _worker_block(
             completed_at=blocked_at,
         )
 
-    _worker_change(store, job_id, token, MODEL_WORKER_STATUSES, block)
+    _worker_change(
+        store,
+        job_id,
+        token,
+        MODEL_WORKER_STATUSES,
+        block,
+        expected_revision=expected_revision,
+    )
 
 
 def _pull_request_branch(job: CursorJob) -> str:
@@ -1438,6 +1588,7 @@ def _prepare_pull_request_checkout(
                 token,
                 {JobStatus.ROUTING},
                 refresh_checkout_inputs,
+                expected_revision=job.revision,
             )
             if refreshed is None:
                 return None
@@ -1481,7 +1632,14 @@ def _prepare_pull_request_checkout(
                 pull_request_worktree_error=message,
             )
 
-        _worker_change(store, job_id, token, {JobStatus.ROUTING}, quarantine)
+        _worker_change(
+            store,
+            job_id,
+            token,
+            {JobStatus.ROUTING},
+            quarantine,
+            expected_revision=job.revision,
+        )
         raise
 
     def ready(current: CursorJob) -> CursorJob:
@@ -1491,7 +1649,14 @@ def _prepare_pull_request_checkout(
             pull_request_worktree_error=None,
         )
 
-    return _worker_change(store, job_id, token, {JobStatus.ROUTING}, ready)
+    return _worker_change(
+        store,
+        job_id,
+        token,
+        {JobStatus.ROUTING},
+        ready,
+        expected_revision=job.revision,
+    )
 
 
 def _reserve_worker_target(
@@ -1502,6 +1667,7 @@ def _reserve_worker_target(
     repository: Path,
     issue_key: str | None,
     *,
+    expected_revision: int,
     dispatching: bool = False,
     participant: WorkflowParticipant | None = None,
 ) -> CursorJob | None:
@@ -1523,6 +1689,7 @@ def _reserve_worker_target(
     def reserve(job: CursorJob) -> CursorJob | None:
         if (
             not _worker_owned(job, token)
+            or job.revision != expected_revision
             or job.status not in MODEL_WORKER_STATUSES
             or job.terminal_intent_status is not None
         ):
@@ -1618,10 +1785,13 @@ def _settle_worker_agent(
     job_id: str,
     token: WorkerClaim,
     selection: AgentSelection,
+    *,
+    expected_revision: int,
 ) -> CursorJob | None:
     def settle(job: CursorJob) -> CursorJob | None:
         if (
             not _worker_owned(job, token)
+            or job.revision != expected_revision
             or job.herdr_target != selection.target
             or job.agent_dispatch_state != "dispatching"
             or job.status
@@ -1682,10 +1852,19 @@ def _failed_operation_state(exc: HerdrError) -> str:
 
 
 def _fail_worker_agent_dispatch(
-    store: JobStore, job_id: str, token: WorkerClaim, exc: HerdrError
-) -> None:
+    store: JobStore,
+    job_id: str,
+    token: WorkerClaim,
+    exc: HerdrError,
+    *,
+    expected_revision: int,
+) -> CursorJob | None:
     def fail(job: CursorJob) -> CursorJob | None:
-        if not _worker_owned(job, token) or job.agent_dispatch_state != "dispatching":
+        if (
+            not _worker_owned(job, token)
+            or job.revision != expected_revision
+            or job.agent_dispatch_state != "dispatching"
+        ):
             return None
         operation = job.agent_session_operation
         if operation is None:
@@ -1699,7 +1878,7 @@ def _fail_worker_agent_dispatch(
             worker_operation=None,
         )
 
-    store.update(job_id, fail)
+    return store.update(job_id, fail)
 
 
 def _reserve_worker_worktree(
@@ -1710,6 +1889,7 @@ def _reserve_worker_worktree(
     branch: str,
     checkout: Path,
     *,
+    expected_revision: int,
     state: str,
 ) -> CursorJob | None:
     if state not in {"planned", "dispatching", "ready"}:
@@ -1720,6 +1900,7 @@ def _reserve_worker_worktree(
     def reserve(job: CursorJob) -> CursorJob | None:
         if (
             not _worker_owned(job, token)
+            or job.revision != expected_revision
             or job.status.value != "routing"
             or job.terminal_intent_status is not None
         ):
@@ -1752,12 +1933,15 @@ def _settle_worker_worktree(
     checkout: Path,
     workspace_id: str | None,
     pane_id: str | None,
+    *,
+    expected_revision: int,
 ) -> CursorJob | None:
     checkout_value = str(checkout.resolve())
 
     def settle(job: CursorJob) -> CursorJob | None:
         if (
             not _worker_owned(job, token)
+            or job.revision != expected_revision
             or job.worktree_path != checkout_value
             or job.status.value not in {"routing", "cancelled", "failed"}
         ):
@@ -1800,11 +1984,17 @@ def _settle_worker_worktree(
 
 
 def _fail_worker_worktree(
-    store: JobStore, job_id: str, token: WorkerClaim, exc: HerdrError
-) -> None:
+    store: JobStore,
+    job_id: str,
+    token: WorkerClaim,
+    exc: HerdrError,
+    *,
+    expected_revision: int,
+) -> CursorJob | None:
     def fail(job: CursorJob) -> CursorJob | None:
         if (
             not _worker_owned(job, token)
+            or job.revision != expected_revision
             or job.worktree_provision_state != "dispatching"
         ):
             return None
@@ -1820,7 +2010,7 @@ def _fail_worker_worktree(
             worker_operation=None,
         )
 
-    store.update(job_id, fail)
+    return store.update(job_id, fail)
 
 
 def _begin_fork_operation(
@@ -1830,6 +2020,8 @@ def _begin_fork_operation(
     source: GitHubRepository,
     login: str,
     target: str,
+    *,
+    expected_revision: int,
 ) -> CursorJob | None:
     def begin(job: CursorJob) -> CursorJob:
         return job.evolve(
@@ -1845,7 +2037,14 @@ def _begin_fork_operation(
             worker_operation=None,
         )
 
-    return _worker_change(store, job_id, token, {JobStatus.ROUTING}, begin)
+    return _worker_change(
+        store,
+        job_id,
+        token,
+        {JobStatus.ROUTING},
+        begin,
+        expected_revision=expected_revision,
+    )
 
 
 def _persisted_fork_plan(job: CursorJob) -> GitHubForkPlan | None:
@@ -1878,7 +2077,13 @@ def _persisted_fork_plan(job: CursorJob) -> GitHubForkPlan | None:
     )
 
 
-def _mark_fork_dispatching(store: JobStore, job_id: str, token: WorkerClaim) -> None:
+def _mark_fork_dispatching(
+    store: JobStore,
+    job_id: str,
+    token: WorkerClaim,
+    *,
+    expected_revision: int,
+) -> CursorJob:
     def dispatch(job: CursorJob) -> CursorJob:
         operation = job.fork_operation
         if operation is None:
@@ -1891,8 +2096,17 @@ def _mark_fork_dispatching(store: JobStore, job_id: str, token: WorkerClaim) -> 
             worker_operation="fork_create",
         )
 
-    if _worker_change(store, job_id, token, {JobStatus.ROUTING}, dispatch) is None:
+    updated = _worker_change(
+        store,
+        job_id,
+        token,
+        {JobStatus.ROUTING},
+        dispatch,
+        expected_revision=expected_revision,
+    )
+    if updated is None:
         raise WorkerCancelled
+    return updated
 
 
 def _settle_fork_operation(
@@ -1901,12 +2115,14 @@ def _settle_fork_operation(
     token: WorkerClaim,
     fork: GitHubRepository | None,
     *,
+    expected_revision: int,
     ambiguous: bool = False,
     failed_observing: bool = False,
 ) -> CursorJob | None:
     def settle(job: CursorJob) -> CursorJob | None:
         if (
             not _worker_owned(job, token)
+            or job.revision != expected_revision
             or job.fork_operation_state not in {"planned", "submitted"}
             or job.status.value not in {"routing", "cancelled", "failed"}
         ):
@@ -2051,8 +2267,15 @@ def _provision_followup_agent(
             label=f"{label}-planner",
             workspace_id=workspace_id,
         )
-    before_pane_submit, pane_accepted = _participant_pane_callbacks(
-        store, job_id, token, name
+    revision_state = [job.revision]
+    before_pane_submit, pane_accepted, participant_revision = (
+        _participant_pane_callbacks(
+            store,
+            job_id,
+            token,
+            name,
+            revision_state=revision_state,
+        )
     )
     try:
         before_pane_submit()
@@ -2064,7 +2287,13 @@ def _provision_followup_agent(
         )
         pane_accepted(pane, workspace_id)
     except HerdrError as exc:
-        _fence_participant_creation(store, job_id, token, exc)
+        _fence_participant_creation(
+            store,
+            job_id,
+            token,
+            exc,
+            expected_revision=participant_revision(),
+        )
         raise
     provisional = AgentSelection(
         target=name,
@@ -2081,6 +2310,7 @@ def _provision_followup_agent(
         provisional,
         repository,
         job.issue_key,
+        expected_revision=participant_revision(),
         dispatching=True,
         participant=WorkflowParticipant.PLANNER,
     )
@@ -2098,14 +2328,27 @@ def _provision_followup_agent(
             checkpoint=checkpoint,
         )
     except HerdrError as exc:
-        _fail_worker_agent_dispatch(store, job_id, token, exc)
+        failed = _fail_worker_agent_dispatch(
+            store,
+            job_id,
+            token,
+            exc,
+            expected_revision=reserved_job.revision,
+        )
+        _carry_observed_revision(exc, failed)
         raise
     if selection.target != name:
         error = HerdrError(
             "Herdr started a different follow-up agent than the reserved target",
             code="operation_ambiguous",
         )
-        _fail_worker_agent_dispatch(store, job_id, token, error)
+        _fail_worker_agent_dispatch(
+            store,
+            job_id,
+            token,
+            error,
+            expected_revision=reserved_job.revision,
+        )
         raise error
     _validate_followup_agent_binding(
         checkout,
@@ -2115,7 +2358,13 @@ def _provision_followup_agent(
         expected_pane_id=pane,
         expected_workspace_id=workspace_id,
     )
-    reserved_job = _settle_worker_agent(store, job_id, token, selection)
+    reserved_job = _settle_worker_agent(
+        store,
+        job_id,
+        token,
+        selection,
+        expected_revision=reserved_job.revision,
+    )
     if reserved_job is None:
         raise HarnessError("could not reserve a Cursor agent for the follow-up")
     return reserved_job, selection.target
@@ -2289,6 +2538,7 @@ def _workflow_question(
     token: WorkerClaim,
     question: str,
     *,
+    expected_revision: int,
     clarification_kind: str = "workflow",
     job_changes: Mapping[str, object] | None = None,
     sensitivity: QuestionSensitivity = QuestionSensitivity.ROUTINE,
@@ -2324,11 +2574,23 @@ def _workflow_question(
         )
         return asked
 
-    _worker_change(store, job_id, token, MODEL_WORKER_STATUSES, ask)
+    _worker_change(
+        store,
+        job_id,
+        token,
+        MODEL_WORKER_STATUSES,
+        ask,
+        expected_revision=expected_revision,
+    )
 
 
 def _workflow_block(
-    store: JobStore, job_id: str, token: WorkerClaim, message: str
+    store: JobStore,
+    job_id: str,
+    token: WorkerClaim,
+    message: str,
+    *,
+    expected_revision: int,
 ) -> None:
     def block(job: CursorJob) -> CursorJob:
         now = time.time()
@@ -2345,11 +2607,22 @@ def _workflow_block(
             worker_token=None,
         )
 
-    _worker_change(store, job_id, token, MODEL_WORKER_STATUSES, block)
+    _worker_change(
+        store,
+        job_id,
+        token,
+        MODEL_WORKER_STATUSES,
+        block,
+        expected_revision=expected_revision,
+    )
 
 
 def _begin_phase_turn(
-    store: JobStore, job_id: str, worker_token: WorkerClaim
+    store: JobStore,
+    job_id: str,
+    worker_token: WorkerClaim,
+    *,
+    expected_revision: int,
 ) -> CursorJob | None:
     def begin(job: CursorJob) -> CursorJob:
         turn = job.turn + 1
@@ -2365,7 +2638,14 @@ def _begin_phase_turn(
             prompt_baseline_sequence=None,
         )
 
-    return _worker_change(store, job_id, worker_token, MODEL_WORKER_STATUSES, begin)
+    return _worker_change(
+        store,
+        job_id,
+        worker_token,
+        MODEL_WORKER_STATUSES,
+        begin,
+        expected_revision=expected_revision,
+    )
 
 
 def _record_plan_boundary(
@@ -2374,6 +2654,7 @@ def _record_plan_boundary(
     worker_token: WorkerClaim,
     output: str,
     *,
+    expected_revision: int,
     agent_status: str,
     agent_session: str | None,
     state_change_sequence: int | None,
@@ -2418,6 +2699,7 @@ def _record_plan_boundary(
         worker_token,
         MODEL_WORKER_STATUSES,
         record,
+        expected_revision=expected_revision,
     )
     if recorded is None:
         raise WorkerCancelled
@@ -2445,7 +2727,13 @@ def _advance_workflow_output(
     token = job.turn_token or ""
     question = extract_marker(output, "VOICE_QUESTION", token)
     if question:
-        _workflow_question(store, job.id, worker_token, question)
+        _workflow_question(
+            store,
+            job.id,
+            worker_token,
+            question,
+            expected_revision=job.revision,
+        )
         return None
 
     if job.workflow_phase == WorkflowPhase.CLASSIFYING:
@@ -2457,6 +2745,7 @@ def _advance_workflow_output(
                 job.id,
                 worker_token,
                 "Cursor classification ended without valid tier and reason markers.",
+                expected_revision=job.revision,
             )
             return None
         try:
@@ -2467,7 +2756,13 @@ def _advance_workflow_output(
                 job.github_issue_context,
             )
         except HarnessError as exc:
-            _workflow_block(store, job.id, worker_token, str(exc))
+            _workflow_block(
+                store,
+                job.id,
+                worker_token,
+                str(exc),
+                expected_revision=job.revision,
+            )
             return None
         hard_risk_evidence = _hard_risk_evidence(
             job.request,
@@ -2494,6 +2789,7 @@ def _advance_workflow_output(
                 review_decision=None,
                 review_approval_source=None,
             ),
+            expected_revision=job.revision,
         )
 
     if job.workflow_phase in {WorkflowPhase.PLANNING, WorkflowPhase.REVISING}:
@@ -2504,6 +2800,7 @@ def _advance_workflow_output(
                 job.id,
                 worker_token,
                 "Cursor planner ended without a valid plan marker.",
+                expected_revision=job.revision,
             )
             return None
         return store.publish_artifact(
@@ -2512,6 +2809,7 @@ def _advance_workflow_output(
             job.review_round,
             plan,
             expected_worker_token=worker_token,
+            expected_revision=job.revision,
             expected_turn_token=token,
             expected_phase=job.workflow_phase.value,
             expected_prior_reference=job.plan_artifact,
@@ -2541,6 +2839,7 @@ def _advance_workflow_output(
                 job.id,
                 worker_token,
                 "Cursor reviewer ended without valid review markers.",
+                expected_revision=job.revision,
             )
             return None
         if job.plan_artifact is None:
@@ -2549,6 +2848,7 @@ def _advance_workflow_output(
                 job.id,
                 worker_token,
                 "Cursor reviewer has no current plan artifact.",
+                expected_revision=job.revision,
             )
             return None
         if decision == "approve":
@@ -2619,6 +2919,7 @@ def _advance_workflow_output(
                 job.review_round,
                 review,
                 expected_worker_token=worker_token,
+                expected_revision=job.revision,
                 expected_turn_token=token,
                 expected_phase=job.workflow_phase.value,
                 expected_prior_reference=job.review_artifact,
@@ -2635,6 +2936,7 @@ def _advance_workflow_output(
                 job.review_round,
                 review,
                 expected_worker_token=worker_token,
+                expected_revision=job.revision,
                 expected_turn_token=token,
                 expected_phase=job.workflow_phase.value,
                 expected_prior_reference=job.review_artifact,
@@ -2657,6 +2959,7 @@ def _advance_workflow_output(
                 job.id,
                 worker_token,
                 f"The plan review needs your decision: {review}"[:500],
+                expected_revision=published.revision,
                 clarification_kind="workflow_review",
             )
             return None
@@ -2667,6 +2970,7 @@ def _advance_workflow_output(
                 job.review_round,
                 review,
                 expected_worker_token=worker_token,
+                expected_revision=job.revision,
                 expected_turn_token=token,
                 expected_phase=job.workflow_phase.value,
                 expected_prior_reference=job.review_artifact,
@@ -2691,6 +2995,7 @@ def _advance_workflow_output(
                 "The final plan review still has unresolved findings. "
                 "Say approve to implement the reviewed plan anyway, or abort to "
                 f"cancel the job: {review}"[:500],
+                expected_revision=published.revision,
                 clarification_kind="workflow_review_exhausted",
             )
             return None
@@ -2700,6 +3005,7 @@ def _advance_workflow_output(
             job.review_round,
             review,
             expected_worker_token=worker_token,
+            expected_revision=job.revision,
             expected_turn_token=token,
             expected_phase=job.workflow_phase.value,
             expected_prior_reference=job.review_artifact,
@@ -2739,6 +3045,7 @@ def _advance_workflow_output(
                     job.id,
                     worker_token,
                     "Cursor requested promotion without a reason.",
+                    expected_revision=job.revision,
                 )
                 return None
             try:
@@ -2749,7 +3056,13 @@ def _advance_workflow_output(
                     job.github_issue_context,
                 )
             except HarnessError as exc:
-                _workflow_block(store, job.id, worker_token, str(exc))
+                _workflow_block(
+                    store,
+                    job.id,
+                    worker_token,
+                    str(exc),
+                    expected_revision=job.revision,
+                )
                 return None
             try:
                 promoted_workflow = job.workflow_state.promote(
@@ -2762,6 +3075,7 @@ def _advance_workflow_output(
                     job.id,
                     worker_token,
                     "Cursor requested a workflow promotion that did not increase risk.",
+                    expected_revision=job.revision,
                 )
                 return None
             hard_risk_evidence = _hard_risk_evidence(
@@ -2804,6 +3118,7 @@ def _advance_workflow_output(
                     plan_approval_revision=None,
                     plan_approval_counted=False,
                 ),
+                expected_revision=job.revision,
             )
         _worker_complete(
             store,
@@ -2811,6 +3126,7 @@ def _advance_workflow_output(
             worker_token,
             output=output,
             agent_status=agent_status,
+            expected_revision=job.revision,
         )
         return None
 
@@ -2820,6 +3136,7 @@ def _advance_workflow_output(
         worker_token,
         f"Cursor returned output for unsupported workflow phase "
         f"{job.workflow_phase.value}.",
+        expected_revision=job.revision,
     )
     return None
 
@@ -2856,6 +3173,7 @@ def _plan_participant_creation(
                 or current.agent_operation_checkout
             ),
         ),
+        expected_revision=job.revision,
     )
     if planned is None:
         raise WorkerCancelled
@@ -2867,7 +3185,9 @@ def _participant_pane_callbacks(
     job_id: str,
     worker_token: WorkerClaim,
     target: str,
-) -> tuple[Callable[[], None], Callable[[str, str], None]]:
+    *,
+    revision_state: list[int],
+) -> tuple[Callable[[], None], Callable[[str, str], None], Callable[[], int]]:
     def before_submit() -> None:
         def submit(current: CursorJob) -> CursorJob:
             operation = current.participant_pane_operation
@@ -2887,9 +3207,11 @@ def _participant_pane_callbacks(
             worker_token,
             MODEL_WORKER_STATUSES,
             submit,
+            expected_revision=revision_state[0],
         )
         if updated is None:
             raise WorkerCancelled
+        revision_state[0] = updated.revision
 
     def accepted(pane_id: str, workspace_id: str) -> None:
         def accept(current: CursorJob) -> CursorJob:
@@ -2918,16 +3240,23 @@ def _participant_pane_callbacks(
             worker_token,
             MODEL_WORKER_STATUSES,
             accept,
+            expected_revision=revision_state[0],
         )
         if updated is None:
             raise WorkerCancelled
+        revision_state[0] = updated.revision
 
-    return before_submit, accepted
+    return before_submit, accepted, lambda: revision_state[0]
 
 
 def _fence_participant_creation(
-    store: JobStore, job_id: str, worker_token: WorkerClaim, exc: HerdrError
-) -> None:
+    store: JobStore,
+    job_id: str,
+    worker_token: WorkerClaim,
+    exc: HerdrError,
+    *,
+    expected_revision: int,
+) -> CursorJob | None:
     def fence(current: CursorJob) -> CursorJob | None:
         if not _worker_owned(
             current, worker_token
@@ -2963,7 +3292,14 @@ def _fence_participant_creation(
             worker_operation=None,
         )
 
-    store.update(job_id, fence)
+    return _worker_change(
+        store,
+        job_id,
+        worker_token,
+        MODEL_WORKER_STATUSES,
+        fence,
+        expected_revision=expected_revision,
+    )
 
 
 def _ensure_workflow_participant(
@@ -3084,6 +3420,7 @@ def _ensure_workflow_participant(
         worker_token,
         MODEL_WORKER_STATUSES,
         clear_closed_participants,
+        expected_revision=job.revision,
     )
     if cleared is None:
         raise WorkerCancelled
@@ -3113,11 +3450,19 @@ def _ensure_workflow_participant(
             label=role_label,
             workspace_id=workspace,
         )
-    before_pane_submit, pane_accepted = _participant_pane_callbacks(
-        store, job.id, worker_token, name
+    revision_state = [job.revision]
+    before_pane_submit, pane_accepted, participant_revision = (
+        _participant_pane_callbacks(
+            store,
+            job.id,
+            worker_token,
+            name,
+            revision_state=revision_state,
+        )
     )
 
     def reserve(selection: AgentSelection, dispatching: bool) -> None:
+        nonlocal job
         reserved = _reserve_worker_target(
             store,
             job.id,
@@ -3125,6 +3470,7 @@ def _ensure_workflow_participant(
             selection,
             Path(job.repository or checkout),
             job.issue_key,
+            expected_revision=participant_revision(),
             dispatching=dispatching,
             participant=participant,
         )
@@ -3135,10 +3481,32 @@ def _ensure_workflow_participant(
                 "existing Cursor agent has no complete provider session identity"
             )
         selection_holder["reserved"] = selection
+        revision_state[0] = reserved.revision
+        job = reserved
 
     def settle(selection: AgentSelection) -> None:
-        if _settle_worker_agent(store, job.id, worker_token, selection) is None:
+        settled = _settle_worker_agent(
+            store,
+            job.id,
+            worker_token,
+            selection,
+            expected_revision=participant_revision(),
+        )
+        if settled is None:
             raise WorkerCancelled
+        revision_state[0] = settled.revision
+
+    def fail_agent(exc: HerdrError) -> None:
+        failed = _fail_worker_agent_dispatch(
+            store,
+            job.id,
+            worker_token,
+            exc,
+            expected_revision=participant_revision(),
+        )
+        if failed is not None:
+            revision_state[0] = failed.revision
+        _carry_observed_revision(exc, failed)
 
     try:
         selection = client.start_fresh_agent(
@@ -3155,14 +3523,19 @@ def _ensure_workflow_participant(
             checkpoint=checkpoint,
             reserve=reserve,
             settle=settle,
-            fail_agent=lambda exc: _fail_worker_agent_dispatch(
-                store, job.id, worker_token, exc
-            ),
+            fail_agent=fail_agent,
             before_pane_submit=before_pane_submit,
             pane_accepted=pane_accepted,
         )
     except HerdrError as exc:
-        _fence_participant_creation(store, job.id, worker_token, exc)
+        fenced = _fence_participant_creation(
+            store,
+            job.id,
+            worker_token,
+            exc,
+            expected_revision=participant_revision(),
+        )
+        _carry_observed_revision(exc, fenced)
         raise
     current = store.get(job.id)
     return current, selection.target
@@ -3265,6 +3638,7 @@ def _execute_phase_prompt(
             worker_token,
             MODEL_WORKER_STATUSES,
             plan_prompt,
+            expected_revision=job.revision,
         )
         if planned is None:
             return None
@@ -3318,6 +3692,7 @@ def _execute_phase_prompt(
                 worker_token,
                 MODEL_WORKER_STATUSES,
                 mark_observed_submission,
+                expected_revision=job.revision,
             )
             if submitted is None:
                 return None
@@ -3344,6 +3719,7 @@ def _execute_phase_prompt(
                     manual_reconcile_token=uuid.uuid4().hex,
                     manual_reconcile_required_at=time.time(),
                 ),
+                expected_revision=job.revision,
             )
             raise HarnessError(
                 "Cursor prompt submission is ambiguous and requires manual "
@@ -3368,6 +3744,7 @@ def _execute_phase_prompt(
                 lambda current: current.evolve_plan_approval(
                     current.plan_approval.count()
                 ),
+                expected_revision=job.revision,
             )
             if counted is None:
                 return None
@@ -3393,6 +3770,7 @@ def _execute_phase_prompt(
                     job,
                     worker_token,
                     outcome.output,
+                    expected_revision=job.revision,
                     agent_status=outcome.status,
                     agent_session=outcome.agent_session,
                     state_change_sequence=outcome.state_change_sequence,
@@ -3410,6 +3788,7 @@ def _execute_phase_prompt(
                     lambda current: current.evolve_plan_approval(
                         current.plan_approval.observe()
                     ),
+                    expected_revision=job.revision,
                 )
                 if observed is None:
                     return None
@@ -3429,6 +3808,7 @@ def _execute_phase_prompt(
                     worker_process_start=None,
                     worker_token=None,
                 ),
+                expected_revision=job.revision,
             )
             raise WorkerCancelled from None
 
@@ -3455,8 +3835,10 @@ def _execute_phase_prompt(
         ) or bool(manifest and manifest.get("full_rehydration"))
         payload = build_prompt(session_identity, full_rehydration)
     prompt = payload.text
+    callback_revision = job.revision
 
     def before_submit(observed_baseline: int) -> None:
+        nonlocal callback_revision
         if observed_baseline != operation_baseline:
             raise HarnessError("Cursor prompt baseline changed before submission")
 
@@ -3467,19 +3849,20 @@ def _execute_phase_prompt(
             )
             return current.evolve(**legacy_prompt_fields(operation))
 
-        if (
-            _worker_change(
-                store,
-                job.id,
-                worker_token,
-                MODEL_WORKER_STATUSES,
-                mark_submitting,
-            )
-            is None
-        ):
+        updated = _worker_change(
+            store,
+            job.id,
+            worker_token,
+            MODEL_WORKER_STATUSES,
+            mark_submitting,
+            expected_revision=callback_revision,
+        )
+        if updated is None:
             raise WorkerCancelled
+        callback_revision = updated.revision
 
     def accepted() -> None:
+        nonlocal callback_revision
         counted = _accepted_explicit_plan_approval(job)
 
         def mark_submitted(current: CursorJob) -> CursorJob:
@@ -3504,17 +3887,17 @@ def _execute_phase_prompt(
                 prompt_context_sessions=sessions,
             )
 
-        if (
-            _worker_change(
-                store,
-                job.id,
-                worker_token,
-                MODEL_WORKER_STATUSES,
-                mark_submitted,
-            )
-            is None
-        ):
+        updated = _worker_change(
+            store,
+            job.id,
+            worker_token,
+            MODEL_WORKER_STATUSES,
+            mark_submitted,
+            expected_revision=callback_revision,
+        )
+        if updated is None:
             raise WorkerCancelled
+        callback_revision = updated.revision
 
     try:
         outcome = client.prompt_and_wait(
@@ -3544,8 +3927,11 @@ def _execute_phase_prompt(
                 raise
         # Third-party/test clients that fail before invoking the callback still
         # crossed the call boundary. Conservatively fence the operation.
-        store.update(
+        fenced = _worker_change(
+            store,
             job.id,
+            worker_token,
+            MODEL_WORKER_STATUSES,
             lambda current: (
                 current.evolve(
                     **legacy_prompt_fields(
@@ -3563,7 +3949,9 @@ def _execute_phase_prompt(
                 in {"planned", "submitting", "submitted"}
                 else None
             ),
+            expected_revision=callback_revision,
         )
+        _carry_observed_revision(exc, fenced)
         raise
     checkpoint()
     if phase in {WorkflowPhase.PLANNING, WorkflowPhase.REVISING}:
@@ -3572,6 +3960,7 @@ def _execute_phase_prompt(
             job,
             worker_token,
             outcome.output,
+            expected_revision=callback_revision,
             agent_status=outcome.status,
             agent_session=outcome.agent_session,
             state_change_sequence=outcome.state_change_sequence,
@@ -3586,6 +3975,7 @@ def _execute_phase_prompt(
             lambda current: current.evolve_plan_approval(
                 current.plan_approval.observe()
             ),
+            expected_revision=callback_revision,
         )
         if observed is None:
             return None
@@ -3621,7 +4011,12 @@ def _run_tiered_workflow(
             if advanced is None:
                 return
             job = advanced
-            next_turn = _begin_phase_turn(store, job.id, worker_token)
+            next_turn = _begin_phase_turn(
+                store,
+                job.id,
+                worker_token,
+                expected_revision=job.revision,
+            )
             if next_turn is None:
                 return
             job = next_turn
@@ -3641,7 +4036,12 @@ def _run_tiered_workflow(
         )
         token = job.turn_token or ""
         if not token or job.workflow_turn_phase != phase:
-            next_turn = _begin_phase_turn(store, job.id, worker_token)
+            next_turn = _begin_phase_turn(
+                store,
+                job.id,
+                worker_token,
+                expected_revision=job.revision,
+            )
             if next_turn is None:
                 return
             job = next_turn
@@ -3695,7 +4095,13 @@ def _run_tiered_workflow(
                 token=token,
             )
         except PromptSizeError as exc:
-            _workflow_block(store, job.id, worker_token, str(exc))
+            _workflow_block(
+                store,
+                job.id,
+                worker_token,
+                str(exc),
+                expected_revision=job.revision,
+            )
             return
         if pending_output is None:
             return
@@ -3767,6 +4173,7 @@ def _mark_prompt_boundary(
     worker_token: WorkerClaim,
     turn_token: str,
     *,
+    expected_revision: int,
     state: PromptOperationState,
     agent: dict[str, object],
 ) -> None:
@@ -3804,6 +4211,7 @@ def _mark_prompt_boundary(
         worker_token,
         {JobStatus.RUNNING},
         mark,
+        expected_revision=expected_revision,
     )
     if updated is None:
         raise WorkerCancelled
@@ -3917,7 +4325,12 @@ def run_claimed_worker(  # pyright: ignore[reportGeneralTypeIssues]
             return _begin_prompt_turn(current, turn, turn_token)
 
         updated = _worker_change(
-            store, job_id, worker_token, {JobStatus.ROUTING}, begin_turn
+            store,
+            job_id,
+            worker_token,
+            {JobStatus.ROUTING},
+            begin_turn,
+            expected_revision=job.revision,
         )
         if updated is None:
             return
@@ -3967,6 +4380,7 @@ def run_claimed_worker(  # pyright: ignore[reportGeneralTypeIssues]
                             worker_token,
                             {JobStatus.ROUTING},
                             defer_legacy_dispatch,
+                            expected_revision=job.revision,
                         )
                         return
                     legacy_agent = None
@@ -3999,7 +4413,13 @@ def run_claimed_worker(  # pyright: ignore[reportGeneralTypeIssues]
                         name=job.agent_name or target,
                         checkpoint=checkpoint,
                     )
-                updated = _settle_worker_agent(store, job_id, worker_token, selection)
+                updated = _settle_worker_agent(
+                    store,
+                    job_id,
+                    worker_token,
+                    selection,
+                    expected_revision=job.revision,
+                )
                 if updated is None:
                     return
                 job = updated
@@ -4027,6 +4447,7 @@ def run_claimed_worker(  # pyright: ignore[reportGeneralTypeIssues]
                             manual_reconcile_required_at=time.time(),
                             worker_operation=None,
                         ),
+                        expected_revision=job.revision,
                     )
                     return
                 try:
@@ -4053,6 +4474,7 @@ def run_claimed_worker(  # pyright: ignore[reportGeneralTypeIssues]
                             worker_token,
                             {JobStatus.ROUTING},
                             defer_dispatch,
+                            expected_revision=job.revision,
                         )
                         return
                     observation = None
@@ -4108,9 +4530,16 @@ def run_claimed_worker(  # pyright: ignore[reportGeneralTypeIssues]
                             manual_reconcile_required_at=time.time(),
                             worker_operation=None,
                         ),
+                        expected_revision=job.revision,
                     )
                     return
-                updated = _settle_worker_agent(store, job_id, worker_token, selection)
+                updated = _settle_worker_agent(
+                    store,
+                    job_id,
+                    worker_token,
+                    selection,
+                    expected_revision=job.revision,
+                )
                 if updated is None:
                     return
                 job = updated
@@ -4135,6 +4564,7 @@ def run_claimed_worker(  # pyright: ignore[reportGeneralTypeIssues]
                     worker_token,
                     {JobStatus.ROUTING},
                     retry_dispatch,
+                    expected_revision=job.revision,
                 )
                 if updated is None:
                     return
@@ -4190,6 +4620,7 @@ def run_claimed_worker(  # pyright: ignore[reportGeneralTypeIssues]
                         worker_token,
                         "Which repository's pull request should I check out? "
                         "Please say its owner and repository name.",
+                        expected_revision=job.revision,
                         clarification_kind="github_repository",
                     )
                     return
@@ -4220,6 +4651,7 @@ def run_claimed_worker(  # pyright: ignore[reportGeneralTypeIssues]
                     worker_token,
                     {JobStatus.ROUTING},
                     record_pull_request,
+                    expected_revision=job.revision,
                 )
                 if updated is None:
                     return
@@ -4233,6 +4665,7 @@ def run_claimed_worker(  # pyright: ignore[reportGeneralTypeIssues]
                         worker_token,
                         "Which public GitHub repository should I fork? "
                         "Please say its owner and repository name.",
+                        expected_revision=job.revision,
                         clarification_kind="github_repository",
                     )
                     return
@@ -4243,6 +4676,7 @@ def run_claimed_worker(  # pyright: ignore[reportGeneralTypeIssues]
                         worker_token,
                         f"Please confirm: should I create a GitHub fork of "
                         f"{github_repository}? Say yes or no.",
+                        expected_revision=job.revision,
                         clarification_kind="fork_confirmation",
                     )
                     return
@@ -4277,25 +4711,41 @@ def run_claimed_worker(  # pyright: ignore[reportGeneralTypeIssues]
                     )
                 else:
                     updated = _begin_fork_operation(
-                        store, job_id, worker_token, source, login, fork_target
+                        store,
+                        job_id,
+                        worker_token,
+                        source,
+                        login,
+                        fork_target,
+                        expected_revision=job.revision,
                     )
                     if updated is None:
                         return
                     job = updated
+                    fork_revision = [job.revision]
+                    fork_submitted = [False]
+
+                    def mark_fork_dispatching() -> None:
+                        dispatched = _mark_fork_dispatching(
+                            store,
+                            job_id,
+                            worker_token,
+                            expected_revision=fork_revision[0],
+                        )
+                        fork_revision[0] = dispatched.revision
+                        fork_submitted[0] = True
+
                     try:
                         fork = github.submit_fork(
                             fork_plan,
                             confirmed=job.fork_confirmed,
                             checkpoint=checkpoint,
-                            before_submit=lambda: _mark_fork_dispatching(
-                                store, job_id, worker_token
-                            ),
+                            before_submit=mark_fork_dispatching,
                         )
                     except WorkerCancelled:
                         raise
                     except GitHubError as exc:
-                        current = store.get(job_id)
-                        was_submitted = current.fork_operation_state == "submitted"
+                        was_submitted = fork_submitted[0]
                         visible = (
                             github.observe_fork(fork_plan) if was_submitted else None
                         )
@@ -4304,6 +4754,7 @@ def run_claimed_worker(  # pyright: ignore[reportGeneralTypeIssues]
                             job_id,
                             worker_token,
                             visible,
+                            expected_revision=fork_revision[0],
                             ambiguous=(
                                 was_submitted
                                 and visible is None
@@ -4316,7 +4767,13 @@ def run_claimed_worker(  # pyright: ignore[reportGeneralTypeIssues]
                             ),
                         )
                         raise
-                    updated = _settle_fork_operation(store, job_id, worker_token, fork)
+                    updated = _settle_fork_operation(
+                        store,
+                        job_id,
+                        worker_token,
+                        fork,
+                        expected_revision=fork_revision[0],
+                    )
                     if updated is None:
                         return
                     job = updated
@@ -4340,6 +4797,7 @@ def run_claimed_worker(  # pyright: ignore[reportGeneralTypeIssues]
                     worker_token,
                     {JobStatus.ROUTING},
                     record_provisioning,
+                    expected_revision=job.revision,
                 )
                 if updated is None:
                     return
@@ -4354,6 +4812,7 @@ def run_claimed_worker(  # pyright: ignore[reportGeneralTypeIssues]
                         worker_token,
                         "Which repository's GitHub issue should I work on? "
                         "Please say owner/repository and the issue number.",
+                        expected_revision=job.revision,
                         clarification_kind="github_repository",
                     )
                     return
@@ -4391,6 +4850,7 @@ def run_claimed_worker(  # pyright: ignore[reportGeneralTypeIssues]
                     worker_token,
                     {JobStatus.ROUTING},
                     record_issue,
+                    expected_revision=job.revision,
                 )
                 if updated is None:
                     return
@@ -4440,15 +4900,19 @@ def run_claimed_worker(  # pyright: ignore[reportGeneralTypeIssues]
                     job_id,
                     worker_token,
                     question,
+                    expected_revision=job.revision,
                     clarification_kind="repository",
                 )
                 return
             for _attempt in range(3):
                 reservation: CursorJob | None = None
                 agent_settled = False
+                callback_revision = [job.revision]
 
                 def reserve_selection(
-                    selection: AgentSelection, dispatching: bool
+                    selection: AgentSelection,
+                    dispatching: bool,
+                    revision_state: list[int] = callback_revision,
                 ) -> None:
                     nonlocal reservation, job, target
                     reservation = _reserve_worker_target(
@@ -4458,6 +4922,7 @@ def run_claimed_worker(  # pyright: ignore[reportGeneralTypeIssues]
                         selection,
                         repository,
                         issue_key,
+                        expected_revision=revision_state[0],
                         dispatching=dispatching,
                         participant=WorkflowParticipant.PLANNER,
                     )
@@ -4469,27 +4934,49 @@ def run_claimed_worker(  # pyright: ignore[reportGeneralTypeIssues]
                             "existing Cursor agent has no complete provider session identity"
                         )
                     job = reservation
+                    revision_state[0] = reservation.revision
                     target = selection.target
 
-                def settle_selection(selection: AgentSelection) -> None:
+                def settle_selection(
+                    selection: AgentSelection,
+                    revision_state: list[int] = callback_revision,
+                ) -> None:
                     nonlocal reservation, job, target, agent_settled
                     reservation = _settle_worker_agent(
-                        store, job_id, worker_token, selection
+                        store,
+                        job_id,
+                        worker_token,
+                        selection,
+                        expected_revision=revision_state[0],
                     )
                     if reservation is None:
                         raise ReservationConflict
                     job = reservation
+                    revision_state[0] = reservation.revision
                     target = selection.target
                     agent_settled = True
 
-                def fail_selection(exc: HerdrError) -> None:
-                    _fail_worker_agent_dispatch(store, job_id, worker_token, exc)
+                def fail_selection(
+                    exc: HerdrError,
+                    revision_state: list[int] = callback_revision,
+                ) -> None:
+                    failed = _fail_worker_agent_dispatch(
+                        store,
+                        job_id,
+                        worker_token,
+                        exc,
+                        expected_revision=revision_state[0],
+                    )
+                    if failed is not None:
+                        revision_state[0] = failed.revision
+                    _carry_observed_revision(exc, failed)
 
                 def reserve_worktree(
                     worktree_repository: Path,
                     branch: str,
                     checkout: Path,
                     state: str,
+                    revision_state: list[int] = callback_revision,
                 ) -> None:
                     nonlocal job
                     reserved_worktree = _reserve_worker_worktree(
@@ -4499,17 +4986,20 @@ def run_claimed_worker(  # pyright: ignore[reportGeneralTypeIssues]
                         worktree_repository,
                         branch,
                         checkout,
+                        expected_revision=revision_state[0],
                         state=state,
                     )
                     if reserved_worktree is None:
                         checkpoint()
                         raise ReservationConflict
                     job = reserved_worktree
+                    revision_state[0] = reserved_worktree.revision
 
                 def settle_worktree(
                     checkout: Path,
                     workspace_id: str | None,
                     pane_id: str | None,
+                    revision_state: list[int] = callback_revision,
                 ) -> None:
                     nonlocal job
                     settled_worktree = _settle_worker_worktree(
@@ -4519,13 +5009,27 @@ def run_claimed_worker(  # pyright: ignore[reportGeneralTypeIssues]
                         checkout,
                         workspace_id,
                         pane_id,
+                        expected_revision=revision_state[0],
                     )
                     if settled_worktree is None:
                         raise ReservationConflict
                     job = settled_worktree
+                    revision_state[0] = settled_worktree.revision
 
-                def fail_worktree(exc: HerdrError) -> None:
-                    _fail_worker_worktree(store, job_id, worker_token, exc)
+                def fail_worktree(
+                    exc: HerdrError,
+                    revision_state: list[int] = callback_revision,
+                ) -> None:
+                    failed = _fail_worker_worktree(
+                        store,
+                        job_id,
+                        worker_token,
+                        exc,
+                        expected_revision=revision_state[0],
+                    )
+                    if failed is not None:
+                        revision_state[0] = failed.revision
+                    _carry_observed_revision(exc, failed)
 
                 planned_participant_target = [""]
 
@@ -4534,6 +5038,7 @@ def run_claimed_worker(  # pyright: ignore[reportGeneralTypeIssues]
                     label: str,
                     workspace_id: str | None,
                     target_holder: list[str] = planned_participant_target,
+                    revision_state: list[int] = callback_revision,
                 ) -> None:
                     nonlocal job
                     target_holder[0] = name
@@ -4546,15 +5051,18 @@ def run_claimed_worker(  # pyright: ignore[reportGeneralTypeIssues]
                         label=label,
                         workspace_id=workspace_id or "",
                     )
+                    revision_state[0] = job.revision
 
                 def before_pane_submit(
                     target_holder: list[str] = planned_participant_target,
+                    revision_state: list[int] = callback_revision,
                 ) -> None:
-                    callback, _accepted = _participant_pane_callbacks(
+                    callback, _accepted, _revision = _participant_pane_callbacks(
                         store,
                         job_id,
                         worker_token,
                         target_holder[0],
+                        revision_state=revision_state,
                     )
                     callback()
 
@@ -4562,12 +5070,14 @@ def run_claimed_worker(  # pyright: ignore[reportGeneralTypeIssues]
                     pane_id: str,
                     workspace_id: str,
                     target_holder: list[str] = planned_participant_target,
+                    revision_state: list[int] = callback_revision,
                 ) -> None:
-                    _before, callback = _participant_pane_callbacks(
+                    _before, callback, _revision = _participant_pane_callbacks(
                         store,
                         job_id,
                         worker_token,
                         target_holder[0],
+                        revision_state=revision_state,
                     )
                     callback(pane_id, workspace_id)
 
@@ -4622,17 +5132,17 @@ def run_claimed_worker(  # pyright: ignore[reportGeneralTypeIssues]
         def mark_running(current: CursorJob) -> CursorJob:
             return current.evolve(status=JobStatus.RUNNING)
 
-        if (
-            _worker_change(
-                store,
-                job_id,
-                worker_token,
-                {JobStatus.ROUTING},
-                mark_running,
-            )
-            is None
-        ):
+        running = _worker_change(
+            store,
+            job_id,
+            worker_token,
+            {JobStatus.ROUTING},
+            mark_running,
+            expected_revision=job.revision,
+        )
+        if running is None:
             return
+        job = running
         checkpoint()
         _run_tiered_workflow(
             store,
@@ -4650,6 +5160,7 @@ def run_claimed_worker(  # pyright: ignore[reportGeneralTypeIssues]
             job_id,
             worker_token,
             exc,
+            expected_revision=_observed_revision(exc, job.revision),
             prompt_may_be_active=bool(target),
             client=client,
             target=target,

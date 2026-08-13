@@ -367,6 +367,7 @@ class CompletedFollowup:
     """
 
     job_id: str
+    parent_revision: int
     completed_at: float | None
     expires_at: float
     display_fingerprint: str | None = None
@@ -1074,6 +1075,7 @@ class WakeConversationDaemon:
             return
         self.completed_followup = CompletedFollowup(
             job_id=job_id,
+            parent_revision=job.revision,
             completed_at=job.completed_at,
             expires_at=(
                 time.monotonic() + self.platform.cursor_followup_window_seconds
@@ -2032,6 +2034,7 @@ class WakeConversationDaemon:
                             utterance=text,
                             action="follow_up",
                             job_id=current_completed.job_id,
+                            expected_parent_revision=current_completed.parent_revision,
                             expected_completed_at=current_completed.completed_at,
                             on_follow_up_started=consume_completed_followup,
                         ),

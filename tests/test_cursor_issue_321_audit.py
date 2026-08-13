@@ -159,9 +159,39 @@ def test_worker_mutations_compare_complete_owner_and_reject_token_only(
     def change(current: CursorJob) -> CursorJob:
         return current.evolve(status=JobStatus.RUNNING)
 
-    assert _worker_change(store, job.id, "worker", {JobStatus.ROUTING}, change) is None
-    assert _worker_change(store, job.id, stale, {JobStatus.ROUTING}, change) is None
-    assert _worker_change(store, job.id, owner, {JobStatus.ROUTING}, change) is not None
+    assert (
+        _worker_change(
+            store,
+            job.id,
+            "worker",
+            {JobStatus.ROUTING},
+            change,
+            expected_revision=job.revision,
+        )
+        is None
+    )
+    assert (
+        _worker_change(
+            store,
+            job.id,
+            stale,
+            {JobStatus.ROUTING},
+            change,
+            expected_revision=job.revision,
+        )
+        is None
+    )
+    assert (
+        _worker_change(
+            store,
+            job.id,
+            owner,
+            {JobStatus.ROUTING},
+            change,
+            expected_revision=job.revision,
+        )
+        is not None
+    )
 
 
 def test_worker_context_rejects_legacy_incomplete_claim(tmp_path: Path) -> None:
@@ -522,7 +552,14 @@ def test_participant_callbacks_require_owner_and_retain_settled_spec(
         label="planner",
         workspace_id="workspace",
     )
-    before_submit, accepted = _participant_pane_callbacks(store, job.id, owner, "agent")
+    revision_state = [planned.revision]
+    before_submit, accepted, _revision = _participant_pane_callbacks(
+        store,
+        job.id,
+        owner,
+        "agent",
+        revision_state=revision_state,
+    )
     before_submit()
 
     stale = WorkerOwnership(
@@ -533,7 +570,13 @@ def test_participant_callbacks_require_owner_and_retain_settled_spec(
         owner.operation,
         owner.claimed_at,
     )
-    _before, stale_accepted = _participant_pane_callbacks(store, job.id, stale, "agent")
+    _before, stale_accepted, _stale_revision = _participant_pane_callbacks(
+        store,
+        job.id,
+        stale,
+        "agent",
+        revision_state=[revision_state[0]],
+    )
     with pytest.raises(WorkerCancelled):
         stale_accepted("pane", "workspace")
 
@@ -549,7 +592,13 @@ def test_participant_callbacks_require_owner_and_retain_settled_spec(
         "session",
         7,
     )
-    settled = _settle_worker_agent(store, planned.id, owner, selection)
+    settled = _settle_worker_agent(
+        store,
+        planned.id,
+        owner,
+        selection,
+        expected_revision=revision_state[0],
+    )
     assert settled is not None
     assert settled.participant_creation_state == "created"
     assert settled.participant_creation_target == "agent"
@@ -561,7 +610,7 @@ def test_known_participant_failure_retains_complete_spec(tmp_path: Path) -> None
     store = _store(tmp_path)
     job = store.create(_current_job())
     owner = _owner(job)
-    _plan_participant_creation(
+    planned = _plan_participant_creation(
         store,
         job,
         owner,
@@ -576,6 +625,7 @@ def test_known_participant_failure_retains_complete_spec(tmp_path: Path) -> None
         job.id,
         owner,
         HerdrError("rejected", code="invalid_request"),
+        expected_revision=planned.revision,
     )
 
     failed = store.get(job.id)

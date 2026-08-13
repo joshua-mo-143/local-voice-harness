@@ -13,11 +13,18 @@ import time
 import warnings
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Literal
 
 from ..integrations.github import GitHubError, load_github_provider_state
+from ..job_lifecycle import (
+    FollowUpEvent,
+    JobLifecycleError,
+    QueuedJob,
+    WorkerCallbackEvent,
+    apply_follow_up,
+)
 from .model import (
     ACTIVE_STATUSES,
     CURRENT_SCHEMA_VERSION,
@@ -1068,7 +1075,7 @@ def _normalize_for_durable_write(
         values.pop("session_id", None)
     normalized = CursorJob.from_dict(values)
     normalized.validate_invariants(require_worker_owner=True)
-    return normalized
+    return replace(normalized, _lifecycle_event=candidate._lifecycle_event)
 
 
 def write_unlocked(path: Path, job: dict[str, object]) -> None:
@@ -1312,6 +1319,33 @@ def _validate_follow_up_source(
         )
 
 
+def _validate_follow_up_event(
+    parent: CursorJob,
+    child: CursorJob,
+    expected_parent_revision: int,
+    expected_completed_at: float | None,
+) -> None:
+    child_lifecycle = child.lifecycle
+    if not isinstance(child_lifecycle, QueuedJob):
+        raise JobValidationError("follow-up child must begin queued")
+    assert parent.completed_at is not None
+    try:
+        apply_follow_up(
+            parent.lifecycle,
+            FollowUpEvent(
+                expected_parent_revision,
+                (
+                    expected_completed_at
+                    if expected_completed_at is not None
+                    else parent.completed_at
+                ),
+                child_lifecycle,
+            ),
+        )
+    except JobLifecycleError as exc:
+        raise JobValidationError(str(exc)) from exc
+
+
 JobCommand = Callable[[CursorJob], CursorJob | None]
 FollowUpBuilder = Callable[[CursorJob], CursorJob]
 ArtifactCommand = Callable[[CursorJob, str], CursorJob]
@@ -1514,6 +1548,7 @@ class JsonJobStore:
         text: str,
         *,
         expected_worker_token: WorkerOwnership | str,
+        expected_revision: int,
         expected_turn_token: str,
         expected_phase: str,
         expected_prior_reference: str | None,
@@ -1539,6 +1574,7 @@ class JsonJobStore:
             field = "plan_artifact" if kind == "plan" else "review_artifact"
             if (
                 current.terminal_intent_status is not None
+                or current.revision != expected_revision
                 or not _worker_claim_matches(current, expected_worker_token)
                 or current.turn_token != expected_turn_token
                 or current.workflow_phase.value != expected_phase
@@ -1576,6 +1612,14 @@ class JsonJobStore:
             _ensure_artifact_directory_unlocked(self.durable_dir, job_id)
             _exclusive_bytes(artifact_path, serialized)
             candidate = change(current, reference)
+            if isinstance(expected_worker_token, WorkerOwnership):
+                event = WorkerCallbackEvent(
+                    expected_revision,
+                    candidate.lifecycle,
+                    expected_worker_token,
+                )
+                current.validate_lifecycle_event(candidate, event)
+                candidate = replace(candidate, _lifecycle_event=event)
             if candidate.to_dict().get(field) != reference:
                 raise JobValidationError(
                     f"artifact publication must set {field} to the new reference"
@@ -1630,6 +1674,7 @@ class JsonJobStore:
         parent_job_id: str,
         build: FollowUpBuilder,
         *,
+        expected_parent_revision: int,
         expected_completed_at: float | None = None,
     ) -> CursorJob:
         """Atomically create a child job that reuses a completed parent checkout.
@@ -1653,6 +1698,9 @@ class JsonJobStore:
                 ) from exc
             _validate_follow_up_source(parent, expected_completed_at)
             child = build(parent)
+            _validate_follow_up_event(
+                parent, child, expected_parent_revision, expected_completed_at
+            )
             if child.parent_job_id != parent.id:
                 raise JobValidationError(
                     "follow-up child must reference its parent job id"
@@ -2521,6 +2569,7 @@ class JobStore:
         text: str,
         *,
         expected_worker_token: WorkerOwnership | str,
+        expected_revision: int,
         expected_turn_token: str,
         expected_phase: str,
         expected_prior_reference: str | None,
@@ -2535,6 +2584,7 @@ class JobStore:
             field = "plan_artifact" if kind == "plan" else "review_artifact"
             if (
                 current.terminal_intent_status is not None
+                or current.revision != expected_revision
                 or not _worker_claim_matches(current, expected_worker_token)
                 or current.turn_token != expected_turn_token
                 or current.workflow_phase.value != expected_phase
@@ -2570,6 +2620,14 @@ class JobStore:
             _ensure_artifact_directory_unlocked(self.durable_dir, job_id)
             _exclusive_bytes(artifact_path, serialized)
             candidate = change(current, reference)
+            if isinstance(expected_worker_token, WorkerOwnership):
+                event = WorkerCallbackEvent(
+                    expected_revision,
+                    candidate.lifecycle,
+                    expected_worker_token,
+                )
+                current.validate_lifecycle_event(candidate, event)
+                candidate = replace(candidate, _lifecycle_event=event)
             if candidate.to_dict().get(field) != reference:
                 raise JobValidationError(
                     f"artifact publication must set {field} to the new reference"
@@ -2619,6 +2677,7 @@ class JobStore:
         parent_job_id: str,
         build: FollowUpBuilder,
         *,
+        expected_parent_revision: int,
         expected_completed_at: float | None = None,
     ) -> CursorJob:
         self._ensure_ready()
@@ -2638,6 +2697,9 @@ class JobStore:
                 ) from exc
             _validate_follow_up_source(parent, expected_completed_at)
             child = build(parent)
+            _validate_follow_up_event(
+                parent, child, expected_parent_revision, expected_completed_at
+            )
             if child.parent_job_id != parent.id:
                 raise JobValidationError(
                     "follow-up child must reference its parent job id"

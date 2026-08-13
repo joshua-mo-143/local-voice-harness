@@ -144,6 +144,7 @@ class CursorTurnRequest:
     expected_question_id: str | None = None
     expected_question_turn: str | None = None
     answer_provenance: AnswerProvenance = AnswerProvenance.USER_TEXT
+    expected_parent_revision: int | None = None
     expected_completed_at: float | None = None
     on_follow_up_started: Callable[[], None] | None = None
     on_job_started: Callable[[], None] | None = None
@@ -1614,6 +1615,7 @@ def start_follow_up(
     parent_job_id: str,
     text: str,
     *,
+    expected_parent_revision: int,
     expected_completed_at: float | None = None,
     utterance: str | None = None,
     on_created: Callable[[], None] | None = None,
@@ -1665,7 +1667,10 @@ def start_follow_up(
         )
 
     created = store.create_follow_up(
-        parent_job_id, build, expected_completed_at=expected_completed_at
+        parent_job_id,
+        build,
+        expected_parent_revision=expected_parent_revision,
+        expected_completed_at=expected_completed_at,
     )
     if on_created is not None:
         on_created()
@@ -2362,11 +2367,13 @@ def cursor_turn(
         expected_question_turn = request.expected_question_turn
         answer_provenance = request.answer_provenance
         expected_completed_at = request.expected_completed_at
+        expected_parent_revision = request.expected_parent_revision
         on_follow_up_started = request.on_follow_up_started
         on_job_started = request.on_job_started
     else:
         text = request
         expected_completed_at = None
+        expected_parent_revision = None
     if action == "list":
         return CursorTurnResult(list_jobs(), session_id)
     if action == "missed":
@@ -2473,9 +2480,14 @@ def cursor_turn(
                 "I don't have a recent completed Cursor job to follow up on.", None
             )
         try:
+            if expected_parent_revision is None:
+                raise FollowUpUnavailable(
+                    "follow-up parent revision identity is required"
+                )
             job_id = start_follow_up(
                 job_id,
                 text,
+                expected_parent_revision=expected_parent_revision,
                 expected_completed_at=expected_completed_at,
                 utterance=utterance,
                 on_created=on_follow_up_started,
