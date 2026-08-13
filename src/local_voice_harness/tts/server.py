@@ -136,6 +136,18 @@ def _request_voice(request: dict[str, object]) -> Path | None:
     return voice
 
 
+def _request_bool(
+    request: dict[str, object],
+    name: str,
+    *,
+    default: bool,
+) -> bool:
+    value = request.get(name, default)
+    if not isinstance(value, bool):
+        raise ValueError(f"{name} must be a boolean")
+    return value
+
+
 def _generate(text: str, voice: Path | None) -> tuple[Any, float]:
     import torch
 
@@ -245,6 +257,15 @@ def _atempo_filter(speed: float) -> str:
     return ",".join(f"atempo={factor:g}" for factor in factors)
 
 
+def _require_ffmpeg() -> str:
+    ffmpeg = shutil.which("ffmpeg")
+    if ffmpeg is None:
+        raise RuntimeError(
+            "FFmpeg is required for pitch-preserving Venice TTS speed adjustment"
+        )
+    return ffmpeg
+
+
 def _apply_venice_speed(
     audio: bytes,
     output: Path,
@@ -256,11 +277,7 @@ def _apply_venice_speed(
     if speed == 1:
         output.write_bytes(audio)
     else:
-        ffmpeg = shutil.which("ffmpeg")
-        if ffmpeg is None:
-            raise RuntimeError(
-                "FFmpeg is required for pitch-preserving Venice TTS speed adjustment"
-            )
+        ffmpeg = _require_ffmpeg()
         source_path: Path | None = None
         try:
             with tempfile.NamedTemporaryFile(
@@ -370,6 +387,15 @@ def _stream_response(
     if not REQUEST_ID.fullmatch(request_id):
         raise ValueError("request_id must contain 1-64 letters, numbers, '_' or '-'")
     chunks = split_text(text)
+    apply_speed = _request_bool(request, "apply_speed", default=True)
+    preflight_speed = _request_bool(request, "preflight_speed", default=False)
+    settings = _settings()
+    if (
+        settings.tts_provider == "venice"
+        and settings.tts_speed != 1
+        and preflight_speed
+    ):
+        _require_ffmpeg()
     output_dir = OUTPUT_ROOT / f"stream-{request_id}"
     output_dir.mkdir(mode=0o700, parents=False, exist_ok=False)
     cancelled = threading.Event()
@@ -394,7 +420,10 @@ def _stream_response(
                     break
                 output = output_dir / f"{index:04d}.wav"
                 rate, duration, elapsed = _synthesize(
-                    chunk, voice, output, apply_speed=index > 0
+                    chunk,
+                    voice,
+                    output,
+                    apply_speed=apply_speed,
                 )
                 generation_seconds += elapsed
                 if cancelled.is_set():

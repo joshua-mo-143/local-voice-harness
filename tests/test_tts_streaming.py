@@ -292,7 +292,7 @@ class ServerStreamingTests(unittest.TestCase):
         self.assertEqual(server._atempo_filter(0.25), "atempo=0.5,atempo=0.5")
         self.assertEqual(server._atempo_filter(4), "atempo=2,atempo=2")
 
-    def test_first_streamed_venice_chunk_skips_ffmpeg_speed(self) -> None:
+    def test_only_first_streamed_reply_request_skips_ffmpeg_speed(self) -> None:
         native = io.BytesIO()
         with wave.open(native, "wb") as target:
             target.setnchannels(1)
@@ -340,17 +340,55 @@ class ServerStreamingTests(unittest.TestCase):
             server._stream_response(
                 handler,
                 {
-                    "text": "First sentence. Second sentence.",
+                    "text": "First sentence.",
                     "request_id": "speed-1",
+                    "apply_speed": False,
+                    "preflight_speed": True,
+                },
+            )
+            server._stream_response(
+                handler,
+                {
+                    "text": "Second sentence.",
+                    "request_id": "speed-2",
                 },
             )
 
         chunk_events = [event for event in events if event.get("event") == "chunk"]
         self.assertEqual(len(chunk_events), 2)
         self.assertEqual(run.call_count, 1)
-        self.assertEqual(ffmpeg_when, [("start", "chunk")])
+        self.assertEqual(ffmpeg_when, [("start", "chunk", "done")])
         self.assertEqual(chunk_events[0]["audio_seconds"], 0.1)
         self.assertEqual(chunk_events[1]["audio_seconds"], 0.08)
+
+    def test_first_native_chunk_preflights_required_ffmpeg(self) -> None:
+        settings = replace(
+            load_backend_settings({}),
+            tts_provider="venice",
+            tts_speed=1.25,
+        )
+        handler = mock.Mock()
+        handler.wfile = io.BytesIO()
+
+        with (
+            tempfile.TemporaryDirectory() as temporary,
+            mock.patch.object(server, "OUTPUT_ROOT", Path(temporary)),
+            mock.patch.object(server, "SETTINGS", settings),
+            mock.patch.object(server.shutil, "which", return_value=None),
+            mock.patch.object(server, "_venice_audio") as venice_audio,
+            self.assertRaisesRegex(RuntimeError, "FFmpeg is required"),
+        ):
+            server._stream_response(
+                handler,
+                {
+                    "text": "First sentence.",
+                    "request_id": "speed-preflight",
+                    "apply_speed": False,
+                    "preflight_speed": True,
+                },
+            )
+
+        venice_audio.assert_not_called()
 
     def test_unit_speed_stream_never_invokes_ffmpeg(self) -> None:
         native = io.BytesIO()

@@ -607,7 +607,7 @@ class ProcessUtteranceTests(unittest.TestCase):
     def test_venice_turn_streams_sentence_chunks_to_playback(self) -> None:
         daemon = _bare_daemon()
         daemon.providers = replace(daemon.providers, llm_provider="venice")
-        played_requests: list[str] = []
+        played_requests: list[PlaybackRequest] = []
 
         def streamed_turn(
             _text: str,
@@ -633,7 +633,7 @@ class ProcessUtteranceTests(unittest.TestCase):
                     request for request, _handle in daemon.playback_queue._items
                 ]
                 daemon.playback_queue._items.clear()
-            played_requests.extend(request.text for request in requests)
+            played_requests.extend(requests)
             return [
                 (
                     {
@@ -670,7 +670,14 @@ class ProcessUtteranceTests(unittest.TestCase):
         ):
             daemon.process_utterance(AUDIO_GENERATION, woke=False)
 
-        self.assertEqual(played_requests, ["First sentence.", "Second sentence."])
+        self.assertEqual(
+            [request.text for request in played_requests],
+            ["First sentence.", "Second sentence."],
+        )
+        self.assertFalse(played_requests[0].apply_speed)
+        self.assertTrue(played_requests[0].preflight_speed)
+        self.assertTrue(played_requests[1].apply_speed)
+        self.assertFalse(played_requests[1].preflight_speed)
         self.assertEqual(
             daemon.history,
             [
@@ -2983,7 +2990,7 @@ class AnnounceJobTests(unittest.TestCase):
         handle = mock.Mock()
         handle.wait.side_effect = wake_daemon.HarnessError("socket refused")
 
-        def create_handle(_text: str) -> object:
+        def create_handle(_text: str, **_options: object) -> object:
             events.append("prefetch")
             return handle
 
