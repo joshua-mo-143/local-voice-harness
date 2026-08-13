@@ -21,6 +21,7 @@ from .model import (
     JobStatus,
     JobValidationError,
     transition,
+    worker_callback_transition,
 )
 from .operations import WorkerOwnership, worker_ownership_fields
 from .store import JobStore
@@ -427,8 +428,10 @@ def launch_worker(
         failed_at = time.time()
 
         def fail(job: CursorJob) -> CursorJob | None:
-            if job.status != JobStatus.QUEUED or not launcher_ownership.matches(
-                job.worker_ownership
+            if (
+                job.status != JobStatus.QUEUED
+                or not launcher_ownership.matches(job.worker_ownership)
+                or job.revision != reserved.revision
             ):
                 return None
             return prepare_failure(job, message[:500], failed_at)
@@ -506,8 +509,10 @@ def launch_worker(
         if child_start and child_boot:
 
             def hand_off(job: CursorJob) -> CursorJob | None:
-                if job.status != JobStatus.QUEUED or not launcher_ownership.matches(
-                    job.worker_ownership
+                if (
+                    job.status != JobStatus.QUEUED
+                    or not launcher_ownership.matches(job.worker_ownership)
+                    or job.revision != reserved.revision
                 ):
                     return None
                 child_ownership = WorkerOwnership(
@@ -518,8 +523,10 @@ def launch_worker(
                     launcher_ownership.operation,
                     launcher_ownership.claimed_at,
                 )
-                return transition(
+                return worker_callback_transition(
                     job,
+                    reserved.revision,
+                    launcher_ownership,
                     JobStatus.QUEUED,
                     **worker_ownership_fields(child_ownership),
                 )

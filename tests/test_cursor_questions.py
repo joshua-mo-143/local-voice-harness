@@ -737,6 +737,7 @@ def test_third_accepted_approval_offers_auto_after_implementation(
         _owner(job),
         output="VOICE_SUMMARY[aaaaaaaaaaaa-4]: done",
         agent_status="idle",
+        expected_revision=job.revision,
     )
 
     offered = store.get(job.id)
@@ -1179,12 +1180,51 @@ def test_successful_cleanup_resolves_dispatched_question(store: JobStore) -> Non
         _owner(job),
         output="VOICE_SUMMARY[aaaaaaaaaaaa-2]: completed",
         agent_status="idle",
+        expected_revision=job.revision,
     )
 
     resolved = questions.current(store.get(job.id))
     assert resolved is not None
     assert resolved.state == QuestionState.RESOLVED
     assert resolved.prompt_state == PromptOperationState.RESOLVED
+
+
+def test_same_owner_stale_worker_revision_cannot_ask_question(
+    store: JobStore,
+) -> None:
+    job = store.create(
+        CursorJob.from_dict(
+            {
+                "id": "aaaaaaaaaaaa",
+                "request": "build the feature",
+                "status": JobStatus.RUNNING.value,
+                "created_at": 1,
+                "turn": 1,
+                "turn_token": "aaaaaaaaaaaa-1",
+                "worker_token": "worker",
+                "worker_pid": 42,
+                "worker_boot_id": "boot",
+                "worker_process_start": "start",
+                "worker_claim_operation": "run",
+                "worker_claimed_at": 1,
+                "herdr_target": "retained-agent",
+            }
+        )
+    )
+    store.update(job.id, lambda current: current.evolve(reconcile=True))
+
+    provisioning._worker_question(
+        store,
+        job.id,
+        _owner(job),
+        "Which approach should I use?",
+        expected_revision=job.revision,
+        clarification_kind="agent",
+    )
+
+    current = store.get(job.id)
+    assert current.status == JobStatus.RUNNING
+    assert current.question is None
 
 
 def test_structured_agent_question_becomes_durable_envelope() -> None:
@@ -1342,6 +1382,7 @@ def test_interactive_questionnaire_error_persists_blocked_status(
         running.id,
         _owner(running),
         HerdrError("questionnaire", code="interactive_questionnaire"),
+        expected_revision=running.revision,
         prompt_may_be_active=True,
     )
 

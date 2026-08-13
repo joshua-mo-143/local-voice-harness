@@ -27,6 +27,7 @@ from local_voice_harness.cursor.model import (
     CursorJob,
     JobStatus,
     WorkflowParticipant,
+    WorkflowPhase,
 )
 from local_voice_harness.cursor.operations import WorkerOwnership
 from local_voice_harness.cursor.recovery import stage_terminal_intent
@@ -676,6 +677,48 @@ class DurablePromptOperationTests(unittest.TestCase):
             1,
         )
 
+    def test_stale_same_owner_prompt_observation_is_rejected(self) -> None:
+        created = self.create_approved_plan()
+        job = self.store.update(
+            created.id,
+            lambda current: current.evolve(
+                prompt_operation_state="submitting",
+                prompt_operation_phase="implementing",
+                prompt_operation_turn=4,
+                prompt_operation_target="planner",
+                prompt_operation_agent_session="planner-session",
+                prompt_baseline_sequence=7,
+            ),
+        )
+        assert job is not None
+        client = mock.Mock()
+
+        def observe(_target: str) -> dict[str, object]:
+            self.store.update(job.id, lambda current: current.evolve(reconcile=True))
+            return {
+                "state_change_seq": 8,
+                "agent_session": "planner-session",
+            }
+
+        client.get_agent.side_effect = observe
+
+        outcome = production_jobs._execute_phase_prompt(
+            self.store,
+            job,
+            WORKER,
+            client,
+            lambda: None,
+            target="planner",
+            prompt="lgtm. Implement the approved plan.",
+            token="123456789abc-4",
+        )
+
+        self.assertIsNone(outcome)
+        current = self.store.get(job.id)
+        self.assertTrue(current.reconcile)
+        self.assertEqual(current.prompt_operation_state, "submitting")
+        client.wait_for_stable_completion.assert_not_called()
+
     def test_approval_submit_recovery_rejects_replaced_agent_session(self) -> None:
         created = self.create_approved_plan()
         job = self.store.update(
@@ -742,6 +785,7 @@ class DurablePromptOperationTests(unittest.TestCase):
                 WORKER,
                 output="VOICE_SUMMARY[123456789abc-4]: done",
                 agent_status="idle",
+                expected_revision=job.revision,
             )
 
         deferred = self.store.get(job.id)
@@ -817,6 +861,7 @@ class DurablePromptOperationTests(unittest.TestCase):
                 WORKER,
                 output="VOICE_SUMMARY[123456789abc-4]: done",
                 agent_status="idle",
+                expected_revision=job.revision,
             )
 
         deferred = self.store.get(job.id)
@@ -1121,11 +1166,14 @@ class DurablePromptOperationTests(unittest.TestCase):
             ),
         )
         assert planned is not None
-        before_create, _accepted = production_jobs._participant_pane_callbacks(
-            self.store,
-            job.id,
-            WORKER,
-            "reviewer",
+        before_create, _accepted, _revision = (
+            production_jobs._participant_pane_callbacks(
+                self.store,
+                job.id,
+                WORKER,
+                "reviewer",
+                revision_state=[planned.revision],
+            )
         )
         self.store.update(
             job.id,
@@ -1143,6 +1191,41 @@ class DurablePromptOperationTests(unittest.TestCase):
 
         current = self.store.get(job.id)
         self.assertEqual(current.terminal_intent_status, JobStatus.FAILED)
+        self.assertEqual(current.participant_creation_state, "planned")
+
+    def test_stale_same_owner_participant_callback_is_rejected(self) -> None:
+        job = self.create()
+        planned = self.store.update(
+            job.id,
+            lambda current: current.evolve(
+                participant_creation_state="planned",
+                participant_creation_participant="reviewer",
+                participant_creation_target="reviewer",
+                participant_creation_label="task-reviewer",
+                participant_creation_workspace_id="workspace",
+                participant_creation_checkout="/checkout",
+            ),
+        )
+        assert planned is not None
+        before_create, _accepted, _revision = (
+            production_jobs._participant_pane_callbacks(
+                self.store,
+                job.id,
+                WORKER,
+                "reviewer",
+                revision_state=[planned.revision],
+            )
+        )
+        mutated = self.store.update(
+            job.id, lambda current: current.evolve(reconcile=True)
+        )
+        assert mutated is not None
+
+        with self.assertRaises(production_jobs.WorkerCancelled):
+            before_create()
+
+        current = self.store.get(job.id)
+        self.assertEqual(current.revision, mutated.revision)
         self.assertEqual(current.participant_creation_state, "planned")
 
     def test_submitted_prompt_observes_without_resubmitting(self) -> None:
@@ -1719,6 +1802,42 @@ class CursorJobStateTests(unittest.TestCase):
         updated = store.get("123456789abc")
         self.assertEqual(updated.status, JobStatus.AWAITING_USER)
         self.assertEqual(updated.prompt_operation_state, "none")
+
+    def test_same_owner_stale_workflow_callback_cannot_advance_phase(self) -> None:
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "rename text",
+                "status": "running",
+                "worker_token": "worker",
+                "worker_pid": 42,
+                "worker_process_start": "start",
+                "worker_claim_operation": "test",
+                "worker_claimed_at": 1,
+                "workflow_phase": "classifying",
+                "planner_target": "planner",
+                "active_participant": "planner",
+                "herdr_target": "planner",
+                "turn_token": "current",
+            }
+        )
+        store = jobs._store()
+        observed = store.get("123456789abc")
+        store.update(observed.id, lambda current: current.evolve(reconcile=True))
+
+        advanced = production_jobs._advance_workflow_output(
+            store,
+            observed,
+            LEGACY_WORKER,
+            "WORKFLOW_TIER[current]: simple\n"
+            "WORKFLOW_REASON[current]: localized change",
+            "idle",
+        )
+
+        self.assertIsNone(advanced)
+        self.assertEqual(
+            store.get(observed.id).workflow_phase, WorkflowPhase.CLASSIFYING
+        )
 
     def test_malformed_review_output_blocks_approval_gate(self) -> None:
         jobs.write_job(
@@ -2657,6 +2776,57 @@ class CursorJobStateTests(unittest.TestCase):
         self.assertEqual(updated["github_issue_create_operation_state"], "created")
         herdr.assert_not_called()
 
+    def test_stale_same_owner_issue_submission_result_is_rejected(self) -> None:
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "create an issue about startup",
+                "trusted_utterance": "create an issue about startup",
+                "issue_provider": "github",
+                "github_repository": "source/project",
+                "github_issue_create_requested": True,
+                "github_issue_create_confirmed": True,
+                "github_issue_create_title": "Fix startup",
+                "github_issue_create_body": "Startup fails after reboot.",
+                "github_issue_create_marker": "a" * 32,
+                "github_issue_create_operation_state": "planned",
+                "status": "queued",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        result = GitHubIssueCreationResult(
+            GitHubIssue("source", "project", 42),
+            "https://github.com/source/project/issues/42",
+            "a" * 32,
+        )
+        github = mock.Mock()
+        github.inspect_repository.return_value = GitHubRepository(
+            "source/project",
+            "https://github.com/source/project",
+            False,
+            "main",
+        )
+
+        def submit_issue(
+            *_args: object, **_kwargs: object
+        ) -> GitHubIssueCreationResult:
+            jobs._store().update(
+                "123456789abc", lambda current: current.evolve(reconcile=True)
+            )
+            return result
+
+        github.submit_issue.side_effect = submit_issue
+
+        with mock.patch.object(jobs, "GitHubClient", return_value=github):
+            service.run_worker("123456789abc")
+
+        updated = jobs.read_job("123456789abc")
+        self.assertEqual(updated["status"], "running")
+        self.assertEqual(updated["github_issue_create_operation_state"], "submitted")
+        self.assertIsNone(updated.get("github_issue_created_number"))
+        self.assertTrue(updated["reconcile"])
+
     def test_timed_out_issue_creation_is_reconciled_without_resubmission(self) -> None:
         jobs.write_job(
             {
@@ -3184,6 +3354,7 @@ class CursorJobStateTests(unittest.TestCase):
             selection,
             Path("/repo"),
             None,
+            expected_revision=0,
         )
 
         self.assertIsNone(reserved)
@@ -3898,6 +4069,7 @@ class CursorJobStateTests(unittest.TestCase):
             "worker-claim",
             output="VOICE_SUMMARY[turn]: stale success",
             agent_status="idle",
+            expected_revision=0,
         )
 
         updated = jobs.read_job("123456789abc")
@@ -3988,6 +4160,7 @@ class CursorJobStateTests(unittest.TestCase):
             token: str,
             value: GitHubRepository | None,
             *,
+            expected_revision: int,
             ambiguous: bool = False,
             failed_observing: bool = False,
         ) -> dict[str, object] | None:
@@ -3996,6 +4169,7 @@ class CursorJobStateTests(unittest.TestCase):
                 job_id,
                 token,
                 value,
+                expected_revision=expected_revision,
                 ambiguous=ambiguous,
                 failed_observing=failed_observing,
             )
@@ -4294,7 +4468,7 @@ class CursorJobStateTests(unittest.TestCase):
         )
         client.prompt_and_wait.assert_not_called()
 
-    def test_late_agent_visibility_after_cancelled_startup(self) -> None:
+    def test_stale_agent_failure_after_cancelled_startup_is_rejected(self) -> None:
         repository = Path(self.temporary.name) / "project"
         jobs.write_job(
             {
@@ -4397,9 +4571,10 @@ class CursorJobStateTests(unittest.TestCase):
             worker.join(2)
 
         self.assertFalse(worker.is_alive())
-        self.assertEqual(
-            jobs.read_job("123456789abc")["agent_dispatch_state"], "ambiguous"
-        )
+        cancelled = jobs.read_job("123456789abc")
+        self.assertEqual(cancelled["status"], "reconciling")
+        self.assertEqual(cancelled["terminal_intent_status"], "cancelled")
+        self.assertEqual(cancelled["agent_dispatch_state"], "dispatching")
         with (
             mock.patch.object(jobs, "HerdrClient", return_value=client),
             mock.patch.object(jobs, "_worker_is_alive", return_value=False),
@@ -5291,6 +5466,7 @@ class CursorJobStateTests(unittest.TestCase):
                 repository,
                 "voice/task",
                 checkout,
+                expected_revision=0,
                 state="planned",
             )
         )
@@ -5307,6 +5483,7 @@ class CursorJobStateTests(unittest.TestCase):
                 repository,
                 "voice/task",
                 checkout,
+                expected_revision=0,
                 state="planned",
             )
         )

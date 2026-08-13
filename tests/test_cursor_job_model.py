@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import unittest
 
+from local_voice_harness.cursor.lifecycle import CleanupReconciling
 from local_voice_harness.cursor.model import (
     CURRENT_SCHEMA_VERSION,
     CursorJob,
@@ -14,6 +15,7 @@ from local_voice_harness.cursor.model import (
     validate_reservations,
 )
 from local_voice_harness.cursor.workflow import LegacyPlanApprovalProof
+from local_voice_harness.job_lifecycle import ReconcilingJob
 
 
 class FollowUpLineageTests(unittest.TestCase):
@@ -674,6 +676,40 @@ class CursorJobModelTests(unittest.TestCase):
                             f"illegal Cursor job transition {source} -> {target}",
                         ):
                             transition(job, target, **fields)
+
+    def test_generic_evolve_cannot_infer_recovery_only_edge(self) -> None:
+        queued = self.job_for_status(JobStatus.QUEUED).evolve(
+            github_repository="owner/repository",
+            github_issue_create_title="Recovered issue",
+            github_issue_create_marker="marker",
+            github_issue_create_operation_state="submitted",
+        )
+
+        with self.assertRaisesRegex(
+            JobValidationError, "illegal Cursor job transition queued -> completed"
+        ):
+            queued.evolve(
+                status=JobStatus.COMPLETED,
+                result="Created issue",
+                completed_at=2,
+                github_issue_create_operation_state="created",
+            )
+
+    def test_current_reconciling_adapter_accepts_cleanup_reconciliation(self) -> None:
+        job = self.job_for_status(JobStatus.RECONCILING).evolve(
+            cancellation_reconciliation_pending=True,
+            github_repository="owner/repository",
+            github_issue_create_title="Issue",
+            github_issue_create_marker="marker",
+            github_issue_create_operation_state="submitted",
+        )
+
+        lifecycle = job.lifecycle
+        self.assertEqual(job.loaded_schema_version, CURRENT_SCHEMA_VERSION)
+        self.assertIsInstance(lifecycle, ReconcilingJob)
+        assert isinstance(lifecycle, ReconcilingJob)
+        self.assertIsInstance(lifecycle.cleanup, CleanupReconciling)
+        self.assertIsNone(lifecycle.terminal_intent)
 
     def test_materialized_terminal_outcome_rejects_every_payload_rewrite(self) -> None:
         job = self.job_for_status(JobStatus.COMPLETED)

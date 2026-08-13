@@ -352,24 +352,30 @@ def _run_effect(root: Path, effect: str, point: str) -> None:
     checkout = root / "worktree"
 
     if effect == "worktree":
-        provisioning._reserve_worker_worktree(
+        planned = provisioning._reserve_worker_worktree(
             store,
             job.id,
             token,
             repository,
             "voice/issue-100",
             checkout,
+            expected_revision=job.revision,
             state="planned",
         )
-        provisioning._reserve_worker_worktree(
+        if planned is None:
+            raise RuntimeError("could not plan crash-test worktree")
+        dispatching = provisioning._reserve_worker_worktree(
             store,
             job.id,
             token,
             repository,
             "voice/issue-100",
             checkout,
+            expected_revision=planned.revision,
             state="dispatching",
         )
+        if dispatching is None:
+            raise RuntimeError("could not dispatch crash-test worktree")
         kill("pre-submit")
         effects.record(
             "worktrees",
@@ -383,7 +389,13 @@ def _run_effect(root: Path, effect: str, point: str) -> None:
         )
         kill("post-submit")
         provisioning._settle_worker_worktree(
-            store, job.id, token, checkout, "workspace-1", "pane-1"
+            store,
+            job.id,
+            token,
+            checkout,
+            "workspace-1",
+            "pane-1",
+            expected_revision=dispatching.revision,
         )
         kill("post-settle")
         return
@@ -400,15 +412,18 @@ def _run_effect(root: Path, effect: str, point: str) -> None:
             provider_session_id="crash-session",
             state_sequence=1,
         )
-        provisioning._reserve_worker_target(
+        reserved = provisioning._reserve_worker_target(
             store,
             job.id,
             token,
             selection,
             repository,
             None,
+            expected_revision=job.revision,
             dispatching=True,
         )
+        if reserved is None:
+            raise RuntimeError("could not reserve crash-test agent")
         kill("pre-submit")
         effects.record(
             "agents",
@@ -425,7 +440,13 @@ def _run_effect(root: Path, effect: str, point: str) -> None:
             },
         )
         kill("post-submit")
-        provisioning._settle_worker_agent(store, job.id, token, selection)
+        provisioning._settle_worker_agent(
+            store,
+            job.id,
+            token,
+            selection,
+            expected_revision=reserved.revision,
+        )
         kill("post-settle")
         return
 
@@ -437,10 +458,23 @@ def _run_effect(root: Path, effect: str, point: str) -> None:
             "main",
             None,
         )
-        provisioning._begin_fork_operation(
-            store, job.id, token, source, "voice-user", "voice-user/project"
+        planned = provisioning._begin_fork_operation(
+            store,
+            job.id,
+            token,
+            source,
+            "voice-user",
+            "voice-user/project",
+            expected_revision=job.revision,
         )
-        provisioning._mark_fork_dispatching(store, job.id, token)
+        if planned is None:
+            raise RuntimeError("could not plan crash-test fork")
+        dispatching = provisioning._mark_fork_dispatching(
+            store,
+            job.id,
+            token,
+            expected_revision=planned.revision,
+        )
         kill("pre-submit")
         effects.record(
             "forks",
@@ -455,29 +489,41 @@ def _run_effect(root: Path, effect: str, point: str) -> None:
             "main",
             "upstream/project",
         )
-        provisioning._settle_fork_operation(store, job.id, token, fork)
+        provisioning._settle_fork_operation(
+            store,
+            job.id,
+            token,
+            fork,
+            expected_revision=dispatching.revision,
+        )
         kill("post-settle")
         return
 
     if effect == "pane":
-        provisioning._reserve_worker_worktree(
+        reserved = provisioning._reserve_worker_worktree(
             store,
             job.id,
             token,
             repository,
             "voice/issue-100",
             checkout,
+            expected_revision=job.revision,
             state="planned",
         )
-        provisioning._settle_worker_worktree(
+        if reserved is None:
+            raise RuntimeError("could not reserve crash-test pane worktree")
+        settled = provisioning._settle_worker_worktree(
             store,
             job.id,
             token,
             checkout,
             "workspace-1",
             "pane-root",
+            expected_revision=reserved.revision,
         )
-        job = store.get(job.id)
+        if settled is None:
+            raise RuntimeError("could not settle crash-test pane worktree")
+        job = settled
         planned = provisioning._plan_participant_creation(
             store,
             job,
@@ -487,8 +533,12 @@ def _run_effect(root: Path, effect: str, point: str) -> None:
             label="issue-100-reviewer",
             workspace_id="workspace-1",
         )
-        before_submit, accepted = provisioning._participant_pane_callbacks(
-            store, planned.id, token, "voice-reviewer"
+        before_submit, accepted, _revision = provisioning._participant_pane_callbacks(
+            store,
+            planned.id,
+            token,
+            "voice-reviewer",
+            revision_state=[planned.revision],
         )
         before_submit()
         kill("pre-submit")

@@ -4,7 +4,7 @@ import math
 import re
 import uuid
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import StrEnum
 from typing import Any
 
@@ -13,6 +13,27 @@ from ..integrations.github import (
     GitHubError,
     dump_github_provider_state,
     load_github_provider_state,
+)
+from ..job_lifecycle import (
+    AwaitingUserJob,
+    BlockedJob,
+    ExecutionComponents,
+    JobEvent,
+    JobIdentity,
+    JobLifecycle,
+    JobLifecycleError,
+    JobState,
+    LifecycleEvent,
+    QueuedJob,
+    ReconcilingJob,
+    RecoveryEvent,
+    RoutingProvisioningJob,
+    RunningJob,
+    TerminalJob,
+    WorkerCallbackEvent,
+    WorkerClaim,
+    apply_event,
+    legal_edges,
 )
 from ..prompt_operations import (
     PromptOperation,
@@ -30,6 +51,7 @@ from .lifecycle import (
     LifecycleTransitionError,
     MaterializedTerminalOutcome,
     PendingDelivery,
+    TerminalIntent,
     TerminalState,
     abandon_cleanup_owner,
     acknowledge_without_claim,
@@ -149,59 +171,10 @@ TERMINAL_STATUSES = frozenset(
 )
 
 _LEGAL_TRANSITIONS: dict[JobStatus, frozenset[JobStatus]] = {
-    JobStatus.QUEUED: frozenset(
-        {
-            JobStatus.ROUTING,
-            JobStatus.RECONCILING,
-            JobStatus.FAILED,
-            JobStatus.CANCELLED,
-        }
-    ),
-    JobStatus.ROUTING: frozenset(
-        {
-            JobStatus.QUEUED,
-            JobStatus.RUNNING,
-            JobStatus.RECONCILING,
-            JobStatus.AWAITING_USER,
-            JobStatus.FAILED,
-            JobStatus.CANCELLED,
-        }
-    ),
-    JobStatus.RUNNING: frozenset(
-        {
-            JobStatus.QUEUED,
-            JobStatus.AWAITING_USER,
-            JobStatus.BLOCKED,
-            JobStatus.RECONCILING,
-            JobStatus.COMPLETED,
-            JobStatus.FAILED,
-            JobStatus.CANCELLED,
-        }
-    ),
-    JobStatus.RECONCILING: frozenset(
-        {
-            JobStatus.QUEUED,
-            JobStatus.AWAITING_USER,
-            JobStatus.BLOCKED,
-            JobStatus.COMPLETED,
-            JobStatus.FAILED,
-            JobStatus.CANCELLED,
-        }
-    ),
-    JobStatus.AWAITING_USER: frozenset(
-        {
-            JobStatus.QUEUED,
-            JobStatus.RECONCILING,
-            JobStatus.COMPLETED,
-            JobStatus.CANCELLED,
-        }
-    ),
-    JobStatus.BLOCKED: frozenset(
-        {JobStatus.QUEUED, JobStatus.RECONCILING, JobStatus.CANCELLED}
-    ),
-    JobStatus.COMPLETED: frozenset(),
-    JobStatus.FAILED: frozenset(),
-    JobStatus.CANCELLED: frozenset(),
+    JobStatus(source.value): frozenset(
+        JobStatus(target.value) for target in legal_edges(source)
+    )
+    for source in JobState
 }
 
 _BOOL_FIELDS = frozenset(
@@ -1249,6 +1222,7 @@ class AgentJob:
     active_participant: WorkflowParticipant | None
     _compatibility_layout: bool
     _values: dict[str, object]
+    _lifecycle_event: JobEvent | None = None
 
     @classmethod
     def from_dict(cls, raw: dict[str, object]) -> CursorJob:
@@ -1541,6 +1515,7 @@ class AgentJob:
             active_participant=active_participant,
             _compatibility_layout=compatibility_layout,
             _values=values,
+            _lifecycle_event=None,
         )
         job.validate_invariants(
             require_worker_owner=loaded_version == CURRENT_SCHEMA_VERSION
@@ -1824,6 +1799,10 @@ class AgentJob:
         values["schema_version"] = CURRENT_SCHEMA_VERSION
         values["revision"] = self.revision + 1
         updated = CursorJob.from_dict(values)
+        updated = replace(
+            updated,
+            _lifecycle_event=RecoveryEvent(self.revision, updated.lifecycle),
+        )
         validate_transition(self, updated)
         return updated
 
@@ -2654,6 +2633,111 @@ class AgentJob:
                 intent_completed_at=self.terminal_intent_completed_at,
             )
         except LifecycleTransitionError as exc:
+            raise JobValidationError(str(exc)) from exc
+
+    @property
+    def lifecycle(self) -> JobLifecycle:
+        """Adapt the flat compatibility record to the active typed lifecycle."""
+
+        try:
+            identity = JobIdentity(
+                self.id,
+                self.created_at,
+                self.parent_job_id,
+                self.request,
+                self.harness_kind.value,
+                self.issue_provider,
+                self.revision,
+            )
+            worker = (
+                WorkerClaim(
+                    ownership.token,
+                    ownership.pid,
+                    ownership.boot_id,
+                    ownership.process_start,
+                    ownership.operation,
+                    ownership.claimed_at,
+                )
+                if (ownership := self.worker_ownership) is not None
+                else None
+            )
+            try:
+                prompt_operation = self.prompt_operation
+            except JobValidationError:
+                # The flat adapter still accepts a narrow set of historical
+                # current-schema records whose prompt session was not stored.
+                # They remain compatibility records, not typed prompt states.
+                prompt_operation = None
+            execution = ExecutionComponents(
+                prompt_operation,
+                self.workflow_state,
+            )
+            state = JobState(self.status.value)
+            if state == JobState.QUEUED:
+                if self.queued_at is None:
+                    raise JobLifecycleError("queued job requires a finite queued time")
+                return QueuedJob(identity, self.queued_at, execution, worker)
+            if state == JobState.ROUTING:
+                if worker is None:
+                    raise JobLifecycleError("routing job requires worker identity")
+                return RoutingProvisioningJob(identity, worker, execution)
+            if state == JobState.RUNNING:
+                if worker is None:
+                    raise JobLifecycleError("running job requires worker identity")
+                return RunningJob(identity, worker, execution)
+            if state == JobState.AWAITING_USER:
+                return AwaitingUserJob(
+                    identity, self.question or "", self.result or "", execution
+                )
+            if state == JobState.BLOCKED:
+                if self.completed_at is None:
+                    raise JobLifecycleError("blocked job requires blocked time")
+                return BlockedJob(
+                    identity, self.result or "", self.completed_at, execution
+                )
+            if state == JobState.RECONCILING:
+                terminal_state = self.terminal_state
+                intent = (
+                    terminal_state
+                    if isinstance(terminal_state, TerminalIntent)
+                    else None
+                )
+                return ReconcilingJob(
+                    identity,
+                    execution,
+                    self.cleanup_state,
+                    intent,
+                    worker,
+                )
+            if self.completed_at is None:
+                raise JobLifecycleError("terminal job requires completion time")
+            terminal_state = self.terminal_state
+            if not isinstance(terminal_state, MaterializedTerminalOutcome):
+                raise JobLifecycleError("terminal job requires materialized outcome")
+            return TerminalJob(identity, execution, terminal_state)
+        except (JobLifecycleError, OperationTransitionError, ValueError) as exc:
+            raise JobValidationError(str(exc)) from exc
+
+    def validate_lifecycle_event(
+        self,
+        updated: CursorJob,
+        event: JobEvent,
+    ) -> None:
+        """Validate a typed event against this exact persisted revision."""
+
+        if (
+            self.loaded_schema_version != CURRENT_SCHEMA_VERSION
+            or updated.loaded_schema_version != CURRENT_SCHEMA_VERSION
+        ):
+            # Compatibility imports may lack worker/session evidence that the
+            # active v18 constructors require. Existing transition validation
+            # remains the fail-closed boundary until such a row is normalized.
+            return
+        try:
+            if event.next_state != updated.lifecycle:
+                raise JobLifecycleError("lifecycle event payload does not match update")
+            apply_event(self.lifecycle, event)
+        except JobLifecycleError as exc:
             raise JobValidationError(str(exc)) from exc
 
     @property
@@ -4019,40 +4103,11 @@ def validate_transition(before: CursorJob, after: CursorJob) -> None:
             "Cursor job revision must increase by exactly one "
             f"({before.revision} -> {after.revision})"
         )
-    github_issue_creation_recovery_transition = (
-        before.status == JobStatus.QUEUED
-        and before.github_issue_create_operation_state in {"submitted", "ambiguous"}
-        and (
-            (
-                after.status == JobStatus.COMPLETED
-                and after.github_issue_create_operation_state == "created"
-            )
-            or (
-                after.status == JobStatus.BLOCKED
-                and after.github_issue_create_operation_state == "manual_required"
-            )
-        )
-    )
-    linear_ticket_creation_recovery_transition = (
-        before.status == JobStatus.QUEUED
-        and before.linear_ticket_create_operation_state
-        in {"submitting", "submitted", "ambiguous"}
-        and (
-            (
-                after.status == JobStatus.COMPLETED
-                and after.linear_ticket_create_operation_state == "created"
-            )
-            or (
-                after.status == JobStatus.BLOCKED
-                and after.linear_ticket_create_operation_state == "manual_required"
-            )
-        )
-    )
+    recovery_event = isinstance(after._lifecycle_event, RecoveryEvent)
     if (
         before.status != after.status
         and after.status not in _LEGAL_TRANSITIONS[before.status]
-        and not github_issue_creation_recovery_transition
-        and not linear_ticket_creation_recovery_transition
+        and not recovery_event
     ):
         raise JobValidationError(
             "illegal Cursor job transition "
@@ -4147,6 +4202,10 @@ def validate_transition(before: CursorJob, after: CursorJob) -> None:
     except WorkflowTransitionError as exc:
         raise JobValidationError(str(exc)) from exc
     after.validate_invariants(require_worker_owner=True)
+    lifecycle_event = after._lifecycle_event or LifecycleEvent(
+        before.revision, after.lifecycle
+    )
+    before.validate_lifecycle_event(after, lifecycle_event)
 
 
 def transition(
@@ -4154,20 +4213,7 @@ def transition(
     status: JobStatus,
     **changes: Any,
 ) -> CursorJob:
-    issue_recovery_edge = (
-        job.status == JobStatus.QUEUED
-        and (
-            job.github_issue_create_operation_state in {"submitted", "ambiguous"}
-            or job.linear_ticket_create_operation_state
-            in {"submitting", "submitted", "ambiguous"}
-        )
-        and status in {JobStatus.COMPLETED, JobStatus.BLOCKED}
-    )
-    if (
-        status != job.status
-        and status not in _LEGAL_TRANSITIONS[job.status]
-        and not issue_recovery_edge
-    ):
+    if status != job.status and status not in _LEGAL_TRANSITIONS[job.status]:
         raise JobValidationError(
             f"illegal Cursor job transition {job.status.value} -> {status.value}"
         )
@@ -4186,6 +4232,31 @@ def transition(
     updated = CursorJob.from_dict(values)
     validate_transition(job, updated)
     return updated
+
+
+def worker_callback_transition(
+    job: CursorJob,
+    expected_revision: int,
+    expected_worker: WorkerOwnership,
+    status: JobStatus,
+    **changes: Any,
+) -> CursorJob:
+    """Apply a callback only to the exact worker revision and ownership."""
+
+    updated = transition(job, status, **changes)
+    event = WorkerCallbackEvent(
+        expected_revision,
+        updated.lifecycle,
+        expected_worker,
+    )
+    job.validate_lifecycle_event(
+        updated,
+        event,
+    )
+    return replace(
+        updated,
+        _lifecycle_event=event,
+    )
 
 
 def legal_transitions(status: JobStatus) -> frozenset[JobStatus]:
