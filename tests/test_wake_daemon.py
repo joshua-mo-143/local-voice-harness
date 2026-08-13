@@ -825,6 +825,109 @@ class ProcessUtteranceTests(unittest.TestCase):
 
         qwen_turn.assert_called_once()
 
+    def test_venice_conversation_does_not_wait_on_router(self) -> None:
+        daemon = _bare_daemon()
+        daemon.providers = replace(daemon.providers, llm_provider="venice")
+
+        def fake_stream(
+            generate: Callable[
+                [Callable[[str], bool], Callable[[], bool]],
+                tuple[str, str | None],
+            ],
+        ) -> tuple[str, str | None, dict[str, object], None]:
+            response, session = generate(lambda _chunk: True, lambda: False)
+            return response, session, {"played_text": response}, None
+
+        with (
+            mock.patch.object(
+                wake_daemon, "transcribe", return_value="what time is it"
+            ),
+            mock.patch.object(wake_daemon, "start_components"),
+            mock.patch.object(
+                wake_daemon, "qwen_turn", return_value=("it is noon", None)
+            ) as qwen_turn,
+            mock.patch.object(
+                daemon, "play_streamed_response", side_effect=fake_stream
+            ),
+            mock.patch.object(
+                wake_daemon,
+                "request_context",
+                return_value=RequestContext("what time is it"),
+            ),
+            mock.patch.object(wake_daemon, "route_intent") as route_intent,
+            mock.patch.object(wake_daemon, "notify"),
+        ):
+            daemon.process_utterance(AUDIO_GENERATION, woke=True)
+
+        route_intent.assert_not_called()
+        qwen_turn.assert_called_once()
+
+    def test_venice_submit_still_requires_high_confidence_route(self) -> None:
+        daemon = _bare_daemon()
+        daemon.providers = replace(daemon.providers, llm_provider="venice")
+        with (
+            mock.patch.object(wake_daemon, "transcribe", return_value="work on this"),
+            mock.patch.object(wake_daemon, "start_components"),
+            mock.patch.object(
+                wake_daemon,
+                "request_context",
+                side_effect=lambda text, **_settings: RequestContext(text),
+            ),
+            mock.patch.object(
+                wake_daemon,
+                "route_intent",
+                return_value=IntentRoute(Intent.CURSOR_SUBMIT, "low"),
+            ) as route_intent,
+            mock.patch.object(wake_daemon, "cursor_turn") as cursor_turn,
+            mock.patch.object(wake_daemon, "qwen_turn") as qwen_turn,
+            mock.patch.object(
+                daemon,
+                "_drain_playback_queue",
+                return_value=(_playback_batch("ok"), None),
+            ),
+            mock.patch.object(wake_daemon, "notify"),
+        ):
+            daemon.process_utterance(AUDIO_GENERATION, woke=True)
+
+        route_intent.assert_called_once()
+        cursor_turn.assert_not_called()
+        qwen_turn.assert_not_called()
+
+    def test_venice_high_confidence_submit_still_runs_the_router(self) -> None:
+        daemon = _bare_daemon()
+        daemon.providers = replace(daemon.providers, llm_provider="venice")
+        with (
+            mock.patch.object(
+                wake_daemon, "transcribe", return_value="work on a new ticket"
+            ),
+            mock.patch.object(wake_daemon, "start_components"),
+            mock.patch.object(
+                wake_daemon,
+                "request_context",
+                side_effect=lambda text, **_settings: RequestContext(text),
+            ),
+            mock.patch.object(
+                wake_daemon,
+                "route_intent",
+                return_value=IntentRoute(Intent.CURSOR_SUBMIT, "high"),
+            ) as route_intent,
+            mock.patch.object(
+                wake_daemon, "cursor_turn", return_value=("started", None)
+            ) as cursor_turn,
+            mock.patch.object(wake_daemon, "qwen_turn") as qwen_turn,
+            mock.patch.object(
+                daemon,
+                "_drain_playback_queue",
+                return_value=(_playback_batch("ok"), None),
+            ),
+            mock.patch.object(wake_daemon, "notify"),
+        ):
+            daemon.process_utterance(AUDIO_GENERATION, woke=True)
+
+        route_intent.assert_called_once()
+        cursor_turn.assert_called_once()
+        qwen_turn.assert_not_called()
+
     def test_fuzzy_new_ticket_task_bypasses_main_qwen_for_readback(self) -> None:
         daemon = _bare_daemon()
         daemon.cursor_session = "oldjob123456"

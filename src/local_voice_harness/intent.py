@@ -204,6 +204,25 @@ class IntentRoute:
 
 
 FALLBACK_ROUTE = IntentRoute(Intent.UNCERTAIN, "low")
+ROUTER_OPTIONAL_CONVERSATION_PATTERN = re.compile(
+    r"^\s*(?:"
+    r"(?:hello|hi|hey)(?:\s+there)?|"
+    r"what\s+time\s+is\s+it|"
+    r"what(?:'s|\s+is)\s+(?:the\s+)?(?:current\s+)?time|"
+    r"what(?:'s|\s+is)\s+(?:today's|the)\s+date|"
+    r"how\s+are\s+you|"
+    r"(?:please\s+)?tell\s+me\s+(?:a\s+)?joke|"
+    r"thanks|thank\s+you"
+    r")\s*[?!.]*\s*$",
+    re.IGNORECASE,
+)
+
+
+def needs_intent_router(text: str) -> bool:
+    """Fail closed unless the whole utterance is known-safe conversation."""
+    return ROUTER_OPTIONAL_CONVERSATION_PATTERN.fullmatch(text) is None
+
+
 FORK_WORD = re.compile(r"\bfork(?:ed|ing|s)?\b", re.IGNORECASE)
 FORK_NEGATION = re.compile(
     r"\b(?:do\s+not|don['’]?t|never|no|not|without|avoid|stop)\b",

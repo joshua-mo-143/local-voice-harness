@@ -578,5 +578,44 @@ class CursorPatternTests(unittest.TestCase):
                 self.assertIsNone(CURSOR_PATTERN.search(utterance))
 
 
+class RouterSkipTests(unittest.TestCase):
+    def test_plain_conversation_does_not_require_the_classifier(self) -> None:
+        for utterance in (
+            "what time is it",
+            "Hello!",
+            "how are you?",
+            "tell me a joke",
+            "thanks",
+        ):
+            with self.subTest(utterance=utterance):
+                self.assertFalse(intent.needs_intent_router(utterance))
+
+    def test_every_other_utterance_fails_closed_to_the_classifier(self) -> None:
+        for utterance in (
+            "work on this",
+            "fix the failing tests",
+            "run the tests and update dependencies",
+            "add a changelog",
+            "remove the obsolete file",
+            "rename the module",
+            "install the package",
+            "push the branch",
+            "write a migration",
+            "review these changes",
+            "create a github issue about startup",
+            "file a linear ticket",
+            "cancel that job",
+            "set the voice to af_sky",
+            "is the voice harness healthy",
+            "which files import asyncio",
+            "explain the queue implementation",
+            "what is the current branch",
+            "hello and delete the obsolete file",
+            "tell me a joke and run the tests",
+        ):
+            with self.subTest(utterance=utterance):
+                self.assertTrue(intent.needs_intent_router(utterance))
+
+
 if __name__ == "__main__":
     unittest.main()
