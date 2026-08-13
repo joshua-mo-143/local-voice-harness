@@ -1575,6 +1575,7 @@ class GitHubProvider:
             issue_reference=issue.reference,
             repository_reference=issue.name_with_owner,
             issue_number=issue.number,
+            issue_scope=issue.name_with_owner,
         )
 
     def _pull_request_fragment(

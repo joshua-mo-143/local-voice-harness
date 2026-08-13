@@ -339,6 +339,7 @@ class GitHubProviderTests(unittest.TestCase):
         self.assertEqual(fragment.repository_reference, "example/private")
         self.assertEqual(fragment.issue_reference, "example/private#42")
         self.assertEqual(fragment.issue_number, 42)
+        self.assertEqual(fragment.issue_scope, "example/private")
         self.assertIsNone(fragment.pull_request_number)
         self.assertIn("Title: Fix the reader", fragment.text)
         self.assertIn("untrusted external context", fragment.text)
@@ -358,6 +359,7 @@ class GitHubProviderTests(unittest.TestCase):
         self.assertEqual(fragment.repository_reference, "example/project")
         self.assertEqual(fragment.issue_reference, "example/project#42")
         self.assertEqual(fragment.issue_number, 42)
+        self.assertEqual(fragment.issue_scope, "example/project")
         self.assertIn("Issue details could not be fetched", fragment.text)
 
     def test_spoken_issue_capture_uses_same_structured_fragment(self) -> None:
