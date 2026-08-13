@@ -4,6 +4,7 @@ import io
 import json
 import unittest
 import urllib.error
+from collections.abc import Iterator
 from dataclasses import replace
 from email.message import Message
 from unittest import mock
@@ -225,6 +226,62 @@ class LlmTransportContractTests(unittest.TestCase):
         empty = io.BytesIO(b"data: [DONE]\n\n")
         with self.assertRaisesRegex(HarnessError, "empty streaming response"):
             streamed_message(empty, None)
+
+    def test_first_sentence_emits_before_stream_is_exhausted(self) -> None:
+        events = [
+            'data: {"choices":[{"delta":{"content":"First sentence. "}}]}\n',
+            'data: {"choices":[{"delta":{"content":"Second sentence. "}}]}\n',
+            'data: {"choices":[{"delta":{"content":"Trailing fragment"}}]}\n',
+            "data: [DONE]\n",
+        ]
+        remaining_at_first: list[int] = []
+        chunks: list[str] = []
+
+        def on_chunk(text: str) -> None:
+            chunks.append(text)
+            if len(chunks) == 1:
+                remaining_at_first.append(len(events))
+
+        def stream() -> Iterator[str]:
+            while events:
+                yield events.pop(0)
+
+        message = streamed_message(stream(), on_chunk)
+
+        self.assertEqual(
+            chunks,
+            ["First sentence.", "Second sentence.", "Trailing fragment"],
+        )
+        self.assertGreater(remaining_at_first[0], 0)
+        self.assertEqual(
+            message["content"],
+            "First sentence. Second sentence. Trailing fragment",
+        )
+
+    def test_tool_call_streams_do_not_emit_held_sentences(self) -> None:
+        chunks: list[str] = []
+        message = streamed_message(
+            _stream_response(
+                {"content": "Speaking already. "},
+                {
+                    "tool_calls": [
+                        {
+                            "index": 0,
+                            "id": "call-1",
+                            "function": {"name": "cursor", "arguments": "{}"},
+                        }
+                    ]
+                },
+            ),
+            chunks.append,
+        )
+
+        self.assertEqual(message["content"], "Speaking already. ")
+        self.assertEqual(chunks, [])
+        tool_calls = message["tool_calls"]
+        self.assertIsInstance(tool_calls, list)
+        assert isinstance(tool_calls, list)
+        self.assertEqual(len(tool_calls), 1)
 
     def test_streamed_tool_call_fragments_are_aggregated(self) -> None:
         transport = self._transport(provider="venice", api_key="secret")
