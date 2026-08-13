@@ -10,8 +10,20 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 from dataclasses import dataclass, field
+from typing import Literal
 
 from .model import CursorJob
+
+ObservationOutcome = Literal[
+    "Confirmed",
+    "ConfirmedAbsent",
+    "Failed",
+    "OutcomeUnknown",
+    "ManualRequired",
+]
+OUTBOX_LEASE_SECONDS = 30.0
+OUTBOX_RETRY_SECONDS = 5.0
+OUTBOX_MAX_ATTEMPTS = 8
 
 
 class CoordinatorError(ValueError):
@@ -63,3 +75,28 @@ class CoordinatorDecision:
         if reserved:
             names = ", ".join(sorted(reserved))
             raise CoordinatorError(f"event payload cannot override {names}")
+
+@dataclass(frozen=True, slots=True)
+class OutboxLease:
+    """A claimed outbox row held by one executor until observe or expiry."""
+
+    effect_id: str
+    job_id: str
+    kind: str
+    idempotency_key: str
+    payload: Mapping[str, object]
+    lease_token: str
+    attempts: int
+
+
+@dataclass(frozen=True, slots=True)
+class EffectObservation:
+    """Coordinator observation for one leased effect. Never writes job rows."""
+
+    outcome: ObservationOutcome
+    retryable: bool = False
+    detail: Mapping[str, object] = field(default_factory=dict)
+
+    def __post_init__(self) -> None:
+        if self.retryable and self.outcome != "Failed":
+            raise CoordinatorError("only Failed observations may be retryable")

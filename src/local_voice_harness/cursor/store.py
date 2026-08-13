@@ -26,7 +26,15 @@ from ..job_lifecycle import (
     WorkerCallbackEvent,
     apply_follow_up,
 )
-from .coordinator import CoordinatorCommand, CoordinatorDecision
+from .coordinator import (
+    OUTBOX_LEASE_SECONDS,
+    OUTBOX_MAX_ATTEMPTS,
+    OUTBOX_RETRY_SECONDS,
+    CoordinatorCommand,
+    CoordinatorDecision,
+    EffectObservation,
+    OutboxLease,
+)
 from .model import (
     ACTIVE_STATUSES,
     CURRENT_SCHEMA_VERSION,
@@ -2719,6 +2727,171 @@ class JobStore:
             self._db.insert_outbox_effects(connection, job.id, decision.effects)
         except sqlite3.IntegrityError as exc:
             raise JobValidationError(f"SQLite outbox constraint failed: {exc}") from exc
+
+    def claim_outbox(
+        self,
+        kinds: tuple[str, ...],
+        *,
+        now: float | None = None,
+        lease_token: str | None = None,
+        exclude: tuple[str, ...] = (),
+    ) -> OutboxLease | None:
+        """Lease one due outbox row. Does not mutate canonical job state."""
+
+        claimed_at = time.time() if now is None else now
+        token = uuid.uuid4().hex if lease_token is None else lease_token
+        self._ensure_ready()
+        with self._db.transaction() as connection:
+            row = self._db.claim_due_outbox(
+                connection,
+                kinds=kinds,
+                now=claimed_at,
+                lease_token=token,
+                exclude=exclude,
+            )
+            if row is None:
+                return None
+            payload_raw = row["payload_json"]
+            payload = json.loads(str(payload_raw)) if payload_raw else {}
+            if not isinstance(payload, dict):
+                payload = {}
+            return OutboxLease(
+                effect_id=str(row["effect_id"]),
+                job_id=str(row["job_id"]),
+                kind=str(row["kind"]),
+                idempotency_key=str(row["idempotency_key"]),
+                payload=payload,
+                lease_token=token,
+                attempts=int(row["attempts"]),
+            )
+
+    def mark_outbox_dispatched(self, lease: OutboxLease) -> bool:
+        """Record that an unsafe effect crossed its submit fence."""
+
+        self._ensure_ready()
+        with self._db.transaction() as connection:
+            return self._db.mark_outbox_dispatched(
+                connection, effect_id=lease.effect_id, lease_token=lease.lease_token
+            )
+
+    def outbox_dispatched(self, lease: OutboxLease) -> bool:
+        self._ensure_ready()
+        with self._db.connect(readonly=True) as connection:
+            row = self._db.load_outbox(connection, lease.effect_id)
+        if row is None or str(row["lease_token"] or "") != lease.lease_token:
+            return False
+        raw = row["outcome_json"]
+        if not raw:
+            return False
+        payload = json.loads(str(raw))
+        return isinstance(payload, dict) and payload.get("fence") == "submitted"
+
+    def observe_outbox(
+        self,
+        lease: OutboxLease,
+        observation: EffectObservation,
+        *,
+        now: float | None = None,
+    ) -> str:
+        """Record an effect observation without writing job lifecycle rows."""
+
+        observed_at = time.time() if now is None else now
+        if observation.outcome in {"OutcomeUnknown", "ManualRequired"}:
+            status = "unknown"
+            next_at: float | None = None
+        elif observation.retryable and lease.attempts < OUTBOX_MAX_ATTEMPTS:
+            status = "failed-retryable"
+            next_at = observed_at + OUTBOX_RETRY_SECONDS
+        elif observation.retryable:
+            status = "unknown"
+            next_at = None
+        else:
+            status = "succeeded"
+            next_at = None
+        outcome = {
+            "outcome": observation.outcome,
+            "retryable": observation.retryable,
+            **dict(observation.detail),
+        }
+        last_error = None
+        if observation.outcome in {"Failed", "OutcomeUnknown", "ManualRequired"}:
+            detail = observation.detail.get("error")
+            last_error = str(detail) if detail is not None else observation.outcome
+        self._ensure_ready()
+        with self._db.transaction() as connection:
+            return self._db.complete_outbox_observation(
+                connection,
+                effect_id=lease.effect_id,
+                idempotency_key=lease.idempotency_key,
+                lease_token=lease.lease_token,
+                status=status,
+                outcome=outcome,
+                now=observed_at,
+                next_at=next_at,
+                last_error=last_error,
+            )
+
+    def release_outbox_lease(
+        self,
+        lease: OutboxLease,
+        *,
+        error: str | None = None,
+        now: float | None = None,
+    ) -> bool:
+        """Return an undispatched running lease to pending for replay."""
+
+        released_at = time.time() if now is None else now
+        self._ensure_ready()
+        with self._db.transaction() as connection:
+            row = self._db.load_outbox(connection, lease.effect_id)
+            if row is None or str(row["lease_token"] or "") != lease.lease_token:
+                return False
+            raw = row["outcome_json"]
+            payload = json.loads(str(raw)) if raw else {}
+            if isinstance(payload, dict) and payload.get("fence") == "submitted":
+                return False
+            return self._db.release_running_outbox(
+                connection,
+                effect_id=lease.effect_id,
+                lease_token=lease.lease_token,
+                now=released_at,
+                last_error=error,
+            )
+
+    def reap_expired_outbox_leases(
+        self,
+        *,
+        now: float | None = None,
+        lease_seconds: float = OUTBOX_LEASE_SECONDS,
+    ) -> int:
+        """Recover expired leases without executing handlers or writing jobs."""
+
+        recovered_at = time.time() if now is None else now
+        self._ensure_ready()
+        reaped = 0
+        with self._db.transaction() as connection:
+            for row in self._db.expired_outbox_leases(
+                connection, now=recovered_at, lease_seconds=lease_seconds
+            ):
+                raw = row["outcome_json"]
+                payload = json.loads(str(raw)) if raw else {}
+                dispatched = (
+                    isinstance(payload, dict) and payload.get("fence") == "submitted"
+                )
+                unknown = dispatched or int(row["attempts"]) >= OUTBOX_MAX_ATTEMPTS
+                self._db.settle_expired_outbox(
+                    connection,
+                    effect_id=str(row["effect_id"]),
+                    unknown=unknown,
+                    now=recovered_at,
+                    outcome=(
+                        {"outcome": "OutcomeUnknown", "retryable": False}
+                        if unknown
+                        else None
+                    ),
+                )
+                reaped += 1
+        return reaped
 
     def write_artifact(
         self,

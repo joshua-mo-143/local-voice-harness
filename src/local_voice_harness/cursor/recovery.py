@@ -65,6 +65,7 @@ from .operations import (
     OperationTransitionError,
     SessionIdentity,
 )
+from .outbox import recover_outbox
 from .store import JobStore, LegacyWorkerInspector
 from .worker_lifecycle import (
     boot_identity,
@@ -1774,6 +1775,7 @@ def recover_jobs(
     blocked_legacy_jobs = store.migrate_legacy(inspect_worker=inspect_legacy_worker)
     store.prune(now=now)
     recovered_at = time.time() if now is None else now
+    recover_outbox(store, now=recovered_at)
 
     for existing in store.list():
         if not has_legacy_worker_claim(existing):

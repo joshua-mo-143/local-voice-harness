@@ -368,6 +368,14 @@ outbox rows commit in one `BEGIN IMMEDIATE` transaction or not at all. Existing
 coordinator is production-used before every caller is migrated. Effect execution
 is [#345](https://github.com/joshua-mo-143/local-voice-harness/issues/345).
 
+[#345](https://github.com/joshua-mo-143/local-voice-harness/issues/345) implements
+the execution half: `JobStore.claim_outbox` leases a pending row, handlers run
+after that transaction commits, and `observe_outbox` records `Confirmed`,
+`ConfirmedAbsent`, `Failed`, `OutcomeUnknown`, or `ManualRequired` against the
+effect ID and idempotency key. Executors never write canonical job rows.
+`recover_jobs` reaps expired leases; a crash before the submit fence returns the
+row to `pending`, and a crash after it becomes `OutcomeUnknown`.
+
 An effect executor must lease an outbox row, renew it, and report `Confirmed`,
 `ConfirmedAbsent`, `Failed`, or `OutcomeUnknown`; it must not directly update
 `jobs`. Named effects, payload identity, and replay rules are the
@@ -735,7 +743,8 @@ for each active reservation.
 - [x] [#342](https://github.com/joshua-mo-143/local-voice-harness/issues/342)
   persist `(state transition, event, reservations, outbox effects)` atomically.
 - [ ] Make the coordinator the sole durable state writer.
-- [ ] Execute named provider effects outside transactions with idempotency keys,
+- [x] [#345](https://github.com/joshua-mo-143/local-voice-harness/issues/345)
+  execute named provider effects outside transactions with idempotency keys,
   leases, observations, and `OutcomeUnknown` recovery.
 - [ ] Remove per-job JSON writes, compatibility layout, and v0–v11 incremental
   migration only after parity and hardware recovery checks pass.
