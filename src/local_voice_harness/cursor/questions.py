@@ -31,6 +31,7 @@ from .model import (
     WorkflowPhase,
     WorkflowTier,
 )
+from .workflow import PlanApprovalSource, ReviewApprovalSource
 
 FIELD = "voice_question"
 
@@ -94,6 +95,26 @@ def ask(
         ),
     }
     changes.update(job_changes or {})
+    if (
+        owner == "workflow_plan_approval"
+        and changes.get("plan_approval_state") == "awaiting"
+    ):
+        approval = job.plan_approval.await_question(
+            question_id=question.id,
+            question_turn_token=question.origin.turn_token,
+            plan_reference=str(changes.get("plan_artifact") or job.plan_artifact or ""),
+            review_reference=str(
+                changes.get("review_artifact") or job.review_artifact or ""
+            ),
+            review_accepted=bool(changes.get("review_approved", job.review_approved)),
+        )
+        changes.update(
+            plan_approval_state=approval.state.value,
+            plan_approval_source=None,
+            plan_approval_plan_artifact=approval.plan_reference,
+            plan_approval_review_artifact=approval.review_reference,
+            plan_approval_counted=approval.counted,
+        )
     if clear_worker:
         return job.evolve_for_delivery(
             now=now,
@@ -757,6 +778,8 @@ def _workflow_review_answer(
                 "plan_approval_id": None,
                 "plan_approval_source": None,
                 "plan_approval_agent_session": None,
+                "plan_approval_plan_artifact": None,
+                "plan_approval_review_artifact": None,
                 "plan_approval_state_change_sequence": None,
                 "plan_approval_revision": None,
                 "plan_approval_counted": False,
@@ -788,6 +811,13 @@ def _workflow_review_exhausted_answer(
             None,
             message="The reviewed Plan Mode boundary is no longer available.",
         )
+    approved_review = job.review_state.approve_exhausted()
+    approval = job.plan_approval.approve(
+        PlanApprovalSource.EXPLICIT,
+        plan_reference=job.plan_artifact or "",
+        review_reference=job.review_artifact or "",
+        review_accepted=approved_review.approved,
+    )
     return AnswerTransition(
         _workflow_queue_answer(
             job,
@@ -796,12 +826,14 @@ def _workflow_review_exhausted_answer(
             context,
             continuation=False,
             workflow_phase=WorkflowPhase.IMPLEMENTING.value,
-            review_approved=True,
-            review_approval_source="user",
+            review_approved=approved_review.approved,
+            review_approval_source=ReviewApprovalSource.USER.value,
             extra_changes={
-                "plan_approval_state": "approved",
-                "plan_approval_source": "explicit",
-                "plan_approval_counted": False,
+                "plan_approval_state": approval.state.value,
+                "plan_approval_source": PlanApprovalSource.EXPLICIT.value,
+                "plan_approval_plan_artifact": approval.plan_reference,
+                "plan_approval_review_artifact": approval.review_reference,
+                "plan_approval_counted": approval.counted,
             },
         ),
         launch=True,
@@ -834,6 +866,14 @@ def _workflow_plan_approval_answer(
             None,
             message="That reviewed Plan Mode boundary is no longer available.",
         )
+    approval = job.plan_approval.approve(
+        PlanApprovalSource.EXPLICIT,
+        plan_reference=job.plan_artifact,
+        review_reference=job.review_artifact or "",
+        review_accepted=job.review_approved,
+        question_id=question.id,
+        question_turn_token=question.origin.turn_token,
+    )
     return AnswerTransition(
         _workflow_queue_answer(
             job,
@@ -843,9 +883,11 @@ def _workflow_plan_approval_answer(
             continuation=False,
             workflow_phase=WorkflowPhase.IMPLEMENTING.value,
             extra_changes={
-                "plan_approval_state": "approved",
-                "plan_approval_source": "explicit",
-                "plan_approval_counted": False,
+                "plan_approval_state": approval.state.value,
+                "plan_approval_source": PlanApprovalSource.EXPLICIT.value,
+                "plan_approval_plan_artifact": approval.plan_reference,
+                "plan_approval_review_artifact": approval.review_reference,
+                "plan_approval_counted": approval.counted,
             },
         ),
         launch=True,

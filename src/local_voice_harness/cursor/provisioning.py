@@ -7,7 +7,7 @@ import time
 import traceback
 import uuid
 from collections.abc import Callable, Mapping, Set
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from ..diagnostic_safety import redact_diagnostic
@@ -115,6 +115,15 @@ from .prompts import (
     revision_prompt,
 )
 from .store import JobStore
+from .workflow import (
+    ArtifactReference,
+    ParticipantCreation,
+    ParticipantCreationState,
+    PlanApprovalProof,
+    PlanApprovalSource,
+    ReviewDecision,
+    WorkflowTransitionError,
+)
 
 DELIVERY_RETRY_SECONDS = 5.0
 FOREGROUND_GRACE_SECONDS = 2.0
@@ -965,8 +974,9 @@ def _run_linear_ticket_creation(
 def _completion_preferences(
     job: CursorJob,
 ) -> tuple[PlanApprovalPreferences | None, bool]:
-    approval_id = job.plan_approval_id
-    if job.plan_approval_source != "explicit" or approval_id is None:
+    approval = job.plan_approval
+    approval_id = approval.proof.gate_id if approval.proof is not None else None
+    if approval.source != PlanApprovalSource.EXPLICIT or approval_id is None:
         return None, False
     try:
         preferences = (
@@ -993,12 +1003,15 @@ def _finish_completed_workflow(
         and preferences is not None
         and approval_id in preferences.explicit_approval_ids
     )
+    approval = job.plan_approval
+    if counted and not approval.counted:
+        approval = approval.count()
     completion_changes: Mapping[str, object] = {
         "result": result,
         "workflow_phase": WorkflowPhase.FINISHED.value,
         "active_participant": None,
         "prompt_operation_state": "none",
-        "plan_approval_counted": counted,
+        "plan_approval_counted": approval.counted,
         "plan_approval_completion_pending": False,
     }
     if (
@@ -2222,9 +2235,9 @@ def _record_plan_boundary(
         return job
     if agent_status not in {"idle", "done", "working", "blocked"}:
         raise HarnessError("Cursor Plan Mode boundary has an unsupported agent state")
-    if agent_session is None or state_change_sequence is None:
+    if agent_session is None or state_change_sequence is None or revision is None:
         raise HarnessError(
-            "Cursor Plan Mode boundary is missing durable Herdr session proof"
+            "Cursor Plan Mode boundary is missing durable Herdr session/revision proof"
         )
     gate_material = (
         f"{job.id}\0{job.review_round}\0{token}\0{agent_session}\0"
@@ -2239,15 +2252,15 @@ def _record_plan_boundary(
             or current.plan_approval_state not in {"none", "boundary"}
         ):
             raise WorkerCancelled
-        return current.evolve(
-            plan_approval_state="boundary",
-            plan_approval_id=gate_id,
-            plan_approval_source=None,
-            plan_approval_agent_session=agent_session,
-            plan_approval_state_change_sequence=state_change_sequence,
-            plan_approval_revision=revision,
-            plan_approval_counted=False,
+        approval = current.plan_approval.record_boundary(
+            PlanApprovalProof(
+                gate_id,
+                agent_session,
+                state_change_sequence,
+                revision,
+            )
         )
+        return current.evolve_plan_approval(approval)
 
     recorded = _worker_change(
         store,
@@ -2316,20 +2329,16 @@ def _advance_workflow_output(
             classification_reason = (
                 f"{reason} Deterministic hard-risk floor: {hard_risk_evidence}."
             )
-        phase = (
-            WorkflowPhase.IMPLEMENTING
-            if tier == WorkflowTier.SIMPLE
-            else WorkflowPhase.PLANNING
-        )
         return _worker_change(
             store,
             job.id,
             worker_token,
             MODEL_WORKER_STATUSES,
-            lambda current: current.evolve(
-                workflow_tier=tier.value,
-                workflow_classification_reason=classification_reason[:500],
-                workflow_phase=phase.value,
+            lambda current: current.evolve_workflow(
+                current.workflow_state.classify(
+                    tier,
+                    classification_reason[:500],
+                ),
                 prompt_operation_state="none",
                 review_approved=False,
                 review_decision=None,
@@ -2356,13 +2365,18 @@ def _advance_workflow_output(
             expected_turn_token=token,
             expected_phase=job.workflow_phase.value,
             expected_prior_reference=job.plan_artifact,
-            change=lambda current, reference: current.evolve(
-                workflow_phase=WorkflowPhase.REVIEWING.value,
-                plan_artifact=reference,
+            change=lambda current, reference: current.evolve_review(
+                current.review_state.publish_plan(
+                    ArtifactReference.parse(
+                        reference,
+                        job_id=current.id,
+                        kind="plan",
+                    )
+                ),
+                workflow_phase=current.workflow_state.transition(
+                    WorkflowPhase.REVIEWING
+                ).phase.value,
                 prompt_operation_state="none",
-                review_approved=False,
-                review_decision=None,
-                review_approval_source=None,
             ),
         )
 
@@ -2398,17 +2412,32 @@ def _advance_workflow_output(
             now = time.time()
 
             def approve_review(current: CursorJob, reference: str) -> CursorJob:
+                approved_review = current.review_state.publish_review(
+                    ArtifactReference.parse(
+                        reference,
+                        job_id=current.id,
+                        kind="review",
+                    ),
+                    ReviewDecision.APPROVE,
+                )
                 if auto_approval:
-                    return current.evolve(
-                        workflow_phase=WorkflowPhase.IMPLEMENTING.value,
-                        review_artifact=reference,
+                    approval = current.plan_approval.approve(
+                        PlanApprovalSource.AUTO,
+                        plan_reference=current.plan_artifact or "",
+                        review_reference=reference,
+                        review_accepted=approved_review.approved,
+                    )
+                    return current.evolve_review(
+                        approved_review,
+                        workflow_phase=current.workflow_state.transition(
+                            WorkflowPhase.IMPLEMENTING
+                        ).phase.value,
                         prompt_operation_state="none",
-                        review_approved=True,
-                        review_decision="approve",
-                        review_approval_source="reviewer",
-                        plan_approval_state="approved",
-                        plan_approval_source="auto",
-                        plan_approval_counted=False,
+                        plan_approval_state=approval.state.value,
+                        plan_approval_source=PlanApprovalSource.AUTO.value,
+                        plan_approval_plan_artifact=approval.plan_reference,
+                        plan_approval_review_artifact=approval.review_reference,
+                        plan_approval_counted=approval.counted,
                     )
                 return question_adapter.ask(
                     current,
@@ -2460,11 +2489,15 @@ def _advance_workflow_output(
                 expected_phase=job.workflow_phase.value,
                 expected_prior_reference=job.review_artifact,
                 expected_plan_reference=job.plan_artifact,
-                change=lambda current, reference: current.evolve(
-                    review_artifact=reference,
-                    review_approved=False,
-                    review_decision="revise",
-                    review_approval_source=None,
+                change=lambda current, reference: current.evolve_review(
+                    current.review_state.publish_review(
+                        ArtifactReference.parse(
+                            reference,
+                            job_id=current.id,
+                            kind="review",
+                        ),
+                        ReviewDecision.REVISE,
+                    )
                 ),
             )
             if published is None:
@@ -2477,7 +2510,7 @@ def _advance_workflow_output(
                 clarification_kind="workflow_review",
             )
             return None
-        if job.review_round >= 1:
+        if job.review_round >= 2:
             published = store.publish_artifact(
                 job.id,
                 "review",
@@ -2488,11 +2521,15 @@ def _advance_workflow_output(
                 expected_phase=job.workflow_phase.value,
                 expected_prior_reference=job.review_artifact,
                 expected_plan_reference=job.plan_artifact,
-                change=lambda current, reference: current.evolve(
-                    review_artifact=reference,
-                    review_approved=False,
-                    review_decision="revise",
-                    review_approval_source=None,
+                change=lambda current, reference: current.evolve_review(
+                    current.review_state.publish_review(
+                        ArtifactReference.parse(
+                            reference,
+                            job_id=current.id,
+                            kind="review",
+                        ),
+                        ReviewDecision.REVISE,
+                    )
                 ),
             )
             if published is None:
@@ -2517,18 +2554,25 @@ def _advance_workflow_output(
             expected_phase=job.workflow_phase.value,
             expected_prior_reference=job.review_artifact,
             expected_plan_reference=job.plan_artifact,
-            change=lambda current, reference: current.evolve(
-                workflow_phase=WorkflowPhase.REVISING.value,
-                review_artifact=reference,
-                review_round=current.review_round + 1,
+            change=lambda current, reference: current.evolve_review(
+                current.review_state.publish_review(
+                    ArtifactReference.parse(
+                        reference,
+                        job_id=current.id,
+                        kind="review",
+                    ),
+                    ReviewDecision.REVISE,
+                ).revise(),
+                workflow_phase=current.workflow_state.transition(
+                    WorkflowPhase.REVISING
+                ).phase.value,
                 prompt_operation_state="none",
-                review_approved=False,
-                review_decision="revise",
-                review_approval_source=None,
                 plan_approval_state="none",
                 plan_approval_id=None,
                 plan_approval_source=None,
                 plan_approval_agent_session=None,
+                plan_approval_plan_artifact=None,
+                plan_approval_review_artifact=None,
                 plan_approval_state_change_sequence=None,
                 plan_approval_revision=None,
                 plan_approval_counted=False,
@@ -2557,15 +2601,12 @@ def _advance_workflow_output(
             except HarnessError as exc:
                 _workflow_block(store, job.id, worker_token, str(exc))
                 return None
-            current_order = {
-                WorkflowTier.SIMPLE: 0,
-                WorkflowTier.MEDIUM: 1,
-                WorkflowTier.HIGH_RISK: 2,
-            }
-            if (
-                job.workflow_tier is None
-                or current_order[promoted] <= current_order[job.workflow_tier]
-            ):
+            try:
+                promoted_workflow = job.workflow_state.promote(
+                    promoted,
+                    promotion_reason,
+                )
+            except WorkflowTransitionError:
                 _workflow_block(
                     store,
                     job.id,
@@ -2584,16 +2625,18 @@ def _advance_workflow_output(
                     f"{promotion_reason} Deterministic hard-risk floor: "
                     f"{hard_risk_evidence}."
                 )
+            promoted_workflow = job.workflow_state.promote(
+                promoted,
+                classification_reason[:500],
+            )
             return _worker_change(
                 store,
                 job.id,
                 worker_token,
                 MODEL_WORKER_STATUSES,
-                lambda current: current.evolve(
+                lambda current: current.evolve_workflow(
+                    promoted_workflow,
                     continuation=False,
-                    workflow_tier=promoted.value,
-                    workflow_classification_reason=classification_reason[:500],
-                    workflow_phase=WorkflowPhase.PLANNING.value,
                     review_round=0,
                     plan_artifact=None,
                     review_artifact=None,
@@ -2605,6 +2648,8 @@ def _advance_workflow_output(
                     plan_approval_id=None,
                     plan_approval_source=None,
                     plan_approval_agent_session=None,
+                    plan_approval_plan_artifact=None,
+                    plan_approval_review_artifact=None,
                     plan_approval_state_change_sequence=None,
                     plan_approval_revision=None,
                     plan_approval_counted=False,
@@ -2644,13 +2689,17 @@ def _plan_participant_creation(
         job.id,
         worker_token,
         MODEL_WORKER_STATUSES,
-        lambda current: current.evolve(
-            participant_creation_state="planned",
-            participant_creation_participant=participant.value,
-            participant_creation_target=target,
-            participant_creation_label=label,
-            participant_creation_workspace_id=workspace_id,
-            participant_creation_pane_id=None,
+        lambda current: current.evolve_participant(
+            replace(
+                current.participant_lifecycle,
+                creation=ParticipantCreation(
+                    ParticipantCreationState.PLANNED,
+                    participant,
+                    target,
+                    label,
+                    workspace_id,
+                ),
+            )
         ),
     )
     if planned is None:
@@ -2670,25 +2719,39 @@ def _participant_pane_callbacks(
             job_id,
             worker_token,
             MODEL_WORKER_STATUSES,
-            lambda current: current.evolve(participant_creation_state="submitting"),
+            lambda current: current.evolve_participant(
+                replace(
+                    current.participant_lifecycle,
+                    creation=current.participant_lifecycle.creation.begin(),
+                )
+            ),
         )
         if updated is None:
             raise WorkerCancelled
 
     def accepted(pane_id: str, workspace_id: str) -> None:
+        def accept(current: CursorJob) -> CursorJob:
+            if current.participant_creation_target != target:
+                raise WorkerCancelled
+            return current.evolve_participant(
+                replace(
+                    current.participant_lifecycle,
+                    creation=current.participant_lifecycle.creation.created(
+                        pane_id=pane_id,
+                        workspace_id=workspace_id,
+                    ),
+                ),
+                herdr_pane_id=pane_id,
+                herdr_workspace_id=workspace_id,
+                agent_name=target,
+            )
+
         updated = _worker_change(
             store,
             job_id,
             worker_token,
             MODEL_WORKER_STATUSES,
-            lambda current: current.evolve(
-                participant_creation_state="created",
-                participant_creation_pane_id=pane_id,
-                participant_creation_workspace_id=workspace_id,
-                herdr_pane_id=pane_id,
-                herdr_workspace_id=workspace_id,
-                agent_name=target,
-            ),
+            accept,
         )
         if updated is None:
             raise WorkerCancelled
@@ -2707,15 +2770,21 @@ def _fence_participant_creation(
             "operation_ambiguous",
         }
         if uncertain:
-            return current.evolve(
-                participant_creation_state="manual_required",
+            return current.evolve_participant(
+                replace(
+                    current.participant_lifecycle,
+                    creation=current.participant_lifecycle.creation.require_manual(),
+                ),
                 manual_reconcile_operation="pane",
                 manual_reconcile_token=uuid.uuid4().hex,
                 manual_reconcile_required_at=time.time(),
                 worker_operation=None,
             )
-        return current.evolve(
-            participant_creation_state="none",
+        return current.evolve_participant(
+            replace(
+                current.participant_lifecycle,
+                creation=ParticipantCreation(),
+            ),
             worker_operation=None,
         )
 
@@ -3032,9 +3101,12 @@ def _execute_phase_prompt(
                 sessions = current.prompt_context_sessions
                 if current.active_participant is not None:
                     sessions[current.active_participant.value] = observed_session
-                return current.evolve(
+                approval = current.plan_approval
+                if counted and not approval.counted:
+                    approval = approval.count()
+                return current.evolve_plan_approval(
+                    approval,
                     **legacy_prompt_fields(submitted_operation),
-                    plan_approval_counted=(current.plan_approval_counted or counted),
                     prompt_context_sessions=sessions,
                 )
 
@@ -3091,7 +3163,9 @@ def _execute_phase_prompt(
                 job.id,
                 worker_token,
                 MODEL_WORKER_STATUSES,
-                lambda current: current.evolve(plan_approval_counted=True),
+                lambda current: current.evolve_plan_approval(
+                    current.plan_approval.count()
+                ),
             )
             if counted is None:
                 return None
@@ -3131,7 +3205,9 @@ def _execute_phase_prompt(
                     job.id,
                     worker_token,
                     MODEL_WORKER_STATUSES,
-                    lambda current: current.evolve(plan_approval_state="observed"),
+                    lambda current: current.evolve_plan_approval(
+                        current.plan_approval.observe()
+                    ),
                 )
                 if observed is None:
                     return None
@@ -3217,9 +3293,12 @@ def _execute_phase_prompt(
                 sessions[current.active_participant.value] = (
                     current.prompt_operation_agent_session
                 )
-            return current.evolve(
+            approval = current.plan_approval
+            if counted and not approval.counted:
+                approval = approval.count()
+            return current.evolve_plan_approval(
+                approval,
                 **legacy_prompt_fields(operation),
-                plan_approval_counted=(current.plan_approval_counted or counted),
                 prompt_context_sessions=sessions,
             )
 
@@ -3301,7 +3380,9 @@ def _execute_phase_prompt(
             job.id,
             worker_token,
             MODEL_WORKER_STATUSES,
-            lambda current: current.evolve(plan_approval_state="observed"),
+            lambda current: current.evolve_plan_approval(
+                current.plan_approval.observe()
+            ),
         )
         if observed is None:
             return None

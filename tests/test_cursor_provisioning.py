@@ -418,6 +418,8 @@ class DurablePromptOperationTests(unittest.TestCase):
                 review_approval_source="reviewer",
                 plan_approval_state="approved",
                 plan_approval_source="explicit",
+                plan_approval_plan_artifact=plan_reference,
+                plan_approval_review_artifact=review_reference,
             ),
         )
         assert updated is not None
@@ -1142,7 +1144,7 @@ class CursorJobStateTests(unittest.TestCase):
                 "workflow_tier": "high-risk",
                 "workflow_classification_reason": "recovery",
                 "workflow_phase": "reviewing",
-                "review_round": 1,
+                "review_round": 2,
                 "review_decision": "revise",
                 "herdr_target": "planner",
                 "planner_target": "planner",
@@ -1151,6 +1153,7 @@ class CursorJobStateTests(unittest.TestCase):
                 "plan_approval_id": "gate-id",
                 "plan_approval_agent_session": "planner-session",
                 "plan_approval_state_change_sequence": 2,
+                "plan_approval_revision": 2,
             }
         )
         store = jobs._store()
@@ -1158,13 +1161,13 @@ class CursorJobStateTests(unittest.TestCase):
         plan_reference = store.write_artifact(
             "123456789abc",
             "plan",
-            1,
+            2,
             plan,
         )
         review_reference = store.write_artifact(
             "123456789abc",
             "review",
-            1,
+            2,
             "Ownership remains unresolved.",
             source_text=plan,
         )
@@ -1313,6 +1316,7 @@ class CursorJobStateTests(unittest.TestCase):
                 "plan_approval_id": "gate-id",
                 "plan_approval_agent_session": "planner-session",
                 "plan_approval_state_change_sequence": 7,
+                "plan_approval_revision": 3,
             }
         )
         store = jobs._store()
@@ -1369,6 +1373,7 @@ class CursorJobStateTests(unittest.TestCase):
                 "plan_approval_id": "gate-id",
                 "plan_approval_agent_session": "planner-session",
                 "plan_approval_state_change_sequence": 7,
+                "plan_approval_revision": 3,
             }
         )
         store = jobs._store()
@@ -1427,6 +1432,7 @@ class CursorJobStateTests(unittest.TestCase):
                 "plan_approval_id": "gate-id",
                 "plan_approval_agent_session": "planner-session",
                 "plan_approval_state_change_sequence": 7,
+                "plan_approval_revision": 3,
             }
         )
 
@@ -1713,7 +1719,7 @@ class CursorJobStateTests(unittest.TestCase):
         self.assertIn("preserve compatibility", str(promoted.continuation_answer))
         self.assertFalse(promoted.continuation)
 
-    def test_high_risk_final_rejected_review_awaits_explicit_decision(self) -> None:
+    def test_high_risk_round_one_rejection_advances_to_round_two(self) -> None:
         jobs.write_job(
             {
                 "id": "123456789abc",
@@ -1751,13 +1757,10 @@ class CursorJobStateTests(unittest.TestCase):
         )
 
         updated = store.get("123456789abc")
-        self.assertEqual(updated.status, JobStatus.AWAITING_USER)
-        self.assertEqual(updated.review_round, 1)
-        self.assertEqual(
-            updated.clarification_kind,
-            "workflow_review_exhausted",
-        )
-        self.assertEqual(updated.workflow_phase.value, "reviewing")
+        self.assertEqual(updated.status, JobStatus.RUNNING)
+        self.assertEqual(updated.review_round, 2)
+        self.assertIsNone(updated.clarification_kind)
+        self.assertEqual(updated.workflow_phase.value, "revising")
 
     def test_exhausted_review_approve_queues_unchanged_plan_for_implementation(
         self,
