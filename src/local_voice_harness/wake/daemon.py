@@ -876,7 +876,7 @@ class WakeConversationDaemon:
             self.playback_queue.enqueue(
                 PlaybackRequest(
                     text=spoken_text,
-                    apply_speed=not first_streamed_request,
+                    skip_first_speed=first_streamed_request,
                     preflight_speed=first_streamed_request,
                 )
             )

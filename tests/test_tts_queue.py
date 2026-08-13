@@ -41,7 +41,7 @@ class PlaybackQueueTests(unittest.TestCase):
             [
                 mock.call(
                     "first",
-                    apply_speed=True,
+                    skip_first_speed=False,
                     preflight_speed=False,
                 )
             ],
@@ -125,7 +125,7 @@ class PlaybackQueueTests(unittest.TestCase):
 
         prefetch.assert_called_once_with(
             "arrived during playback",
-            apply_speed=True,
+            skip_first_speed=False,
             preflight_speed=False,
         )
         self.assertIs(queue._items[0][1], prefetch.return_value)

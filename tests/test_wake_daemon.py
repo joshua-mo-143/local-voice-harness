@@ -674,9 +674,9 @@ class ProcessUtteranceTests(unittest.TestCase):
             [request.text for request in played_requests],
             ["First sentence.", "Second sentence."],
         )
-        self.assertFalse(played_requests[0].apply_speed)
+        self.assertTrue(played_requests[0].skip_first_speed)
         self.assertTrue(played_requests[0].preflight_speed)
-        self.assertTrue(played_requests[1].apply_speed)
+        self.assertFalse(played_requests[1].skip_first_speed)
         self.assertFalse(played_requests[1].preflight_speed)
         self.assertEqual(
             daemon.history,

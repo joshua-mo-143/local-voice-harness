@@ -42,7 +42,7 @@ class PrefetchedUtterance:
 @dataclass
 class PlaybackRequest:
     text: str
-    apply_speed: bool = True
+    skip_first_speed: bool = False
     preflight_speed: bool = False
     job_id: str | None = None
     delivery_token: str | None = None
@@ -57,12 +57,12 @@ class PrefetchHandle:
         text: str,
         settings: AudioSettings | None = None,
         *,
-        apply_speed: bool = True,
+        skip_first_speed: bool = False,
         preflight_speed: bool = False,
     ) -> None:
         self.text = text
         self.audio = settings or default_user_config().audio
-        self.apply_speed = apply_speed
+        self.skip_first_speed = skip_first_speed
         self.preflight_speed = preflight_speed
         self.request_id = uuid.uuid4().hex
         self._event = threading.Event()
@@ -107,7 +107,7 @@ class PrefetchHandle:
                 clear_socket=self._clear_socket,
                 settings=self.audio,
                 on_chunk=self._note_chunk,
-                apply_speed=self.apply_speed,
+                skip_first_speed=self.skip_first_speed,
                 preflight_speed=self.preflight_speed,
             )
         except BaseException as exc:
@@ -292,7 +292,7 @@ def _prefetch_utterance(
     clear_socket: Callable[[socket.socket], None],
     settings: AudioSettings | None = None,
     on_chunk: Callable[[Path, str, int], None] | None = None,
-    apply_speed: bool = True,
+    skip_first_speed: bool = False,
     preflight_speed: bool = False,
 ) -> PrefetchedUtterance:
     from ..config import TTS_SOCKET
@@ -314,7 +314,7 @@ def _prefetch_utterance(
             "voice": (settings or default_user_config().audio).voice,
             "stream": True,
             "request_id": request_id,
-            "apply_speed": apply_speed,
+            "skip_first_speed": skip_first_speed,
             "preflight_speed": preflight_speed,
         }
         submit_request(stream_socket, json.dumps(request).encode() + b"\n")
@@ -470,13 +470,13 @@ class PlaybackQueue:
                 PrefetchHandle(
                     request.text,
                     self._audio,
-                    apply_speed=request.apply_speed,
+                    skip_first_speed=request.skip_first_speed,
                     preflight_speed=request.preflight_speed,
                 )
                 if prefetch and self._audio is not None
                 else PrefetchHandle(
                     request.text,
-                    apply_speed=request.apply_speed,
+                    skip_first_speed=request.skip_first_speed,
                     preflight_speed=request.preflight_speed,
                 )
                 if prefetch
@@ -497,13 +497,13 @@ class PlaybackQueue:
                         PrefetchHandle(
                             request.text,
                             self._audio,
-                            apply_speed=request.apply_speed,
+                            skip_first_speed=request.skip_first_speed,
                             preflight_speed=request.preflight_speed,
                         )
                         if self._audio is not None
                         else PrefetchHandle(
                             request.text,
-                            apply_speed=request.apply_speed,
+                            skip_first_speed=request.skip_first_speed,
                             preflight_speed=request.preflight_speed,
                         )
                     )
@@ -563,13 +563,13 @@ class PlaybackQueue:
                                 PrefetchHandle(
                                     request.text,
                                     self._audio,
-                                    apply_speed=request.apply_speed,
+                                    skip_first_speed=request.skip_first_speed,
                                     preflight_speed=request.preflight_speed,
                                 )
                                 if self._audio is not None
                                 else PrefetchHandle(
                                     request.text,
-                                    apply_speed=request.apply_speed,
+                                    skip_first_speed=request.skip_first_speed,
                                     preflight_speed=request.preflight_speed,
                                 )
                             )

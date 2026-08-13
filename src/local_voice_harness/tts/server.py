@@ -387,7 +387,7 @@ def _stream_response(
     if not REQUEST_ID.fullmatch(request_id):
         raise ValueError("request_id must contain 1-64 letters, numbers, '_' or '-'")
     chunks = split_text(text)
-    apply_speed = _request_bool(request, "apply_speed", default=True)
+    skip_first_speed = _request_bool(request, "skip_first_speed", default=False)
     preflight_speed = _request_bool(request, "preflight_speed", default=False)
     settings = _settings()
     if (
@@ -423,7 +423,7 @@ def _stream_response(
                     chunk,
                     voice,
                     output,
-                    apply_speed=apply_speed,
+                    apply_speed=not (skip_first_speed and index == 0),
                 )
                 generation_seconds += elapsed
                 if cancelled.is_set():

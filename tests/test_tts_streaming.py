@@ -340,9 +340,9 @@ class ServerStreamingTests(unittest.TestCase):
             server._stream_response(
                 handler,
                 {
-                    "text": "First sentence.",
+                    "text": "First clause, " + "continued words " * 9 + "end.",
                     "request_id": "speed-1",
-                    "apply_speed": False,
+                    "skip_first_speed": True,
                     "preflight_speed": True,
                 },
             )
@@ -355,11 +355,12 @@ class ServerStreamingTests(unittest.TestCase):
             )
 
         chunk_events = [event for event in events if event.get("event") == "chunk"]
-        self.assertEqual(len(chunk_events), 2)
-        self.assertEqual(run.call_count, 1)
-        self.assertEqual(ffmpeg_when, [("start", "chunk", "done")])
+        self.assertEqual(len(chunk_events), 3)
+        self.assertEqual(run.call_count, 2)
+        self.assertEqual(ffmpeg_when[0], ("start", "chunk"))
         self.assertEqual(chunk_events[0]["audio_seconds"], 0.1)
         self.assertEqual(chunk_events[1]["audio_seconds"], 0.08)
+        self.assertEqual(chunk_events[2]["audio_seconds"], 0.08)
 
     def test_first_native_chunk_preflights_required_ffmpeg(self) -> None:
         settings = replace(
@@ -383,7 +384,7 @@ class ServerStreamingTests(unittest.TestCase):
                 {
                     "text": "First sentence.",
                     "request_id": "speed-preflight",
-                    "apply_speed": False,
+                    "skip_first_speed": True,
                     "preflight_speed": True,
                 },
             )
