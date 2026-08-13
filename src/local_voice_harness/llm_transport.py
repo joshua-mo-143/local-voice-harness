@@ -59,39 +59,100 @@ def response_message(result: object) -> dict[str, object]:
     return message
 
 
-class _TextChunker:
-    def __init__(self, callback: Callable[[str], None] | None) -> None:
-        self.callback = callback
-        self.buffer = ""
+TextChunkCallback = Callable[[str], bool | None]
+CancellationCheck = Callable[[], bool]
 
-    def feed(self, text: str) -> None:
+
+def _chunk_callback(
+    callback: TextChunkCallback | None,
+    content_filter: Callable[[str], str] | None,
+) -> TextChunkCallback | None:
+    if callback is None:
+        return None
+
+    def emit(text: str) -> bool | None:
+        spoken = content_filter(text) if content_filter is not None else text
+        if spoken:
+            return callback(spoken)
+        return None
+
+    return emit
+
+
+class _TextChunker:
+    def __init__(self, callback: TextChunkCallback | None, *, emit_early: bool) -> None:
+        self.callback = callback
+        self.emit_early = emit_early
+        self.buffer = ""
+        self._held = ""
+
+    def _emit(self, text: str) -> bool:
         if self.callback is None:
-            return
+            return False
+        if self.callback(text) is False:
+            self.discard()
+            return False
+        return True
+
+    def feed(self, text: str) -> bool:
+        if self.callback is None:
+            return True
         self.buffer += text
+        if not self.emit_early:
+            return True
         while match := _SENTENCE.match(self.buffer):
             chunk = match.group(1).strip()
             self.buffer = self.buffer[match.end() :]
-            if chunk:
-                self.callback(chunk)
+            if not chunk:
+                continue
+            if self.emit_early and self._held and not self._emit(self._held):
+                return False
+            self._held = chunk
+        if self.emit_early and self._held and self.buffer:
+            if not self._emit(self._held):
+                return False
+            self._held = ""
+        return True
 
-    def flush(self) -> None:
+    def flush(self) -> bool:
+        if self.callback is None:
+            self.buffer = ""
+            self._held = ""
+            return False
+        if self._held:
+            if not self._emit(self._held):
+                return False
+            self._held = ""
         chunk = self.buffer.strip()
         self.buffer = ""
-        if self.callback is not None and chunk:
-            self.callback(chunk)
+        return not chunk or self._emit(chunk)
+
+    def discard(self) -> None:
+        self.callback = None
+        self.buffer = ""
+        self._held = ""
 
 
 def streamed_message(
     response: Iterable[bytes | str],
-    on_text_chunk: Callable[[str], None] | None,
+    on_text_chunk: TextChunkCallback | None,
     *,
     content_filter: Callable[[str], str] | None = None,
+    emit_text_early: bool = False,
+    should_cancel: CancellationCheck | None = None,
 ) -> dict[str, object]:
     content: list[str] = []
     tool_calls: dict[int, dict[str, object]] = {}
-    chunker = _TextChunker(on_text_chunk)
+    chunker = _TextChunker(
+        _chunk_callback(on_text_chunk, content_filter),
+        emit_early=emit_text_early,
+    )
     received_event = False
+    cancelled = False
     for raw_line in response:
+        if should_cancel is not None and should_cancel():
+            cancelled = True
+            break
         line = (
             raw_line.decode("utf-8") if isinstance(raw_line, bytes) else str(raw_line)
         ).strip()
@@ -116,9 +177,6 @@ def streamed_message(
         if not isinstance(delta, dict):
             continue
         received_event = True
-        delta_content = delta.get("content")
-        if delta_content is not None:
-            content.append(str(delta_content))
         delta_tools = delta.get("tool_calls")
         if delta_tools is not None:
             if not isinstance(delta_tools, list):
@@ -157,14 +215,21 @@ def streamed_message(
                             function[key] = str(function[key]) + str(
                                 function_delta[key]
                             )
+            chunker.discard()
+        delta_content = delta.get("content")
+        if delta_content is not None:
+            content.append(str(delta_content))
+            if not tool_calls and not chunker.feed(str(delta_content)):
+                cancelled = True
+                break
     if not received_event:
         raise HarnessError("LLM returned an empty streaming response")
     answer = "".join(content)
     if answer and not tool_calls:
         if content_filter is not None:
             answer = content_filter(answer)
-        chunker.feed(answer)
-        chunker.flush()
+        if not cancelled:
+            chunker.flush()
     message: dict[str, object] = {"content": answer or None}
     if tool_calls:
         message["tool_calls"] = [tool_calls[index] for index in sorted(tool_calls)]
@@ -237,7 +302,8 @@ class LlmTransport:
         self,
         request: ChatCompletionRequest,
         *,
-        on_text_chunk: Callable[[str], None] | None = None,
+        on_text_chunk: TextChunkCallback | None = None,
+        should_cancel: CancellationCheck | None = None,
         content_filter: Callable[[str], str] | None = None,
         telemetry_round: int | None = None,
     ) -> dict[str, object]:
@@ -266,6 +332,8 @@ class LlmTransport:
                         response,
                         on_text_chunk,
                         content_filter=content_filter,
+                        emit_text_early=request.tools is None,
+                        should_cancel=should_cancel,
                     )
                     if stream
                     else response_message(json.load(response))

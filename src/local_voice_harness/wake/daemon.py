@@ -854,7 +854,7 @@ class WakeConversationDaemon:
     def play_streamed_response(
         self,
         generate: Callable[
-            [Callable[[str], None]],
+            [Callable[[str], bool], Callable[[], bool]],
             tuple[str, str | None],
         ],
     ) -> tuple[str, str | None, dict[str, object], BargeIn | None]:
@@ -869,17 +869,18 @@ class WakeConversationDaemon:
             getattr(self, "speech_renderer", SpeechRenderer())
         )
 
-        def on_text_chunk(text: str) -> None:
+        def on_text_chunk(text: str) -> bool:
             nonlocal stopped
             if not text.strip():
-                return
+                return True
             with condition:
                 if stopped:
-                    return
+                    return False
                 chunks.append(text.strip())
                 for spoken_text in stream_renderer.feed(text):
                     self.playback_queue.enqueue(PlaybackRequest(text=spoken_text))
                 condition.notify()
+                return True
 
         def flush_text_chunks() -> None:
             with condition:
@@ -888,6 +889,10 @@ class WakeConversationDaemon:
                 for spoken_text in stream_renderer.flush():
                     self.playback_queue.enqueue(PlaybackRequest(text=spoken_text))
                 condition.notify()
+
+        def should_cancel_generation() -> bool:
+            with condition:
+                return stopped
 
         def player() -> None:
             nonlocal stopped, interruption
@@ -923,7 +928,10 @@ class WakeConversationDaemon:
         )
         playback_thread.start()
         try:
-            response, next_cursor_session = generate(on_text_chunk)
+            response, next_cursor_session = generate(
+                on_text_chunk,
+                should_cancel_generation,
+            )
             flush_text_chunks()
         finally:
             with condition:
@@ -1969,7 +1977,7 @@ class WakeConversationDaemon:
                         playback,
                         interruption,
                     ) = self.play_streamed_response(
-                        lambda on_text_chunk: qwen_turn(
+                        lambda on_text_chunk, should_cancel: qwen_turn(
                             context.text,
                             self.history,
                             self.cursor_session,
@@ -1977,6 +1985,7 @@ class WakeConversationDaemon:
                             trusted_utterance=text,
                             delivery_claims=delivery_claims,
                             on_text_chunk=on_text_chunk,
+                            should_cancel=should_cancel,
                             allow_tools=False,
                             settings=self.providers,
                         )

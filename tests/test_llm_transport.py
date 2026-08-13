@@ -4,6 +4,7 @@ import io
 import json
 import unittest
 import urllib.error
+from collections.abc import Iterator
 from dataclasses import replace
 from email.message import Message
 from unittest import mock
@@ -225,6 +226,129 @@ class LlmTransportContractTests(unittest.TestCase):
         empty = io.BytesIO(b"data: [DONE]\n\n")
         with self.assertRaisesRegex(HarnessError, "empty streaming response"):
             streamed_message(empty, None)
+
+    def test_first_sentence_emits_before_stream_is_exhausted(self) -> None:
+        events = [
+            'data: {"choices":[{"delta":{"content":"First sentence. "}}]}\n',
+            'data: {"choices":[{"delta":{"content":"Second sentence. "}}]}\n',
+            'data: {"choices":[{"delta":{"content":"Trailing fragment"}}]}\n',
+            "data: [DONE]\n",
+        ]
+        remaining_at_first: list[int] = []
+        chunks: list[str] = []
+
+        def on_chunk(text: str) -> None:
+            chunks.append(text)
+            if len(chunks) == 1:
+                remaining_at_first.append(len(events))
+
+        def stream() -> Iterator[str]:
+            while events:
+                yield events.pop(0)
+
+        message = streamed_message(stream(), on_chunk, emit_text_early=True)
+
+        self.assertEqual(
+            chunks,
+            ["First sentence.", "Second sentence.", "Trailing fragment"],
+        )
+        self.assertGreater(remaining_at_first[0], 0)
+        self.assertEqual(
+            message["content"],
+            "First sentence. Second sentence. Trailing fragment",
+        )
+
+    def test_callback_can_stop_consuming_stream_after_barge_in(self) -> None:
+        events = [
+            'data: {"choices":[{"delta":{"content":"First sentence. "}}]}\n',
+            'data: {"choices":[{"delta":{"content":"Second sentence. "}}]}\n',
+            'data: {"choices":[{"delta":{"content":"Never consumed."}}]}\n',
+        ]
+        chunks: list[str] = []
+
+        def on_chunk(text: str) -> bool:
+            chunks.append(text)
+            return False
+
+        def stream() -> Iterator[str]:
+            while events:
+                yield events.pop(0)
+
+        message = streamed_message(stream(), on_chunk, emit_text_early=True)
+
+        self.assertEqual(chunks, ["First sentence."])
+        self.assertEqual(message["content"], "First sentence. Second sentence. ")
+        self.assertEqual(len(events), 1)
+
+    def test_cancellation_is_checked_for_every_sse_event(self) -> None:
+        events = [
+            'data: {"choices":[{"delta":{"content":"A long"}}]}\n',
+            'data: {"choices":[{"delta":{"content":" unfinished sentence"}}]}\n',
+            'data: {"choices":[{"delta":{"content":" keeps going"}}]}\n',
+        ]
+        checks = iter((False, True))
+
+        def stream() -> Iterator[str]:
+            while events:
+                yield events.pop(0)
+
+        message = streamed_message(
+            stream(),
+            mock.Mock(side_effect=AssertionError("no sentence should emit")),
+            emit_text_early=True,
+            should_cancel=lambda: next(checks),
+        )
+
+        self.assertEqual(message["content"], "A long")
+        self.assertEqual(len(events), 1)
+
+    def test_tool_capable_stream_defers_speech_until_completion(self) -> None:
+        events = [
+            'data: {"choices":[{"delta":{"content":"First sentence. "}}]}\n',
+            'data: {"choices":[{"delta":{"content":"Second sentence. "}}]}\n',
+            "data: [DONE]\n",
+        ]
+        chunks: list[str] = []
+        remaining_at_callback: list[int] = []
+
+        def on_chunk(text: str) -> None:
+            chunks.append(text)
+            remaining_at_callback.append(len(events))
+
+        def stream() -> Iterator[str]:
+            while events:
+                yield events.pop(0)
+
+        message = streamed_message(stream(), on_chunk)
+
+        self.assertEqual(chunks, ["First sentence. Second sentence."])
+        self.assertEqual(remaining_at_callback, [0])
+        self.assertEqual(message["content"], "First sentence. Second sentence. ")
+
+    def test_tool_call_streams_do_not_emit_held_sentences(self) -> None:
+        chunks: list[str] = []
+        message = streamed_message(
+            _stream_response(
+                {"content": "Speaking already. "},
+                {
+                    "tool_calls": [
+                        {
+                            "index": 0,
+                            "id": "call-1",
+                            "function": {"name": "cursor", "arguments": "{}"},
+                        }
+                    ]
+                },
+            ),
+            chunks.append,
+        )
+
+        self.assertEqual(message["content"], "Speaking already. ")
+        self.assertEqual(chunks, [])
+        tool_calls = message["tool_calls"]
+        self.assertIsInstance(tool_calls, list)
+        assert isinstance(tool_calls, list)
+        self.assertEqual(len(tool_calls), 1)
 
     def test_streamed_tool_call_fragments_are_aggregated(self) -> None:
         transport = self._transport(provider="venice", api_key="secret")
