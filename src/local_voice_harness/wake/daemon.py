@@ -109,6 +109,7 @@ from ..intent import (
     IntentRoute,
     decide_fork_intent,
     is_grouped_repository_mapping,
+    needs_intent_router,
     route_intent,
 )
 from ..linear_ticket_creation import team_from_utterance
@@ -1545,6 +1546,13 @@ class WakeConversationDaemon:
                 or activation_response is not None
             ):
                 route = IntentRoute(Intent.UNCERTAIN, "low")
+            elif (
+                self.providers.llm_provider == "venice"
+                and pending is None
+                and active_completed is None
+                and not needs_intent_router(text)
+            ):
+                route = IntentRoute(Intent.CONVERSATION, "high")
             else:
                 route = route_intent(
                     text,

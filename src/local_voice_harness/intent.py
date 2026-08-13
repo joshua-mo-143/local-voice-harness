@@ -204,6 +204,30 @@ class IntentRoute:
 
 
 FALLBACK_ROUTE = IntentRoute(Intent.UNCERTAIN, "low")
+ROUTER_REQUIRED_PATTERN = re.compile(
+    r"\b(?:"
+    r"cursor|curser|cursa|agent|"
+    r"github|linear|zendesk|"
+    r"issue|ticket|jobs?|"
+    r"pull\s+request|pr|"
+    r"cancel|dismiss|repeat|status|submit|"
+    r"config(?:uration)?|settings?|voice|threshold|barge-?in|"
+    r"implement|refactor|commit|merge|deploy|"
+    r"work\s+on|handle\s+this|"
+    r"fix|create|enable|disable|"
+    r"inspect|repositor(?:y|ies)|codebase|checkout|"
+    r"harness|healthy|"
+    r"self[\s-]health"
+    r")\b",
+    re.IGNORECASE,
+)
+
+
+def needs_intent_router(text: str) -> bool:
+    """Return whether classification must run before a mutating path can proceed."""
+    return ROUTER_REQUIRED_PATTERN.search(text) is not None
+
+
 FORK_WORD = re.compile(r"\bfork(?:ed|ing|s)?\b", re.IGNORECASE)
 FORK_NEGATION = re.compile(
     r"\b(?:do\s+not|don['’]?t|never|no|not|without|avoid|stop)\b",
