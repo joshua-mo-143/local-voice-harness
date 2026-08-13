@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 
 from .agents.delivery import AgentDeliveryClaims as DeliveryClaims
 from .agents.service import AgentTurnRequest as CursorTurnRequest
@@ -14,7 +14,7 @@ from .diagnostic_safety import (
     redact_fields,
 )
 from .errors import HarnessError
-from .llm_transport import ChatCompletionRequest, LlmTransport
+from .llm_transport import ChatCompletionRequest, LlmTransport, TextChunkCallback
 from .notifications import notify
 from .questions import AnswerProvenance
 from .responses import as_assistant_response
@@ -180,7 +180,7 @@ def qwen_turn(
     github_pull_request: int | None = None,
     trusted_utterance: str | None = None,
     delivery_claims: DeliveryClaims | None = None,
-    on_text_chunk: Callable[[str], None] | None = None,
+    on_text_chunk: TextChunkCallback | None = None,
     allow_tools: bool = False,
     settings: BackendSettings | None = None,
 ) -> tuple[str, str | None]:

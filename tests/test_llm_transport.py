@@ -246,7 +246,7 @@ class LlmTransportContractTests(unittest.TestCase):
             while events:
                 yield events.pop(0)
 
-        message = streamed_message(stream(), on_chunk)
+        message = streamed_message(stream(), on_chunk, emit_text_early=True)
 
         self.assertEqual(
             chunks,
@@ -257,6 +257,51 @@ class LlmTransportContractTests(unittest.TestCase):
             message["content"],
             "First sentence. Second sentence. Trailing fragment",
         )
+
+    def test_callback_can_stop_consuming_stream_after_barge_in(self) -> None:
+        events = [
+            'data: {"choices":[{"delta":{"content":"First sentence. "}}]}\n',
+            'data: {"choices":[{"delta":{"content":"Second sentence. "}}]}\n',
+            'data: {"choices":[{"delta":{"content":"Never consumed."}}]}\n',
+        ]
+        chunks: list[str] = []
+
+        def on_chunk(text: str) -> bool:
+            chunks.append(text)
+            return False
+
+        def stream() -> Iterator[str]:
+            while events:
+                yield events.pop(0)
+
+        message = streamed_message(stream(), on_chunk, emit_text_early=True)
+
+        self.assertEqual(chunks, ["First sentence."])
+        self.assertEqual(message["content"], "First sentence. Second sentence. ")
+        self.assertEqual(len(events), 1)
+
+    def test_tool_capable_stream_defers_speech_until_completion(self) -> None:
+        events = [
+            'data: {"choices":[{"delta":{"content":"First sentence. "}}]}\n',
+            'data: {"choices":[{"delta":{"content":"Second sentence. "}}]}\n',
+            "data: [DONE]\n",
+        ]
+        chunks: list[str] = []
+        remaining_at_callback: list[int] = []
+
+        def on_chunk(text: str) -> None:
+            chunks.append(text)
+            remaining_at_callback.append(len(events))
+
+        def stream() -> Iterator[str]:
+            while events:
+                yield events.pop(0)
+
+        message = streamed_message(stream(), on_chunk)
+
+        self.assertEqual(chunks, ["First sentence. Second sentence."])
+        self.assertEqual(remaining_at_callback, [0])
+        self.assertEqual(message["content"], "First sentence. Second sentence. ")
 
     def test_tool_call_streams_do_not_emit_held_sentences(self) -> None:
         chunks: list[str] = []

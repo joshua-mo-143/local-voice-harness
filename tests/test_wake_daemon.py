@@ -690,7 +690,7 @@ class ProcessUtteranceTests(unittest.TestCase):
         )
         played_requests: list[str] = []
 
-        def generate(callback: Callable[[str], None]) -> tuple[str, None]:
+        def generate(callback: Callable[[str], bool]) -> tuple[str, None]:
             callback("PR #")
             callback("42 changed Local ")
             callback("Voice Harness.")

@@ -854,7 +854,7 @@ class WakeConversationDaemon:
     def play_streamed_response(
         self,
         generate: Callable[
-            [Callable[[str], None]],
+            [Callable[[str], bool]],
             tuple[str, str | None],
         ],
     ) -> tuple[str, str | None, dict[str, object], BargeIn | None]:
@@ -869,17 +869,18 @@ class WakeConversationDaemon:
             getattr(self, "speech_renderer", SpeechRenderer())
         )
 
-        def on_text_chunk(text: str) -> None:
+        def on_text_chunk(text: str) -> bool:
             nonlocal stopped
             if not text.strip():
-                return
+                return True
             with condition:
                 if stopped:
-                    return
+                    return False
                 chunks.append(text.strip())
                 for spoken_text in stream_renderer.feed(text):
                     self.playback_queue.enqueue(PlaybackRequest(text=spoken_text))
                 condition.notify()
+                return True
 
         def flush_text_chunks() -> None:
             with condition:
