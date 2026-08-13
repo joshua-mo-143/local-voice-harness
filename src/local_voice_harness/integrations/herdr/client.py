@@ -3,6 +3,12 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+from ...agents.harness import (
+    HarnessCapability,
+    HarnessSession,
+    SessionReconciliation,
+    SessionRequest,
+)
 from .repository import HerdrRepository
 from .session import HerdrSession
 from .transport import HerdrTransport
@@ -53,6 +59,7 @@ class HerdrClient:
         self.agent_inactivity_timeout = agent_inactivity_timeout
         self.agent_max_runtime = agent_max_runtime
         self.session = HerdrSession(self)
+        self.harness = self.session
         self.repository = HerdrRepository(self, root)
         self.workspace = HerdrWorkspace(
             self,
@@ -83,6 +90,26 @@ class HerdrClient:
 
     def ensure_server(self, timeout: float | None = None) -> None:
         self.transport.ensure_server(timeout=timeout)
+
+    @property
+    def capabilities(self) -> frozenset[HarnessCapability]:
+        return self.harness.capabilities
+
+    def create_session(
+        self,
+        request: SessionRequest,
+        *,
+        checkpoint: Checkpoint | None = None,
+    ) -> HarnessSession:
+        return self.harness.create_session(request, checkpoint=checkpoint)
+
+    def reconcile_session(
+        self,
+        target: str,
+        *,
+        expected_session_id: str | None = None,
+    ) -> SessionReconciliation:
+        return self.harness.reconcile(target, expected_session_id=expected_session_id)
 
     def list_agents(self) -> list[dict[str, Any]]:
         return list(self.run_json("agent", "list").get("agents") or [])
@@ -297,6 +324,7 @@ class HerdrClient:
         active_marker: str | None = None,
         allow_interactive_plan_boundary: bool = False,
         allow_enter_fallback: bool = True,
+        clarification_reply: bool = False,
     ) -> PromptOutcome:
         return self.session.prompt_and_wait(
             target,
@@ -314,6 +342,7 @@ class HerdrClient:
             active_marker=active_marker,
             allow_interactive_plan_boundary=allow_interactive_plan_boundary,
             allow_enter_fallback=allow_enter_fallback,
+            clarification_reply=clarification_reply,
         )
 
     def wait_for_stable_completion(

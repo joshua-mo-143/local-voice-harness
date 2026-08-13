@@ -202,6 +202,12 @@ an invalid or partially prepared checkout is marked quarantined and is never dis
 
 ### Durable question broker
 
+Coding-agent communication crosses the
+[provider-neutral harness contract](agent-harness-contract.md). Cursor/Herdr
+implements its session, task, event, clarification, cancellation, capability, and
+restart-reconciliation operations; repository, workspace, pane, and worktree policy
+remains outside that transport boundary.
+
 Agent questions cross a provider-neutral broker contract before entering the Cursor
 job flow. A question records its type (free text or multiple choice), choices,
 decision sensitivity, provider, opaque job identity, and originating turn token.

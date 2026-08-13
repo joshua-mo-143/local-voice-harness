@@ -8,6 +8,7 @@ from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import cast
 
+from ..agents.harness import ReconciliationState
 from ..diagnostic_safety import redact_diagnostic
 from ..errors import HarnessError
 from ..integrations.github import (
@@ -20,7 +21,6 @@ from ..integrations.github import (
 from ..integrations.herdr import (
     HerdrClient,
     HerdrError,
-    agent_session_identity,
 )
 from ..integrations.linear import LinearError, LinearIntegration
 from ..integrations.registry import build_integration_registry, issue_provider
@@ -607,9 +607,22 @@ def reconcile_prompt_and_pane_operations(
         try:
             client = herdr_factory()
             client.ensure_server()
-            agent = client.get_agent(target)
-            sequence = int(agent.get("state_change_seq") or 0)
-            session = agent_session_identity(agent.get("agent_session"))
+            observation = client.reconcile_session(target)
+            if observation.state == ReconciliationState.MISSING or (
+                observation.state == ReconciliationState.UNKNOWN
+                and observation.session is None
+            ):
+                return
+            sequence = (
+                observation.session.state_sequence
+                if observation.session is not None
+                else 0
+            )
+            session = (
+                observation.session.session_id
+                if observation.session is not None
+                else None
+            )
         except (HerdrError, TypeError, ValueError):
             # A failed observation carries no evidence. Keep the submit fence.
             return

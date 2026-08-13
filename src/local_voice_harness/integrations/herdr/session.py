@@ -3,12 +3,28 @@ from __future__ import annotations
 import hashlib
 import subprocess
 import time
+from collections.abc import Iterator
 from typing import Any, Protocol
 
+from ...agents.harness import (
+    AgentHarness,
+    HarnessCapability,
+    HarnessEvent,
+    HarnessEventKind,
+    HarnessSession,
+    HarnessTask,
+    ReconciliationState,
+    SessionReconciliation,
+    SessionRequest,
+    TaskSubmission,
+    require_capabilities,
+)
 from .types import (
     AGENT_COMPLETION_POLL_SECONDS,
     AGENT_COMPLETION_QUIET_SECONDS,
     AGENT_PROMPT_WAIT_SECONDS,
+    AGENT_START_READY_POLL_SECONDS,
+    AGENT_START_READY_TIMEOUT_SECONDS,
     OBSERVABLE_AGENT_STATES,
     SETTLED,
     BeforePromptSubmit,
@@ -34,13 +50,108 @@ class HerdrSessionClient(Protocol):
     def get_agent(self, target: str) -> dict[str, Any]: ...
 
 
-class HerdrSession:
+class HerdrSession(AgentHarness):
     """Agent prompt, completion, and cancellation handling."""
 
     def __init__(self, client: HerdrSessionClient) -> None:
         self._client = client
 
-    def prompt_and_wait(
+    @property
+    def provider(self) -> str:
+        return "cursor/herdr"
+
+    @property
+    def capabilities(self) -> frozenset[HarnessCapability]:
+        return frozenset(HarnessCapability)
+
+    @staticmethod
+    def _session(agent: dict[str, Any], target: str) -> HarnessSession | None:
+        identity = agent_session_identity(agent.get("agent_session"))
+        if identity is None:
+            return None
+        sequence = agent.get("state_change_seq")
+        return HarnessSession(
+            provider="cursor/herdr",
+            session_id=identity,
+            target=target,
+            state_sequence=(
+                sequence
+                if isinstance(sequence, int) and not isinstance(sequence, bool)
+                else 0
+            ),
+            metadata={
+                key: str(agent.get(key) or "")
+                for key in ("name", "pane_id", "workspace_id", "cwd")
+            },
+        )
+
+    def create_session(
+        self,
+        request: SessionRequest,
+        *,
+        checkpoint: Checkpoint | None = None,
+    ) -> HarnessSession:
+        require_capabilities(
+            self.provider, self.capabilities, request.required_capabilities
+        )
+        if request.provider != self.provider:
+            raise HerdrError(
+                f"{self.provider} cannot create a {request.provider!r} session",
+                code="unsupported_provider",
+            )
+        if request.mode not in {None, "plan", "ask"}:
+            raise HerdrError("invalid Cursor mode", code="invalid_session_request")
+        pane = request.launch_context.get("pane_id", "")
+        workspace = request.launch_context.get("workspace_id", "")
+        if not request.name or not pane or not workspace:
+            raise HerdrError(
+                "Cursor/Herdr session creation requires name, pane_id, and workspace_id",
+                code="invalid_session_request",
+            )
+        if checkpoint is not None:
+            checkpoint()
+        agent_args = ["--trust", "--approve-mcps"]
+        if request.mode is not None:
+            agent_args.extend(["--mode", request.mode])
+        result = self._client.run_json(
+            "agent",
+            "start",
+            request.name,
+            "--kind",
+            "cursor",
+            "--pane",
+            pane,
+            "--timeout",
+            "60000",
+            "--",
+            *agent_args,
+            timeout=70,
+        )
+        agent = dict(result.get("agent") or {})
+        target = str(agent.get("name") or agent.get("pane_id") or request.name)
+        deadline = time.monotonic() + AGENT_START_READY_TIMEOUT_SECONDS
+        while (
+            agent.get("interactive_ready") is not True
+            or self._session(agent, target) is None
+        ):
+            if time.monotonic() >= deadline:
+                raise HerdrError(
+                    f"Herdr agent {target} did not expose a ready Cursor session "
+                    "after startup",
+                    code="operation_ambiguous",
+                )
+            if checkpoint is not None:
+                checkpoint()
+            time.sleep(AGENT_START_READY_POLL_SECONDS)
+            try:
+                agent = self._client.get_agent(target)
+            except HerdrError:
+                agent = {}
+        session = self._session(agent, target)
+        assert session is not None
+        return session
+
+    def _submit_task(
         self,
         target: str,
         text: str,
@@ -58,7 +169,7 @@ class HerdrSession:
         active_marker: str | None = None,
         allow_interactive_plan_boundary: bool = False,
         allow_enter_fallback: bool = True,
-    ) -> PromptOutcome:
+    ) -> TaskSubmission:
         started_at = time.monotonic()
         if checkpoint is not None:
             checkpoint()
@@ -255,14 +366,201 @@ class HerdrSession:
                 f"Herdr did not accept the prompt for agent {target}",
                 code="agent_prompt_stalled",
             )
+        session = self._session(before, target)
+        if session is None:
+            raise HerdrError(
+                f"Herdr agent {target} has no durable Cursor session",
+                code="agent_session_missing",
+            )
+        return TaskSubmission(
+            session=session,
+            correlation_id=token,
+            baseline_sequence=observed_baseline,
+            started_at=started_at,
+        )
+
+    def submit_task(
+        self,
+        session: HarnessSession,
+        task: HarnessTask,
+        *,
+        checkpoint: Checkpoint | None = None,
+        before_submit: BeforePromptSubmit | None = None,
+        accepted: PromptAccepted | None = None,
+        before_agent: PromptBoundary | None = None,
+        after_submit: PromptBoundary | None = None,
+        active_marker: str | None = None,
+        allow_interactive_plan_boundary: bool = False,
+        allow_enter_fallback: bool = True,
+    ) -> TaskSubmission:
+        if session.provider != self.provider or task.expected_session_id != (
+            session.session_id
+        ):
+            raise HerdrError(
+                "task submission does not match the durable Cursor/Herdr session",
+                code="agent_session_changed",
+            )
+        return self._submit_task(
+            session.target,
+            task.text,
+            token=task.correlation_id,
+            checkpoint=checkpoint,
+            baseline_sequence=task.baseline_sequence,
+            expected_agent_session=task.expected_session_id,
+            before_submit=before_submit,
+            accepted=accepted,
+            before_agent=before_agent,
+            after_submit=after_submit,
+            active_marker=active_marker,
+            allow_interactive_plan_boundary=allow_interactive_plan_boundary,
+            allow_enter_fallback=allow_enter_fallback,
+        )
+
+    def reply_to_clarification(
+        self,
+        session: HarnessSession,
+        task: HarnessTask,
+        *,
+        checkpoint: Checkpoint | None = None,
+        before_submit: BeforePromptSubmit | None = None,
+        accepted: PromptAccepted | None = None,
+        before_agent: PromptBoundary | None = None,
+        after_submit: PromptBoundary | None = None,
+        active_marker: str | None = None,
+        allow_interactive_plan_boundary: bool = False,
+        allow_enter_fallback: bool = True,
+    ) -> TaskSubmission:
+        require_capabilities(
+            self.provider,
+            self.capabilities,
+            frozenset({HarnessCapability.CLARIFICATION_REPLIES}),
+        )
+        return self.submit_task(
+            session,
+            task,
+            checkpoint=checkpoint,
+            before_submit=before_submit,
+            accepted=accepted,
+            before_agent=before_agent,
+            after_submit=after_submit,
+            active_marker=active_marker,
+            allow_interactive_plan_boundary=allow_interactive_plan_boundary,
+            allow_enter_fallback=allow_enter_fallback,
+        )
+
+    def _wait_for_submission(
+        self,
+        submission: TaskSubmission,
+        *,
+        inactivity_timeout: float,
+        max_runtime: float,
+        checkpoint: Checkpoint | None = None,
+        active_marker: str | None = None,
+        allow_interactive_plan_boundary: bool = False,
+    ) -> PromptOutcome:
         return self.wait_for_stable_completion(
+            submission.session.target,
+            token=submission.correlation_id,
+            inactivity_timeout=inactivity_timeout,
+            max_runtime=max_runtime,
+            started_at=submission.started_at,
+            checkpoint=checkpoint,
+            expected_agent_session=submission.session.session_id,
+            active_marker=active_marker,
+            allow_interactive_plan_boundary=allow_interactive_plan_boundary,
+        )
+
+    def stream_events(
+        self,
+        submission: TaskSubmission,
+        *,
+        checkpoint: Checkpoint | None = None,
+    ) -> Iterator[HarnessEvent]:
+        outcome = self._wait_for_submission(
+            submission,
+            inactivity_timeout=15 * 60,
+            max_runtime=60 * 60,
+            checkpoint=checkpoint,
+        )
+        session = HarnessSession(
+            provider=submission.session.provider,
+            session_id=outcome.agent_session or submission.session.session_id,
+            target=submission.session.target,
+            state_sequence=(
+                outcome.state_change_sequence
+                if outcome.state_change_sequence is not None
+                else submission.session.state_sequence
+            ),
+            metadata=submission.session.metadata,
+        )
+        yield HarnessEvent(
+            kind=(
+                HarnessEventKind.CLARIFICATION
+                if outcome.question
+                else (
+                    HarnessEventKind.FAILED
+                    if outcome.status in {"blocked", "unknown"}
+                    else HarnessEventKind.SUCCEEDED
+                )
+            ),
+            session=session,
+            status=outcome.status,
+            output=outcome.output,
+            summary=outcome.summary,
+            question=outcome.question,
+            error=(
+                f"agent settled with status {outcome.status}"
+                if outcome.status in {"blocked", "unknown"} and not outcome.question
+                else None
+            ),
+        )
+
+    def prompt_and_wait(
+        self,
+        target: str,
+        text: str,
+        *,
+        token: str,
+        timeout: float = 15 * 60,
+        max_runtime: float = 60 * 60,
+        checkpoint: Checkpoint | None = None,
+        baseline_sequence: int | None = None,
+        expected_agent_session: str | None = None,
+        before_submit: BeforePromptSubmit | None = None,
+        accepted: PromptAccepted | None = None,
+        before_agent: PromptBoundary | None = None,
+        after_submit: PromptBoundary | None = None,
+        active_marker: str | None = None,
+        allow_interactive_plan_boundary: bool = False,
+        allow_enter_fallback: bool = True,
+        clarification_reply: bool = False,
+    ) -> PromptOutcome:
+        if clarification_reply:
+            require_capabilities(
+                self.provider,
+                self.capabilities,
+                frozenset({HarnessCapability.CLARIFICATION_REPLIES}),
+            )
+        submission = self._submit_task(
             target,
+            text,
             token=token,
+            checkpoint=checkpoint,
+            baseline_sequence=baseline_sequence,
+            expected_agent_session=expected_agent_session,
+            before_submit=before_submit,
+            accepted=accepted,
+            before_agent=before_agent,
+            after_submit=after_submit,
+            active_marker=active_marker,
+            allow_interactive_plan_boundary=allow_interactive_plan_boundary,
+            allow_enter_fallback=allow_enter_fallback,
+        )
+        return self._wait_for_submission(
+            submission,
             inactivity_timeout=timeout,
             max_runtime=max_runtime,
-            started_at=started_at,
             checkpoint=checkpoint,
-            expected_agent_session=expected_agent_session,
             active_marker=active_marker,
             allow_interactive_plan_boundary=allow_interactive_plan_boundary,
         )
@@ -442,6 +740,108 @@ class HerdrSession:
             time.sleep(max(0.0, remaining))
             if checkpoint is not None:
                 checkpoint()
+
+    def reconcile(
+        self,
+        target: str,
+        *,
+        expected_session_id: str | None = None,
+    ) -> SessionReconciliation:
+        require_capabilities(
+            self.provider,
+            self.capabilities,
+            frozenset({HarnessCapability.RECOVERY}),
+        )
+        try:
+            agent = self._client.get_agent(target)
+        except HerdrError as exc:
+            if exc.code in {"agent_not_found", "not_found"}:
+                return SessionReconciliation(
+                    ReconciliationState.MISSING,
+                    None,
+                    "missing",
+                    False,
+                    str(exc),
+                )
+            return SessionReconciliation(
+                ReconciliationState.UNKNOWN,
+                None,
+                "unknown",
+                False,
+                str(exc),
+            )
+        session = self._session(agent, target)
+        status = str(agent.get("agent_status") or "unknown")
+        if session is None:
+            return SessionReconciliation(
+                ReconciliationState.UNKNOWN,
+                None,
+                status,
+                False,
+                "provider returned no durable session identity",
+            )
+        if (
+            expected_session_id is not None
+            and session.session_id != expected_session_id
+        ):
+            return SessionReconciliation(
+                ReconciliationState.CHANGED,
+                session,
+                status,
+                False,
+                "provider session identity changed",
+            )
+        if status == "unknown":
+            return SessionReconciliation(
+                ReconciliationState.UNKNOWN,
+                session,
+                status,
+                False,
+                "provider returned an unknown agent status",
+            )
+        return SessionReconciliation(
+            (
+                ReconciliationState.SETTLED
+                if status in OBSERVABLE_AGENT_STATES
+                else ReconciliationState.ACTIVE
+            ),
+            session,
+            status,
+            True,
+        )
+
+    def cancel(
+        self,
+        session: HarnessSession,
+        *,
+        checkpoint: Checkpoint | None = None,
+    ) -> None:
+        require_capabilities(
+            self.provider,
+            self.capabilities,
+            frozenset({HarnessCapability.CANCELLATION}),
+        )
+        observed = self.reconcile(
+            session.target, expected_session_id=session.session_id
+        )
+        if observed.state == ReconciliationState.MISSING:
+            return
+        if observed.state not in {
+            ReconciliationState.ACTIVE,
+            ReconciliationState.SETTLED,
+        }:
+            raise HerdrError(
+                f"cannot safely cancel {session.target}: "
+                f"{observed.detail or observed.state.value}",
+                code="agent_session_changed",
+            )
+        if observed.status in SETTLED:
+            return
+        if checkpoint is not None:
+            checkpoint()
+        self.cancel_agent(session.target)
+        if checkpoint is not None:
+            checkpoint()
 
     def cancel_agent(self, target: str) -> None:
         self._client.run_json("agent", "send-keys", target, "ctrl+c")

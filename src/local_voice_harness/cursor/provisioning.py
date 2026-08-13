@@ -2877,6 +2877,7 @@ def _execute_phase_prompt(
     phase = job.workflow_phase
     state = job.prompt_operation_state
     payload: PromptPayload | None = None
+    full_rehydration = True
     build_prompt = prompt_factory
     if prompt_factory is None:
         if prompt is None:
@@ -3177,6 +3178,9 @@ def _execute_phase_prompt(
             ),
             allow_interactive_plan_boundary=phase
             in {WorkflowPhase.PLANNING, WorkflowPhase.REVISING},
+            clarification_reply=bool(
+                job.continuation and job.continuation_answer and not full_rehydration
+            ),
         )
     except HerdrError as exc:
         if exc.code == "interactive_questionnaire":

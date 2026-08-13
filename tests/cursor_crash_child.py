@@ -18,6 +18,7 @@ from local_voice_harness.integrations.github import GitHubClient, GitHubReposito
 from local_voice_harness.integrations.herdr import (
     AgentSelection,
     HerdrClient,
+    HerdrSession,
     PromptOutcome,
 )
 
@@ -92,6 +93,8 @@ class PersistentEffects:
 class PersistentHerdr(HerdrClient):
     def __init__(self, effects: PersistentEffects) -> None:
         self.effects = effects
+        self.session = HerdrSession(self)
+        self.harness = self.session
 
     def ensure_server(self, timeout: float | None = None) -> None:
         return None
@@ -171,6 +174,7 @@ class PromptHerdr(PersistentHerdr):
         active_marker: str | None = None,
         allow_interactive_plan_boundary: bool = False,
         allow_enter_fallback: bool = True,
+        clarification_reply: bool = False,
     ) -> PromptOutcome:
         del (
             text,
@@ -183,6 +187,7 @@ class PromptHerdr(PersistentHerdr):
             active_marker,
             allow_interactive_plan_boundary,
             allow_enter_fallback,
+            clarification_reply,
         )
         if before_submit is None or accepted is None:
             raise RuntimeError("fake prompt requires durable boundary callbacks")

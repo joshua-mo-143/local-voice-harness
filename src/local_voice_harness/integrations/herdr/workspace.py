@@ -7,10 +7,9 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+from ...agents.harness import HarnessCapability, SessionRequest
 from .cursor_auth import CursorMcpAuthError, CursorMcpAuthLinker
 from .types import (
-    AGENT_START_READY_POLL_SECONDS,
-    AGENT_START_READY_TIMEOUT_SECONDS,
     SETTLED,
     AgentSelection,
     BeforePaneSubmit,
@@ -24,7 +23,6 @@ from .types import (
     ReserveWorktree,
     SettleAgent,
     SettleWorktree,
-    agent_session_identity,
     normalize_name,
 )
 
@@ -224,8 +222,6 @@ class HerdrWorkspace:
         mode: str | None = None,
         checkpoint: Checkpoint | None = None,
     ) -> AgentSelection:
-        if mode not in {None, "plan", "ask"}:
-            raise HerdrError("invalid Cursor mode")
         if self._cursor_mcp_auth is not None:
             try:
                 self._cursor_mcp_auth.link(checkout)
@@ -239,49 +235,31 @@ class HerdrWorkspace:
         deadline = time.monotonic() + 15
         while True:
             try:
-                if checkpoint is not None:
-                    checkpoint()
-                # Capability preflight verifies the configured MCP authentication,
-                # while this flag lets the spawned non-interactive session use it
-                # instead of opening a desktop approval prompt.
-                agent_args = ["--trust", "--approve-mcps"]
-                if mode is not None:
-                    agent_args.extend(["--mode", mode])
-                result = self._operations.run_json(
-                    "agent",
-                    "start",
-                    name,
-                    "--kind",
-                    "cursor",
-                    "--pane",
-                    pane,
-                    "--timeout",
-                    "60000",
-                    "--",
-                    *agent_args,
-                    timeout=70,
+                session = self._operations.create_session(
+                    SessionRequest(
+                        name=name,
+                        provider="cursor/herdr",
+                        mode=mode,
+                        launch_context={
+                            "pane_id": pane,
+                            "workspace_id": workspace,
+                        },
+                        required_capabilities=(
+                            frozenset({HarnessCapability.MCP_CONNECTORS})
+                            if self._cursor_mcp_auth is not None
+                            else frozenset()
+                        ),
+                    ),
+                    checkpoint=checkpoint,
                 )
-                agent = dict(result.get("agent") or {})
-                selection = self.selection(agent, str(checkout))
-                ready_deadline = time.monotonic() + AGENT_START_READY_TIMEOUT_SECONDS
-                while (
-                    agent.get("interactive_ready") is not True
-                    or agent_session_identity(agent.get("agent_session")) is None
-                ):
-                    if time.monotonic() >= ready_deadline:
-                        raise HerdrError(
-                            f"Herdr agent {selection.target} did not expose a ready "
-                            "Cursor session after startup",
-                            code="operation_ambiguous",
-                        )
-                    if checkpoint is not None:
-                        checkpoint()
-                    time.sleep(AGENT_START_READY_POLL_SECONDS)
-                    try:
-                        agent = self._operations.get_agent(selection.target)
-                    except HerdrError:
-                        agent = {}
-                return selection
+                return AgentSelection(
+                    target=session.target,
+                    pane_id=session.metadata.get("pane_id", pane),
+                    workspace_id=session.metadata.get("workspace_id", workspace),
+                    cwd=session.metadata.get("cwd", str(checkout)),
+                    name=name,
+                    worktree_path=str(checkout),
+                )
             except HerdrError as exc:
                 if exc.code != "agent_pane_busy" or time.monotonic() >= deadline:
                     raise
