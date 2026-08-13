@@ -5108,13 +5108,11 @@ class CursorJobStateTests(unittest.TestCase):
             self.assertTrue(jobs.read_job("123456789abc")["target_release_pending"])
             with mock.patch("time.time", return_value=104):
                 service.recover_jobs()
-            self.assertEqual(client.close_owned_pane.call_count, 2)
-            with mock.patch("time.time", return_value=105):
-                service.recover_jobs()
+            client.close_owned_pane.assert_not_called()
 
-        self.assertFalse(jobs.read_job("123456789abc")["target_release_pending"])
-        self.assertEqual(client.get_agent.call_count, 4)
-        self.assertGreaterEqual(client.close_owned_pane.call_count, 2)
+        unresolved = jobs.read_job("123456789abc")
+        self.assertTrue(unresolved["target_release_pending"])
+        self.assertEqual(unresolved["agent_dispatch_state"], "ambiguous")
 
     def test_truly_absent_agent_releases_after_bounded_backoff(self) -> None:
         jobs.write_job(
@@ -5385,6 +5383,9 @@ class CursorJobStateTests(unittest.TestCase):
                 "reconciliation_base_error": "agent startup failed",
                 "herdr_target": "retained-agent",
                 "agent_dispatch_state": "manual_required",
+                "agent_provider": "cursor/herdr",
+                "agent_provider_session_id": "retained-session",
+                "agent_state_sequence": 1,
                 "manual_reconcile_operation": "agent",
                 "manual_reconcile_token": "manual-token",
                 "target_release_pending": True,
@@ -5474,7 +5475,7 @@ class CursorJobStateTests(unittest.TestCase):
         service.acknowledge_worktree_quarantine("123456789abc")
         self.assertEqual(
             jobs.read_job("123456789abc")["worktree_provision_state"],
-            "retained",
+            "ambiguous",
         )
         self.assertIsNone(
             jobs._reserve_worker_worktree(

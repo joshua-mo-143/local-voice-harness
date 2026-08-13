@@ -60,6 +60,7 @@ def _awaiting(
                 "worktree_path": f"/worktrees/{job_id}",
                 "worktree_label": job_id,
                 "worktree_workspace_id": f"workspace-{job_id}",
+                "worktree_root_pane_id": f"root-pane-{job_id}",
                 "worktree_provision_state": "ready",
                 "voice_question": question.to_dict(),
             }

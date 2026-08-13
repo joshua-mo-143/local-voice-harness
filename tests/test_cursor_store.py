@@ -646,11 +646,10 @@ class CursorStoreIntegrationTests(unittest.TestCase):
             persisted = read_unlocked(path)
 
         self.assertEqual(persisted["schema_version"], CURRENT_SCHEMA_VERSION)
-        self.assertEqual(persisted["status"], "failed")
-        self.assertIsNone(persisted["worker_token"])
-        self.assertIsNone(persisted["worker_pid"])
-        self.assertIsNone(persisted["worker_boot_id"])
-        self.assertIn("manual recovery", str(persisted["error"]))
+        self.assertEqual(persisted["status"], "running")
+        self.assertEqual(persisted["worker_token"], "claim")
+        self.assertEqual(persisted["worker_pid"], 42)
+        self.assertEqual(persisted["worker_boot_id"], "legacy-unknown")
 
     def test_legacy_runtime_import_is_idempotent_and_leaves_logs_transient(
         self,

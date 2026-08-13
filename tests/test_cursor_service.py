@@ -1886,7 +1886,7 @@ def test_nuke_jobs_checks_legacy_claim_before_modern_token(
     inspect.assert_called_once()
     stop.assert_not_called()
     store = JobStore(jobs_dir, tmp_path / "legacy")
-    assert store.get("aaaaaaaaaaaa").loaded_schema_version == 5
+    assert store.get("aaaaaaaaaaaa").loaded_schema_version == CURRENT_SCHEMA_VERSION
     assert (jobs_dir / "aaaaaaaaaaaa.json.imported").exists()
 
 

@@ -6,9 +6,60 @@ or the public `JobStore` API. The implementation phases are [#140](https://githu
 [#141](https://github.com/joshua-mo-143/local-voice-harness/issues/141), and
 [#142](https://github.com/joshua-mo-143/local-voice-harness/issues/142), in that order.
 
-SQLite parity in #140 is now implemented. The inventory below records the
-pre-migration JSON baseline used to design that change; #141 and #142 remain future
-phases.
+SQLite parity and the typed lifecycle children are now implemented. Schema-v18
+state is persisted by database schema v2 as described below. The older v12
+inventory remains as historical design context for the compatibility importer.
+
+## Current schema-v18 relational inventory
+
+`CursorJob` currently produces 213 persisted field names, including the
+dynamically emitted `pane_retained_at` cleanup and
+`grouped_repository_coordinator_id` handoff fields. Database schema v2
+assigns each exactly once: 207 named lifecycle columns, two immutable artifact
+references, and four import-only compatibility values. The executable exhaustive
+inventory is `_NAMED_TABLE_FIELDS` in `cursor/sqlite_store.py`; startup rejects a
+v18 value not present in that inventory rather than silently creating generic
+state.
+
+| Disposition | Named owner | Count |
+|---|---|---:|
+| Identity and top-level discriminator | `jobs` plus `job_identity.lifecycle_kind` | 25, including `id` |
+| Prompt and question | `job_prompt_question` | 15 |
+| Terminal intent and cleanup | `job_terminal_cleanup` | 6 |
+| Delivery and announcement | `job_delivery_announcement` | 10 |
+| Workflow, review, approval, and participant | `job_workflow_review_approval_participant` | 31 lifecycle values |
+| Immutable artifact references | `plan_artifact` and `review_artifact` columns, foreign-key evidence in `artifacts` | 2 |
+| Checkout and fork | `job_checkout_fork` | 46 |
+| Provider and ticket creation | `job_provider_ticket` | 28 |
+| Session, pane, reconciliation, and release | `job_session_pane` | 39 |
+| Worker ownership | `job_worker` (with claim projection in `worker_claims`) | 7 |
+| Import-only compatibility | `schema_version`, `migration_source_schema_version`, `phase_prompt_active`, `agent_identity_legacy_compatible` | 4 |
+
+The only JSON-valued columns are the nine intrinsically structured, edge-validated
+values: `voice_question`, `clarifications`, `prompt_context_sessions`,
+`prompt_manifest`, `grouped_repository_targets`,
+`grouped_repository_candidates`, `grouped_repository_launches`,
+`target_release_unverified_targets`, and `participant_session_owners`.
+`job_field_presence` records serialization presence only; lifecycle values always
+come from named columns. `job_fields` is retained unchanged as v1 migration
+evidence and is never read or written by canonical schema-v2 operations.
+
+Opening a v1 database first takes the checkout-local
+`.sqlite-bootstrap.lock`, then starts one `BEGIN IMMEDIATE` transaction and
+rechecks the marker. Every EAV record passes through the current `CursorJob`
+compatibility adapter and durable-write normalizer. Legacy settled operations
+without typed identity are retained as explicit uncertainty rather than being
+blessed as current state. After writing named rows, migration reloads each row
+through the canonical relational reader and validates it as native schema v18
+before changing `store_meta.schema_version` last. Any invalid or lossy record
+rolls back the schema projection and version marker together. Reservations,
+delivery and worker claim projections, maintenance, quarantine, artifacts, and
+outbox rows are not rewritten by this migration. Retrying either repeats the
+whole v1 projection or observes completed v2 state, so cutover is idempotent.
+Fresh base schema creation and its marker use that same transaction; no
+`executescript` implicit commit is used. A marker-free partial database is
+completed only when its existing tables contain no evidence. Populated unknown
+or unmarked tables fail closed and remain untouched.
 
 ## Pre-migration baseline
 

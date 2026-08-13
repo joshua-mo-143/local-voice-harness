@@ -91,7 +91,12 @@ from .model import (
     ACTIVE_STATUSES as MODEL_ACTIVE_STATUSES,
 )
 from .model import (
-    CURRENT_SCHEMA_VERSION,
+    TERMINAL_STATUSES as MODEL_TERMINAL_STATUSES,
+)
+from .model import (
+    WORKER_STATUSES as MODEL_WORKER_STATUSES,
+)
+from .model import (
     CursorJob,
     JobStatus,
     JobValidationError,
@@ -99,12 +104,6 @@ from .model import (
     WorkflowPhase,
     WorkflowTier,
     transition,
-)
-from .model import (
-    TERMINAL_STATUSES as MODEL_TERMINAL_STATUSES,
-)
-from .model import (
-    WORKER_STATUSES as MODEL_WORKER_STATUSES,
 )
 from .operations import (
     OperationState,
@@ -4345,7 +4344,6 @@ def run_claimed_worker(  # pyright: ignore[reportGeneralTypeIssues]
         if (
             target
             and job.agent_dispatch_state == "dispatching"
-            and job.loaded_schema_version < CURRENT_SCHEMA_VERSION
             and (
                 job.agent_session_operation is None
                 or job.agent_session_operation.session is None

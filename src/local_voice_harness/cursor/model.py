@@ -265,6 +265,7 @@ _FLOAT_FIELDS = frozenset(
         "worktree_confirmed_absent_at",
         "worktree_automatic_reconcile_stopped_at",
         "worktree_retained_at",
+        "pane_retained_at",
         "manual_reconcile_required_at",
         "manual_reconcile_resolved_at",
         "worktree_quarantine_acknowledged_at",
@@ -281,6 +282,7 @@ _STRING_FIELDS = frozenset(
         "trusted_utterance",
         "repository_hint",
         "context_repository",
+        "grouped_repository_coordinator_id",
         "repository",
         "github_repository",
         "github_issue_url",
@@ -3204,8 +3206,15 @@ class AgentJob:
                     fork_exists=True,
                     fork_repository=self.fork_operation_target,
                 )
-            elif operation == "agent" and not self.herdr_target:
-                return None
+            elif operation == "agent":
+                if not self.herdr_target:
+                    return None
+                if (
+                    self.agent_provider is None
+                    or self.agent_provider_session_id is None
+                    or self.agent_state_sequence is None
+                ):
+                    return None
             elif operation == "worktree" and not self.worktree_path:
                 return None
         elif operation == "agent":

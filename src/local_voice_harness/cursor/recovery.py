@@ -51,6 +51,7 @@ from .lifecycle import (
 )
 from .model import (
     CURRENT_SCHEMA_VERSION,
+    LEGACY_BOOT_ID,
     TERMINAL_STATUSES,
     CursorJob,
     JobStatus,
@@ -195,7 +196,7 @@ def reconcile_uncertain_agent(
     identity: SessionIdentity | None = None
     agent: dict[str, object] = {}
     if operation is None or operation.session is None:
-        if job.loaded_schema_version < CURRENT_SCHEMA_VERSION:
+        if job.status in TERMINAL_STATUSES or job.terminal_intent_status is not None:
             try:
                 client = herdr_factory()
                 client.ensure_server()
@@ -229,6 +230,7 @@ def reconcile_uncertain_agent(
                 if (
                     current.agent_dispatch_state not in states
                     or current.herdr_target != target
+                    or current.manual_reconcile_operation is not None
                 ):
                     return None
                 return current.evolve_recovery(
@@ -317,7 +319,9 @@ def reconcile_uncertain_agent(
             ):
                 return None
             changes: dict[str, object] = {
-                "agent_dispatch_state": "ready",
+                "agent_dispatch_state": (
+                    "ready" if identity is not None else "ambiguous"
+                ),
                 "agent_name": str(agent.get("name") or target),
                 "herdr_pane_id": str(
                     agent.get("pane_id") or current.herdr_pane_id or ""
@@ -353,7 +357,7 @@ def reconcile_uncertain_agent(
         if current.agent_dispatch_state not in states or current.herdr_target != target:
             return None
         changes: dict[str, object] = {
-            "agent_dispatch_state": "ready",
+            "agent_dispatch_state": "ready" if identity is not None else "ambiguous",
             "agent_name": str(agent.get("name") or target),
             "herdr_pane_id": str(agent.get("pane_id") or current.herdr_pane_id or ""),
             "herdr_workspace_id": str(
@@ -1030,7 +1034,7 @@ def cancel_target_and_release(
             client = herdr_factory()
             client.ensure_server()
             for participant_target in targets:
-                if current.loaded_schema_version < CURRENT_SCHEMA_VERSION and (
+                if (
                     current.agent_dispatch_state is None
                     or current.agent_provider is None
                     or current.agent_provider_session_id is None
@@ -1072,6 +1076,8 @@ def cancel_target_and_release(
                         and expected_checkout
                         and expected_workspace
                         and root_pane_id
+                        and expected_workspace != LEGACY_BOOT_ID
+                        and root_pane_id != LEGACY_BOOT_ID
                         and expected_binding_workspace == expected_workspace
                         and expected_pane_id != root_pane_id
                     )
@@ -1155,10 +1161,7 @@ def cancel_target_and_release(
                                 cast(int, historical["state_sequence"]),
                             ),
                         )
-                if (
-                    agent_operation is None
-                    and current.loaded_schema_version < CURRENT_SCHEMA_VERSION
-                ):
+                if agent_operation is None:
                     try:
                         creation_operation = current.participant_pane_operation
                     except JobValidationError:
@@ -1483,7 +1486,11 @@ def acknowledge_worktree_quarantine(
         ):
             return None
         return job.evolve(
-            worktree_provision_state="retained",
+            worktree_provision_state=(
+                "retained"
+                if job.worktree_workspace_id and job.worktree_root_pane_id
+                else "ambiguous"
+            ),
             worktree_manual_inspection_required=False,
             worktree_quarantine_acknowledged_at=acknowledged_at,
         )

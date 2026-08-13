@@ -88,7 +88,10 @@ def test_active_schema_import_survives_process_death(
     assert persisted.schema_version == CURRENT_SCHEMA_VERSION
     assert persisted.id == JOB_ID
     assert (tmp_path / "jobs" / f"{JOB_ID}.json.imported").exists()
-    assert _effects(tmp_path)["launches"] == [JOB_ID]
+    assert _effects(tmp_path)["launches"] == []
+    assert persisted.status.value == "queued"
+    assert persisted.agent_dispatch_state == "manual_required"
+    assert persisted.manual_reconcile_operation == "agent"
 
 
 @pytest.mark.parametrize("killpoint", ["before-marker", "after-marker", "after-commit"])
