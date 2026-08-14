@@ -173,6 +173,7 @@ CONVERSATION_TIMEOUT_SECONDS = 60
 PRE_ROLL_FRAMES = 25
 MICROPHONE_START_ATTEMPTS = 30
 MICROPHONE_RETRY_SECONDS = 1
+RETAINED_RECOVERY_RETRY_SECONDS = 5.0
 PLAYBACK_ECHO_WINDOW_SECONDS = 8.0
 RECENT_PLAYBACK_LIMIT = 8
 TARGET_RESOLUTION_CONTEXT_RESPONSE = AssistantResponse.from_text(
@@ -1606,6 +1607,7 @@ class WakeConversationDaemon:
                 )
                 raise
             delivery_ambiguous = True
+            self.retained_recovery_required = True
 
         self.config_activation_delivery = None
         recent_playback = self._active_recent_playback() if not woke else ()
@@ -1628,8 +1630,11 @@ class WakeConversationDaemon:
                 }:
                     preserve_delivery = True
                     turn_failed = True
+                    self.retained_recovery_required = True
+                    self.retained_recovery_retry_at = (
+                        time.monotonic() + RETAINED_RECOVERY_RETRY_SECONDS
+                    )
                     if transcript_delivery.state == "uncertain":
-                        self.retained_recovery_required = True
                         uncertain_deliveries = getattr(
                             self, "uncertain_retained_delivery_ids", set()
                         )
@@ -2451,6 +2456,9 @@ class WakeConversationDaemon:
         for delivery in recover_retained_transcripts():
             if delivery.state == "ambiguous":
                 self.retained_recovery_required = True
+                self.retained_recovery_retry_at = (
+                    time.monotonic() + RETAINED_RECOVERY_RETRY_SECONDS
+                )
                 log(
                     "retained voice turn requires reconciliation before retry: "
                     f"{delivery.delivery_id}"
@@ -2504,7 +2512,7 @@ class WakeConversationDaemon:
             self._recover_retained_utterances()
         except Exception as exc:
             self.retained_recovery_required = True
-            self.retained_recovery_retry_at = now + 1.0
+            self.retained_recovery_retry_at = now + RETAINED_RECOVERY_RETRY_SECONDS
             log(
                 f"in-process retained turn recovery failed: {type(exc).__name__}: {exc}"
             )

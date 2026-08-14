@@ -2804,6 +2804,7 @@ class RetainedUtteranceTests(unittest.TestCase):
 
         delivery.mark_ambiguous.assert_called_once_with()
         delivery.release.assert_not_called()
+        self.assertTrue(daemon.retained_recovery_required)
 
     def test_failed_replay_fence_preserves_and_schedules_in_process_recovery(
         self,
@@ -2893,6 +2894,7 @@ class RetainedUtteranceTests(unittest.TestCase):
         recovered.text = delivery.text
         recovered.woke = delivery.woke
         recovered.state = "pending"
+        daemon.retained_recovery_retry_at = 0.0
         with (
             mock.patch.object(
                 wake_daemon,
@@ -3087,6 +3089,7 @@ class RetainedUtteranceTests(unittest.TestCase):
 
         process.assert_not_called()
         self.assertTrue(daemon.retained_recovery_required)
+        self.assertGreater(daemon.retained_recovery_retry_at, 0.0)
 
     def test_startup_stays_live_when_retained_recovery_is_unavailable(self) -> None:
         daemon = _bare_daemon()
@@ -3109,7 +3112,7 @@ class RetainedUtteranceTests(unittest.TestCase):
                 wake_daemon,
                 "recover_retained_transcripts",
                 side_effect=HarnessError("STT unavailable"),
-            ),
+            ) as recover_retained,
             mock.patch.object(
                 daemon, "_recover_config_activation", return_value=None
             ) as recover_activation,
@@ -3129,6 +3132,7 @@ class RetainedUtteranceTests(unittest.TestCase):
         recover_activation.assert_not_called()
         drain_announcements.assert_not_called()
         record.assert_not_called()
+        recover_retained.assert_called_once_with()
         self.assertTrue(daemon.retained_recovery_required)
         self.assertGreaterEqual(notify.call_count, 1)
 
