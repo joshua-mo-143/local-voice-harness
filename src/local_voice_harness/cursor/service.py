@@ -1348,7 +1348,15 @@ def _reply_grouped_repository(
         )
 
     store = _job_store()
-    updated = store.stage_grouped_children(job.id, record, tuple(children))
+    try:
+        updated = store.stage_grouped_children(job.id, record, tuple(children))
+    except JobValidationError as exc:
+        if "resource is reserved" not in str(exc):
+            raise
+        return (
+            "One or more tickets became active before this answer was applied. "
+            "No duplicate ticket jobs were started."
+        )
     if updated is None:
         return "That grouped clarification was already changed, so I did not use it."
     outcomes = _launch_grouped_children(
@@ -1578,7 +1586,15 @@ def reply_job(
         immediate = transition.message
         return transition.job
 
-    updated = _job_store().update(job_id, reply)
+    try:
+        updated = _job_store().update(job_id, reply)
+    except JobValidationError as exc:
+        if "resource is reserved" not in str(exc):
+            raise
+        return (
+            "That ticket became active before this answer was applied. "
+            "No duplicate ticket job was started."
+        )
     if updated is None and immediate is None:
         raise HarnessError(f"Cursor job {job_id} is not waiting for a reply")
     if should_cancel:
@@ -1732,7 +1748,7 @@ def cancel_job(
         if job.status not in ACTIVE_STATUSES:
             raise HarnessError(f"Cursor job {job_id} cannot be cancelled")
         if (
-            job.participant_admission_state == "waiting"
+            job.participant_admission_state in {"waiting", "released"}
             and job.herdr_target is None
             and job.worker_token is None
         ):

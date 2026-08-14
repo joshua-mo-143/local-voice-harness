@@ -4445,6 +4445,31 @@ def validate_transition(before: CursorJob, after: CursorJob) -> None:
                 before.participant_lifecycle.admit()
             elif (
                 after.participant_lifecycle.admission
+                == ParticipantAdmissionState.WAITING
+            ):
+                resource_fields = (
+                    "herdr_target",
+                    "planner_target",
+                    "reviewer_target",
+                    "implementer_target",
+                    "participant_creation_target",
+                    "worktree_path",
+                )
+                if (
+                    before.status not in {JobStatus.ROUTING, JobStatus.RUNNING}
+                    or after.status != JobStatus.AWAITING_USER
+                    or after.clarification_kind != "repository"
+                    or after.worker_token is not None
+                    or after.active_participant is not None
+                    or any(after._values.get(field) for field in resource_fields)
+                ):
+                    raise WorkflowTransitionError(
+                        "held participant capacity can only yield for a "
+                        "resource-free repository clarification"
+                    )
+                before.participant_lifecycle.yield_capacity()
+            elif (
+                after.participant_lifecycle.admission
                 == ParticipantAdmissionState.RELEASED
             ):
                 before.participant_lifecycle.release(
