@@ -1368,6 +1368,8 @@ class WakeConversationDaemon:
         text: str,
         *,
         blocked: bool,
+        before_mutation: Callable[[], None] | None = None,
+        after_mutation: Callable[[], None] | None = None,
     ) -> tuple[
         AssistantResponse | None, ConfirmationDecision, PendingConfigChange | None
     ]:
@@ -1387,8 +1389,12 @@ class WakeConversationDaemon:
                 pending,
             )
         try:
+            if before_mutation is not None:
+                before_mutation()
             result = commit_pending_change(pending)
         except StaleConfigChangeError:
+            if after_mutation is not None:
+                after_mutation()
             response = AssistantResponse.from_text(
                 "The stored value changed before confirmation, so I didn't write "
                 "anything. Please start the change again."
@@ -1412,6 +1418,8 @@ class WakeConversationDaemon:
                     expected_config=expected_config,
                 )
             except ActivationStateError as exc:
+                if after_mutation is not None:
+                    after_mutation()
                 log(f"activation offer persistence failed: {exc}")
                 response = AssistantResponse.from_text(
                     f"Saved {pending.setting.value}, but I could not durably track "
@@ -1419,6 +1427,8 @@ class WakeConversationDaemon:
                     "was restarted."
                 )
             else:
+                if after_mutation is not None:
+                    after_mutation()
                 if offer is None:
                     response = render_change_committed(pending, result)
                 else:
@@ -1435,6 +1445,7 @@ class WakeConversationDaemon:
         text: str,
         *,
         before_mutation: Callable[[], None] | None = None,
+        after_mutation: Callable[[], None] | None = None,
     ) -> AssistantResponse | None:
         record = self.config_activation_store.current()
         if (
@@ -1448,6 +1459,8 @@ class WakeConversationDaemon:
             if before_mutation is not None:
                 before_mutation()
             record = self.config_activation_store.accept(record.id)
+            if after_mutation is not None:
+                after_mutation()
             delivery = ActivationDelivery(
                 record,
                 ActivationDeliveryKind.PRE_RESTART,
@@ -1458,6 +1471,8 @@ class WakeConversationDaemon:
             if before_mutation is not None:
                 before_mutation()
             record = self.config_activation_store.decline(record.id)
+            if after_mutation is not None:
+                after_mutation()
             delivery = ActivationDelivery(record, ActivationDeliveryKind.RESULT)
             self.config_activation_delivery = delivery
             return render_activation_delivery(delivery)
@@ -1771,8 +1786,6 @@ class WakeConversationDaemon:
                 if pending_readback is not None or resuming_target_resolution
                 else routing_context
             )
-            if self.pending_config_change is not None:
-                fence_side_effect()
             if pending_readback is not None:
                 (
                     readback_result,
@@ -1789,11 +1802,14 @@ class WakeConversationDaemon:
             ) = self._resolve_pending_config_confirmation(
                 text,
                 blocked=pending_readback is not None,
+                before_mutation=fence_side_effect,
+                after_mutation=terminalize_non_side_effect,
             )
             activation_response = (
                 self._resolve_activation_confirmation(
                     text,
                     before_mutation=fence_side_effect,
+                    after_mutation=terminalize_non_side_effect,
                 )
                 if pending_readback is None
                 and pending_config is None

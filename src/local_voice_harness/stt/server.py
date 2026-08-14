@@ -704,6 +704,7 @@ def _write_retained_claim(
 ) -> None:
     retained_root = _retained_root(claim.paths)
     temporary: Path | None = None
+    destination: Path | None = None
     committed = False
     try:
         with recorder.recording_lock(claim.paths.state_dir, claim.paths.lock):
@@ -756,11 +757,40 @@ def _write_retained_claim(
         if committed:
             log(f"STT wake retention committed despite lock cleanup failure: {exc}")
             return
-        if temporary is not None and claim.processing.exists():
-            with contextlib.suppress(OSError):
-                (temporary / RETAINED_METADATA).unlink()
-            with contextlib.suppress(OSError):
-                temporary.rmdir()
+        if destination is not None and destination.exists():
+            try:
+                _load_retained_delivery(destination)
+            except (OSError, json.JSONDecodeError):
+                pass
+            else:
+                log(f"STT wake retention committed despite rename failure: {exc}")
+                return
+        if temporary is not None:
+            retained_audio = temporary / RETAINED_AUDIO
+            if retained_audio.exists() and not claim.processing.exists():
+                try:
+                    retained_audio.rename(claim.processing)
+                except OSError as restore_error:
+                    try:
+                        _load_retained_delivery(temporary)
+                    except (OSError, json.JSONDecodeError):
+                        raise OSError(
+                            "retained STT audio could not be restored or recovered"
+                        ) from restore_error
+                    log(
+                        "STT wake retention rollback left a recoverable hidden "
+                        f"delivery at {temporary}: {restore_error}"
+                    )
+                else:
+                    with contextlib.suppress(OSError):
+                        (temporary / RETAINED_METADATA).unlink()
+                    with contextlib.suppress(OSError):
+                        temporary.rmdir()
+            elif claim.processing.exists():
+                with contextlib.suppress(OSError):
+                    (temporary / RETAINED_METADATA).unlink()
+                with contextlib.suppress(OSError):
+                    temporary.rmdir()
         raise
 
 

@@ -2703,6 +2703,122 @@ class ProcessUtteranceTests(unittest.TestCase):
 
 
 class RetainedUtteranceTests(unittest.TestCase):
+    def test_config_commit_terminalizes_before_post_commit_crash(self) -> None:
+        daemon = _bare_daemon()
+        pending = _pending_config()
+        daemon.pending_config_change = pending
+        delivery = mock.Mock(spec=wake_daemon.RetainedTranscript)
+        delivery.text = "yes"
+        delivery.woke = False
+        delivery.state = "pending"
+        delivery.delivery_id = "6" * 32
+        order: list[str] = []
+        delivery.mark_ambiguous.side_effect = lambda: order.append("fence")
+        delivery.mark_terminal.side_effect = lambda: order.append("terminal")
+        result = ConfigChangeResult(
+            config=daemon.user_config,
+            changed_keys=("audio.voice",),
+            restart_services=("voice-harness-wake.service",),
+        )
+
+        with (
+            mock.patch.object(wake_daemon, "start_components"),
+            mock.patch.object(
+                wake_daemon,
+                "commit_pending_change",
+                side_effect=lambda _pending: order.append("commit") or result,
+            ),
+            mock.patch.object(
+                daemon.config_activation_store,
+                "create_offer",
+                side_effect=lambda *_args, **_kwargs: order.append("offer") or None,
+            ),
+            mock.patch.object(
+                wake_daemon,
+                "render_change_committed",
+                side_effect=RuntimeError("crash after config commit"),
+            ),
+            mock.patch.object(wake_daemon, "release_deliveries"),
+            mock.patch.object(wake_daemon, "notify"),
+            mock.patch.object(wake_daemon, "log"),
+        ):
+            daemon.process_utterance(None, woke=False, retained=delivery)
+
+        self.assertEqual(order, ["fence", "commit", "offer", "terminal"])
+        delivery.release.assert_not_called()
+
+    def test_activation_decisions_terminalize_before_response_crash(self) -> None:
+        for text, operation in (
+            ("activate now", "accept"),
+            ("not now", "decline"),
+        ):
+            with (
+                self.subTest(operation=operation),
+                tempfile.TemporaryDirectory() as temp,
+            ):
+                daemon = _bare_daemon()
+                store = wake_daemon.ActivationStore(Path(temp) / "activation.json")
+                daemon.config_activation_store = store
+                result = ConfigChangeResult(
+                    config=replace(
+                        daemon.user_config,
+                        audio=replace(daemon.user_config.audio, voice="new_voice"),
+                    ),
+                    changed_keys=("audio.voice",),
+                    restart_services=("voice-harness-wake.service",),
+                )
+                offer = store.create_offer(_pending_config(), result)
+                assert offer is not None
+                store.mark_offer_delivered(offer.id)
+                delivery = mock.Mock(spec=wake_daemon.RetainedTranscript)
+                delivery.text = text
+                delivery.woke = False
+                delivery.state = "pending"
+                delivery.delivery_id = ("7" if operation == "accept" else "8") * 32
+                order: list[str] = []
+                delivery.mark_ambiguous.side_effect = lambda order=order: order.append(
+                    "fence"
+                )
+                delivery.mark_terminal.side_effect = lambda order=order: order.append(
+                    "terminal"
+                )
+                original_operation = getattr(store, operation)
+
+                def mutate(
+                    record_id: str,
+                    order: list[str] = order,
+                    operation: str = operation,
+                    original_operation: object = original_operation,
+                ) -> object:
+                    order.append(operation)
+                    assert callable(original_operation)
+                    return original_operation(record_id)
+
+                with (
+                    mock.patch.object(store, operation, side_effect=mutate),
+                    mock.patch.object(
+                        wake_daemon,
+                        "render_activation_delivery",
+                        side_effect=RuntimeError("crash after activation decision"),
+                    ),
+                    mock.patch.object(wake_daemon, "start_components"),
+                    mock.patch.object(wake_daemon, "release_deliveries"),
+                    mock.patch.object(wake_daemon, "notify"),
+                    mock.patch.object(wake_daemon, "log"),
+                ):
+                    daemon.process_utterance(None, woke=False, retained=delivery)
+
+                self.assertEqual(order, ["fence", operation, "terminal"])
+                delivery.release.assert_not_called()
+                current = store.current()
+                assert current is not None
+                expected = (
+                    wake_daemon.ActivationStatus.ACCEPTED
+                    if operation == "accept"
+                    else wake_daemon.ActivationStatus.DECLINED
+                )
+                self.assertEqual(current.status, expected)
+
     def test_no_speech_releases_retained_evidence_terminally(self) -> None:
         daemon = _bare_daemon()
         delivery = mock.Mock(spec=wake_daemon.RetainedTranscript)

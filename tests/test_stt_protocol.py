@@ -959,6 +959,105 @@ class SpeechToTextProtocolTests(unittest.TestCase):
                 )
             )
 
+    def test_retention_post_audio_move_failures_preserve_recoverable_ownership(
+        self,
+    ) -> None:
+        for failure in ("directory_fsync", "rename_before", "rename_after"):
+            with (
+                self.subTest(failure=failure),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
+                root = Path(temporary)
+                paths = server.recorder.RecorderPaths(
+                    root,
+                    root / "request.wav",
+                    root / "recording.pid",
+                    root / "recording.log",
+                )
+                processing_dir = root / server.PROCESSING_DIRECTORY
+                processing_dir.mkdir(mode=0o700)
+                original = root / "request-generation.wav"
+                processing = processing_dir / f"{original.stem}-{uuid.uuid4().hex}.wav"
+                contents = b"RIFF-retain-rollback" + b"\0" * 64
+                processing.write_bytes(contents)
+                processing.chmod(0o600)
+                delivery_id = uuid.uuid4().hex
+                retained_root = root / server.RETAINED_DIRECTORY
+                original_rename = Path.rename
+
+                def fail_rename(
+                    path: Path,
+                    target: Path,
+                    retained_root: Path = retained_root,
+                    delivery_id: str = delivery_id,
+                    failure: str = failure,
+                    original_rename: Callable[[Path, Path], Path] = original_rename,
+                ) -> Path:
+                    if (
+                        path.parent == retained_root
+                        and path.name.startswith(".")
+                        and target == retained_root / delivery_id
+                    ):
+                        if failure == "rename_after":
+                            original_rename(path, target)
+                        raise OSError(f"{failure} failed")
+                    return original_rename(path, target)
+
+                fsync_calls = 0
+                original_fsync = server.os.fsync
+
+                def fail_directory_fsync(
+                    fd: int,
+                    failure: str = failure,
+                    original_fsync: Callable[[int], None] = original_fsync,
+                ) -> None:
+                    nonlocal fsync_calls
+                    fsync_calls += 1
+                    if failure == "directory_fsync" and fsync_calls == 2:
+                        raise OSError("directory fsync failed")
+                    original_fsync(fd)
+
+                patches = (
+                    mock.patch.object(Path, "rename", fail_rename)
+                    if failure.startswith("rename")
+                    else mock.patch.object(server.os, "fsync", fail_directory_fsync)
+                )
+                with patches:
+                    if failure == "rename_after":
+                        server._write_retained_claim(
+                            server.AudioClaim(original, processing, paths),
+                            delivery_id=delivery_id,
+                            text="hello",
+                            woke=True,
+                        )
+                    else:
+                        with self.assertRaises(OSError):
+                            server._write_retained_claim(
+                                server.AudioClaim(original, processing, paths),
+                                delivery_id=delivery_id,
+                                text="hello",
+                                woke=True,
+                            )
+
+                destination = retained_root / delivery_id
+                if failure == "rename_after":
+                    self.assertFalse(processing.exists())
+                    self.assertEqual(
+                        server._load_retained_delivery(destination)["state"],
+                        "ambiguous",
+                    )
+                else:
+                    self.assertEqual(processing.read_bytes(), contents)
+                    self.assertFalse(destination.exists())
+                    self.assertEqual(
+                        tuple(
+                            path
+                            for path in retained_root.iterdir()
+                            if path.name.startswith(".")
+                        ),
+                        (),
+                    )
+
     def test_retained_deliveries_recover_in_creation_order(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
