@@ -41,6 +41,10 @@ def test_v8_cursor_fixture_migrates_to_structured_agent_schema() -> None:
     assert record["implementer_target"] == "cursor-agent-61"
     expected_harness = fixture("agent-v9.json")["harness_state"]
     assert isinstance(expected_harness, dict)
+    expected_harness = {
+        **expected_harness,
+        "agent_dispatch_state": "ambiguous",
+    }
     harness_state = record["harness_state"]
     assert isinstance(harness_state, dict)
     assert {key: harness_state[key] for key in expected_harness} == expected_harness
@@ -64,7 +68,7 @@ def test_v9_agent_fixture_loads_with_legacy_recovery_accessors() -> None:
     assert job.loaded_schema_version == 9
     assert job.schema_version == CURRENT_SCHEMA_VERSION
     assert job.herdr_pane_id == "pane-1"
-    assert job.agent_dispatch_state == "ready"
+    assert job.agent_dispatch_state == "ambiguous"
     assert job.github_repository == "owner/project"
     assert job.github_issue == 61
     assert job.repository == "/repo"

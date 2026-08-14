@@ -27,10 +27,16 @@ from local_voice_harness.cursor.model import (
     CURRENT_SCHEMA_VERSION,
     CursorJob,
     JobStatus,
+    JobValidationError,
     WorkflowParticipant,
     transition,
 )
-from local_voice_harness.cursor.operations import WorkerOwnership
+from local_voice_harness.cursor.operations import (
+    AgentSessionOperation,
+    AgentSessionSpec,
+    AgentSessionState,
+    WorkerOwnership,
+)
 from local_voice_harness.cursor.recovery import (
     acknowledge_worktree_quarantine,
     cancel_target_and_release,
@@ -62,7 +68,11 @@ from local_voice_harness.integrations.linear import (
     LinearIssue,
     LinearTicketCreationResult,
 )
-from local_voice_harness.prompt_operations import AmbiguousPrompt, SubmittingPrompt
+from local_voice_harness.prompt_operations import (
+    AmbiguousPrompt,
+    PromptIdentity,
+    SubmittingPrompt,
+)
 
 WORKER = WorkerOwnership("worker", 42, "boot", "start", "test", 1)
 
@@ -1354,49 +1364,40 @@ class CursorRecoveryTests(unittest.TestCase):
         self.assertEqual(recovered.manual_reconcile_operation, "prompt")
         self.assertIsNotNone(recovered.manual_reconcile_token)
 
-    def test_incomplete_prompt_submit_identity_fails_closed_without_replay(
+    def test_incomplete_native_prompt_identity_is_rejected_at_durable_write(
         self,
     ) -> None:
-        self.create(
-            {
-                "id": "123456789abc",
-                "status": "running",
-                "request": "test",
-                "created_at": 1,
-                "delivered": False,
-                "worker_token": "worker",
-                "worker_pid": 42,
-                "worker_boot_id": "boot",
-                "worker_process_start": "start",
-                "worker_claim_operation": "test",
-                "worker_claimed_at": 1,
-                "workflow_phase": "classifying",
-                "turn": 1,
-                "workflow_turn_phase": "classifying",
-                "herdr_target": "planner",
-                "planner_target": "planner",
-                "active_participant": "planner",
-                "prompt_operation_state": "submitting",
-                "prompt_operation_phase": "classifying",
-                "prompt_operation_turn": 1,
-                "prompt_operation_target": "planner",
-                "prompt_baseline_sequence": -1,
-            }
-        )
-        client = mock.Mock()
-
-        reconcile_prompt_and_pane_operations(
-            self.store,
-            self.store.get("123456789abc"),
-            now=10,
-            herdr_factory=lambda: client,
-        )
-
-        client.ensure_server.assert_not_called()
-        recovered = self.store.get("123456789abc")
-        self.assertEqual(recovered.prompt_operation_state, "ambiguous")
-        self.assertEqual(recovered.manual_reconcile_operation, "prompt")
-        self.assertIsNotNone(recovered.manual_reconcile_token)
+        with self.assertRaisesRegex(
+            JobValidationError, "prompt identity fields must not be empty"
+        ):
+            self.create(
+                {
+                    "id": "123456789abc",
+                    "schema_version": CURRENT_SCHEMA_VERSION,
+                    "revision": 0,
+                    "status": "running",
+                    "request": "test",
+                    "created_at": 1,
+                    "delivered": False,
+                    "worker_token": "worker",
+                    "worker_pid": 42,
+                    "worker_boot_id": "boot",
+                    "worker_process_start": "start",
+                    "worker_claim_operation": "test",
+                    "worker_claimed_at": 1,
+                    "workflow_phase": "classifying",
+                    "turn": 1,
+                    "workflow_turn_phase": "classifying",
+                    "herdr_target": "planner",
+                    "planner_target": "planner",
+                    "active_participant": "planner",
+                    "prompt_operation_state": "submitting",
+                    "prompt_operation_phase": "classifying",
+                    "prompt_operation_turn": 1,
+                    "prompt_operation_target": "planner",
+                    "prompt_baseline_sequence": -1,
+                }
+            )
 
     def test_plan_approval_recovery_rejects_replaced_agent_session(self) -> None:
         created = self.create(
@@ -1678,6 +1679,40 @@ class CursorRecoveryTests(unittest.TestCase):
             },
         )
 
+    def test_materialized_worktree_records_required_workspace_identity(self) -> None:
+        created = self.create(
+            {
+                "id": "123456789abc",
+                "status": "routing",
+                "request": "recover a worktree",
+                "created_at": 1,
+                "delivered": False,
+                "repository": "/repo",
+                "worktree_branch": "voice/recovery",
+                "worktree_path": "/worktree",
+                "worktree_provision_state": "manual_required",
+                "manual_reconcile_operation": "worktree",
+                "manual_reconcile_token": "worktree-fence",
+                "manual_reconcile_required_at": 9,
+            }
+        )
+
+        resolved = resolve_manual_reconciliation(
+            self.store,
+            created.id,
+            "worktree",
+            "worktree-fence",
+            "materialized",
+            now=11,
+            pane_id="root-pane",
+            workspace_id="workspace",
+        )
+
+        self.assertEqual(resolved.worktree_provision_state, "retained")
+        self.assertEqual(resolved.worktree_root_pane_id, "root-pane")
+        self.assertEqual(resolved.worktree_workspace_id, "workspace")
+        self.assertIsNone(resolved.manual_reconcile_operation)
+
     def test_concurrent_terminal_intent_fences_reviewer_pane_acceptance(self) -> None:
         created = self.create(
             {
@@ -1951,11 +1986,17 @@ class CursorRecoveryTests(unittest.TestCase):
 
         def mark_prompt_ambiguous(current: CursorJob) -> CursorJob:
             return current.evolve(
-                prompt_operation_state="ambiguous",
-                prompt_operation_phase="planning",
-                prompt_operation_turn=1,
-                prompt_operation_target="planner-agent",
-                prompt_baseline_sequence=0,
+                prompt_operation=AmbiguousPrompt(
+                    PromptIdentity(
+                        current.id,
+                        "planning",
+                        1,
+                        f"{current.id}-1",
+                        "planner-agent",
+                        "session-planner",
+                        0,
+                    )
+                ),
                 manual_reconcile_operation="prompt",
                 manual_reconcile_token="manual-token",
                 manual_reconcile_required_at=10,
@@ -2025,6 +2066,91 @@ class CursorRecoveryTests(unittest.TestCase):
             "agent",
             expected_session_id="session",
         )
+
+    def test_session_reconciliation_cannot_advance_same_target_replacement(
+        self,
+    ) -> None:
+        job = self.create(
+            {
+                "id": "123456789abc",
+                "schema_version": CURRENT_SCHEMA_VERSION,
+                "revision": 0,
+                "status": "queued",
+                "request": "test",
+                "created_at": 1,
+                "queued_at": 1,
+                "delivered": False,
+                "worktree_path": "/worktree-a",
+                "herdr_target": "agent",
+                "herdr_pane_id": "pane-a",
+                "herdr_workspace_id": "workspace-a",
+                "agent_dispatch_state": "ambiguous",
+                "agent_provider": "cursor/herdr",
+                "agent_provider_session_id": "session-a",
+                "agent_state_sequence": 7,
+            }
+        )
+        client = mock.Mock()
+
+        def replace_before_observation(*_args: object, **_kwargs: object) -> object:
+            current = self.store.get(job.id)
+            operation = current.agent_session_operation
+            assert operation is not None
+            absent = operation.transition(AgentSessionState.CONFIRMED_ABSENT)
+            confirmed = self.store.update(
+                current.id,
+                lambda latest: latest.evolve(agent_session_operation=absent),
+            )
+            assert confirmed is not None
+            replacement = AgentSessionOperation(
+                AgentSessionState.DISPATCHING,
+                AgentSessionSpec("agent", "/worktree-b", "workspace-b", "pane-b"),
+            )
+            self.store.update(
+                current.id,
+                lambda latest: latest.evolve(
+                    agent_session_operation=replacement,
+                    worktree_path="/worktree-b",
+                    herdr_workspace_id="workspace-b",
+                    herdr_pane_id="pane-b",
+                    agent_provider=None,
+                    agent_provider_session_id=None,
+                    agent_state_sequence=None,
+                ),
+            )
+            return SessionReconciliation(
+                ReconciliationState.ACTIVE,
+                HarnessSession(
+                    "cursor/herdr",
+                    "session-a",
+                    "agent",
+                    8,
+                    metadata={
+                        "cwd": "/worktree-a",
+                        "workspace_id": "workspace-a",
+                        "pane_id": "pane-a",
+                    },
+                ),
+                "working",
+                True,
+            )
+
+        client.reconcile_session.side_effect = replace_before_observation
+
+        reconcile_uncertain_agent(
+            self.store,
+            job,
+            now=10,
+            herdr_factory=lambda: client,
+        )
+
+        current = self.store.get(job.id)
+        self.assertEqual(current.agent_dispatch_state, "dispatching")
+        self.assertEqual(current.herdr_workspace_id, "workspace-b")
+        current_operation = current.agent_session_operation
+        self.assertIsNotNone(current_operation)
+        assert current_operation is not None
+        self.assertIsNone(current_operation.session)
 
     def test_typed_cleanup_never_closes_mismatched_checkout(self) -> None:
         job = self.create(

@@ -22,6 +22,7 @@ from ..integrations.github import (
 from ..integrations.herdr import (
     HerdrClient,
     HerdrError,
+    agent_session_identity,
 )
 from ..integrations.linear import LinearError, LinearIntegration
 from ..integrations.registry import build_integration_registry, issue_provider
@@ -371,6 +372,8 @@ def reconcile_uncertain_agent(
             if (
                 current.agent_dispatch_state not in states
                 or current.herdr_target != target
+                or current.revision != job.revision
+                or current.agent_session_operation != operation
             ):
                 return None
             next_state = (
@@ -378,15 +381,15 @@ def reconcile_uncertain_agent(
                 if identity is not None
                 else AgentSessionState.AMBIGUOUS
             )
-            operation = current.agent_session_operation
+            current_operation = current.agent_session_operation
             changes: dict[str, object] = {
                 **(
                     {
-                        "agent_session_operation": operation.transition(
+                        "agent_session_operation": current_operation.transition(
                             next_state, session=identity
                         )
                     }
-                    if operation is not None
+                    if current_operation is not None
                     else {"agent_dispatch_state": next_state.value}
                 ),
                 "agent_name": str(agent.get("name") or target),
@@ -421,22 +424,27 @@ def reconcile_uncertain_agent(
         return
 
     def visible(current: CursorJob) -> CursorJob | None:
-        if current.agent_dispatch_state not in states or current.herdr_target != target:
+        if (
+            current.agent_dispatch_state not in states
+            or current.herdr_target != target
+            or current.revision != job.revision
+            or current.agent_session_operation != operation
+        ):
             return None
         next_state = (
             AgentSessionState.READY
             if identity is not None
             else AgentSessionState.AMBIGUOUS
         )
-        operation = current.agent_session_operation
+        current_operation = current.agent_session_operation
         changes: dict[str, object] = {
             **(
                 {
-                    "agent_session_operation": operation.transition(
+                    "agent_session_operation": current_operation.transition(
                         next_state, session=identity
                     )
                 }
-                if operation is not None
+                if current_operation is not None
                 else {"agent_dispatch_state": next_state.value}
             ),
             "agent_name": str(agent.get("name") or target),
@@ -1699,13 +1707,13 @@ def resolve_manual_reconciliation(
         raise HarnessError("manual reconciliation outcome is invalid")
     supplied_pane_identity = pane_id is not None or workspace_id is not None
     if supplied_pane_identity and (
-        operation != "pane"
+        operation not in {"pane", "worktree"}
         or outcome != "materialized"
         or not pane_id
         or not workspace_id
     ):
         raise HarnessError(
-            "pane and workspace identity require a materialized pane outcome"
+            "pane and workspace identity require a materialized pane or worktree outcome"
         )
     resolved_at = time.time() if now is None else now
 
@@ -1772,10 +1780,19 @@ def _reconcile_question_prompt(
     current_status = ""
     if not observed_started:
         try:
+            prompt_identity = question_adapter.shared_prompt_identity(job, question)
+        except PromptOperationError:
+            return
+        try:
             client = herdr_factory()
             client.ensure_server()
             agent = client.get_agent(job.herdr_target or "")
         except (HarnessError, HerdrError):
+            return
+        if (
+            agent_session_identity(agent.get("agent_session"))
+            != prompt_identity.agent_session
+        ):
             return
         value = agent.get("state_change_seq")
         current_sequence = (
@@ -1792,8 +1809,8 @@ def _reconcile_question_prompt(
         current_question = question_adapter.current(current)
         if (
             current_question is None
-            or current_question.id != question.id
-            or current_question.prompt_state != question.prompt_state
+            or current.revision != job.revision
+            or current_question != question
             or is_worker_alive(current)
         ):
             return None

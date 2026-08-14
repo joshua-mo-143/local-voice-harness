@@ -132,8 +132,8 @@ def test_v17_incomplete_operations_migrate_to_safe_typed_states() -> None:
 
     migrated = CursorJob.from_dict(values)
 
-    assert migrated.worktree_provision_state == "ready"
-    assert migrated.agent_dispatch_state == "ready"
+    assert migrated.worktree_provision_state == "ambiguous"
+    assert migrated.agent_dispatch_state == "ambiguous"
     assert migrated.agent_operation_checkout == "/checkout"
     assert migrated.participant_creation_checkout == "/checkout"
     assert migrated.fork_operation_state == "ambiguous"
@@ -141,6 +141,7 @@ def test_v17_incomplete_operations_migrate_to_safe_typed_states() -> None:
     assert migrated.checkout_operation.state == CheckoutState.AMBIGUOUS
     assert migrated.agent_session_operation is not None
     assert migrated.agent_session_operation.state == AgentSessionState.AMBIGUOUS
+    assert migrated.has_uncertain_operation()
     assert migrated.participant_pane_operation is not None
     assert migrated.fork_operation is not None
 

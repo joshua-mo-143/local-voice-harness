@@ -1217,15 +1217,20 @@ def _typed_prompt_operation(
 
 
 def _optional_typed_prompt_operation(
-    values: Mapping[str, object], job_id: str
+    values: Mapping[str, object], job_id: str, *, loaded_version: int
 ) -> PromptOperation | None:
     try:
         return _typed_prompt_operation(values, job_id)
     except JobValidationError:
-        return None
+        if (
+            loaded_version < CURRENT_SCHEMA_VERSION
+            or values.get("migration_source_schema_version") is not None
+        ):
+            return None
+        raise
 
 
-def _consume_typed_prompt_operation(changes: dict[str, object]) -> None:
+def _consume_typed_prompt_operation(changes: dict[str, object], *, job_id: str) -> None:
     operation = changes.pop("prompt_operation", None)
     if operation is None:
         return
@@ -1242,6 +1247,11 @@ def _consume_typed_prompt_operation(changes: dict[str, object]) -> None:
         ),
     ):
         raise JobValidationError("prompt_operation must be a typed PromptOperation")
+    if not isinstance(operation, IdlePrompt):
+        if operation.identity.job_id != job_id:
+            raise JobValidationError("prompt operation does not belong to this job")
+        changes["turn"] = operation.identity.turn
+        changes["turn_token"] = operation.identity.turn_token
     changes.update(legacy_prompt_fields(operation))
 
 
@@ -1337,12 +1347,14 @@ def _typed_agent_session_operation(
         values.get("agent_provider_session_id"),
         values.get("agent_state_sequence"),
     )
+    clear_legacy_session = False
     if (
         parsed in {AgentSessionState.READY, AgentSessionState.RETAINED}
-        and not any(value is not None for value in session_values)
         and loaded_version < CURRENT_SCHEMA_VERSION
+        and not all(value is not None for value in session_values)
     ):
         parsed = AgentSessionState.AMBIGUOUS
+        clear_legacy_session = True
     try:
         return load_agent_session_operation(
             state=parsed.value,
@@ -1388,17 +1400,19 @@ def _typed_agent_session_operation(
             ),
             provider=(
                 str(values["agent_provider"])
-                if values.get("agent_provider") is not None
+                if values.get("agent_provider") is not None and not clear_legacy_session
                 else None
             ),
             session_id=(
                 str(values["agent_provider_session_id"])
                 if values.get("agent_provider_session_id") is not None
+                and not clear_legacy_session
                 else None
             ),
             state_sequence=(
                 _integer(values["agent_state_sequence"], "agent_state_sequence")
                 if values.get("agent_state_sequence") is not None
+                and not clear_legacy_session
                 else None
             ),
         )
@@ -1680,6 +1694,33 @@ class AgentJob:
         ):
             raise JobValidationError(f"{status.value} job requires completed_at")
 
+        prompt_operation = _optional_typed_prompt_operation(
+            values,
+            str(values["id"]),
+            loaded_version=loaded_version,
+        )
+        checkout_operation = _optional_typed_checkout_operation(
+            values, loaded_version=loaded_version
+        )
+        agent_session_operation = _optional_typed_agent_session_operation(
+            values, loaded_version=loaded_version
+        )
+        if loaded_version < CURRENT_SCHEMA_VERSION:
+            if checkout_operation is not None:
+                values.update(checkout_fields(checkout_operation))
+            if agent_session_operation is not None:
+                values.update(agent_session_fields(agent_session_operation))
+                if (
+                    agent_session_operation.state == AgentSessionState.AMBIGUOUS
+                    and values.get("agent_dispatch_state") == "ambiguous"
+                    and agent_session_operation.session is None
+                ):
+                    values.update(
+                        agent_provider=None,
+                        agent_provider_session_id=None,
+                        agent_state_sequence=None,
+                    )
+
         job = cls(
             schema_version=CURRENT_SCHEMA_VERSION,
             loaded_schema_version=loaded_version,
@@ -1793,15 +1834,9 @@ class AgentJob:
             active_participant=active_participant,
             _compatibility_layout=compatibility_layout,
             _values=values,
-            _prompt_operation=_optional_typed_prompt_operation(
-                values, str(values["id"])
-            ),
-            _checkout_operation=_optional_typed_checkout_operation(
-                values, loaded_version=loaded_version
-            ),
-            _agent_session_operation=_optional_typed_agent_session_operation(
-                values, loaded_version=loaded_version
-            ),
+            _prompt_operation=prompt_operation,
+            _checkout_operation=checkout_operation,
+            _agent_session_operation=agent_session_operation,
             _lifecycle_event=None,
         )
         job.validate_invariants(
@@ -1898,7 +1933,7 @@ class AgentJob:
         values = self.to_dict()
         for field in remove:
             values.pop(field, None)
-        _consume_typed_prompt_operation(changes)
+        _consume_typed_prompt_operation(changes, job_id=self.id)
         _consume_typed_checkout_operation(changes)
         _consume_typed_agent_session_operation(changes)
         values.update(changes)
@@ -1986,12 +2021,12 @@ class AgentJob:
             values.pop(field, None)
         if dynamic_changes is not None:
             mutable_dynamic = dict(dynamic_changes)
-            _consume_typed_prompt_operation(mutable_dynamic)
+            _consume_typed_prompt_operation(mutable_dynamic, job_id=self.id)
             _consume_typed_checkout_operation(mutable_dynamic)
             _consume_typed_agent_session_operation(mutable_dynamic)
             values.update(mutable_dynamic)
             dynamic_changes = mutable_dynamic
-        _consume_typed_prompt_operation(changes)
+        _consume_typed_prompt_operation(changes, job_id=self.id)
         _consume_typed_checkout_operation(changes)
         _consume_typed_agent_session_operation(changes)
         values.update(changes)
@@ -3421,6 +3456,20 @@ class AgentJob:
                     participant_creation_workspace_id=None,
                     participant_creation_pane_id=None,
                 )
+        elif operation == "worktree" and outcome == "materialized":
+            checkout = self.checkout_operation
+            resolved_pane = pane_id or self.worktree_root_pane_id
+            resolved_workspace = workspace_id or self.worktree_workspace_id
+            if checkout is None or not resolved_pane or not resolved_workspace:
+                return None
+            try:
+                changes["checkout_operation"] = checkout.transition(
+                    CheckoutState.RETAINED,
+                    workspace_id=resolved_workspace,
+                    root_pane_id=resolved_pane,
+                )
+            except OperationTransitionError:
+                return None
         elif outcome == "materialized":
             if operation == "fork":
                 if not self.fork_operation_target:
@@ -3612,7 +3661,7 @@ class AgentJob:
     def _updated(self, **changes: object) -> CursorJob:
         values = dict(self._values)
         mutable = dict(changes)
-        _consume_typed_prompt_operation(mutable)
+        _consume_typed_prompt_operation(mutable, job_id=self.id)
         _consume_typed_checkout_operation(mutable)
         _consume_typed_agent_session_operation(mutable)
         values.update(mutable)
@@ -4488,7 +4537,7 @@ def transition(
             f"illegal Cursor job transition {job.status.value} -> {status.value}"
         )
     values = job.to_dict()
-    _consume_typed_prompt_operation(changes)
+    _consume_typed_prompt_operation(changes, job_id=job.id)
     _consume_typed_checkout_operation(changes)
     _consume_typed_agent_session_operation(changes)
     values.update(changes)
