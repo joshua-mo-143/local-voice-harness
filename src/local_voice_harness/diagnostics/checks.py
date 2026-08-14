@@ -354,7 +354,7 @@ def _python_environments() -> tuple[tuple[str, Path, Path, str], ...]:
             "wake/management (.venv)",
             PROJECT_ROOT / ".venv",
             PROJECT_ROOT / ".venv" / "bin" / "voice-harness-wake",
-            "uv sync --python 3.11 --extra wake --no-dev",
+            "scripts/sync-wake.sh",
         ),
         (
             "dictation (.venv-dictation)",

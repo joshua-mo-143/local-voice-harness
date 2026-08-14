@@ -20,21 +20,31 @@ The self-health request runs bounded, read-only diagnostics and returns only a
 non-sensitive summary. This text-only smoke does not use the microphone and does
 not require stopping the installed wake listener.
 
-The launcher sets `XDG_CONFIG_HOME` to `.dev/config` and `XDG_STATE_HOME` to
-`.dev/state`. For example, branch-specific backend configuration belongs at
-`.dev/config/voice-harness/backends.toml`, and durable jobs are stored below
-`.dev/state/voice-harness/`. The checkout-local jobs database is explicitly
-`<checkout>/.dev/state/voice-harness/jobs/jobs.sqlite3`. Existing
-`VOICE_HARNESS_*` values are inherited, so temporary overrides remain available:
+The launcher sets `XDG_CONFIG_HOME` to `.dev/config`, `XDG_STATE_HOME` to
+`.dev/state`, and `UV_PROJECT_ENVIRONMENT` to `.dev/venv`. For example,
+branch-specific backend configuration belongs at
+`.dev/config/voice-harness/backends.toml`, durable jobs are stored below
+`.dev/state/voice-harness/`, and launcher dependencies stay in `.dev/venv`.
+The checkout-local jobs database is explicitly
+`<checkout>/.dev/state/voice-harness/jobs/jobs.sqlite3`.
+Existing `VOICE_HARNESS_*` values are inherited, so temporary overrides remain
+available:
 
 ```bash
 VOICE_HARNESS_LLM_PROVIDER=venice scripts/dev.sh text "Summarize my open work"
 ```
 
-Every launcher command selects Python 3.11 and the `wake` extra because the
-checkout's `.venv` is also used by the installed wake service. This keeps
-development runs aligned with the installed runtime and prevents them from
-re-syncing that environment without OpenWakeWord and its compatible NumPy version.
+The primary checkout's `.venv` belongs to the installed wake service. Development
+launcher commands never sync or execute that environment; they select Python 3.11
+and the `wake` extra in `.dev/venv` instead. Git worktrees already have distinct
+checkout-local `.venv` directories, and each worktree launcher likewise uses its own
+ignored `.dev/venv`. The foreground `wake` command restores its launcher-local model
+only when absent. Installed STT, TTS, and LLM services remain shared.
+
+Only explicit installation and wake synchronization may mutate the installed wake
+environment. Run `scripts/sync-wake.sh` to sync its dependencies and restore the
+required OpenWakeWord model if it is missing. Existing model files make the restore
+step a no-op.
 
 GitHub CLI authentication remains shared with the normal user profile. Before
 isolating `XDG_CONFIG_HOME`, the launcher sets `GH_CONFIG_DIR` to the directory
@@ -157,8 +167,9 @@ This is branch testing isolation, not a complete runtime profile:
 The default development environment contains only the package and quality tools;
 it does not install the CUDA, audio, wake-word, or model extras:
 
-```bash
-python_version=3.12
+```fish
+set python_version 3.12
+set -gx UV_PROJECT_ENVIRONMENT ".dev/quality-$python_version"
 uv sync --python $python_version
 uv run ruff format --check .
 uv run ruff check .
