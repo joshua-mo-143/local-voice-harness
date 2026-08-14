@@ -822,6 +822,9 @@ class ProcessUtteranceTests(unittest.TestCase):
             mock.patch.object(daemon, "_drain_playback_queue") as drain_playback,
             mock.patch.object(wake_daemon, "recover_jobs"),
             mock.patch.object(
+                wake_daemon, "recover_retained_transcripts", return_value=()
+            ),
+            mock.patch.object(
                 wake_daemon,
                 "drain_pending_announcements",
                 return_value=announcement_policy.DrainResult(),
