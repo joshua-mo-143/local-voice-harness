@@ -558,6 +558,7 @@ class WakeConversationDaemon:
         self.retained_recovery_retry_at = 0.0
         self.conversation_deadline = 0.0
         self.awaiting_followup = False
+        self.last_ordinary_reply: str | None = None
         self.last_wake = 0.0
         self.force_listen = threading.Event()
         self.running = True
@@ -761,6 +762,7 @@ class WakeConversationDaemon:
         self.pending_config_change = None
         self.conversation_deadline = 0.0
         self.awaiting_followup = False
+        self.last_ordinary_reply = None
         self.pause_microphone()
         try:
             self.stop_components_when_idle()
@@ -1209,6 +1211,14 @@ class WakeConversationDaemon:
             display_text=rendered.display_text,
         )
 
+    def _has_announceable_jobs(self) -> bool:
+        if self._active_completed_followup() is not None:
+            return True
+        return any(
+            job.status in cursor_service.ANNOUNCEABLE_STATUSES and not job.delivered
+            for job in CURSOR_STORE.list()
+        )
+
     def _pending_cursor_question(self) -> PendingQuestionSnapshot | None:
         """Load one immutable question snapshot for routing and answer fencing."""
         if self.cursor_session is None:
@@ -1480,7 +1490,10 @@ class WakeConversationDaemon:
             delivery = ActivationDelivery(record, ActivationDeliveryKind.RESULT)
             self.config_activation_delivery = delivery
             return render_activation_delivery(delivery)
-        if resolve_confirmation(text) == ConfirmationDecision.CONFIRM:
+        if (
+            resolve_confirmation(text) == ConfirmationDecision.CONFIRM
+            or question_control(text) == AnswerOutcome.REPEAT
+        ):
             return AssistantResponse.from_text(
                 "This activation needs a separate explicit confirmation. "
                 "Say activate now to restart the affected service, or not now "
@@ -1817,9 +1830,54 @@ class WakeConversationDaemon:
                 terminalize_non_side_effect()
                 self.close_conversation("spoken command")
                 return None
+            pending_target_resolution = getattr(self, "pending_target_resolution", None)
+            if (
+                pending_target_resolution is not None
+                and time.monotonic() >= pending_target_resolution.expires_at
+            ):
+                self.pending_target_resolution = None
+                pending_target_resolution = None
             if STOP_TALKING_PATTERN.search(text):
                 terminalize_non_side_effect()
                 self.playback_queue.clear()
+                self.awaiting_followup = True
+                self.conversation_deadline = (
+                    time.monotonic() + CONVERSATION_TIMEOUT_SECONDS
+                )
+                notify("Listening for a follow-up…")
+                return None
+            pending_resolution = getattr(self, "pending_target_resolution", None)
+            resolution_active = (
+                pending_resolution is not None
+                and time.monotonic() < pending_resolution.expires_at
+            )
+            activation_record = self.config_activation_store.current()
+            activation_offer_pending = (
+                activation_record is not None
+                and activation_record.status == ActivationStatus.OFFERED
+                and activation_record.offer_delivered
+            )
+            if (
+                question_control(text) == AnswerOutcome.REPEAT
+                and self._pending_cursor_question() is None
+                and not self._has_announceable_jobs()
+                and self.pending_config_change is None
+                and getattr(self, "pending_target_readback", None) is None
+                and not resolution_active
+                and not activation_offer_pending
+            ):
+                terminalize_non_side_effect()
+                spoken = (
+                    self.last_ordinary_reply
+                    if self.last_ordinary_reply
+                    else "I don't have a reply to repeat."
+                )
+                self.ensure_components()
+                response = AssistantResponse.from_text(spoken)
+                print(f"Assistant: {response.display_text}", flush=True)
+                _playback, interruption = self.play_response(response)
+                if interruption is not None:
+                    return interruption
                 self.awaiting_followup = True
                 self.conversation_deadline = (
                     time.monotonic() + CONVERSATION_TIMEOUT_SECONDS
@@ -1845,6 +1903,7 @@ class WakeConversationDaemon:
             next_cursor_session = self.cursor_session
             next_history = list(self.history)
             remember_response = False
+            ordinary_reply = False
             streamed_playback = False
             recommendation_playback = False
             playback: dict[str, object] = {}
@@ -1862,7 +1921,12 @@ class WakeConversationDaemon:
                 if pending_readback is not None or resuming_target_resolution
                 else routing_context
             )
-            if pending_readback is not None:
+            if (
+                pending_readback is not None
+                and question_control(text) == AnswerOutcome.REPEAT
+            ):
+                readback_result = readback_response(pending_readback.candidate)
+            elif pending_readback is not None:
                 (
                     readback_result,
                     confirmed_request,
@@ -2002,7 +2066,9 @@ class WakeConversationDaemon:
             ):
                 if route.intent == Intent.HARNESS_CONFIG_CHANGE:
                     self.pending_config_change = None
-                elif route.actionable:
+                elif (
+                    route.actionable and question_control(text) != AnswerOutcome.REPEAT
+                ):
                     self.pending_config_change = None
                 else:
                     config_response = AssistantResponse.from_text(
@@ -2127,6 +2193,7 @@ class WakeConversationDaemon:
                     )
             elif route.actionable and route.intent == Intent.SELF_HEALTH:
                 response = self_health_response()
+                ordinary_reply = True
             elif invalid_target_resolution:
                 response = TARGET_RESOLUTION_CONTEXT_RESPONSE
             elif missing_ticket_scope:
@@ -2178,6 +2245,7 @@ class WakeConversationDaemon:
                 )
                 if snapshot is None:
                     response = cursor_consultation.NO_PENDING_QUESTION
+                    ordinary_reply = True
                 else:
                     try:
                         client = self.integrations.herdr_client()
@@ -2191,6 +2259,7 @@ class WakeConversationDaemon:
                             context.text,
                         )
                         recommendation_playback = True
+                        ordinary_reply = True
                     except Exception as exc:  # noqa: BLE001 - consultation fails closed
                         response = (
                             str(exc)
@@ -2198,6 +2267,7 @@ class WakeConversationDaemon:
                             and str(exc) == cursor_consultation.STALE_PENDING_QUESTION
                             else cursor_consultation.CONSULTATION_FAILED
                         )
+                        ordinary_reply = True
             elif route.actionable and route.intent == Intent.WORKSPACE_CONSULTATION:
                 completed_job = None
                 if active_completed is not None:
@@ -2221,8 +2291,10 @@ class WakeConversationDaemon:
                         response = cursor_consultation.consult(
                             client, target, context.text
                         )
+                    ordinary_reply = True
                 except Exception:  # noqa: BLE001 - consultation fails closed
                     response = cursor_consultation.CONSULTATION_FAILED
+                    ordinary_reply = True
             elif route.actionable and route.intent == Intent.AGENT_LIST:
                 response, next_cursor_session = cursor_turn(
                     CursorTurnRequest(
@@ -2471,7 +2543,10 @@ class WakeConversationDaemon:
                         settings=self.providers,
                     )
                 remember_response = True
+                ordinary_reply = True
             rendered_response = as_assistant_response(response)
+            if ordinary_reply and rendered_response.spoken_text:
+                self.last_ordinary_reply = rendered_response.spoken_text
             print(f"Assistant: {rendered_response.display_text}", flush=True)
             cursor_session_before_playback = self.cursor_session
             if not streamed_playback:
