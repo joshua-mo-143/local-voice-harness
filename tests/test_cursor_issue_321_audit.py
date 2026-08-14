@@ -19,7 +19,11 @@ from local_voice_harness.cursor.model import (
     JobValidationError,
     WorkflowParticipant,
 )
-from local_voice_harness.cursor.operations import OperationState, WorkerOwnership
+from local_voice_harness.cursor.operations import (
+    AgentSessionState,
+    CheckoutState,
+    WorkerOwnership,
+)
 from local_voice_harness.cursor.provisioning import (
     _fence_participant_creation,
     _participant_pane_callbacks,
@@ -134,9 +138,9 @@ def test_v17_incomplete_operations_migrate_to_safe_typed_states() -> None:
     assert migrated.participant_creation_checkout == "/checkout"
     assert migrated.fork_operation_state == "ambiguous"
     assert migrated.checkout_operation is not None
-    assert migrated.checkout_operation.state == OperationState.UNKNOWN
+    assert migrated.checkout_operation.state == CheckoutState.AMBIGUOUS
     assert migrated.agent_session_operation is not None
-    assert migrated.agent_session_operation.state == OperationState.UNKNOWN
+    assert migrated.agent_session_operation.state == AgentSessionState.AMBIGUOUS
     assert migrated.participant_pane_operation is not None
     assert migrated.fork_operation is not None
 

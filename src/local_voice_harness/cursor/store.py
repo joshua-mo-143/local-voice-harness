@@ -47,7 +47,7 @@ from .model import (
     validate_reservations,
     validate_transition,
 )
-from .operations import WorkerOwnership
+from .operations import WorkerOwnership, checkout_blocks_reservation
 from .sqlite_store import SQLiteJobDatabase, fsync_database_directory
 
 DELIVERED_JOB_RETENTION_SECONDS = 7 * 24 * 60 * 60
@@ -947,7 +947,9 @@ def _job_reserves_resources(job: CursorJob) -> bool:
         or job.has_uncertain_operation()
         or job.manual_reconcile_operation is not None
         or job.worktree_manual_inspection_required
-        or job.worktree_provision_state in {"quarantined", "manual_required"}
+        or checkout_blocks_reservation(
+            None if job.checkout_operation is None else job.checkout_operation.state
+        )
         or job.pull_request_worktree_state == "quarantined"
     )
 

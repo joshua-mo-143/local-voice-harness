@@ -5,8 +5,10 @@ import pytest
 from local_voice_harness.cursor.operations import (
     AgentSessionOperation,
     AgentSessionSpec,
+    AgentSessionState,
     CheckoutOperation,
     CheckoutSpec,
+    CheckoutState,
     ForkOperation,
     ForkSpec,
     OperationState,
@@ -24,10 +26,10 @@ from local_voice_harness.cursor.operations import (
     [
         (
             CheckoutOperation(
-                OperationState.PLANNED,
+                CheckoutState.PLANNED,
                 CheckoutSpec("/repo", "voice/task", "/worktree"),
             ),
-            OperationState.ACTIVE,
+            CheckoutState.DISPATCHING,
         ),
         (
             ForkOperation(
@@ -60,7 +62,7 @@ from local_voice_harness.cursor.operations import (
 )
 def test_operation_state_machines_accept_legal_transitions(
     operation: CheckoutOperation | ForkOperation | ParticipantPaneOperation,
-    next_state: OperationState,
+    next_state: CheckoutState | OperationState,
 ) -> None:
     assert operation.transition(next_state).state == next_state
 
@@ -70,10 +72,10 @@ def test_operation_state_machines_accept_legal_transitions(
     [
         (
             CheckoutOperation(
-                OperationState.PLANNED,
+                CheckoutState.PLANNED,
                 CheckoutSpec("/repo", "voice/task", "/worktree"),
             ),
-            OperationState.MANUAL,
+            CheckoutState.MANUAL_REQUIRED,
         ),
         (
             ForkOperation(
@@ -106,7 +108,7 @@ def test_operation_state_machines_accept_legal_transitions(
 )
 def test_operation_state_machines_reject_illegal_transitions(
     operation: CheckoutOperation | ForkOperation | ParticipantPaneOperation,
-    next_state: OperationState,
+    next_state: CheckoutState | OperationState,
 ) -> None:
     with pytest.raises(OperationTransitionError):
         operation.transition(next_state)
@@ -174,7 +176,7 @@ def test_agent_reconciliation_uses_complete_identity_and_sequence_fence(
 ) -> None:
     identity = SessionIdentity("cursor/herdr", "session", "agent", 7)
     operation = AgentSessionOperation(
-        OperationState.SETTLED,
+        AgentSessionState.READY,
         AgentSessionSpec("agent", "/worktree", "workspace", "pane"),
         identity,
     )
@@ -184,8 +186,29 @@ def test_agent_reconciliation_uses_complete_identity_and_sequence_fence(
 
 def test_operation_specs_survive_uncertain_and_manual_states() -> None:
     spec = CheckoutSpec("/repo", "voice/task", "/worktree")
-    active = CheckoutOperation(OperationState.ACTIVE, spec)
-    unknown = active.transition(OperationState.UNKNOWN)
-    manual = unknown.transition(OperationState.MANUAL)
+    active = CheckoutOperation(CheckoutState.DISPATCHING, spec)
+    unknown = active.transition(CheckoutState.AMBIGUOUS)
+    manual = unknown.transition(CheckoutState.MANUAL_REQUIRED)
     assert unknown.spec == spec
     assert manual.spec == spec
+
+
+def test_checkout_preserves_ready_versus_retained() -> None:
+    spec = CheckoutSpec("/repo", "voice/task", "/worktree")
+    dispatching = CheckoutOperation(CheckoutState.DISPATCHING, spec)
+    ready = dispatching.transition(
+        CheckoutState.READY, workspace_id="ws", root_pane_id="pane"
+    )
+    retained = ready.transition(CheckoutState.RETAINED)
+    assert ready.state == CheckoutState.READY
+    assert retained.state == CheckoutState.RETAINED
+    assert retained.workspace_id == "ws"
+
+
+def test_checkout_preserves_quarantine_versus_ambiguous() -> None:
+    spec = CheckoutSpec("/repo", "voice/task", "/worktree")
+    dispatching = CheckoutOperation(CheckoutState.DISPATCHING, spec)
+    quarantined = dispatching.transition(CheckoutState.QUARANTINED)
+    ambiguous = quarantined.transition(CheckoutState.AMBIGUOUS)
+    assert quarantined.state == CheckoutState.QUARANTINED
+    assert ambiguous.state == CheckoutState.AMBIGUOUS

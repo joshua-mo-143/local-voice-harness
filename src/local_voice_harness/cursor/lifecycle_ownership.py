@@ -440,10 +440,9 @@ def _build_field_ownership() -> tuple[FieldOwnership, ...]:
             adapter="CursorJob.checkout_operation / fork_operation",
             callers=_CHECKOUT_CALLERS + ("cursor.recovery.reconcile_uncertain_fork",),
             duplicate=(
-                "Checkout and fork labels such as retained, quarantined, "
-                "confirmed_absent, and failed_observing are reconstructed into "
-                "generic SETTLED/UNKNOWN/FAILED; provisioning and recovery still "
-                "interpret the original strings."
+                "Fork labels such as retained, quarantined, confirmed_absent, "
+                "and failed_observing still collapse into generic "
+                "SETTLED/UNKNOWN/FAILED. Checkout now uses CheckoutState."
             ),
         )
     )
@@ -544,9 +543,8 @@ def _build_field_ownership() -> tuple[FieldOwnership, ...]:
                 "cursor.recovery.resolve_manual_reconciliation",
             ),
             duplicate=(
-                "session_id aliases herdr_target; agent_dispatch_state labels "
-                "retained/ready/ambiguous/failed_observing collapse to generic "
-                "typed OperationState while callers still branch on the strings."
+                "session_id aliases herdr_target. Agent session labels now use "
+                "AgentSessionState; herdr_target remains a live-binding alias."
             ),
         )
     )
@@ -601,32 +599,7 @@ TOP_LEVEL_STATES: frozenset[str] = frozenset(
     status.value for status in model_mod.JobStatus
 )
 
-DUPLICATE_AUTHORITIES: tuple[DuplicateAuthority, ...] = (
-    DuplicateAuthority(
-        name="checkout-session-label-collapse",
-        representations=(
-            "worktree_provision_state strings "
-            "(ready/retained/quarantined/ambiguous/failed_observing/"
-            "confirmed_absent/manual_required)",
-            "agent_dispatch_state strings with the same distinctions",
-            "CheckoutOperation/AgentSessionOperation OperationState "
-            "(SETTLED/UNKNOWN/FAILED/MANUAL)",
-        ),
-        overlapping_files=(
-            "src/local_voice_harness/cursor/operations.py",
-            "src/local_voice_harness/cursor/model.py",
-            "src/local_voice_harness/cursor/provisioning.py",
-            "src/local_voice_harness/cursor/recovery.py",
-        ),
-        crash_risk=(
-            "Retained versus ready, quarantined versus ambiguous, and confirmed "
-            "absence versus failed observation change replay, reservation, and "
-            "cleanup. Collapsing them in the typed view leaves the flat strings "
-            "as a second decision model."
-        ),
-        child_issue=360,
-    ),
-)
+DUPLICATE_AUTHORITIES: tuple[DuplicateAuthority, ...] = ()
 
 CHILD_SEQUENCE: tuple[ChildSequence, ...] = (
     ChildSequence(
@@ -667,7 +640,12 @@ CHILD_SEQUENCE: tuple[ChildSequence, ...] = (
         issue=360,
         title="Consolidate checkout and session operation lifecycle ownership",
         blocked_by=(357, 359),
-        overlapping_files=DUPLICATE_AUTHORITIES[0].overlapping_files,
+        overlapping_files=(
+            "src/local_voice_harness/cursor/operations.py",
+            "src/local_voice_harness/cursor/model.py",
+            "src/local_voice_harness/cursor/provisioning.py",
+            "src/local_voice_harness/cursor/recovery.py",
+        ),
         overlapping_contracts=(
             "CheckoutOperation",
             "AgentSessionOperation",
@@ -1289,6 +1267,16 @@ COMPATIBILITY_ADAPTERS: frozenset[str] = frozenset(
         "local_voice_harness.cursor.model._typed_prompt_operation",
         "local_voice_harness.cursor.model._optional_typed_prompt_operation",
         "local_voice_harness.cursor.model._consume_typed_prompt_operation",
+        "local_voice_harness.cursor.model._typed_checkout_operation",
+        "local_voice_harness.cursor.model._optional_typed_checkout_operation",
+        "local_voice_harness.cursor.model._consume_typed_checkout_operation",
+        "local_voice_harness.cursor.model._typed_agent_session_operation",
+        "local_voice_harness.cursor.model._optional_typed_agent_session_operation",
+        "local_voice_harness.cursor.model._consume_typed_agent_session_operation",
+        "local_voice_harness.cursor.operations.load_checkout_operation",
+        "local_voice_harness.cursor.operations.checkout_fields",
+        "local_voice_harness.cursor.operations.load_agent_session_operation",
+        "local_voice_harness.cursor.operations.agent_session_fields",
         "local_voice_harness.cursor.operations.load_worker_ownership",
         "local_voice_harness.cursor.operations.worker_ownership_fields",
         "local_voice_harness.cursor.lifecycle.load_terminal_state",
@@ -1385,8 +1373,8 @@ BASELINE_COUNTS: dict[str, int] = {
     "named_table_fields": 208,
     "import_only_fields": 4,
     "cursor_job_public_properties": 152,
-    "compatibility_adapters": 28,
+    "compatibility_adapters": 38,
     "transition_entry_points": 72,
-    "duplicate_authorities": 1,
-    "lifecycle_module_lines": 24401,
+    "duplicate_authorities": 0,
+    "lifecycle_module_lines": 25006,
 }

@@ -23,6 +23,159 @@ class OperationState(StrEnum):
     MANUAL = "manual"
 
 
+class CheckoutState(StrEnum):
+    PLANNED = "planned"
+    DISPATCHING = "dispatching"
+    READY = "ready"
+    RETAINED = "retained"
+    QUARANTINED = "quarantined"
+    AMBIGUOUS = "ambiguous"
+    FAILED_OBSERVING = "failed_observing"
+    CONFIRMED_ABSENT = "confirmed_absent"
+    MANUAL_REQUIRED = "manual_required"
+
+
+class AgentSessionState(StrEnum):
+    DISPATCHING = "dispatching"
+    READY = "ready"
+    RETAINED = "retained"
+    AMBIGUOUS = "ambiguous"
+    FAILED_OBSERVING = "failed_observing"
+    CONFIRMED_ABSENT = "confirmed_absent"
+    MANUAL_REQUIRED = "manual_required"
+
+
+_SETTLED_CHECKOUT_STATES = frozenset({CheckoutState.READY, CheckoutState.RETAINED})
+_UNKNOWN_CHECKOUT_STATES = frozenset(
+    {
+        CheckoutState.QUARANTINED,
+        CheckoutState.AMBIGUOUS,
+        CheckoutState.FAILED_OBSERVING,
+    }
+)
+_SETTLED_SESSION_STATES = frozenset(
+    {AgentSessionState.READY, AgentSessionState.RETAINED}
+)
+_UNKNOWN_SESSION_STATES = frozenset(
+    {AgentSessionState.AMBIGUOUS, AgentSessionState.FAILED_OBSERVING}
+)
+
+# Preserve the previous collapsed OperationState edges, plus same-collapse
+# distinctions that callers already persisted (ready/retained, quarantined/
+# ambiguous/failed_observing).
+_CHECKOUT_TRANSITIONS = {
+    CheckoutState.PLANNED: frozenset(
+        {
+            CheckoutState.DISPATCHING,
+            CheckoutState.READY,
+            CheckoutState.RETAINED,
+            CheckoutState.CONFIRMED_ABSENT,
+        }
+    ),
+    CheckoutState.DISPATCHING: frozenset(
+        {
+            CheckoutState.READY,
+            CheckoutState.RETAINED,
+            CheckoutState.QUARANTINED,
+            CheckoutState.AMBIGUOUS,
+            CheckoutState.FAILED_OBSERVING,
+            CheckoutState.CONFIRMED_ABSENT,
+            CheckoutState.MANUAL_REQUIRED,
+        }
+    ),
+    CheckoutState.QUARANTINED: frozenset(
+        {
+            CheckoutState.READY,
+            CheckoutState.RETAINED,
+            CheckoutState.AMBIGUOUS,
+            CheckoutState.FAILED_OBSERVING,
+            CheckoutState.CONFIRMED_ABSENT,
+            CheckoutState.MANUAL_REQUIRED,
+        }
+    ),
+    CheckoutState.AMBIGUOUS: frozenset(
+        {
+            CheckoutState.READY,
+            CheckoutState.RETAINED,
+            CheckoutState.QUARANTINED,
+            CheckoutState.FAILED_OBSERVING,
+            CheckoutState.CONFIRMED_ABSENT,
+            CheckoutState.MANUAL_REQUIRED,
+        }
+    ),
+    CheckoutState.FAILED_OBSERVING: frozenset(
+        {
+            CheckoutState.READY,
+            CheckoutState.RETAINED,
+            CheckoutState.QUARANTINED,
+            CheckoutState.AMBIGUOUS,
+            CheckoutState.CONFIRMED_ABSENT,
+            CheckoutState.MANUAL_REQUIRED,
+        }
+    ),
+    CheckoutState.MANUAL_REQUIRED: frozenset(
+        {
+            CheckoutState.READY,
+            CheckoutState.RETAINED,
+            CheckoutState.CONFIRMED_ABSENT,
+        }
+    ),
+    CheckoutState.READY: frozenset(
+        {CheckoutState.RETAINED, CheckoutState.CONFIRMED_ABSENT}
+    ),
+    CheckoutState.RETAINED: frozenset(
+        {CheckoutState.READY, CheckoutState.CONFIRMED_ABSENT}
+    ),
+    CheckoutState.CONFIRMED_ABSENT: frozenset(),
+}
+
+_SESSION_TRANSITIONS = {
+    AgentSessionState.DISPATCHING: frozenset(
+        {
+            AgentSessionState.READY,
+            AgentSessionState.RETAINED,
+            AgentSessionState.AMBIGUOUS,
+            AgentSessionState.FAILED_OBSERVING,
+            AgentSessionState.CONFIRMED_ABSENT,
+            AgentSessionState.MANUAL_REQUIRED,
+        }
+    ),
+    AgentSessionState.AMBIGUOUS: frozenset(
+        {
+            AgentSessionState.READY,
+            AgentSessionState.RETAINED,
+            AgentSessionState.FAILED_OBSERVING,
+            AgentSessionState.CONFIRMED_ABSENT,
+            AgentSessionState.MANUAL_REQUIRED,
+        }
+    ),
+    AgentSessionState.FAILED_OBSERVING: frozenset(
+        {
+            AgentSessionState.READY,
+            AgentSessionState.RETAINED,
+            AgentSessionState.AMBIGUOUS,
+            AgentSessionState.CONFIRMED_ABSENT,
+            AgentSessionState.MANUAL_REQUIRED,
+        }
+    ),
+    AgentSessionState.MANUAL_REQUIRED: frozenset(
+        {
+            AgentSessionState.READY,
+            AgentSessionState.RETAINED,
+            AgentSessionState.AMBIGUOUS,
+            AgentSessionState.CONFIRMED_ABSENT,
+        }
+    ),
+    AgentSessionState.READY: frozenset(
+        {AgentSessionState.RETAINED, AgentSessionState.CONFIRMED_ABSENT}
+    ),
+    AgentSessionState.RETAINED: frozenset(
+        {AgentSessionState.READY, AgentSessionState.CONFIRMED_ABSENT}
+    ),
+    AgentSessionState.CONFIRMED_ABSENT: frozenset(),
+}
+
+
 _TRANSITIONS = {
     OperationState.PLANNED: frozenset(
         {OperationState.ACTIVE, OperationState.SETTLED, OperationState.FAILED}
@@ -146,7 +299,7 @@ class CheckoutSpec:
 
 @dataclass(frozen=True, slots=True)
 class CheckoutOperation:
-    state: OperationState
+    state: CheckoutState
     spec: CheckoutSpec
     workspace_id: str | None = None
     root_pane_id: str | None = None
@@ -156,7 +309,7 @@ class CheckoutOperation:
             raise OperationTransitionError(
                 "checkout workspace and root-pane identity must be paired"
             )
-        if self.state == OperationState.SETTLED and (
+        if self.state in _SETTLED_CHECKOUT_STATES and (
             not self.workspace_id or not self.root_pane_id
         ):
             raise OperationTransitionError(
@@ -165,12 +318,12 @@ class CheckoutOperation:
 
     def transition(
         self,
-        state: OperationState,
+        state: CheckoutState,
         *,
         workspace_id: str | None = None,
         root_pane_id: str | None = None,
     ) -> CheckoutOperation:
-        if state not in _TRANSITIONS[self.state]:
+        if state not in _CHECKOUT_TRANSITIONS[self.state]:
             raise OperationTransitionError(
                 f"checkout cannot transition from {self.state} to {state}"
             )
@@ -180,6 +333,56 @@ class CheckoutOperation:
             workspace_id=workspace_id or self.workspace_id,
             root_pane_id=root_pane_id or self.root_pane_id,
         )
+
+
+def checkout_fields(operation: CheckoutOperation) -> dict[str, object]:
+    """Flatten a typed checkout without changing the legacy storage schema."""
+    return {
+        "worktree_provision_state": operation.state.value,
+        "repository": operation.spec.repository,
+        "worktree_branch": operation.spec.branch,
+        "worktree_path": operation.spec.path,
+        "worktree_workspace_id": operation.workspace_id,
+        "worktree_root_pane_id": operation.root_pane_id,
+    }
+
+
+def load_checkout_operation(
+    *,
+    state: str | None,
+    repository: str | None,
+    branch: str | None,
+    path: str | None,
+    workspace_id: str | None,
+    root_pane_id: str | None,
+) -> CheckoutOperation | None:
+    """Adapt persisted checkout labels into the typed operation."""
+    if state is None:
+        return None
+    try:
+        parsed = CheckoutState(state)
+    except ValueError as exc:
+        raise OperationTransitionError(
+            f"invalid checkout operation state {state!r}"
+        ) from exc
+    return CheckoutOperation(
+        parsed,
+        CheckoutSpec(repository or "", branch or "", path or ""),
+        workspace_id,
+        root_pane_id,
+    )
+
+
+def checkout_blocks_reservation(state: CheckoutState | None) -> bool:
+    return state in {CheckoutState.QUARANTINED, CheckoutState.MANUAL_REQUIRED}
+
+
+def checkout_is_usable(state: CheckoutState | None) -> bool:
+    return state in _SETTLED_CHECKOUT_STATES
+
+
+def uncertain_checkout_state(*, ambiguous: bool) -> CheckoutState:
+    return CheckoutState.AMBIGUOUS if ambiguous else CheckoutState.FAILED_OBSERVING
 
 
 @dataclass(frozen=True, slots=True)
@@ -270,7 +473,7 @@ class AgentSessionSpec:
 
 @dataclass(frozen=True, slots=True)
 class AgentSessionOperation:
-    state: OperationState
+    state: AgentSessionState
     spec: AgentSessionSpec
     session: SessionIdentity | None = None
 
@@ -279,18 +482,18 @@ class AgentSessionOperation:
             raise OperationTransitionError(
                 "agent session target does not match its spec"
             )
-        if self.state == OperationState.SETTLED and self.session is None:
+        if self.state in _SETTLED_SESSION_STATES and self.session is None:
             raise OperationTransitionError(
                 "settled agent operation requires provider session identity"
             )
 
     def transition(
         self,
-        state: OperationState,
+        state: AgentSessionState,
         *,
         session: SessionIdentity | None = None,
     ) -> AgentSessionOperation:
-        if state not in _TRANSITIONS[self.state]:
+        if state not in _SESSION_TRANSITIONS[self.state]:
             raise OperationTransitionError(
                 f"agent session cannot transition from {self.state} to {state}"
             )
@@ -303,6 +506,70 @@ class AgentSessionOperation:
             target=identity.target,
             state_sequence=identity.state_sequence,
         )
+
+
+def agent_session_fields(operation: AgentSessionOperation) -> dict[str, object]:
+    """Flatten a typed session without changing the legacy storage schema."""
+    fields: dict[str, object] = {
+        "agent_dispatch_state": operation.state.value,
+        "agent_operation_target": operation.spec.target,
+        "agent_operation_checkout": operation.spec.checkout,
+        "agent_operation_workspace_id": operation.spec.workspace_id,
+        "agent_operation_pane_id": operation.spec.pane_id,
+    }
+    if operation.session is not None:
+        fields.update(
+            agent_provider=operation.session.provider,
+            agent_provider_session_id=operation.session.session_id,
+            agent_state_sequence=operation.session.state_sequence,
+        )
+    return fields
+
+
+def load_agent_session_operation(
+    *,
+    state: str | None,
+    target: str | None,
+    checkout: str | None,
+    workspace_id: str | None,
+    pane_id: str | None,
+    provider: str | None,
+    session_id: str | None,
+    state_sequence: int | None,
+) -> AgentSessionOperation | None:
+    """Adapt persisted session labels into the typed operation."""
+    if state is None:
+        return None
+    try:
+        parsed = AgentSessionState(state)
+    except ValueError as exc:
+        raise OperationTransitionError(
+            f"invalid agent session operation state {state!r}"
+        ) from exc
+    session = None
+    values = (provider, session_id, state_sequence)
+    if any(value is not None for value in values):
+        if not all(value is not None for value in values):
+            raise OperationTransitionError(
+                "agent provider session identity is incomplete"
+            )
+        assert provider is not None
+        assert session_id is not None
+        assert state_sequence is not None
+        session = SessionIdentity(provider, session_id, target or "", state_sequence)
+    return AgentSessionOperation(
+        parsed,
+        AgentSessionSpec(
+            target or "", checkout or "", workspace_id or "", pane_id or ""
+        ),
+        session,
+    )
+
+
+def uncertain_session_state(*, ambiguous: bool) -> AgentSessionState:
+    return (
+        AgentSessionState.AMBIGUOUS if ambiguous else AgentSessionState.FAILED_OBSERVING
+    )
 
 
 @dataclass(frozen=True, slots=True)
