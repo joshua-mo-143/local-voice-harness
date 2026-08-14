@@ -1376,5 +1376,5 @@ BASELINE_COUNTS: dict[str, int] = {
     "compatibility_adapters": 38,
     "transition_entry_points": 72,
     "duplicate_authorities": 0,
-    "lifecycle_module_lines": 25305,
+    "lifecycle_module_lines": 25356,
 }

@@ -3,6 +3,7 @@ from __future__ import annotations
 import collections
 import contextlib
 import json
+import os
 import select
 import shutil
 import socket
@@ -24,6 +25,11 @@ from .stream import STREAM_POLL_SECONDS, STREAM_TIMEOUT_SECONDS, TTSStreamParser
 PREFETCH_JOIN_SECONDS = 3.0
 PREFETCH_CONNECT_SECONDS = 2.0
 PREFETCH_LIMIT = 2
+PLAYBACK_PROGRESS_TIMEOUT_SECONDS = 5.0
+
+
+class _PlaybackFailure(HarnessError):
+    pass
 
 
 @dataclass
@@ -377,15 +383,102 @@ def _open_playback(
 def _wait_for_process(
     process: subprocess.Popen[bytes],
     on_poll: Callable[[], None] | None,
-) -> int:
-    if on_poll is None:
-        return process.wait()
+    should_interrupt: Callable[[], bool] | None,
+) -> int | None:
+    deadline = time.monotonic() + PLAYBACK_PROGRESS_TIMEOUT_SECONDS
     while True:
-        on_poll()
+        if on_poll is not None:
+            on_poll()
+        if should_interrupt is not None and should_interrupt():
+            return None
         try:
             return process.wait(timeout=STREAM_POLL_SECONDS)
         except subprocess.TimeoutExpired:
+            if time.monotonic() >= deadline:
+                raise HarnessError("pw-play completion stalled") from None
+
+
+def _playback_fd(process: subprocess.Popen[bytes]) -> int | None:
+    if process.stdin is None:
+        raise _PlaybackFailure("pw-play stdin is unavailable")
+    fd = process.stdin.fileno()
+    if not isinstance(fd, int):
+        # Test doubles and alternate file-like process adapters may not expose
+        # an OS descriptor. Real subprocess pipes always take the bounded path.
+        return None
+    os.set_blocking(fd, False)
+    return fd
+
+
+def _write_playback(
+    process: subprocess.Popen[bytes],
+    fd: int | None,
+    audio: bytes,
+    *,
+    should_interrupt: Callable[[], bool] | None,
+    on_poll: Callable[[], None] | None,
+) -> bool:
+    if process.stdin is None:
+        raise _PlaybackFailure("pw-play stdin is unavailable")
+    if fd is None:
+        if on_poll is not None:
+            on_poll()
+        if should_interrupt is not None and should_interrupt():
+            return True
+        process.stdin.write(audio)
+        return False
+
+    pending = memoryview(audio)
+    deadline = time.monotonic() + PLAYBACK_PROGRESS_TIMEOUT_SECONDS
+    while pending:
+        if on_poll is not None:
+            on_poll()
+        if should_interrupt is not None and should_interrupt():
+            return True
+        if process.poll() is not None:
+            raise _PlaybackFailure("pw-play exited before playback completed")
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise _PlaybackFailure("pw-play write stalled")
+        try:
+            _, writable, _ = select.select(
+                [],
+                [fd],
+                [],
+                min(STREAM_POLL_SECONDS, remaining),
+            )
+        except (OSError, ValueError) as exc:
+            if process.poll() is not None:
+                raise _PlaybackFailure(
+                    "pw-play exited before playback completed"
+                ) from exc
+            raise
+        if not writable:
             continue
+        try:
+            written = os.write(fd, pending)
+        except BlockingIOError:
+            continue
+        except BrokenPipeError as exc:
+            raise _PlaybackFailure(
+                "pw-play closed stdin before playback completed"
+            ) from exc
+        if written <= 0:
+            raise _PlaybackFailure("pw-play made no write progress")
+        pending = pending[written:]
+        deadline = time.monotonic() + PLAYBACK_PROGRESS_TIMEOUT_SECONDS
+    return False
+
+
+def _terminate_process(process: subprocess.Popen[bytes]) -> None:
+    if process.poll() is not None:
+        return
+    process.terminate()
+    try:
+        process.wait(timeout=1)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=1)
 
 
 def play_prefetched(
@@ -545,11 +638,14 @@ class PlaybackQueue:
         """Play every queued item through one continuous pw-play stream."""
         played: list[tuple[dict[str, object], bool, PlaybackRequest]] = []
         deferred_error: Exception | None = None
+        playback_failed = False
+        invalidate_played_batch = False
         started = time.perf_counter()
         with self._lock:
             self._draining = True
         with playback_slot():
             process: subprocess.Popen[bytes] | None = None
+            playback_fd: int | None = None
             sample_rate = 0
             interrupted = False
             try:
@@ -599,6 +695,7 @@ class PlaybackQueue:
                             if process is None and have < len(chunks_seen):
                                 sample_rate = sample_rate_now
                                 process = _open_playback(sample_rate, self._audio)
+                                playback_fd = _playback_fd(process)
                             if process is not None and process.stdin is None:
                                 raise HarnessError("pw-play stdin is unavailable")
                             while have < len(chunks_seen) and not interrupted:
@@ -631,12 +728,23 @@ class PlaybackQueue:
                                         audio = source.readframes(4096)
                                         if not audio:
                                             break
-                                        process.stdin.write(audio)
+                                        interrupted = _write_playback(
+                                            process,
+                                            playback_fd,
+                                            audio,
+                                            should_interrupt=should_interrupt,
+                                            on_poll=on_poll,
+                                        )
+                                        if interrupted:
+                                            break
                                 if interrupted:
                                     break
                                 chunk_texts.append(texts[have])
                                 have += 1
                                 self.start_prefetch(limit=PREFETCH_LIMIT)
+                    except _PlaybackFailure as exc:
+                        playback_failed = True
+                        deferred_error = exc
                     except Exception as exc:
                         deferred_error = exc
                     finally:
@@ -645,9 +753,7 @@ class PlaybackQueue:
                             and process is not None
                             and process.poll() is None
                         ):
-                            with contextlib.suppress(subprocess.TimeoutExpired):
-                                process.terminate()
-                                process.wait(timeout=1)
+                            _terminate_process(process)
                         handle.discard()
                         _cleanup_chunks(chunks_seen)
                         with self._lock:
@@ -684,13 +790,21 @@ class PlaybackQueue:
                     if deferred_error is not None or interrupted:
                         break
                 if process is not None:
-                    if interrupted:
-                        process.terminate()
-                        process.wait(timeout=1)
+                    if interrupted or playback_failed:
+                        _terminate_process(process)
+                        invalidate_played_batch = playback_failed
                     else:
                         if process.stdin is not None:
                             process.stdin.close()
-                        returncode = _wait_for_process(process, on_poll)
+                        returncode = _wait_for_process(
+                            process,
+                            on_poll,
+                            should_interrupt,
+                        )
+                        if returncode is None:
+                            interrupted = True
+                            _terminate_process(process)
+                            invalidate_played_batch = True
                         if returncode:
                             detail = (
                                 process.stderr.read().decode(errors="replace").strip()
@@ -700,11 +814,13 @@ class PlaybackQueue:
                             raise HarnessError(
                                 f"pw-play failed: {detail or returncode}"
                             )
+                if invalidate_played_batch:
+                    for index, (result, _was_interrupted, request) in enumerate(played):
+                        result["interrupted"] = True
+                        played[index] = (result, True, request)
             finally:
                 if process is not None and process.poll() is None:
-                    with contextlib.suppress(subprocess.TimeoutExpired):
-                        process.terminate()
-                        process.wait(timeout=1)
+                    _terminate_process(process)
                 with self._lock:
                     self._draining = False
         if played:

@@ -1691,7 +1691,6 @@ class WakeConversationDaemon:
                 return None
             if not text:
                 log("wake phrase contained no request; waiting for follow-up")
-                notify("Listening for a follow-up…")
                 self.awaiting_followup = True
                 self.conversation_deadline = (
                     time.monotonic() + CONVERSATION_TIMEOUT_SECONDS
