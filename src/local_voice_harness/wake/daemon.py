@@ -396,6 +396,7 @@ def strip_wake_prefix(text: str) -> tuple[str, bool]:
 CLOSE_PATTERN = re.compile(
     r"\b(?:goodbye|stop listening|go to sleep|end conversation)\b", re.IGNORECASE
 )
+STOP_TALKING_PATTERN = re.compile(r"\b(?:stop talking|shut up)\b", re.IGNORECASE)
 PENDING_SUBMIT_PATTERN = re.compile(
     r"\b(?:work\s+on|fix|change|update|implement|add|remove|run|review|inspect|"
     r"start|create|build|refactor|test)\b",
@@ -1815,6 +1816,15 @@ class WakeConversationDaemon:
             if CLOSE_PATTERN.search(text):
                 terminalize_non_side_effect()
                 self.close_conversation("spoken command")
+                return None
+            if STOP_TALKING_PATTERN.search(text):
+                terminalize_non_side_effect()
+                self.playback_queue.clear()
+                self.awaiting_followup = True
+                self.conversation_deadline = (
+                    time.monotonic() + CONVERSATION_TIMEOUT_SECONDS
+                )
+                notify("Listening for a follow-up…")
                 return None
             pending_target_resolution = getattr(self, "pending_target_resolution", None)
             if (

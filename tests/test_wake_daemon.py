@@ -617,6 +617,80 @@ class ProcessUtteranceTests(unittest.TestCase):
         self.assertEqual(daemon.conversation_deadline, 0.0)
         self.assertEqual(daemon.history, [])
 
+    def test_stop_talking_keeps_conversation_open_and_skips_tools(self) -> None:
+        for phrase in ("stop talking", "shut up"):
+            with self.subTest(phrase=phrase):
+                daemon = _bare_daemon()
+                daemon.awaiting_followup = True
+                deadline = time.monotonic() + 30
+                daemon.conversation_deadline = deadline
+                daemon.history = [{"role": "user", "content": "earlier"}]
+                daemon.playback_queue.enqueue(PlaybackRequest(text="still talking"))
+                with (
+                    mock.patch.object(wake_daemon, "transcribe", return_value=phrase),
+                    mock.patch.object(wake_daemon, "start_components") as start,
+                    mock.patch.object(wake_daemon, "stop_components") as stop,
+                    mock.patch.object(wake_daemon, "qwen_turn") as qwen_turn,
+                    mock.patch.object(wake_daemon, "cursor_turn") as cursor_turn,
+                    mock.patch.object(daemon, "close_conversation") as close,
+                    mock.patch.object(
+                        wake_daemon,
+                        "route_intent",
+                        return_value=IntentRoute(Intent.CONVERSATION, "high"),
+                    ) as route_intent,
+                    mock.patch.object(wake_daemon, "notify") as notify,
+                ):
+                    result = daemon.process_utterance(AUDIO_GENERATION, woke=False)
+
+                self.assertIsNone(result)
+                qwen_turn.assert_not_called()
+                cursor_turn.assert_not_called()
+                route_intent.assert_not_called()
+                start.assert_not_called()
+                stop.assert_not_called()
+                close.assert_not_called()
+                self.assertTrue(daemon.awaiting_followup)
+                self.assertGreater(daemon.conversation_deadline, time.monotonic())
+                self.assertEqual(
+                    daemon.history, [{"role": "user", "content": "earlier"}]
+                )
+                self.assertEqual(len(daemon.playback_queue), 0)
+                notify.assert_called_with("Listening for a follow-up…")
+
+    def test_hang_up_phrases_still_close_after_stop_talking(self) -> None:
+        for phrase in ("goodbye", "stop listening", "go to sleep", "end conversation"):
+            with self.subTest(phrase=phrase):
+                daemon = _bare_daemon()
+                daemon.awaiting_followup = True
+                daemon.conversation_deadline = time.monotonic() + 30
+                daemon.history = [{"role": "user", "content": "earlier"}]
+                with (
+                    mock.patch.object(wake_daemon, "transcribe", return_value=phrase),
+                    mock.patch.object(wake_daemon, "start_components"),
+                    mock.patch.object(wake_daemon, "stop_components"),
+                    mock.patch.object(wake_daemon, "qwen_turn") as qwen_turn,
+                    mock.patch.object(wake_daemon, "cursor_turn") as cursor_turn,
+                    mock.patch.object(wake_daemon, "notify"),
+                ):
+                    result = daemon.process_utterance(AUDIO_GENERATION, woke=False)
+
+                self.assertIsNone(result)
+                qwen_turn.assert_not_called()
+                cursor_turn.assert_not_called()
+                self.assertFalse(daemon.awaiting_followup)
+                self.assertEqual(daemon.conversation_deadline, 0.0)
+                self.assertEqual(daemon.history, [])
+
+    def test_stop_talking_does_not_match_close_pattern(self) -> None:
+        for phrase in ("stop talking", "shut up"):
+            with self.subTest(phrase=phrase):
+                self.assertIsNone(wake_daemon.CLOSE_PATTERN.search(phrase))
+                self.assertIsNotNone(wake_daemon.STOP_TALKING_PATTERN.search(phrase))
+        for phrase in ("goodbye", "stop listening", "go to sleep", "end conversation"):
+            with self.subTest(phrase=phrase):
+                self.assertIsNotNone(wake_daemon.CLOSE_PATTERN.search(phrase))
+                self.assertIsNone(wake_daemon.STOP_TALKING_PATTERN.search(phrase))
+
     def test_end_conversation_barge_in_keeps_conversation_open(self) -> None:
         daemon = _bare_daemon()
         daemon.awaiting_followup = True
