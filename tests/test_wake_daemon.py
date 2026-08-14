@@ -2721,6 +2721,29 @@ class RetainedUtteranceTests(unittest.TestCase):
         delivery.release.assert_called_once_with()
         delivery.mark_ambiguous.assert_not_called()
 
+    def test_failed_terminal_release_is_fenced_before_recovery(self) -> None:
+        daemon = _bare_daemon()
+        delivery = mock.Mock(spec=wake_daemon.RetainedTranscript)
+        delivery.text = ""
+        delivery.woke = False
+        delivery.state = "pending"
+        delivery.delivery_id = "f" * 32
+        delivery.release.side_effect = HarnessError("STT unavailable")
+
+        with (
+            mock.patch.object(wake_daemon, "release_deliveries"),
+            mock.patch.object(wake_daemon, "notify"),
+            mock.patch.object(wake_daemon, "log"),
+        ):
+            daemon.process_utterance(None, woke=False, retained=delivery)
+
+        delivery.release.assert_called_once_with()
+        self.assertTrue(daemon.retained_recovery_required)
+        self.assertEqual(
+            daemon.uncertain_retained_delivery_ids,
+            {delivery.delivery_id},
+        )
+
     def test_rejected_echo_releases_retained_evidence_terminally(self) -> None:
         daemon = _bare_daemon()
         delivery = mock.Mock(spec=wake_daemon.RetainedTranscript)
@@ -2904,11 +2927,13 @@ class RetainedUtteranceTests(unittest.TestCase):
             mock.patch.object(daemon, "process_utterance") as process,
             mock.patch.object(wake_daemon, "log"),
         ):
-            self.assertTrue(daemon._retry_retained_recovery())
+            self.assertFalse(daemon._retry_retained_recovery())
 
         recovered.mark_ambiguous.assert_called_once_with()
         process.assert_not_called()
         self.assertEqual(daemon.uncertain_retained_delivery_ids, set())
+        self.assertTrue(daemon.retained_recovery_required)
+        self.assertGreater(daemon.retained_recovery_retry_at, 0.0)
 
     def test_digest_claims_cannot_run_without_a_successful_fence(self) -> None:
         daemon = _bare_daemon()

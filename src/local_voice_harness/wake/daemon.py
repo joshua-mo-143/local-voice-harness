@@ -2443,6 +2443,15 @@ class WakeConversationDaemon:
                 try:
                     transcript_delivery.release()
                 except Exception as exc:  # noqa: BLE001 - retained evidence survives
+                    self.retained_recovery_required = True
+                    self.retained_recovery_retry_at = (
+                        time.monotonic() + RETAINED_RECOVERY_RETRY_SECONDS
+                    )
+                    uncertain_deliveries = getattr(
+                        self, "uncertain_retained_delivery_ids", set()
+                    )
+                    uncertain_deliveries.add(transcript_delivery.delivery_id)
+                    self.uncertain_retained_delivery_ids = uncertain_deliveries
                     log(
                         "could not release terminal STT delivery "
                         f"{transcript_delivery.delivery_id}: "
@@ -2484,6 +2493,10 @@ class WakeConversationDaemon:
                 else:
                     uncertain_deliveries.remove(delivery.delivery_id)
                     self.uncertain_retained_delivery_ids = uncertain_deliveries
+                    self.retained_recovery_required = True
+                    self.retained_recovery_retry_at = (
+                        time.monotonic() + RETAINED_RECOVERY_RETRY_SECONDS
+                    )
                     log(
                         "uncertain retained voice delivery was fenced for "
                         f"reconciliation: {delivery.delivery_id}"
