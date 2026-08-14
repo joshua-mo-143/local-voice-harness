@@ -221,10 +221,17 @@ def drain_pending_announcements(
     integrations: IntegrationRegistry | None = None,
 ) -> announcement_policy.DrainResult:
     recover_jobs(integrations=integrations)
-    return announcement_policy.drain_background_announcements(
-        CURSOR_STORE,
-        settings,
-    )
+    try:
+        result = announcement_policy.drain_background_announcements(
+            CURSOR_STORE,
+            settings,
+        )
+    except Exception as exc:  # noqa: BLE001 - notification failures cannot stop wake
+        log(f"announcement drain failed: {type(exc).__name__}: {exc}")
+        return announcement_policy.DrainResult()
+    for claim in result.desktop_failed:
+        log(f"desktop notification failed for job {claim.job.id}; delivery will retry")
+    return result
 
 
 class _DeliveryLeaseGuard:

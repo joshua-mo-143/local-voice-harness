@@ -4180,6 +4180,38 @@ class WakeRecordingHandoffTests(unittest.TestCase):
 
 
 class PeriodicCursorRecoveryTests(unittest.TestCase):
+    def test_desktop_notification_failure_is_reported_without_escaping(self) -> None:
+        claim = _delivery_claim("job1", "completed")
+        failed = announcement_policy.DrainResult(desktop_failed=(claim,))
+        with (
+            mock.patch.object(wake_daemon, "recover_jobs"),
+            mock.patch.object(
+                announcement_policy,
+                "drain_background_announcements",
+                return_value=failed,
+            ),
+            mock.patch.object(wake_daemon, "log") as log,
+        ):
+            result = wake_daemon.drain_pending_announcements(USER_CONFIG.announcements)
+
+        self.assertIs(result, failed)
+        self.assertIn("delivery will retry", log.call_args.args[0])
+
+    def test_notification_backend_exception_cannot_escape_drain_boundary(self) -> None:
+        with (
+            mock.patch.object(wake_daemon, "recover_jobs"),
+            mock.patch.object(
+                announcement_policy,
+                "drain_background_announcements",
+                side_effect=RuntimeError("backend unavailable"),
+            ),
+            mock.patch.object(wake_daemon, "log") as log,
+        ):
+            result = wake_daemon.drain_pending_announcements(USER_CONFIG.announcements)
+
+        self.assertEqual(result, announcement_policy.DrainResult())
+        self.assertIn("RuntimeError: backend unavailable", log.call_args.args[0])
+
     def test_next_delivery_poll_recovers_worker_that_died_after_startup(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
