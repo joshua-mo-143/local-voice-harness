@@ -1497,8 +1497,10 @@ class WakeConversationDaemon:
             if (
                 current is not None
                 and current.id == record_id
+                and current.setting_key == "audio.voice"
                 and current.status
                 in {
+                    ActivationStatus.READY,
                     ActivationStatus.VALIDATING,
                     ActivationStatus.ROLLING_BACK,
                 }
@@ -1506,6 +1508,18 @@ class WakeConversationDaemon:
                 log(
                     "could not relaunch voice activation reconciliation worker: "
                     f"{type(exc).__name__}: {exc}"
+                )
+                return
+            if (
+                current is not None
+                and current.id == record_id
+                and current.setting_key == "audio.voice"
+                and current.status == ActivationStatus.RESTARTING
+            ):
+                self.config_activation_store.begin_rollback(
+                    record_id,
+                    "The isolated activation worker could not be relaunched after "
+                    f"voice restart state was recorded: {exc}",
                 )
                 return
             self.config_activation_store.fail_worker(
@@ -1534,7 +1548,11 @@ class WakeConversationDaemon:
         if self.config_activation_delivery == delivery:
             self.config_activation_delivery = None
 
-    def _recover_config_activation(self) -> BargeIn | None:
+    def _recover_config_activation(
+        self,
+        *,
+        actions_allowed: bool = True,
+    ) -> BargeIn | None:
         for record_id, process in tuple(self.launched_config_activations.items()):
             return_code = process.poll()
             if return_code is None:
@@ -1545,22 +1563,41 @@ class WakeConversationDaemon:
                 current is not None
                 and current.id == record_id
                 and current.status
-                in {ActivationStatus.READY, ActivationStatus.RESTARTING}
+                in {
+                    ActivationStatus.READY,
+                    ActivationStatus.VALIDATING,
+                    ActivationStatus.RESTARTING,
+                    ActivationStatus.ROLLING_BACK,
+                }
                 and self.config_activation_dispatch_attempts.get(record_id, 0) >= 2
             ):
-                self.config_activation_store.fail_worker(
-                    record_id,
+                detail = (
                     "The isolated activation worker could not reconcile the durable "
-                    f"request (status {return_code}); no restart will be repeated.",
+                    f"request (status {return_code})."
                 )
+                if current.setting_key == "audio.voice":
+                    if current.status != ActivationStatus.ROLLING_BACK:
+                        self.config_activation_store.begin_rollback(record_id, detail)
+                else:
+                    self.config_activation_store.fail_worker(record_id, detail)
         record = self.config_activation_store.current()
-        if record is not None and record.status in {
-            ActivationStatus.READY,
-            ActivationStatus.VALIDATING,
-            ActivationStatus.RESTARTING,
-            ActivationStatus.ROLLING_BACK,
-        }:
+        dispatchable_statuses = (
+            {
+                ActivationStatus.READY,
+                ActivationStatus.VALIDATING,
+                ActivationStatus.RESTARTING,
+                ActivationStatus.ROLLING_BACK,
+            }
+            if actions_allowed
+            else {
+                ActivationStatus.VALIDATING,
+                ActivationStatus.ROLLING_BACK,
+            }
+        )
+        if record is not None and record.status in dispatchable_statuses:
             self._dispatch_ready_config_activation(record.id)
+        if not actions_allowed:
+            return None
         delivery = self.config_activation_store.next_delivery()
         if delivery is None:
             return None
@@ -2607,8 +2644,10 @@ class WakeConversationDaemon:
         speech_streak = 0
         while self.running:
             actions_allowed = self._retry_retained_recovery()
+            activation_interruption = self._recover_config_activation(
+                actions_allowed=actions_allowed
+            )
             if actions_allowed:
-                activation_interruption = self._recover_config_activation()
                 if activation_interruption is not None:
                     self.continue_after_barge_in(activation_interruption)
                     speech_streak = 0
