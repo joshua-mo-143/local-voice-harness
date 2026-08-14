@@ -2450,6 +2450,7 @@ class WakeConversationDaemon:
     def _recover_retained_utterances(self) -> None:
         for delivery in recover_retained_transcripts():
             if delivery.state == "ambiguous":
+                self.retained_recovery_required = True
                 log(
                     "retained voice turn requires reconciliation before retry: "
                     f"{delivery.delivery_id}"

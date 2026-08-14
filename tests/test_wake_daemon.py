@@ -3086,6 +3086,7 @@ class RetainedUtteranceTests(unittest.TestCase):
             daemon._recover_retained_utterances()
 
         process.assert_not_called()
+        self.assertTrue(daemon.retained_recovery_required)
 
     def test_startup_stays_live_when_retained_recovery_is_unavailable(self) -> None:
         daemon = _bare_daemon()
