@@ -43,6 +43,7 @@ RETAINED_DIRECTORY = "stt-retained"
 QUARANTINE_DIRECTORY = "stt-quarantine"
 RETAINED_METADATA = "delivery.json"
 RETAINED_AUDIO = "audio.wav"
+RELEASED_RETAINED_PREFIX = ".released-"
 MAX_RETAINED_DELIVERIES = 32
 WHISPER_MODELS = frozenset(
     {
@@ -164,7 +165,7 @@ class TranscriptionRequest:
 
 @dataclass(frozen=True)
 class DeliveryRequest:
-    operation: Literal["recover", "release", "pending", "ambiguous"]
+    operation: Literal["recover", "release", "pending", "ambiguous", "terminal"]
     delivery_id: str | None = None
 
 
@@ -436,7 +437,7 @@ def _parse_request(frame: bytes) -> TranscriptionRequest | DeliveryRequest:
     if value.get("version") != PROTOCOL_VERSION:
         raise ProtocolError("unsupported_protocol", "unsupported STT protocol version")
     request_type = value.get("type")
-    if request_type in {"recover", "release", "pending", "ambiguous"}:
+    if request_type in {"recover", "release", "pending", "ambiguous", "terminal"}:
         delivery_id = value.get("delivery_id")
         if request_type != "recover" and (
             not isinstance(delivery_id, str)
@@ -789,7 +790,7 @@ def _load_retained_delivery(path: Path) -> dict[str, object]:
         or (not path.name.startswith(".") and value.get("delivery_id") != path.name)
         or not isinstance(value.get("text"), str)
         or not isinstance(value.get("woke"), bool)
-        or value.get("state") not in {"pending", "ambiguous"}
+        or value.get("state") not in {"pending", "ambiguous", "terminal"}
         or isinstance(value.get("created_at"), bool)
         or not isinstance(value.get("created_at"), (int, float))
         or not math.isfinite(float(value["created_at"]))
@@ -814,6 +815,9 @@ def _recover_retained_deliveries() -> list[dict[str, object]]:
             continue
         _prepare_private_directory(root)
         for delivery in sorted(root.iterdir()):
+            if delivery.name.startswith(RELEASED_RETAINED_PREFIX):
+                _remove_released_retained_delivery(delivery)
+                continue
             if delivery.name.startswith("."):
                 try:
                     metadata = _load_retained_delivery(delivery)
@@ -837,7 +841,7 @@ def _recover_retained_deliveries() -> list[dict[str, object]]:
                 )
     recovered.sort(
         key=lambda delivery: (
-            float(delivery["created_at"]),
+            float(delivery["created_at"]),  # pyright: ignore[reportArgumentType]
             str(delivery["delivery_id"]),
         )
     )
@@ -845,24 +849,77 @@ def _recover_retained_deliveries() -> list[dict[str, object]]:
 
 
 def _update_retained_state(
-    delivery_id: str, state: Literal["pending", "ambiguous"]
+    delivery_id: str, state: Literal["pending", "ambiguous", "terminal"]
 ) -> None:
     delivery, metadata = _find_retained_delivery(delivery_id)
+    if metadata["state"] == "terminal":
+        if state == "terminal":
+            return
+        raise ProtocolError(
+            "invalid_delivery_transition",
+            "terminal retained delivery cannot become replayable or ambiguous",
+        )
     metadata["state"] = state
     replacement = delivery / f".{RETAINED_METADATA}-{uuid.uuid4().hex}"
-    replacement.write_text(
-        json.dumps(metadata, separators=(",", ":")),
-        encoding="utf-8",
-    )
-    replacement.chmod(0o600)
-    os.replace(replacement, delivery / RETAINED_METADATA)
+    try:
+        replacement.write_text(
+            json.dumps(metadata, separators=(",", ":")),
+            encoding="utf-8",
+        )
+        replacement.chmod(0o600)
+        with replacement.open("rb") as metadata_file:
+            os.fsync(metadata_file.fileno())
+        os.replace(replacement, delivery / RETAINED_METADATA)
+        directory_fd = os.open(delivery, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        with contextlib.suppress(FileNotFoundError):
+            replacement.unlink()
+
+
+def _fsync_directory(path: Path) -> None:
+    directory_fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        os.fsync(directory_fd)
+    finally:
+        os.close(directory_fd)
+
+
+def _remove_released_retained_delivery(delivery: Path) -> None:
+    metadata = delivery.lstat()
+    if (
+        not stat.S_ISDIR(metadata.st_mode)
+        or metadata.st_uid != os.getuid()
+        or metadata.st_mode & 0o077
+    ):
+        raise OSError("released retained delivery is not private and harness-owned")
+    allowed = {RETAINED_AUDIO, RETAINED_METADATA}
+    for child in delivery.iterdir():
+        if child.name not in allowed:
+            raise OSError("released retained delivery contains unexpected evidence")
+        child_metadata = child.lstat()
+        if (
+            not stat.S_ISREG(child_metadata.st_mode)
+            or child_metadata.st_uid != os.getuid()
+            or child_metadata.st_mode & 0o077
+        ):
+            raise OSError("released retained evidence is not private and harness-owned")
+        child.unlink()
+    delivery.rmdir()
+    _fsync_directory(delivery.parent)
 
 
 def _release_retained_delivery(delivery_id: str) -> None:
     delivery, _metadata = _find_retained_delivery(delivery_id)
-    (delivery / RETAINED_AUDIO).unlink()
-    (delivery / RETAINED_METADATA).unlink()
-    delivery.rmdir()
+    released = delivery.parent / (
+        f"{RELEASED_RETAINED_PREFIX}{delivery_id}-{uuid.uuid4().hex}"
+    )
+    delivery.rename(released)
+    _fsync_directory(released.parent)
+    _remove_released_retained_delivery(released)
 
 
 def _recovery_error(

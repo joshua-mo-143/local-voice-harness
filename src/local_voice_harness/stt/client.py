@@ -32,6 +32,9 @@ class RetainedTranscript:
     def mark_ambiguous(self) -> None:
         _delivery_request("ambiguous", self.delivery_id)
 
+    def mark_terminal(self) -> None:
+        _delivery_request("terminal", self.delivery_id)
+
     def release(self) -> None:
         _delivery_request("release", self.delivery_id)
 
@@ -203,7 +206,7 @@ def recover_retained_transcripts() -> tuple[RetainedTranscript, ...]:
             or not isinstance(value.get("delivery_id"), str)
             or not isinstance(value.get("text"), str)
             or not isinstance(value.get("woke"), bool)
-            or value.get("state") not in {"pending", "ambiguous"}
+            or value.get("state") not in {"pending", "ambiguous", "terminal"}
         ):
             raise HarnessError("STT server returned an invalid retained delivery")
         recovered.append(

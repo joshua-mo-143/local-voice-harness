@@ -2718,10 +2718,13 @@ class RetainedUtteranceTests(unittest.TestCase):
         ):
             daemon.process_utterance(None, woke=False, retained=delivery)
 
+        delivery.mark_terminal.assert_called_once_with()
         delivery.release.assert_called_once_with()
         delivery.mark_ambiguous.assert_not_called()
 
-    def test_failed_terminal_release_is_fenced_before_recovery(self) -> None:
+    def test_failed_terminal_cleanup_retries_without_replay_or_manual_pause(
+        self,
+    ) -> None:
         daemon = _bare_daemon()
         delivery = mock.Mock(spec=wake_daemon.RetainedTranscript)
         delivery.text = ""
@@ -2737,12 +2740,96 @@ class RetainedUtteranceTests(unittest.TestCase):
         ):
             daemon.process_utterance(None, woke=False, retained=delivery)
 
+        delivery.mark_terminal.assert_called_once_with()
         delivery.release.assert_called_once_with()
         self.assertTrue(daemon.retained_recovery_required)
-        self.assertEqual(
-            daemon.uncertain_retained_delivery_ids,
-            {delivery.delivery_id},
-        )
+        terminal = mock.Mock(spec=wake_daemon.RetainedTranscript)
+        terminal.delivery_id = delivery.delivery_id
+        terminal.text = delivery.text
+        terminal.woke = delivery.woke
+        terminal.state = "terminal"
+        with (
+            mock.patch.object(
+                wake_daemon,
+                "recover_retained_transcripts",
+                side_effect=[(terminal,), ()],
+            ),
+            mock.patch.object(daemon, "process_utterance") as replay,
+            mock.patch.object(wake_daemon, "log"),
+        ):
+            daemon.retained_recovery_retry_at = 0.0
+            self.assertTrue(daemon._retry_retained_recovery())
+            daemon.retained_recovery_required = True
+            daemon.retained_recovery_retry_at = 0.0
+            self.assertTrue(daemon._retry_retained_recovery())
+
+        terminal.release.assert_called_once_with()
+        replay.assert_not_called()
+
+    def test_failure_before_durable_terminalization_keeps_evidence(self) -> None:
+        daemon = _bare_daemon()
+        delivery = mock.Mock(spec=wake_daemon.RetainedTranscript)
+        delivery.text = ""
+        delivery.woke = False
+        delivery.state = "pending"
+        delivery.delivery_id = "0" * 32
+        delivery.mark_terminal.side_effect = HarnessError("STT unavailable")
+
+        with (
+            mock.patch.object(wake_daemon, "release_deliveries"),
+            mock.patch.object(wake_daemon, "notify"),
+            mock.patch.object(wake_daemon, "log"),
+        ):
+            daemon.process_utterance(None, woke=False, retained=delivery)
+
+        delivery.mark_terminal.assert_called_once_with()
+        delivery.release.assert_not_called()
+        self.assertTrue(daemon.retained_recovery_required)
+        self.assertGreater(daemon.retained_recovery_retry_at, 0.0)
+
+    def test_non_side_effect_executes_only_after_durable_terminalization(self) -> None:
+        daemon = _bare_daemon()
+        delivery = mock.Mock(spec=wake_daemon.RetainedTranscript)
+        delivery.text = "tell me the time"
+        delivery.woke = False
+        delivery.state = "pending"
+        delivery.delivery_id = "5" * 32
+        order: list[str] = []
+        delivery.mark_terminal.side_effect = lambda: order.append("terminal")
+        delivery.release.side_effect = lambda: order.append("cleanup")
+
+        def answer(
+            _text: str,
+            _history: list[dict[str, str]],
+            _context: RequestContext,
+            **_kwargs: object,
+        ) -> tuple[str, None]:
+            order.append("action")
+            return "it is noon", None
+
+        with (
+            mock.patch.object(wake_daemon, "start_components"),
+            mock.patch.object(
+                wake_daemon,
+                "request_context",
+                side_effect=lambda text, **_settings: RequestContext(text),
+            ),
+            mock.patch.object(
+                wake_daemon,
+                "route_intent",
+                return_value=IntentRoute(Intent.CONVERSATION, "high"),
+            ),
+            mock.patch.object(wake_daemon, "qwen_turn", side_effect=answer),
+            mock.patch.object(
+                daemon,
+                "_drain_playback_queue",
+                return_value=(_playback_batch("ok"), None),
+            ),
+            mock.patch.object(wake_daemon, "notify"),
+        ):
+            daemon.process_utterance(None, woke=False, retained=delivery)
+
+        self.assertEqual(order, ["terminal", "action", "cleanup"])
 
     def test_rejected_echo_releases_retained_evidence_terminally(self) -> None:
         daemon = _bare_daemon()
@@ -2758,6 +2845,7 @@ class RetainedUtteranceTests(unittest.TestCase):
         ):
             daemon.process_utterance(None, woke=False, retained=delivery)
 
+        delivery.mark_terminal.assert_called_once_with()
         delivery.release.assert_called_once_with()
         delivery.mark_ambiguous.assert_not_called()
 
@@ -2790,6 +2878,7 @@ class RetainedUtteranceTests(unittest.TestCase):
         ):
             daemon.process_utterance(None, woke=False, retained=delivery)
 
+        delivery.mark_terminal.assert_called_once_with()
         delivery.release.assert_called_once_with()
         delivery.mark_ambiguous.assert_not_called()
 
@@ -2826,6 +2915,7 @@ class RetainedUtteranceTests(unittest.TestCase):
             daemon.process_utterance(None, woke=False, retained=delivery)
 
         delivery.mark_ambiguous.assert_called_once_with()
+        delivery.mark_terminal.assert_not_called()
         delivery.release.assert_not_called()
         self.assertTrue(daemon.retained_recovery_required)
 
@@ -2902,10 +2992,6 @@ class RetainedUtteranceTests(unittest.TestCase):
         delivery.mark_ambiguous.assert_not_called()
         delivery.release.assert_not_called()
         self.assertTrue(daemon.retained_recovery_required)
-        self.assertEqual(
-            daemon.uncertain_retained_delivery_ids,
-            {delivery.delivery_id},
-        )
         notify.assert_called_once_with(
             "I retained that voice request because its handoff was interrupted. "
             "I will not run it until recovery confirms whether it is safe.",
@@ -2927,13 +3013,11 @@ class RetainedUtteranceTests(unittest.TestCase):
             mock.patch.object(daemon, "process_utterance") as process,
             mock.patch.object(wake_daemon, "log"),
         ):
-            self.assertFalse(daemon._retry_retained_recovery())
+            self.assertTrue(daemon._retry_retained_recovery())
 
-        recovered.mark_ambiguous.assert_called_once_with()
-        process.assert_not_called()
-        self.assertEqual(daemon.uncertain_retained_delivery_ids, set())
-        self.assertTrue(daemon.retained_recovery_required)
-        self.assertGreater(daemon.retained_recovery_retry_at, 0.0)
+        recovered.mark_ambiguous.assert_not_called()
+        process.assert_called_once_with(None, woke=False, retained=recovered)
+        self.assertFalse(daemon.retained_recovery_required)
 
     def test_digest_claims_cannot_run_without_a_successful_fence(self) -> None:
         daemon = _bare_daemon()

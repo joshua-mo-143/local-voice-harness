@@ -14,6 +14,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from unittest import mock
 
+from local_voice_harness.errors import HarnessError
 from local_voice_harness.stt import client as stt_client
 from local_voice_harness.stt import server
 from local_voice_harness.user_config import DictationDevice
@@ -300,6 +301,131 @@ class SpeechToTextProtocolTests(unittest.TestCase):
 
                     recovered[0].mark_ambiguous()
                     recovered[0].release()
+                    self.assertEqual(stt_client.recover_retained_transcripts(), ())
+
+    def test_terminal_delivery_survives_restart_without_replay(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            with _running_server(Path(temporary), _Transcriber()) as (
+                socket_path,
+                audio_path,
+            ):
+                generation = _generation(
+                    audio_path,
+                    b"RIFF-terminal" + b"\0" * 64,
+                )
+                process = subprocess.run(
+                    [
+                        sys.executable,
+                        "-c",
+                        (
+                            "import os, sys; from pathlib import Path; "
+                            "from local_voice_harness.stt import client; "
+                            "client.STT_SOCKET = Path(sys.argv[1]); "
+                            "delivery = client.transcribe_retained("
+                            "Path(sys.argv[2]), woke=False); "
+                            "delivery.mark_terminal(); "
+                            "os._exit(74)"
+                        ),
+                        str(socket_path),
+                        str(generation),
+                    ],
+                    check=False,
+                    timeout=2,
+                )
+
+                self.assertEqual(process.returncode, 74)
+                with mock.patch.object(stt_client, "STT_SOCKET", socket_path):
+                    recovered = stt_client.recover_retained_transcripts()
+                    self.assertEqual(len(recovered), 1)
+                    self.assertEqual(recovered[0].state, "terminal")
+                    with self.assertRaisesRegex(
+                        server.ProtocolError,
+                        "terminal retained delivery cannot become",
+                    ):
+                        server._delivery_response(
+                            server.DeliveryRequest("pending", recovered[0].delivery_id)
+                        )
+
+                    recovered[0].release()
+                    self.assertEqual(stt_client.recover_retained_transcripts(), ())
+
+    def test_failed_terminalization_preserves_pending_replay_authority(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            with _running_server(Path(temporary), _Transcriber()) as (
+                socket_path,
+                audio_path,
+            ):
+                generation = _generation(
+                    audio_path,
+                    b"RIFF-terminal-failure" + b"\0" * 64,
+                )
+                with mock.patch.object(stt_client, "STT_SOCKET", socket_path):
+                    delivery = stt_client.transcribe_retained(generation, woke=False)
+                    with (
+                        mock.patch.object(
+                            server.os,
+                            "replace",
+                            side_effect=OSError("metadata replace failed"),
+                        ),
+                        self.assertRaises((HarnessError, OSError)),
+                    ):
+                        delivery.mark_terminal()
+
+                    recovered = stt_client.recover_retained_transcripts()
+                    self.assertEqual(len(recovered), 1)
+                    self.assertEqual(recovered[0].state, "pending")
+                    recovered[0].release()
+
+    def test_cleanup_failure_after_terminalization_is_eventually_removed(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with _running_server(root, _Transcriber()) as (
+                socket_path,
+                audio_path,
+            ):
+                generation = _generation(
+                    audio_path,
+                    b"RIFF-terminal-cleanup" + b"\0" * 64,
+                )
+                with mock.patch.object(stt_client, "STT_SOCKET", socket_path):
+                    delivery = stt_client.transcribe_retained(generation, woke=False)
+                    delivery.mark_terminal()
+                    with (
+                        mock.patch.object(
+                            server,
+                            "_remove_released_retained_delivery",
+                            side_effect=OSError("cleanup interrupted"),
+                        ),
+                        self.assertRaises((HarnessError, OSError)),
+                    ):
+                        delivery.release()
+
+                    self.assertEqual(stt_client.recover_retained_transcripts(), ())
+                    self.assertEqual(
+                        tuple(root.rglob(f"{server.RELEASED_RETAINED_PREFIX}*")),
+                        (),
+                    )
+
+    def test_lost_cleanup_response_cannot_restore_terminal_delivery(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with _running_server(root, _Transcriber()) as (
+                socket_path,
+                audio_path,
+            ):
+                generation = _generation(
+                    audio_path,
+                    b"RIFF-lost-cleanup-response" + b"\0" * 64,
+                )
+                with mock.patch.object(stt_client, "STT_SOCKET", socket_path):
+                    delivery = stt_client.transcribe_retained(generation, woke=False)
+                    delivery.mark_terminal()
+                    server._delivery_response(
+                        server.DeliveryRequest("release", delivery.delivery_id)
+                    )
+
                     self.assertEqual(stt_client.recover_retained_transcripts(), ())
 
     def test_malformed_and_oversized_requests_return_structured_errors(self) -> None:

@@ -555,7 +555,6 @@ class WakeConversationDaemon:
         self.config_activation_dispatch_attempts: dict[str, int] = {}
         self.retained_recovery_required = False
         self.retained_recovery_retry_at = 0.0
-        self.uncertain_retained_delivery_ids: set[str] = set()
         self.conversation_deadline = 0.0
         self.awaiting_followup = False
         self.last_wake = 0.0
@@ -1589,6 +1588,7 @@ class WakeConversationDaemon:
         delivery_claims: DeliveryClaims = []
         transcript_delivery = retained
         delivery_ambiguous = retained is not None and retained.state == "ambiguous"
+        delivery_terminal = retained is not None and retained.state == "terminal"
         preserve_delivery = False
         turn_failed = False
 
@@ -1608,6 +1608,27 @@ class WakeConversationDaemon:
                 raise
             delivery_ambiguous = True
             self.retained_recovery_required = True
+
+        def terminalize_non_side_effect() -> None:
+            nonlocal delivery_terminal, preserve_delivery
+            if transcript_delivery is None or delivery_terminal:
+                return
+            preserve_delivery = True
+            try:
+                transcript_delivery.mark_terminal()
+            except Exception:
+                self.retained_recovery_required = True
+                self.retained_recovery_retry_at = (
+                    time.monotonic() + RETAINED_RECOVERY_RETRY_SECONDS
+                )
+                log(
+                    "voice turn terminalization failed before safe completion; "
+                    f"retained evidence will be retried: "
+                    f"{transcript_delivery.delivery_id}"
+                )
+                raise
+            delivery_terminal = True
+            preserve_delivery = False
 
         self.config_activation_delivery = None
         recent_playback = self._active_recent_playback() if not woke else ()
@@ -1634,12 +1655,6 @@ class WakeConversationDaemon:
                     self.retained_recovery_retry_at = (
                         time.monotonic() + RETAINED_RECOVERY_RETRY_SECONDS
                     )
-                    if transcript_delivery.state == "uncertain":
-                        uncertain_deliveries = getattr(
-                            self, "uncertain_retained_delivery_ids", set()
-                        )
-                        uncertain_deliveries.add(transcript_delivery.delivery_id)
-                        self.uncertain_retained_delivery_ids = uncertain_deliveries
                     log(
                         "voice turn retention acknowledgment requires reconciliation: "
                         f"{transcript_delivery.delivery_id} "
@@ -1653,8 +1668,10 @@ class WakeConversationDaemon:
                     )
                     return None
                 if text.startswith("__DICTATION_ERROR__:"):
+                    terminalize_non_side_effect()
                     raise HarnessError(text.removeprefix("__DICTATION_ERROR__:"))
                 if not text:
+                    terminalize_non_side_effect()
                     raise NoSpeechError("STT did not recognize any speech")
             except NoSpeechError:
                 pending_target_resolution = getattr(
@@ -1666,6 +1683,7 @@ class WakeConversationDaemon:
                     and getattr(self, "pending_config_change", None) is None
                 ):
                     raise
+                terminalize_non_side_effect()
                 log("confirmation reply contained no recognizable speech")
                 self.awaiting_followup = True
                 self.conversation_deadline = (
@@ -1694,14 +1712,17 @@ class WakeConversationDaemon:
                             f"{text!r}"
                         )
                     else:
+                        terminalize_non_side_effect()
                         log(f"rejected wake candidate: {text!r}")
                         self.stop_components_when_idle()
                         return None
             if self._is_playback_echo(text, recent_playback):
+                terminalize_non_side_effect()
                 log("rejected follow-up matching recent local playback")
                 self.awaiting_followup = True
                 return None
             if not text:
+                terminalize_non_side_effect()
                 log("wake phrase contained no request; waiting for follow-up")
                 self.awaiting_followup = True
                 self.conversation_deadline = (
@@ -1711,6 +1732,7 @@ class WakeConversationDaemon:
             self.awaiting_followup = False
             log(f"user: {text}")
             if CLOSE_PATTERN.search(text):
+                terminalize_non_side_effect()
                 self.close_conversation("spoken command")
                 return None
             pending_target_resolution = getattr(self, "pending_target_resolution", None)
@@ -1866,12 +1888,15 @@ class WakeConversationDaemon:
                         # Follow-up VAD can capture nearby conversation. A pending
                         # structured question makes conversational fallback unsafe:
                         # close silently and leave the durable question untouched.
+                        terminalize_non_side_effect()
                         self.close_pending_capture("non-actionable speech")
                         return None
             if confirmed_request is not None or (
                 route.actionable and route.intent in SIDE_EFFECTING_INTENTS
             ):
                 fence_side_effect()
+            else:
+                terminalize_non_side_effect()
             if (
                 pending_target_resolution is not None
                 and not resuming_target_resolution
@@ -2441,28 +2466,51 @@ class WakeConversationDaemon:
                 turn_failed and (delivery_ambiguous or preserve_delivery)
             ):
                 try:
-                    transcript_delivery.release()
+                    if not delivery_terminal:
+                        transcript_delivery.mark_terminal()
                 except Exception as exc:  # noqa: BLE001 - retained evidence survives
                     self.retained_recovery_required = True
                     self.retained_recovery_retry_at = (
                         time.monotonic() + RETAINED_RECOVERY_RETRY_SECONDS
                     )
-                    uncertain_deliveries = getattr(
-                        self, "uncertain_retained_delivery_ids", set()
-                    )
-                    uncertain_deliveries.add(transcript_delivery.delivery_id)
-                    self.uncertain_retained_delivery_ids = uncertain_deliveries
                     log(
-                        "could not release terminal STT delivery "
+                        "could not durably terminalize STT delivery "
                         f"{transcript_delivery.delivery_id}: "
                         f"{type(exc).__name__}: {exc}"
                     )
+                else:
+                    try:
+                        transcript_delivery.release()
+                    except Exception as exc:  # noqa: BLE001 - terminal is durable
+                        self.retained_recovery_required = True
+                        self.retained_recovery_retry_at = (
+                            time.monotonic() + RETAINED_RECOVERY_RETRY_SECONDS
+                        )
+                        log(
+                            "could not clean up terminal STT delivery "
+                            f"{transcript_delivery.delivery_id}: "
+                            f"{type(exc).__name__}: {exc}"
+                        )
             self.resume_microphone()
             self.wake_model.reset()
         return None
 
     def _recover_retained_utterances(self) -> None:
         for delivery in recover_retained_transcripts():
+            if delivery.state == "terminal":
+                try:
+                    delivery.release()
+                except Exception as exc:  # noqa: BLE001 - retry ordered cleanup
+                    self.retained_recovery_required = True
+                    self.retained_recovery_retry_at = (
+                        time.monotonic() + RETAINED_RECOVERY_RETRY_SECONDS
+                    )
+                    log(
+                        "could not clean up terminal retained voice delivery "
+                        f"{delivery.delivery_id}: {type(exc).__name__}: {exc}"
+                    )
+                    break
+                continue
             if delivery.state == "ambiguous":
                 self.retained_recovery_required = True
                 self.retained_recovery_retry_at = (
@@ -2477,30 +2525,6 @@ class WakeConversationDaemon:
                     "I retained it for reconciliation and will not run it again.",
                     error=True,
                 )
-                break
-            uncertain_deliveries = getattr(
-                self, "uncertain_retained_delivery_ids", set()
-            )
-            if delivery.delivery_id in uncertain_deliveries:
-                try:
-                    delivery.mark_ambiguous()
-                except Exception as exc:  # noqa: BLE001 - evidence stays retained
-                    self.retained_recovery_required = True
-                    log(
-                        "could not reconcile uncertain retained voice delivery "
-                        f"{delivery.delivery_id}: {type(exc).__name__}: {exc}"
-                    )
-                else:
-                    uncertain_deliveries.remove(delivery.delivery_id)
-                    self.uncertain_retained_delivery_ids = uncertain_deliveries
-                    self.retained_recovery_required = True
-                    self.retained_recovery_retry_at = (
-                        time.monotonic() + RETAINED_RECOVERY_RETRY_SECONDS
-                    )
-                    log(
-                        "uncertain retained voice delivery was fenced for "
-                        f"reconciliation: {delivery.delivery_id}"
-                    )
                 break
             self.process_utterance(
                 None,
