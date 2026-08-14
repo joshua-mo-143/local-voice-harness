@@ -652,30 +652,30 @@ class WakeConversationDaemon:
         *,
         wait_for_fresh_speech: bool = False,
     ) -> Path:
-        frames = list(initial)
-        has_speech = (
-            False
-            if wait_for_fresh_speech
-            else any(self.is_speech(frame) for frame in frames)
-        )
-        silence_ms = 0
-        captured_frames = 0
-        while self.running:
-            frame = self.read_frame()
-            frames.append(frame)
-            captured_frames += 1
-            if self.is_speech(frame):
-                has_speech = True
-                silence_ms = 0
-            elif has_speech:
-                silence_ms += FRAME_MS
-            duration = captured_frames * FRAME_MS / 1000
-            if has_speech and silence_ms >= END_SILENCE_MS:
-                break
-            if duration >= MAX_UTTERANCE_SECONDS:
-                break
-
         def write_audio(path: Path) -> None:
+            frames = list(initial)
+            has_speech = (
+                False
+                if wait_for_fresh_speech
+                else any(self.is_speech(frame) for frame in frames)
+            )
+            silence_ms = 0
+            captured_frames = 0
+            while self.running:
+                frame = self.read_frame()
+                frames.append(frame)
+                captured_frames += 1
+                if self.is_speech(frame):
+                    has_speech = True
+                    silence_ms = 0
+                elif has_speech:
+                    silence_ms += FRAME_MS
+                duration = captured_frames * FRAME_MS / 1000
+                if has_speech and silence_ms >= END_SILENCE_MS:
+                    break
+                if duration >= MAX_UTTERANCE_SECONDS:
+                    break
+
             with wave.open(str(path), "wb") as output:
                 output.setnchannels(1)
                 output.setsampwidth(2)
