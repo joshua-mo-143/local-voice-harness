@@ -335,8 +335,10 @@ for #141):
   UNIQUE, payload_json, status, attempts, next_at, lease_token, leased_at,
   completed_at, outcome_json, last_error)`; effect status must distinguish
   pending, running, succeeded, failed-retryable, and unknown.
-* `events(event_id PRIMARY KEY, job_id, revision, kind, payload_json, created_at)`
-  for audit/recovery evidence; event insertion and state update are atomic.
+* `events(event_id PRIMARY KEY, command_id UNIQUE, job_id REFERENCES jobs,
+  revision, kind, payload_json, created_at)` for audit/recovery evidence; event
+  insertion and state update are atomic. Duplicate `command_id` delivery is a
+  no-op.
 
 SQL constraints should enforce identity, uniqueness, null pairing, booleans,
 counter ranges, foreign keys, and immutable artifact identity. Domain-specific
@@ -356,6 +358,15 @@ command(job snapshot, expected revision)
   -> execute effects outside transaction
   -> report observation(effect id, idempotency key, outcome)
 ```
+
+[#342](https://github.com/joshua-mo-143/local-voice-harness/issues/342) implements
+the commit half of this API as `JobStore.apply`. A typed `CoordinatorCommand`
+against an expected revision produces a `CoordinatorDecision` (canonical job plus
+named `DurableEffect`s). State, reservations, one `events` row, and pending
+outbox rows commit in one `BEGIN IMMEDIATE` transaction or not at all. Existing
+`JobStore.create` and `JobStore.update` record through that same path so the
+coordinator is production-used before every caller is migrated. Effect execution
+is [#345](https://github.com/joshua-mo-143/local-voice-harness/issues/345).
 
 An effect executor must lease an outbox row, renew it, and report `Confirmed`,
 `ConfirmedAbsent`, `Failed`, or `OutcomeUnknown`; it must not directly update
@@ -721,7 +732,7 @@ for each active reservation.
 - [x] [#341](https://github.com/joshua-mo-143/local-voice-harness/issues/341)
   catalogue every durable external effect, assign handler boundaries, and
   decide coordinator ownership, lease concurrency, and replay/reconcile rules.
-- [ ] [#342](https://github.com/joshua-mo-143/local-voice-harness/issues/342)
+- [x] [#342](https://github.com/joshua-mo-143/local-voice-harness/issues/342)
   persist `(state transition, event, reservations, outbox effects)` atomically.
 - [ ] Make the coordinator the sole durable state writer.
 - [ ] Execute named provider effects outside transactions with idempotency keys,
