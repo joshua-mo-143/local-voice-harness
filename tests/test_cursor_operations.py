@@ -28,30 +28,15 @@ def test_checkout_state_machine_accepts_legal_transitions() -> None:
     )
     dispatching = planned.transition(CheckoutState.DISPATCHING)
     assert dispatching.state is CheckoutState.DISPATCHING
-    retained = dispatching.transition(
-        CheckoutState.RETAINED,
-        spec=CheckoutSpec(
-            "/repo",
-            "voice/task",
-            "/worktree",
-            workspace_path="/workspace",
-            pane_id="%1",
-        ),
-    )
-    assert retained.state is CheckoutState.RETAINED
-    assert retained.transition(CheckoutState.READY).state is CheckoutState.READY
 
 
 def test_agent_session_state_machine_accepts_legal_transitions() -> None:
-    planned = AgentSessionOperation(AgentSessionState.PLANNED)
-    dispatching = planned.transition(AgentSessionState.DISPATCHING)
-    assert dispatching.state is AgentSessionState.DISPATCHING
-    retained = dispatching.transition(
-        AgentSessionState.RETAINED,
-        spec=AgentSessionSpec("composer-1", "bc-1"),
+    dispatching = AgentSessionOperation(
+        AgentSessionState.DISPATCHING,
+        AgentSessionSpec("agent", "/worktree", "workspace", "pane"),
     )
-    assert retained.state is AgentSessionState.RETAINED
-    assert retained.transition(AgentSessionState.READY).state is AgentSessionState.READY
+    ambiguous = dispatching.transition(AgentSessionState.AMBIGUOUS)
+    assert ambiguous.state is AgentSessionState.AMBIGUOUS
 
 
 def test_operation_state_machines_accept_legal_transitions() -> None:
@@ -90,9 +75,13 @@ def test_checkout_state_machine_rejects_illegal_transitions() -> None:
 
 
 def test_agent_session_state_machine_rejects_illegal_transitions() -> None:
-    planned = AgentSessionOperation(AgentSessionState.PLANNED)
+    ready = AgentSessionOperation(
+        AgentSessionState.READY,
+        AgentSessionSpec("agent", "/worktree", "workspace", "pane"),
+        SessionIdentity("cursor/herdr", "session", "agent", 7),
+    )
     with pytest.raises(OperationTransitionError):
-        planned.transition(AgentSessionState.MANUAL_REQUIRED)
+        ready.transition(AgentSessionState.AMBIGUOUS)
 
 
 def test_operation_state_machines_reject_illegal_transitions() -> None:
