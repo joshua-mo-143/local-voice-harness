@@ -306,6 +306,9 @@ def prepare_config_change(
         return ChangePreparation(ChangePreparationStatus.CONFLICT)
     if new_value == stored_value:
         return ChangePreparation(ChangePreparationStatus.NO_CHANGE)
+    fenced_value = describe_config_value(stored, resolution.value)
+    if not isinstance(fenced_value, (str, bool, float)):
+        return ChangePreparation(ChangePreparationStatus.INVALID)
     return ChangePreparation(
         ChangePreparationStatus.READY,
         PendingConfigChange(
@@ -314,7 +317,7 @@ def prepare_config_change(
             raw_value=raw_value,
             old_value=active_value,
             new_value=new_value,
-            stored_value=describe_config_value(stored, resolution.value),
+            stored_value=fenced_value,
             affected_services=restart_services_for_keys(
                 updated,
                 (resolution.value,),
