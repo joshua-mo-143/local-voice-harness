@@ -126,10 +126,10 @@ def _request_text(request: dict[str, object]) -> str:
     return text
 
 
-def _request_voice(request: dict[str, object]) -> Path | None:
-    if _settings().tts_provider == "venice":
-        return None
+def _request_voice(request: dict[str, object]) -> Path | str | None:
     voice_value = str(request.get("voice", "")).strip()
+    if _settings().tts_provider == "venice":
+        return voice_value or None
     voice = Path(voice_value).expanduser().resolve() if voice_value else None
     if voice is not None and not voice.is_file():
         raise FileNotFoundError(f"reference voice not found: {voice}")
@@ -192,12 +192,15 @@ def _wav_metadata(audio: bytes) -> tuple[int, float]:
     return sample_rate, len(pcm) / frame_width / sample_rate
 
 
-def _venice_audio(text: str) -> tuple[bytes, int, float, float]:
+def _venice_audio(
+    text: str,
+    voice: str | None = None,
+) -> tuple[bytes, int, float, float]:
     settings = _settings()
     payload = json.dumps(
         {
             "model": settings.tts_model,
-            "voice": settings.tts_voice,
+            "voice": voice or settings.tts_voice,
             "input": text,
             "response_format": "wav",
             # Venice models do not apply this consistently. Request the original
@@ -330,14 +333,17 @@ def _apply_venice_speed(
 
 def _synthesize(
     text: str,
-    voice: Path | None,
+    voice: Path | str | None,
     output: Path,
     *,
     apply_speed: bool = True,
 ) -> tuple[int, float, float]:
     if _settings().tts_provider == "venice":
         settings = _settings()
-        audio, _sample_rate, _duration, generation_elapsed = _venice_audio(text)
+        audio, _sample_rate, _duration, generation_elapsed = _venice_audio(
+            text,
+            voice if isinstance(voice, str) else None,
+        )
         sample_rate, duration, processing_elapsed = _apply_venice_speed(
             audio,
             output,
@@ -348,7 +354,7 @@ def _synthesize(
 
     import soundfile as sf
 
-    audio, elapsed = _generate(text, voice)
+    audio, elapsed = _generate(text, voice if isinstance(voice, Path) else None)
     sf.write(str(output), audio, MODEL.sr, subtype="PCM_16")
     return MODEL.sr, len(audio) / MODEL.sr, elapsed
 
@@ -509,6 +515,33 @@ class RequestHandler(socketserver.StreamRequestHandler):
                     "cancelled": _cancel_stream(request_id),
                     "request_id": request_id,
                 }
+                _write_response(self, response)
+                return
+            if request.get("op") == "validate_voice":
+                voice = _request_voice(request)
+                output = OUTPUT_ROOT / (
+                    f".voice-validation-{threading.get_ident()}-"
+                    f"{time.monotonic_ns()}.wav"
+                )
+                try:
+                    with LOCK:
+                        _sample_rate, duration, _elapsed = _synthesize(
+                            "Voice validation.",
+                            voice,
+                            output,
+                            apply_speed=False,
+                        )
+                    if (
+                        duration <= 0
+                        or not output.is_file()
+                        or output.stat().st_size == 0
+                    ):
+                        raise RuntimeError(
+                            "TTS provider returned empty validation audio"
+                        )
+                    response = {"ok": True, "voice_usable": True}
+                finally:
+                    output.unlink(missing_ok=True)
                 _write_response(self, response)
                 return
             if request.get("stream"):

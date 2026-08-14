@@ -3123,6 +3123,78 @@ class ConfigChangeConversationTests(unittest.TestCase):
         route_intent.assert_not_called()
         launch.assert_not_called()
 
+    def test_exhausted_workers_keep_voice_reconciliation_retryable(self) -> None:
+        for status in (
+            wake_daemon.ActivationStatus.VALIDATING,
+            wake_daemon.ActivationStatus.ROLLING_BACK,
+        ):
+            with (
+                self.subTest(status=status),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
+                daemon = _bare_daemon()
+                store = wake_daemon.ActivationStore(Path(temporary) / "activation.json")
+                daemon.config_activation_store = store
+                pending = _pending_config()
+                result = ConfigChangeResult(
+                    config=replace(
+                        daemon.user_config,
+                        audio=replace(daemon.user_config.audio, voice="new_voice"),
+                    ),
+                    changed_keys=("audio.voice",),
+                    restart_services=("voice-harness-wake.service",),
+                )
+                offer = store.create_offer(pending, result)
+                assert offer is not None
+                store.mark_offer_delivered(offer.id)
+                store.accept(offer.id)
+                ready = store.mark_pre_restart_delivered(offer.id)
+                validating = store.begin_voice_validation(ready.id)
+                if status == wake_daemon.ActivationStatus.ROLLING_BACK:
+                    current = store.begin_rollback(
+                        validating.id,
+                        "validation worker exited",
+                    )
+                else:
+                    current = validating
+                with (
+                    mock.patch.object(
+                        wake_daemon,
+                        "launch_activation_worker",
+                        side_effect=OSError("temporary launch failure"),
+                    ),
+                    mock.patch.object(wake_daemon, "log") as log,
+                ):
+                    daemon._dispatch_ready_config_activation(current.id)
+                after_launch_failure = store.current()
+                assert after_launch_failure is not None
+                self.assertEqual(after_launch_failure.status, status)
+                log.assert_called_once()
+                exhausted = mock.Mock()
+                exhausted.poll.return_value = 17
+                replacement = mock.Mock()
+                replacement.poll.return_value = None
+                daemon.launched_config_activations = {current.id: exhausted}
+                daemon.config_activation_dispatch_attempts = {current.id: 2}
+
+                with mock.patch.object(
+                    wake_daemon,
+                    "launch_activation_worker",
+                    return_value=replacement,
+                ) as launch:
+                    returned = daemon._recover_config_activation()
+                recovered = store.current()
+
+            self.assertIsNone(returned)
+            assert recovered is not None
+            self.assertEqual(recovered.status, status)
+            self.assertFalse(recovered.acknowledged)
+            launch.assert_called_once_with(current.id)
+            self.assertIs(
+                daemon.launched_config_activations[current.id],
+                replacement,
+            )
+
     def test_post_restart_result_is_acknowledged_only_after_playback(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             daemon = _bare_daemon()
@@ -3172,7 +3244,7 @@ class ConfigChangeConversationTests(unittest.TestCase):
         assert current is not None
         self.assertTrue(current.acknowledged)
         response = play.call_args.args[0]
-        self.assertIn("expected configuration snapshot", response.spoken_text)
+        self.assertIn("expected voice snapshot", response.spoken_text)
 
 
 class AnnounceJobTests(unittest.TestCase):

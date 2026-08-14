@@ -1445,6 +1445,21 @@ class WakeConversationDaemon:
         try:
             process = launch_activation_worker(record_id)
         except OSError as exc:
+            current = self.config_activation_store.current()
+            if (
+                current is not None
+                and current.id == record_id
+                and current.status
+                in {
+                    ActivationStatus.VALIDATING,
+                    ActivationStatus.ROLLING_BACK,
+                }
+            ):
+                log(
+                    "could not relaunch voice activation reconciliation worker: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+                return
             self.config_activation_store.fail_worker(
                 record_id,
                 f"Could not launch the isolated activation worker: {exc}",
@@ -1493,7 +1508,9 @@ class WakeConversationDaemon:
         record = self.config_activation_store.current()
         if record is not None and record.status in {
             ActivationStatus.READY,
+            ActivationStatus.VALIDATING,
             ActivationStatus.RESTARTING,
+            ActivationStatus.ROLLING_BACK,
         }:
             self._dispatch_ready_config_activation(record.id)
         delivery = self.config_activation_store.next_delivery()

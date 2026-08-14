@@ -13,6 +13,7 @@ import time
 import uuid
 import wave
 from collections.abc import Callable, Iterator
+from dataclasses import dataclass
 from pathlib import Path
 
 from ..config import STATE_DIR, TTS_SOCKET
@@ -20,6 +21,38 @@ from ..errors import HarnessError
 from ..ipc import unix_request
 from ..user_config import AudioSettings, default_user_config
 from .stream import STREAM_POLL_SECONDS, STREAM_TIMEOUT_SECONDS, TTSStreamParser
+
+
+@dataclass(frozen=True, slots=True)
+class VoiceValidationResult:
+    usable: bool
+    detail: str
+
+
+def validate_voice(voice: str) -> VoiceValidationResult:
+    """Ask the active TTS provider to synthesize a bounded, inaudible probe."""
+
+    request = json.dumps({"op": "validate_voice", "voice": voice}).encode() + b"\n"
+    try:
+        response = unix_request(TTS_SOCKET, request, timeout=120)
+    except OSError as exc:
+        return VoiceValidationResult(False, f"TTS validation was unavailable: {exc}")
+    try:
+        decoded = json.loads(response)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return VoiceValidationResult(
+            False, "TTS validation returned an invalid response"
+        )
+    if not isinstance(decoded, dict):
+        return VoiceValidationResult(
+            False, "TTS validation returned an invalid response"
+        )
+    if decoded.get("ok") and decoded.get("voice_usable") is True:
+        return VoiceValidationResult(
+            True, "the selected TTS provider accepted the voice"
+        )
+    detail = str(decoded.get("error") or "the selected TTS provider rejected the voice")
+    return VoiceValidationResult(False, detail)
 
 
 @contextlib.contextmanager
