@@ -1546,9 +1546,7 @@ class RepositoryQuestionTests(unittest.TestCase):
         )
 
     def test_list_request_phrases_are_whole_utterance_matches(self) -> None:
-        self.assertTrue(
-            production_jobs.is_repository_list_request("list repositories")
-        )
+        self.assertTrue(production_jobs.is_repository_list_request("list repositories"))
         self.assertTrue(production_jobs.is_repository_list_request("Hear more names."))
         self.assertFalse(production_jobs.is_repository_list_request("list"))
         self.assertFalse(
@@ -4182,6 +4180,7 @@ class CursorJobStateTests(unittest.TestCase):
         client = mock.Mock()
         client.repository_roots.return_value = repositories
         client.ensure_router.return_value = mock.Mock(target="voice-router")
+
         def resolve(
             hint: str | None, task: str, _repositories: list[Path]
         ) -> tuple[Path | None, list[Path]]:

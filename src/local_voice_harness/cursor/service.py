@@ -1534,8 +1534,9 @@ def reply_job(
             concurrency=concurrency,
             integrations=integrations,
         )
-    if current.clarification_kind == "repository" and provisioning.is_repository_list_request(
-        trusted_utterance or text
+    if (
+        current.clarification_kind == "repository"
+        and provisioning.is_repository_list_request(trusted_utterance or text)
     ):
         return _reply_repository_list(
             current,

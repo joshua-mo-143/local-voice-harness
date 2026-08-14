@@ -406,9 +406,7 @@ def repository_question(
     )
     if spoken:
         listed = ", ".join(spoken)
-        more = (
-            " Say list repositories to hear more names." if remaining > 0 else ""
-        )
+        more = " Say list repositories to hear more names." if remaining > 0 else ""
         return (
             f"{prefix}Which repository should Cursor use? "
             f"Available repositories include: {listed}.{more}"
