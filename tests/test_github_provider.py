@@ -41,6 +41,7 @@ class GitHubUrlTests(unittest.TestCase):
         issue = GitHubIssue("example", "project", 42)
         for text in (
             "work on example/project#42",
+            "work on example/project issue 42",
             "please handle issue 42 in example/project",
             "work on https://github.com/example/project/issues/42",
         ):

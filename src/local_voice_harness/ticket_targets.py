@@ -29,6 +29,19 @@ _GITHUB_REFERENCE = re.compile(
     r"(?P<repo>[A-Za-z0-9_.-]+)#(?P<number>\d+)(?![A-Za-z0-9_.-])",
     re.IGNORECASE,
 )
+_GITHUB_REPOSITORY_TARGET = re.compile(
+    r"(?<![A-Za-z0-9_.-])"
+    r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})/"
+    r"[A-Za-z0-9_.-]+",
+    re.IGNORECASE,
+)
+_GITHUB_REPOSITORY_ISSUE = re.compile(
+    r"(?<![A-Za-z0-9_.-])"
+    r"(?P<owner>[A-Za-z0-9](?:[A-Za-z0-9-]{0,38}))/"
+    r"(?P<repo>[A-Za-z0-9_.-]+)\s+issues?\s+#?"
+    r"(?P<number>\d+)(?![A-Za-z0-9_/-])",
+    re.IGNORECASE,
+)
 _GITHUB_IN_REPOSITORY = re.compile(
     r"\bissue\s+#?(?P<number>\d+)\s+(?:in|from)\s+"
     r"(?P<owner>[A-Za-z0-9](?:[A-Za-z0-9-]{0,38}))/"
@@ -408,7 +421,12 @@ def extract_ticket_targets(
     candidates: list[TicketReference] = []
     specific_spans: list[tuple[int, int]] = []
 
-    for pattern in (_GITHUB_URL, _GITHUB_REFERENCE, _GITHUB_IN_REPOSITORY):
+    for pattern in (
+        _GITHUB_URL,
+        _GITHUB_REFERENCE,
+        _GITHUB_REPOSITORY_ISSUE,
+        _GITHUB_IN_REPOSITORY,
+    ):
         for match in pattern.finditer(text):
             candidates.append(
                 _github_reference(
@@ -420,6 +438,10 @@ def extract_ticket_targets(
                 )
             )
             specific_spans.append(match.span())
+
+    specific_spans.extend(
+        match.span() for match in _GITHUB_REPOSITORY_TARGET.finditer(text)
+    )
 
     for match in _LINEAR_REFERENCE.finditer(text):
         if _overlaps(match.start(), match.end(), specific_spans):

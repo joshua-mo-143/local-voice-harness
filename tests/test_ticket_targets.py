@@ -197,6 +197,47 @@ def test_linear_like_substrings_inside_github_references_are_ignored() -> None:
     ]
 
 
+def test_natural_github_target_owns_linear_like_repository_segments() -> None:
+    extraction = extract_ticket_targets(
+        "Work on joshua-mo-143/local-voice-harness issue 369."
+    )
+
+    assert extraction.requested_count == 1
+    assert [(item.source, item.canonical) for item in extraction.references] == [
+        ("github", "joshua-mo-143/local-voice-harness#369")
+    ]
+    assert not extraction.references[0].scoped
+
+
+def test_genuine_linear_key_survives_natural_github_overlap_filtering() -> None:
+    extraction = extract_ticket_targets(
+        "Work on MO-143 and joshua-mo-143/local-voice-harness issue 369."
+    )
+
+    assert extraction.requested_count == 2
+    assert [(item.source, item.canonical) for item in extraction.references] == [
+        ("linear", "MO-143"),
+        ("github", "joshua-mo-143/local-voice-harness#369"),
+    ]
+
+
+def test_standalone_linear_key_before_sentence_period_is_extracted() -> None:
+    extraction = extract_ticket_targets("Work on MO-143.")
+
+    assert [(item.source, item.canonical) for item in extraction.references] == [
+        ("linear", "MO-143")
+    ]
+
+
+def test_repository_names_alone_do_not_become_linear_targets() -> None:
+    extraction = extract_ticket_targets(
+        "Use joshua-mo-143/local-voice-harness and example/eng-42."
+    )
+
+    assert extraction.requested_count == 0
+    assert extraction.references == ()
+
+
 def test_repeated_github_urls_before_sentence_period_remain_github_targets() -> None:
     extraction = extract_ticket_targets(
         "Work on https://github.com/joshua-mo-143/example/issues/3 and "
