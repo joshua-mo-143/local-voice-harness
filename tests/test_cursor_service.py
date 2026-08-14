@@ -331,6 +331,79 @@ def test_repeated_full_github_urls_start_only_github_children() -> None:
     ) < response.display_text.index("local-voice-harness-batch-fixture#5")
 
 
+def test_natural_github_target_and_genuine_linear_key_keep_providers() -> None:
+    client = mock.Mock()
+    client.issue_details.return_value = {
+        "number": 369,
+        "title": "Issue 369",
+        "state": "OPEN",
+        "url": ("https://github.com/joshua-mo-143/local-voice-harness/issues/369"),
+    }
+    registry = mock.Mock()
+    registry.github_client.return_value = client
+    started: list[TicketJobRequest] = []
+
+    def start(
+        requests: tuple[TicketJobRequest, ...], **_kwargs: object
+    ) -> tuple[service.TicketStartOutcome, ...]:
+        started.extend(requests)
+        return tuple(
+            service.TicketStartOutcome(
+                request.target,
+                "accepted",
+                job_id=f"{index + 1:012x}",
+            )
+            for index, request in enumerate(requests)
+        )
+
+    utterance = "Work on MO-7 and joshua-mo-143/local-voice-harness issue 369."
+    with (
+        mock.patch.object(service, "integration_enabled", return_value=True),
+        mock.patch.object(service, "require_issue_capabilities"),
+        mock.patch.object(
+            service,
+            "resolve_issue_reference",
+            side_effect=lambda reference, _registry: reference,
+        ),
+        mock.patch.object(
+            service,
+            "_preflight_batch_repositories",
+            side_effect=lambda prepared, _slots, **_kwargs: (
+                prepared,
+                [],
+                [],
+            ),
+        ),
+        mock.patch.object(service, "start_jobs", side_effect=start),
+    ):
+        result = service.cursor_turn(
+            CursorTurnRequest(utterance, utterance=utterance),
+            integrations=registry,
+        )
+
+    assert [
+        (
+            request.target,
+            request.request.issue_key,
+            request.request.github_repository,
+            request.request.github_issue,
+        )
+        for request in started
+    ] == [
+        ("MO-7", "MO-7", None, None),
+        (
+            "joshua-mo-143/local-voice-harness#369",
+            None,
+            "joshua-mo-143/local-voice-harness",
+            369,
+        ),
+    ]
+    response = as_assistant_response(result.text)
+    assert "MO-7: accepted" in response.display_text
+    assert "joshua-mo-143/local-voice-harness#369: accepted" in response.display_text
+    assert "MO-143" not in response.display_text
+
+
 def test_multi_ticket_repository_ambiguities_use_one_durable_grouped_question(
     tmp_path: Path,
 ) -> None:

@@ -42,6 +42,13 @@ ISSUE_REFERENCE = re.compile(
     r"(?!\d)",
     re.IGNORECASE,
 )
+REPOSITORY_ISSUE = re.compile(
+    r"(?<![A-Za-z0-9_.-])"
+    r"(?P<owner>[A-Za-z0-9](?:[A-Za-z0-9-]{0,38}))/"
+    r"(?P<repo>[A-Za-z0-9_.-]+)\s+issues?\s+#?"
+    r"(?P<number>[1-9]\d*)(?![A-Za-z0-9_/-])",
+    re.IGNORECASE,
+)
 ISSUE_IN_REPOSITORY = re.compile(
     r"\bissue\s+#?(?P<number>[1-9]\d*)\s+(?:in|from)\s+"
     r"(?P<owner>[A-Za-z0-9](?:[A-Za-z0-9-]{0,38}))/"
@@ -993,7 +1000,11 @@ def github_issue_from_text(text: str) -> GitHubIssue | None:
         issue = github_issue_from_url(url_match.group(0))
         if issue is not None:
             return issue
-    match = ISSUE_REFERENCE.search(text) or ISSUE_IN_REPOSITORY.search(text)
+    match = (
+        ISSUE_REFERENCE.search(text)
+        or REPOSITORY_ISSUE.search(text)
+        or ISSUE_IN_REPOSITORY.search(text)
+    )
     if match is None:
         return None
     repository = _validated_repository(match.group("owner"), match.group("repo"))
