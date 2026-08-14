@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import socket
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -19,6 +20,20 @@ MAX_RESPONSE_BYTES = 1024 * 1024
 
 class _LegacyServer(Exception):
     pass
+
+
+@dataclass(frozen=True, slots=True)
+class RetainedTranscript:
+    delivery_id: str
+    text: str
+    woke: bool
+    state: str = "pending"
+
+    def mark_ambiguous(self) -> None:
+        _delivery_request("ambiguous", self.delivery_id)
+
+    def release(self) -> None:
+        _delivery_request("release", self.delivery_id)
 
 
 def _busy_timeout_error(audio_path: Path) -> HarnessError:
@@ -68,7 +83,13 @@ def _remaining_timeout(deadline: float) -> float:
     return remaining
 
 
-def _v2_request(audio_path: Path, *, timeout: float) -> dict[str, Any]:
+def _v2_request(
+    audio_path: Path,
+    *,
+    timeout: float,
+    retain: bool = False,
+    woke: bool = False,
+) -> dict[str, Any]:
     deadline = time.monotonic() + timeout
     request = {
         "version": PROTOCOL_VERSION,
@@ -97,6 +118,9 @@ def _v2_request(audio_path: Path, *, timeout: float) -> dict[str, Any]:
             "type": "ack",
             "delivery_id": response["delivery_id"],
         }
+        if retain:
+            acknowledgment["disposition"] = "retain"
+            acknowledgment["woke"] = woke
         client.settimeout(_remaining_timeout(deadline))
         client.sendall(
             json.dumps(acknowledgment, separators=(",", ":")).encode() + b"\n"
@@ -111,6 +135,15 @@ def _v2_request(audio_path: Path, *, timeout: float) -> dict[str, Any]:
             while chunk := client.recv(64 * 1024):
                 trailing.extend(chunk)
         except OSError:
+            if retain:
+                response["_retained_state"] = "uncertain"
+                try:
+                    _delivery_request("ambiguous", str(response["delivery_id"]))
+                except (HarnessError, OSError):
+                    pass
+                else:
+                    response["_retained_state"] = "ambiguous"
+                return response
             return response
         if trailing:
             try:
@@ -125,6 +158,56 @@ def _v2_request(audio_path: Path, *, timeout: float) -> dict[str, Any]:
         return response
     finally:
         client.close()
+
+
+def _delivery_request(operation: str, delivery_id: str | None = None) -> dict[str, Any]:
+    request: dict[str, object] = {
+        "version": PROTOCOL_VERSION,
+        "type": operation,
+    }
+    if delivery_id is not None:
+        request["delivery_id"] = delivery_id
+    response = unix_request(
+        STT_SOCKET,
+        json.dumps(request, separators=(",", ":")).encode() + b"\n",
+        timeout=REQUEST_DEADLINE_SECONDS,
+    )
+    try:
+        protocol = _decode_protocol(response.strip())
+    except _LegacyServer as exc:
+        raise HarnessError(
+            "STT server does not support durable wake deliveries"
+        ) from exc
+    if protocol.get("ok") is False:
+        code, message, details = _error_details(protocol)
+        raise HarnessError(_error_message(code, message, details))
+    return protocol
+
+
+def recover_retained_transcripts() -> tuple[RetainedTranscript, ...]:
+    protocol = _delivery_request("recover")
+    deliveries = protocol.get("deliveries")
+    if protocol.get("type") != "deliveries" or not isinstance(deliveries, list):
+        raise HarnessError("STT server returned invalid retained deliveries")
+    recovered: list[RetainedTranscript] = []
+    for value in deliveries:
+        if (
+            not isinstance(value, dict)
+            or not isinstance(value.get("delivery_id"), str)
+            or not isinstance(value.get("text"), str)
+            or not isinstance(value.get("woke"), bool)
+            or value.get("state") not in {"pending", "ambiguous"}
+        ):
+            raise HarnessError("STT server returned an invalid retained delivery")
+        recovered.append(
+            RetainedTranscript(
+                value["delivery_id"],
+                value["text"],
+                value["woke"],
+                str(value["state"]),
+            )
+        )
+    return tuple(recovered)
 
 
 def _legacy_request(audio_path: Path, *, timeout: float) -> str:
@@ -225,3 +308,44 @@ def transcribe(audio_path: Path) -> str:
         json.dumps({"stage": "stt", "seconds": round(time.perf_counter() - started, 3)})
     )
     return text
+
+
+def transcribe_retained(audio_path: Path, *, woke: bool) -> RetainedTranscript:
+    started = time.perf_counter()
+    deadline = time.monotonic() + REQUEST_DEADLINE_SECONDS
+    backoff = BUSY_BACKOFF_SECONDS
+    while True:
+        try:
+            protocol = _v2_request(
+                audio_path,
+                timeout=_remaining_timeout(deadline),
+                retain=True,
+                woke=woke,
+            )
+        except _LegacyServer as exc:
+            raise HarnessError(
+                "STT server does not support durable wake deliveries"
+            ) from exc
+        except OSError as exc:
+            raise HarnessError(f"STT request failed: {exc}") from exc
+        if protocol.get("ok") is not False:
+            break
+        code, message, details = _error_details(protocol)
+        if code != "server_busy":
+            raise HarnessError(_error_message(code, message, details))
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise _busy_timeout_error(audio_path)
+        delay = min(backoff, remaining)
+        time.sleep(delay)
+        backoff = min(backoff * 2, MAX_BUSY_BACKOFF_SECONDS)
+    text = str(protocol["text"]).strip()
+    print(
+        json.dumps({"stage": "stt", "seconds": round(time.perf_counter() - started, 3)})
+    )
+    return RetainedTranscript(
+        str(protocol["delivery_id"]),
+        text,
+        woke,
+        str(protocol.get("_retained_state", "pending")),
+    )

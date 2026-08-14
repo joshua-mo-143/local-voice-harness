@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import re
@@ -7,6 +8,7 @@ import socket
 import stat
 import sys
 import threading
+import time
 import uuid
 from abc import ABC, abstractmethod
 from collections.abc import Mapping
@@ -36,7 +38,11 @@ READ_TIMEOUT_SECONDS = 2.0
 MAX_CONNECTIONS = 16
 PROCESSING_DIRECTORY = "stt-processing"
 DELIVERED_DIRECTORY = "stt-delivered"
+RETAINED_DIRECTORY = "stt-retained"
 QUARANTINE_DIRECTORY = "stt-quarantine"
+RETAINED_METADATA = "delivery.json"
+RETAINED_AUDIO = "audio.wav"
+MAX_RETAINED_DELIVERIES = 32
 WHISPER_MODELS = frozenset(
     {
         "tiny",
@@ -153,6 +159,12 @@ class TranscriptionRequest:
     requested: Path
     paths: recorder.RecorderPaths
     version: int | None
+
+
+@dataclass(frozen=True)
+class DeliveryRequest:
+    operation: Literal["recover", "release", "ambiguous"]
+    delivery_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -406,7 +418,7 @@ def _resolve_audio_path(
     )
 
 
-def _parse_request(frame: bytes) -> TranscriptionRequest:
+def _parse_request(frame: bytes) -> TranscriptionRequest | DeliveryRequest:
     try:
         text = frame.decode("utf-8")
     except UnicodeDecodeError as exc:
@@ -422,7 +434,16 @@ def _parse_request(frame: bytes) -> TranscriptionRequest:
         raise ProtocolError("invalid_request", "request must be a JSON object")
     if value.get("version") != PROTOCOL_VERSION:
         raise ProtocolError("unsupported_protocol", "unsupported STT protocol version")
-    if value.get("type") != "transcribe":
+    request_type = value.get("type")
+    if request_type in {"recover", "release", "ambiguous"}:
+        delivery_id = value.get("delivery_id")
+        if request_type != "recover" and (
+            not isinstance(delivery_id, str)
+            or re.fullmatch(r"[0-9a-f]{32}", delivery_id) is None
+        ):
+            raise ProtocolError("invalid_request", "a valid delivery_id is required")
+        return DeliveryRequest(request_type, delivery_id)
+    if request_type != "transcribe":
         raise ProtocolError("invalid_request", "request type must be transcribe")
     audio_path = value.get("audio_path")
     if not isinstance(audio_path, str):
@@ -668,6 +689,170 @@ def _commit_claim(claim: AudioClaim) -> None:
         )
 
 
+def _retained_root(paths: recorder.RecorderPaths) -> Path:
+    return paths.state_dir / RETAINED_DIRECTORY
+
+
+def _write_retained_claim(
+    claim: AudioClaim,
+    *,
+    delivery_id: str,
+    text: str,
+    woke: bool,
+) -> None:
+    retained_root = _retained_root(claim.paths)
+    temporary: Path | None = None
+    committed = False
+    try:
+        with recorder.recording_lock(claim.paths.state_dir, claim.paths.lock):
+            _prepare_private_directory(retained_root)
+            deliveries = tuple(retained_root.iterdir())
+            if len(deliveries) >= MAX_RETAINED_DELIVERIES:
+                raise ProtocolError(
+                    "retention_full",
+                    "wake delivery retention is full and requires reconciliation",
+                    preserved_path=claim.processing,
+                )
+            destination = retained_root / delivery_id
+            if destination.exists() or destination.is_symlink():
+                raise ProtocolError(
+                    "delivery_conflict", "delivery identifier already exists"
+                )
+            temporary = retained_root / f".{delivery_id}-{uuid.uuid4().hex}"
+            temporary.mkdir(mode=0o700)
+            metadata = {
+                "version": PROTOCOL_VERSION,
+                "delivery_id": delivery_id,
+                "text": text,
+                "woke": woke,
+                "state": "pending",
+                "created_at": time.time(),
+            }
+            metadata_path = temporary / RETAINED_METADATA
+            metadata_path.write_text(
+                json.dumps(metadata, separators=(",", ":")),
+                encoding="utf-8",
+            )
+            metadata_path.chmod(0o600)
+            with metadata_path.open("rb") as metadata_file:
+                os.fsync(metadata_file.fileno())
+            claim.processing.rename(temporary / RETAINED_AUDIO)
+            directory_fd = os.open(temporary, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+            temporary.rename(destination)
+            committed = True
+            temporary = None
+            root_fd = os.open(retained_root, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                os.fsync(root_fd)
+            finally:
+                os.close(root_fd)
+    except Exception as exc:
+        if committed:
+            log(f"STT wake retention committed despite lock cleanup failure: {exc}")
+            return
+        if temporary is not None and claim.processing.exists():
+            with contextlib.suppress(OSError):
+                (temporary / RETAINED_METADATA).unlink()
+            with contextlib.suppress(OSError):
+                temporary.rmdir()
+        raise
+
+
+def _load_retained_delivery(path: Path) -> dict[str, object]:
+    metadata_path = path / RETAINED_METADATA
+    audio_path = path / RETAINED_AUDIO
+    directory = path.lstat()
+    metadata = metadata_path.lstat()
+    audio = audio_path.lstat()
+    if (
+        not stat.S_ISDIR(directory.st_mode)
+        or not stat.S_ISREG(metadata.st_mode)
+        or not stat.S_ISREG(audio.st_mode)
+        or directory.st_uid != os.getuid()
+        or metadata.st_uid != os.getuid()
+        or audio.st_uid != os.getuid()
+        or directory.st_mode & 0o077
+        or metadata.st_mode & 0o077
+        or audio.st_mode & 0o077
+    ):
+        raise OSError("retained delivery is not private and harness-owned")
+    value = json.loads(metadata_path.read_text(encoding="utf-8"))
+    if (
+        not isinstance(value, dict)
+        or value.get("version") != PROTOCOL_VERSION
+        or re.fullmatch(r"[0-9a-f]{32}", str(value.get("delivery_id", ""))) is None
+        or (not path.name.startswith(".") and value.get("delivery_id") != path.name)
+        or not isinstance(value.get("text"), str)
+        or not isinstance(value.get("woke"), bool)
+        or value.get("state") not in {"pending", "ambiguous"}
+    ):
+        raise OSError("retained delivery metadata is invalid")
+    return value
+
+
+def _find_retained_delivery(delivery_id: str) -> tuple[Path, dict[str, object]]:
+    for paths in _recorder_path_sets():
+        delivery = _retained_root(paths) / delivery_id
+        if delivery.exists():
+            return delivery, _load_retained_delivery(delivery)
+    raise ProtocolError("delivery_not_found", "retained delivery does not exist")
+
+
+def _recover_retained_deliveries() -> list[dict[str, object]]:
+    recovered: list[dict[str, object]] = []
+    for paths in _recorder_path_sets():
+        root = _retained_root(paths)
+        if not root.exists():
+            continue
+        _prepare_private_directory(root)
+        for delivery in sorted(root.iterdir()):
+            if delivery.name.startswith("."):
+                try:
+                    metadata = _load_retained_delivery(delivery)
+                    delivery_id = str(metadata["delivery_id"])
+                    destination = root / delivery_id
+                    if destination.exists() or destination.is_symlink():
+                        raise OSError("retained delivery recovery destination exists")
+                    delivery.rename(destination)
+                    delivery = destination
+                except (OSError, json.JSONDecodeError) as exc:
+                    log(
+                        "incomplete retained STT delivery requires manual recovery "
+                        f"at {delivery}: {exc}"
+                    )
+                    continue
+            try:
+                recovered.append(_load_retained_delivery(delivery))
+            except (OSError, json.JSONDecodeError) as exc:
+                log(
+                    f"retained STT delivery requires manual recovery at {delivery}: {exc}"
+                )
+    return recovered
+
+
+def _update_retained_state(delivery_id: str, state: Literal["ambiguous"]) -> None:
+    delivery, metadata = _find_retained_delivery(delivery_id)
+    metadata["state"] = state
+    replacement = delivery / f".{RETAINED_METADATA}-{uuid.uuid4().hex}"
+    replacement.write_text(
+        json.dumps(metadata, separators=(",", ":")),
+        encoding="utf-8",
+    )
+    replacement.chmod(0o600)
+    os.replace(replacement, delivery / RETAINED_METADATA)
+
+
+def _release_retained_delivery(delivery_id: str) -> None:
+    delivery, _metadata = _find_retained_delivery(delivery_id)
+    (delivery / RETAINED_AUDIO).unlink()
+    (delivery / RETAINED_METADATA).unlink()
+    delivery.rmdir()
+
+
 def _recovery_error(
     code: str,
     message: str,
@@ -781,7 +966,7 @@ def _success_response(text: str, delivery_id: str) -> bytes:
     )
 
 
-def _validate_ack(frame: bytes, delivery_id: str) -> None:
+def _validate_ack(frame: bytes, delivery_id: str) -> tuple[bool, bool]:
     try:
         value = json.loads(frame)
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -796,6 +981,36 @@ def _validate_ack(frame: bytes, delivery_id: str) -> None:
         raise ProtocolError(
             "invalid_ack", "acknowledgment does not match the transcription"
         )
+    retain = value.get("disposition", "complete") == "retain"
+    if value.get("disposition", "complete") not in {"complete", "retain"}:
+        raise ProtocolError("invalid_ack", "unsupported acknowledgment disposition")
+    woke = value.get("woke", False)
+    if not isinstance(woke, bool):
+        raise ProtocolError("invalid_ack", "woke must be a boolean")
+    return retain, woke
+
+
+def _delivery_response(request: DeliveryRequest) -> bytes:
+    if request.operation == "recover":
+        payload: dict[str, object] = {
+            "ok": True,
+            "version": PROTOCOL_VERSION,
+            "type": "deliveries",
+            "deliveries": _recover_retained_deliveries(),
+        }
+    else:
+        assert request.delivery_id is not None
+        if request.operation == "release":
+            _release_retained_delivery(request.delivery_id)
+        else:
+            _update_retained_state(request.delivery_id, "ambiguous")
+        payload = {
+            "ok": True,
+            "version": PROTOCOL_VERSION,
+            "type": request.operation,
+            "delivery_id": request.delivery_id,
+        }
+    return json.dumps(payload, separators=(",", ":")).encode() + b"\n"
 
 
 def handle_connection(
@@ -810,6 +1025,21 @@ def handle_connection(
     try:
         try:
             request = _parse_request(_read_frame(connection))
+            if isinstance(request, DeliveryRequest):
+                try:
+                    _send(connection, _delivery_response(request))
+                except ProtocolError as exc:
+                    _send_error(connection, exc)
+                except Exception as exc:
+                    log(f"retained delivery operation failed: {exc}")
+                    _send_error(
+                        connection,
+                        ProtocolError(
+                            "delivery_operation_failed",
+                            "retained delivery operation could not be completed",
+                        ),
+                    )
+                return
             if not LOCK.acquire(blocking=False):
                 raise ProtocolError(
                     "server_busy", "another transcription is already active"
@@ -858,7 +1088,7 @@ def handle_connection(
             return
 
         try:
-            _validate_ack(_read_frame(connection), delivery_id)
+            retain, woke = _validate_ack(_read_frame(connection), delivery_id)
         except ProtocolError as exc:
             recovery = _restore_claim(claim)
             claim = None
@@ -869,7 +1099,15 @@ def handle_connection(
             return
 
         try:
-            _commit_claim(claim)
+            if retain:
+                _write_retained_claim(
+                    claim,
+                    delivery_id=delivery_id,
+                    text=text,
+                    woke=woke,
+                )
+            else:
+                _commit_claim(claim)
         except Exception as exc:
             log(f"could not commit acknowledged STT audio deletion: {exc}")
             recovery = _restore_claim(claim)

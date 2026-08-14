@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import socket
+import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -12,6 +14,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from unittest import mock
 
+from local_voice_harness.stt import client as stt_client
 from local_voice_harness.stt import server
 from local_voice_harness.user_config import DictationDevice
 
@@ -229,6 +232,75 @@ class SpeechToTextProtocolTests(unittest.TestCase):
 
                 self.assertFalse(generation.exists())
                 self.assertFalse(Path(transcriber.paths[0]).exists())
+
+    def test_wake_crash_retains_then_restart_recovers_exactly_once(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            transcriber = _Transcriber()
+            with _running_server(Path(temporary), transcriber) as (
+                socket_path,
+                audio_path,
+            ):
+                generation = _generation(
+                    audio_path,
+                    b"RIFF-process-crash" + b"\0" * 64,
+                )
+                process = subprocess.run(
+                    [
+                        sys.executable,
+                        "-c",
+                        (
+                            "import os, sys; from pathlib import Path; "
+                            "from local_voice_harness.stt import client; "
+                            "client.STT_SOCKET = Path(sys.argv[1]); "
+                            "client.transcribe_retained(Path(sys.argv[2]), woke=True); "
+                            "os._exit(73)"
+                        ),
+                        str(socket_path),
+                        str(generation),
+                    ],
+                    check=False,
+                    timeout=2,
+                )
+
+                self.assertEqual(process.returncode, 73)
+                with mock.patch.object(stt_client, "STT_SOCKET", socket_path):
+                    recovered = stt_client.recover_retained_transcripts()
+                    self.assertEqual(len(recovered), 1)
+                    self.assertEqual(recovered[0].text, "hello")
+                    self.assertTrue(recovered[0].woke)
+                    self.assertEqual(recovered[0].state, "pending")
+
+                    routed: list[str] = []
+                    routed.append(recovered[0].text)
+                    recovered[0].release()
+
+                    self.assertEqual(stt_client.recover_retained_transcripts(), ())
+
+                self.assertEqual(routed, ["hello"])
+                self.assertEqual(len(transcriber.paths), 1)
+                self.assertFalse(generation.exists())
+
+    def test_ambiguous_delivery_survives_restart_until_reconciliation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            with _running_server(Path(temporary), _Transcriber()) as (
+                socket_path,
+                audio_path,
+            ):
+                generation = _generation(
+                    audio_path,
+                    b"RIFF-ambiguous" + b"\0" * 64,
+                )
+                with mock.patch.object(stt_client, "STT_SOCKET", socket_path):
+                    delivery = stt_client.transcribe_retained(generation, woke=False)
+                    delivery.mark_ambiguous()
+
+                    recovered = stt_client.recover_retained_transcripts()
+                    self.assertEqual(len(recovered), 1)
+                    self.assertEqual(recovered[0].state, "ambiguous")
+
+                    recovered[0].mark_ambiguous()
+                    recovered[0].release()
+                    self.assertEqual(stt_client.recover_retained_transcripts(), ())
 
     def test_malformed_and_oversized_requests_return_structured_errors(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -705,6 +777,58 @@ class SpeechToTextProtocolTests(unittest.TestCase):
             self.assertTrue(
                 any(
                     "delivery committed despite" in str(call)
+                    for call in log.call_args_list
+                )
+            )
+
+    def test_retention_remains_successful_after_post_rename_lock_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            paths = server.recorder.RecorderPaths(
+                root,
+                root / "request.wav",
+                root / "recording.pid",
+                root / "recording.log",
+            )
+            processing_dir = root / server.PROCESSING_DIRECTORY
+            processing_dir.mkdir(mode=0o700)
+            original = root / "recordings" / f"request-{uuid.uuid4().hex}.wav"
+            processing = processing_dir / f"{original.stem}-{uuid.uuid4().hex}.wav"
+            processing.write_bytes(b"RIFF-retain" + b"\0" * 64)
+            processing.chmod(0o600)
+            delivery_id = uuid.uuid4().hex
+
+            @contextmanager
+            def lock_with_failed_cleanup(
+                _state_dir: Path, _lock: Path
+            ) -> Iterator[None]:
+                yield
+                raise OSError("lock cleanup failed")
+
+            with (
+                mock.patch.object(
+                    server.recorder,
+                    "recording_lock",
+                    side_effect=lock_with_failed_cleanup,
+                ),
+                mock.patch.object(server, "log") as log,
+            ):
+                server._write_retained_claim(
+                    server.AudioClaim(original, processing, paths),
+                    delivery_id=delivery_id,
+                    text="hello",
+                    woke=True,
+                )
+
+            retained = root / server.RETAINED_DIRECTORY / delivery_id
+            self.assertTrue((retained / server.RETAINED_AUDIO).exists())
+            self.assertEqual(
+                server._load_retained_delivery(retained)["state"],
+                "pending",
+            )
+            self.assertTrue(
+                any(
+                    "retention committed despite" in str(call)
                     for call in log.call_args_list
                 )
             )
