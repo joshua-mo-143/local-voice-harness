@@ -147,6 +147,7 @@ def _bare_daemon() -> WakeConversationDaemon:
         maxlen=wake_daemon.RECENT_PLAYBACK_LIMIT
     )
     instance.pending_target_readback = None
+    instance.pending_target_resolution = None
     instance.pending_config_change = None
     instance.config_activation_store = mock.Mock(spec=wake_daemon.ActivationStore)
     instance.config_activation_store.current.return_value = None
@@ -2154,9 +2155,301 @@ class ProcessUtteranceTests(unittest.TestCase):
 
         cursor_turn.assert_not_called()
         qwen_turn.assert_not_called()
+        self.assertIsNone(daemon.pending_target_resolution)
         play.assert_called_once_with(
             AssistantResponse.from_text(wake_daemon.MISSING_ISSUE_SCOPE_RESPONSE)
         )
+
+    def test_actionable_bare_ticket_batch_has_no_single_issue_resolution(
+        self,
+    ) -> None:
+        daemon = _bare_daemon()
+        text = "work on issues 92 and 93"
+        with (
+            mock.patch.object(wake_daemon, "transcribe", return_value=text),
+            mock.patch.object(wake_daemon, "start_components"),
+            mock.patch.object(
+                wake_daemon,
+                "request_context",
+                return_value=RequestContext(text),
+            ),
+            mock.patch.object(
+                wake_daemon,
+                "route_intent",
+                return_value=IntentRoute(Intent.AGENT_SUBMIT, "high"),
+            ),
+            mock.patch.object(wake_daemon, "cursor_turn") as cursor_turn,
+            mock.patch.object(wake_daemon, "qwen_turn") as qwen_turn,
+            mock.patch.object(
+                daemon,
+                "play_response",
+                return_value=({"played_text": ""}, None),
+            ),
+            mock.patch.object(wake_daemon, "notify"),
+        ):
+            daemon.process_utterance(AUDIO_GENERATION, woke=False)
+
+        self.assertIsNone(daemon.pending_target_resolution)
+        cursor_turn.assert_not_called()
+        qwen_turn.assert_not_called()
+
+    def test_opened_issue_continuation_resumes_original_request_then_readback(
+        self,
+    ) -> None:
+        daemon = _bare_daemon()
+        request = "work on issue 384"
+        exact_context = RequestContext(
+            f"{request}\n\nGitHub issue context",
+            focused_repository="example/payments",
+            focused_issue="example/payments#384",
+            github_repository="example/payments",
+            github_issue=384,
+            issue_scope="example/payments",
+            issue_scope_source="github",
+        )
+        with (
+            mock.patch.object(
+                wake_daemon,
+                "transcribe",
+                side_effect=[request, "yeah, I've opened it, um", "yes"],
+            ),
+            mock.patch.object(wake_daemon, "start_components"),
+            mock.patch.object(
+                wake_daemon,
+                "request_context",
+                side_effect=[
+                    RequestContext(request),
+                    exact_context,
+                    replace(exact_context, text="yes\n\nGitHub issue context"),
+                ],
+            ) as request_context,
+            mock.patch.object(
+                wake_daemon,
+                "route_intent",
+                return_value=IntentRoute(Intent.AGENT_SUBMIT, "high"),
+            ) as route_intent,
+            mock.patch.object(
+                wake_daemon, "cursor_turn", return_value=("started", None)
+            ) as cursor_turn,
+            mock.patch.object(
+                daemon,
+                "play_response",
+                return_value=({"played_text": ""}, None),
+            ),
+            mock.patch.object(wake_daemon, "notify"),
+        ):
+            daemon.process_utterance(AUDIO_GENERATION, woke=False)
+            self.assertIsNotNone(daemon.pending_target_resolution)
+            cursor_turn.assert_not_called()
+
+            daemon.process_utterance(AUDIO_GENERATION, woke=False)
+            self.assertIsNone(daemon.pending_target_resolution)
+            self.assertIsNotNone(daemon.pending_target_readback)
+            cursor_turn.assert_not_called()
+
+            daemon.process_utterance(AUDIO_GENERATION, woke=False)
+
+        route_intent.assert_called_once()
+        self.assertEqual(
+            [call.args[0] for call in request_context.call_args_list],
+            [request, request, "yes"],
+        )
+        submitted = cursor_turn.call_args.args[0]
+        self.assertEqual(submitted.github_repository, "example/payments")
+        self.assertEqual(submitted.github_issue, 384)
+
+    def test_opened_issue_continuation_rejects_missing_or_conflicting_focus(
+        self,
+    ) -> None:
+        request = "work on issue 384"
+        invalid_contexts = (
+            RequestContext(request),
+            RequestContext(
+                request,
+                focused_repository="example/payments",
+                focused_issue="example/payments#385",
+                github_repository="example/payments",
+                github_issue=385,
+                issue_scope="example/payments",
+                issue_scope_source="github",
+            ),
+            RequestContext(
+                request,
+                focused_repository="example/payments",
+                issue_scope="example/payments",
+                issue_scope_source="github",
+            ),
+        )
+        for invalid_context in invalid_contexts:
+            with self.subTest(context=invalid_context):
+                daemon = _bare_daemon()
+                with (
+                    mock.patch.object(
+                        wake_daemon,
+                        "transcribe",
+                        side_effect=[request, "this issue"],
+                    ),
+                    mock.patch.object(wake_daemon, "start_components"),
+                    mock.patch.object(
+                        wake_daemon,
+                        "request_context",
+                        side_effect=[RequestContext(request), invalid_context],
+                    ),
+                    mock.patch.object(
+                        wake_daemon,
+                        "route_intent",
+                        return_value=IntentRoute(Intent.AGENT_SUBMIT, "high"),
+                    ),
+                    mock.patch.object(wake_daemon, "cursor_turn") as cursor_turn,
+                    mock.patch.object(
+                        daemon,
+                        "play_response",
+                        return_value=({"played_text": ""}, None),
+                    ) as play,
+                    mock.patch.object(wake_daemon, "notify"),
+                ):
+                    daemon.process_utterance(AUDIO_GENERATION, woke=False)
+                    pending = daemon.pending_target_resolution
+                    daemon.process_utterance(AUDIO_GENERATION, woke=False)
+
+                self.assertIs(daemon.pending_target_resolution, pending)
+                self.assertIsNone(daemon.pending_target_readback)
+                cursor_turn.assert_not_called()
+                play.assert_called_with(wake_daemon.TARGET_RESOLUTION_CONTEXT_RESPONSE)
+
+    def test_target_resolution_no_speech_keeps_bounded_retry(self) -> None:
+        daemon = _bare_daemon()
+        pending = wake_daemon.PendingTargetResolution(
+            "work on issue 384",
+            IntentRoute(Intent.AGENT_SUBMIT, "high"),
+            time.monotonic(),
+        )
+        daemon.pending_target_resolution = pending
+        daemon.conversation_deadline = pending.expires_at
+        with (
+            mock.patch.object(
+                wake_daemon,
+                "transcribe",
+                side_effect=NoSpeechError("no recognizable speech"),
+            ),
+            mock.patch.object(wake_daemon, "notify") as notify,
+        ):
+            daemon.process_utterance(AUDIO_GENERATION, woke=False)
+
+        self.assertIs(daemon.pending_target_resolution, pending)
+        self.assertTrue(daemon.awaiting_followup)
+        self.assertLessEqual(daemon.conversation_deadline, pending.expires_at)
+        notify.assert_called_once_with(
+            wake_daemon.TARGET_RESOLUTION_CONTEXT_RESPONSE.spoken_text
+        )
+
+    def test_fork_resume_consumes_target_resolution_after_dispatch(self) -> None:
+        daemon = _bare_daemon()
+        request = "fork and work on issue 384"
+        exact_context = RequestContext(
+            request,
+            focused_repository="example/payments",
+            focused_issue="example/payments#384",
+            github_repository="example/payments",
+            github_issue=384,
+            issue_scope="example/payments",
+            issue_scope_source="github",
+        )
+        with (
+            mock.patch.object(
+                wake_daemon,
+                "transcribe",
+                side_effect=[request, "okay, this issue please"],
+            ),
+            mock.patch.object(wake_daemon, "start_components"),
+            mock.patch.object(
+                wake_daemon,
+                "request_context",
+                side_effect=[RequestContext(request), exact_context],
+            ),
+            mock.patch.object(
+                wake_daemon,
+                "route_intent",
+                return_value=IntentRoute(Intent.AGENT_SUBMIT, "high"),
+            ),
+            mock.patch.object(
+                wake_daemon,
+                "decide_fork_intent",
+                return_value=wake_daemon.ForkIntent.AFFIRMATIVE,
+            ),
+            mock.patch.object(
+                wake_daemon, "cursor_turn", return_value=("confirm fork", None)
+            ) as cursor_turn,
+            mock.patch.object(
+                daemon,
+                "play_response",
+                return_value=({"played_text": ""}, None),
+            ),
+            mock.patch.object(wake_daemon, "notify"),
+        ):
+            daemon.process_utterance(AUDIO_GENERATION, woke=False)
+            daemon.process_utterance(AUDIO_GENERATION, woke=False)
+
+        self.assertIsNone(daemon.pending_target_resolution)
+        self.assertIsNone(daemon.pending_target_readback)
+        cursor_turn.assert_called_once()
+        self.assertTrue(cursor_turn.call_args.args[0].fork_requested)
+
+    def test_unrelated_command_and_timeout_abandon_target_resolution(self) -> None:
+        daemon = _bare_daemon()
+        request = "work on issue 384"
+        with (
+            mock.patch.object(
+                wake_daemon,
+                "transcribe",
+                side_effect=[request, "list my running jobs"],
+            ),
+            mock.patch.object(wake_daemon, "start_components"),
+            mock.patch.object(
+                wake_daemon,
+                "request_context",
+                return_value=RequestContext(request),
+            ),
+            mock.patch.object(
+                wake_daemon,
+                "route_intent",
+                side_effect=[
+                    IntentRoute(Intent.AGENT_SUBMIT, "high"),
+                    IntentRoute(Intent.AGENT_LIST, "high"),
+                ],
+            ),
+            mock.patch.object(
+                wake_daemon, "cursor_turn", return_value=("No jobs.", None)
+            ) as cursor_turn,
+            mock.patch.object(
+                daemon,
+                "play_response",
+                return_value=({"played_text": ""}, None),
+            ),
+            mock.patch.object(wake_daemon, "notify"),
+        ):
+            daemon.process_utterance(AUDIO_GENERATION, woke=False)
+            daemon.process_utterance(AUDIO_GENERATION, woke=False)
+
+        self.assertIsNone(daemon.pending_target_resolution)
+        self.assertEqual(cursor_turn.call_args.args[0].action, "list")
+
+        daemon.pending_target_resolution = wake_daemon.PendingTargetResolution(
+            request,
+            IntentRoute(Intent.AGENT_SUBMIT, "high"),
+            time.monotonic(),
+        )
+        pending = daemon.pending_target_resolution
+        with mock.patch.object(wake_daemon, "stop_components"):
+            daemon.close_pending_capture("non-actionable speech")
+        self.assertIs(daemon.pending_target_resolution, pending)
+
+        with (
+            mock.patch.object(wake_daemon, "stop_components"),
+            mock.patch.object(wake_daemon, "notify"),
+        ):
+            daemon.close_conversation("inactivity")
+        self.assertIsNone(daemon.pending_target_resolution)
 
     def test_failed_fresh_turn_stops_components(self) -> None:
         daemon = _bare_daemon()
