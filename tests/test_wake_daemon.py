@@ -277,6 +277,30 @@ def _pending_free_text_snapshot() -> wake_daemon.PendingQuestionSnapshot:
     )
 
 
+def _pending_repository_snapshot() -> wake_daemon.PendingQuestionSnapshot:
+    question = Question(
+        id="question-repository",
+        text="Which repository should Cursor use?",
+        kind=QuestionKind.FREE_TEXT,
+        sensitivity=QuestionSensitivity.ROUTINE,
+        origin=QuestionOrigin(
+            "cursor",
+            "repo123456789",
+            "repo123456789-routing-0",
+        ),
+        owner="repository",
+        asked_at=1,
+    )
+    return wake_daemon.PendingQuestionSnapshot(
+        "repo123456789",
+        question.text,
+        question.owner,
+        question.id,
+        question.origin.turn_token,
+        question,
+    )
+
+
 def _pending_grouped_repository_snapshot() -> wake_daemon.PendingQuestionSnapshot:
     question = Question(
         id="question-grouped",
@@ -1646,6 +1670,47 @@ class ProcessUtteranceTests(unittest.TestCase):
             request.expected_question_turn,
             "grouped12345-repository-group",
         )
+
+    def test_repository_list_request_overrides_list_route(self) -> None:
+        daemon = _bare_daemon()
+        daemon.cursor_session = "repo123456789"
+        with (
+            mock.patch.object(
+                wake_daemon, "transcribe", return_value="list repositories"
+            ),
+            mock.patch.object(wake_daemon, "start_components"),
+            mock.patch.object(
+                wake_daemon,
+                "request_context",
+                return_value=RequestContext("list repositories"),
+            ),
+            mock.patch.object(
+                daemon,
+                "_pending_cursor_question",
+                return_value=_pending_repository_snapshot(),
+            ),
+            mock.patch.object(
+                wake_daemon,
+                "route_intent",
+                return_value=IntentRoute(Intent.AGENT_LIST, "high"),
+            ),
+            mock.patch.object(
+                wake_daemon, "cursor_turn", return_value=("more names", None)
+            ) as cursor_turn,
+            mock.patch.object(
+                daemon,
+                "play_response",
+                return_value=({"played_text": "more names"}, None),
+            ),
+            mock.patch.object(wake_daemon, "notify"),
+        ):
+            daemon.process_utterance(AUDIO_GENERATION, woke=True)
+
+        request = cursor_turn.call_args.args[0]
+        self.assertEqual(request.action, "reply")
+        self.assertEqual(request.job_id, "repo123456789")
+        self.assertEqual(request.utterance, "list repositories")
+        self.assertEqual(request.expected_question_id, "question-repository")
 
     def test_repository_mapping_does_not_override_unrelated_question(self) -> None:
         daemon = _bare_daemon()

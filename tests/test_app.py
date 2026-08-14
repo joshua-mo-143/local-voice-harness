@@ -265,6 +265,83 @@ class AppContextTests(unittest.TestCase):
         ):
             self.assertIsNone(app._pending_grouped_repository_question())
 
+    def test_list_repositories_answers_single_repository_question(self) -> None:
+        target = ("repo123456789", "question-repository", "repo123456789-turn")
+        with (
+            mock.patch.object(app, "start_components"),
+            mock.patch.object(
+                app,
+                "request_context",
+                return_value=RequestContext("list repositories"),
+            ),
+            mock.patch.object(app, "_pending_repository_question", return_value=target),
+            mock.patch.object(app, "route_intent") as route_intent,
+            mock.patch.object(
+                app,
+                "cursor_turn",
+                return_value=("Available repositories include: a.", None),
+            ) as cursor_turn,
+            mock.patch.object(app, "stream_and_play"),
+        ):
+            app.respond("list repositories")
+
+        route_intent.assert_not_called()
+        cursor_turn.assert_called_once_with(
+            CursorTurnRequest(
+                "list repositories",
+                action="reply",
+                reference="list repositories",
+                utterance="list repositories",
+                job_id="repo123456789",
+                expected_question_id="question-repository",
+                expected_question_turn="repo123456789-turn",
+                answer_provenance=AnswerProvenance.USER_TEXT,
+            ),
+            delivery_claims=mock.ANY,
+            integrations=mock.ANY,
+        )
+
+    def test_repository_question_lookup_requires_one_matching_owner(self) -> None:
+        repository_job = mock.Mock(id="repo123456789", status=JobStatus.AWAITING_USER)
+        unrelated_job = mock.Mock(id="other1234567", status=JobStatus.AWAITING_USER)
+        repository_question = mock.Mock(
+            id="question-repository",
+            owner="repository",
+            origin=mock.Mock(turn_token="repo123456789-turn"),
+        )
+        unrelated_question = mock.Mock(owner="grouped_repository")
+
+        with (
+            mock.patch.object(
+                app.CURSOR_STORE,
+                "list",
+                return_value=[repository_job, unrelated_job],
+            ),
+            mock.patch.object(
+                app.cursor_questions,
+                "current",
+                side_effect=[repository_question, unrelated_question],
+            ),
+        ):
+            self.assertEqual(
+                app._pending_repository_question(),
+                ("repo123456789", "question-repository", "repo123456789-turn"),
+            )
+
+        with (
+            mock.patch.object(
+                app.CURSOR_STORE,
+                "list",
+                return_value=[repository_job, repository_job],
+            ),
+            mock.patch.object(
+                app.cursor_questions,
+                "current",
+                return_value=repository_question,
+            ),
+        ):
+            self.assertIsNone(app._pending_repository_question())
+
     def test_response_channels_are_selected_at_foreground_boundary(self) -> None:
         output = io.StringIO()
         response = AssistantResponse(

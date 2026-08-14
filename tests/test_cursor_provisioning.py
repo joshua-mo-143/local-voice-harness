@@ -1527,6 +1527,33 @@ class DurablePromptOperationTests(unittest.TestCase):
         self.assertTrue(deferred.reconcile)
 
 
+class RepositoryQuestionTests(unittest.TestCase):
+    def test_spoken_page_is_bounded_and_omits_names_without_a_shortlist(self) -> None:
+        repositories = [Path(f"/repos/project-{index}") for index in range(6)]
+        self.assertEqual(
+            production_jobs.repository_question(repositories, names=[], remaining=6),
+            "Which repository should Cursor use?",
+        )
+        self.assertEqual(
+            production_jobs.repository_question(
+                repositories,
+                names=["project-0", "project-1", "project-2", "project-3"],
+                remaining=2,
+            ),
+            "Which repository should Cursor use? Available repositories include: "
+            "project-0, project-1, project-2, project-3. "
+            "Say list repositories to hear more names.",
+        )
+
+    def test_list_request_phrases_are_whole_utterance_matches(self) -> None:
+        self.assertTrue(production_jobs.is_repository_list_request("list repositories"))
+        self.assertTrue(production_jobs.is_repository_list_request("Hear more names."))
+        self.assertFalse(production_jobs.is_repository_list_request("list"))
+        self.assertFalse(
+            production_jobs.is_repository_list_request("use the list repository")
+        )
+
+
 class CursorJobStateTests(unittest.TestCase):
     def setUp(self) -> None:
         self.temporary = tempfile.TemporaryDirectory()
@@ -3830,8 +3857,7 @@ class CursorJobStateTests(unittest.TestCase):
         self.assertEqual(command[1:3], ["-m", "local_voice_harness.cursor.worker"])
         thread.assert_called_once()
 
-    def test_worker_uses_rofi_repository_selection_before_prompting(self) -> None:
-        repository = Path(self.temporary.name) / "cloned-project"
+    def test_worker_asks_for_repository_by_voice_without_opening_rofi(self) -> None:
         jobs.write_job(
             {
                 "id": "123456789abc",
@@ -3844,29 +3870,198 @@ class CursorJobStateTests(unittest.TestCase):
         client = mock.Mock()
         client.repository_roots.return_value = []
         client.resolve_repository.return_value = (None, [])
-        client.choose_or_clone_repository.return_value = (repository, "")
+
+        with mock.patch.object(production_jobs, "HerdrClient", return_value=client):
+            service.run_worker("123456789abc")
+
+        awaiting = jobs.read_job("123456789abc")
+        self.assertEqual(awaiting["status"], "awaiting_user")
+        self.assertEqual(awaiting["clarification_kind"], "repository")
+        self.assertEqual(awaiting["participant_admission_state"], "waiting")
+        self.assertIsNone(awaiting.get("repository"))
+        self.assertEqual(
+            awaiting["question"],
+            "Which repository should Cursor use?",
+        )
+        client.choose_or_clone_repository.assert_not_called()
+        client.ensure_agent.assert_not_called()
+
+    def test_unresolved_repository_question_does_not_enumerate_local_repos(
+        self,
+    ) -> None:
+        repositories = [Path(f"/repos/project-{index}") for index in range(8)]
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "Use Cursor to fix the bug",
+                "status": "queued",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        client = mock.Mock()
+        client.repository_roots.return_value = repositories
+        client.resolve_repository.return_value = (None, [])
+
+        with mock.patch.object(production_jobs, "HerdrClient", return_value=client):
+            service.run_worker("123456789abc")
+
+        awaiting = jobs.read_job("123456789abc")
+        question = str(awaiting["question"])
+        self.assertEqual(awaiting["status"], "awaiting_user")
+        self.assertEqual(question, "Which repository should Cursor use?")
+        for repository in repositories:
+            self.assertNotIn(repository.name, question)
+        self.assertEqual(
+            awaiting["grouped_repository_candidates"],
+            [repository.name for repository in repositories],
+        )
+        client.choose_or_clone_repository.assert_not_called()
+
+    def test_repository_question_speaks_at_most_four_shortlist_names(self) -> None:
+        shortlist = [Path(f"/repos/hint-{index}") for index in range(6)]
+        others = [Path("/repos/other-one"), Path("/repos/other-two")]
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "Use Cursor to fix the bug",
+                "repository_hint": "hint",
+                "status": "queued",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        client = mock.Mock()
+        client.repository_roots.return_value = [*shortlist, *others]
+        client.resolve_repository.return_value = (None, shortlist)
+
+        with mock.patch.object(production_jobs, "HerdrClient", return_value=client):
+            service.run_worker("123456789abc")
+
+        awaiting = jobs.read_job("123456789abc")
+        question = str(awaiting["question"])
+        self.assertEqual(awaiting["status"], "awaiting_user")
+        self.assertIn("hint-0, hint-1, hint-2, hint-3", question)
+        self.assertNotIn("hint-4", question)
+        self.assertNotIn("hint-5", question)
+        self.assertNotIn("other-one", question)
+        self.assertIn("Say list repositories to hear more names.", question)
+        self.assertEqual(
+            awaiting["grouped_repository_candidates"],
+            ["hint-4", "hint-5", "other-one", "other-two"],
+        )
+        client.choose_or_clone_repository.assert_not_called()
+
+    def test_repository_list_follow_up_speaks_another_bounded_page(self) -> None:
+        remaining = [f"repo-{index}" for index in range(6)]
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "Use Cursor to fix the bug",
+                "status": "awaiting_user",
+                "clarification_kind": "repository",
+                "question": "Which repository should Cursor use?",
+                "voice_question": {
+                    "version": 1,
+                    "id": "question-1",
+                    "text": "Which repository should Cursor use?",
+                    "kind": "free_text",
+                    "sensitivity": "routine",
+                    "origin": {
+                        "provider": "cursor",
+                        "job_id": "123456789abc",
+                        "turn_token": "token-1",
+                    },
+                    "owner": "repository",
+                    "state": "pending",
+                    "asked_at": 1,
+                },
+                "grouped_repository_candidates": remaining,
+                "participant_admission_state": "waiting",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+
+        spoken = service.reply_job("123456789abc", "list repositories")
+
+        updated = jobs.read_job("123456789abc")
+        self.assertEqual(updated["status"], "awaiting_user")
+        self.assertEqual(updated["clarification_kind"], "repository")
+        self.assertEqual(spoken, updated["question"])
+        self.assertIn("repo-0, repo-1, repo-2, repo-3", str(spoken))
+        self.assertNotIn("repo-4", str(spoken))
+        self.assertNotIn("repo-5", str(spoken))
+        self.assertEqual(
+            updated["grouped_repository_candidates"],
+            ["repo-4", "repo-5"],
+        )
+        self.assertIsNone(updated.get("repository_hint"))
+        self.assertIsNone(updated.get("repository"))
+
+    def test_repository_answer_does_not_open_rofi(self) -> None:
+        selected = Path("/repos/payments")
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "Use Cursor to fix the bug",
+                "status": "awaiting_user",
+                "clarification_kind": "repository",
+                "question": "Which repository should Cursor use?",
+                "voice_question": {
+                    "version": 1,
+                    "id": "question-1",
+                    "text": "Which repository should Cursor use?",
+                    "kind": "free_text",
+                    "sensitivity": "routine",
+                    "origin": {
+                        "provider": "cursor",
+                        "job_id": "123456789abc",
+                        "turn_token": "token-1",
+                    },
+                    "owner": "repository",
+                    "state": "pending",
+                    "asked_at": 1,
+                },
+                "participant_admission_state": "waiting",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        client = mock.Mock()
+        client.repository_roots.return_value = [selected]
+        client.resolve_repository.return_value = (selected, [selected])
         client.ensure_agent.return_value = AgentSelection(
             target="cursor-agent",
             pane_id="pane",
             workspace_id="workspace",
-            cwd=str(repository),
+            cwd=str(selected),
             name="cursor-agent",
-            worktree_path=str(repository),
+            worktree_path=str(selected),
             provider="cursor/herdr",
             provider_session_id="test-session",
             state_sequence=7,
         )
-        configure_tiered_outcomes(client, repository)
+        configure_tiered_outcomes(client, selected)
 
-        with mock.patch.object(jobs, "HerdrClient", return_value=client):
-            service.run_worker("123456789abc")
+        with (
+            mock.patch.object(jobs, "HerdrClient", return_value=client),
+            mock.patch.object(
+                service, "_dispatch_waiting_jobs", return_value=frozenset()
+            ) as dispatch,
+        ):
+            service.reply_job(
+                "123456789abc",
+                "payments",
+                trusted_utterance="payments",
+            )
 
-        updated = jobs.read_job("123456789abc")
-        self.assertEqual(updated["status"], "completed")
-        self.assertEqual(updated["repository"], str(repository))
-        client.choose_or_clone_repository.assert_called_once_with(
-            [], checkpoint=mock.ANY
-        )
+        requeued = jobs.read_job("123456789abc")
+        self.assertEqual(requeued["status"], "queued")
+        self.assertEqual(requeued["repository_hint"], "payments")
+        self.assertIsNone(requeued.get("repository"))
+        client.choose_or_clone_repository.assert_not_called()
+        dispatch.assert_called_once()
 
     def test_worker_checks_issue_capability_before_herdr_side_effects(self) -> None:
         jobs.write_job(
@@ -3985,7 +4180,6 @@ class CursorJobStateTests(unittest.TestCase):
         client = mock.Mock()
         client.repository_roots.return_value = repositories
         client.ensure_router.return_value = mock.Mock(target="voice-router")
-        client.choose_or_clone_repository.return_value = (None, "")
 
         def resolve(
             hint: str | None, task: str, _repositories: list[Path]
@@ -4064,10 +4258,14 @@ class CursorJobStateTests(unittest.TestCase):
                 ),
             ],
         )
-        client.choose_or_clone_repository.assert_called_once_with(
-            [focused], checkpoint=mock.ANY
-        )
+        client.choose_or_clone_repository.assert_not_called()
         client.ensure_agent.assert_not_called()
+        question = str(awaiting["question"])
+        self.assertIn("Available repositories include: local-voice-harness.", question)
+        self.assertNotIn(
+            "Available repositories include: local-voice-harness-tiered-batch-fixture",
+            question,
+        )
 
         with mock.patch.object(
             service, "_dispatch_waiting_jobs", return_value=frozenset()

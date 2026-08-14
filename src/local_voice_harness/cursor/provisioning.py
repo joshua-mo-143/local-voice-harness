@@ -362,14 +362,56 @@ def reserved_targets(store: JobStore, exclude_job_id: str | None = None) -> set[
     return reserved
 
 
-def repository_question(repositories: list[Path], reason: str = "") -> str:
-    names = ", ".join(path.name for path in repositories)
+REPOSITORY_NAME_PAGE = 4
+_REPOSITORY_LIST_PHRASES = frozenset(
+    {
+        "hear more",
+        "hear more names",
+        "list more",
+        "list more repositories",
+        "list repositories",
+        "list the repositories",
+        "more repositories",
+        "what repositories",
+    }
+)
+
+
+def is_repository_list_request(text: str) -> bool:
+    """Return whether a repository-question follow-up asks for another name page."""
+
+    normalized = re.sub(r"[^\w\s]", " ", text.casefold())
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    return normalized in _REPOSITORY_LIST_PHRASES
+
+
+def repository_name_page(names: list[str]) -> tuple[list[str], list[str]]:
+    """Split speakable repository names into one bounded page and the remainder."""
+
+    return names[:REPOSITORY_NAME_PAGE], names[REPOSITORY_NAME_PAGE:]
+
+
+def repository_question(
+    repositories: list[Path],
+    reason: str = "",
+    *,
+    names: list[str] | None = None,
+    remaining: int = 0,
+) -> str:
     prefix = f"{reason.strip()} " if reason.strip() else ""
-    return (
-        f"{prefix}Which repository should Cursor use? Available repositories are {names}."
-        if names
-        else f"{prefix}I could not find an available local Git repository."
+    spoken = (
+        names
+        if names is not None
+        else [path.name for path in repositories[:REPOSITORY_NAME_PAGE]]
     )
+    if spoken:
+        listed = ", ".join(spoken)
+        more = " Say list repositories to hear more names." if remaining > 0 else ""
+        return (
+            f"{prefix}Which repository should Cursor use? "
+            f"Available repositories include: {listed}.{more}"
+        )
+    return f"{prefix}Which repository should Cursor use?"
 
 
 def resolve_job_repository(
@@ -5227,21 +5269,21 @@ def run_claimed_worker(  # pyright: ignore[reportGeneralTypeIssues]
                     )
                 checkpoint()
             if repository is None:
-                checkpoint()
-                repository, rofi_reason = client.choose_or_clone_repository(
-                    candidates or repositories, checkpoint=checkpoint
-                )
-                checkpoint()
-                reason = rofi_reason or reason
-            if repository is None:
+                shortlist = [path.name for path in candidates]
+                page, _shortlist_rest = repository_name_page(shortlist)
+                remaining_names = [
+                    path.name for path in repositories if path.name not in page
+                ]
                 question = repository_question(
-                    candidates or repositories,
+                    [],
                     reason
                     or (
                         "The repository could not be determined confidently."
                         if hint or issue_key
                         else ""
                     ),
+                    names=page,
+                    remaining=len(remaining_names),
                 )
                 _worker_question(
                     store,
@@ -5250,7 +5292,12 @@ def run_claimed_worker(  # pyright: ignore[reportGeneralTypeIssues]
                     question,
                     expected_revision=job.revision,
                     clarification_kind="repository",
-                    job_changes={"participant_admission_state": "waiting"},
+                    job_changes={
+                        "participant_admission_state": "waiting",
+                        # Remaining speakable names for later "list repositories"
+                        # pages. Unused by the grouped-ticket owner.
+                        "grouped_repository_candidates": remaining_names,
+                    },
                 )
                 return
             for _attempt in range(3):
