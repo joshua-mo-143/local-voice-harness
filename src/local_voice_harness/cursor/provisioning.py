@@ -16,6 +16,7 @@ from ..errors import HarnessError
 from ..github_issue_creation import draft_github_issue
 from ..integrations.github import (
     GitHubClient,
+    GitHubCommandStartError,
     GitHubError,
     GitHubForkPlan,
     GitHubIssue,
@@ -718,12 +719,10 @@ def _run_github_issue_creation(
         result = github.submit_issue_creation(plan, confirmed=True)
     except GitHubError as exc:
         checkpoint()
-        observation_failed = False
         try:
             visible = github.observe_issue_creation(plan)
         except GitHubError:
             visible = None
-            observation_failed = True
         if visible is not None:
             _finish_github_issue_creation(
                 store,
@@ -733,7 +732,7 @@ def _run_github_issue_creation(
                 expected_revision=submitted.revision,
             )
             return
-        if isinstance(exc, GitHubOperationAmbiguous) or observation_failed:
+        if not isinstance(exc, GitHubCommandStartError):
 
             def ambiguous(current: CursorJob) -> CursorJob:
                 return current.evolve(
@@ -758,22 +757,29 @@ def _run_github_issue_creation(
             )
             return
 
-        def failed_before_creation(current: CursorJob) -> CursorJob:
+        def retry_after_start_failure(current: CursorJob) -> CursorJob:
             return current.evolve(
+                status=JobStatus.QUEUED,
+                queued_at=time.time(),
                 github_issue_create_operation_state="planned",
+                worker_pid=None,
+                worker_boot_id=None,
+                worker_process_start=None,
+                worker_token=None,
                 worker_operation=None,
+                worker_claim_operation=None,
+                worker_claimed_at=None,
             )
 
-        fenced = _worker_change(
+        _worker_change(
             store,
             job.id,
             token,
             {JobStatus.RUNNING},
-            failed_before_creation,
+            retry_after_start_failure,
             expected_revision=submitted.revision,
         )
-        _carry_observed_revision(exc, fenced)
-        raise
+        return
     _finish_github_issue_creation(
         store,
         job.id,

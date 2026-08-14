@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import socket
+import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -12,6 +14,8 @@ from contextlib import contextmanager
 from pathlib import Path
 from unittest import mock
 
+from local_voice_harness.errors import HarnessError
+from local_voice_harness.stt import client as stt_client
 from local_voice_harness.stt import server
 from local_voice_harness.user_config import DictationDevice
 
@@ -229,6 +233,200 @@ class SpeechToTextProtocolTests(unittest.TestCase):
 
                 self.assertFalse(generation.exists())
                 self.assertFalse(Path(transcriber.paths[0]).exists())
+
+    def test_wake_crash_retains_then_restart_recovers_exactly_once(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            transcriber = _Transcriber()
+            with _running_server(Path(temporary), transcriber) as (
+                socket_path,
+                audio_path,
+            ):
+                generation = _generation(
+                    audio_path,
+                    b"RIFF-process-crash" + b"\0" * 64,
+                )
+                process = subprocess.run(
+                    [
+                        sys.executable,
+                        "-c",
+                        (
+                            "import os, sys; from pathlib import Path; "
+                            "from local_voice_harness.stt import client; "
+                            "client.STT_SOCKET = Path(sys.argv[1]); "
+                            "client.transcribe_retained(Path(sys.argv[2]), woke=True); "
+                            "os._exit(73)"
+                        ),
+                        str(socket_path),
+                        str(generation),
+                    ],
+                    check=False,
+                    timeout=2,
+                )
+
+                self.assertEqual(process.returncode, 73)
+                with mock.patch.object(stt_client, "STT_SOCKET", socket_path):
+                    recovered = stt_client.recover_retained_transcripts()
+                    self.assertEqual(len(recovered), 1)
+                    self.assertEqual(recovered[0].text, "hello")
+                    self.assertTrue(recovered[0].woke)
+                    self.assertEqual(recovered[0].state, "pending")
+
+                    routed: list[str] = []
+                    routed.append(recovered[0].text)
+                    recovered[0].release()
+
+                    self.assertEqual(stt_client.recover_retained_transcripts(), ())
+
+                self.assertEqual(routed, ["hello"])
+                self.assertEqual(len(transcriber.paths), 1)
+                self.assertFalse(generation.exists())
+
+    def test_ambiguous_delivery_survives_restart_until_reconciliation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            with _running_server(Path(temporary), _Transcriber()) as (
+                socket_path,
+                audio_path,
+            ):
+                generation = _generation(
+                    audio_path,
+                    b"RIFF-ambiguous" + b"\0" * 64,
+                )
+                with mock.patch.object(stt_client, "STT_SOCKET", socket_path):
+                    delivery = stt_client.transcribe_retained(generation, woke=False)
+                    delivery.mark_ambiguous()
+
+                    recovered = stt_client.recover_retained_transcripts()
+                    self.assertEqual(len(recovered), 1)
+                    self.assertEqual(recovered[0].state, "ambiguous")
+
+                    recovered[0].mark_ambiguous()
+                    recovered[0].release()
+                    self.assertEqual(stt_client.recover_retained_transcripts(), ())
+
+    def test_terminal_delivery_survives_restart_without_replay(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            with _running_server(Path(temporary), _Transcriber()) as (
+                socket_path,
+                audio_path,
+            ):
+                generation = _generation(
+                    audio_path,
+                    b"RIFF-terminal" + b"\0" * 64,
+                )
+                process = subprocess.run(
+                    [
+                        sys.executable,
+                        "-c",
+                        (
+                            "import os, sys; from pathlib import Path; "
+                            "from local_voice_harness.stt import client; "
+                            "client.STT_SOCKET = Path(sys.argv[1]); "
+                            "delivery = client.transcribe_retained("
+                            "Path(sys.argv[2]), woke=False); "
+                            "delivery.mark_terminal(); "
+                            "os._exit(74)"
+                        ),
+                        str(socket_path),
+                        str(generation),
+                    ],
+                    check=False,
+                    timeout=2,
+                )
+
+                self.assertEqual(process.returncode, 74)
+                with mock.patch.object(stt_client, "STT_SOCKET", socket_path):
+                    recovered = stt_client.recover_retained_transcripts()
+                    self.assertEqual(len(recovered), 1)
+                    self.assertEqual(recovered[0].state, "terminal")
+                    with self.assertRaisesRegex(
+                        server.ProtocolError,
+                        "terminal retained delivery cannot become",
+                    ):
+                        server._delivery_response(
+                            server.DeliveryRequest("pending", recovered[0].delivery_id)
+                        )
+
+                    recovered[0].release()
+                    self.assertEqual(stt_client.recover_retained_transcripts(), ())
+
+    def test_failed_terminalization_preserves_pending_replay_authority(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            with _running_server(Path(temporary), _Transcriber()) as (
+                socket_path,
+                audio_path,
+            ):
+                generation = _generation(
+                    audio_path,
+                    b"RIFF-terminal-failure" + b"\0" * 64,
+                )
+                with mock.patch.object(stt_client, "STT_SOCKET", socket_path):
+                    delivery = stt_client.transcribe_retained(generation, woke=False)
+                    with (
+                        mock.patch.object(
+                            server.os,
+                            "replace",
+                            side_effect=OSError("metadata replace failed"),
+                        ),
+                        self.assertRaises((HarnessError, OSError)),
+                    ):
+                        delivery.mark_terminal()
+
+                    recovered = stt_client.recover_retained_transcripts()
+                    self.assertEqual(len(recovered), 1)
+                    self.assertEqual(recovered[0].state, "pending")
+                    recovered[0].release()
+
+    def test_cleanup_failure_after_terminalization_is_eventually_removed(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with _running_server(root, _Transcriber()) as (
+                socket_path,
+                audio_path,
+            ):
+                generation = _generation(
+                    audio_path,
+                    b"RIFF-terminal-cleanup" + b"\0" * 64,
+                )
+                with mock.patch.object(stt_client, "STT_SOCKET", socket_path):
+                    delivery = stt_client.transcribe_retained(generation, woke=False)
+                    delivery.mark_terminal()
+                    with (
+                        mock.patch.object(
+                            server,
+                            "_remove_released_retained_delivery",
+                            side_effect=OSError("cleanup interrupted"),
+                        ),
+                        self.assertRaises((HarnessError, OSError)),
+                    ):
+                        delivery.release()
+
+                    self.assertEqual(stt_client.recover_retained_transcripts(), ())
+                    self.assertEqual(
+                        tuple(root.rglob(f"{server.RELEASED_RETAINED_PREFIX}*")),
+                        (),
+                    )
+
+    def test_lost_cleanup_response_cannot_restore_terminal_delivery(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with _running_server(root, _Transcriber()) as (
+                socket_path,
+                audio_path,
+            ):
+                generation = _generation(
+                    audio_path,
+                    b"RIFF-lost-cleanup-response" + b"\0" * 64,
+                )
+                with mock.patch.object(stt_client, "STT_SOCKET", socket_path):
+                    delivery = stt_client.transcribe_retained(generation, woke=False)
+                    delivery.mark_terminal()
+                    server._delivery_response(
+                        server.DeliveryRequest("release", delivery.delivery_id)
+                    )
+
+                    self.assertEqual(stt_client.recover_retained_transcripts(), ())
 
     def test_malformed_and_oversized_requests_return_structured_errors(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -708,6 +906,203 @@ class SpeechToTextProtocolTests(unittest.TestCase):
                     for call in log.call_args_list
                 )
             )
+
+    def test_retention_remains_successful_after_post_rename_lock_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            paths = server.recorder.RecorderPaths(
+                root,
+                root / "request.wav",
+                root / "recording.pid",
+                root / "recording.log",
+            )
+            processing_dir = root / server.PROCESSING_DIRECTORY
+            processing_dir.mkdir(mode=0o700)
+            original = root / "recordings" / f"request-{uuid.uuid4().hex}.wav"
+            processing = processing_dir / f"{original.stem}-{uuid.uuid4().hex}.wav"
+            processing.write_bytes(b"RIFF-retain" + b"\0" * 64)
+            processing.chmod(0o600)
+            delivery_id = uuid.uuid4().hex
+
+            @contextmanager
+            def lock_with_failed_cleanup(
+                _state_dir: Path, _lock: Path
+            ) -> Iterator[None]:
+                yield
+                raise OSError("lock cleanup failed")
+
+            with (
+                mock.patch.object(
+                    server.recorder,
+                    "recording_lock",
+                    side_effect=lock_with_failed_cleanup,
+                ),
+                mock.patch.object(server, "log") as log,
+            ):
+                server._write_retained_claim(
+                    server.AudioClaim(original, processing, paths),
+                    delivery_id=delivery_id,
+                    text="hello",
+                    woke=True,
+                )
+
+            retained = root / server.RETAINED_DIRECTORY / delivery_id
+            self.assertTrue((retained / server.RETAINED_AUDIO).exists())
+            self.assertEqual(
+                server._load_retained_delivery(retained)["state"],
+                "ambiguous",
+            )
+            self.assertTrue(
+                any(
+                    "retention committed despite" in str(call)
+                    for call in log.call_args_list
+                )
+            )
+
+    def test_retention_post_audio_move_failures_preserve_recoverable_ownership(
+        self,
+    ) -> None:
+        for failure in ("directory_fsync", "rename_before", "rename_after"):
+            with (
+                self.subTest(failure=failure),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
+                root = Path(temporary)
+                paths = server.recorder.RecorderPaths(
+                    root,
+                    root / "request.wav",
+                    root / "recording.pid",
+                    root / "recording.log",
+                )
+                processing_dir = root / server.PROCESSING_DIRECTORY
+                processing_dir.mkdir(mode=0o700)
+                original = root / "request-generation.wav"
+                processing = processing_dir / f"{original.stem}-{uuid.uuid4().hex}.wav"
+                contents = b"RIFF-retain-rollback" + b"\0" * 64
+                processing.write_bytes(contents)
+                processing.chmod(0o600)
+                delivery_id = uuid.uuid4().hex
+                retained_root = root / server.RETAINED_DIRECTORY
+                original_rename = Path.rename
+
+                def fail_rename(
+                    path: Path,
+                    target: Path,
+                    retained_root: Path = retained_root,
+                    delivery_id: str = delivery_id,
+                    failure: str = failure,
+                    original_rename: Callable[[Path, Path], Path] = original_rename,
+                ) -> Path:
+                    if (
+                        path.parent == retained_root
+                        and path.name.startswith(".")
+                        and target == retained_root / delivery_id
+                    ):
+                        if failure == "rename_after":
+                            original_rename(path, target)
+                        raise OSError(f"{failure} failed")
+                    return original_rename(path, target)
+
+                fsync_calls = 0
+                original_fsync = server.os.fsync
+
+                def fail_directory_fsync(
+                    fd: int,
+                    failure: str = failure,
+                    original_fsync: Callable[[int], None] = original_fsync,
+                ) -> None:
+                    nonlocal fsync_calls
+                    fsync_calls += 1
+                    if failure == "directory_fsync" and fsync_calls == 2:
+                        raise OSError("directory fsync failed")
+                    original_fsync(fd)
+
+                patches = (
+                    mock.patch.object(Path, "rename", fail_rename)
+                    if failure.startswith("rename")
+                    else mock.patch.object(server.os, "fsync", fail_directory_fsync)
+                )
+                with patches:
+                    if failure == "rename_after":
+                        server._write_retained_claim(
+                            server.AudioClaim(original, processing, paths),
+                            delivery_id=delivery_id,
+                            text="hello",
+                            woke=True,
+                        )
+                    else:
+                        with self.assertRaises(OSError):
+                            server._write_retained_claim(
+                                server.AudioClaim(original, processing, paths),
+                                delivery_id=delivery_id,
+                                text="hello",
+                                woke=True,
+                            )
+
+                destination = retained_root / delivery_id
+                if failure == "rename_after":
+                    self.assertFalse(processing.exists())
+                    self.assertEqual(
+                        server._load_retained_delivery(destination)["state"],
+                        "ambiguous",
+                    )
+                else:
+                    self.assertEqual(processing.read_bytes(), contents)
+                    self.assertFalse(destination.exists())
+                    self.assertEqual(
+                        tuple(
+                            path
+                            for path in retained_root.iterdir()
+                            if path.name.startswith(".")
+                        ),
+                        (),
+                    )
+
+    def test_retained_deliveries_recover_in_creation_order(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            paths = server.recorder.RecorderPaths(
+                root,
+                root / "request.wav",
+                root / "recording.pid",
+                root / "recording.log",
+            )
+            retained_root = root / server.RETAINED_DIRECTORY
+            retained_root.mkdir(mode=0o700)
+            deliveries = (
+                ("0" * 32, "later", 2.0),
+                ("f" * 32, "earlier", 1.0),
+            )
+            for delivery_id, text, created_at in deliveries:
+                delivery = retained_root / delivery_id
+                delivery.mkdir(mode=0o700)
+                metadata = delivery / server.RETAINED_METADATA
+                metadata.write_text(
+                    json.dumps(
+                        {
+                            "version": server.PROTOCOL_VERSION,
+                            "delivery_id": delivery_id,
+                            "text": text,
+                            "woke": True,
+                            "state": "pending",
+                            "created_at": created_at,
+                        }
+                    )
+                )
+                metadata.chmod(0o600)
+                audio = delivery / server.RETAINED_AUDIO
+                audio.write_bytes(b"RIFF-retained" + b"\0" * 64)
+                audio.chmod(0o600)
+
+            with mock.patch.object(
+                server, "_recorder_path_sets", return_value=(paths,)
+            ):
+                recovered = server._recover_retained_deliveries()
+
+        self.assertEqual(
+            [delivery["text"] for delivery in recovered],
+            ["earlier", "later"],
+        )
 
     def test_main_recovers_before_loading_model(self) -> None:
         order: list[str] = []
