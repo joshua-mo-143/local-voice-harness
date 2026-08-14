@@ -62,23 +62,20 @@ def test_top_level_and_submachine_inventory_is_complete() -> None:
 def test_duplicate_authorities_include_prompt_and_checkout_overlaps() -> None:
     names = {item.name for item in ownership.DUPLICATE_AUTHORITIES}
     assert names == {
-        "prompt-operation-vocabularies",
         "prompt-flat-runtime-reconstruction",
         "checkout-session-label-collapse",
     }
-    job_states = {item.value for item in JobPromptState}
-    question_states = {item.value for item in QuestionPromptState}
-    assert job_states != question_states
-    assert {"none", "submitting", "ambiguous"} <= job_states
-    assert {"observed", "resolved"} <= question_states
-    assert {"planned", "submitted"} <= job_states & question_states
-
-    prompt = next(
-        item
-        for item in ownership.DUPLICATE_AUTHORITIES
-        if item.name == "prompt-operation-vocabularies"
-    )
-    assert prompt.child_issue == 358
+    assert JobPromptState is QuestionPromptState
+    shared_states = {item.value for item in JobPromptState}
+    assert {
+        "none",
+        "planned",
+        "submitting",
+        "submitted",
+        "observed",
+        "ambiguous",
+        "resolved",
+    } == shared_states
     checkout = next(
         item
         for item in ownership.DUPLICATE_AUTHORITIES

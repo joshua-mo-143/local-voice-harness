@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from typing import Any, Protocol
 
 from ..integrations.linear import LinearError, LinearIntegration
+from ..prompt_operations import PromptIdentity
 from ..questions import (
     AnswerResolution,
     Question,
@@ -17,6 +18,7 @@ from ..questions import (
     QuestionSpec,
     QuestionState,
     question_identity,
+    question_prompt_identity,
     transition_question,
 )
 from ..user_config import (
@@ -34,6 +36,23 @@ from .model import (
 from .workflow import PlanApprovalSource, ReviewApprovalSource
 
 FIELD = "voice_question"
+
+
+def shared_prompt_identity(
+    job: CursorJob, question: Question, *, turn: int | None = None
+) -> PromptIdentity:
+    """Job-scoped identity fence for the shared clarification prompt operation."""
+    target = job.herdr_target or job.session_id or ""
+    agent_session = (
+        job.agent_provider_session_id or job.session_id or job.herdr_target or ""
+    )
+    return question_prompt_identity(
+        question,
+        job_id=job.id,
+        turn=turn if turn is not None else (job.turn if job.turn > 0 else 1),
+        target=target,
+        agent_session=agent_session,
+    )
 
 
 def current(job: CursorJob) -> Question | None:

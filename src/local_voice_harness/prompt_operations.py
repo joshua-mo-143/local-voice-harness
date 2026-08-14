@@ -16,7 +16,9 @@ class PromptOperationState(StrEnum):
     PLANNED = "planned"
     SUBMITTING = "submitting"
     SUBMITTED = "submitted"
+    OBSERVED = "observed"
     AMBIGUOUS = "ambiguous"
+    RESOLVED = "resolved"
 
 
 @dataclass(frozen=True, slots=True)
@@ -71,13 +73,31 @@ class SubmittedPrompt:
 
 
 @dataclass(frozen=True, slots=True)
+class ObservedPrompt:
+    identity: PromptIdentity
+    state: PromptOperationState = PromptOperationState.OBSERVED
+
+
+@dataclass(frozen=True, slots=True)
 class AmbiguousPrompt:
     identity: PromptIdentity
     state: PromptOperationState = PromptOperationState.AMBIGUOUS
 
 
+@dataclass(frozen=True, slots=True)
+class ResolvedPrompt:
+    identity: PromptIdentity
+    state: PromptOperationState = PromptOperationState.RESOLVED
+
+
 PromptOperation: TypeAlias = (
-    IdlePrompt | PlannedPrompt | SubmittingPrompt | SubmittedPrompt | AmbiguousPrompt
+    IdlePrompt
+    | PlannedPrompt
+    | SubmittingPrompt
+    | SubmittedPrompt
+    | ObservedPrompt
+    | AmbiguousPrompt
+    | ResolvedPrompt
 )
 
 
@@ -121,7 +141,9 @@ def load_prompt_operation(
         PromptOperationState.PLANNED: PlannedPrompt,
         PromptOperationState.SUBMITTING: SubmittingPrompt,
         PromptOperationState.SUBMITTED: SubmittedPrompt,
+        PromptOperationState.OBSERVED: ObservedPrompt,
         PromptOperationState.AMBIGUOUS: AmbiguousPrompt,
+        PromptOperationState.RESOLVED: ResolvedPrompt,
     }
     return constructors[parsed_state](identity)
 
@@ -172,6 +194,18 @@ def accept_prompt_submission(
     return SubmittedPrompt(identity)
 
 
+def record_prompt_submitted(
+    operation: PromptOperation, identity: PromptIdentity
+) -> SubmittedPrompt:
+    """Cross the submit fence from planned or submitting. Never retries after it."""
+    if not isinstance(operation, PlannedPrompt | SubmittingPrompt):
+        raise PromptOperationError(
+            "only a planned or submitting prompt can record submission"
+        )
+    _require_identity(operation, identity)
+    return SubmittedPrompt(identity)
+
+
 def observe_prompt_submission(
     operation: PromptOperation,
     identity: PromptIdentity,
@@ -193,18 +227,59 @@ def observe_prompt_submission(
     return AmbiguousPrompt(identity)
 
 
+def observe_accepted_prompt(
+    operation: PromptOperation, identity: PromptIdentity
+) -> ObservedPrompt:
+    if not isinstance(operation, SubmittedPrompt):
+        raise PromptOperationError("only a submitted prompt can be observed")
+    _require_identity(operation, identity)
+    return ObservedPrompt(identity)
+
+
+def resolve_prompt(
+    operation: PromptOperation, identity: PromptIdentity
+) -> ResolvedPrompt:
+    if not isinstance(operation, PlannedPrompt | SubmittedPrompt | ObservedPrompt):
+        raise PromptOperationError(
+            "only a planned, submitted, or observed prompt can resolve"
+        )
+    _require_identity(operation, identity)
+    return ResolvedPrompt(identity)
+
+
+def replan_unobserved_prompt(
+    operation: PromptOperation, identity: PromptIdentity
+) -> PlannedPrompt:
+    """Retry only after confirmed absence; never replay an observed submit."""
+    if not isinstance(operation, SubmittedPrompt):
+        raise PromptOperationError(
+            "only an unobserved submitted prompt can be replanned"
+        )
+    _require_identity(operation, identity)
+    return PlannedPrompt(identity)
+
+
 def mark_prompt_ambiguous(
     operation: PromptOperation, identity: PromptIdentity
 ) -> AmbiguousPrompt:
-    if not isinstance(operation, PlannedPrompt | SubmittingPrompt | SubmittedPrompt):
+    if not isinstance(
+        operation, PlannedPrompt | SubmittingPrompt | SubmittedPrompt | ObservedPrompt
+    ):
         raise PromptOperationError("prompt operation cannot become ambiguous")
     _require_identity(operation, identity)
     return AmbiguousPrompt(identity)
 
 
-def _require_identity(
-    operation: PlannedPrompt | SubmittingPrompt | SubmittedPrompt,
-    identity: PromptIdentity,
-) -> None:
+_IDENTITY_STATES = (
+    PlannedPrompt
+    | SubmittingPrompt
+    | SubmittedPrompt
+    | ObservedPrompt
+    | AmbiguousPrompt
+    | ResolvedPrompt
+)
+
+
+def _require_identity(operation: _IDENTITY_STATES, identity: PromptIdentity) -> None:
     if operation.identity != identity:
         raise PromptOperationError("stale prompt operation identity")

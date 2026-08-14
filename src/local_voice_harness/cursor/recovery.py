@@ -33,7 +33,12 @@ from ..prompt_operations import (
     legacy_prompt_fields,
     mark_prompt_ambiguous,
 )
-from ..questions import PromptOperationState, QuestionState
+from ..questions import (
+    PromptOperationState,
+    QuestionState,
+    observe_question_prompt,
+    replan_question_prompt,
+)
 from ..user_config import default_user_config
 from . import questions as question_adapter
 from .agent_outbox import (
@@ -1709,6 +1714,14 @@ def _reconcile_question_prompt(
         ):
             return None
         if observed_started:
+            observed = (
+                current_question
+                if current_question.prompt_state == PromptOperationState.OBSERVED
+                else observe_question_prompt(
+                    current_question,
+                    question_adapter.shared_prompt_identity(current, current_question),
+                )
+            )
             return current.evolve(
                 status=JobStatus.QUEUED,
                 queued_at=now,
@@ -1718,10 +1731,10 @@ def _reconcile_question_prompt(
                 worker_process_start=None,
                 worker_token=None,
                 voice_question=question_adapter.envelope(
-                    current_question,
+                    observed,
                     QuestionState.DISPATCHING,
                     job=current,
-                    prompt_state=PromptOperationState.OBSERVED,
+                    prompt_state=observed.prompt_state,
                 ),
             )
         if (
@@ -1753,6 +1766,10 @@ def _reconcile_question_prompt(
                     prompt_absent_observations=observations,
                 )
             )
+        replanned = replan_question_prompt(
+            current_question,
+            question_adapter.shared_prompt_identity(current, current_question),
+        )
         return current.evolve(
             status=JobStatus.QUEUED,
             queued_at=now,
@@ -1762,10 +1779,10 @@ def _reconcile_question_prompt(
             worker_process_start=None,
             worker_token=None,
             voice_question=question_adapter.envelope(
-                current_question,
+                replanned,
                 QuestionState.DISPATCHING,
                 job=current,
-                prompt_state=PromptOperationState.PLANNED,
+                prompt_state=replanned.prompt_state,
                 prompt_baseline_seq=None,
                 prompt_submitted_at=None,
                 prompt_absent_observations=0,

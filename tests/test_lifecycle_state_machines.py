@@ -35,10 +35,12 @@ from local_voice_harness.cursor.lifecycle import (
 from local_voice_harness.prompt_operations import (
     AmbiguousPrompt,
     IdlePrompt,
+    ObservedPrompt,
     PlannedPrompt,
     PromptIdentity,
     PromptOperation,
     PromptOperationError,
+    ResolvedPrompt,
     SubmittedPrompt,
     SubmittingPrompt,
     accept_prompt_submission,
@@ -46,8 +48,15 @@ from local_voice_harness.prompt_operations import (
     legacy_prompt_fields,
     load_prompt_operation,
     mark_prompt_ambiguous,
+    observe_accepted_prompt,
     observe_prompt_submission,
     plan_prompt,
+    record_prompt_submitted,
+    replan_unobserved_prompt,
+    resolve_prompt,
+)
+from local_voice_harness.prompt_operations import (
+    PromptOperationState as SharedPromptState,
 )
 from local_voice_harness.questions import (
     PromptOperationState,
@@ -58,6 +67,11 @@ from local_voice_harness.questions import (
     QuestionOrigin,
     QuestionSensitivity,
     QuestionState,
+    load_question_prompt,
+    plan_question_prompt,
+    question_prompt_identity,
+    resolve_question_prompt,
+    submit_question_prompt,
     transition_question,
 )
 
@@ -352,6 +366,22 @@ def test_legal_prompt_transitions_preserve_complete_identity() -> None:
     assert mark_prompt_ambiguous(
         SubmittedPrompt(identity), identity
     ) == AmbiguousPrompt(identity)
+    assert mark_prompt_ambiguous(ObservedPrompt(identity), identity) == AmbiguousPrompt(
+        identity
+    )
+    submitted = record_prompt_submitted(planned, identity)
+    assert submitted == SubmittedPrompt(identity)
+    assert record_prompt_submitted(submitting, identity) == SubmittedPrompt(identity)
+    observed = observe_accepted_prompt(submitted, identity)
+    assert observed == ObservedPrompt(identity)
+    assert resolve_prompt(planned, identity) == ResolvedPrompt(identity)
+    assert resolve_prompt(submitted, identity) == ResolvedPrompt(identity)
+    assert resolve_prompt(observed, identity) == ResolvedPrompt(identity)
+    assert replan_unobserved_prompt(submitted, identity) == PlannedPrompt(identity)
+    with pytest.raises(PromptOperationError, match="unobserved"):
+        replan_unobserved_prompt(observed, identity)
+    with pytest.raises(PromptOperationError, match="submitted prompt can be observed"):
+        observe_accepted_prompt(planned, identity)
 
 
 @pytest.mark.parametrize(
@@ -375,6 +405,10 @@ def test_legal_prompt_transitions_preserve_complete_identity() -> None:
         ),
         (mark_prompt_ambiguous, lambda _identity: IdlePrompt()),
         (mark_prompt_ambiguous, lambda identity: AmbiguousPrompt(identity)),
+        (record_prompt_submitted, lambda _identity: IdlePrompt()),
+        (observe_accepted_prompt, lambda identity: PlannedPrompt(identity)),
+        (resolve_prompt, lambda _identity: IdlePrompt()),
+        (replan_unobserved_prompt, lambda identity: ObservedPrompt(identity)),
     ],
 )
 def test_illegal_prompt_transitions_are_rejected(
@@ -411,11 +445,18 @@ def test_prompt_transition_rejects_stale_full_identity_fence() -> None:
         PlannedPrompt(_prompt_identity()),
         begin_prompt_submission(PlannedPrompt(_prompt_identity()), _prompt_identity()),
         SubmittedPrompt(_prompt_identity()),
+        ObservedPrompt(_prompt_identity()),
         AmbiguousPrompt(_prompt_identity()),
+        ResolvedPrompt(_prompt_identity()),
     ],
 )
 def test_legacy_prompt_adapter_round_trips_typed_states(
-    operation: PlannedPrompt | SubmittingPrompt | SubmittedPrompt | AmbiguousPrompt,
+    operation: PlannedPrompt
+    | SubmittingPrompt
+    | SubmittedPrompt
+    | ObservedPrompt
+    | AmbiguousPrompt
+    | ResolvedPrompt,
 ) -> None:
     fields = legacy_prompt_fields(operation)
 
@@ -554,6 +595,24 @@ def test_question_transition_cannot_replace_identity_or_policy() -> None:
                 identity,
                 **changes,
             )
+
+
+def test_question_module_reuses_shared_prompt_operation_enum() -> None:
+    assert PromptOperationState is SharedPromptState
+    identity = question_prompt_identity(
+        _question(QuestionState.ANSWERED),
+        job_id="job-1",
+        turn=2,
+        target="agent-1",
+        agent_session="session-1",
+    )
+    planned = plan_question_prompt(_question(QuestionState.ANSWERED), identity)
+    assert planned.prompt_state == PromptOperationState.PLANNED
+    assert isinstance(load_question_prompt(planned, identity), PlannedPrompt)
+    submitted = submit_question_prompt(planned, identity)
+    assert submitted.prompt_state == PromptOperationState.SUBMITTED
+    resolved = resolve_question_prompt(submitted, identity)
+    assert resolved.prompt_state == PromptOperationState.RESOLVED
 
 
 def test_answered_question_state_requires_answer_payload() -> None:
