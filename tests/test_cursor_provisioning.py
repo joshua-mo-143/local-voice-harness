@@ -41,6 +41,8 @@ from local_voice_harness.cursor.store import JobQuarantineWarning, JobStore
 from local_voice_harness.github_issue_creation import GitHubIssueDraft
 from local_voice_harness.integrations import linear
 from local_voice_harness.integrations.github import (
+    GitHubCommandStartError,
+    GitHubError,
     GitHubIssue,
     GitHubIssueCreationResult,
     GitHubOperationAmbiguous,
@@ -3113,6 +3115,71 @@ class CursorJobStateTests(unittest.TestCase):
         self.assertEqual(updated["status"], "queued")
         self.assertEqual(updated["github_issue_create_operation_state"], "ambiguous")
         self.assertEqual(github.submit_issue.call_count, 1)
+
+    def test_issue_creation_start_failure_is_queued_and_retried_after_restart(
+        self,
+    ) -> None:
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "create an issue",
+                "trusted_utterance": "create an issue",
+                "issue_provider": "github",
+                "github_repository": "source/project",
+                "github_issue_create_requested": True,
+                "github_issue_create_confirmed": True,
+                "github_issue_create_title": "Fix startup",
+                "github_issue_create_body": "Startup fails.",
+                "github_issue_create_marker": "a" * 32,
+                "github_issue_create_operation_state": "planned",
+                "status": "queued",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        github = mock.Mock()
+        github.inspect_repository.return_value = GitHubRepository(
+            "source/project",
+            "https://github.com/source/project",
+            False,
+            "main",
+        )
+        result = GitHubIssueCreationResult(
+            GitHubIssue("source", "project", 42),
+            "https://github.com/source/project/issues/42",
+            "a" * 32,
+        )
+        github.submit_issue.side_effect = [
+            GitHubCommandStartError("missing gh"),
+            result,
+        ]
+        github.observe_issue.side_effect = GitHubError("gh still missing")
+        with (
+            mock.patch.object(jobs, "GitHubClient", return_value=github),
+            mock.patch.object(service, "launch_worker") as launch,
+        ):
+            service.run_worker("123456789abc")
+
+        updated = jobs.read_job("123456789abc")
+        self.assertEqual(updated["status"], "queued")
+        self.assertEqual(updated["github_issue_create_operation_state"], "planned")
+        self.assertFalse(updated.get("reconcile", False))
+        self.assertEqual(github.submit_issue.call_count, 1)
+        self.assertEqual(github.observe_issue.call_count, 1)
+        self.assertIsNone(updated.get("worker_token"))
+        self.assertIsNone(updated.get("worker_claim_operation"))
+        self.assertIsNone(updated.get("worker_claimed_at"))
+        launch.assert_called_once_with("123456789abc")
+
+        with mock.patch.object(jobs, "GitHubClient", return_value=github):
+            service.run_worker("123456789abc")
+
+        retried = jobs.read_job("123456789abc")
+        self.assertEqual(retried["status"], "completed")
+        self.assertEqual(retried["github_issue_create_operation_state"], "created")
+        self.assertEqual(retried["github_issue_created_number"], 42)
+        self.assertEqual(github.submit_issue.call_count, 2)
+        self.assertEqual(github.observe_issue.call_count, 1)
 
     def test_worker_drafts_linear_ticket_before_requesting_confirmation(self) -> None:
         jobs.write_job(

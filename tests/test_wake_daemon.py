@@ -69,6 +69,18 @@ USER_CONFIG = replace(
 )
 
 
+def _run_audio_writer(
+    _paths: recorder.RecorderPaths,
+    writer: Callable[[Path], None],
+    *,
+    conflicts: tuple[recorder.RecorderPaths, ...] = (),
+) -> Path:
+    del conflicts
+    with tempfile.TemporaryDirectory() as temporary:
+        writer(Path(temporary) / "recording.wav")
+    return AUDIO_GENERATION
+
+
 def _playback_batch(
     text: str = "test",
     *,
@@ -521,7 +533,7 @@ class ProcessUtteranceTests(unittest.TestCase):
             allow_tools=False,
             settings=daemon.providers,
         )
-        transcribe.assert_called_once_with(AUDIO_GENERATION)
+        transcribe.assert_called_once_with(AUDIO_GENERATION, woke=False)
         self.assertTrue(
             daemon.awaiting_followup,
             "a completed turn must re-arm follow-up listening",
@@ -788,19 +800,58 @@ class ProcessUtteranceTests(unittest.TestCase):
 
         self.assertEqual(daemon.cursor_session, "job1")
 
-    def test_empty_wake_phrase_waits_for_followup(self) -> None:
+    def test_phrase_only_wake_activation_notifies_once_and_waits_for_followup(
+        self,
+    ) -> None:
         daemon = _bare_daemon()
+        daemon.np = mock.Mock()  # type: ignore[assignment]
+        daemon.wake_key = "wake"
+        daemon.wake_model.predict.return_value = {
+            "wake": daemon.audio.wake_threshold + 0.1
+        }
+        daemon.start_microphone = lambda: None  # type: ignore[method-assign]
+        daemon.read_frame = lambda: b"wake"  # type: ignore[method-assign]
+
+        def stop_after_processing(_interruption: wake_daemon.BargeIn | None) -> None:
+            daemon.running = False
+
         with (
             mock.patch.object(wake_daemon, "transcribe", return_value="hey jarvis"),
-            mock.patch.object(wake_daemon, "start_components"),
+            mock.patch.object(
+                daemon,
+                "record_utterance_safely",
+                return_value=AUDIO_GENERATION,
+            ),
+            mock.patch.object(
+                daemon,
+                "continue_after_barge_in",
+                side_effect=stop_after_processing,
+            ),
+            mock.patch.object(daemon, "begin_activation") as begin_activation,
             mock.patch.object(wake_daemon, "qwen_turn") as qwen_turn,
-            mock.patch.object(daemon, "_drain_playback_queue") as play,
-            mock.patch.object(wake_daemon, "notify"),
+            mock.patch.object(wake_daemon, "cursor_turn") as cursor_turn,
+            mock.patch.object(daemon, "play_response") as play_response,
+            mock.patch.object(daemon, "_drain_playback_queue") as drain_playback,
+            mock.patch.object(wake_daemon, "recover_jobs"),
+            mock.patch.object(
+                wake_daemon, "recover_retained_transcripts", return_value=()
+            ),
+            mock.patch.object(
+                wake_daemon,
+                "drain_pending_announcements",
+                return_value=announcement_policy.DrainResult(),
+            ),
+            mock.patch.object(wake_daemon, "log"),
+            mock.patch.object(wake_daemon, "notify") as notify,
         ):
-            daemon.process_utterance(AUDIO_GENERATION, woke=True)
+            daemon.run()
 
+        notify.assert_called_once_with("Wake detected — listening…")
+        begin_activation.assert_called_once_with()
         qwen_turn.assert_not_called()
-        play.assert_not_called()
+        cursor_turn.assert_not_called()
+        play_response.assert_not_called()
+        drain_playback.assert_not_called()
         self.assertTrue(daemon.awaiting_followup)
         self.assertGreater(daemon.conversation_deadline, 0.0)
 
@@ -2663,6 +2714,712 @@ class ProcessUtteranceTests(unittest.TestCase):
         self.assertEqual(daemon.history, [])
 
 
+class RetainedUtteranceTests(unittest.TestCase):
+    def test_config_commit_terminalizes_before_post_commit_crash(self) -> None:
+        daemon = _bare_daemon()
+        pending = _pending_config()
+        daemon.pending_config_change = pending
+        delivery = mock.Mock(spec=wake_daemon.RetainedTranscript)
+        delivery.text = "yes"
+        delivery.woke = False
+        delivery.state = "pending"
+        delivery.delivery_id = "6" * 32
+        order: list[str] = []
+        delivery.mark_ambiguous.side_effect = lambda: order.append("fence")
+        delivery.mark_terminal.side_effect = lambda: order.append("terminal")
+        result = ConfigChangeResult(
+            config=daemon.user_config,
+            changed_keys=("audio.voice",),
+            restart_services=("voice-harness-wake.service",),
+        )
+
+        with (
+            mock.patch.object(wake_daemon, "start_components"),
+            mock.patch.object(
+                wake_daemon,
+                "commit_pending_change",
+                side_effect=lambda _pending: order.append("commit") or result,
+            ),
+            mock.patch.object(
+                daemon.config_activation_store,
+                "create_offer",
+                side_effect=lambda *_args, **_kwargs: order.append("offer") or None,
+            ),
+            mock.patch.object(
+                wake_daemon,
+                "render_change_committed",
+                side_effect=RuntimeError("crash after config commit"),
+            ),
+            mock.patch.object(wake_daemon, "release_deliveries"),
+            mock.patch.object(wake_daemon, "notify"),
+            mock.patch.object(wake_daemon, "log"),
+        ):
+            daemon.process_utterance(None, woke=False, retained=delivery)
+
+        self.assertEqual(order, ["fence", "commit", "offer", "terminal"])
+        delivery.release.assert_not_called()
+
+    def test_config_commit_terminalizes_when_offer_io_fails(self) -> None:
+        daemon = _bare_daemon()
+        daemon.pending_config_change = _pending_config()
+        delivery = mock.Mock(spec=wake_daemon.RetainedTranscript)
+        delivery.text = "yes"
+        delivery.woke = False
+        delivery.state = "pending"
+        delivery.delivery_id = "9" * 32
+        order: list[str] = []
+        delivery.mark_ambiguous.side_effect = lambda: order.append("fence")
+        delivery.mark_terminal.side_effect = lambda: order.append("terminal")
+        result = ConfigChangeResult(
+            config=daemon.user_config,
+            changed_keys=("audio.voice",),
+            restart_services=("voice-harness-wake.service",),
+        )
+
+        def fail_offer(*_args: object, **_kwargs: object) -> None:
+            order.append("offer")
+            raise OSError("activation journal unavailable")
+
+        with (
+            mock.patch.object(wake_daemon, "start_components"),
+            mock.patch.object(
+                wake_daemon,
+                "commit_pending_change",
+                side_effect=lambda _pending: order.append("commit") or result,
+            ),
+            mock.patch.object(
+                daemon.config_activation_store,
+                "create_offer",
+                side_effect=fail_offer,
+            ),
+            mock.patch.object(wake_daemon, "release_deliveries"),
+            mock.patch.object(wake_daemon, "notify"),
+            mock.patch.object(wake_daemon, "log"),
+        ):
+            daemon.process_utterance(None, woke=False, retained=delivery)
+
+        self.assertEqual(order, ["fence", "commit", "offer", "terminal"])
+        delivery.release.assert_not_called()
+
+    def test_activation_decisions_terminalize_before_response_crash(self) -> None:
+        for text, operation in (
+            ("activate now", "accept"),
+            ("not now", "decline"),
+        ):
+            with (
+                self.subTest(operation=operation),
+                tempfile.TemporaryDirectory() as temp,
+            ):
+                daemon = _bare_daemon()
+                store = wake_daemon.ActivationStore(Path(temp) / "activation.json")
+                daemon.config_activation_store = store
+                result = ConfigChangeResult(
+                    config=replace(
+                        daemon.user_config,
+                        audio=replace(daemon.user_config.audio, voice="new_voice"),
+                    ),
+                    changed_keys=("audio.voice",),
+                    restart_services=("voice-harness-wake.service",),
+                )
+                offer = store.create_offer(_pending_config(), result)
+                assert offer is not None
+                store.mark_offer_delivered(offer.id)
+                delivery = mock.Mock(spec=wake_daemon.RetainedTranscript)
+                delivery.text = text
+                delivery.woke = False
+                delivery.state = "pending"
+                delivery.delivery_id = ("7" if operation == "accept" else "8") * 32
+                order: list[str] = []
+                delivery.mark_ambiguous.side_effect = lambda order=order: order.append(
+                    "fence"
+                )
+                delivery.mark_terminal.side_effect = lambda order=order: order.append(
+                    "terminal"
+                )
+                original_operation = getattr(store, operation)
+
+                def mutate(
+                    record_id: str,
+                    order: list[str] = order,
+                    operation: str = operation,
+                    original_operation: object = original_operation,
+                ) -> object:
+                    order.append(operation)
+                    assert callable(original_operation)
+                    return original_operation(record_id)
+
+                with (
+                    mock.patch.object(store, operation, side_effect=mutate),
+                    mock.patch.object(
+                        wake_daemon,
+                        "render_activation_delivery",
+                        side_effect=RuntimeError("crash after activation decision"),
+                    ),
+                    mock.patch.object(wake_daemon, "start_components"),
+                    mock.patch.object(wake_daemon, "release_deliveries"),
+                    mock.patch.object(wake_daemon, "notify"),
+                    mock.patch.object(wake_daemon, "log"),
+                ):
+                    daemon.process_utterance(None, woke=False, retained=delivery)
+
+                self.assertEqual(order, ["fence", operation, "terminal"])
+                delivery.release.assert_not_called()
+                current = store.current()
+                assert current is not None
+                expected = (
+                    wake_daemon.ActivationStatus.ACCEPTED
+                    if operation == "accept"
+                    else wake_daemon.ActivationStatus.DECLINED
+                )
+                self.assertEqual(current.status, expected)
+
+    def test_no_speech_releases_retained_evidence_terminally(self) -> None:
+        daemon = _bare_daemon()
+        delivery = mock.Mock(spec=wake_daemon.RetainedTranscript)
+        delivery.text = ""
+        delivery.woke = False
+        delivery.state = "pending"
+        delivery.delivery_id = "a" * 32
+        daemon.retained_recovery_required = True
+        daemon.retained_recovery_retry_at = 10.0
+
+        with (
+            mock.patch.object(wake_daemon, "release_deliveries"),
+            mock.patch.object(wake_daemon, "notify"),
+            mock.patch.object(wake_daemon, "log"),
+        ):
+            daemon.process_utterance(None, woke=False, retained=delivery)
+
+        delivery.mark_terminal.assert_called_once_with()
+        delivery.release.assert_called_once_with()
+        delivery.mark_ambiguous.assert_not_called()
+        self.assertFalse(daemon.retained_recovery_required)
+        self.assertEqual(daemon.retained_recovery_retry_at, 0.0)
+
+    def test_failed_terminal_cleanup_retries_without_replay_or_manual_pause(
+        self,
+    ) -> None:
+        daemon = _bare_daemon()
+        delivery = mock.Mock(spec=wake_daemon.RetainedTranscript)
+        delivery.text = ""
+        delivery.woke = False
+        delivery.state = "pending"
+        delivery.delivery_id = "f" * 32
+        delivery.release.side_effect = HarnessError("STT unavailable")
+
+        with (
+            mock.patch.object(wake_daemon, "release_deliveries"),
+            mock.patch.object(wake_daemon, "notify"),
+            mock.patch.object(wake_daemon, "log"),
+        ):
+            daemon.process_utterance(None, woke=False, retained=delivery)
+
+        delivery.mark_terminal.assert_called_once_with()
+        delivery.release.assert_called_once_with()
+        self.assertTrue(daemon.retained_recovery_required)
+        terminal = mock.Mock(spec=wake_daemon.RetainedTranscript)
+        terminal.delivery_id = delivery.delivery_id
+        terminal.text = delivery.text
+        terminal.woke = delivery.woke
+        terminal.state = "terminal"
+        with (
+            mock.patch.object(
+                wake_daemon,
+                "recover_retained_transcripts",
+                side_effect=[(terminal,), ()],
+            ),
+            mock.patch.object(daemon, "process_utterance") as replay,
+            mock.patch.object(wake_daemon, "log"),
+        ):
+            daemon.retained_recovery_retry_at = 0.0
+            self.assertTrue(daemon._retry_retained_recovery())
+            daemon.retained_recovery_required = True
+            daemon.retained_recovery_retry_at = 0.0
+            self.assertTrue(daemon._retry_retained_recovery())
+
+        terminal.release.assert_called_once_with()
+        replay.assert_not_called()
+
+    def test_failure_before_durable_terminalization_keeps_evidence(self) -> None:
+        daemon = _bare_daemon()
+        delivery = mock.Mock(spec=wake_daemon.RetainedTranscript)
+        delivery.text = ""
+        delivery.woke = False
+        delivery.state = "pending"
+        delivery.delivery_id = "0" * 32
+        delivery.mark_terminal.side_effect = HarnessError("STT unavailable")
+
+        with (
+            mock.patch.object(wake_daemon, "release_deliveries"),
+            mock.patch.object(wake_daemon, "notify"),
+            mock.patch.object(wake_daemon, "log"),
+        ):
+            daemon.process_utterance(None, woke=False, retained=delivery)
+
+        delivery.mark_terminal.assert_called_once_with()
+        delivery.release.assert_not_called()
+        self.assertTrue(daemon.retained_recovery_required)
+        self.assertGreater(daemon.retained_recovery_retry_at, 0.0)
+
+    def test_non_side_effect_executes_only_after_durable_terminalization(self) -> None:
+        daemon = _bare_daemon()
+        delivery = mock.Mock(spec=wake_daemon.RetainedTranscript)
+        delivery.text = "tell me the time"
+        delivery.woke = False
+        delivery.state = "pending"
+        delivery.delivery_id = "5" * 32
+        order: list[str] = []
+        delivery.mark_terminal.side_effect = lambda: order.append("terminal")
+        delivery.release.side_effect = lambda: order.append("cleanup")
+
+        def answer(
+            _text: str,
+            _history: list[dict[str, str]],
+            _context: RequestContext,
+            **_kwargs: object,
+        ) -> tuple[str, None]:
+            order.append("action")
+            return "it is noon", None
+
+        with (
+            mock.patch.object(wake_daemon, "start_components"),
+            mock.patch.object(
+                wake_daemon,
+                "request_context",
+                side_effect=lambda text, **_settings: RequestContext(text),
+            ),
+            mock.patch.object(
+                wake_daemon,
+                "route_intent",
+                return_value=IntentRoute(Intent.CONVERSATION, "high"),
+            ),
+            mock.patch.object(wake_daemon, "qwen_turn", side_effect=answer),
+            mock.patch.object(
+                daemon,
+                "_drain_playback_queue",
+                return_value=(_playback_batch("ok"), None),
+            ),
+            mock.patch.object(wake_daemon, "notify"),
+        ):
+            daemon.process_utterance(None, woke=False, retained=delivery)
+
+        self.assertEqual(order, ["terminal", "action", "cleanup"])
+
+    def test_rejected_echo_releases_retained_evidence_terminally(self) -> None:
+        daemon = _bare_daemon()
+        delivery = mock.Mock(spec=wake_daemon.RetainedTranscript)
+        delivery.text = "local playback echo"
+        delivery.woke = False
+        delivery.state = "pending"
+        delivery.delivery_id = "e" * 32
+
+        with (
+            mock.patch.object(daemon, "_is_playback_echo", return_value=True),
+            mock.patch.object(wake_daemon, "log"),
+        ):
+            daemon.process_utterance(None, woke=False, retained=delivery)
+
+        delivery.mark_terminal.assert_called_once_with()
+        delivery.release.assert_called_once_with()
+        delivery.mark_ambiguous.assert_not_called()
+
+    def test_non_actionable_turn_releases_retained_evidence_terminally(self) -> None:
+        daemon = _bare_daemon()
+        delivery = mock.Mock(spec=wake_daemon.RetainedTranscript)
+        delivery.text = "maybe start something"
+        delivery.woke = False
+        delivery.state = "pending"
+        delivery.delivery_id = "f" * 32
+
+        with (
+            mock.patch.object(wake_daemon, "start_components"),
+            mock.patch.object(
+                wake_daemon,
+                "request_context",
+                side_effect=lambda text, **_settings: RequestContext(text),
+            ),
+            mock.patch.object(
+                wake_daemon,
+                "route_intent",
+                return_value=IntentRoute(Intent.AGENT_SUBMIT, "low"),
+            ),
+            mock.patch.object(
+                daemon,
+                "_drain_playback_queue",
+                return_value=(_playback_batch("not started"), None),
+            ),
+            mock.patch.object(wake_daemon, "notify"),
+        ):
+            daemon.process_utterance(None, woke=False, retained=delivery)
+
+        delivery.mark_terminal.assert_called_once_with()
+        delivery.release.assert_called_once_with()
+        delivery.mark_ambiguous.assert_not_called()
+
+    def test_failed_side_effect_is_fenced_and_not_replayed(self) -> None:
+        daemon = _bare_daemon()
+        daemon.cursor_session = "oldjob123456"
+        delivery = mock.Mock(spec=wake_daemon.RetainedTranscript)
+        delivery.text = "cancel that job"
+        delivery.woke = False
+        delivery.state = "pending"
+        delivery.delivery_id = "b" * 32
+
+        with (
+            mock.patch.object(wake_daemon, "start_components"),
+            mock.patch.object(
+                wake_daemon,
+                "request_context",
+                side_effect=lambda text, **_settings: RequestContext(text),
+            ),
+            mock.patch.object(
+                wake_daemon,
+                "route_intent",
+                return_value=IntentRoute(Intent.AGENT_CANCEL, "high"),
+            ),
+            mock.patch.object(
+                wake_daemon,
+                "cursor_turn",
+                side_effect=RuntimeError("outcome unknown"),
+            ),
+            mock.patch.object(wake_daemon, "release_deliveries"),
+            mock.patch.object(wake_daemon, "notify"),
+            mock.patch.object(wake_daemon, "log"),
+        ):
+            daemon.process_utterance(None, woke=False, retained=delivery)
+
+        delivery.mark_ambiguous.assert_called_once_with()
+        delivery.mark_terminal.assert_not_called()
+        delivery.release.assert_not_called()
+        self.assertTrue(daemon.retained_recovery_required)
+
+    def test_failed_replay_fence_preserves_and_schedules_in_process_recovery(
+        self,
+    ) -> None:
+        daemon = _bare_daemon()
+        daemon.cursor_session = "oldjob123456"
+        delivery = mock.Mock(spec=wake_daemon.RetainedTranscript)
+        delivery.text = "cancel that job"
+        delivery.woke = False
+        delivery.state = "pending"
+        delivery.delivery_id = "1" * 32
+        delivery.mark_ambiguous.side_effect = HarnessError("STT unavailable")
+
+        with (
+            mock.patch.object(wake_daemon, "start_components"),
+            mock.patch.object(
+                wake_daemon,
+                "request_context",
+                side_effect=lambda text, **_settings: RequestContext(text),
+            ),
+            mock.patch.object(
+                wake_daemon,
+                "route_intent",
+                return_value=IntentRoute(Intent.AGENT_CANCEL, "high"),
+            ),
+            mock.patch.object(wake_daemon, "cursor_turn") as cursor_turn,
+            mock.patch.object(wake_daemon, "release_deliveries"),
+            mock.patch.object(wake_daemon, "notify"),
+            mock.patch.object(wake_daemon, "log") as log,
+        ):
+            daemon.process_utterance(None, woke=False, retained=delivery)
+
+        delivery.mark_ambiguous.assert_called_once_with()
+        delivery.release.assert_not_called()
+        cursor_turn.assert_not_called()
+        self.assertTrue(daemon.retained_recovery_required)
+        self.assertTrue(
+            any("retried in-process" in call.args[0] for call in log.call_args_list)
+        )
+
+        with (
+            mock.patch.object(
+                wake_daemon,
+                "recover_retained_transcripts",
+                return_value=(delivery,),
+            ),
+            mock.patch.object(daemon, "process_utterance") as process,
+        ):
+            recovered = daemon._retry_retained_recovery()
+
+        self.assertTrue(recovered)
+        process.assert_called_once_with(None, woke=False, retained=delivery)
+
+    def test_uncertain_retained_ack_is_surfaced_without_execution_or_release(
+        self,
+    ) -> None:
+        daemon = _bare_daemon()
+        delivery = mock.Mock(spec=wake_daemon.RetainedTranscript)
+        delivery.text = "cancel that job"
+        delivery.woke = False
+        delivery.state = "uncertain"
+        delivery.delivery_id = "2" * 32
+
+        with (
+            mock.patch.object(wake_daemon, "cursor_turn") as cursor_turn,
+            mock.patch.object(wake_daemon, "notify") as notify,
+            mock.patch.object(wake_daemon, "log"),
+        ):
+            daemon.process_utterance(None, woke=False, retained=delivery)
+
+        cursor_turn.assert_not_called()
+        delivery.mark_ambiguous.assert_not_called()
+        delivery.release.assert_not_called()
+        self.assertTrue(daemon.retained_recovery_required)
+        notify.assert_called_once_with(
+            "I retained that voice request because its handoff was interrupted. "
+            "I will not run it until recovery confirms whether it is safe.",
+            error=True,
+        )
+
+        recovered = mock.Mock(spec=wake_daemon.RetainedTranscript)
+        recovered.delivery_id = delivery.delivery_id
+        recovered.text = delivery.text
+        recovered.woke = delivery.woke
+        recovered.state = "pending"
+        daemon.retained_recovery_retry_at = 0.0
+        with (
+            mock.patch.object(
+                wake_daemon,
+                "recover_retained_transcripts",
+                return_value=(recovered,),
+            ),
+            mock.patch.object(daemon, "process_utterance") as process,
+            mock.patch.object(wake_daemon, "log"),
+        ):
+            self.assertTrue(daemon._retry_retained_recovery())
+
+        recovered.mark_ambiguous.assert_not_called()
+        process.assert_called_once_with(None, woke=False, retained=recovered)
+        self.assertFalse(daemon.retained_recovery_required)
+
+    def test_digest_claims_cannot_run_without_a_successful_fence(self) -> None:
+        daemon = _bare_daemon()
+        delivery = mock.Mock(spec=wake_daemon.RetainedTranscript)
+        delivery.text = "what did I miss"
+        delivery.woke = False
+        delivery.state = "pending"
+        delivery.delivery_id = "3" * 32
+        delivery.mark_ambiguous.side_effect = HarnessError("fence unavailable")
+
+        with (
+            mock.patch.object(wake_daemon, "start_components"),
+            mock.patch.object(
+                wake_daemon,
+                "route_intent",
+                return_value=IntentRoute(Intent.ANNOUNCEMENT_DIGEST, "high"),
+            ),
+            mock.patch.object(wake_daemon, "cursor_turn") as cursor_turn,
+            mock.patch.object(wake_daemon, "release_deliveries"),
+            mock.patch.object(wake_daemon, "notify"),
+            mock.patch.object(wake_daemon, "log"),
+        ):
+            daemon.process_utterance(None, woke=False, retained=delivery)
+
+        delivery.mark_ambiguous.assert_called_once_with()
+        cursor_turn.assert_not_called()
+        delivery.release.assert_not_called()
+        self.assertTrue(daemon.retained_recovery_required)
+
+    def test_digest_claim_crash_is_fenced_and_not_replayed(self) -> None:
+        daemon = _bare_daemon()
+        delivery = mock.Mock(spec=wake_daemon.RetainedTranscript)
+        delivery.text = "what did I miss"
+        delivery.woke = False
+        delivery.state = "pending"
+        delivery.delivery_id = "4" * 32
+        order: list[str] = []
+        delivery.mark_ambiguous.side_effect = lambda: order.append("fence")
+
+        def crash_after_claim(
+            _request: CursorTurnRequest,
+            **_kwargs: object,
+        ) -> tuple[str, None]:
+            order.append("digest")
+            raise RuntimeError("crash after digest claims")
+
+        with (
+            mock.patch.object(wake_daemon, "start_components"),
+            mock.patch.object(
+                wake_daemon,
+                "route_intent",
+                return_value=IntentRoute(Intent.ANNOUNCEMENT_DIGEST, "high"),
+            ),
+            mock.patch.object(
+                wake_daemon,
+                "cursor_turn",
+                side_effect=crash_after_claim,
+            ) as cursor_turn,
+            mock.patch.object(wake_daemon, "release_deliveries"),
+            mock.patch.object(wake_daemon, "notify"),
+            mock.patch.object(wake_daemon, "log"),
+        ):
+            daemon.process_utterance(None, woke=False, retained=delivery)
+
+        self.assertEqual(order, ["fence", "digest"])
+        cursor_turn.assert_called_once_with(
+            CursorTurnRequest("", None, action="missed"),
+            delivery_claims=mock.ANY,
+            integrations=mock.ANY,
+        )
+        delivery.release.assert_not_called()
+
+        ambiguous = wake_daemon.RetainedTranscript(
+            delivery.delivery_id,
+            delivery.text,
+            delivery.woke,
+            "ambiguous",
+        )
+        with (
+            mock.patch.object(
+                wake_daemon,
+                "recover_retained_transcripts",
+                return_value=(ambiguous,),
+            ),
+            mock.patch.object(daemon, "process_utterance") as replay,
+            mock.patch.object(wake_daemon, "notify"),
+            mock.patch.object(wake_daemon, "log"),
+        ):
+            daemon._recover_retained_utterances()
+
+        replay.assert_not_called()
+
+    def test_startup_routes_pending_and_fails_ambiguous_closed(self) -> None:
+        daemon = _bare_daemon()
+        pending = wake_daemon.RetainedTranscript("c" * 32, "safe turn", True)
+        ambiguous = wake_daemon.RetainedTranscript(
+            "d" * 32,
+            "possibly executed",
+            False,
+            "ambiguous",
+        )
+        with (
+            mock.patch.object(
+                wake_daemon,
+                "recover_retained_transcripts",
+                return_value=(pending, ambiguous),
+            ),
+            mock.patch.object(daemon, "process_utterance") as process,
+            mock.patch.object(wake_daemon, "notify") as notify,
+            mock.patch.object(wake_daemon, "log"),
+        ):
+            daemon._recover_retained_utterances()
+
+        process.assert_called_once_with(None, woke=True, retained=pending)
+        notify.assert_called_once_with(
+            "A previous voice request may have started before interruption. "
+            "I retained it for reconciliation and will not run it again.",
+            error=True,
+        )
+
+    def test_recovery_batch_stops_when_first_delivery_requires_reconciliation(
+        self,
+    ) -> None:
+        daemon = _bare_daemon()
+        first = wake_daemon.RetainedTranscript("a" * 32, "first turn", True)
+        second = wake_daemon.RetainedTranscript("b" * 32, "second turn", True)
+
+        def process(
+            _audio_path: Path | None,
+            *,
+            woke: bool,
+            retained: wake_daemon.RetainedTranscript,
+        ) -> None:
+            del woke, retained
+            daemon.retained_recovery_required = True
+
+        with (
+            mock.patch.object(
+                wake_daemon,
+                "recover_retained_transcripts",
+                return_value=(first, second),
+            ),
+            mock.patch.object(
+                daemon, "process_utterance", side_effect=process
+            ) as process_utterance,
+            mock.patch.object(wake_daemon, "log") as log,
+        ):
+            daemon._recover_retained_utterances()
+
+        process_utterance.assert_called_once_with(None, woke=True, retained=first)
+        self.assertTrue(
+            any(
+                "paused before later deliveries" in call.args[0]
+                for call in log.call_args_list
+            )
+        )
+
+    def test_ambiguous_delivery_stops_ordered_recovery_batch(self) -> None:
+        daemon = _bare_daemon()
+        ambiguous = wake_daemon.RetainedTranscript(
+            "a" * 32,
+            "possibly executed",
+            True,
+            "ambiguous",
+        )
+        pending = wake_daemon.RetainedTranscript("b" * 32, "later turn", True)
+        with (
+            mock.patch.object(
+                wake_daemon,
+                "recover_retained_transcripts",
+                return_value=(ambiguous, pending),
+            ),
+            mock.patch.object(daemon, "process_utterance") as process,
+            mock.patch.object(wake_daemon, "notify"),
+            mock.patch.object(wake_daemon, "log"),
+        ):
+            daemon._recover_retained_utterances()
+
+        process.assert_not_called()
+        self.assertTrue(daemon.retained_recovery_required)
+        self.assertGreater(daemon.retained_recovery_retry_at, 0.0)
+
+    def test_startup_stays_live_when_retained_recovery_is_unavailable(self) -> None:
+        daemon = _bare_daemon()
+        daemon.np = mock.Mock()  # type: ignore[assignment]
+        daemon.wake_key = "wake"
+        daemon.wake_model.predict.return_value = {
+            "wake": daemon.audio.wake_threshold + 0.1
+        }
+        daemon.start_microphone = mock.Mock()  # type: ignore[method-assign]
+
+        def read_frame() -> bytes:
+            daemon.running = False
+            return b"\x00\x00"
+
+        daemon.read_frame = read_frame  # type: ignore[method-assign]
+
+        with (
+            mock.patch.object(wake_daemon, "recover_jobs"),
+            mock.patch.object(
+                wake_daemon,
+                "recover_retained_transcripts",
+                side_effect=HarnessError("STT unavailable"),
+            ) as recover_retained,
+            mock.patch.object(
+                daemon, "_recover_config_activation", return_value=None
+            ) as recover_activation,
+            mock.patch.object(
+                wake_daemon,
+                "drain_pending_announcements",
+                return_value=announcement_policy.DrainResult(),
+            ) as drain_announcements,
+            mock.patch.object(daemon, "record_utterance_safely") as record,
+            mock.patch.object(wake_daemon, "notify") as notify,
+            mock.patch.object(wake_daemon, "log"),
+        ):
+            daemon.run()
+
+        daemon.start_microphone.assert_called_once_with()
+        daemon.wake_model.predict.assert_called_once()
+        recover_activation.assert_not_called()
+        drain_announcements.assert_not_called()
+        record.assert_not_called()
+        recover_retained.assert_called_once_with()
+        self.assertTrue(daemon.retained_recovery_required)
+        self.assertGreaterEqual(notify.call_count, 1)
+
+
 class InboxIntentRoutingTests(unittest.TestCase):
     def test_list_intent_routes_to_inbox(self) -> None:
         daemon = _bare_daemon()
@@ -4447,7 +5204,7 @@ class WakeRecordingHandoffTests(unittest.TestCase):
         with mock.patch.object(
             wake_daemon.recorder,
             "write_audio_generation",
-            return_value=AUDIO_GENERATION,
+            side_effect=_run_audio_writer,
         ) as handoff:
             result = daemon.record_utterance([b"\x01\x00"])
 
@@ -4468,7 +5225,7 @@ class WakeRecordingHandoffTests(unittest.TestCase):
         with mock.patch.object(
             wake_daemon.recorder,
             "write_audio_generation",
-            return_value=AUDIO_GENERATION,
+            side_effect=_run_audio_writer,
         ):
             result = daemon.record_utterance(
                 [b"wake"],
@@ -4489,11 +5246,120 @@ class WakeRecordingHandoffTests(unittest.TestCase):
         with mock.patch.object(
             wake_daemon.recorder,
             "write_audio_generation",
-            return_value=AUDIO_GENERATION,
+            side_effect=_run_audio_writer,
         ):
             daemon.record_utterance([b"pre-roll"] * wake_daemon.PRE_ROLL_FRAMES)
 
         self.assertEqual(daemon.read_frame.call_count, expected_frames)
+
+    def test_competing_recorder_waits_until_wake_generation_is_durable(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            shared_lock = root / "recording.lock"
+            wake_paths = recorder.RecorderPaths(
+                root / "wake",
+                root / "wake" / "request.wav",
+                root / "wake" / "recording.pid",
+                root / "wake" / "pw-record.log",
+                shared_lock,
+            )
+            dictation_paths = recorder.RecorderPaths(
+                root / "dictation",
+                root / "dictation" / "recording.wav",
+                root / "dictation" / "recording.pid",
+                root / "dictation" / "pw-record.log",
+                shared_lock,
+            )
+            daemon = _bare_daemon()
+            capture_started = threading.Event()
+            contender_reached_lock = threading.Event()
+            release_capture = threading.Event()
+            wake_result: list[Path] = []
+            errors: list[BaseException] = []
+            original_recording_lock = recorder.recording_lock
+
+            @contextlib.contextmanager
+            def observed_recording_lock(state_dir: Path, lock_path: Path | None = None):
+                if threading.current_thread().name == "competing-dictation":
+                    contender_reached_lock.set()
+                with original_recording_lock(state_dir, lock_path):
+                    yield
+
+            def read_frame() -> bytes:
+                capture_started.set()
+                if not release_capture.wait(2):
+                    raise AssertionError("capture was not released")
+                daemon.running = False
+                return b"\x01\x00" * 32
+
+            def capture() -> None:
+                try:
+                    result = daemon.record_utterance_safely([b"\x01\x00" * 32])
+                    if result is not None:
+                        wake_result.append(result)
+                except BaseException as exc:
+                    errors.append(exc)
+
+            def start_dictation() -> None:
+                try:
+                    recorder.start_recording(
+                        dictation_paths,
+                        source="",
+                        ready=lambda: True,
+                        conflicts=(wake_paths,),
+                    )
+                except BaseException as exc:
+                    errors.append(exc)
+
+            daemon.read_frame = read_frame  # type: ignore[method-assign]
+            daemon.is_speech = lambda _frame: True  # type: ignore[method-assign]
+            process = mock.Mock(pid=os.getpid(), returncode=None)
+            process.poll.return_value = None
+            with (
+                mock.patch.object(wake_daemon, "RECORDING_PATHS", wake_paths),
+                mock.patch.object(
+                    wake_daemon, "DICTATION_RECORDING_PATHS", dictation_paths
+                ),
+                mock.patch.object(
+                    wake_daemon,
+                    "CAPTURE_PATHS",
+                    (wake_paths, dictation_paths),
+                ),
+                mock.patch.object(
+                    recorder.subprocess, "Popen", return_value=process
+                ) as popen,
+                mock.patch.object(recorder, "_wait_for_recorder"),
+                mock.patch.object(
+                    recorder, "recording_lock", side_effect=observed_recording_lock
+                ),
+            ):
+                wake_thread = threading.Thread(target=capture)
+                wake_thread.start()
+                self.assertTrue(capture_started.wait(1))
+
+                dictation_thread = threading.Thread(
+                    target=start_dictation,
+                    name="competing-dictation",
+                )
+                dictation_thread.start()
+                self.assertTrue(contender_reached_lock.wait(1))
+
+                self.assertTrue(dictation_thread.is_alive())
+                popen.assert_not_called()
+                self.assertFalse(dictation_paths.process.exists())
+
+                release_capture.set()
+                wake_thread.join(2)
+                dictation_thread.join(2)
+
+            self.assertFalse(wake_thread.is_alive())
+            self.assertFalse(dictation_thread.is_alive())
+            self.assertFalse(errors)
+            self.assertEqual(len(wake_result), 1)
+            self.assertTrue(wake_result[0].exists())
+            self.assertGreater(wake_result[0].stat().st_size, recorder.WAV_HEADER_SIZE)
+            popen.assert_called_once()
+            self.assertTrue(dictation_paths.process.exists())
 
     def test_run_requires_fresh_speech_after_wake_detection(self) -> None:
         daemon = _bare_daemon()
@@ -4518,6 +5384,9 @@ class WakeRecordingHandoffTests(unittest.TestCase):
             ) as record,
             mock.patch.object(daemon, "begin_activation"),
             mock.patch.object(wake_daemon, "recover_jobs"),
+            mock.patch.object(
+                wake_daemon, "recover_retained_transcripts", return_value=()
+            ),
             mock.patch.object(
                 wake_daemon,
                 "drain_pending_announcements",
@@ -4604,6 +5473,9 @@ class WakeRecordingHandoffTests(unittest.TestCase):
                 mock.patch.object(daemon, "record_utterance") as record,
                 mock.patch.object(daemon, "begin_activation") as activate,
                 mock.patch.object(wake_daemon, "recover_jobs"),
+                mock.patch.object(
+                    wake_daemon, "recover_retained_transcripts", return_value=()
+                ),
                 mock.patch.object(
                     wake_daemon,
                     "drain_pending_announcements",
@@ -4762,6 +5634,9 @@ class RunLoopFollowupTests(unittest.TestCase):
         with (
             mock.patch.object(wake_daemon, "recover_jobs") as recover,
             mock.patch.object(
+                wake_daemon, "recover_retained_transcripts", return_value=()
+            ),
+            mock.patch.object(
                 wake_daemon,
                 "drain_pending_announcements",
                 return_value=announcement_policy.DrainResult(),
@@ -4799,6 +5674,9 @@ class ForceListenTests(unittest.TestCase):
 
         with (
             mock.patch.object(wake_daemon, "recover_jobs"),
+            mock.patch.object(
+                wake_daemon, "recover_retained_transcripts", return_value=()
+            ),
             mock.patch.object(
                 wake_daemon,
                 "drain_pending_announcements",
