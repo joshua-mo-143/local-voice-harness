@@ -99,6 +99,49 @@ class ServerStreamingTests(unittest.TestCase):
         self.assertIn("request failed: JSONDecodeError:", log.call_args.args[0])
         self.assertFalse(write.call_args.args[1]["ok"])
 
+    def test_voice_validation_uses_provider_boundary_without_playback(self) -> None:
+        handler = server.RequestHandler.__new__(server.RequestHandler)
+        handler.rfile = io.BytesIO(
+            json.dumps({"op": "validate_voice", "voice": "candidate"}).encode() + b"\n"
+        )
+        handler.wfile = io.BytesIO()
+
+        def synthesize(
+            _text: str,
+            _voice: object,
+            output: Path,
+            *,
+            apply_speed: bool,
+        ) -> tuple[int, float, float]:
+            self.assertFalse(apply_speed)
+            output.write_bytes(b"validated audio")
+            return 24_000, 0.2, 0.1
+
+        with (
+            tempfile.TemporaryDirectory() as temporary,
+            mock.patch.object(server, "OUTPUT_ROOT", Path(temporary)),
+            mock.patch.object(server, "_request_voice", return_value="candidate"),
+            mock.patch.object(server, "_synthesize", side_effect=synthesize) as call,
+        ):
+            handler.handle()
+            response = json.loads(handler.wfile.getvalue())
+
+        self.assertEqual(response, {"ok": True, "voice_usable": True})
+        call.assert_called_once()
+
+    def test_voice_validation_reports_provider_rejection(self) -> None:
+        with mock.patch.object(
+            client,
+            "unix_request",
+            return_value=json.dumps(
+                {"ok": False, "error": "unknown provider voice"}
+            ).encode(),
+        ):
+            result = client.validate_voice("missing")
+
+        self.assertFalse(result.usable)
+        self.assertEqual(result.detail, "unknown provider voice")
+
     def test_cancellation_stops_before_the_next_model_call(self) -> None:
         handler = mock.Mock()
         handler.wfile = io.BytesIO()
@@ -224,6 +267,34 @@ class ServerStreamingTests(unittest.TestCase):
         )
         self.assertEqual(request.get_header("Authorization"), "Bearer venice-secret")
         self.assertEqual(urlopen.call_args.kwargs["timeout"], 19)
+
+    def test_venice_synthesis_uses_request_voice_as_provider_override(self) -> None:
+        settings = replace(
+            load_backend_settings({}),
+            tts_provider="venice",
+            tts_voice="configured_voice",
+            tts_speed=1,
+        )
+        with (
+            mock.patch.object(server, "SETTINGS", settings),
+            mock.patch.object(
+                server,
+                "_venice_audio",
+                return_value=(b"wav", 24_000, 0.1, 0.05),
+            ) as venice_audio,
+            mock.patch.object(
+                server,
+                "_apply_venice_speed",
+                return_value=(24_000, 0.1, 0.01),
+            ),
+        ):
+            server._synthesize(
+                "Hello.",
+                "candidate_voice",
+                Path("/tmp/not-written.wav"),
+            )
+
+        venice_audio.assert_called_once_with("Hello.", "candidate_voice")
 
     def test_venice_http_error_is_closed_after_bounded_detail_read(self) -> None:
         settings = replace(

@@ -53,6 +53,10 @@ def updated_config():
     return replace(config, audio=replace(config.audio, voice="new_voice"))
 
 
+def original_config():
+    return default_user_config(home=Path("/home/example"))
+
+
 def main() -> None:
     command = sys.argv[1]
     store = config_activation.ActivationStore(Path(sys.argv[2]))
@@ -86,6 +90,11 @@ def main() -> None:
                 crash=os.environ.get("CRASH_AFTER_RESTART") == "1",
             ),
             load_config=updated_config,
+            voice_validator=lambda _voice: config_activation.VoiceValidationResult(
+                True,
+                "accepted",
+            ),
+            restore_voice=lambda _record: original_config(),
             observation_timeout=0,
         )
         print(json.dumps({"status": final.status.value}))

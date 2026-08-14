@@ -200,6 +200,37 @@ def _pending_config(
     )
 
 
+def _voice_activation_at_status(
+    store: wake_daemon.ActivationStore,
+    daemon: WakeConversationDaemon,
+    status: wake_daemon.ActivationStatus,
+) -> config_activation.ActivationRecord:
+    result = ConfigChangeResult(
+        config=replace(
+            daemon.user_config,
+            audio=replace(daemon.user_config.audio, voice="new_voice"),
+        ),
+        changed_keys=("audio.voice",),
+        restart_services=("voice-harness-wake.service",),
+    )
+    offer = store.create_offer(_pending_config(), result)
+    assert offer is not None
+    store.mark_offer_delivered(offer.id)
+    store.accept(offer.id)
+    ready = store.mark_pre_restart_delivered(offer.id)
+    if status == wake_daemon.ActivationStatus.READY:
+        return ready
+    validating = store.begin_voice_validation(ready.id)
+    if status == wake_daemon.ActivationStatus.VALIDATING:
+        return validating
+    if status == wake_daemon.ActivationStatus.RESTARTING:
+        validated = store.mark_voice_validated(validating.id)
+        return store.begin_restart(validated.id, validated.outcomes)
+    if status == wake_daemon.ActivationStatus.ROLLING_BACK:
+        return store.begin_rollback(validating.id, "validation worker exited")
+    raise AssertionError(f"unsupported activation status: {status}")
+
+
 def _pending_choice_snapshot() -> wake_daemon.PendingQuestionSnapshot:
     question = Question(
         id="question-1",
@@ -3349,6 +3380,36 @@ class RetainedUtteranceTests(unittest.TestCase):
             )
         )
 
+    def test_run_reconciles_activation_without_barge_in_during_retained_pause(
+        self,
+    ) -> None:
+        daemon = _bare_daemon()
+        daemon.np = mock.Mock()  # type: ignore[assignment]
+        daemon.np.frombuffer.return_value = ()
+        daemon.wake_key = "wake"
+        daemon.wake_model.predict.return_value = {"wake": 0.0}
+
+        def stop_after_frame() -> bytes:
+            daemon.running = False
+            return b"\x00\x00"
+
+        with (
+            mock.patch.object(wake_daemon, "recover_jobs"),
+            mock.patch.object(daemon, "_retry_retained_recovery", return_value=False),
+            mock.patch.object(daemon, "start_microphone"),
+            mock.patch.object(daemon, "read_frame", side_effect=stop_after_frame),
+            mock.patch.object(
+                daemon,
+                "_recover_config_activation",
+                return_value=wake_daemon.BargeIn([b"speech"], woke=False),
+            ) as recover_activation,
+            mock.patch.object(daemon, "continue_after_barge_in") as continue_barge,
+        ):
+            daemon.run()
+
+        recover_activation.assert_called_once_with(actions_allowed=False)
+        continue_barge.assert_not_called()
+
     def test_ambiguous_delivery_stops_ordered_recovery_batch(self) -> None:
         daemon = _bare_daemon()
         ambiguous = wake_daemon.RetainedTranscript(
@@ -3412,7 +3473,7 @@ class RetainedUtteranceTests(unittest.TestCase):
 
         daemon.start_microphone.assert_called_once_with()
         daemon.wake_model.predict.assert_called_once()
-        recover_activation.assert_not_called()
+        recover_activation.assert_called_once_with(actions_allowed=False)
         drain_announcements.assert_not_called()
         record.assert_not_called()
         recover_retained.assert_called_once_with()
@@ -3880,6 +3941,170 @@ class ConfigChangeConversationTests(unittest.TestCase):
         route_intent.assert_not_called()
         launch.assert_not_called()
 
+    def test_voice_worker_launch_failure_preserves_or_starts_rollback(self) -> None:
+        for status in (
+            wake_daemon.ActivationStatus.READY,
+            wake_daemon.ActivationStatus.VALIDATING,
+            wake_daemon.ActivationStatus.RESTARTING,
+            wake_daemon.ActivationStatus.ROLLING_BACK,
+        ):
+            with (
+                self.subTest(status=status),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
+                daemon = _bare_daemon()
+                store = wake_daemon.ActivationStore(Path(temporary) / "activation.json")
+                daemon.config_activation_store = store
+                current = _voice_activation_at_status(store, daemon, status)
+                with (
+                    mock.patch.object(
+                        wake_daemon,
+                        "launch_activation_worker",
+                        side_effect=OSError("temporary launch failure"),
+                    ),
+                    mock.patch.object(wake_daemon, "log") as log,
+                ):
+                    daemon._dispatch_ready_config_activation(current.id)
+                after_launch_failure = store.current()
+
+            assert after_launch_failure is not None
+            expected = (
+                wake_daemon.ActivationStatus.ROLLING_BACK
+                if status == wake_daemon.ActivationStatus.RESTARTING
+                else status
+            )
+            self.assertEqual(after_launch_failure.status, expected)
+            self.assertEqual(after_launch_failure.setting_key, "audio.voice")
+            self.assertEqual(after_launch_failure.old_value, "")
+            self.assertEqual(after_launch_failure.new_value, "new_voice")
+            if status == wake_daemon.ActivationStatus.RESTARTING:
+                self.assertIn("could not be relaunched", after_launch_failure.detail)
+                log.assert_not_called()
+            else:
+                log.assert_called_once()
+
+    def test_repeated_voice_worker_launch_failures_enter_durable_rollback(
+        self,
+    ) -> None:
+        for status in (
+            wake_daemon.ActivationStatus.READY,
+            wake_daemon.ActivationStatus.VALIDATING,
+            wake_daemon.ActivationStatus.ROLLING_BACK,
+        ):
+            with (
+                self.subTest(status=status),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
+                daemon = _bare_daemon()
+                store = wake_daemon.ActivationStore(Path(temporary) / "activation.json")
+                daemon.config_activation_store = store
+                current = _voice_activation_at_status(store, daemon, status)
+                with (
+                    mock.patch.object(
+                        wake_daemon,
+                        "launch_activation_worker",
+                        side_effect=OSError("systemd unavailable"),
+                    ),
+                    mock.patch.object(wake_daemon, "log"),
+                ):
+                    daemon._dispatch_ready_config_activation(current.id)
+                    daemon._dispatch_ready_config_activation(current.id)
+
+                recovered = store.current()
+
+            assert recovered is not None
+            self.assertEqual(
+                recovered.status,
+                wake_daemon.ActivationStatus.ROLLING_BACK,
+            )
+            self.assertEqual(
+                daemon.config_activation_dispatch_attempts[current.id],
+                2,
+            )
+
+    def test_exhausted_voice_workers_enter_or_continue_durable_rollback(self) -> None:
+        for status in (
+            wake_daemon.ActivationStatus.READY,
+            wake_daemon.ActivationStatus.VALIDATING,
+            wake_daemon.ActivationStatus.RESTARTING,
+            wake_daemon.ActivationStatus.ROLLING_BACK,
+        ):
+            with (
+                self.subTest(status=status),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
+                daemon = _bare_daemon()
+                store = wake_daemon.ActivationStore(Path(temporary) / "activation.json")
+                daemon.config_activation_store = store
+                current = _voice_activation_at_status(store, daemon, status)
+                exhausted = mock.Mock()
+                exhausted.poll.return_value = 17
+                replacement = mock.Mock()
+                replacement.poll.return_value = None
+                daemon.launched_config_activations = {current.id: exhausted}
+                daemon.config_activation_dispatch_attempts = {current.id: 2}
+
+                with mock.patch.object(
+                    wake_daemon,
+                    "launch_activation_worker",
+                    return_value=replacement,
+                ) as launch:
+                    returned = daemon._recover_config_activation()
+                recovered = store.current()
+
+            self.assertIsNone(returned)
+            assert recovered is not None
+            self.assertEqual(
+                recovered.status,
+                wake_daemon.ActivationStatus.ROLLING_BACK,
+            )
+            self.assertFalse(recovered.acknowledged)
+            self.assertFalse(recovered.rollback_config_restored)
+            self.assertEqual(recovered.setting_key, "audio.voice")
+            self.assertEqual(recovered.old_value, "")
+            self.assertEqual(recovered.new_value, "new_voice")
+            launch.assert_called_once_with(current.id)
+            self.assertIs(
+                daemon.launched_config_activations[current.id],
+                replacement,
+            )
+
+    def test_retained_pause_dispatches_only_voice_safety_reconciliation(self) -> None:
+        for status, should_launch in (
+            (wake_daemon.ActivationStatus.READY, False),
+            (wake_daemon.ActivationStatus.RESTARTING, False),
+            (wake_daemon.ActivationStatus.VALIDATING, True),
+            (wake_daemon.ActivationStatus.ROLLING_BACK, True),
+        ):
+            with (
+                self.subTest(status=status),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
+                daemon = _bare_daemon()
+                store = wake_daemon.ActivationStore(Path(temporary) / "activation.json")
+                daemon.config_activation_store = store
+                current = _voice_activation_at_status(store, daemon, status)
+                process = mock.Mock()
+                process.poll.return_value = None
+                with (
+                    mock.patch.object(
+                        wake_daemon,
+                        "launch_activation_worker",
+                        return_value=process,
+                    ) as launch,
+                    mock.patch.object(daemon, "ensure_components") as components,
+                    mock.patch.object(daemon, "play_response") as play,
+                ):
+                    returned = daemon._recover_config_activation(actions_allowed=False)
+
+            self.assertIsNone(returned)
+            if should_launch:
+                launch.assert_called_once_with(current.id)
+            else:
+                launch.assert_not_called()
+            components.assert_not_called()
+            play.assert_not_called()
+
     def test_post_restart_result_is_acknowledged_only_after_playback(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             daemon = _bare_daemon()
@@ -3929,7 +4154,7 @@ class ConfigChangeConversationTests(unittest.TestCase):
         assert current is not None
         self.assertTrue(current.acknowledged)
         response = play.call_args.args[0]
-        self.assertIn("expected configuration snapshot", response.spoken_text)
+        self.assertIn("expected voice snapshot", response.spoken_text)
 
 
 class AnnounceJobTests(unittest.TestCase):
