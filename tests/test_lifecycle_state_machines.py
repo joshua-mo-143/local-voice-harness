@@ -650,7 +650,7 @@ def test_cursor_job_evolves_typed_checkout_without_flat_kwargs() -> None:
             "id": "123456789abc",
             "revision": 0,
             "request": "implement it",
-            "status": "routing",
+            "status": "queued",
             "created_at": 1,
             "queued_at": 1,
             "delivered": False,

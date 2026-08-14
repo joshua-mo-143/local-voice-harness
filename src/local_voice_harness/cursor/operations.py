@@ -323,7 +323,7 @@ class CheckoutOperation:
         workspace_id: str | None = None,
         root_pane_id: str | None = None,
     ) -> CheckoutOperation:
-        if state not in _CHECKOUT_TRANSITIONS[self.state]:
+        if state != self.state and state not in _CHECKOUT_TRANSITIONS[self.state]:
             raise OperationTransitionError(
                 f"checkout cannot transition from {self.state} to {state}"
             )
@@ -493,7 +493,7 @@ class AgentSessionOperation:
         *,
         session: SessionIdentity | None = None,
     ) -> AgentSessionOperation:
-        if state not in _SESSION_TRANSITIONS[self.state]:
+        if state != self.state and state not in _SESSION_TRANSITIONS[self.state]:
             raise OperationTransitionError(
                 f"agent session cannot transition from {self.state} to {state}"
             )

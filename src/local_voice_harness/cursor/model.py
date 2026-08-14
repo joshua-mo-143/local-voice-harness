@@ -3611,7 +3611,11 @@ class AgentJob:
 
     def _updated(self, **changes: object) -> CursorJob:
         values = dict(self._values)
-        values.update(changes)
+        mutable = dict(changes)
+        _consume_typed_prompt_operation(mutable)
+        _consume_typed_checkout_operation(mutable)
+        _consume_typed_agent_session_operation(mutable)
+        values.update(mutable)
         _pair_worker_ownership(values)
         values["schema_version"] = CURRENT_SCHEMA_VERSION
         values["revision"] = self.revision + 1
@@ -4482,6 +4486,9 @@ def transition(
             f"illegal Cursor job transition {job.status.value} -> {status.value}"
         )
     values = job.to_dict()
+    _consume_typed_prompt_operation(changes)
+    _consume_typed_checkout_operation(changes)
+    _consume_typed_agent_session_operation(changes)
     values.update(changes)
     _pair_worker_ownership(values)
     if "herdr_target" in changes and "session_id" not in changes:

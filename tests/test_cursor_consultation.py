@@ -253,10 +253,14 @@ def test_workspace_target_prefers_explicit_focus_then_retained_completion() -> N
             "completed_at": 2,
             "delivered": True,
             "result": "done",
+            "schema_version": 18,
+            "revision": 0,
             "repository": "/projects/example",
+            "worktree_branch": "voice/retained",
             "worktree_path": "/worktrees/example",
             "worktree_label": "retained",
             "worktree_workspace_id": "retained-workspace",
+            "worktree_root_pane_id": "retained-pane",
             "worktree_provision_state": "retained",
         }
     )
@@ -306,6 +310,7 @@ def test_workspace_target_rejects_missing_or_changed_workspace() -> None:
             "result": "done",
             "worktree_path": "/worktrees/example",
             "worktree_workspace_id": "expected-workspace",
+            "worktree_root_pane_id": "expected-pane",
             "worktree_provision_state": "retained",
         }
     )
