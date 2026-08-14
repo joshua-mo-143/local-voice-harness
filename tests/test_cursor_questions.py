@@ -938,6 +938,19 @@ def test_exact_turn_is_fenced_before_answer_dispatch(store: JobStore) -> None:
     assert question.prompt_state == PromptOperationState.PLANNED
     assert question.dispatch_token == "aaaaaaaaaaaa-2"
     assert dispatching.herdr_target == "retained-agent"
+    assert question.prompt_target == "retained-agent"
+    assert question.prompt_agent_session == "retained-agent"
+    replacement = replace(
+        dispatching,
+        _values={
+            **dispatching._values,
+            "herdr_target": "replacement-agent",
+            "agent_provider_session_id": "replacement-session",
+        },
+    )
+    persisted_identity = questions.shared_prompt_identity(replacement, question)
+    assert persisted_identity.target == "retained-agent"
+    assert persisted_identity.agent_session == "retained-agent"
 
     stale_values = queued.to_dict()
     envelope = dict(cast(dict[str, object], stale_values["voice_question"]))
@@ -1045,8 +1058,21 @@ def test_submitted_dispatch_retries_only_after_repeated_absence(
     herdr.get_agent.return_value = {
         "state_change_seq": 7,
         "agent_status": "idle",
+        "agent_session": "replacement-session",
     }
     launch = mock.Mock()
+
+    recovery.recover_jobs(
+        store,
+        launch_worker=launch,
+        herdr_factory=lambda: herdr,
+        is_worker_alive=lambda _job: False,
+        now=95,
+    )
+    unchanged_question = questions.current(store.get(planned.id))
+    assert unchanged_question is not None
+    assert unchanged_question.prompt_absent_observations == 0
+    herdr.get_agent.return_value["agent_session"] = "retained-agent"
 
     for observed_at in (100, 106):
         recovery.recover_jobs(
@@ -1146,6 +1172,9 @@ def test_successful_cleanup_resolves_dispatched_question(store: JobStore) -> Non
         state=QuestionState.DISPATCHING,
         dispatch_token="aaaaaaaaaaaa-2",
         prompt_state=PromptOperationState.SUBMITTED,
+        prompt_turn=2,
+        prompt_target="retained-agent",
+        prompt_agent_session="retained-agent",
         prompt_baseline_seq=1,
         prompt_submitted_at=2,
     )
@@ -1372,6 +1401,7 @@ def test_interactive_questionnaire_error_persists_blocked_status(
                 "prompt_operation_phase": "implementing",
                 "prompt_operation_turn": 1,
                 "prompt_operation_target": "agent",
+                "prompt_operation_agent_session": "session",
                 "prompt_baseline_sequence": 7,
             }
         )

@@ -17,7 +17,7 @@ from ..integrations.herdr import HerdrClient
 from ..process import boot_identity, process_identity
 from ..questions import Choice, Question, QuestionSensitivity, QuestionState
 from . import questions
-from .model import CursorJob, JobStatus
+from .model import CursorJob, JobStatus, JobValidationError
 from .operations import checkout_is_usable
 from .store import JobStore
 
@@ -94,6 +94,22 @@ _recommendation: RecommendationReference | None = None
 def _eligible_question(job: CursorJob) -> Question | None:
     if job.status != JobStatus.AWAITING_USER or not job.delivered:
         return None
+    try:
+        checkout_operation = job.checkout_operation
+    except JobValidationError:
+        return None
+    checkout_value = job.worktree_path or job.repository
+    workspace_id = job.worktree_workspace_id or job.herdr_workspace_id
+    if (
+        checkout_operation is None
+        or not checkout_is_usable(checkout_operation.state)
+        or not checkout_value
+        or not workspace_id
+        or Path(checkout_value).expanduser().resolve()
+        != Path(checkout_operation.spec.path).expanduser().resolve()
+        or workspace_id != checkout_operation.workspace_id
+    ):
+        return None
     question = questions.current(job)
     if question is None or question.state != QuestionState.PENDING:
         return None
@@ -150,6 +166,8 @@ def _same_pending_question(
     except (OSError, ValueError):
         return False
     question = _eligible_question(job)
+    checkout_value = job.worktree_path or job.repository
+    workspace_id = job.worktree_workspace_id or job.herdr_workspace_id
     return bool(
         question is not None
         and question.id == snapshot.question_id
@@ -158,6 +176,9 @@ def _same_pending_question(
         and question.text == snapshot.text
         and question.owner == snapshot.owner
         and question.sensitivity == snapshot.sensitivity
+        and checkout_value
+        and Path(checkout_value).expanduser().resolve() == snapshot.checkout
+        and workspace_id == snapshot.workspace_id
     )
 
 

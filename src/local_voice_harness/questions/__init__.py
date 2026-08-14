@@ -111,6 +111,9 @@ class Question:
     answered_at: float | None = None
     dispatch_token: str | None = None
     prompt_state: PromptOperationState | None = None
+    prompt_turn: int | None = None
+    prompt_target: str | None = None
+    prompt_agent_session: str | None = None
     prompt_baseline_seq: int | None = None
     prompt_submitted_at: float | None = None
     prompt_absent_observations: int = 0
@@ -135,6 +138,9 @@ class Question:
             "answered_at": self.answered_at,
             "dispatch_token": self.dispatch_token,
             "prompt_state": self.prompt_state.value if self.prompt_state else None,
+            "prompt_turn": self.prompt_turn,
+            "prompt_target": self.prompt_target,
+            "prompt_agent_session": self.prompt_agent_session,
             "prompt_baseline_seq": self.prompt_baseline_seq,
             "prompt_submitted_at": self.prompt_submitted_at,
             "prompt_absent_observations": self.prompt_absent_observations,
@@ -190,6 +196,13 @@ class Question:
                     PromptOperationState(str(raw["prompt_state"]))
                     if raw.get("prompt_state") is not None
                     else None
+                ),
+                prompt_turn=_optional_int(raw.get("prompt_turn"), "prompt_turn"),
+                prompt_target=_optional_string(
+                    raw.get("prompt_target"), "prompt_target"
+                ),
+                prompt_agent_session=_optional_string(
+                    raw.get("prompt_agent_session"), "prompt_agent_session"
                 ),
                 prompt_baseline_seq=_optional_int(
                     raw.get("prompt_baseline_seq"), "prompt_baseline_seq"
@@ -551,6 +564,15 @@ def _validate_question(question: Question) -> None:
         raise QuestionError("question identity fields must not be empty")
     if question.prompt_absent_observations < 0:
         raise QuestionError("prompt absent observations must not be negative")
+    prompt_identity = (
+        question.prompt_turn,
+        question.prompt_target,
+        question.prompt_agent_session,
+    )
+    if any(value is not None for value in prompt_identity) and not all(
+        value is not None for value in prompt_identity
+    ):
+        raise QuestionError("question prompt identity is incomplete")
     if question.state == QuestionState.ANSWERED and (
         not question.answer or question.answered_at is None
     ):
@@ -562,6 +584,15 @@ def _validate_question(question: Question) -> None:
     ):
         raise QuestionError(
             "dispatching question requires a token and prompt operation state"
+        )
+    if question.state == QuestionState.DISPATCHING and question.prompt_state not in {
+        PromptOperationState.PLANNED,
+        PromptOperationState.SUBMITTED,
+        PromptOperationState.OBSERVED,
+        PromptOperationState.RESOLVED,
+    }:
+        raise QuestionError(
+            "dispatching question has an invalid prompt operation state"
         )
 
 
@@ -614,8 +645,20 @@ def load_question_prompt(
 def bind_question_prompt(question: Question, operation: PromptOperation) -> Question:
     """Write a shared prompt operation back onto question compatibility fields."""
     if isinstance(operation, IdlePrompt):
-        return replace(question, prompt_state=None)
-    return replace(question, prompt_state=operation.state)
+        return replace(
+            question,
+            prompt_state=None,
+            prompt_turn=None,
+            prompt_target=None,
+            prompt_agent_session=None,
+        )
+    return replace(
+        question,
+        prompt_state=operation.state,
+        prompt_turn=operation.identity.turn,
+        prompt_target=operation.identity.target,
+        prompt_agent_session=operation.identity.agent_session,
+    )
 
 
 def plan_question_prompt(question: Question, identity: PromptIdentity) -> Question:

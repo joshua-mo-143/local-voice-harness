@@ -1149,6 +1149,40 @@ def _normalize_for_durable_write(
             not workspace_id or not root_pane_id
         ):
             values["worktree_provision_state"] = "ambiguous"
+        if (
+            candidate._prompt_operation is None
+            and candidate.prompt_operation_state != "none"
+        ):
+            turn = max(candidate.prompt_operation_turn, candidate.turn, 1)
+            values.update(
+                prompt_operation_state="ambiguous",
+                prompt_operation_phase=(
+                    candidate.prompt_operation_phase.value
+                    if candidate.prompt_operation_phase is not None
+                    else candidate.workflow_phase.value
+                ),
+                prompt_operation_turn=turn,
+                prompt_operation_target=(
+                    candidate.prompt_operation_target
+                    or candidate.herdr_target
+                    or LEGACY_BOOT_ID
+                ),
+                prompt_operation_agent_session=LEGACY_BOOT_ID,
+                prompt_baseline_sequence=max(
+                    candidate.prompt_baseline_sequence or 0, 0
+                ),
+                manual_reconcile_operation="prompt",
+                manual_reconcile_token=(
+                    candidate.manual_reconcile_token
+                    or uuid.uuid5(
+                        uuid.NAMESPACE_URL,
+                        f"local-voice-harness:prompt:{candidate.id}:{turn}",
+                    ).hex
+                ),
+                manual_reconcile_required_at=(
+                    candidate.updated_at or candidate.created_at
+                ),
+            )
     for field in (
         "migration_source_schema_version",
         "phase_prompt_active",

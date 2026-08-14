@@ -8,6 +8,7 @@ import pytest
 
 from local_voice_harness.cursor import consultation
 from local_voice_harness.cursor.model import CursorJob, JobStatus
+from local_voice_harness.cursor.operations import CheckoutState
 from local_voice_harness.cursor.store import JobStore
 from local_voice_harness.errors import HarnessError
 from local_voice_harness.integrations.herdr import AgentSelection, PromptOutcome
@@ -39,6 +40,7 @@ def _awaiting(
     owner: str = "agent",
     kind: QuestionKind = QuestionKind.MULTIPLE_CHOICE,
     sensitivity: QuestionSensitivity = QuestionSensitivity.ARCHITECTURE,
+    checkout_state: str = "ready",
     choices: tuple[Choice, ...] = (
         Choice("safe", "Use the safe design"),
         Choice("fast", "Use the fast design"),
@@ -70,10 +72,11 @@ def _awaiting(
                 "turn_token": question.origin.turn_token,
                 "repository": f"/projects/{job_id}",
                 "worktree_path": f"/worktrees/{job_id}",
+                "worktree_branch": f"voice/{job_id}",
                 "worktree_label": job_id,
                 "worktree_workspace_id": f"workspace-{job_id}",
                 "worktree_root_pane_id": f"root-pane-{job_id}",
-                "worktree_provision_state": "ready",
+                "worktree_provision_state": checkout_state,
                 "voice_question": question.to_dict(),
             }
         )
@@ -111,6 +114,16 @@ def test_pending_snapshot_fails_closed_for_undelivered_or_competing_jobs(
     assert (
         consultation.pending_question_snapshot(competing_store, "aaaaaaaaaaaa") is None
     )
+
+
+@pytest.mark.parametrize("checkout_state", ["quarantined", "confirmed_absent"])
+def test_pending_snapshot_rejects_unusable_checkout(
+    tmp_path: Path, checkout_state: str
+) -> None:
+    store = _store(tmp_path)
+    _awaiting(store, checkout_state=checkout_state)
+
+    assert consultation.pending_question_snapshot(store, "aaaaaaaaaaaa") is None
 
 
 def test_pending_consultation_revalidates_identity_and_preserves_question(
@@ -163,6 +176,42 @@ def test_pending_consultation_revalidates_identity_and_preserves_question(
         }
     )
     store.update(current.id, lambda _job: changed)
+    before_submit = client.prompt_and_wait.call_args.kwargs["before_submit"]
+    with pytest.raises(HarnessError, match="changed before consultation"):
+        before_submit(1)
+
+
+def test_pending_consultation_revalidates_checkout_binding(tmp_path: Path) -> None:
+    store = _store(tmp_path)
+    original = _awaiting(store)
+    snapshot = consultation.pending_question_snapshot(store, original.id)
+    assert snapshot is not None
+    client = mock.Mock()
+    client.workspace_for.return_value = {"workspace_id": "workspace-aaaaaaaaaaaa"}
+    client.start_fresh_agent.return_value = AgentSelection(
+        "consultant",
+        "pane-2",
+        "workspace-aaaaaaaaaaaa",
+        "/worktrees/aaaaaaaaaaaa",
+        "consultant",
+    )
+    client.prompt_and_wait.return_value = PromptOutcome(
+        "done", "I recommend the safe design.", None, ""
+    )
+
+    consultation.consult_pending_question(
+        client, store, snapshot, "Which option do you recommend?"
+    )
+    current = store.get(original.id)
+    checkout = current.checkout_operation
+    assert checkout is not None
+    store.update(
+        current.id,
+        lambda job: job.evolve(
+            checkout_operation=checkout.transition(CheckoutState.CONFIRMED_ABSENT)
+        ),
+    )
+
     before_submit = client.prompt_and_wait.call_args.kwargs["before_submit"]
     with pytest.raises(HarnessError, match="changed before consultation"):
         before_submit(1)

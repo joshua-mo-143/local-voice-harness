@@ -32,7 +32,11 @@ from local_voice_harness.cursor.lifecycle import (
     settle_cleanup,
     take_over_cleanup,
 )
-from local_voice_harness.cursor.model import CURRENT_SCHEMA_VERSION, CursorJob
+from local_voice_harness.cursor.model import (
+    CURRENT_SCHEMA_VERSION,
+    CursorJob,
+    JobValidationError,
+)
 from local_voice_harness.cursor.operations import CheckoutState
 from local_voice_harness.prompt_operations import (
     AmbiguousPrompt,
@@ -610,6 +614,10 @@ def test_question_module_reuses_shared_prompt_operation_enum() -> None:
     )
     planned = plan_question_prompt(_question(QuestionState.ANSWERED), identity)
     assert planned.prompt_state == PromptOperationState.PLANNED
+    assert planned.prompt_turn == identity.turn
+    assert planned.prompt_target == identity.target
+    assert planned.prompt_agent_session == identity.agent_session
+    assert Question.from_dict(planned.to_dict()) == planned
     assert isinstance(load_question_prompt(planned, identity), PlannedPrompt)
     submitted = submit_question_prompt(planned, identity)
     assert submitted.prompt_state == PromptOperationState.SUBMITTED
@@ -641,6 +649,40 @@ def test_cursor_job_evolves_typed_prompt_operation_without_flat_kwargs() -> None
     assert updated.to_dict()["prompt_operation_state"] == "planned"
     restored = CursorJob.from_dict(updated.to_dict())
     assert restored.prompt_operation == planned
+
+
+def test_typed_prompt_identity_is_authoritative_when_evolving_job() -> None:
+    job = CursorJob.from_dict(
+        {
+            "schema_version": CURRENT_SCHEMA_VERSION,
+            "id": "123456789abc",
+            "revision": 0,
+            "request": "implement it",
+            "status": "queued",
+            "created_at": 1,
+            "queued_at": 1,
+            "delivered": False,
+        }
+    )
+    identity = _prompt_identity(job_id=job.id, turn=2, turn_token="typed-token")
+    planned = plan_prompt(job.prompt_operation, identity)
+
+    updated = job.evolve(
+        prompt_operation=planned,
+        turn=99,
+        turn_token="flat-token",
+    )
+
+    assert updated.turn == identity.turn
+    assert updated.turn_token == identity.turn_token
+    assert updated.prompt_operation == planned
+
+    foreign = plan_prompt(
+        job.prompt_operation,
+        _prompt_identity(job_id="other-job", turn=1, turn_token="other-token"),
+    )
+    with pytest.raises(JobValidationError, match="does not belong"):
+        job.evolve(prompt_operation=foreign)
 
 
 def test_cursor_job_evolves_typed_checkout_without_flat_kwargs() -> None:
@@ -690,3 +732,20 @@ def test_answered_question_state_requires_answer_payload() -> None:
             state=QuestionState.ANSWERED,
             asked_at=1,
         )
+
+
+@pytest.mark.parametrize(
+    "prompt_state",
+    [
+        PromptOperationState.IDLE,
+        PromptOperationState.SUBMITTING,
+        PromptOperationState.AMBIGUOUS,
+    ],
+)
+def test_dispatching_question_rejects_non_dispatch_states(
+    prompt_state: PromptOperationState,
+) -> None:
+    raw = _question(QuestionState.DISPATCHING).to_dict()
+    raw["prompt_state"] = prompt_state.value
+    with pytest.raises(QuestionError, match="invalid prompt operation state"):
+        Question.from_dict(raw)

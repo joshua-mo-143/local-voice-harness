@@ -649,6 +649,7 @@ class DurablePromptOperationTests(unittest.TestCase):
                 prompt_operation_phase="classifying",
                 prompt_operation_turn=1,
                 prompt_operation_target="planner",
+                prompt_operation_agent_session="planner-session",
                 prompt_baseline_sequence=7,
             )
         return self.store.create(CursorJob.from_dict(values))
@@ -978,6 +979,7 @@ class DurablePromptOperationTests(unittest.TestCase):
                 prompt_operation_phase="implementing",
                 prompt_operation_turn=4,
                 prompt_operation_target="planner",
+                prompt_operation_agent_session="planner-session",
                 prompt_baseline_sequence=7,
             ),
         )
@@ -1054,6 +1056,7 @@ class DurablePromptOperationTests(unittest.TestCase):
                 prompt_operation_phase="implementing",
                 prompt_operation_turn=4,
                 prompt_operation_target="planner",
+                prompt_operation_agent_session="planner-session",
                 prompt_baseline_sequence=7,
             ),
         )

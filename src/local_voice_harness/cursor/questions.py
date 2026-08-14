@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from typing import Any, Protocol
 
 from ..integrations.linear import LinearError, LinearIntegration
-from ..prompt_operations import PromptIdentity
+from ..prompt_operations import IdlePrompt, PromptIdentity, PromptOperationError
 from ..questions import (
     AnswerResolution,
     Question,
@@ -42,6 +42,35 @@ def shared_prompt_identity(
     job: CursorJob, question: Question, *, turn: int | None = None
 ) -> PromptIdentity:
     """Job-scoped identity fence for the shared clarification prompt operation."""
+    persisted_identity = (
+        question.prompt_turn,
+        question.prompt_target,
+        question.prompt_agent_session,
+    )
+    if all(value is not None for value in persisted_identity):
+        return question_prompt_identity(
+            question,
+            job_id=job.id,
+            turn=question.prompt_turn or 0,
+            target=question.prompt_target or "",
+            agent_session=question.prompt_agent_session or "",
+        )
+    if any(value is not None for value in persisted_identity):
+        raise PromptOperationError("question prompt identity is incomplete")
+    if question.prompt_state is not None and turn is None:
+        operation = job.prompt_operation
+        if (
+            not isinstance(operation, IdlePrompt)
+            and operation.identity.turn_token == question.dispatch_token
+        ):
+            return question_prompt_identity(
+                question,
+                job_id=job.id,
+                turn=operation.identity.turn,
+                target=operation.identity.target,
+                agent_session=operation.identity.agent_session,
+            )
+        raise PromptOperationError("question prompt identity is incomplete")
     target = job.herdr_target or job.session_id or ""
     agent_session = (
         job.agent_provider_session_id or job.session_id or job.herdr_target or ""
