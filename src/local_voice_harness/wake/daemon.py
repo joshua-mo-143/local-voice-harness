@@ -553,6 +553,7 @@ class WakeConversationDaemon:
         self.launched_config_activations: dict[str, subprocess.Popen[bytes]] = {}
         self.config_activation_dispatch_attempts: dict[str, int] = {}
         self.retained_recovery_required = False
+        self.retained_recovery_retry_at = 0.0
         self.uncertain_retained_delivery_ids: set[str] = set()
         self.conversation_deadline = 0.0
         self.awaiting_followup = False
@@ -2494,11 +2495,15 @@ class WakeConversationDaemon:
     def _retry_retained_recovery(self) -> bool:
         if not getattr(self, "retained_recovery_required", False):
             return True
+        now = time.monotonic()
+        if now < getattr(self, "retained_recovery_retry_at", 0.0):
+            return False
         self.retained_recovery_required = False
         try:
             self._recover_retained_utterances()
         except Exception as exc:
             self.retained_recovery_required = True
+            self.retained_recovery_retry_at = now + 1.0
             log(
                 f"in-process retained turn recovery failed: {type(exc).__name__}: {exc}"
             )
@@ -2516,9 +2521,7 @@ class WakeConversationDaemon:
         self.start_microphone()
         speech_streak = 0
         while self.running:
-            if not self._retry_retained_recovery():
-                time.sleep(1.0)
-                continue
+            actions_allowed = self._retry_retained_recovery()
             activation_interruption = self._recover_config_activation()
             if activation_interruption is not None:
                 self.continue_after_barge_in(activation_interruption)
@@ -2539,6 +2542,26 @@ class WakeConversationDaemon:
             self.pre_roll.append(frame)
             if self.conversation_deadline and now >= self.conversation_deadline:
                 self.close_conversation("inactivity")
+                speech_streak = 0
+                continue
+            if not actions_allowed:
+                if self.force_listen.is_set():
+                    self.force_listen.clear()
+                    notify(
+                        "Voice actions are paused while a retained request is "
+                        "reconciled.",
+                        error=True,
+                    )
+                samples = self.np.frombuffer(frame, dtype="<i2")
+                score = float(self.wake_model.predict(samples).get(self.wake_key, 0.0))
+                if score >= self.audio.wake_threshold and now - self.last_wake >= 2.0:
+                    self.last_wake = now
+                    log(f"wake detected while retained recovery is paused: {score:.3f}")
+                    notify(
+                        "Wake detected, but voice actions are paused while a "
+                        "retained request is reconciled.",
+                        error=True,
+                    )
                 speech_streak = 0
                 continue
             if self.force_listen.is_set():

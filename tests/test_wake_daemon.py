@@ -3089,10 +3089,18 @@ class RetainedUtteranceTests(unittest.TestCase):
 
     def test_startup_stays_live_when_retained_recovery_is_unavailable(self) -> None:
         daemon = _bare_daemon()
+        daemon.np = mock.Mock()  # type: ignore[assignment]
+        daemon.wake_key = "wake"
+        daemon.wake_model.predict.return_value = {
+            "wake": daemon.audio.wake_threshold + 0.1
+        }
         daemon.start_microphone = mock.Mock()  # type: ignore[method-assign]
 
-        def stop_after_backoff(_seconds: float) -> None:
+        def read_frame() -> bytes:
             daemon.running = False
+            return b"\x00\x00"
+
+        daemon.read_frame = read_frame  # type: ignore[method-assign]
 
         with (
             mock.patch.object(wake_daemon, "recover_jobs"),
@@ -3101,15 +3109,21 @@ class RetainedUtteranceTests(unittest.TestCase):
                 "recover_retained_transcripts",
                 side_effect=HarnessError("STT unavailable"),
             ),
+            mock.patch.object(daemon, "_recover_config_activation", return_value=None),
             mock.patch.object(
-                wake_daemon.time, "sleep", side_effect=stop_after_backoff
+                wake_daemon,
+                "drain_pending_announcements",
+                return_value=announcement_policy.DrainResult(),
             ),
+            mock.patch.object(daemon, "record_utterance_safely") as record,
             mock.patch.object(wake_daemon, "notify") as notify,
             mock.patch.object(wake_daemon, "log"),
         ):
             daemon.run()
 
         daemon.start_microphone.assert_called_once_with()
+        daemon.wake_model.predict.assert_called_once()
+        record.assert_not_called()
         self.assertTrue(daemon.retained_recovery_required)
         self.assertGreaterEqual(notify.call_count, 1)
 
