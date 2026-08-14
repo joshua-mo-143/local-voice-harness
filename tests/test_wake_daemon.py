@@ -3003,6 +3003,43 @@ class RetainedUtteranceTests(unittest.TestCase):
             error=True,
         )
 
+    def test_recovery_batch_stops_when_first_delivery_requires_reconciliation(
+        self,
+    ) -> None:
+        daemon = _bare_daemon()
+        first = wake_daemon.RetainedTranscript("a" * 32, "first turn", True)
+        second = wake_daemon.RetainedTranscript("b" * 32, "second turn", True)
+
+        def process(
+            _audio_path: Path | None,
+            *,
+            woke: bool,
+            retained: wake_daemon.RetainedTranscript,
+        ) -> None:
+            del woke, retained
+            daemon.retained_recovery_required = True
+
+        with (
+            mock.patch.object(
+                wake_daemon,
+                "recover_retained_transcripts",
+                return_value=(first, second),
+            ),
+            mock.patch.object(
+                daemon, "process_utterance", side_effect=process
+            ) as process_utterance,
+            mock.patch.object(wake_daemon, "log") as log,
+        ):
+            daemon._recover_retained_utterances()
+
+        process_utterance.assert_called_once_with(None, woke=True, retained=first)
+        self.assertTrue(
+            any(
+                "paused before later deliveries" in call.args[0]
+                for call in log.call_args_list
+            )
+        )
+
 
 class InboxIntentRoutingTests(unittest.TestCase):
     def test_list_intent_routes_to_inbox(self) -> None:

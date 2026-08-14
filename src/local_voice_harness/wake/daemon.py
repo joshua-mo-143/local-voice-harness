@@ -2458,6 +2458,12 @@ class WakeConversationDaemon:
                 woke=delivery.woke,
                 retained=delivery,
             )
+            if getattr(self, "retained_recovery_required", False):
+                log(
+                    "retained voice recovery paused before later deliveries "
+                    "until reconciliation succeeds"
+                )
+                break
 
     def _retry_retained_recovery(self) -> bool:
         if not getattr(self, "retained_recovery_required", False):
