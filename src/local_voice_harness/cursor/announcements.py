@@ -10,6 +10,7 @@ from datetime import time as dt_time
 from enum import StrEnum
 from zoneinfo import ZoneInfo
 
+from ..notifications import NotificationResult
 from ..notifications import notify as desktop_notify
 from ..responses import AssistantResponse
 from ..user_config import AnnouncementMode, AnnouncementSettings
@@ -21,6 +22,7 @@ from .delivery import (
     acknowledge_desktop_delivery,
     announcement_drain_lock,
     pending_deliveries,
+    release_delivery,
     suppressed_jobs,
 )
 from .model import (
@@ -60,6 +62,7 @@ ACTION_REQUIRED_KINDS = frozenset(
 class DrainResult:
     speak: tuple[DeliveryClaim, ...] = ()
     desktop: tuple[DeliveryClaim, ...] = ()
+    desktop_failed: tuple[DeliveryClaim, ...] = ()
     deferred: tuple[DeliveryClaim, ...] = ()
 
 
@@ -220,14 +223,21 @@ def _apply_desktop(
     claim: DeliveryClaim,
     *,
     render_job: Callable[[CursorJob], AssistantResponse],
-    notify: Callable[..., None],
+    notify: Callable[..., NotificationResult],
     now: float,
-) -> bool:
+) -> bool | None:
     rendered = render_job(claim.job)
-    notify(
-        rendered.display_text,
-        error=classify(claim.job) == AnnouncementKind.FAILURE,
-    )
+    try:
+        result = notify(
+            rendered.display_text,
+            error=classify(claim.job) == AnnouncementKind.FAILURE,
+        )
+    except Exception:  # noqa: BLE001 - backend failures follow durable retry policy
+        release_delivery(store, claim.job.id, claim.token, now=now)
+        return False
+    if result != NotificationResult.SUCCEEDED:
+        release_delivery(store, claim.job.id, claim.token, now=now)
+        return False
     return acknowledge_desktop_delivery(store, claim.job.id, claim.token, now=now)
 
 
@@ -240,7 +250,7 @@ def drain_background_announcements(
     settings: AnnouncementSettings,
     *,
     now: float | None = None,
-    notify: Callable[..., None] = desktop_notify,
+    notify: Callable[..., NotificationResult] = desktop_notify,
     render_job: Callable[[CursorJob], AssistantResponse] | None = None,
 ) -> DrainResult:
     """Claim due announcements under one drain lock and apply non-spoken policy."""
@@ -260,25 +270,30 @@ def drain_background_announcements(
         )
         speak: list[DeliveryClaim] = []
         desktop: list[DeliveryClaim] = []
+        desktop_failed: list[DeliveryClaim] = []
         deferred: list[DeliveryClaim] = []
         for claim in claims:
             chosen = disposition(settings, classify(claim.job), now=now)
             if chosen == AnnouncementDisposition.SPEAK:
                 speak.append(claim)
             elif chosen == AnnouncementDisposition.DESKTOP:
-                if _apply_desktop(
+                applied = _apply_desktop(
                     store,
                     claim,
                     render_job=renderer,
                     notify=notify,
                     now=applied_at,
-                ):
+                )
+                if applied:
                     desktop.append(claim)
+                elif applied is False:
+                    desktop_failed.append(claim)
             elif _apply_deferred(store, claim, now=applied_at):
                 deferred.append(claim)
         return DrainResult(
             speak=tuple(speak),
             desktop=tuple(desktop),
+            desktop_failed=tuple(desktop_failed),
             deferred=tuple(deferred),
         )
 

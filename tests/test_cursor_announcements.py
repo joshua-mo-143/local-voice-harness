@@ -26,6 +26,7 @@ from local_voice_harness.cursor.delivery import (
 )
 from local_voice_harness.cursor.model import AnnouncementAck, CursorJob, JobStatus
 from local_voice_harness.cursor.store import JobStore
+from local_voice_harness.notifications import NotificationResult
 from local_voice_harness.responses import AssistantResponse
 from local_voice_harness.user_config import AnnouncementMode, AnnouncementSettings
 
@@ -193,7 +194,7 @@ class AnnouncementDrainTests(unittest.TestCase):
 
     def test_desktop_only_records_desktop_ack_not_spoken(self) -> None:
         self._create(_job("aaaaaaaaaaaa", "completed", completed_at=1))
-        notify = mock.Mock()
+        notify = mock.Mock(return_value=NotificationResult.SUCCEEDED)
         result = drain_background_announcements(
             self.store,
             _settings(AnnouncementMode.DESKTOP_ONLY),
@@ -212,6 +213,66 @@ class AnnouncementDrainTests(unittest.TestCase):
         job = self.store.get("aaaaaaaaaaaa")
         self.assertFalse(job.delivered)
         self.assertEqual(job.announcement_ack, AnnouncementAck.DESKTOP.value)
+
+    def test_failed_desktop_notification_retries_without_changing_durable_ack(
+        self,
+    ) -> None:
+        self._create(_job("aaaaaaaaaaaa", "completed", completed_at=1))
+        notify = mock.Mock(
+            side_effect=[
+                NotificationResult.FAILED,
+                NotificationResult.SUCCEEDED,
+            ]
+        )
+
+        failed = drain_background_announcements(
+            self.store,
+            _settings(AnnouncementMode.DESKTOP_ONLY),
+            now=100,
+            notify=notify,
+            render_job=lambda job: AssistantResponse.from_text(job.id),
+        )
+        persisted = JobStore(self.store.durable_dir, self.store.legacy_dir)
+        pending = persisted.get("aaaaaaaaaaaa")
+        self.assertEqual(failed.desktop, ())
+        self.assertEqual(
+            [claim.job.id for claim in failed.desktop_failed], [pending.id]
+        )
+        self.assertEqual(pending.announcement_ack, AnnouncementAck.PENDING.value)
+        self.assertFalse(pending.delivered)
+        self.assertIsNone(pending.delivery_claim_token)
+
+        too_soon = drain_background_announcements(
+            persisted,
+            _settings(AnnouncementMode.DESKTOP_ONLY),
+            now=104,
+            notify=notify,
+            render_job=lambda job: AssistantResponse.from_text(job.id),
+        )
+        self.assertEqual(too_soon.desktop, ())
+        self.assertEqual(notify.call_count, 1)
+
+        succeeded = drain_background_announcements(
+            persisted,
+            _settings(AnnouncementMode.DESKTOP_ONLY),
+            now=105,
+            notify=notify,
+            render_job=lambda job: AssistantResponse.from_text(job.id),
+        )
+        self.assertEqual(len(succeeded.desktop), 1)
+        acknowledged = persisted.get("aaaaaaaaaaaa")
+        self.assertEqual(acknowledged.announcement_ack, AnnouncementAck.DESKTOP.value)
+        self.assertFalse(acknowledged.delivered)
+
+        repeated = drain_background_announcements(
+            persisted,
+            _settings(AnnouncementMode.DESKTOP_ONLY),
+            now=110,
+            notify=notify,
+            render_job=lambda job: AssistantResponse.from_text(job.id),
+        )
+        self.assertEqual(repeated.desktop, ())
+        self.assertEqual(notify.call_count, 2)
 
     def test_action_required_speaks_questions_and_defers_completions(self) -> None:
         self._create(
