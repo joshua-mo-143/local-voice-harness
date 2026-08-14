@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import math
 import os
 import re
 import socket
@@ -789,6 +790,9 @@ def _load_retained_delivery(path: Path) -> dict[str, object]:
         or not isinstance(value.get("text"), str)
         or not isinstance(value.get("woke"), bool)
         or value.get("state") not in {"pending", "ambiguous"}
+        or isinstance(value.get("created_at"), bool)
+        or not isinstance(value.get("created_at"), (int, float))
+        or not math.isfinite(float(value["created_at"]))
     ):
         raise OSError("retained delivery metadata is invalid")
     return value
@@ -831,6 +835,12 @@ def _recover_retained_deliveries() -> list[dict[str, object]]:
                 log(
                     f"retained STT delivery requires manual recovery at {delivery}: {exc}"
                 )
+    recovered.sort(
+        key=lambda delivery: (
+            float(delivery["created_at"]),
+            str(delivery["delivery_id"]),
+        )
+    )
     return recovered
 
 

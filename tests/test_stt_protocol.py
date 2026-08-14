@@ -833,6 +833,52 @@ class SpeechToTextProtocolTests(unittest.TestCase):
                 )
             )
 
+    def test_retained_deliveries_recover_in_creation_order(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            paths = server.recorder.RecorderPaths(
+                root,
+                root / "request.wav",
+                root / "recording.pid",
+                root / "recording.log",
+            )
+            retained_root = root / server.RETAINED_DIRECTORY
+            retained_root.mkdir(mode=0o700)
+            deliveries = (
+                ("0" * 32, "later", 2.0),
+                ("f" * 32, "earlier", 1.0),
+            )
+            for delivery_id, text, created_at in deliveries:
+                delivery = retained_root / delivery_id
+                delivery.mkdir(mode=0o700)
+                metadata = delivery / server.RETAINED_METADATA
+                metadata.write_text(
+                    json.dumps(
+                        {
+                            "version": server.PROTOCOL_VERSION,
+                            "delivery_id": delivery_id,
+                            "text": text,
+                            "woke": True,
+                            "state": "pending",
+                            "created_at": created_at,
+                        }
+                    )
+                )
+                metadata.chmod(0o600)
+                audio = delivery / server.RETAINED_AUDIO
+                audio.write_bytes(b"RIFF-retained" + b"\0" * 64)
+                audio.chmod(0o600)
+
+            with mock.patch.object(
+                server, "_recorder_path_sets", return_value=(paths,)
+            ):
+                recovered = server._recover_retained_deliveries()
+
+        self.assertEqual(
+            [delivery["text"] for delivery in recovered],
+            ["earlier", "later"],
+        )
+
     def test_main_recovers_before_loading_model(self) -> None:
         order: list[str] = []
         settings = server.STTRuntimeSettings(
