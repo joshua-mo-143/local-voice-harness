@@ -4,6 +4,7 @@ import collections
 import contextlib
 import io
 import json
+import math
 import os
 import tempfile
 import threading
@@ -170,6 +171,7 @@ def _bare_daemon() -> WakeConversationDaemon:
     instance.config_activation_dispatch_attempts = {}
     instance.conversation_deadline = 0.0
     instance.awaiting_followup = False
+    instance.last_ordinary_reply = None
     instance.last_wake = 0.0
     instance.force_listen = threading.Event()
     instance.running = True
@@ -616,6 +618,493 @@ class ProcessUtteranceTests(unittest.TestCase):
         self.assertFalse(daemon.awaiting_followup)
         self.assertEqual(daemon.conversation_deadline, 0.0)
         self.assertEqual(daemon.history, [])
+
+    def test_stop_talking_keeps_conversation_open_and_skips_tools(self) -> None:
+        for phrase in ("stop talking", "shut up"):
+            with self.subTest(phrase=phrase):
+                daemon = _bare_daemon()
+                daemon.awaiting_followup = True
+                deadline = time.monotonic() + 30
+                daemon.conversation_deadline = deadline
+                daemon.history = [{"role": "user", "content": "earlier"}]
+                daemon.playback_queue.enqueue(PlaybackRequest(text="still talking"))
+                with (
+                    mock.patch.object(wake_daemon, "transcribe", return_value=phrase),
+                    mock.patch.object(wake_daemon, "start_components") as start,
+                    mock.patch.object(wake_daemon, "stop_components") as stop,
+                    mock.patch.object(wake_daemon, "qwen_turn") as qwen_turn,
+                    mock.patch.object(wake_daemon, "cursor_turn") as cursor_turn,
+                    mock.patch.object(daemon, "close_conversation") as close,
+                    mock.patch.object(
+                        wake_daemon,
+                        "route_intent",
+                        return_value=IntentRoute(Intent.CONVERSATION, "high"),
+                    ) as route_intent,
+                    mock.patch.object(wake_daemon, "notify") as notify,
+                ):
+                    result = daemon.process_utterance(AUDIO_GENERATION, woke=False)
+
+                self.assertIsNone(result)
+                qwen_turn.assert_not_called()
+                cursor_turn.assert_not_called()
+                route_intent.assert_not_called()
+                start.assert_not_called()
+                stop.assert_not_called()
+                close.assert_not_called()
+                self.assertTrue(daemon.awaiting_followup)
+                self.assertGreater(daemon.conversation_deadline, time.monotonic())
+                self.assertEqual(
+                    daemon.history, [{"role": "user", "content": "earlier"}]
+                )
+                self.assertEqual(len(daemon.playback_queue), 0)
+                notify.assert_called_with("Listening for a follow-up…")
+
+    def test_hang_up_phrases_still_close_after_stop_talking(self) -> None:
+        for phrase in ("goodbye", "stop listening", "go to sleep", "end conversation"):
+            with self.subTest(phrase=phrase):
+                daemon = _bare_daemon()
+                daemon.awaiting_followup = True
+                daemon.conversation_deadline = time.monotonic() + 30
+                daemon.history = [{"role": "user", "content": "earlier"}]
+                with (
+                    mock.patch.object(wake_daemon, "transcribe", return_value=phrase),
+                    mock.patch.object(wake_daemon, "start_components"),
+                    mock.patch.object(wake_daemon, "stop_components"),
+                    mock.patch.object(wake_daemon, "qwen_turn") as qwen_turn,
+                    mock.patch.object(wake_daemon, "cursor_turn") as cursor_turn,
+                    mock.patch.object(wake_daemon, "notify"),
+                ):
+                    result = daemon.process_utterance(AUDIO_GENERATION, woke=False)
+
+                self.assertIsNone(result)
+                qwen_turn.assert_not_called()
+                cursor_turn.assert_not_called()
+                self.assertFalse(daemon.awaiting_followup)
+                self.assertEqual(daemon.conversation_deadline, 0.0)
+                self.assertEqual(daemon.history, [])
+
+    def test_stop_talking_does_not_match_close_pattern(self) -> None:
+        for phrase in ("stop talking", "shut up"):
+            with self.subTest(phrase=phrase):
+                self.assertIsNone(wake_daemon.CLOSE_PATTERN.search(phrase))
+                self.assertIsNotNone(wake_daemon.STOP_TALKING_PATTERN.search(phrase))
+        for phrase in ("goodbye", "stop listening", "go to sleep", "end conversation"):
+            with self.subTest(phrase=phrase):
+                self.assertIsNotNone(wake_daemon.CLOSE_PATTERN.search(phrase))
+                self.assertIsNone(wake_daemon.STOP_TALKING_PATTERN.search(phrase))
+
+    def test_stop_talking_clears_expired_target_resolution(self) -> None:
+        daemon = _bare_daemon()
+        daemon.pending_target_resolution = wake_daemon.PendingTargetResolution(
+            "work on issue 384",
+            IntentRoute(Intent.AGENT_SUBMIT, "high"),
+            created_at=time.monotonic() - wake_daemon.CONVERSATION_TIMEOUT_SECONDS - 1,
+        )
+        with (
+            mock.patch.object(wake_daemon, "transcribe", return_value="stop talking"),
+            mock.patch.object(wake_daemon, "start_components"),
+            mock.patch.object(wake_daemon, "notify"),
+        ):
+            daemon.process_utterance(AUDIO_GENERATION, woke=False)
+
+        self.assertIsNone(daemon.pending_target_resolution)
+        self.assertTrue(daemon.awaiting_followup)
+
+    def test_ordinary_repeat_replays_conversation_reply(self) -> None:
+        daemon = _bare_daemon()
+        reply = AssistantResponse.from_text("It is noon.")
+        with (
+            mock.patch.object(
+                wake_daemon, "transcribe", return_value="what time is it"
+            ),
+            mock.patch.object(wake_daemon, "start_components"),
+            mock.patch.object(
+                wake_daemon, "qwen_turn", return_value=(reply, None)
+            ) as qwen_turn,
+            mock.patch.object(wake_daemon, "cursor_turn") as cursor_turn,
+            mock.patch.object(
+                daemon,
+                "play_response",
+                return_value=({"played_text": reply.spoken_text}, None),
+            ) as play,
+            mock.patch.object(
+                wake_daemon,
+                "route_intent",
+                return_value=IntentRoute(Intent.CONVERSATION, "high"),
+            ),
+            mock.patch.object(daemon, "_pending_cursor_question", return_value=None),
+            mock.patch.object(daemon, "_has_announceable_jobs", return_value=False),
+            mock.patch.object(wake_daemon, "notify"),
+        ):
+            daemon.process_utterance(AUDIO_GENERATION, woke=False)
+
+        self.assertEqual(daemon.last_ordinary_reply, reply.spoken_text)
+        qwen_turn.assert_called_once()
+        cursor_turn.assert_not_called()
+
+        qwen_turn.reset_mock()
+        play.reset_mock()
+        with (
+            mock.patch.object(wake_daemon, "transcribe", return_value="say that again"),
+            mock.patch.object(wake_daemon, "start_components"),
+            mock.patch.object(wake_daemon, "qwen_turn") as qwen_repeat,
+            mock.patch.object(wake_daemon, "cursor_turn") as cursor_repeat,
+            mock.patch.object(
+                daemon,
+                "play_response",
+                return_value=({"played_text": reply.spoken_text}, None),
+            ) as replay,
+            mock.patch.object(daemon, "_pending_cursor_question", return_value=None),
+            mock.patch.object(daemon, "_has_announceable_jobs", return_value=False),
+            mock.patch.object(wake_daemon, "notify"),
+        ):
+            daemon.process_utterance(AUDIO_GENERATION, woke=False)
+
+        qwen_repeat.assert_not_called()
+        cursor_repeat.assert_not_called()
+        replay.assert_called_once_with(reply)
+        self.assertTrue(daemon.awaiting_followup)
+        self.assertEqual(daemon.last_ordinary_reply, reply.spoken_text)
+
+    def test_ordinary_repeat_without_slot_says_so(self) -> None:
+        daemon = _bare_daemon()
+        with (
+            mock.patch.object(wake_daemon, "transcribe", return_value="repeat that"),
+            mock.patch.object(wake_daemon, "start_components"),
+            mock.patch.object(wake_daemon, "qwen_turn") as qwen_turn,
+            mock.patch.object(wake_daemon, "cursor_turn") as cursor_turn,
+            mock.patch.object(
+                daemon,
+                "play_response",
+                return_value=({"played_text": "I don't have a reply to repeat."}, None),
+            ) as play,
+            mock.patch.object(daemon, "_pending_cursor_question", return_value=None),
+            mock.patch.object(daemon, "_has_announceable_jobs", return_value=False),
+            mock.patch.object(wake_daemon, "notify"),
+        ):
+            daemon.process_utterance(AUDIO_GENERATION, woke=False)
+
+        qwen_turn.assert_not_called()
+        cursor_turn.assert_not_called()
+        play.assert_called_once_with(
+            AssistantResponse.from_text("I don't have a reply to repeat.")
+        )
+        self.assertIsNone(daemon.last_ordinary_reply)
+        self.assertTrue(daemon.awaiting_followup)
+
+    def test_pending_question_repeat_still_wins(self) -> None:
+        daemon = _bare_daemon()
+        daemon.last_ordinary_reply = "It is noon."
+        daemon.cursor_session = "oldjob123456"
+        with (
+            mock.patch.object(wake_daemon, "transcribe", return_value="repeat that"),
+            mock.patch.object(wake_daemon, "start_components"),
+            mock.patch.object(
+                wake_daemon,
+                "request_context",
+                return_value=RequestContext("repeat that"),
+            ),
+            mock.patch.object(
+                wake_daemon,
+                "route_intent",
+                return_value=IntentRoute(Intent.AGENT_REPEAT, "high"),
+            ),
+            mock.patch.object(
+                daemon,
+                "_pending_cursor_question",
+                return_value=_pending_choice_snapshot(),
+            ),
+            mock.patch.object(daemon, "_has_announceable_jobs", return_value=False),
+            mock.patch.object(
+                wake_daemon, "cursor_turn", return_value=("Which database?", None)
+            ) as cursor_turn,
+            mock.patch.object(wake_daemon, "qwen_turn") as qwen_turn,
+            mock.patch.object(
+                daemon,
+                "play_response",
+                return_value=({"played_text": "Which database?"}, None),
+            ),
+            mock.patch.object(wake_daemon, "notify"),
+        ):
+            daemon.process_utterance(AUDIO_GENERATION, woke=False)
+
+        cursor_turn.assert_called_once()
+        request = cursor_turn.call_args.args[0]
+        self.assertEqual(request.action, "reply")
+        self.assertEqual(request.job_id, "oldjob123456")
+        qwen_turn.assert_not_called()
+        self.assertEqual(daemon.last_ordinary_reply, "It is noon.")
+
+    def test_ordinary_repeat_does_not_steal_config_confirmation(self) -> None:
+        daemon = _bare_daemon()
+        daemon.last_ordinary_reply = "It is noon."
+        pending = _pending_config()
+        daemon.pending_config_change = pending
+        with (
+            mock.patch.object(wake_daemon, "transcribe", return_value="repeat that"),
+            mock.patch.object(wake_daemon, "start_components"),
+            mock.patch.object(
+                wake_daemon,
+                "request_context",
+                return_value=RequestContext("repeat that"),
+            ),
+            mock.patch.object(
+                wake_daemon,
+                "route_intent",
+                return_value=IntentRoute(Intent.AGENT_REPEAT, "high"),
+            ),
+            mock.patch.object(daemon, "_pending_cursor_question", return_value=None),
+            mock.patch.object(daemon, "_has_announceable_jobs", return_value=False),
+            mock.patch.object(wake_daemon, "cursor_turn") as cursor_turn,
+            mock.patch.object(wake_daemon, "qwen_turn") as qwen_turn,
+            mock.patch.object(
+                daemon,
+                "play_response",
+                return_value=({"played_text": "Please say yes"}, None),
+            ) as play,
+            mock.patch.object(wake_daemon, "notify"),
+        ):
+            daemon.process_utterance(AUDIO_GENERATION, woke=False)
+
+        cursor_turn.assert_not_called()
+        qwen_turn.assert_not_called()
+        self.assertIs(daemon.pending_config_change, pending)
+        self.assertEqual(daemon.last_ordinary_reply, "It is noon.")
+        played = play.call_args.args[0]
+        self.assertIn("say yes to confirm", played.spoken_text)
+        self.assertNotEqual(played.spoken_text, "It is noon.")
+
+    def test_ordinary_repeat_does_not_steal_target_readback(self) -> None:
+        daemon = _bare_daemon()
+        daemon.last_ordinary_reply = "It is noon."
+        target = wake_daemon.CriticalTarget(
+            "github", "example/payments", "42", "submit"
+        )
+        candidate = wake_daemon.new_candidate(
+            wake_daemon.TargetSelection(target, (None,) * 5),
+            origin_turn="readback-turn",
+        )
+        daemon.pending_target_readback = wake_daemon.PendingTargetReadback(
+            candidate,
+            wake_daemon._critical_target_request(target),
+        )
+        expected = wake_daemon.readback_response(candidate)
+        with (
+            mock.patch.object(wake_daemon, "transcribe", return_value="say that again"),
+            mock.patch.object(wake_daemon, "start_components"),
+            mock.patch.object(
+                wake_daemon,
+                "request_context",
+                return_value=RequestContext("say that again"),
+            ),
+            mock.patch.object(daemon, "_pending_cursor_question", return_value=None),
+            mock.patch.object(daemon, "_has_announceable_jobs", return_value=False),
+            mock.patch.object(wake_daemon, "cursor_turn") as cursor_turn,
+            mock.patch.object(wake_daemon, "qwen_turn") as qwen_turn,
+            mock.patch.object(
+                daemon,
+                "play_response",
+                return_value=({"played_text": expected.spoken_text}, None),
+            ) as play,
+            mock.patch.object(wake_daemon, "notify"),
+        ):
+            daemon.process_utterance(AUDIO_GENERATION, woke=False)
+
+        cursor_turn.assert_not_called()
+        qwen_turn.assert_not_called()
+        self.assertIsNotNone(daemon.pending_target_readback)
+        self.assertEqual(daemon.last_ordinary_reply, "It is noon.")
+        play.assert_called_once_with(expected)
+
+    def test_hang_up_clears_ordinary_reply_slot(self) -> None:
+        daemon = _bare_daemon()
+        daemon.last_ordinary_reply = "It is noon."
+        daemon.awaiting_followup = True
+        daemon.conversation_deadline = time.monotonic() + 30
+        with (
+            mock.patch.object(wake_daemon, "transcribe", return_value="goodbye"),
+            mock.patch.object(wake_daemon, "start_components"),
+            mock.patch.object(wake_daemon, "stop_components"),
+            mock.patch.object(wake_daemon, "notify"),
+        ):
+            daemon.process_utterance(AUDIO_GENERATION, woke=False)
+
+        self.assertIsNone(daemon.last_ordinary_reply)
+        self.assertFalse(daemon.awaiting_followup)
+
+    def test_repeat_the_issue_is_not_ordinary_replay(self) -> None:
+        daemon = _bare_daemon()
+        daemon.last_ordinary_reply = "It is noon."
+        with (
+            mock.patch.object(
+                wake_daemon, "transcribe", return_value="repeat the payments issue"
+            ),
+            mock.patch.object(wake_daemon, "start_components"),
+            mock.patch.object(
+                wake_daemon,
+                "request_context",
+                return_value=RequestContext("repeat the payments issue"),
+            ),
+            mock.patch.object(
+                wake_daemon,
+                "route_intent",
+                return_value=IntentRoute(Intent.AGENT_REPEAT, "high"),
+            ),
+            mock.patch.object(daemon, "_pending_cursor_question", return_value=None),
+            mock.patch.object(daemon, "_has_announceable_jobs", return_value=False),
+            mock.patch.object(
+                wake_daemon,
+                "cursor_turn",
+                return_value=("Cursor finished payments.", None),
+            ) as cursor_turn,
+            mock.patch.object(wake_daemon, "qwen_turn") as qwen_turn,
+            mock.patch.object(
+                daemon,
+                "play_response",
+                return_value=({"played_text": "Cursor finished payments."}, None),
+            ),
+            mock.patch.object(wake_daemon, "notify"),
+        ):
+            daemon.process_utterance(AUDIO_GENERATION, woke=False)
+
+        cursor_turn.assert_called_once()
+        request = cursor_turn.call_args.args[0]
+        self.assertEqual(request.action, "repeat")
+        self.assertEqual(request.reference, "repeat the payments issue")
+        qwen_turn.assert_not_called()
+        self.assertEqual(daemon.last_ordinary_reply, "It is noon.")
+
+    def test_announceable_job_repeat_still_wins(self) -> None:
+        daemon = _bare_daemon()
+        daemon.last_ordinary_reply = "It is noon."
+        with (
+            mock.patch.object(wake_daemon, "transcribe", return_value="repeat that"),
+            mock.patch.object(wake_daemon, "start_components"),
+            mock.patch.object(
+                wake_daemon,
+                "request_context",
+                return_value=RequestContext("repeat that"),
+            ),
+            mock.patch.object(
+                wake_daemon,
+                "route_intent",
+                return_value=IntentRoute(Intent.AGENT_REPEAT, "high"),
+            ),
+            mock.patch.object(daemon, "_pending_cursor_question", return_value=None),
+            mock.patch.object(daemon, "_has_announceable_jobs", return_value=True),
+            mock.patch.object(
+                wake_daemon,
+                "cursor_turn",
+                return_value=("Cursor finished payments.", None),
+            ) as cursor_turn,
+            mock.patch.object(wake_daemon, "qwen_turn") as qwen_turn,
+            mock.patch.object(
+                daemon,
+                "play_response",
+                return_value=({"played_text": "Cursor finished payments."}, None),
+            ),
+            mock.patch.object(wake_daemon, "notify"),
+        ):
+            daemon.process_utterance(AUDIO_GENERATION, woke=False)
+
+        cursor_turn.assert_called_once()
+        self.assertEqual(cursor_turn.call_args.args[0].action, "repeat")
+        qwen_turn.assert_not_called()
+        self.assertEqual(daemon.last_ordinary_reply, "It is noon.")
+
+    def test_delivered_historical_jobs_do_not_own_generic_repeat(self) -> None:
+        daemon = _bare_daemon()
+        delivered = mock.Mock(status=JobStatus.COMPLETED, delivered=True)
+        with mock.patch.object(
+            wake_daemon.CURSOR_STORE, "list", return_value=[delivered]
+        ):
+            self.assertFalse(daemon._has_announceable_jobs())
+
+        undelivered = mock.Mock(status=JobStatus.COMPLETED, delivered=False)
+        with mock.patch.object(
+            wake_daemon.CURSOR_STORE, "list", return_value=[undelivered]
+        ):
+            self.assertTrue(daemon._has_announceable_jobs())
+
+        daemon.completed_followup = wake_daemon.CompletedFollowup(
+            job_id="abc123456789",
+            parent_revision=1,
+            completed_at=1.0,
+            expires_at=time.monotonic() + 30,
+            display_fingerprint="fp",
+        )
+        with mock.patch.object(wake_daemon.CURSOR_STORE, "list", return_value=[]):
+            self.assertTrue(daemon._has_announceable_jobs())
+
+    def test_self_health_and_consultation_set_ordinary_reply_slot(self) -> None:
+        daemon = _bare_daemon()
+        health = AssistantResponse.from_text("The voice harness looks healthy.")
+        with (
+            mock.patch.object(
+                wake_daemon, "transcribe", return_value="Is the voice harness healthy?"
+            ),
+            mock.patch.object(wake_daemon, "start_components"),
+            mock.patch.object(
+                wake_daemon,
+                "route_intent",
+                return_value=IntentRoute(Intent.SELF_HEALTH, "high"),
+            ),
+            mock.patch.object(wake_daemon, "self_health_response", return_value=health),
+            mock.patch.object(
+                daemon,
+                "play_response",
+                return_value=({"played_text": health.spoken_text}, None),
+            ),
+            mock.patch.object(wake_daemon, "notify"),
+        ):
+            daemon.process_utterance(AUDIO_GENERATION, woke=False)
+
+        self.assertEqual(daemon.last_ordinary_reply, health.spoken_text)
+
+        consultation = "SQLite is simpler for a local tool."
+        daemon.cursor_session = "oldjob123456"
+        with (
+            mock.patch.object(
+                wake_daemon,
+                "transcribe",
+                return_value="which option would you recommend",
+            ),
+            mock.patch.object(wake_daemon, "start_components"),
+            mock.patch.object(
+                wake_daemon,
+                "request_context",
+                return_value=RequestContext("which option would you recommend"),
+            ),
+            mock.patch.object(
+                daemon,
+                "_pending_cursor_question",
+                return_value=_pending_choice_snapshot(),
+            ),
+            mock.patch.object(
+                wake_daemon,
+                "route_intent",
+                return_value=IntentRoute(Intent.QUESTION_CONSULTATION, "high"),
+            ),
+            mock.patch.object(
+                wake_daemon.cursor_consultation,
+                "pending_question_snapshot",
+                return_value=mock.Mock(),
+            ),
+            mock.patch.object(
+                wake_daemon.cursor_consultation,
+                "consult_pending_question",
+                return_value=consultation,
+            ),
+            mock.patch.object(
+                daemon,
+                "play_response",
+                return_value=({"played_text": consultation}, None),
+            ),
+            mock.patch.object(wake_daemon, "notify"),
+        ):
+            daemon.process_utterance(AUDIO_GENERATION, woke=False)
+
+        self.assertEqual(daemon.last_ordinary_reply, consultation)
 
     def test_end_conversation_barge_in_keeps_conversation_open(self) -> None:
         daemon = _bare_daemon()
@@ -3864,6 +4353,37 @@ class ConfigChangeConversationTests(unittest.TestCase):
         response = calls["play"].call_args.args[0]
         self.assertIn("Say activate now", response.spoken_text)
 
+    def test_ordinary_repeat_does_not_steal_activation_offer(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            daemon = _bare_daemon()
+            daemon.last_ordinary_reply = "It is noon."
+            store = wake_daemon.ActivationStore(Path(temporary) / "activation.json")
+            daemon.config_activation_store = store
+            pending = _pending_config()
+            result = ConfigChangeResult(
+                config=replace(
+                    daemon.user_config,
+                    audio=replace(daemon.user_config.audio, voice="new_voice"),
+                ),
+                changed_keys=("audio.voice",),
+                restart_services=("voice-harness-wake.service",),
+            )
+            offer = store.create_offer(pending, result)
+            assert offer is not None
+            store.mark_offer_delivered(offer.id)
+
+            calls = self._run_turn(daemon, "repeat that")
+            current = store.current()
+
+        assert current is not None
+        self.assertEqual(current.status, wake_daemon.ActivationStatus.OFFERED)
+        self.assertEqual(daemon.last_ordinary_reply, "It is noon.")
+        calls["cursor"].assert_not_called()
+        calls["qwen"].assert_not_called()
+        response = calls["play"].call_args.args[0]
+        self.assertIn("activate now", response.spoken_text)
+        self.assertNotEqual(response.spoken_text, "It is noon.")
+
     def test_pre_restart_delivery_precedes_isolated_worker_launch(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             daemon = _bare_daemon()
@@ -5392,8 +5912,8 @@ class WakeRecordingHandoffTests(unittest.TestCase):
         daemon = _bare_daemon()
         daemon.is_speech = lambda _frame: False  # type: ignore[method-assign]
         daemon.read_frame = mock.Mock(return_value=b"quiet")  # type: ignore[method-assign]
-        expected_frames = (
-            int(wake_daemon.MAX_UTTERANCE_SECONDS * 1000 / wake_daemon.FRAME_MS) + 1
+        expected_frames = math.ceil(
+            wake_daemon.MAX_UTTERANCE_SECONDS * 1000 / wake_daemon.FRAME_MS
         )
 
         with mock.patch.object(
@@ -5404,6 +5924,28 @@ class WakeRecordingHandoffTests(unittest.TestCase):
             daemon.record_utterance([b"pre-roll"] * wake_daemon.PRE_ROLL_FRAMES)
 
         self.assertEqual(daemon.read_frame.call_count, expected_frames)
+
+    def test_utterance_cap_is_120_seconds_and_silence_still_ends_early(self) -> None:
+        self.assertEqual(wake_daemon.MAX_UTTERANCE_SECONDS, 120)
+        daemon = _bare_daemon()
+        silence_frames = int(wake_daemon.END_SILENCE_MS / wake_daemon.FRAME_MS)
+        frames = [b"speech", *[b"quiet"] * silence_frames]
+        daemon.read_frame = mock.Mock(side_effect=frames)  # type: ignore[method-assign]
+        daemon.is_speech = lambda frame: frame == b"speech"  # type: ignore[method-assign]
+        cap_frames = int(
+            wake_daemon.MAX_UTTERANCE_SECONDS * 1000 / wake_daemon.FRAME_MS
+        )
+
+        with mock.patch.object(
+            wake_daemon.recorder,
+            "write_audio_generation",
+            side_effect=_run_audio_writer,
+        ):
+            result = daemon.record_utterance([b"speech"])
+
+        self.assertEqual(result, AUDIO_GENERATION)
+        self.assertEqual(daemon.read_frame.call_count, len(frames))
+        self.assertLess(daemon.read_frame.call_count, cap_frames)
 
     def test_competing_recorder_waits_until_wake_generation_is_durable(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
