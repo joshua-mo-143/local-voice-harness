@@ -402,6 +402,31 @@ def _named_schema_statements() -> tuple[str, ...]:
     return tuple(statements)
 
 
+def _required_named_columns(table: str, fields: tuple[str, ...]) -> tuple[str, ...]:
+    if table == "job_identity":
+        return ("job_id", "lifecycle_kind", *fields)
+    return ("job_id", *fields)
+
+
+def _missing_named_columns(
+    connection: sqlite3.Connection,
+) -> dict[str, tuple[str, ...]]:
+    missing: dict[str, tuple[str, ...]] = {}
+    for table, fields in _NAMED_TABLE_FIELDS.items():
+        present = {
+            str(row["name"])
+            for row in connection.execute(f'PRAGMA table_info("{table}")')
+        }
+        absent = tuple(
+            column
+            for column in _required_named_columns(table, fields)
+            if column not in present
+        )
+        if absent:
+            missing[table] = absent
+    return missing
+
+
 def _schema_statements(script: str) -> tuple[str, ...]:
     statements: list[str] = []
     pending = ""
@@ -724,6 +749,31 @@ class SQLiteJobDatabase:
             connection.execute(statement)
         for statement in _named_schema_statements():
             connection.execute(statement)
+        missing = _missing_named_columns(connection)
+        malformed = {
+            table: tuple(
+                column
+                for column in columns
+                if column == "job_id"
+                or (table == "job_identity" and column == "lifecycle_kind")
+            )
+            for table, columns in missing.items()
+        }
+        malformed = {table: columns for table, columns in malformed.items() if columns}
+        if malformed:
+            details = ", ".join(
+                f"{table}.{column}"
+                for table, columns in sorted(malformed.items())
+                for column in columns
+            )
+            raise sqlite3.DatabaseError(
+                f"job database named schema has missing foundational columns: {details}"
+            )
+        for table, columns in missing.items():
+            for column in columns:
+                connection.execute(
+                    f'ALTER TABLE "{table}" ADD COLUMN {_column_definition(column)}'
+                )
         connection.execute(
             """
             INSERT OR IGNORE INTO outbox_concurrency(effect_id, concurrency_key)
@@ -1537,6 +1587,17 @@ class SQLiteJobDatabase:
     def diagnostics(self) -> dict[str, Any]:
         with self.connect(readonly=True) as connection:
             schema = self.meta(connection, "schema_version")
+            missing = _missing_named_columns(connection)
+            if missing:
+                details = ", ".join(
+                    f"{table}.{column}"
+                    for table, columns in sorted(missing.items())
+                    for column in columns
+                )
+                raise sqlite3.DatabaseError(
+                    "job database named schema is incomplete; missing required "
+                    f"columns: {details}"
+                )
             migration = self.meta(connection, "migration_status")
             failures = int(
                 connection.execute(

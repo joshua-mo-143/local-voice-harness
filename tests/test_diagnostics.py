@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import json
+import sqlite3
 import subprocess
 import time
 import unittest
@@ -848,6 +849,44 @@ class CursorJobTests(unittest.TestCase):
         self.assertIn("migration=complete", database.detail)
         self.assertIn("integrity=ok", database.detail)
         self.assertEqual(after, before)
+
+    def test_sqlite_store_reports_missing_required_named_column_as_fatal(self) -> None:
+        import tempfile
+
+        from local_voice_harness.cursor.model import CursorJob
+        from local_voice_harness.cursor.store import JobStore
+
+        with tempfile.TemporaryDirectory() as temporary:
+            jobs = Path(temporary) / "jobs"
+            store = JobStore(jobs, Path(temporary) / "legacy")
+            store.create(
+                CursorJob.from_dict(
+                    {
+                        "id": "123456789abc",
+                        "revision": 0,
+                        "request": "diagnose missing schema",
+                        "status": "queued",
+                        "created_at": 1,
+                        "queued_at": 1,
+                        "delivered": False,
+                    }
+                )
+            )
+            with sqlite3.connect(store.db_path) as connection:
+                connection.execute(
+                    "ALTER TABLE job_identity "
+                    "DROP COLUMN grouped_repository_coordinator_id"
+                )
+
+            with mock.patch.object(checks, "JOBS_DIR", jobs):
+                results = checks.check_cursor_jobs()
+
+        self.assertEqual(len(results), 1)
+        database = results[0]
+        self.assertEqual(database.name, "jobs:database")
+        self.assertIs(database.severity, Severity.FATAL)
+        self.assertIn("named schema is incomplete", database.detail)
+        self.assertIn("job_identity.grouped_repository_coordinator_id", database.detail)
 
 
 class IntegrationCheckTests(unittest.TestCase):
