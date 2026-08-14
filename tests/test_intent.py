@@ -457,6 +457,7 @@ class HarnessConfigChangeIntentTests(LocalRouterTestCase):
         properties = intent.ROUTE_TOOL["function"]["parameters"]["properties"]
         self.assertIn("harness_config_change", properties["intent"]["enum"])
         self.assertIn("raw_value", properties)
+        self.assertIn("speaking speed", intent.ROUTER_SYSTEM_PROMPT)
 
     def test_change_route_retains_typed_raw_value(self) -> None:
         with mock.patch.object(

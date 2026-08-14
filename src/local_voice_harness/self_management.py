@@ -13,6 +13,7 @@ from .config_management import (
     apply_config_values,
     commit_config_change,
     config_paths,
+    describe_config_value,
     load_managed_config,
     restart_services_for_keys,
 )
@@ -21,12 +22,13 @@ from .user_config import UserConfig, UserConfigurationError
 
 UNSUPPORTED_INSPECTION_RESPONSE = (
     "I can only inspect one supported harness setting at a time: voice, "
-    "barge-in mode, announcement policy, or whether GitHub, Linear, or Zendesk "
-    "is enabled."
+    "speaking speed, barge-in mode, announcement policy, or whether GitHub, "
+    "Linear, or Zendesk is enabled."
 )
 AMBIGUOUS_INSPECTION_RESPONSE = (
     "I couldn't identify exactly one supported harness setting. Ask about voice, "
-    "barge-in mode, announcement policy, or one supported integration."
+    "speaking speed, barge-in mode, announcement policy, or one supported "
+    "integration."
 )
 _MAX_SPOKEN_VALUE_CHARS = 80
 _SAFE_VOICE_VALUE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,79}$")
@@ -75,6 +77,7 @@ class SettingKey(StrEnum):
     """Configuration keys intentionally exposed to conversation."""
 
     VOICE = "audio.voice"
+    TTS_SPEED = "providers.tts.speed"
     BARGE_IN_MODE = "audio.barge_in_mode"
     ANNOUNCEMENT_MODE = "announcements.mode"
     GITHUB = "integrations.github"
@@ -116,7 +119,7 @@ class PendingConfigChange:
     raw_value: str
     old_value: str | bool
     new_value: str | bool
-    stored_value: str | bool
+    stored_value: str | bool | float
     affected_services: tuple[str, ...]
 
 
@@ -142,6 +145,16 @@ SETTING_REGISTRY = (
         SettingKey.VOICE,
         ("voice", "assistant voice", "speaking voice", "audio voice"),
         lambda config: config.audio.voice,
+    ),
+    SettingSpec(
+        SettingKey.TTS_SPEED,
+        (
+            "speaking speed",
+            "tts speed",
+            "speech speed",
+            "speed",
+        ),
+        lambda config: format(config.providers.tts_speed, "g"),
     ),
     SettingSpec(
         SettingKey.BARGE_IN_MODE,
@@ -293,6 +306,9 @@ def prepare_config_change(
         return ChangePreparation(ChangePreparationStatus.CONFLICT)
     if new_value == stored_value:
         return ChangePreparation(ChangePreparationStatus.NO_CHANGE)
+    fenced_value = describe_config_value(stored, resolution.value)
+    if not isinstance(fenced_value, (str, bool, float)):
+        return ChangePreparation(ChangePreparationStatus.INVALID)
     return ChangePreparation(
         ChangePreparationStatus.READY,
         PendingConfigChange(
@@ -301,7 +317,7 @@ def prepare_config_change(
             raw_value=raw_value,
             old_value=active_value,
             new_value=new_value,
-            stored_value=stored_value,
+            stored_value=fenced_value,
             affected_services=restart_services_for_keys(
                 updated,
                 (resolution.value,),
@@ -450,6 +466,12 @@ def render_inspection_result(result: InspectionResult) -> AssistantResponse:
         return AssistantResponse(
             spoken_text=f"My configured voice is {value}.",
             display_text=f"audio.voice: {value}",
+        )
+    if result.setting == SettingKey.TTS_SPEED:
+        value = _bounded_spoken_value(str(result.value or ""))
+        return AssistantResponse(
+            spoken_text=f"Speaking speed is {value}.",
+            display_text=f"providers.tts.speed: {value}",
         )
     if result.setting == SettingKey.BARGE_IN_MODE:
         value = _bounded_spoken_value(str(result.value or ""))
