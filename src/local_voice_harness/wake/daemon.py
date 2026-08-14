@@ -2510,6 +2510,9 @@ class WakeConversationDaemon:
                             f"{transcript_delivery.delivery_id}: "
                             f"{type(exc).__name__}: {exc}"
                         )
+                    else:
+                        self.retained_recovery_required = False
+                        self.retained_recovery_retry_at = 0.0
             self.resume_microphone()
             self.wake_model.reset()
         return None

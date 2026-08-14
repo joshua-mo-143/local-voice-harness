@@ -2868,6 +2868,8 @@ class RetainedUtteranceTests(unittest.TestCase):
         delivery.woke = False
         delivery.state = "pending"
         delivery.delivery_id = "a" * 32
+        daemon.retained_recovery_required = True
+        daemon.retained_recovery_retry_at = 10.0
 
         with (
             mock.patch.object(wake_daemon, "release_deliveries"),
@@ -2879,6 +2881,8 @@ class RetainedUtteranceTests(unittest.TestCase):
         delivery.mark_terminal.assert_called_once_with()
         delivery.release.assert_called_once_with()
         delivery.mark_ambiguous.assert_not_called()
+        self.assertFalse(daemon.retained_recovery_required)
+        self.assertEqual(daemon.retained_recovery_retry_at, 0.0)
 
     def test_failed_terminal_cleanup_retries_without_replay_or_manual_pause(
         self,
