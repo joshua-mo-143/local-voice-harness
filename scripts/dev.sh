@@ -48,6 +48,7 @@ fi
 export XDG_CONFIG_HOME="$PROJECT_DIR/.dev/config"
 export XDG_STATE_HOME="$PROJECT_DIR/.dev/state"
 export UV_PROJECT_ENVIRONMENT="$PROJECT_DIR/.dev/venv"
+unset STATE_DIRECTORY
 mkdir -p -- "$XDG_CONFIG_HOME" "$XDG_STATE_HOME"
 
 if [[ "$command" == "text" || "$command" == "pronounce" ]]; then
