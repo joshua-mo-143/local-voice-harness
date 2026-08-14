@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import fcntl
 import json
+import math
 import os
 import re
 import shutil
@@ -147,6 +148,13 @@ def _parse_float(value: str) -> float:
         raise UserConfigurationError(f"expected a number, got {value!r}") from exc
 
 
+def _parse_tts_speed(value: str) -> float:
+    speed = _parse_float(value)
+    if not math.isfinite(speed) or speed < 0.25 or speed > 4:
+        raise UserConfigurationError("TTS speed must be between 0.25 and 4")
+    return speed
+
+
 def _parse_path(value: str) -> Path:
     return Path(value.strip()).expanduser()
 
@@ -237,7 +245,7 @@ _CONFIG_FIELDS: dict[str, ConfigField] = {
     "providers.tts.provider": _provider_field("tts", "provider", parse=_parse_str),
     "providers.tts.model": _provider_field("tts", "model", parse=_parse_str),
     "providers.tts.voice": _provider_field("tts", "voice", parse=_parse_str),
-    "providers.tts.speed": _provider_field("tts", "speed", parse=_parse_float),
+    "providers.tts.speed": _provider_field("tts", "speed", parse=_parse_tts_speed),
     "providers.tts.endpoint": _provider_field("tts", "endpoint", parse=_parse_str),
     "providers.tts.timeout": _provider_field("tts", "timeout", parse=_parse_float),
     "integrations.github": _field(

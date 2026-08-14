@@ -65,6 +65,21 @@ class ConfigInspectionTests(unittest.TestCase):
                 self_management.SettingKey.ANNOUNCEMENT_MODE,
                 "all",
             ),
+            (
+                "What is the speaking speed?",
+                self_management.SettingKey.TTS_SPEED,
+                "1.25",
+            ),
+            (
+                "What TTS speed is configured?",
+                self_management.SettingKey.TTS_SPEED,
+                "1.25",
+            ),
+            (
+                "What speech speed are you using?",
+                self_management.SettingKey.TTS_SPEED,
+                "1.25",
+            ),
         )
         for utterance, setting, value in cases:
             with self.subTest(utterance=utterance):
@@ -134,6 +149,15 @@ class ConfigInspectionTests(unittest.TestCase):
             response.spoken_text,
             "My configured voice is the configured default.",
         )
+
+    def test_tts_speed_inspection_speaks_the_stored_value(self) -> None:
+        response = self_management.inspect_config_utterance(
+            "What is the current speaking speed?",
+            self.config,
+        )
+
+        self.assertEqual(response.spoken_text, "Speaking speed is 1.25.")
+        self.assertEqual(response.display_text, "providers.tts.speed: 1.25")
 
 
 class ConfigChangeTests(unittest.TestCase):
@@ -224,6 +248,38 @@ class ConfigChangeTests(unittest.TestCase):
                 self.assertIn(old_text, response.spoken_text)
                 self.assertIn(new_text, response.spoken_text)
 
+    def test_tts_speed_change_preflights_exact_old_and_new_values(self) -> None:
+        cases = (
+            ("Set the speaking speed to 1.2", "1.2", "1.25", "1.2"),
+            ("Set TTS speed to 2", "2", "1.25", "2"),
+            ("Set speech speed to 0.25", "0.25", "1.25", "0.25"),
+            ("Set speed to 4", "4", "1.25", "4"),
+        )
+        for utterance, raw_value, old_value, new_value in cases:
+            with self.subTest(utterance=utterance):
+                preparation = self.prepare(utterance, raw_value)
+
+                self.assertEqual(
+                    preparation.status,
+                    self_management.ChangePreparationStatus.READY,
+                )
+                pending = preparation.pending
+                assert pending is not None
+                self.assertEqual(pending.setting, self_management.SettingKey.TTS_SPEED)
+                self.assertEqual(pending.old_value, old_value)
+                self.assertEqual(pending.new_value, new_value)
+                self.assertEqual(
+                    pending.affected_services,
+                    (
+                        "voice-harness-wake.service",
+                        "voice-harness-tts.service",
+                    ),
+                )
+                response = self_management.render_change_preparation(preparation)
+                self.assertIn(old_value, response.spoken_text)
+                self.assertIn(new_value, response.spoken_text)
+                self.assertIn("Say yes to confirm", response.spoken_text)
+
     def test_malformed_unsupported_ambiguous_and_unsafe_changes_fail_closed(
         self,
     ) -> None:
@@ -262,6 +318,36 @@ class ConfigChangeTests(unittest.TestCase):
                 "Set barge-in mode to loud",
                 "loud",
                 self_management.ChangePreparationStatus.INVALID,
+            ),
+            (
+                "Set the speaking speed to 5",
+                "5",
+                self_management.ChangePreparationStatus.INVALID,
+            ),
+            (
+                "Set TTS speed to 0.1",
+                "0.1",
+                self_management.ChangePreparationStatus.INVALID,
+            ),
+            (
+                "Set speed to faster",
+                "faster",
+                self_management.ChangePreparationStatus.INVALID,
+            ),
+            (
+                "Change the speaking speed",
+                None,
+                self_management.ChangePreparationStatus.MALFORMED,
+            ),
+            (
+                "Set voice and speaking speed to 1.2",
+                "1.2",
+                self_management.ChangePreparationStatus.AMBIGUOUS,
+            ),
+            (
+                "Speak faster",
+                "faster",
+                self_management.ChangePreparationStatus.UNSUPPORTED,
             ),
         )
         for utterance, raw_value, status in cases:
@@ -343,6 +429,68 @@ class ConfigChangeTests(unittest.TestCase):
             "Restart voice-harness-wake.service manually", response.spoken_text
         )
         self.assertIn("Active affected services", response.spoken_text)
+
+    def test_tts_speed_commit_preserves_runtime_snapshot(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = self.paths(Path(temporary))
+            write_user_config(self.config, paths.config)
+            preparation = self_management.prepare_config_change(
+                self_management.ConfigChangeRequest(
+                    "Set the speaking speed to 1.2",
+                    "1.2",
+                ),
+                self.config,
+                paths=paths,
+            )
+            pending = preparation.pending
+            assert pending is not None
+            with mock.patch.object(
+                config_management,
+                "active_services",
+                return_value=(
+                    "voice-harness-wake.service",
+                    "voice-harness-tts.service",
+                ),
+            ):
+                result = self_management.commit_pending_change(pending, paths=paths)
+
+            stored = config_management.load_managed_config(paths)
+
+        self.assertEqual(self.config.providers.tts_speed, 1.25)
+        self.assertEqual(stored.providers.tts_speed, 1.2)
+        response = self_management.render_change_committed(pending, result)
+        self.assertIn(
+            "running configuration snapshot is unchanged", response.spoken_text
+        )
+        self.assertIn("providers.tts.speed", response.spoken_text)
+        self.assertIn("1.2", response.spoken_text)
+
+    def test_tts_speed_commit_fences_the_typed_stored_float(self) -> None:
+        precise = 1.23456789
+        self.assertNotEqual(float(format(precise, "g")), precise)
+        config = replace(
+            self.config,
+            providers=replace(self.config.providers, tts_speed=precise),
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            paths = self.paths(Path(temporary))
+            write_user_config(config, paths.config)
+            preparation = self_management.prepare_config_change(
+                self_management.ConfigChangeRequest(
+                    "Set the speaking speed to 1.2",
+                    "1.2",
+                ),
+                config,
+                paths=paths,
+            )
+            pending = preparation.pending
+            assert pending is not None
+            self.assertEqual(pending.stored_value, precise)
+            result = self_management.commit_pending_change(pending, paths=paths)
+            stored = config_management.load_managed_config(paths)
+
+        self.assertEqual(stored.providers.tts_speed, 1.2)
+        self.assertEqual(result.changed_keys, ("providers.tts.speed",))
 
 
 if __name__ == "__main__":
