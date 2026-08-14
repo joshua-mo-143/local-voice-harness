@@ -43,18 +43,17 @@ import signal
 import sys
 from pathlib import Path
 
+sys.path.insert(0, os.environ["FAKE_APPLICATION_SOURCE"])
+from local_voice_harness.config import JOBS_DB
+
 record = {
     "arguments": sys.argv[1:],
-    "jobs_database": str(
-        Path(os.environ["XDG_STATE_HOME"])
-        / "voice-harness"
-        / "jobs"
-        / "jobs.sqlite3"
-    ),
+    "jobs_database": str(JOBS_DB),
     "environment": {
         name: os.environ.get(name)
         for name in (
             "GH_CONFIG_DIR",
+            "STATE_DIRECTORY",
             "XDG_CONFIG_HOME",
             "XDG_STATE_HOME",
             "XDG_RUNTIME_DIR",
@@ -100,6 +99,10 @@ raise SystemExit(int(os.environ.get("FAKE_SYSTEMCTL_EXIT", "3")))
                 "FAKE_SYSTEMCTL_RECORD": str(self.systemctl_record),
                 "FAKE_READY": str(self.ready),
                 "FAKE_SYSTEMCTL_EXIT": "3",
+                "FAKE_APPLICATION_SOURCE": str(PROJECT_ROOT / "src"),
+                "STATE_DIRECTORY": str(
+                    self.test_root / "production-state" / "voice-harness"
+                ),
                 "XDG_CONFIG_HOME": str(self.test_root / "official-config"),
                 "XDG_STATE_HOME": str(self.test_root / "official-state"),
                 "XDG_RUNTIME_DIR": str(self.test_root / "shared-runtime"),
@@ -162,6 +165,7 @@ raise SystemExit(int(os.environ.get("FAKE_SYSTEMCTL_EXIT", "3")))
             invocation["environment"],
             {
                 "GH_CONFIG_DIR": str(self.test_root / "official-config" / "gh"),
+                "STATE_DIRECTORY": None,
                 "XDG_CONFIG_HOME": str(PROJECT_ROOT / ".dev" / "config"),
                 "XDG_STATE_HOME": str(PROJECT_ROOT / ".dev" / "state"),
                 "XDG_RUNTIME_DIR": str(self.test_root / "shared-runtime"),
@@ -183,6 +187,78 @@ raise SystemExit(int(os.environ.get("FAKE_SYSTEMCTL_EXIT", "3")))
         self.assertTrue((PROJECT_ROOT / ".dev" / "config").is_dir())
         self.assertTrue((PROJECT_ROOT / ".dev" / "state").is_dir())
         self.assertFalse(self.systemctl_record.exists())
+
+    def test_commands_cannot_inherit_production_durable_state(self) -> None:
+        production_database = (
+            self.test_root
+            / "production-state"
+            / "voice-harness"
+            / "jobs"
+            / "jobs.sqlite3"
+        )
+        production_database.parent.mkdir(parents=True)
+        production_database.write_text("production sentinel")
+        expected_database = (
+            PROJECT_ROOT / ".dev" / "state" / "voice-harness" / "jobs" / "jobs.sqlite3"
+        )
+        resolved_databases: set[str] = set()
+
+        for arguments in (
+            ("text", "request"),
+            ("wake",),
+            ("setup", "--defaults"),
+            ("config", "show", "audio.wake_threshold"),
+            ("integrations", "list"),
+        ):
+            with self.subTest(arguments=arguments):
+                process = self._run(*arguments)
+
+                self.assertEqual(process.returncode, 0, process.stderr)
+                invocation = self._uv_invocation()
+                resolved_databases.add(cast(str, invocation["jobs_database"]))
+                self.assertEqual(
+                    invocation["jobs_database"],
+                    str(expected_database),
+                )
+                self.assertIsNone(
+                    cast(dict[str, str | None], invocation["environment"])[
+                        "STATE_DIRECTORY"
+                    ]
+                )
+                self.assertEqual(production_database.read_text(), "production sentinel")
+
+        self.assertEqual(resolved_databases, {str(expected_database)})
+
+    def test_copied_launchers_use_distinct_checkout_databases(self) -> None:
+        resolved_databases: list[str] = []
+
+        for name in ("checkout-one", "checkout-two"):
+            checkout = self.test_root / name
+            scripts = checkout / "scripts"
+            scripts.mkdir(parents=True)
+            launcher = scripts / "dev.sh"
+            shutil.copy2(LAUNCHER, launcher)
+            record = self.test_root / f"{name}-uv.json"
+
+            process = subprocess.run(
+                [str(launcher), "text", "request"],
+                cwd=self.test_root,
+                env=self._environment(FAKE_UV_RECORD=str(record)),
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+
+            self.assertEqual(process.returncode, 0, process.stderr)
+            invocation = json.loads(record.read_text())
+            expected_database = (
+                checkout / ".dev" / "state" / "voice-harness" / "jobs" / "jobs.sqlite3"
+            )
+            self.assertEqual(invocation["jobs_database"], str(expected_database))
+            resolved_databases.append(cast(str, invocation["jobs_database"]))
+
+        self.assertNotEqual(*resolved_databases)
 
     def test_primary_checkout_launcher_preserves_installed_wake_environment(
         self,
