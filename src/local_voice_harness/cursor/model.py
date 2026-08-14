@@ -36,8 +36,16 @@ from ..job_lifecycle import (
     legal_edges,
 )
 from ..prompt_operations import (
+    AmbiguousPrompt,
+    IdlePrompt,
+    ObservedPrompt,
+    PlannedPrompt,
     PromptOperation,
     PromptOperationError,
+    ResolvedPrompt,
+    SubmittedPrompt,
+    SubmittingPrompt,
+    legacy_prompt_fields,
     load_prompt_operation,
 )
 from ..questions import Question, QuestionError
@@ -1161,6 +1169,78 @@ def _legacy_defaults(values: dict[str, object]) -> None:
         values.setdefault("completed_at", values["created_at"])
 
 
+def _typed_prompt_operation(
+    values: Mapping[str, object], job_id: str
+) -> PromptOperation:
+    try:
+        turn = _integer(
+            values.get("prompt_operation_turn") or 0, "prompt_operation_turn"
+        )
+        return load_prompt_operation(
+            state=str(values.get("prompt_operation_state") or "none"),
+            job_id=job_id,
+            phase=(
+                str(values["prompt_operation_phase"])
+                if values.get("prompt_operation_phase") is not None
+                else None
+            ),
+            turn=turn,
+            turn_token=(
+                str(values["turn_token"])
+                if values.get("turn_token") is not None
+                else (f"{job_id}-{turn}" if turn > 0 else None)
+            ),
+            target=(
+                str(values["prompt_operation_target"])
+                if values.get("prompt_operation_target") is not None
+                else None
+            ),
+            agent_session=(
+                str(values["prompt_operation_agent_session"])
+                if values.get("prompt_operation_agent_session") is not None
+                else None
+            ),
+            baseline_sequence=(
+                _integer(values["prompt_baseline_sequence"], "prompt_baseline_sequence")
+                if values.get("prompt_baseline_sequence") is not None
+                else None
+            ),
+        )
+    except PromptOperationError as exc:
+        if str(values.get("prompt_operation_state") or "none") == "none":
+            return IdlePrompt()
+        raise JobValidationError(str(exc)) from exc
+
+
+def _optional_typed_prompt_operation(
+    values: Mapping[str, object], job_id: str
+) -> PromptOperation | None:
+    try:
+        return _typed_prompt_operation(values, job_id)
+    except JobValidationError:
+        return None
+
+
+def _consume_typed_prompt_operation(changes: dict[str, object]) -> None:
+    operation = changes.pop("prompt_operation", None)
+    if operation is None:
+        return
+    if not isinstance(
+        operation,
+        (
+            IdlePrompt,
+            PlannedPrompt,
+            SubmittingPrompt,
+            SubmittedPrompt,
+            ObservedPrompt,
+            AmbiguousPrompt,
+            ResolvedPrompt,
+        ),
+    ):
+        raise JobValidationError("prompt_operation must be a typed PromptOperation")
+    changes.update(legacy_prompt_fields(operation))
+
+
 def _prompt_operation_defaults(values: dict[str, object]) -> None:
     """Translate the schema-v10 boolean prompt fence without a schema bump."""
     if "prompt_operation_state" in values:
@@ -1232,6 +1312,7 @@ class AgentJob:
     active_participant: WorkflowParticipant | None
     _compatibility_layout: bool
     _values: dict[str, object]
+    _prompt_operation: PromptOperation | None
     _lifecycle_event: JobEvent | None = None
 
     @classmethod
@@ -1525,6 +1606,9 @@ class AgentJob:
             active_participant=active_participant,
             _compatibility_layout=compatibility_layout,
             _values=values,
+            _prompt_operation=_optional_typed_prompt_operation(
+                values, str(values["id"])
+            ),
             _lifecycle_event=None,
         )
         job.validate_invariants(
@@ -1621,6 +1705,7 @@ class AgentJob:
         values = self.to_dict()
         for field in remove:
             values.pop(field, None)
+        _consume_typed_prompt_operation(changes)
         values.update(changes)
         _pair_announcement_ack(values)
         _pair_worker_ownership(values)
@@ -1705,7 +1790,11 @@ class AgentJob:
         for field in remove:
             values.pop(field, None)
         if dynamic_changes is not None:
-            values.update(dynamic_changes)
+            mutable_dynamic = dict(dynamic_changes)
+            _consume_typed_prompt_operation(mutable_dynamic)
+            values.update(mutable_dynamic)
+            dynamic_changes = mutable_dynamic
+        _consume_typed_prompt_operation(changes)
         values.update(changes)
         _pair_worker_ownership(values)
         if "prompt_operation_state" in values:
@@ -2474,30 +2563,9 @@ class AgentJob:
 
     @property
     def prompt_operation(self) -> PromptOperation:
-        try:
-            return load_prompt_operation(
-                state=self.prompt_operation_state,
-                job_id=self.id,
-                phase=(
-                    self.prompt_operation_phase.value
-                    if self.prompt_operation_phase is not None
-                    else None
-                ),
-                turn=self.prompt_operation_turn,
-                turn_token=(
-                    self.turn_token
-                    or (
-                        f"{self.id}-{self.prompt_operation_turn}"
-                        if self.prompt_operation_turn > 0
-                        else None
-                    )
-                ),
-                target=self.prompt_operation_target,
-                agent_session=self.prompt_operation_agent_session,
-                baseline_sequence=self.prompt_baseline_sequence,
-            )
-        except PromptOperationError as exc:
-            raise JobValidationError(str(exc)) from exc
+        if self._prompt_operation is not None:
+            return self._prompt_operation
+        return _typed_prompt_operation(self._values, self.id)
 
     @property
     def prompt_operation_phase(self) -> WorkflowPhase | None:

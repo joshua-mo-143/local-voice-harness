@@ -32,6 +32,7 @@ from local_voice_harness.cursor.lifecycle import (
     settle_cleanup,
     take_over_cleanup,
 )
+from local_voice_harness.cursor.model import CURRENT_SCHEMA_VERSION, CursorJob
 from local_voice_harness.prompt_operations import (
     AmbiguousPrompt,
     IdlePrompt,
@@ -613,6 +614,32 @@ def test_question_module_reuses_shared_prompt_operation_enum() -> None:
     assert submitted.prompt_state == PromptOperationState.SUBMITTED
     resolved = resolve_question_prompt(submitted, identity)
     assert resolved.prompt_state == PromptOperationState.RESOLVED
+
+
+def test_cursor_job_evolves_typed_prompt_operation_without_flat_kwargs() -> None:
+    job = CursorJob.from_dict(
+        {
+            "schema_version": CURRENT_SCHEMA_VERSION,
+            "id": "123456789abc",
+            "revision": 0,
+            "request": "implement it",
+            "status": "queued",
+            "created_at": 1,
+            "queued_at": 1,
+            "delivered": False,
+        }
+    )
+    identity = _prompt_identity(job_id=job.id, turn=1, turn_token="123456789abc-1")
+    planned = plan_prompt(job.prompt_operation, identity)
+    updated = job.evolve(
+        prompt_operation=planned, turn=1, turn_token=identity.turn_token
+    )
+
+    assert updated.prompt_operation == planned
+    assert updated.prompt_operation_state == "planned"
+    assert updated.to_dict()["prompt_operation_state"] == "planned"
+    restored = CursorJob.from_dict(updated.to_dict())
+    assert restored.prompt_operation == planned
 
 
 def test_answered_question_state_requires_answer_payload() -> None:
