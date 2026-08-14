@@ -2878,11 +2878,35 @@ class RetainedUtteranceTests(unittest.TestCase):
         delivery.mark_ambiguous.assert_not_called()
         delivery.release.assert_not_called()
         self.assertTrue(daemon.retained_recovery_required)
+        self.assertEqual(
+            daemon.uncertain_retained_delivery_ids,
+            {delivery.delivery_id},
+        )
         notify.assert_called_once_with(
             "I retained that voice request because its handoff was interrupted. "
             "I will not run it until recovery confirms whether it is safe.",
             error=True,
         )
+
+        recovered = mock.Mock(spec=wake_daemon.RetainedTranscript)
+        recovered.delivery_id = delivery.delivery_id
+        recovered.text = delivery.text
+        recovered.woke = delivery.woke
+        recovered.state = "pending"
+        with (
+            mock.patch.object(
+                wake_daemon,
+                "recover_retained_transcripts",
+                return_value=(recovered,),
+            ),
+            mock.patch.object(daemon, "process_utterance") as process,
+            mock.patch.object(wake_daemon, "log"),
+        ):
+            self.assertTrue(daemon._retry_retained_recovery())
+
+        recovered.mark_ambiguous.assert_called_once_with()
+        process.assert_not_called()
+        self.assertEqual(daemon.uncertain_retained_delivery_ids, set())
 
     def test_digest_claims_cannot_run_without_a_successful_fence(self) -> None:
         daemon = _bare_daemon()
@@ -3039,6 +3063,29 @@ class RetainedUtteranceTests(unittest.TestCase):
                 for call in log.call_args_list
             )
         )
+
+    def test_ambiguous_delivery_stops_ordered_recovery_batch(self) -> None:
+        daemon = _bare_daemon()
+        ambiguous = wake_daemon.RetainedTranscript(
+            "a" * 32,
+            "possibly executed",
+            True,
+            "ambiguous",
+        )
+        pending = wake_daemon.RetainedTranscript("b" * 32, "later turn", True)
+        with (
+            mock.patch.object(
+                wake_daemon,
+                "recover_retained_transcripts",
+                return_value=(ambiguous, pending),
+            ),
+            mock.patch.object(daemon, "process_utterance") as process,
+            mock.patch.object(wake_daemon, "notify"),
+            mock.patch.object(wake_daemon, "log"),
+        ):
+            daemon._recover_retained_utterances()
+
+        process.assert_not_called()
 
 
 class InboxIntentRoutingTests(unittest.TestCase):

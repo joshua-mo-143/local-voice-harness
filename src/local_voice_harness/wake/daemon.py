@@ -553,6 +553,7 @@ class WakeConversationDaemon:
         self.launched_config_activations: dict[str, subprocess.Popen[bytes]] = {}
         self.config_activation_dispatch_attempts: dict[str, int] = {}
         self.retained_recovery_required = False
+        self.uncertain_retained_delivery_ids: set[str] = set()
         self.conversation_deadline = 0.0
         self.awaiting_followup = False
         self.last_wake = 0.0
@@ -1628,6 +1629,11 @@ class WakeConversationDaemon:
                     turn_failed = True
                     if transcript_delivery.state == "uncertain":
                         self.retained_recovery_required = True
+                        uncertain_deliveries = getattr(
+                            self, "uncertain_retained_delivery_ids", set()
+                        )
+                        uncertain_deliveries.add(transcript_delivery.delivery_id)
+                        self.uncertain_retained_delivery_ids = uncertain_deliveries
                     log(
                         "voice turn retention acknowledgment requires reconciliation: "
                         f"{transcript_delivery.delivery_id} "
@@ -2452,7 +2458,27 @@ class WakeConversationDaemon:
                     "I retained it for reconciliation and will not run it again.",
                     error=True,
                 )
-                continue
+                break
+            uncertain_deliveries = getattr(
+                self, "uncertain_retained_delivery_ids", set()
+            )
+            if delivery.delivery_id in uncertain_deliveries:
+                try:
+                    delivery.mark_ambiguous()
+                except Exception as exc:  # noqa: BLE001 - evidence stays retained
+                    self.retained_recovery_required = True
+                    log(
+                        "could not reconcile uncertain retained voice delivery "
+                        f"{delivery.delivery_id}: {type(exc).__name__}: {exc}"
+                    )
+                else:
+                    uncertain_deliveries.remove(delivery.delivery_id)
+                    self.uncertain_retained_delivery_ids = uncertain_deliveries
+                    log(
+                        "uncertain retained voice delivery was fenced for "
+                        f"reconciliation: {delivery.delivery_id}"
+                    )
+                break
             self.process_utterance(
                 None,
                 woke=delivery.woke,
