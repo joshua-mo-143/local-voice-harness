@@ -3,12 +3,23 @@ from __future__ import annotations
 import json
 import os
 import signal
+import sqlite3
 import sys
+import time
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any, cast
 from unittest import mock
 
+from local_voice_harness.agents import (
+    HarnessEvent,
+    HarnessEventKind,
+    HarnessSession,
+    HarnessTask,
+    ReconciliationState,
+    SessionReconciliation,
+    TaskSubmission,
+)
 from local_voice_harness.cursor import provisioning, worker_lifecycle
 from local_voice_harness.cursor.delivery import acknowledge_delivery, claim_delivery
 from local_voice_harness.cursor.model import CursorJob, WorkflowParticipant
@@ -95,7 +106,7 @@ class PersistentHerdr(HerdrClient):
     def __init__(self, effects: PersistentEffects) -> None:
         self.effects = effects
         self.session = HerdrSession(self)
-        self.harness = self.session
+        self.harness = self
 
     def ensure_server(self, timeout: float | None = None) -> None:
         return None
@@ -118,6 +129,90 @@ class PersistentHerdr(HerdrClient):
             agents.pop(target, None)
 
         self.effects.update(change)
+
+    def submit_task(
+        self,
+        session: HarnessSession,
+        task: HarnessTask,
+        *,
+        before_submit: Callable[[int], None],
+        accepted: Callable[[], None],
+        **_kwargs: object,
+    ) -> TaskSubmission:
+        before = self.get_agent(session.target)
+        sequence = int(before.get("state_change_seq") or 0)
+        before_submit(sequence)
+
+        def submit(state: dict[str, Any]) -> None:
+            agents = cast(dict[str, dict[str, Any]], state["agents"])
+            calls = cast(dict[str, int], state["calls"])
+            calls[f"prompts:{task.correlation_id}"] = (
+                calls.get(f"prompts:{task.correlation_id}", 0) + 1
+            )
+            agent = dict(agents[session.target])
+            agent["state_change_seq"] = sequence + 1
+            agents[session.target] = agent
+
+        self.effects.update(submit)
+        accepted()
+        return TaskSubmission(session, task.correlation_id, sequence, 1)
+
+    def reply_to_clarification(
+        self,
+        session: HarnessSession,
+        task: HarnessTask,
+        **kwargs: Any,
+    ) -> TaskSubmission:
+        return self.submit_task(session, task, **kwargs)
+
+    def stream_events(
+        self,
+        submission: TaskSubmission,
+        **_kwargs: object,
+    ) -> list[HarnessEvent]:
+        return [
+            HarnessEvent(
+                HarnessEventKind.SUCCEEDED,
+                HarnessSession(
+                    submission.session.provider,
+                    submission.session.session_id,
+                    submission.session.target,
+                    submission.baseline_sequence + 1,
+                    submission.session.metadata,
+                ),
+                "idle",
+                "output",
+                "done",
+            )
+        ]
+
+    def reconcile(
+        self,
+        target: str,
+        *,
+        expected_session_id: str | None = None,
+    ) -> SessionReconciliation:
+        agent = self.get_agent(target)
+        if not agent:
+            return SessionReconciliation(
+                ReconciliationState.MISSING,
+                None,
+                "missing",
+                False,
+            )
+        session_id = str(agent.get("agent_session") or expected_session_id or "")
+        return SessionReconciliation(
+            ReconciliationState.ACTIVE,
+            HarnessSession(
+                "cursor/herdr",
+                session_id,
+                target,
+                int(agent.get("state_change_seq") or 0),
+                {"cwd": str(agent.get("cwd") or "")},
+            ),
+            "active",
+            session_id == expected_session_id,
+        )
 
 
 class PersistentGitHub(GitHubClient):
@@ -156,6 +251,32 @@ class PromptHerdr(PersistentHerdr):
     ) -> None:
         super().__init__(effects)
         self.kill = kill
+
+    def submit_task(
+        self,
+        session: HarnessSession,
+        task: HarnessTask,
+        *,
+        before_submit: Callable[[int], None],
+        accepted: Callable[[], None],
+        **_kwargs: object,
+    ) -> TaskSubmission:
+        self.prompt_and_wait(
+            session.target,
+            task.text,
+            token=task.correlation_id,
+            baseline_sequence=task.baseline_sequence,
+            expected_agent_session=task.expected_session_id,
+            before_submit=before_submit,
+            accepted=accepted,
+        )
+        assert task.baseline_sequence is not None
+        return TaskSubmission(
+            session,
+            task.correlation_id,
+            task.baseline_sequence,
+            1,
+        )
 
     def prompt_and_wait(
         self,
@@ -585,6 +706,14 @@ def _run_effect(root: Path, effect: str, point: str) -> None:
 def _run_recovery(root: Path) -> None:
     store = JobStore(root / "jobs", root / "legacy")
     effects = PersistentEffects(root / "effects.json")
+    try:
+        with sqlite3.connect(store.db_path) as connection:
+            has_outbox = (
+                connection.execute("SELECT 1 FROM outbox LIMIT 1").fetchone()
+                is not None
+            )
+    except sqlite3.OperationalError:
+        has_outbox = False
 
     def herdr() -> PersistentHerdr:
         return PersistentHerdr(effects)
@@ -621,7 +750,11 @@ def _run_recovery(root: Path) -> None:
             inspect_legacy_worker=lambda _job: "stopped",
             get_boot_identity=lambda: "recovery-worker",
             get_process_identity=lambda _pid: "recovery-start",
-            now=1000.0 * (pass_number + 1),
+            now=(
+                time.time() + 100.0 * (pass_number + 1)
+                if has_outbox
+                else 1000.0 * (pass_number + 1)
+            ),
         )
         snapshots.append(([job.to_record() for job in store.list()], effects.read()))
     if snapshots[-1] != snapshots[-2]:

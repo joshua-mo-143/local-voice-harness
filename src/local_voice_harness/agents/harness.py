@@ -92,6 +92,9 @@ class HarnessTask:
     correlation_id: str
     expected_session_id: str
     baseline_sequence: int | None = None
+    completion_marker: str | None = None
+    allow_interactive_boundary: bool = False
+    allow_fallback_submit: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -115,6 +118,7 @@ class HarnessEvent:
     summary: str | None = None
     question: str | None = None
     error: str | None = None
+    revision: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -129,6 +133,7 @@ class SessionReconciliation:
 
 
 Checkpoint = Callable[[], None]
+BeforeDispatch = Callable[[], None]
 BeforeSubmit = Callable[[int], None]
 Accepted = Callable[[], None]
 
@@ -160,6 +165,7 @@ class AgentHarness(Protocol):
         request: SessionRequest,
         *,
         checkpoint: Checkpoint | None = None,
+        before_submit: BeforeDispatch | None = None,
     ) -> HarnessSession: ...
 
     def submit_task(

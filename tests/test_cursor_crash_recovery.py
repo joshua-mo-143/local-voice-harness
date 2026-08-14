@@ -253,7 +253,9 @@ def test_external_effect_recovery_never_blindly_replays(
             assert job.manual_reconcile_operation == "pane"
             assert job.manual_reconcile_token
     else:
-        assert job.prompt_operation_state == "submitted"
+        assert job.prompt_operation_state == "ambiguous"
+        assert job.manual_reconcile_operation == "prompt"
+        assert job.manual_reconcile_token
 
 
 def _seed_delivery(root: Path) -> None:

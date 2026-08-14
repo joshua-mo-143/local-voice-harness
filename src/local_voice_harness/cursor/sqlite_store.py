@@ -556,6 +556,12 @@ CREATE TABLE IF NOT EXISTS outbox_concurrency (
     concurrency_key TEXT NOT NULL
 ) STRICT;
 
+CREATE TABLE IF NOT EXISTS outbox_consumptions (
+    effect_id TEXT PRIMARY KEY REFERENCES outbox(effect_id) ON DELETE CASCADE,
+    disposition TEXT NOT NULL,
+    consumed_at REAL NOT NULL
+) STRICT;
+
 CREATE TABLE IF NOT EXISTS events (
     event_id TEXT PRIMARY KEY,
     command_id TEXT NOT NULL UNIQUE,
@@ -1188,6 +1194,53 @@ class SQLiteJobDatabase:
                 (effect_id, effect.concurrency_key),
             )
 
+    def abandon_stale_outbox_effects(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        kinds: tuple[str, ...],
+        now: float,
+    ) -> None:
+        if not kinds:
+            return
+        kind_placeholders = ",".join("?" for _ in kinds)
+        error = "effect admission revision was superseded before dispatch"
+        connection.execute(
+            f"""
+            UPDATE outbox
+            SET status = 'failed',
+                outcome_json = ?,
+                completed_at = ?,
+                next_at = NULL,
+                last_error = ?
+            WHERE kind IN ({kind_placeholders})
+              AND lease_token IS NULL
+              AND status IN ('pending', 'failed-retryable')
+              AND json_type(payload_json, '$.expected_revision') = 'integer'
+              AND NOT EXISTS (
+                  SELECT 1 FROM jobs
+                  WHERE jobs.job_id = outbox.job_id
+                    AND jobs.revision = CAST(
+                        json_extract(
+                            outbox.payload_json,
+                            '$.expected_revision'
+                        ) AS INTEGER
+                    )
+              )
+            """,
+            (
+                json.dumps(
+                    {"outcome": "Failed", "retryable": False, "error": error},
+                    allow_nan=False,
+                    separators=(",", ":"),
+                    sort_keys=True,
+                ),
+                now,
+                error,
+                *kinds,
+            ),
+        )
+
     def claim_due_outbox(
         self,
         connection: sqlite3.Connection,
@@ -1263,29 +1316,50 @@ class SQLiteJobDatabase:
             "SELECT * FROM outbox WHERE effect_id = ?", (effect_id,)
         ).fetchone()
 
+    @staticmethod
+    def load_job_revision(
+        connection: sqlite3.Connection,
+        job_id: str,
+    ) -> int | None:
+        row = connection.execute(
+            "SELECT revision FROM jobs WHERE job_id = ?",
+            (job_id,),
+        ).fetchone()
+        return int(row["revision"]) if row is not None else None
+
     def mark_outbox_dispatched(
         self,
         connection: sqlite3.Connection,
         *,
         effect_id: str,
         lease_token: str,
+        expected_revision: int | None = None,
     ) -> bool:
+        revision_guard = ""
+        parameters: tuple[object, ...] = (
+            json.dumps(
+                {"fence": "submitted"},
+                allow_nan=False,
+                separators=(",", ":"),
+                sort_keys=True,
+            ),
+            effect_id,
+            lease_token,
+        )
+        if expected_revision is not None:
+            revision_guard = (
+                "AND EXISTS (SELECT 1 FROM jobs "
+                "WHERE jobs.job_id = outbox.job_id AND jobs.revision = ?)"
+            )
+            parameters = (*parameters, expected_revision)
         connection.execute(
-            """
+            f"""
             UPDATE outbox
             SET outcome_json = ?
             WHERE effect_id = ? AND lease_token = ? AND status = 'running'
+              {revision_guard}
             """,
-            (
-                json.dumps(
-                    {"fence": "submitted"},
-                    allow_nan=False,
-                    separators=(",", ":"),
-                    sort_keys=True,
-                ),
-                effect_id,
-                lease_token,
-            ),
+            parameters,
         )
         changed = connection.execute("SELECT changes() AS changed").fetchone()
         return changed is not None and int(changed["changed"]) == 1
@@ -1388,6 +1462,73 @@ class SQLiteJobDatabase:
                 (now - lease_seconds,),
             )
         )
+
+    def unconsumed_outbox_results(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        kinds: tuple[str, ...],
+        limit: int,
+    ) -> list[sqlite3.Row]:
+        if not kinds or limit <= 0:
+            return []
+        placeholders = ",".join("?" for _ in kinds)
+        return list(
+            connection.execute(
+                f"""
+                SELECT o.effect_id, o.job_id, o.kind, o.idempotency_key,
+                       o.payload_json, o.status, o.outcome_json
+                FROM outbox AS o
+                LEFT JOIN outbox_consumptions AS consumed
+                  ON consumed.effect_id = o.effect_id
+                WHERE o.kind IN ({placeholders})
+                  AND o.status IN ('succeeded', 'failed', 'unknown')
+                  AND o.lease_token IS NULL
+                  AND o.outcome_json IS NOT NULL
+                  AND consumed.effect_id IS NULL
+                ORDER BY o.rowid
+                LIMIT ?
+                """,
+                (*kinds, limit),
+            )
+        )
+
+    @staticmethod
+    def load_outbox_result(
+        connection: sqlite3.Connection,
+        idempotency_key: str,
+    ) -> sqlite3.Row | None:
+        return connection.execute(
+            """
+            SELECT effect_id, job_id, kind, idempotency_key, payload_json,
+                   status, outcome_json
+            FROM outbox
+            WHERE idempotency_key = ?
+              AND status IN ('succeeded', 'failed', 'unknown')
+              AND lease_token IS NULL
+              AND outcome_json IS NOT NULL
+            """,
+            (idempotency_key,),
+        ).fetchone()
+
+    @staticmethod
+    def mark_outbox_consumed(
+        connection: sqlite3.Connection,
+        *,
+        effect_id: str,
+        disposition: str,
+        consumed_at: float,
+    ) -> bool:
+        connection.execute(
+            """
+            INSERT OR IGNORE INTO outbox_consumptions(
+                effect_id, disposition, consumed_at
+            ) VALUES(?, ?, ?)
+            """,
+            (effect_id, disposition, consumed_at),
+        )
+        changed = connection.execute("SELECT changes() AS changed").fetchone()
+        return changed is not None and int(changed["changed"]) == 1
 
     @staticmethod
     def delete_job(connection: sqlite3.Connection, job_id: str) -> None:

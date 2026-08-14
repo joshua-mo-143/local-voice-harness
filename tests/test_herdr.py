@@ -6,10 +6,36 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from local_voice_harness.agents import HarnessSession, HarnessTask, TaskSubmission
 from local_voice_harness.integrations import herdr, linear
 
 
 class HerdrIntegrationTests(unittest.TestCase):
+    def test_harness_task_forwards_interactive_boundary_options(self) -> None:
+        client = herdr.HerdrClient("herdr")
+        session = HarnessSession("cursor/herdr", "session", "agent", 7)
+        task = HarnessTask(
+            "plan it",
+            "turn",
+            "session",
+            7,
+            completion_marker="WORKFLOW_PLAN",
+            allow_interactive_boundary=True,
+            allow_fallback_submit=False,
+        )
+        expected = TaskSubmission(session, "turn", 7, 1)
+        with mock.patch.object(
+            client.session,
+            "_submit_task",
+            return_value=expected,
+        ) as submit:
+            observed = client.harness.submit_task(session, task)
+
+        self.assertEqual(observed, expected)
+        self.assertEqual(submit.call_args.kwargs["active_marker"], "WORKFLOW_PLAN")
+        self.assertTrue(submit.call_args.kwargs["allow_interactive_plan_boundary"])
+        self.assertFalse(submit.call_args.kwargs["allow_enter_fallback"])
+
     def test_normalizes_spoken_linear_issue_key(self) -> None:
         self.assertEqual(linear.extract_linear_issue("work on API 77"), "API-77")
         self.assertEqual(linear.extract_linear_issue("work on api - 78"), "API-78")

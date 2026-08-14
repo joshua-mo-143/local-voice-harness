@@ -187,7 +187,7 @@ def observe_prompt_submission(
     if (
         target == identity.target
         and agent_session == identity.agent_session
-        and state_sequence != identity.baseline_sequence
+        and state_sequence > identity.baseline_sequence
     ):
         return SubmittedPrompt(identity)
     return AmbiguousPrompt(identity)

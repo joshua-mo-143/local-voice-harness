@@ -9,6 +9,7 @@ from unittest import mock
 
 import pytest
 
+from local_voice_harness.agents import HarnessSession, SessionRequest
 from local_voice_harness.cursor import provisioning, recovery, service, worker_lifecycle
 from local_voice_harness.cursor.model import (
     CURRENT_SCHEMA_VERSION,
@@ -554,6 +555,44 @@ class _FakeHerdr:
         self.started: list[AgentSelection] = []
         self.started_modes: list[str | None] = []
         self.new_pane_calls = 0
+        self.harness = mock.Mock()
+        self.harness.create_session.side_effect = self._create_session
+
+    def _create_session(
+        self,
+        request: SessionRequest,
+        *,
+        before_submit: object | None = None,
+        **_kwargs: object,
+    ) -> HarnessSession:
+        if callable(before_submit):
+            before_submit()
+        checkout = Path(
+            str(
+                request.launch_context.get("cwd")
+                or self._worktrees[0].get("path")
+                or ""
+            )
+        )
+        selection = self.start_agent(
+            checkout,
+            request.name,
+            request.launch_context["pane_id"],
+            request.launch_context["workspace_id"],
+            name=request.name,
+            mode=request.mode,
+        )
+        return HarnessSession(
+            selection.provider or "cursor/herdr",
+            selection.provider_session_id or f"session-{selection.target}",
+            selection.target,
+            selection.state_sequence or 0,
+            {
+                "pane_id": selection.pane_id,
+                "workspace_id": selection.workspace_id,
+                "cwd": selection.cwd,
+            },
+        )
 
     def allowed_repository(self, path: Path) -> bool:
         return True
@@ -827,10 +866,10 @@ def test_followup_agent_start_is_fenced_before_crash_and_recovered(
         return original_start(*args, **kwargs)  # type: ignore[arg-type]
 
     monkeypatch.setattr(client, "start_agent", start_with_fence)
-    original_settle = provisioning._settle_worker_agent
+    original_consume = provisioning.consume_agent_results
     monkeypatch.setattr(
         provisioning,
-        "_settle_worker_agent",
+        "consume_agent_results",
         mock.Mock(side_effect=RuntimeError("worker crashed after agent start")),
     )
 
@@ -849,25 +888,14 @@ def test_followup_agent_start_is_fenced_before_crash_and_recovered(
     assert dispatching.agent_dispatch_state == "dispatching"
     assert dispatching.herdr_target
     started = client.started[0]
-    monkeypatch.setattr(provisioning, "_settle_worker_agent", original_settle)
-    recovery_client = mock.Mock()
-    recovery_client.ensure_server.return_value = None
-    recovery_client.get_agent.return_value = {
-        "name": started.target,
-        "pane_id": started.pane_id,
-        "workspace_id": started.workspace_id,
-        "cwd": str(checkout),
-    }
-
-    recovery.reconcile_uncertain_agent(
+    monkeypatch.setattr(provisioning, "consume_agent_results", original_consume)
+    original_consume(
         store,
-        dispatching,
-        now=time.time() + 1,
-        herdr_factory=lambda: cast(HerdrClient, recovery_client),
+        provisioning._reduce_agent_effect,
     )
 
     recovered = store.get(job.id)
-    assert recovered.agent_dispatch_state == "manual_required"
+    assert recovered.agent_dispatch_state == "ready"
     assert recovered.herdr_target == started.target
 
 
@@ -893,7 +921,7 @@ def test_followup_agent_timeout_keeps_reserved_identity_for_recovery(
         raise HerdrError("agent start timed out", code="operation_timeout")
 
     monkeypatch.setattr(client, "start_agent", timeout)
-    with pytest.raises(HerdrError, match="timed out"):
+    with pytest.raises(HerdrError, match="durable session creation"):
         provisioning._provision_followup_agent(
             store,
             job.id,

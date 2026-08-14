@@ -299,6 +299,7 @@ class HerdrWorkspace:
         before_pane_submit: BeforePaneSubmit | None = None,
         pane_accepted: PaneAccepted | None = None,
         participant_name: str | None = None,
+        start_session: bool = True,
     ) -> AgentSelection:
         repository = repository.resolve()
         checkout = repository
@@ -450,6 +451,8 @@ class HerdrWorkspace:
         )
         if reserve is not None:
             reserve(provisional, True)
+        if not start_session:
+            return provisional
         try:
             selection = self._operations.start_agent(
                 checkout,
@@ -485,6 +488,7 @@ class HerdrWorkspace:
         fail_agent: FailOperation | None = None,
         before_pane_submit: BeforePaneSubmit | None = None,
         pane_accepted: PaneAccepted | None = None,
+        start_session: bool = True,
     ) -> AgentSelection:
         """Start a distinct participant in a new pane with a durable start fence."""
         if name is None:
@@ -511,6 +515,8 @@ class HerdrWorkspace:
         )
         if reserve is not None:
             reserve(provisional, True)
+        if not start_session:
+            return provisional
         try:
             selection = self._operations.start_agent(
                 checkout,

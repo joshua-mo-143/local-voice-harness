@@ -16,6 +16,13 @@ from local_voice_harness.agents import (
     SessionReconciliation,
 )
 from local_voice_harness.cursor import delivery, provisioning, worker_lifecycle
+from local_voice_harness.cursor.agent_outbox import TASK_SUBMIT
+from local_voice_harness.cursor.coordinator import (
+    CoordinatorCommand,
+    CoordinatorDecision,
+    DurableEffect,
+    EffectObservation,
+)
 from local_voice_harness.cursor.model import (
     CURRENT_SCHEMA_VERSION,
     CursorJob,
@@ -55,6 +62,7 @@ from local_voice_harness.integrations.linear import (
     LinearIssue,
     LinearTicketCreationResult,
 )
+from local_voice_harness.prompt_operations import AmbiguousPrompt, SubmittingPrompt
 
 WORKER = WorkerOwnership("worker", 42, "boot", "start", "test", 1)
 
@@ -103,6 +111,53 @@ class CursorRecoveryTests(unittest.TestCase):
                 values.get("worktree_path") or values.get("repository") or "/worktree",
             )
         return self.store.create(CursorJob.from_dict(values))
+
+    def admit_unknown_prompt_effect(self, job: CursorJob) -> CursorJob:
+        operation = job.prompt_operation
+        assert isinstance(operation, SubmittingPrompt | AmbiguousPrompt)
+        identity = operation.identity
+        key = f"{TASK_SUBMIT}:{job.id}:{identity.phase}:{identity.turn_token}"
+        admitted = self.store.apply(
+            CoordinatorCommand(
+                job_id=job.id,
+                expected_revision=job.revision,
+                command_id=f"admit:{key}",
+                kind=f"{TASK_SUBMIT}.admit",
+            ),
+            lambda current: CoordinatorDecision(
+                job=current.evolve(),
+                effects=(
+                    DurableEffect(
+                        kind=TASK_SUBMIT,
+                        idempotency_key=key,
+                        concurrency_key=f"cursor/herdr:{identity.target}",
+                        payload={
+                            "expected_revision": job.revision + 1,
+                            "prompt_job_id": identity.job_id,
+                            "phase": identity.phase,
+                            "turn": identity.turn,
+                            "turn_token": identity.turn_token,
+                            "target": identity.target,
+                            "session_id": identity.agent_session,
+                            "baseline_sequence": identity.baseline_sequence,
+                        },
+                    ),
+                ),
+            ),
+        )
+        assert admitted is not None
+        lease = self.store.claim_outbox((TASK_SUBMIT,), now=1)
+        assert lease is not None
+        assert self.store.mark_outbox_dispatched(lease)
+        assert (
+            self.store.observe_outbox(
+                lease,
+                EffectObservation(outcome="OutcomeUnknown"),
+                now=2,
+            )
+            == "applied"
+        )
+        return self.store.get(job.id)
 
     def observe_owned_sessions(
         self, client: mock.Mock, job_id: str = "123456789abc"
@@ -393,6 +448,8 @@ class CursorRecoveryTests(unittest.TestCase):
         )
         store.prune.side_effect = lambda **_kwargs: calls.append("prune") or []
         store.list.side_effect = lambda: calls.append("scan") or []
+        store.claim_outbox.return_value = None
+        store.unconsumed_outbox_results.return_value = ()
 
         recover_jobs(store, launch_worker=mock.Mock(), now=100)
 
@@ -1226,7 +1283,7 @@ class CursorRecoveryTests(unittest.TestCase):
         self.assertFalse(acknowledged.to_dict()["worktree_manual_inspection_required"])
 
     def test_prompt_submit_recovery_requires_positive_acceptance_evidence(self) -> None:
-        self.create(
+        created = self.create(
             {
                 "id": "123456789abc",
                 "status": "running",
@@ -1258,6 +1315,7 @@ class CursorRecoveryTests(unittest.TestCase):
                 "prompt_baseline_sequence": 7,
             }
         )
+        self.admit_unknown_prompt_effect(created)
         unavailable = mock.Mock()
         unavailable.ensure_server.side_effect = HerdrError("offline")
 
@@ -1284,16 +1342,17 @@ class CursorRecoveryTests(unittest.TestCase):
             "working",
             True,
         )
+        visible.harness.reconcile.return_value = visible.reconcile_session.return_value
         reconcile_prompt_and_pane_operations(
             self.store,
             self.store.get("123456789abc"),
             now=11,
             herdr_factory=lambda: visible,
         )
-        self.assertEqual(
-            self.store.get("123456789abc").prompt_operation_state,
-            "submitted",
-        )
+        recovered = self.store.get("123456789abc")
+        self.assertEqual(recovered.prompt_operation_state, "ambiguous")
+        self.assertEqual(recovered.manual_reconcile_operation, "prompt")
+        self.assertIsNotNone(recovered.manual_reconcile_token)
 
     def test_incomplete_prompt_submit_identity_fails_closed_without_replay(
         self,
@@ -1406,11 +1465,23 @@ class CursorRecoveryTests(unittest.TestCase):
             ),
         )
         assert submitting is not None
+        submitting = self.admit_unknown_prompt_effect(submitting)
         replacement = mock.Mock()
         replacement.get_agent.return_value = {
             "state_change_seq": 8,
             "agent_session": "replacement-session",
         }
+        replacement.harness.reconcile.return_value = SessionReconciliation(
+            ReconciliationState.CHANGED,
+            HarnessSession(
+                "cursor/herdr",
+                "replacement-session",
+                "planner",
+                8,
+            ),
+            "working",
+            False,
+        )
 
         reconcile_prompt_and_pane_operations(
             self.store,

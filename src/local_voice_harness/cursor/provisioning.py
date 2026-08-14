@@ -10,7 +10,7 @@ from collections.abc import Callable, Mapping, Set
 from dataclasses import dataclass, replace
 from pathlib import Path
 
-from ..agents.harness import ReconciliationState
+from ..agents.harness import HarnessCapability, HarnessSession, ReconciliationState
 from ..diagnostic_safety import redact_diagnostic
 from ..errors import HarnessError
 from ..github_issue_creation import draft_github_issue
@@ -31,6 +31,7 @@ from ..integrations.herdr import (
     AgentSelection,
     HerdrClient,
     HerdrError,
+    PromptOutcome,
     agent_session_identity,
     extract_marker,
     normalize_name,
@@ -60,7 +61,6 @@ from ..prompt_operations import (
     PromptIdentity,
     SubmittedPrompt,
     SubmittingPrompt,
-    accept_prompt_submission,
     begin_prompt_submission,
     legacy_prompt_fields,
     mark_prompt_ambiguous,
@@ -87,6 +87,21 @@ from ..user_config import (
 )
 from . import questions as question_adapter
 from . import recovery, worker_lifecycle
+from .agent_outbox import (
+    CLARIFICATION_REPLY,
+    SESSION_CREATE,
+    TASK_SUBMIT,
+    agent_effect_handlers,
+    consume_agent_results,
+    load_session,
+    session_payload,
+)
+from .coordinator import (
+    CoordinatorCommand,
+    CoordinatorDecision,
+    DurableEffect,
+    OutboxResult,
+)
 from .model import (
     ACTIVE_STATUSES as MODEL_ACTIVE_STATUSES,
 )
@@ -110,6 +125,7 @@ from .operations import (
     SessionIdentity,
     WorkerOwnership,
 )
+from .outbox import drain_outbox
 from .prompts import (
     PromptPayload,
     PromptSizeError,
@@ -1842,6 +1858,239 @@ def _settle_worker_agent(
     return store.update(job_id, settle)
 
 
+def _reduce_agent_effect(job: CursorJob, result: OutboxResult) -> CursorJob | None:
+    if job.terminal_intent_status is not None:
+        return None
+    if result.kind in {TASK_SUBMIT, CLARIFICATION_REPLY}:
+        payload = result.payload
+        operation = job.prompt_operation
+        phase = payload.get("phase")
+        prompt_job_id = payload.get("prompt_job_id")
+        turn = payload.get("turn")
+        turn_token = payload.get("turn_token")
+        target = payload.get("target")
+        session_id = payload.get("session_id")
+        baseline = payload.get("baseline_sequence")
+        if (
+            not isinstance(phase, str)
+            or not isinstance(prompt_job_id, str)
+            or not isinstance(turn, int)
+            or isinstance(turn, bool)
+            or not isinstance(turn_token, str)
+            or not isinstance(target, str)
+            or not isinstance(session_id, str)
+            or not isinstance(baseline, int)
+            or isinstance(baseline, bool)
+        ):
+            return None
+        identity = PromptIdentity(
+            job_id=prompt_job_id,
+            phase=phase,
+            turn=turn,
+            turn_token=turn_token,
+            target=target,
+            agent_session=session_id,
+            baseline_sequence=baseline,
+        )
+        if (
+            not isinstance(operation, SubmittingPrompt)
+            or operation.identity != identity
+            or payload.get("worker_token") != job.worker_token
+        ):
+            return None
+        if result.outcome.get("outcome") != "Confirmed":
+            return job.evolve(
+                **legacy_prompt_fields(mark_prompt_ambiguous(operation, identity)),
+                manual_reconcile_operation="prompt",
+                manual_reconcile_token=uuid.uuid4().hex,
+                manual_reconcile_required_at=time.time(),
+            )
+        event = result.outcome.get("event")
+        if not isinstance(event, dict):
+            return None
+        event_session = event.get("session")
+        if not isinstance(event_session, dict):
+            return None
+        observed = load_session(event_session)
+        resolved = observe_prompt_submission(
+            operation,
+            identity,
+            target=observed.target,
+            agent_session=observed.session_id,
+            state_sequence=observed.state_sequence,
+        )
+        if not isinstance(resolved, SubmittedPrompt):
+            return job.evolve(
+                **legacy_prompt_fields(resolved),
+                manual_reconcile_operation="prompt",
+                manual_reconcile_token=uuid.uuid4().hex,
+                manual_reconcile_required_at=time.time(),
+            )
+        sessions = job.prompt_context_sessions
+        if job.active_participant is not None:
+            sessions[job.active_participant.value] = observed.session_id
+        return job.evolve_plan_approval(
+            job.plan_approval,
+            **legacy_prompt_fields(resolved),
+            prompt_context_sessions=sessions,
+            agent_state_sequence=observed.state_sequence,
+        )
+    if result.kind != SESSION_CREATE:
+        return None
+    payload = result.payload
+    if (
+        job.agent_dispatch_state != "dispatching"
+        or payload.get("worker_token") != job.worker_token
+        or payload.get("target") != job.herdr_target
+        or payload.get("pane_id") != job.herdr_pane_id
+        or payload.get("workspace_id") != job.herdr_workspace_id
+        or (
+            job.agent_operation_checkout is not None
+            and payload.get("checkout") != job.agent_operation_checkout
+        )
+    ):
+        return None
+    operation = job.agent_session_operation
+    if operation is None:
+        return None
+    if result.outcome.get("outcome") == "Confirmed":
+        session_value = result.outcome.get("session")
+        if not isinstance(session_value, dict):
+            return None
+        session = load_session(session_value)
+        observed_checkout = session.metadata.get("cwd")
+        expected_checkout = payload.get("checkout")
+        if not isinstance(expected_checkout, str) or not observed_checkout:
+            return None
+        try:
+            checkout_matches = (
+                Path(observed_checkout).resolve() == Path(expected_checkout).resolve()
+            )
+        except OSError:
+            checkout_matches = False
+        if (
+            session.provider != payload.get("provider")
+            or session.target != job.herdr_target
+            or session.metadata.get("pane_id") != job.herdr_pane_id
+            or session.metadata.get("workspace_id") != job.herdr_workspace_id
+            or not checkout_matches
+        ):
+            return None
+        identity = SessionIdentity(
+            session.provider,
+            session.session_id,
+            session.target,
+            session.state_sequence,
+        )
+        operation.transition(OperationState.SETTLED, session=identity)
+        return transition(
+            job,
+            job.status,
+            agent_dispatch_state="ready",
+            agent_provider=session.provider,
+            agent_provider_session_id=session.session_id,
+            agent_state_sequence=session.state_sequence,
+            worker_operation=None,
+        )
+    operation.transition(OperationState.UNKNOWN)
+    outcome = str(result.outcome.get("outcome") or "")
+    return job.evolve(
+        agent_dispatch_state=(
+            "ambiguous"
+            if outcome in {"OutcomeUnknown", "ManualRequired"}
+            else "failed_observing"
+        ),
+        agent_dispatch_exited=True,
+        agent_reconcile_attempts=0,
+        agent_next_reconcile_at=time.time(),
+        worker_operation=None,
+    )
+
+
+def _execute_session_create_effect(
+    store: JobStore,
+    job: CursorJob,
+    client: HerdrClient,
+    *,
+    mode: str | None,
+) -> AgentSelection:
+    target = job.herdr_target or ""
+    pane_id = job.herdr_pane_id or ""
+    workspace_id = job.herdr_workspace_id or ""
+    checkout = job.agent_operation_checkout or job.worktree_path or ""
+    if (
+        job.agent_dispatch_state != "dispatching"
+        or not target
+        or not pane_id
+        or not workspace_id
+        or not checkout
+        or not job.worker_token
+    ):
+        raise HarnessError("session.create requires a reserved launch context")
+    idempotency_key = f"{SESSION_CREATE}:{job.id}:{target}:{pane_id}:{workspace_id}"
+    expected_observation_revision = job.revision + 1
+    payload: Mapping[str, object] = {
+        "name": job.agent_name or target,
+        "provider": "cursor/herdr",
+        "mode": mode,
+        "launch_context": {
+            "pane_id": pane_id,
+            "workspace_id": workspace_id,
+        },
+        "required_capabilities": [HarnessCapability.MCP_CONNECTORS.value],
+        "target": target,
+        "pane_id": pane_id,
+        "workspace_id": workspace_id,
+        "checkout": checkout,
+        "worker_token": job.worker_token,
+        "expected_revision": expected_observation_revision,
+    }
+    admitted = store.apply(
+        CoordinatorCommand(
+            job_id=job.id,
+            expected_revision=job.revision,
+            command_id=f"admit:{idempotency_key}",
+            kind=f"{SESSION_CREATE}.admit",
+        ),
+        lambda current: CoordinatorDecision(
+            job=current.evolve(),
+            effects=(
+                DurableEffect(
+                    kind=SESSION_CREATE,
+                    idempotency_key=idempotency_key,
+                    concurrency_key=f"cursor/herdr:{target}",
+                    payload=payload,
+                ),
+            ),
+            event_kind=f"{SESSION_CREATE}.admitted",
+        ),
+    )
+    if admitted is None:
+        raise WorkerCancelled
+    drain_outbox(store, agent_effect_handlers(client.harness), limit=1)
+    consume_agent_results(store, _reduce_agent_effect)
+    current = store.get(job.id)
+    if current.agent_dispatch_state != "ready":
+        code = (
+            "operation_ambiguous"
+            if current.agent_dispatch_state
+            in {"ambiguous", "failed_observing", "manual_required"}
+            else "operation_timeout"
+        )
+        raise HerdrError("durable session creation did not settle", code=code)
+    return AgentSelection(
+        target=current.herdr_target or target,
+        pane_id=current.herdr_pane_id or pane_id,
+        workspace_id=current.herdr_workspace_id or workspace_id,
+        cwd=checkout,
+        name=current.agent_name or target,
+        worktree_path=current.worktree_path,
+        provider=current.agent_provider,
+        provider_session_id=current.agent_provider_session_id,
+        state_sequence=current.agent_state_sequence,
+    )
+
+
 def _failed_operation_state(exc: HerdrError) -> str:
     return (
         "ambiguous"
@@ -2316,26 +2565,12 @@ def _provision_followup_agent(
     if reserved_job is None:
         raise HarnessError("could not reserve a Cursor agent for the follow-up")
     checkpoint()
-    try:
-        selection = client.start_agent(
-            checkout,
-            label,
-            pane,
-            workspace_id,
-            name=name,
-            mode="plan",
-            checkpoint=checkpoint,
-        )
-    except HerdrError as exc:
-        failed = _fail_worker_agent_dispatch(
-            store,
-            job_id,
-            token,
-            exc,
-            expected_revision=reserved_job.revision,
-        )
-        _carry_observed_revision(exc, failed)
-        raise
+    selection = _execute_session_create_effect(
+        store,
+        reserved_job,
+        client,
+        mode="plan",
+    )
     if selection.target != name:
         error = HerdrError(
             "Herdr started a different follow-up agent than the reserved target",
@@ -2357,16 +2592,7 @@ def _provision_followup_agent(
         expected_pane_id=pane,
         expected_workspace_id=workspace_id,
     )
-    reserved_job = _settle_worker_agent(
-        store,
-        job_id,
-        token,
-        selection,
-        expected_revision=reserved_job.revision,
-    )
-    if reserved_job is None:
-        raise HarnessError("could not reserve a Cursor agent for the follow-up")
-    return reserved_job, selection.target
+    return store.get(job_id), selection.target
 
 
 _HARD_RISK_TERMS = (
@@ -3528,7 +3754,21 @@ def _ensure_workflow_participant(
             fail_agent=fail_agent,
             before_pane_submit=before_pane_submit,
             pane_accepted=pane_accepted,
+            start_session=False,
         )
+        if selection.provider_session_id is None:
+            selection = _execute_session_create_effect(
+                store,
+                store.get(job.id),
+                client,
+                mode=(
+                    "ask"
+                    if participant == WorkflowParticipant.REVIEWER
+                    else (
+                        "plan" if participant == WorkflowParticipant.PLANNER else None
+                    )
+                ),
+            )
     except HerdrError as exc:
         fenced = _fence_participant_creation(
             store,
@@ -3817,13 +4057,13 @@ def _execute_phase_prompt(
     if state != "planned":
         raise HarnessError(f"invalid durable prompt state {state}")
 
-    operation_baseline = job.prompt_baseline_sequence
     planned_operation = job.prompt_operation
     if not isinstance(planned_operation, PlannedPrompt):
         raise HarnessError(
             f"invalid durable prompt state {planned_operation.state.value}"
         )
     prompt_identity = planned_operation.identity
+    operation_baseline = prompt_identity.baseline_sequence
     if payload is None:
         session_identity = job.prompt_operation_agent_session
         manifest = job.prompt_manifest
@@ -3837,124 +4077,146 @@ def _execute_phase_prompt(
         ) or bool(manifest and manifest.get("full_rehydration"))
         payload = build_prompt(session_identity, full_rehydration)
     prompt = payload.text
-    callback_revision = job.revision
+    clarification = bool(
+        job.continuation and job.continuation_answer and not full_rehydration
+    )
+    effect_kind = CLARIFICATION_REPLY if clarification else TASK_SUBMIT
+    idempotency_key = f"{effect_kind}:{job.id}:{phase.value}:{token}"
+    provider_session = job.prompt_operation_agent_session or ""
+    session = HarnessSession(
+        provider=job.agent_provider or "cursor/herdr",
+        session_id=provider_session,
+        target=target,
+        state_sequence=operation_baseline,
+        metadata={
+            "pane_id": job.herdr_pane_id or "",
+            "workspace_id": job.herdr_workspace_id or "",
+            "cwd": job.worktree_path or job.repository or "",
+        },
+    )
+    expected_observation_revision = job.revision + 1
+    effect_payload: Mapping[str, object] = {
+        "session": session_payload(session),
+        "text": prompt,
+        "correlation_id": token,
+        "baseline_sequence": operation_baseline,
+        "expected_revision": expected_observation_revision,
+        "phase": prompt_identity.phase,
+        "prompt_job_id": prompt_identity.job_id,
+        "turn": prompt_identity.turn,
+        "turn_token": prompt_identity.turn_token,
+        "target": prompt_identity.target,
+        "session_id": prompt_identity.agent_session,
+        "worker_token": job.worker_token or "",
+        "completion_marker": (
+            "WORKFLOW_PLAN"
+            if phase in {WorkflowPhase.PLANNING, WorkflowPhase.REVISING}
+            else None
+        ),
+        "allow_interactive_boundary": phase
+        in {WorkflowPhase.PLANNING, WorkflowPhase.REVISING},
+        "allow_fallback_submit": True,
+        "count_plan_approval": (
+            job.plan_approval_source == "explicit" and job.plan_approval_id is not None
+        ),
+    }
 
-    def before_submit(observed_baseline: int) -> None:
-        nonlocal callback_revision
-        if observed_baseline != operation_baseline:
-            raise HarnessError("Cursor prompt baseline changed before submission")
+    def admit(current: CursorJob) -> CoordinatorDecision | None:
+        if not _worker_owned(current, worker_token):
+            return None
+        operation = begin_prompt_submission(
+            current.prompt_operation,
+            prompt_identity,
+        )
+        return CoordinatorDecision(
+            job=current.evolve(**legacy_prompt_fields(operation)),
+            effects=(
+                DurableEffect(
+                    kind=effect_kind,
+                    idempotency_key=idempotency_key,
+                    concurrency_key=f"{session.provider}:{target}",
+                    payload=effect_payload,
+                ),
+            ),
+            event_kind=f"{effect_kind}.admitted",
+        )
 
-        def mark_submitting(current: CursorJob) -> CursorJob:
-            operation = begin_prompt_submission(
-                current.prompt_operation,
-                prompt_identity,
-            )
-            return current.evolve(**legacy_prompt_fields(operation))
-
-        updated = _worker_change(
+    admitted = store.apply(
+        CoordinatorCommand(
+            job_id=job.id,
+            expected_revision=job.revision,
+            command_id=f"admit:{idempotency_key}",
+            kind=f"{effect_kind}.admit",
+        ),
+        admit,
+    )
+    if admitted is None:
+        raise WorkerCancelled
+    handlers = agent_effect_handlers(client.harness)
+    drain_outbox(store, {effect_kind: handlers[effect_kind]}, limit=1)
+    terminal = next(
+        (
+            result
+            for result in store.unconsumed_outbox_results((effect_kind,))
+            if result.idempotency_key == idempotency_key
+        ),
+        None,
+    )
+    consume_agent_results(store, _reduce_agent_effect)
+    observed_job = store.get(job.id)
+    callback_revision = observed_job.revision
+    if terminal is None or terminal.outcome.get("outcome") != "Confirmed":
+        exc = HerdrError(
+            "durable prompt submission did not settle",
+            code=(
+                "operation_ambiguous"
+                if observed_job.prompt_operation_state == "ambiguous"
+                else "operation_timeout"
+            ),
+        )
+        _carry_observed_revision(exc, observed_job)
+        raise exc
+    if observed_job.prompt_operation_state != "submitted":
+        raise WorkerCancelled
+    if bool(effect_payload["count_plan_approval"]) and _accepted_explicit_plan_approval(
+        observed_job
+    ):
+        counted = _worker_change(
             store,
             job.id,
             worker_token,
             MODEL_WORKER_STATUSES,
-            mark_submitting,
+            lambda current: current.evolve_plan_approval(
+                current.plan_approval.count()
+                if not current.plan_approval.counted
+                else current.plan_approval
+            ),
             expected_revision=callback_revision,
         )
-        if updated is None:
+        if counted is None:
             raise WorkerCancelled
-        callback_revision = updated.revision
-
-    def accepted() -> None:
-        nonlocal callback_revision
-        counted = _accepted_explicit_plan_approval(job)
-
-        def mark_submitted(current: CursorJob) -> CursorJob:
-            operation = accept_prompt_submission(
-                current.prompt_operation,
-                prompt_identity,
-            )
-            sessions = current.prompt_context_sessions
-            if (
-                current.active_participant is not None
-                and current.prompt_operation_agent_session is not None
-            ):
-                sessions[current.active_participant.value] = (
-                    current.prompt_operation_agent_session
-                )
-            approval = current.plan_approval
-            if counted and not approval.counted:
-                approval = approval.count()
-            return current.evolve_plan_approval(
-                approval,
-                **legacy_prompt_fields(operation),
-                prompt_context_sessions=sessions,
-            )
-
-        updated = _worker_change(
-            store,
-            job.id,
-            worker_token,
-            MODEL_WORKER_STATUSES,
-            mark_submitted,
-            expected_revision=callback_revision,
-        )
-        if updated is None:
-            raise WorkerCancelled
-        callback_revision = updated.revision
-
-    try:
-        outcome = client.prompt_and_wait(
-            target,
-            prompt,
-            token=token,
-            checkpoint=checkpoint,
-            baseline_sequence=job.prompt_baseline_sequence,
-            before_submit=before_submit,
-            accepted=accepted,
-            expected_agent_session=job.prompt_operation_agent_session,
-            active_marker=(
-                "WORKFLOW_PLAN"
-                if phase in {WorkflowPhase.PLANNING, WorkflowPhase.REVISING}
-                else None
-            ),
-            allow_interactive_plan_boundary=phase
-            in {WorkflowPhase.PLANNING, WorkflowPhase.REVISING},
-            clarification_reply=bool(
-                job.continuation and job.continuation_answer and not full_rehydration
-            ),
-        )
-    except HerdrError as exc:
-        if exc.code == "interactive_questionnaire":
-            current = store.get(job.id)
-            if current.prompt_operation_state == "planned":
-                raise
-        # Third-party/test clients that fail before invoking the callback still
-        # crossed the call boundary. Conservatively fence the operation.
-        fenced = _worker_change(
-            store,
-            job.id,
-            worker_token,
-            MODEL_WORKER_STATUSES,
-            lambda current: (
-                current.evolve(
-                    **legacy_prompt_fields(
-                        mark_prompt_ambiguous(
-                            current.prompt_operation,
-                            prompt_identity,
-                        )
-                    ),
-                    manual_reconcile_operation="prompt",
-                    manual_reconcile_token=uuid.uuid4().hex,
-                    manual_reconcile_required_at=time.time(),
-                )
-                if _worker_owned(current, worker_token)
-                and current.prompt_operation_state
-                in {"planned", "submitting", "submitted"}
-                else None
-            ),
-            expected_revision=callback_revision,
-        )
-        _carry_observed_revision(exc, fenced)
-        raise
+        observed_job = counted
+        callback_revision = counted.revision
+    event = terminal.outcome.get("event")
+    if not isinstance(event, dict):
+        raise HarnessError("durable prompt observation has no event")
+    event_session_value = event.get("session")
+    if not isinstance(event_session_value, dict):
+        raise HarnessError("durable prompt observation has no session")
+    event_session = load_session(event_session_value)
+    outcome = PromptOutcome(
+        status=str(event.get("status") or "unknown"),
+        summary=(str(event["summary"]) if event.get("summary") is not None else None),
+        question=(
+            str(event["question"]) if event.get("question") is not None else None
+        ),
+        output=str(event.get("output") or ""),
+        agent_session=event_session.session_id,
+        state_change_sequence=event_session.state_sequence,
+        revision=(
+            event["revision"] if isinstance(event.get("revision"), int) else None
+        ),
+    )
     checkpoint()
     if phase in {WorkflowPhase.PLANNING, WorkflowPhase.REVISING}:
         job = _record_plan_boundary(
@@ -4406,20 +4668,22 @@ def run_claimed_worker(  # pyright: ignore[reportGeneralTypeIssues]
                         state_sequence=sequence,
                     )
                 else:
-                    selection = client.start_agent(
-                        Path(checkout_value),
-                        Path(repository_value).name,
-                        pane,
-                        workspace,
-                        name=job.agent_name or target,
-                        checkpoint=checkpoint,
+                    selection = _execute_session_create_effect(
+                        store,
+                        job,
+                        client,
+                        mode=None,
                     )
-                updated = _settle_worker_agent(
-                    store,
-                    job_id,
-                    worker_token,
-                    selection,
-                    expected_revision=job.revision,
+                updated = (
+                    store.get(job_id)
+                    if legacy_agent is None
+                    else _settle_worker_agent(
+                        store,
+                        job_id,
+                        worker_token,
+                        selection,
+                        expected_revision=job.revision,
+                    )
                 )
                 if updated is None:
                     return
@@ -5109,9 +5373,23 @@ def run_claimed_worker(  # pyright: ignore[reportGeneralTypeIssues]
                             if job.participant_creation_state == "planned"
                             else None
                         ),
+                        start_session=False,
                     )
                     if not agent_settled:
-                        reserve_selection(selection, False)
+                        if selection.provider_session_id is not None:
+                            reserve_selection(selection, False)
+                        else:
+                            selection = _execute_session_create_effect(
+                                store,
+                                store.get(job_id),
+                                client,
+                                mode="plan",
+                            )
+                            reservation = store.get(job_id)
+                            job = reservation
+                            callback_revision[0] = reservation.revision
+                            target = selection.target
+                            agent_settled = True
                     checkpoint()
                     break
                 except ReservationConflict:

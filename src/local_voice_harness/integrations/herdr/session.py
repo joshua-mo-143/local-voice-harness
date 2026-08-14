@@ -8,6 +8,7 @@ from typing import Any, Protocol
 
 from ...agents.harness import (
     AgentHarness,
+    BeforeDispatch,
     HarnessCapability,
     HarnessEvent,
     HarnessEventKind,
@@ -90,6 +91,7 @@ class HerdrSession(AgentHarness):
         request: SessionRequest,
         *,
         checkpoint: Checkpoint | None = None,
+        before_submit: BeforeDispatch | None = None,
     ) -> HarnessSession:
         require_capabilities(
             self.provider, self.capabilities, request.required_capabilities
@@ -110,6 +112,8 @@ class HerdrSession(AgentHarness):
             )
         if checkpoint is not None:
             checkpoint()
+        if before_submit is not None:
+            before_submit()
         agent_args = ["--trust", "--approve-mcps"]
         if request.mode is not None:
             agent_args.extend(["--mode", request.mode])
@@ -411,9 +415,11 @@ class HerdrSession(AgentHarness):
             accepted=accepted,
             before_agent=before_agent,
             after_submit=after_submit,
-            active_marker=active_marker,
-            allow_interactive_plan_boundary=allow_interactive_plan_boundary,
-            allow_enter_fallback=allow_enter_fallback,
+            active_marker=active_marker or task.completion_marker,
+            allow_interactive_plan_boundary=(
+                allow_interactive_plan_boundary or task.allow_interactive_boundary
+            ),
+            allow_enter_fallback=(allow_enter_fallback and task.allow_fallback_submit),
         )
 
     def reply_to_clarification(
@@ -513,6 +519,7 @@ class HerdrSession(AgentHarness):
                 if outcome.status in {"blocked", "unknown"} and not outcome.question
                 else None
             ),
+            revision=outcome.revision,
         )
 
     def prompt_and_wait(

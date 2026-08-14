@@ -340,6 +340,7 @@ def test_fresh_store_uses_normalized_private_wal_database(tmp_path: Path) -> Non
             "artifacts",
             "outbox",
             "outbox_concurrency",
+            "outbox_consumptions",
             "events",
         } <= tables
         columns = {row[1] for row in connection.execute("PRAGMA table_info(jobs)")}
