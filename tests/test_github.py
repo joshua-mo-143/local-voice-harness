@@ -9,6 +9,7 @@ from unittest import mock
 
 from local_voice_harness.integrations.github import (
     GitHubClient,
+    GitHubCommandStartError,
     GitHubError,
     GitHubIssue,
     GitHubIssueCreationPlan,
@@ -324,7 +325,7 @@ class GitHubClientTests(unittest.TestCase):
             with (
                 self.subTest(url=url),
                 mock.patch.object(client, "_run", return_value=_completed(url)),
-                self.assertRaises(GitHubError),
+                self.assertRaises(GitHubOperationAmbiguous),
             ):
                 client.submit_issue(plan, confirmed=True)
 
@@ -337,6 +338,35 @@ class GitHubClientTests(unittest.TestCase):
                 side_effect=subprocess.TimeoutExpired(["gh", "issue", "create"], 30),
             ),
             self.assertRaises(GitHubOperationAmbiguous),
+        ):
+            client.submit_issue(plan, confirmed=True)
+
+    def test_issue_submission_nonzero_exit_is_ambiguous(self) -> None:
+        client = GitHubClient()
+        plan = GitHubIssueCreationPlan("example/project", "Title", "Body", "a" * 32)
+        with (
+            mock.patch(
+                "local_voice_harness.integrations.github.run_command",
+                return_value=_completed(
+                    stderr="connection closed after response", returncode=1
+                ),
+            ),
+            self.assertRaisesRegex(
+                GitHubOperationAmbiguous,
+                "write exited without proving.*side effect may already",
+            ),
+        ):
+            client.submit_issue(plan, confirmed=True)
+
+    def test_issue_submission_start_failure_is_definitive(self) -> None:
+        client = GitHubClient()
+        plan = GitHubIssueCreationPlan("example/project", "Title", "Body", "a" * 32)
+        with (
+            mock.patch(
+                "local_voice_harness.integrations.github.run_command",
+                side_effect=OSError("executable missing"),
+            ),
+            self.assertRaisesRegex(GitHubCommandStartError, "failed to start"),
         ):
             client.submit_issue(plan, confirmed=True)
 
@@ -520,8 +550,9 @@ class GitHubClientTests(unittest.TestCase):
         events: list[str] = []
 
         def submit(
-            command: list[str], *, timeout: float = 30
+            command: list[str], *, timeout: float = 30, write: bool = False
         ) -> subprocess.CompletedProcess[str]:
+            self.assertTrue(write)
             events.append("submit")
             return _completed()
 
@@ -543,6 +574,7 @@ class GitHubClientTests(unittest.TestCase):
         run.assert_called_once_with(
             ["gh", "repo", "fork", "source/project", "--clone=false"],
             timeout=120,
+            write=True,
         )
 
     def test_public_fork_provisioning_requires_confirmation(self) -> None:

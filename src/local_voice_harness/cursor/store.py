@@ -1266,90 +1266,110 @@ def migrate_legacy_jobs(
     jobs_dir: Path,
     *,
     inspect_worker: LegacyWorkerInspector | None = None,
+    migrated_sources: dict[Path, str] | None = None,
 ) -> set[str]:
     """Import runtime-era job JSON into the durable store exactly once."""
-    blocked: set[str] = set()
     if not legacy_dir.is_dir() or legacy_dir.resolve() == jobs_dir.resolve():
-        return blocked
+        return set()
     with locked(legacy_dir), locked(jobs_dir):
-        if _read_maintenance_unlocked(jobs_dir) is not None:
-            return blocked
-        for source in sorted(legacy_dir.glob("*.json")):
-            destination = jobs_dir / source.name
-            preserve_source = False
-            try:
-                candidate = _parse_path(source)
-                preserve_source = _has_legacy_worker_claim(candidate)
-                if candidate.id != source.stem:
-                    raise JobValidationError("Cursor job id must match its filename")
-                existing: CursorJob | None = None
-                if destination.exists():
-                    try:
-                        existing = _read_model_unlocked(destination)
-                    except JobQuarantinedError:
-                        existing = None
-                if existing is not None:
-                    if (
-                        existing.id != candidate.id
-                        or existing.created_at != candidate.created_at
-                    ):
-                        raise JobValidationError(
-                            "legacy import identity/created_at lineage conflicts "
-                            "with the durable job"
-                        )
-                disposition: LegacyWorkerDisposition | None = None
-                if _has_legacy_worker_claim(candidate):
-                    disposition = (
-                        inspect_worker(candidate)
-                        if inspect_worker is not None
-                        else "unsafe"
+        return _migrate_legacy_jobs_unlocked(
+            legacy_dir,
+            jobs_dir,
+            inspect_worker=inspect_worker,
+            migrated_sources=migrated_sources,
+        )
+
+
+def _migrate_legacy_jobs_unlocked(
+    legacy_dir: Path,
+    jobs_dir: Path,
+    *,
+    inspect_worker: LegacyWorkerInspector | None = None,
+    migrated_sources: dict[Path, str] | None = None,
+) -> set[str]:
+    blocked: set[str] = set()
+    if _read_maintenance_unlocked(jobs_dir) is not None:
+        return blocked
+    for source in sorted(legacy_dir.glob("*.json")):
+        destination = jobs_dir / source.name
+        preserve_source = False
+        try:
+            candidate = _parse_path(source)
+            preserve_source = _has_legacy_worker_claim(candidate)
+            if candidate.id != source.stem:
+                raise JobValidationError("Cursor job id must match its filename")
+            existing: CursorJob | None = None
+            if destination.exists():
+                try:
+                    existing = _read_model_unlocked(destination)
+                except JobQuarantinedError:
+                    existing = None
+            if existing is not None:
+                if (
+                    existing.id != candidate.id
+                    or existing.created_at != candidate.created_at
+                ):
+                    raise JobValidationError(
+                        "legacy import identity/created_at lineage conflicts "
+                        "with the durable job"
                     )
-                    if disposition == "unsafe":
-                        blocked.add(candidate.id)
-                        _quarantine_import(
-                            source,
-                            jobs_dir,
-                            JobValidationError(
-                                "active legacy worker could not be stopped safely; "
-                                "manual recovery is required"
-                            ),
-                            remove_source=False,
-                        )
-                        continue
-                candidate = _normalize_for_durable_write(
-                    candidate,
-                    legacy_worker_disposition=disposition,
+            disposition: LegacyWorkerDisposition | None = None
+            if _has_legacy_worker_claim(candidate):
+                disposition = (
+                    inspect_worker(candidate)
+                    if inspect_worker is not None
+                    else "unsafe"
                 )
-                if existing is not None:
-                    if existing.revision > candidate.revision:
-                        source.unlink()
-                        _fsync_directory(legacy_dir)
-                        continue
-                    if existing.revision == candidate.revision:
-                        if existing.to_record() != candidate.to_record():
-                            raise JobValidationError(
-                                "legacy import conflicts with durable job at the "
-                                "same revision"
-                            )
-                        source.unlink()
-                        _fsync_directory(legacy_dir)
-                        continue
-                _validate_candidate_reservations_unlocked(
-                    destination,
-                    candidate,
-                    existing,
-                )
-                _atomic_json(destination, candidate.to_record())
-                source.unlink()
-                _fsync_directory(legacy_dir)
-            except JobValidationError as error:
-                if source.exists():
+                if disposition == "unsafe":
+                    blocked.add(candidate.id)
                     _quarantine_import(
                         source,
                         jobs_dir,
-                        error,
-                        remove_source=not preserve_source,
+                        JobValidationError(
+                            "active legacy worker could not be stopped safely; "
+                            "manual recovery is required"
+                        ),
+                        remove_source=False,
                     )
+                    continue
+            candidate = _normalize_for_durable_write(
+                candidate,
+                legacy_worker_disposition=disposition,
+            )
+            if existing is not None:
+                if existing.revision > candidate.revision:
+                    source.unlink()
+                    _fsync_directory(legacy_dir)
+                    continue
+                if existing.revision == candidate.revision:
+                    if existing.to_record() != candidate.to_record():
+                        raise JobValidationError(
+                            "legacy import conflicts with durable job at the "
+                            "same revision"
+                        )
+                    source.unlink()
+                    _fsync_directory(legacy_dir)
+                    continue
+            _validate_candidate_reservations_unlocked(
+                destination,
+                candidate,
+                existing,
+            )
+            _atomic_json(destination, candidate.to_record())
+            if migrated_sources is not None:
+                migrated_sources[destination] = hashlib.sha256(
+                    destination.read_bytes()
+                ).hexdigest()
+            source.unlink()
+            _fsync_directory(legacy_dir)
+        except JobValidationError as error:
+            if source.exists():
+                _quarantine_import(
+                    source,
+                    jobs_dir,
+                    error,
+                    remove_source=not preserve_source,
+                )
     return blocked
 
 
@@ -2269,11 +2289,14 @@ class JobStore:
                 count += 1
         return count
 
-    def _import_json_sources(self) -> set[str]:
+    def _import_json_sources(
+        self, *, superseding_sources: dict[Path, str] | None = None
+    ) -> set[str]:
         archived: list[Path] = []
         failed_sources: list[Path] = []
         blocked: set[str] = set()
         with self._db.transaction() as connection:
+            cutover_complete = self._db.meta(connection, "cutover_complete") == "1"
             quarantine_count = self._import_quarantine_rows(connection)
             sources = sorted(self.durable_dir.glob("*.json"))
             invalid_sources: set[Path] = set()
@@ -2324,6 +2347,19 @@ class JobStore:
                                 "import identity/created_at lineage conflicts "
                                 "with the durable job"
                             )
+                        may_supersede = (
+                            superseding_sources is not None
+                            and superseding_sources.get(source)
+                            == hashlib.sha256(source.read_bytes()).hexdigest()
+                        )
+                        if cutover_complete and not may_supersede:
+                            if current.to_dict() != candidate.to_dict():
+                                raise JobValidationError(
+                                    "post-cutover import conflicts with the "
+                                    "authoritative SQLite job"
+                                )
+                            archived.append(source)
+                            continue
                         if current.revision > candidate.revision:
                             archived.append(source)
                             continue
@@ -2453,12 +2489,21 @@ class JobStore:
         self, *, inspect_worker: LegacyWorkerInspector | None = None
     ) -> set[str]:
         self._ensure_ready()
-        blocked = migrate_legacy_jobs(
-            self.legacy_dir,
-            self.durable_dir,
-            inspect_worker=inspect_worker,
-        )
-        blocked.update(self._import_json_sources())
+        migrated_sources: dict[Path, str] = {}
+        with self._locked_legacy_and_durable():
+            blocked = (
+                _migrate_legacy_jobs_unlocked(
+                    self.legacy_dir,
+                    self.durable_dir,
+                    inspect_worker=inspect_worker,
+                    migrated_sources=migrated_sources,
+                )
+                if self.legacy_dir.resolve() != self.durable_dir.resolve()
+                else set()
+            )
+            blocked.update(
+                self._import_json_sources(superseding_sources=migrated_sources)
+            )
         return blocked
 
     def get(self, job_id: str) -> CursorJob:

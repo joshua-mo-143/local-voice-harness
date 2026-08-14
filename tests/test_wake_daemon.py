@@ -788,19 +788,55 @@ class ProcessUtteranceTests(unittest.TestCase):
 
         self.assertEqual(daemon.cursor_session, "job1")
 
-    def test_empty_wake_phrase_waits_for_followup(self) -> None:
+    def test_phrase_only_wake_activation_notifies_once_and_waits_for_followup(
+        self,
+    ) -> None:
         daemon = _bare_daemon()
+        daemon.np = mock.Mock()  # type: ignore[assignment]
+        daemon.wake_key = "wake"
+        daemon.wake_model.predict.return_value = {
+            "wake": daemon.audio.wake_threshold + 0.1
+        }
+        daemon.start_microphone = lambda: None  # type: ignore[method-assign]
+        daemon.read_frame = lambda: b"wake"  # type: ignore[method-assign]
+
+        def stop_after_processing(_interruption: wake_daemon.BargeIn | None) -> None:
+            daemon.running = False
+
         with (
             mock.patch.object(wake_daemon, "transcribe", return_value="hey jarvis"),
-            mock.patch.object(wake_daemon, "start_components"),
+            mock.patch.object(
+                daemon,
+                "record_utterance_safely",
+                return_value=AUDIO_GENERATION,
+            ),
+            mock.patch.object(
+                daemon,
+                "continue_after_barge_in",
+                side_effect=stop_after_processing,
+            ),
+            mock.patch.object(daemon, "begin_activation") as begin_activation,
             mock.patch.object(wake_daemon, "qwen_turn") as qwen_turn,
-            mock.patch.object(daemon, "_drain_playback_queue") as play,
-            mock.patch.object(wake_daemon, "notify"),
+            mock.patch.object(wake_daemon, "cursor_turn") as cursor_turn,
+            mock.patch.object(daemon, "play_response") as play_response,
+            mock.patch.object(daemon, "_drain_playback_queue") as drain_playback,
+            mock.patch.object(wake_daemon, "recover_jobs"),
+            mock.patch.object(
+                wake_daemon,
+                "drain_pending_announcements",
+                return_value=announcement_policy.DrainResult(),
+            ),
+            mock.patch.object(wake_daemon, "log"),
+            mock.patch.object(wake_daemon, "notify") as notify,
         ):
-            daemon.process_utterance(AUDIO_GENERATION, woke=True)
+            daemon.run()
 
+        notify.assert_called_once_with("Wake detected — listening…")
+        begin_activation.assert_called_once_with()
         qwen_turn.assert_not_called()
-        play.assert_not_called()
+        cursor_turn.assert_not_called()
+        play_response.assert_not_called()
+        drain_playback.assert_not_called()
         self.assertTrue(daemon.awaiting_followup)
         self.assertGreater(daemon.conversation_deadline, 0.0)
 

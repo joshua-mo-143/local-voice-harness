@@ -27,6 +27,11 @@ branch-specific backend configuration belongs at
 `.dev/state/voice-harness/`, and launcher dependencies stay in `.dev/venv`.
 The checkout-local jobs database is explicitly
 `<checkout>/.dev/state/voice-harness/jobs/jobs.sqlite3`.
+All launcher commands in one checkout share that database, while launchers in
+different checkout or worktree roots use distinct databases. The launcher also
+removes an inherited systemd `STATE_DIRECTORY` before starting Python, so a shell
+carrying the installed service environment cannot override `.dev/state` or select
+the production jobs database.
 Existing `VOICE_HARNESS_*` values are inherited, so temporary overrides remain
 available:
 

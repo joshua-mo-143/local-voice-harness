@@ -10,6 +10,7 @@ import warnings
 from pathlib import Path
 from unittest import mock
 
+from local_voice_harness.cursor import store as store_module
 from local_voice_harness.cursor.model import (
     CURRENT_SCHEMA_VERSION,
     CursorJob,
@@ -1426,6 +1427,220 @@ class CursorStoreIntegrationTests(unittest.TestCase):
         self.assertTrue(all(isinstance(job, CursorJob) for job in store.list()))
         self.assertEqual(updated.revision, 1)
         self.assertEqual(store.get(created.id).revision, 1)
+
+    def test_post_cutover_higher_revision_json_cannot_replace_sqlite_fences(
+        self,
+    ) -> None:
+        store = JobStore(self.jobs_dir, self.jobs_dir / "legacy")
+        authoritative = store.create(
+            CursorJob.from_dict(
+                self.job(
+                    "aaaaaaaaaaaa",
+                    status="running",
+                    herdr_target="owned-agent",
+                    worktree_path="/worktrees/owned",
+                )
+            )
+        )
+        before = authoritative.to_dict()
+        source = self.jobs_dir / "aaaaaaaaaaaa.json"
+        source.write_text(
+            json.dumps(
+                self.job(
+                    "aaaaaaaaaaaa",
+                    revision=authoritative.revision + 5,
+                    request="supersede SQLite",
+                )
+            )
+        )
+
+        with self.assertWarnsRegex(JobQuarantineWarning, "authoritative SQLite job"):
+            observed = store.get(authoritative.id)
+
+        self.assertEqual(observed.to_dict(), before)
+        self.assertFalse(source.exists())
+        self.assertTrue(list(self.jobs_dir.glob("aaaaaaaaaaaa.json*.failed")))
+        with self.assertRaisesRegex(JobValidationError, "reserved by both"):
+            store.create(
+                CursorJob.from_dict(
+                    self.job("bbbbbbbbbbbb", herdr_target="owned-agent")
+                )
+            )
+        with self.assertRaisesRegex(JobValidationError, "reserved by both"):
+            store.create(
+                CursorJob.from_dict(
+                    self.job("cccccccccccc", worktree_path="/worktrees/owned")
+                )
+            )
+
+    def test_post_cutover_equal_revision_conflict_preserves_terminal_fence(
+        self,
+    ) -> None:
+        store = JobStore(self.jobs_dir, self.jobs_dir / "legacy")
+        authoritative = store.create(
+            CursorJob.from_dict(
+                self.job(
+                    "aaaaaaaaaaaa",
+                    status="failed",
+                    completed_at=2,
+                    error="timed out",
+                    result="timed out",
+                    herdr_target="late-agent",
+                    agent_dispatch_state="ambiguous",
+                    cancellation_reconciliation_pending=True,
+                )
+            )
+        )
+        before = authoritative.to_dict()
+        conflicting = authoritative.to_dict()
+        conflicting["request"] = "same revision conflict"
+        (self.jobs_dir / "aaaaaaaaaaaa.json").write_text(json.dumps(conflicting))
+
+        with self.assertWarnsRegex(JobQuarantineWarning, "authoritative SQLite job"):
+            jobs = store.list()
+
+        self.assertEqual([job.to_dict() for job in jobs], [before])
+        with self.assertRaisesRegex(
+            JobValidationError,
+            "blocked by unresolved quarantine evidence|reserved by both",
+        ):
+            store.create(
+                CursorJob.from_dict(self.job("bbbbbbbbbbbb", herdr_target="late-agent"))
+            )
+
+    def test_post_cutover_missing_json_imports_and_quarantines_by_contract(
+        self,
+    ) -> None:
+        store = JobStore(self.jobs_dir, self.jobs_dir / "legacy")
+        self.assertEqual(store.list(), [])
+        (self.jobs_dir / "aaaaaaaaaaaa.json").write_text(
+            json.dumps(self.job("aaaaaaaaaaaa", herdr_target="imported-agent"))
+        )
+        imported = store.get("aaaaaaaaaaaa")
+        self.assertEqual(imported.herdr_target, "imported-agent")
+        self.assertTrue((self.jobs_dir / "aaaaaaaaaaaa.json.imported").exists())
+
+        (self.jobs_dir / "bbbbbbbbbbbb.json").write_text("{not JSON")
+
+        with self.assertWarnsRegex(JobQuarantineWarning, "invalid JSON"):
+            created = store.create(CursorJob.from_dict(self.job("cccccccccccc")))
+
+        self.assertEqual(created.id, "cccccccccccc")
+        self.assertEqual(
+            {job.id for job in store.list()}, {"aaaaaaaaaaaa", "cccccccccccc"}
+        )
+        self.assertTrue(list(self.jobs_dir.glob("bbbbbbbbbbbb.json*.failed")))
+        evidence = store.list_quarantine_evidence()
+        self.assertEqual([record.job_id for record in evidence], ["bbbbbbbbbbbb"])
+
+    def test_explicit_legacy_migration_can_supersede_after_cutover(self) -> None:
+        legacy = self.jobs_dir / "legacy"
+        store = JobStore(self.jobs_dir, legacy)
+        store.create(CursorJob.from_dict(self.job("aaaaaaaaaaaa")))
+        legacy.mkdir(exist_ok=True)
+        (legacy / "aaaaaaaaaaaa.json").write_text(
+            json.dumps(
+                self.job(
+                    "aaaaaaaaaaaa",
+                    revision=5,
+                    request="explicit evidence recovery",
+                )
+            )
+        )
+
+        self.assertEqual(store.migrate_legacy(), set())
+
+        recovered = store.get("aaaaaaaaaaaa")
+        self.assertEqual(recovered.revision, 5)
+        self.assertEqual(recovered.request, "explicit evidence recovery")
+        self.assertFalse((legacy / "aaaaaaaaaaaa.json").exists())
+        self.assertTrue((self.jobs_dir / "aaaaaaaaaaaa.json.imported").exists())
+
+        (self.jobs_dir / "aaaaaaaaaaaa.json").write_text(
+            json.dumps(
+                self.job(
+                    "aaaaaaaaaaaa",
+                    revision=6,
+                    request="ordinary post-cutover source",
+                )
+            )
+        )
+        with self.assertWarnsRegex(JobQuarantineWarning, "authoritative SQLite job"):
+            observed = store.get("aaaaaaaaaaaa")
+
+        self.assertEqual(observed.to_dict(), recovered.to_dict())
+
+    def test_ordinary_refresh_cannot_observe_in_flight_explicit_migration(
+        self,
+    ) -> None:
+        legacy = self.jobs_dir / "legacy"
+        store = JobStore(self.jobs_dir, legacy)
+        store.create(CursorJob.from_dict(self.job("aaaaaaaaaaaa")))
+        reader = JobStore(self.jobs_dir, legacy)
+        self.assertEqual(reader.get("aaaaaaaaaaaa").revision, 0)
+        (legacy / "aaaaaaaaaaaa.json").write_text(
+            json.dumps(
+                self.job(
+                    "aaaaaaaaaaaa",
+                    revision=5,
+                    request="explicit evidence recovery",
+                )
+            )
+        )
+        payload = self.jobs_dir / "aaaaaaaaaaaa.json"
+        payload_written = threading.Event()
+        release_migration = threading.Event()
+        refresh_finished = threading.Event()
+        errors: list[BaseException] = []
+        migrated: list[set[str]] = []
+        refreshed: list[CursorJob] = []
+        original_atomic_json = store_module._atomic_json
+
+        def pause_after_payload_write(path: Path, value: dict[str, object]) -> None:
+            original_atomic_json(path, value)
+            if path == payload:
+                payload_written.set()
+                self.assertTrue(release_migration.wait(2))
+
+        def migrate() -> None:
+            try:
+                migrated.append(store.migrate_legacy())
+            except BaseException as error:
+                errors.append(error)
+
+        def refresh() -> None:
+            try:
+                refreshed.append(reader.get("aaaaaaaaaaaa"))
+            except BaseException as error:
+                errors.append(error)
+            finally:
+                refresh_finished.set()
+
+        with mock.patch.object(
+            store_module, "_atomic_json", side_effect=pause_after_payload_write
+        ):
+            migration_thread = threading.Thread(target=migrate)
+            migration_thread.start()
+            self.assertTrue(payload_written.wait(2))
+            refresh_thread = threading.Thread(target=refresh)
+            refresh_thread.start()
+            self.assertFalse(refresh_finished.wait(0.1))
+            self.assertTrue(payload.exists())
+            self.assertFalse(list(self.jobs_dir.glob("aaaaaaaaaaaa.json*.failed")))
+            release_migration.set()
+            migration_thread.join(2)
+            refresh_thread.join(2)
+
+        self.assertFalse(migration_thread.is_alive())
+        self.assertFalse(refresh_thread.is_alive())
+        self.assertEqual(errors, [])
+        self.assertEqual(migrated, [set()])
+        self.assertEqual([job.revision for job in refreshed], [5])
+        self.assertEqual(
+            [job.request for job in refreshed], ["explicit evidence recovery"]
+        )
+        self.assertFalse(payload.exists())
+        self.assertTrue((self.jobs_dir / "aaaaaaaaaaaa.json.imported").exists())
 
     def test_typed_store_failed_command_does_not_write(self) -> None:
         store = JobStore(self.jobs_dir, self.jobs_dir / "legacy")
