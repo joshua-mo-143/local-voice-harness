@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import json
+import subprocess
+import sys
 import tempfile
 import threading
+import time
 import unittest
 import wave
 from pathlib import Path
@@ -18,12 +21,12 @@ from local_voice_harness.tts.queue import (
 )
 
 
-def _write_wav(path: Path) -> Path:
+def _write_wav(path: Path, *, frames: int = 8) -> Path:
     with wave.open(str(path), "wb") as output:
         output.setnchannels(1)
         output.setsampwidth(2)
         output.setframerate(16_000)
-        output.writeframes(b"\x00\x00" * 8)
+        output.writeframes(b"\x00\x00" * frames)
     return path
 
 
@@ -200,12 +203,8 @@ class PlaybackQueueTests(unittest.TestCase):
             job_status="completed",
         )
         with tempfile.TemporaryDirectory() as temporary:
-            chunk = Path(temporary) / "first.wav"
-            with wave.open(str(chunk), "wb") as output:
-                output.setnchannels(1)
-                output.setsampwidth(2)
-                output.setframerate(16_000)
-                output.writeframes(b"\x00\x00" * 8)
+            chunk = _write_wav(Path(temporary) / "first.wav", frames=4_096)
+            received = Path(temporary) / "received"
             first_handle = mock.create_autospec(PrefetchHandle, instance=True)
             first_handle.wait_progress.return_value = (
                 16_000,
@@ -218,27 +217,215 @@ class PlaybackQueueTests(unittest.TestCase):
                 "second prefetch failed"
             )
             queue._items.extend([(first, first_handle), (second, second_handle)])
-            process = mock.Mock()
-            process.stdin = mock.Mock()
-            process.wait.return_value = 0
-            process.poll.return_value = 0
+            process = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-c",
+                    (
+                        "import pathlib, sys; "
+                        "data = sys.stdin.buffer.read(); "
+                        f"pathlib.Path({str(received)!r}).write_bytes(data)"
+                    ),
+                ],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+            )
             on_played = mock.Mock()
 
-            with (
-                mock.patch(
-                    "local_voice_harness.tts.queue._open_playback",
-                    return_value=process,
-                ),
-                self.assertRaisesRegex(HarnessError, "second prefetch failed"),
-            ):
-                queue.drain(on_played=on_played)
+            try:
+                with (
+                    mock.patch(
+                        "local_voice_harness.tts.queue._open_playback",
+                        return_value=process,
+                    ),
+                    self.assertRaisesRegex(HarnessError, "second prefetch failed"),
+                ):
+                    queue.drain(on_played=on_played)
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                process.wait(timeout=1)
+            received_size = len(received.read_bytes())
 
+        self.assertEqual(process.returncode, 0)
+        self.assertEqual(received_size, 8_192)
         on_played.assert_called_once()
         result, interrupted, request = on_played.call_args.args
         self.assertEqual(result["played_text"], "first")
         self.assertFalse(interrupted)
         self.assertIs(request, first)
         second_handle.discard.assert_called_once()
+
+    def test_completion_wait_interruption_marks_entire_shared_batch(self) -> None:
+        queue = PlaybackQueue()
+        first = PlaybackRequest(
+            text="first",
+            job_id="aaaaaaaaaaaa",
+            delivery_token="claim1",
+            job_status="completed",
+        )
+        second = PlaybackRequest(
+            text="second",
+            job_id="bbbbbbbbbbbb",
+            delivery_token="claim2",
+            job_status="completed",
+        )
+        on_played = mock.Mock()
+
+        with tempfile.TemporaryDirectory() as temporary:
+            first_chunk = _write_wav(Path(temporary) / "first.wav")
+            second_chunk = _write_wav(Path(temporary) / "second.wav")
+            first_handle = mock.create_autospec(PrefetchHandle, instance=True)
+            first_handle.done_meta = {}
+            first_handle.wait_progress.return_value = (
+                16_000,
+                [first_chunk],
+                ["first"],
+                True,
+            )
+            second_handle = mock.create_autospec(PrefetchHandle, instance=True)
+            second_handle.done_meta = {}
+            second_handle.wait_progress.return_value = (
+                16_000,
+                [second_chunk],
+                ["second"],
+                True,
+            )
+            queue._items.extend([(first, first_handle), (second, second_handle)])
+            process = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-c",
+                    "import sys, time; sys.stdin.buffer.read(); time.sleep(60)",
+                ],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+            )
+
+            def should_interrupt() -> bool:
+                assert process.stdin is not None
+                return process.stdin.closed
+
+            try:
+                with mock.patch(
+                    "local_voice_harness.tts.queue._open_playback",
+                    return_value=process,
+                ):
+                    batch = queue.drain(
+                        should_interrupt=should_interrupt,
+                        on_played=on_played,
+                    )
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                process.wait(timeout=1)
+
+        self.assertEqual(
+            [interrupted for _result, interrupted, _request in batch], [True, True]
+        )
+        self.assertEqual(
+            [call.args[1] for call in on_played.call_args_list],
+            [True, True],
+        )
+        self.assertTrue(all(result["interrupted"] for result, _flag, _request in batch))
+
+    def test_later_sink_failure_invalidates_written_prefix_batch(self) -> None:
+        queue = PlaybackQueue()
+        first = PlaybackRequest(
+            text="first",
+            job_id="aaaaaaaaaaaa",
+            delivery_token="claim1",
+            job_status="completed",
+        )
+        second = PlaybackRequest(
+            text="second",
+            job_id="bbbbbbbbbbbb",
+            delivery_token="claim2",
+            job_status="completed",
+        )
+        acknowledged: list[PlaybackRequest] = []
+        callbacks: list[tuple[PlaybackRequest, bool]] = []
+
+        def on_played(
+            _result: dict[str, object],
+            interrupted: bool,
+            request: PlaybackRequest,
+        ) -> None:
+            callbacks.append((request, interrupted))
+            if not interrupted:
+                acknowledged.append(request)
+
+        with tempfile.TemporaryDirectory() as temporary:
+            first_chunk = _write_wav(Path(temporary) / "first.wav")
+            second_chunk = _write_wav(
+                Path(temporary) / "second.wav",
+                frames=1_000_000,
+            )
+            reader_closed = Path(temporary) / "reader-closed"
+            first_handle = mock.create_autospec(PrefetchHandle, instance=True)
+            first_handle.done_meta = {}
+            first_handle.wait_progress.return_value = (
+                16_000,
+                [first_chunk],
+                ["first"],
+                True,
+            )
+            second_handle = mock.create_autospec(PrefetchHandle, instance=True)
+            second_handle.done_meta = {}
+
+            def second_progress(
+                _have: int,
+                **_kwargs: object,
+            ) -> tuple[int, list[Path], list[str], bool]:
+                deadline = time.monotonic() + 1
+                while not reader_closed.exists():
+                    if time.monotonic() >= deadline:
+                        self.fail("player did not close stdin reader")
+                    time.sleep(0.001)
+                return 16_000, [second_chunk], ["second"], True
+
+            second_handle.wait_progress.side_effect = second_progress
+            queue._items.extend([(first, first_handle), (second, second_handle)])
+            process = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-c",
+                    (
+                        "import pathlib, sys, time; "
+                        "sys.stdin.buffer.read(16); "
+                        "sys.stdin.close(); "
+                        f"pathlib.Path({str(reader_closed)!r}).touch(); "
+                        "time.sleep(60)"
+                    ),
+                ],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+            )
+
+            try:
+                with (
+                    mock.patch(
+                        "local_voice_harness.tts.queue._open_playback",
+                        return_value=process,
+                    ),
+                    mock.patch.object(
+                        tts_queue,
+                        "PLAYBACK_PROGRESS_TIMEOUT_SECONDS",
+                        0.05,
+                    ),
+                    self.assertRaisesRegex(HarnessError, "write stalled"),
+                ):
+                    queue.drain(on_played=on_played)
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                process.wait(timeout=1)
+
+        self.assertEqual(callbacks, [(first, True)])
+        self.assertEqual(acknowledged, [])
 
     def test_partial_synthesis_failure_releases_delivery_claim(self) -> None:
         queue = PlaybackQueue()
@@ -278,6 +465,163 @@ class PlaybackQueueTests(unittest.TestCase):
         self.assertTrue(result["interrupted"])
         self.assertEqual(result["played_text"], "partial")
         self.assertIs(played_request, request)
+
+    def test_stalled_live_player_is_bounded_and_later_speech_proceeds(self) -> None:
+        queue = PlaybackQueue()
+        first = PlaybackRequest(
+            text="stalled",
+            job_id="aaaaaaaaaaaa",
+            delivery_token="claim",
+            job_status="completed",
+        )
+        second = PlaybackRequest(text="later")
+        on_played = mock.Mock()
+        polls = 0
+        interrupt_checks = 0
+
+        def on_poll() -> None:
+            nonlocal polls
+            polls += 1
+
+        def should_interrupt() -> bool:
+            nonlocal interrupt_checks
+            interrupt_checks += 1
+            return False
+
+        with tempfile.TemporaryDirectory() as temporary:
+            stalled_chunk = _write_wav(
+                Path(temporary) / "stalled.wav",
+                frames=1_000_000,
+            )
+            later_chunk = _write_wav(Path(temporary) / "later.wav")
+            stalled_handle = mock.create_autospec(PrefetchHandle, instance=True)
+            stalled_handle.done_meta = {}
+            stalled_handle.wait_progress.return_value = (
+                16_000,
+                [stalled_chunk],
+                ["stalled"],
+                True,
+            )
+            later_handle = mock.create_autospec(PrefetchHandle, instance=True)
+            later_handle.done_meta = {}
+            later_handle.wait_progress.return_value = (
+                16_000,
+                [later_chunk],
+                ["later"],
+                True,
+            )
+            queue._items.extend([(first, stalled_handle), (second, later_handle)])
+            stalled_process = subprocess.Popen(
+                [sys.executable, "-c", "import time; time.sleep(60)"],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+            )
+            consuming_process = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-c",
+                    "import sys; sys.stdin.buffer.read()",
+                ],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+            )
+            try:
+                with (
+                    mock.patch.object(
+                        tts_queue,
+                        "PLAYBACK_PROGRESS_TIMEOUT_SECONDS",
+                        0.05,
+                    ),
+                    mock.patch.object(tts_queue, "STREAM_POLL_SECONDS", 0.005),
+                    mock.patch.object(
+                        tts_queue,
+                        "_open_playback",
+                        side_effect=[stalled_process, consuming_process],
+                    ),
+                ):
+                    started = time.monotonic()
+                    with self.assertRaisesRegex(HarnessError, "write stalled"):
+                        queue.drain(
+                            should_interrupt=should_interrupt,
+                            on_poll=on_poll,
+                            on_played=on_played,
+                        )
+                    stalled_elapsed = time.monotonic() - started
+                    batch = queue.drain(on_played=on_played)
+            finally:
+                for process in (stalled_process, consuming_process):
+                    if process.poll() is None:
+                        process.kill()
+                    process.wait(timeout=1)
+
+        self.assertIsNotNone(stalled_process.returncode)
+        self.assertLess(stalled_elapsed, 0.5)
+        self.assertGreater(polls, 1)
+        self.assertGreater(interrupt_checks, 1)
+        self.assertEqual(len(queue), 0)
+        self.assertEqual(batch[0][0]["played_text"], "later")
+        on_played.assert_called_once_with(batch[0][0], False, second)
+
+    def test_live_player_completion_stall_is_bounded_and_polled(self) -> None:
+        queue = PlaybackQueue()
+        request = PlaybackRequest(
+            text="completion stalls",
+            job_id="aaaaaaaaaaaa",
+            delivery_token="claim",
+            job_status="completed",
+        )
+        on_played = mock.Mock()
+        on_poll = mock.Mock()
+
+        with tempfile.TemporaryDirectory() as temporary:
+            chunk = _write_wav(Path(temporary) / "chunk.wav")
+            handle = mock.create_autospec(PrefetchHandle, instance=True)
+            handle.done_meta = {}
+            handle.wait_progress.return_value = (
+                16_000,
+                [chunk],
+                ["completion stalls"],
+                True,
+            )
+            queue._items.append((request, handle))
+            process = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-c",
+                    "import sys, time; sys.stdin.buffer.read(); time.sleep(60)",
+                ],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+            )
+            try:
+                started = time.monotonic()
+                with (
+                    mock.patch.object(
+                        tts_queue,
+                        "PLAYBACK_PROGRESS_TIMEOUT_SECONDS",
+                        0.05,
+                    ),
+                    mock.patch.object(tts_queue, "STREAM_POLL_SECONDS", 0.005),
+                    mock.patch.object(
+                        tts_queue,
+                        "_open_playback",
+                        return_value=process,
+                    ),
+                    self.assertRaisesRegex(HarnessError, "completion stalled"),
+                ):
+                    queue.drain(on_poll=on_poll, on_played=on_played)
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                process.wait(timeout=1)
+            stalled_elapsed = time.monotonic() - started
+
+        self.assertLess(stalled_elapsed, 0.5)
+        self.assertGreater(on_poll.call_count, 1)
+        on_played.assert_not_called()
 
     def test_drain_prefetches_next_item_before_playing_current(self) -> None:
         queue = PlaybackQueue()
