@@ -1490,6 +1490,8 @@ class WakeConversationDaemon:
     def _dispatch_ready_config_activation(self, record_id: str) -> None:
         if record_id in self.launched_config_activations:
             return
+        attempts = self.config_activation_dispatch_attempts.get(record_id, 0) + 1
+        self.config_activation_dispatch_attempts[record_id] = attempts
         try:
             process = launch_activation_worker(record_id)
         except OSError as exc:
@@ -1505,6 +1507,16 @@ class WakeConversationDaemon:
                     ActivationStatus.ROLLING_BACK,
                 }
             ):
+                if attempts >= 2 and current.status in {
+                    ActivationStatus.READY,
+                    ActivationStatus.VALIDATING,
+                }:
+                    self.config_activation_store.begin_rollback(
+                        record_id,
+                        "The isolated activation worker could not start after "
+                        f"{attempts} attempts: {exc}",
+                    )
+                    return
                 log(
                     "could not relaunch voice activation reconciliation worker: "
                     f"{type(exc).__name__}: {exc}"
@@ -1528,9 +1540,6 @@ class WakeConversationDaemon:
             )
             return
         self.launched_config_activations[record_id] = process
-        self.config_activation_dispatch_attempts[record_id] = (
-            self.config_activation_dispatch_attempts.get(record_id, 0) + 1
-        )
 
     def _complete_config_activation_delivery(
         self,

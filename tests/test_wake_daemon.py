@@ -3983,6 +3983,45 @@ class ConfigChangeConversationTests(unittest.TestCase):
             else:
                 log.assert_called_once()
 
+    def test_repeated_voice_worker_launch_failures_enter_durable_rollback(
+        self,
+    ) -> None:
+        for status in (
+            wake_daemon.ActivationStatus.READY,
+            wake_daemon.ActivationStatus.VALIDATING,
+            wake_daemon.ActivationStatus.ROLLING_BACK,
+        ):
+            with (
+                self.subTest(status=status),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
+                daemon = _bare_daemon()
+                store = wake_daemon.ActivationStore(Path(temporary) / "activation.json")
+                daemon.config_activation_store = store
+                current = _voice_activation_at_status(store, daemon, status)
+                with (
+                    mock.patch.object(
+                        wake_daemon,
+                        "launch_activation_worker",
+                        side_effect=OSError("systemd unavailable"),
+                    ),
+                    mock.patch.object(wake_daemon, "log"),
+                ):
+                    daemon._dispatch_ready_config_activation(current.id)
+                    daemon._dispatch_ready_config_activation(current.id)
+
+                recovered = store.current()
+
+            assert recovered is not None
+            self.assertEqual(
+                recovered.status,
+                wake_daemon.ActivationStatus.ROLLING_BACK,
+            )
+            self.assertEqual(
+                daemon.config_activation_dispatch_attempts[current.id],
+                2,
+            )
+
     def test_exhausted_voice_workers_enter_or_continue_durable_rollback(self) -> None:
         for status in (
             wake_daemon.ActivationStatus.READY,
