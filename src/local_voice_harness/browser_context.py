@@ -46,6 +46,7 @@ class RequestContext:
     text: str
     focused_repository: str | None = None
     focused_issue: str | None = None
+    focused_issue_page: str | None = None
     github_repository: str | None = None
     github_issue: int | None = None
     github_issue_context: str | None = None
@@ -219,16 +220,20 @@ def request_context(
     integrations: RegistryInput,
 ) -> RequestContext:
     context: ContextFragment | None = None
+    focused_issue_page: str | None = None
     try:
         context = capture_text_context(text, integrations)
         if context is None:
             url = focused_browser_url()
             if url is not None:
                 context = capture_context(url, integrations)
+                if context is not None:
+                    focused_issue_page = context.issue_reference
         if context is None and extract_ticket_targets(text).has_unresolved_scope:
             context = focused_herdr_github_context(integrations)
     except Exception:
         context = None
+        focused_issue_page = None
 
     try:
         app_context = focused_app_context(text, platform)
@@ -272,6 +277,7 @@ def request_context(
         text="\n\n".join(parts),
         focused_repository=focused_repository,
         focused_issue=focused_issue,
+        focused_issue_page=focused_issue_page,
         github_repository=github_repository,
         github_issue=github_issue,
         github_issue_context=github_issue_context,

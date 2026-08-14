@@ -262,6 +262,7 @@ class BrowserDispatchTests(unittest.TestCase):
 
         self.assertEqual(context.focused_repository, "example/project")
         self.assertEqual(context.focused_issue, "example/project#42")
+        self.assertEqual(context.focused_issue_page, "example/project#42")
         self.assertEqual(context.github_repository, "example/project")
         self.assertEqual(context.github_issue, 42)
         self.assertEqual(context.github_issue_context, "Issue context")
@@ -333,6 +334,7 @@ class BrowserDispatchTests(unittest.TestCase):
             )
 
         self.assertEqual(context.focused_issue, "spoken/project#7")
+        self.assertIsNone(context.focused_issue_page)
         self.assertEqual(context.github_repository, "spoken/project")
         self.assertEqual(context.github_issue, 7)
         focused_url.assert_not_called()
@@ -401,6 +403,7 @@ class BrowserDispatchTests(unittest.TestCase):
         self.assertEqual(context.issue_scope, "ENG")
         self.assertEqual(context.issue_scope_source, "linear")
         self.assertIsNone(context.focused_issue)
+        self.assertIsNone(context.focused_issue_page)
         self.assertIsNone(context.external_issue_reference)
 
     def test_bare_github_issues_use_focused_herdr_workspace_as_fallback(self) -> None:

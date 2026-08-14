@@ -18,7 +18,7 @@ from .questions import (
     QuestionSensitivity,
     resolve_answer,
 )
-from .responses import AssistantResponse
+from .responses import AssistantResponse, ResponseLike, as_assistant_response
 from .ticket_targets import TicketExtraction, extract_ticket_targets
 
 READBACK_TIMEOUT_SECONDS = 30.0
@@ -59,6 +59,7 @@ class CriticalTarget:
 class TargetSelection:
     target: CriticalTarget
     context_binding: tuple[str | None, ...]
+    readback_required: bool = True
 
 
 @dataclass(frozen=True, slots=True)
@@ -105,6 +106,7 @@ def context_binding(context: RequestContext) -> tuple[str | None, ...]:
     return (
         context.focused_repository,
         context.focused_issue,
+        context.focused_issue_page,
         context.issue_scope_source,
         context.issue_scope,
     )
@@ -114,7 +116,7 @@ def select_submit_target(
     extraction: TicketExtraction,
     context: RequestContext,
 ) -> TargetSelection | None:
-    """Select one ticket that requires readback; explicit batches are exempt."""
+    """Select one identity-sensitive ticket and its readback policy."""
 
     if extraction.batch_requested:
         return None
@@ -137,7 +139,7 @@ def select_submit_target(
             and context.focused_issue.casefold() != target.canonical.casefold()
         )
         binding = (
-            context_binding(context) if reference.scoped or conflict else (None,) * 4
+            context_binding(context) if reference.scoped or conflict else (None,) * 5
         )
         return TargetSelection(target, binding)
     if extraction.requested_count:
@@ -147,7 +149,15 @@ def select_submit_target(
             target = parse_target(context.focused_issue)
         except ValueError:
             return None
-        return TargetSelection(target, context_binding(context))
+        exact_focused_page = (
+            context.focused_issue_page is not None
+            and context.focused_issue_page.casefold() == target.canonical.casefold()
+        )
+        return TargetSelection(
+            target,
+            context_binding(context),
+            readback_required=not exact_focused_page,
+        )
     return None
 
 
@@ -196,6 +206,20 @@ def readback_response(candidate: ReadbackCandidate) -> AssistantResponse:
     )
 
 
+def identified_target_response(
+    target: CriticalTarget,
+    response: ResponseLike,
+) -> AssistantResponse:
+    """Name the canonical fast-path target without changing the job outcome."""
+
+    rendered = as_assistant_response(response)
+    spoken_target = f"{target.repository} issue {target.ticket}"
+    return AssistantResponse(
+        spoken_text=f"For {spoken_target}: {rendered.spoken_text}",
+        display_text=f"Target {target.canonical}: {rendered.display_text}",
+    )
+
+
 def resolve_readback(
     candidate: ReadbackCandidate,
     reply: str,
@@ -205,7 +229,7 @@ def resolve_readback(
 ) -> ReadbackResolution:
     current_time = time.monotonic() if now is None else now
     if current_time - candidate.created_at > READBACK_TIMEOUT_SECONDS or (
-        candidate.context_binding != (None,) * 4
+        candidate.context_binding != (None,) * 5
         and context_binding(context) != candidate.context_binding
     ):
         return ReadbackResolution(ReadbackReply.EXPIRED)

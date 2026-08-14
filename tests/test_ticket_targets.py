@@ -33,6 +33,77 @@ def test_spoken_scoped_github_numbers_are_extracted() -> None:
     ]
 
 
+def test_singular_digit_grouped_spoken_issue_number_is_extracted() -> None:
+    extraction = extract_ticket_targets(
+        "Work on issue one thirty one please.",
+        scope_source="github",
+        scope="example/project",
+    )
+
+    assert extraction.requested_count == 1
+    assert not extraction.batch_requested
+    assert extraction.references[0].raw == "one thirty one"
+    assert extraction.references[0].canonical == "example/project#131"
+
+
+def test_conventional_cardinal_spoken_issue_number_remains_supported() -> None:
+    extraction = extract_ticket_targets(
+        "Work on issue one hundred thirty one please.",
+        scope_source="github",
+        scope="example/project",
+    )
+
+    assert extraction.requested_count == 1
+    assert extraction.references[0].canonical == "example/project#131"
+
+
+def test_digit_grouping_does_not_merge_plural_lists_or_ranges() -> None:
+    listed = extract_ticket_targets(
+        "Work on issues one and thirty one",
+        scope_source="github",
+        scope="example/project",
+    )
+    ranged = extract_ticket_targets(
+        "Work on issues one to thirty one",
+        scope_source="github",
+        scope="example/project",
+    )
+
+    assert [reference.canonical for reference in listed.references] == [
+        "example/project#1",
+        "example/project#31",
+    ]
+    assert ranged.requested_count == 31
+    assert ranged.references[0].canonical is None
+    assert ranged.references[0].error == "ticket range cannot exceed 25 tickets"
+
+
+def test_singular_digit_grouped_range_keeps_both_explicit_endpoints() -> None:
+    extraction = extract_ticket_targets(
+        "Work on issue one thirty one to one thirty three",
+        scope_source="github",
+        scope="example/project",
+    )
+
+    assert extraction.requested_count == 3
+    assert [reference.canonical for reference in extraction.references] == [
+        "example/project#131",
+        "example/project#132",
+        "example/project#133",
+    ]
+
+
+def test_malformed_adjacent_spoken_number_words_fail_closed() -> None:
+    extraction = extract_ticket_targets(
+        "Work on issue one thirty one hundred",
+        scope_source="github",
+        scope="example/project",
+    )
+
+    assert extraction.requested_count == 0
+    assert extraction.references == ()
+
+
 def test_scoped_digit_ranges_expand_inclusively() -> None:
     for text in (
         "Work on tickets 20 through 25",

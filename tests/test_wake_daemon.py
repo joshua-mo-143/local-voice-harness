@@ -1835,6 +1835,70 @@ class ProcessUtteranceTests(unittest.TestCase):
         )
         qwen_turn.assert_not_called()
 
+    def test_exact_focused_issue_starts_directly_with_canonical_acknowledgement(
+        self,
+    ) -> None:
+        daemon = _bare_daemon()
+        text = "work on this issue"
+        context = RequestContext(
+            f"{text}\n\nIssue context",
+            focused_repository="example/payments",
+            focused_issue="example/payments#42",
+            focused_issue_page="example/payments#42",
+            github_repository="example/payments",
+            github_issue=42,
+            github_issue_context="Issue context",
+            issue_scope="example/payments",
+            issue_scope_source="github",
+        )
+        started = AssistantResponse(
+            "Cursor started payments issue 42.",
+            "Cursor job abc123 started for payments issue 42.",
+        )
+        with (
+            mock.patch.object(wake_daemon, "transcribe", return_value=text),
+            mock.patch.object(wake_daemon, "start_components"),
+            mock.patch.object(wake_daemon, "request_context", return_value=context),
+            mock.patch.object(
+                wake_daemon,
+                "route_intent",
+                return_value=IntentRoute(Intent.CURSOR_SUBMIT, "high"),
+            ),
+            mock.patch.object(
+                wake_daemon,
+                "cursor_turn",
+                return_value=(started, None),
+            ) as cursor_turn,
+            mock.patch.object(
+                daemon,
+                "play_response",
+                return_value=({"played_text": started.spoken_text}, None),
+            ) as play_response,
+            mock.patch.object(wake_daemon, "notify"),
+        ):
+            daemon.process_utterance(AUDIO_GENERATION, woke=False)
+
+        self.assertIsNone(daemon.pending_target_readback)
+        cursor_turn.assert_called_once_with(
+            CursorTurnRequest(
+                context.text,
+                utterance=text,
+                context_repository="example/payments",
+                github_repository="example/payments",
+                github_issue=42,
+                github_issue_context="Issue context",
+                fork_requested=False,
+                github_pull_request=None,
+                issue_scope="example/payments",
+                issue_scope_source="github",
+            ),
+            delivery_claims=mock.ANY,
+            integrations=mock.ANY,
+        )
+        acknowledgement = play_response.call_args.args[0]
+        self.assertIn("example/payments issue 42", acknowledgement.spoken_text)
+        self.assertIn("example/payments#42", acknowledgement.display_text)
+
     def test_exact_affirmation_dispatches_canonical_readback_target(self) -> None:
         daemon = _bare_daemon()
         with (
@@ -2055,6 +2119,7 @@ class ProcessUtteranceTests(unittest.TestCase):
             "fork example/payments and work on example/payments#42",
             focused_repository="example/payments",
             focused_issue="example/payments#42",
+            focused_issue_page="example/payments#42",
             github_repository="example/payments",
             github_issue=42,
         )
@@ -2125,6 +2190,43 @@ class ProcessUtteranceTests(unittest.TestCase):
         request = cursor_turn.call_args.args[0]
         self.assertEqual(request.issue_scope, "ENG")
         self.assertEqual(request.issue_scope_source, "linear")
+
+    def test_digit_grouped_issue_reaches_scoped_wake_submission_boundary(
+        self,
+    ) -> None:
+        daemon = _bare_daemon()
+        text = "Work on issue one thirty one please."
+        context = RequestContext(
+            f"{text}\n\nGitHub repository issue list",
+            issue_scope="example/project",
+            issue_scope_source="github",
+        )
+        with (
+            mock.patch.object(wake_daemon, "transcribe", return_value=text),
+            mock.patch.object(wake_daemon, "start_components"),
+            mock.patch.object(wake_daemon, "request_context", return_value=context),
+            mock.patch.object(
+                wake_daemon,
+                "route_intent",
+                return_value=IntentRoute(Intent.CURSOR_SUBMIT, "high"),
+            ),
+            mock.patch.object(wake_daemon, "cursor_turn") as cursor_turn,
+            mock.patch.object(
+                daemon,
+                "_drain_playback_queue",
+                return_value=(_playback_batch("ok"), None),
+            ),
+            mock.patch.object(wake_daemon, "notify"),
+        ):
+            daemon.process_utterance(AUDIO_GENERATION, woke=False)
+
+        cursor_turn.assert_not_called()
+        self.assertIsNotNone(daemon.pending_target_readback)
+        assert daemon.pending_target_readback is not None
+        self.assertEqual(
+            daemon.pending_target_readback.candidate.target.canonical,
+            "example/project#131",
+        )
 
     def test_uncertain_bare_ticket_batch_requests_repository_scope(self) -> None:
         daemon = _bare_daemon()
@@ -2202,6 +2304,7 @@ class ProcessUtteranceTests(unittest.TestCase):
             f"{request}\n\nGitHub issue context",
             focused_repository="example/payments",
             focused_issue="example/payments#384",
+            focused_issue_page="example/payments#384",
             github_repository="example/payments",
             github_issue=384,
             issue_scope="example/payments",

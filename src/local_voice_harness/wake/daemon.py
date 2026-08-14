@@ -61,6 +61,7 @@ from ..critical_targets import (
     ReadbackCandidate,
     ReadbackReply,
     TargetSelection,
+    identified_target_response,
     new_candidate,
     readback_response,
     resolve_readback,
@@ -2108,7 +2109,11 @@ class WakeConversationDaemon:
                 # Explicit new work invalidates any retained completed-job slot.
                 self.completed_followup = None
                 selection = select_submit_target(extraction, context)
-                if selection is not None and not fork_requested:
+                if (
+                    selection is not None
+                    and selection.readback_required
+                    and not fork_requested
+                ):
                     candidate = new_candidate(
                         selection,
                         origin_turn=uuid.uuid4().hex,
@@ -2134,6 +2139,15 @@ class WakeConversationDaemon:
                         delivery_claims=delivery_claims,
                         integrations=self.integrations,
                     )
+                    if (
+                        selection is not None
+                        and not selection.readback_required
+                        and not fork_requested
+                    ):
+                        response = identified_target_response(
+                            selection.target,
+                            response,
+                        )
                     if resuming_target_resolution:
                         self.pending_target_resolution = None
             elif route.intent == Intent.AGENT_SUBMIT:

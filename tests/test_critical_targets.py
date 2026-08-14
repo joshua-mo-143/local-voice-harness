@@ -61,6 +61,64 @@ def test_affirmation_is_bound_to_current_focused_identity() -> None:
     assert changed.reply == ReadbackReply.EXPIRED
 
 
+def test_exact_focused_issue_page_skips_target_readback() -> None:
+    context = RequestContext(
+        "work on this issue",
+        focused_repository="example/payments",
+        focused_issue="example/payments#42",
+        focused_issue_page="example/payments#42",
+        issue_scope_source="github",
+        issue_scope="example/payments",
+    )
+
+    selection = select_submit_target(
+        extract_ticket_targets("work on this issue"),
+        context,
+    )
+
+    assert selection is not None
+    assert selection.target.canonical == "example/payments#42"
+    assert not selection.readback_required
+
+
+def test_unproven_or_conflicting_focused_identity_still_requires_readback() -> None:
+    for context in (
+        RequestContext(
+            "work on this issue",
+            focused_issue="example/payments#42",
+        ),
+        RequestContext(
+            "work on this issue",
+            focused_issue="example/payments#42",
+            focused_issue_page="example/payments#43",
+        ),
+    ):
+        selection = select_submit_target(
+            extract_ticket_targets("work on this issue"),
+            context,
+        )
+
+        assert selection is not None
+        assert selection.readback_required
+
+
+def test_explicit_target_conflict_never_uses_focused_page_fast_path() -> None:
+    context = RequestContext(
+        "work on example/payments#43",
+        focused_issue="example/payments#42",
+        focused_issue_page="example/payments#42",
+    )
+
+    selection = select_submit_target(
+        extract_ticket_targets("work on example/payments#43"),
+        context,
+    )
+
+    assert selection is not None
+    assert selection.target.canonical == "example/payments#43"
+    assert selection.readback_required
+
+
 def test_browser_scoped_number_requires_identity_bound_confirmation() -> None:
     context = RequestContext(
         "work on issue 42",
@@ -95,7 +153,7 @@ def test_browser_scoped_number_requires_identity_bound_confirmation() -> None:
 def test_number_correction_never_approves_original_target() -> None:
     context = RequestContext("work on example/payments#42")
     candidate = new_candidate(
-        TargetSelection(parse_target("example/payments#42"), (None,) * 4),
+        TargetSelection(parse_target("example/payments#42"), (None,) * 5),
         origin_turn="turn-1",
         now=10,
     )
@@ -110,7 +168,7 @@ def test_number_correction_never_approves_original_target() -> None:
 def test_negative_and_stale_replies_fail_closed() -> None:
     context = RequestContext("work on example/payments#42")
     candidate = new_candidate(
-        TargetSelection(parse_target("example/payments#42"), (None,) * 4),
+        TargetSelection(parse_target("example/payments#42"), (None,) * 5),
         origin_turn="turn-1",
         now=10,
     )
