@@ -1199,6 +1199,69 @@ def _grouped_repository_assignments(
     return assignments
 
 
+def _reply_repository_list(
+    job: CursorJob,
+    *,
+    expected_question_id: str | None,
+    expected_question_turn: str | None,
+) -> str:
+    question = questions.current(job)
+    if question is None:
+        raise HarnessError(f"Cursor job {job.id} has no repository clarification")
+    try:
+        validate_question_identity(
+            question,
+            QuestionIdentity(
+                job.id,
+                expected_question_id or question.id,
+                expected_question_turn or question.origin.turn_token,
+            ),
+        )
+    except QuestionError:
+        return "That answer belongs to an older question, so I did not use it."
+    remaining = list(job.grouped_repository_candidates or ())
+    page, rest = provisioning.repository_name_page(remaining)
+    if not page:
+        return (
+            "I don't have more repository names to list. "
+            "Say a local repository name or path."
+        )
+    now = time.time()
+    next_question = provisioning.repository_question(
+        [],
+        names=page,
+        remaining=len(rest),
+    )
+
+    def update(current: CursorJob) -> CursorJob | None:
+        pending = questions.current(current)
+        if (
+            current.status != JobStatus.AWAITING_USER
+            or pending is None
+            or pending.id != question.id
+        ):
+            return None
+        return questions.ask(
+            current,
+            QuestionSpec(
+                next_question,
+                sensitivity=QuestionSensitivity.ROUTINE,
+            ),
+            owner="repository",
+            turn_token=f"{current.id}-repository-list-{current.revision + 1}",
+            now=now,
+            job_changes={
+                "participant_admission_state": "waiting",
+                "grouped_repository_candidates": rest,
+            },
+        )
+
+    updated = _job_store().update(job.id, update)
+    if updated is None:
+        return "That answer belongs to an older question, so I did not use it."
+    return next_question
+
+
 def _reply_grouped_repository(
     job: CursorJob,
     text: str,
@@ -1470,6 +1533,14 @@ def reply_job(
             foreground_seconds=foreground_seconds,
             concurrency=concurrency,
             integrations=integrations,
+        )
+    if current.clarification_kind == "repository" and provisioning.is_repository_list_request(
+        trusted_utterance or text
+    ):
+        return _reply_repository_list(
+            current,
+            expected_question_id=expected_question_id,
+            expected_question_turn=expected_question_turn,
         )
     now = time.time()
     should_launch = False

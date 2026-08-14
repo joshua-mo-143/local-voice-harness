@@ -27,6 +27,7 @@ from .config import (
     TTS_SOCKET,
 )
 from .cursor import consultation as cursor_consultation
+from .cursor import provisioning as cursor_provisioning
 from .cursor import questions as cursor_questions
 from .diagnostics.health import self_health_response
 from .errors import HarnessError
@@ -106,6 +107,18 @@ def _pending_grouped_repository_question() -> tuple[str, str, str] | None:
     return matches[0] if len(matches) == 1 else None
 
 
+def _pending_repository_question() -> tuple[str, str, str] | None:
+    matches: list[tuple[str, str, str]] = []
+    for job in CURSOR_STORE.list():
+        if job.status != JobStatus.AWAITING_USER:
+            continue
+        question = cursor_questions.current(job)
+        if question is None or question.owner != "repository":
+            continue
+        matches.append((job.id, question.id, question.origin.turn_token))
+    return matches[0] if len(matches) == 1 else None
+
+
 def _single_pending_job() -> AgentJob | None:
     pending = [
         job for job in CURSOR_STORE.list() if job.status == JobStatus.AWAITING_USER
@@ -154,9 +167,14 @@ def respond(text: str, *, user_config: UserConfig | None = None) -> None:
                 if is_grouped_repository_mapping(text)
                 else None
             )
+            repository_reply = (
+                _pending_repository_question()
+                if cursor_provisioning.is_repository_list_request(text)
+                else None
+            )
             pending = cursor_consultation.pending_question_snapshot(CURSOR_STORE, None)
             pending_job = _single_pending_job() if pending is None else None
-            if grouped_reply is not None:
+            if grouped_reply is not None or repository_reply is not None:
                 route = IntentRoute(Intent.AGENT_REPLY, "high")
             elif CURSOR_PATTERN.search(text):
                 route = IntentRoute(Intent.AGENT_SUBMIT, "high")
@@ -369,18 +387,19 @@ def respond(text: str, *, user_config: UserConfig | None = None) -> None:
                     "the tests instead."
                 )
             elif route.actionable and route.intent == Intent.AGENT_REPLY:
+                reply_target = grouped_reply or repository_reply
                 response = cursor_turn(
                     CursorTurnRequest(
                         context.text,
                         action="reply",
                         reference=text,
                         utterance=text,
-                        job_id=grouped_reply[0] if grouped_reply is not None else None,
+                        job_id=reply_target[0] if reply_target is not None else None,
                         expected_question_id=(
-                            grouped_reply[1] if grouped_reply is not None else None
+                            reply_target[1] if reply_target is not None else None
                         ),
                         expected_question_turn=(
-                            grouped_reply[2] if grouped_reply is not None else None
+                            reply_target[2] if reply_target is not None else None
                         ),
                         answer_provenance=AnswerProvenance.USER_TEXT,
                     ),

@@ -69,6 +69,7 @@ from ..critical_targets import (
 )
 from ..cursor import announcements as announcement_policy
 from ..cursor import consultation as cursor_consultation
+from ..cursor import provisioning as cursor_provisioning
 from ..cursor import questions as cursor_questions
 from ..cursor import service as cursor_service
 from ..cursor.delivery import (
@@ -2015,10 +2016,15 @@ class WakeConversationDaemon:
                         pending.owner == "grouped_repository"
                         and is_grouped_repository_mapping(text)
                     )
+                    repository_list_answer = (
+                        pending.owner == "repository"
+                        and cursor_provisioning.is_repository_list_request(text)
+                    )
                     if (
                         resolved_as_answer
                         or apply_recommendation
                         or grouped_repository_answer
+                        or repository_list_answer
                         or question_control(text) is not None
                     ):
                         route = IntentRoute(Intent.AGENT_REPLY, "high")
