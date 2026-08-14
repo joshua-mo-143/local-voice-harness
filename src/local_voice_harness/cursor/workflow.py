@@ -704,6 +704,17 @@ class ParticipantLifecycle:
             )
         return replace(self, admission=ParticipantAdmissionState.HELD)
 
+    def yield_capacity(self) -> ParticipantLifecycle:
+        if self.admission != ParticipantAdmissionState.HELD:
+            raise WorkflowTransitionError(
+                "participant capacity yield requires a held admission"
+            )
+        if self.creation != ParticipantCreation():
+            raise WorkflowTransitionError(
+                "participant capacity cannot yield after creation begins"
+            )
+        return replace(self, admission=ParticipantAdmissionState.WAITING)
+
     def release(self, *, cleanup_confirmed: bool) -> ParticipantLifecycle:
         if self.admission == ParticipantAdmissionState.RELEASED:
             return self

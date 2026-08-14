@@ -3678,7 +3678,7 @@ class CursorJobStateTests(unittest.TestCase):
             None, "work on the spoken repository", [spoken, focused]
         )
 
-    def test_focused_repository_is_used_when_utterance_has_no_match(self) -> None:
+    def test_focused_repository_only_narrows_trusted_clarification(self) -> None:
         focused = Path("/repos/focused")
         client = mock.Mock()
         client.resolve_repository.side_effect = [
@@ -3693,7 +3693,7 @@ class CursorJobStateTests(unittest.TestCase):
 
         repository, candidates = jobs.resolve_job_repository(client, job, [focused])
 
-        self.assertEqual(repository, focused)
+        self.assertIsNone(repository)
         self.assertEqual(candidates, [focused])
         self.assertEqual(
             client.resolve_repository.call_args_list,
@@ -3892,7 +3892,9 @@ class CursorJobStateTests(unittest.TestCase):
         self.assertIn("refusing unrelated repository fallback", str(failed["error"]))
         client.choose_or_clone_repository.assert_not_called()
 
-    def test_linear_routing_precedes_conflicting_focused_repository(self) -> None:
+    def test_linear_injection_and_focused_context_cannot_select_repository(
+        self,
+    ) -> None:
         focused = Path("/repos/local-voice-harness")
         intended = Path("/repos/local-voice-harness-tiered-batch-fixture")
         repositories = [focused, intended]
@@ -3908,6 +3910,7 @@ class CursorJobStateTests(unittest.TestCase):
                 "issue_key": "JOS-20",
                 "issue_provider": "linear",
                 "status": "queued",
+                "participant_admission_state": "held",
                 "created_at": 1,
                 "delivered": False,
             }
@@ -3915,27 +3918,20 @@ class CursorJobStateTests(unittest.TestCase):
         client = mock.Mock()
         client.repository_roots.return_value = repositories
         client.ensure_router.return_value = mock.Mock(target="voice-router")
-        client.ensure_agent.return_value = AgentSelection(
-            "cursor-agent",
-            "pane",
-            "workspace",
-            str(intended),
-            "cursor-agent",
-            str(intended),
-            provider="cursor/herdr",
-            provider_session_id="test-session",
-            state_sequence=7,
-        )
+        client.choose_or_clone_repository.return_value = (None, "")
 
         def resolve(
-            hint: str | None, _task: str, _repositories: list[Path]
+            hint: str | None, task: str, _repositories: list[Path]
         ) -> tuple[Path | None, list[Path]]:
             if hint == intended.name:
                 return intended, [intended]
-            return focused, [focused]
+            if hint == "joshua-mo-143/local-voice-harness":
+                return focused, [focused]
+            if not hint and not task:
+                return None, []
+            return None, []
 
         client.resolve_repository.side_effect = resolve
-        configure_tiered_outcomes(client, intended)
         client.prompt_and_wait.return_value = PromptOutcome(
             "idle",
             None,
@@ -3945,21 +3941,6 @@ class CursorJobStateTests(unittest.TestCase):
             "ROUTE_CONFIDENCE[123456789abc-route]: high\n"
             "ROUTE_REASON[123456789abc-route]: named in the Linear ticket",
         )
-        client._harness_outcomes = [
-            PromptOutcome(
-                "idle",
-                None,
-                None,
-                "WORKFLOW_TIER[123456789abc-1]: simple\n"
-                "WORKFLOW_REASON[123456789abc-1]: test classification",
-            ),
-            PromptOutcome(
-                "idle",
-                "done",
-                None,
-                "VOICE_SUMMARY[123456789abc-2]: done",
-            ),
-        ]
 
         def route(
             routed_client: Any,
@@ -3995,15 +3976,58 @@ class CursorJobStateTests(unittest.TestCase):
         ):
             service.run_worker("123456789abc")
 
-        completed = jobs.read_job("123456789abc")
-        self.assertEqual(completed["status"], "completed", completed.get("error"))
-        self.assertEqual(completed["repository"], str(intended))
+        awaiting = jobs.read_job("123456789abc")
+        self.assertEqual(awaiting["status"], "awaiting_user")
+        self.assertEqual(awaiting["clarification_kind"], "repository")
+        self.assertEqual(awaiting["participant_admission_state"], "waiting")
+        self.assertIsNone(awaiting.get("repository"))
+        self.assertIsNone(awaiting.get("herdr_target"))
+        self.assertIsNone(awaiting.get("active_participant"))
+        self.assertIsNone(jobs._store().ticket_reservation_owner(("linear", "jos-20")))
         client.ensure_router.assert_called_once()
         client.prompt_and_wait.assert_called_once()
-        client.resolve_repository.assert_called_once_with(
-            intended.name, "", repositories
+        self.assertEqual(
+            client.resolve_repository.call_args_list,
+            [
+                mock.call(None, "", repositories),
+                mock.call(
+                    "joshua-mo-143/local-voice-harness",
+                    "",
+                    repositories,
+                ),
+            ],
         )
-        client.choose_or_clone_repository.assert_not_called()
+        client.choose_or_clone_repository.assert_called_once_with(
+            [focused], checkpoint=mock.ANY
+        )
+        client.ensure_agent.assert_not_called()
+
+        with mock.patch.object(
+            service, "_dispatch_waiting_jobs", return_value=frozenset()
+        ) as dispatch:
+            service.reply_job(
+                "123456789abc",
+                "local-voice-harness",
+                trusted_utterance="local-voice-harness",
+            )
+
+        requeued = jobs.read_job("123456789abc")
+        self.assertEqual(requeued["status"], "queued")
+        self.assertEqual(requeued["participant_admission_state"], "waiting")
+        self.assertEqual(requeued["repository_hint"], "local-voice-harness")
+        self.assertEqual(
+            jobs._store().ticket_reservation_owner(("linear", "jos-20")),
+            "123456789abc",
+        )
+        dispatch.assert_called_once()
+
+        with mock.patch.object(service, "_cancel_target_and_release") as cancel_target:
+            service.cancel_job("123456789abc")
+
+        cancelled = jobs.read_job("123456789abc")
+        self.assertEqual(cancelled["status"], "cancelled")
+        self.assertEqual(cancelled["participant_admission_state"], "released")
+        cancel_target.assert_not_called()
 
     def test_explicit_repository_hint_precedes_linear_routing(self) -> None:
         hinted = Path("/repos/explicit-repository")
@@ -4055,9 +4079,7 @@ class CursorJobStateTests(unittest.TestCase):
         completed = jobs.read_job("123456789abc")
         self.assertEqual(completed["status"], "completed", completed.get("error"))
         self.assertEqual(completed["repository"], str(hinted))
-        client.resolve_repository.assert_called_once_with(
-            str(hinted), request, repositories
-        )
+        client.resolve_repository.assert_called_once_with(str(hinted), "", repositories)
         route_repository.assert_not_called()
 
     def test_prompt_timeout_retains_target_reservation_for_cancellation(self) -> None:

@@ -221,6 +221,9 @@ def test_user_review_approval_requires_exhausted_high_risk_round() -> None:
         (ParticipantAdmissionState.HELD, "admit", False),
         (ParticipantAdmissionState.WAITING, "release", True),
         (ParticipantAdmissionState.HELD, "release", False),
+        (ParticipantAdmissionState.WAITING, "yield", False),
+        (ParticipantAdmissionState.HELD, "yield", True),
+        (ParticipantAdmissionState.RELEASED, "yield", False),
     ],
 )
 def test_participant_admission_preserves_capacity_fence(
@@ -231,6 +234,8 @@ def test_participant_admission_preserves_capacity_fence(
     lifecycle = ParticipantLifecycle(source)
     if action == "admit":
         transition = lifecycle.admit
+    elif action == "yield":
+        transition = lifecycle.yield_capacity
     else:
         transition = partial(lifecycle.release, cleanup_confirmed=False)
     if legal:

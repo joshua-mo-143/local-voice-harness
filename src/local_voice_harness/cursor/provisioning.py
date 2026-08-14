@@ -377,12 +377,13 @@ def resolve_job_repository(
     repositories: list[Path],
 ) -> tuple[Path | None, list[Path]]:
     hint = (job.repository_hint or "").strip() or None
-    task = job.request
-    utterance = job.utterance or task
-    repository, candidates = client.resolve_repository(hint, utterance, repositories)
+    trusted_utterance = (job.trusted_utterance or job.utterance or "").strip()
+    repository, candidates = client.resolve_repository(
+        hint, trusted_utterance, repositories
+    )
     context_hint = (job.context_repository or "").strip() or None
     if repository is None and not hint and context_hint:
-        repository, context_candidates = client.resolve_repository(
+        _context_repository, context_candidates = client.resolve_repository(
             context_hint, "", repositories
         )
         candidates = context_candidates or candidates
@@ -5243,6 +5244,7 @@ def run_claimed_worker(  # pyright: ignore[reportGeneralTypeIssues]
                     question,
                     expected_revision=job.revision,
                     clarification_kind="repository",
+                    job_changes={"participant_admission_state": "waiting"},
                 )
                 return
             for _attempt in range(3):

@@ -785,7 +785,7 @@ def test_grouped_handoff_recovery_launches_durably_staged_child(
     assert recovered.grouped_repository_launches[0]["state"] == "completed"
 
 
-def test_overlapping_unresolved_batches_share_ticket_ownership_fence(
+def test_unresolved_batches_create_no_ticket_ownership(
     tmp_path: Path,
 ) -> None:
     store = JobStore(tmp_path / "jobs", tmp_path / "legacy")
@@ -833,13 +833,126 @@ def test_overlapping_unresolved_batches_share_ticket_ownership_fence(
         )
 
     assert [outcome.status for outcome in outcomes] == [
-        "rejected",
+        "awaiting-clarification",
         "awaiting-clarification",
     ]
-    assert outcomes[0].job_id == first_id
-    assert outcomes[1].job_id != first_id
-    assert store.ticket_reservation_owner(("linear", "jos-1")) == first_id
-    assert store.ticket_reservation_owner(("linear", "jos-2")) == outcomes[1].job_id
+    assert outcomes[0].job_id == outcomes[1].job_id
+    assert outcomes[0].job_id != first_id
+    assert store.ticket_reservation_owner(("linear", "jos-1")) is None
+    assert store.ticket_reservation_owner(("linear", "jos-2")) is None
+    assert all(job.participant_admission_state == "released" for job in store.list())
+
+    launch = mock.Mock()
+    service.recovery.recover_jobs(
+        store,
+        launch_worker=launch,
+        is_worker_alive=lambda _job: False,
+        require_issue_provider=lambda _provider: None,
+        outbox_handlers={},
+    )
+
+    launch.assert_not_called()
+    assert all(job.status == JobStatus.AWAITING_USER for job in store.list())
+    assert all(job.participant_admission_state == "released" for job in store.list())
+
+
+def test_overlapping_clarification_answers_preserve_ticket_reservation_fence(
+    tmp_path: Path,
+) -> None:
+    store = JobStore(tmp_path / "jobs", tmp_path / "legacy")
+    repository = tmp_path / "alpha"
+    client = mock.Mock()
+    client.resolve_repository.return_value = (repository, [repository])
+    registry = mock.Mock()
+
+    with (
+        mock.patch.object(service, "_job_store", return_value=store),
+        mock.patch.object(service, "HerdrClient", return_value=client),
+        mock.patch.object(
+            service,
+            "resolve_issue_reference",
+            side_effect=lambda reference, _registry: reference,
+        ),
+        mock.patch.object(service, "issue_provider_identity", return_value="linear"),
+        mock.patch.object(service, "require_issue_capabilities"),
+        mock.patch.object(service, "launch_worker"),
+    ):
+        first = service._create_grouped_repository_clarification(
+            [_grouped_target(0, "JOS-1")],
+            [repository],
+            original_request=StartJobRequest("work on JOS-1", foreground=False),
+        )
+        second = service._create_grouped_repository_clarification(
+            [_grouped_target(0, "JOS-1")],
+            [repository],
+            original_request=StartJobRequest("work on JOS-1", foreground=False),
+        )
+
+        service.reply_job(first, "JOS-1: alpha", integrations=registry)
+        result = service.reply_job(second, "JOS-1: alpha", integrations=registry)
+
+    assert "No duplicate ticket jobs were started" in str(result)
+    assert store.get(second).status == JobStatus.AWAITING_USER
+    owner = store.ticket_reservation_owner(("linear", "jos-1"))
+    assert owner is not None
+    assert owner not in {first, second}
+
+
+def test_single_repository_answer_reports_ticket_reservation_race(
+    tmp_path: Path,
+) -> None:
+    store = JobStore(tmp_path / "jobs", tmp_path / "legacy")
+    clarification = CursorJob.new(
+        NewCursorJob(
+            id="111111111111",
+            request="work on JOS-1",
+            trusted_utterance="work on JOS-1",
+            issue_provider="linear",
+            issue_key="JOS-1",
+            created_at=1,
+            foreground_until=0,
+        )
+    )
+    clarification = CursorJob.from_dict(
+        {
+            **clarification.to_dict(),
+            "status": JobStatus.AWAITING_USER.value,
+            "question": "Which repository should Cursor use?",
+            "result": "Which repository should Cursor use?",
+            "clarification_kind": "repository",
+        }
+    )
+    store.create(clarification)
+    active = CursorJob.new(
+        NewCursorJob(
+            id="222222222222",
+            request="other work on JOS-1",
+            trusted_utterance="other work on JOS-1",
+            issue_provider="linear",
+            issue_key="JOS-1",
+            repository_hint="alpha",
+            created_at=3,
+            foreground_until=0,
+        )
+    )
+    store.create(active)
+
+    with (
+        mock.patch.object(service, "_job_store", return_value=store),
+        mock.patch.object(service, "launch_worker") as launch,
+    ):
+        result = service.reply_job(
+            clarification.id,
+            "alpha",
+            trusted_utterance="alpha",
+        )
+
+    assert "No duplicate ticket job was started" in str(result)
+    unchanged = store.get(clarification.id)
+    assert unchanged.status == JobStatus.AWAITING_USER
+    assert unchanged.repository_hint is None
+    assert store.ticket_reservation_owner(("linear", "jos-1")) == active.id
+    launch.assert_not_called()
 
 
 def test_start_jobs_preserves_outcome_order_during_durable_creation() -> None:

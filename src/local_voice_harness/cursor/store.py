@@ -954,6 +954,16 @@ def _job_reserves_resources(job: CursorJob) -> bool:
     )
 
 
+def _job_reserves_ticket_ownership(job: CursorJob) -> bool:
+    return _job_reserves_resources(job) and not (
+        job.status == JobStatus.AWAITING_USER
+        and job.clarification_kind in {"repository", "grouped_repository"}
+        and job.herdr_target is None
+        and job.worktree_path is None
+        and job.active_participant is None
+    )
+
+
 def _ticket_identity(job: CursorJob) -> tuple[str, ...] | None:
     if (
         not job.fork_requested
@@ -994,7 +1004,8 @@ def _active_ticket_conflict_unlocked(
         (
             peer
             for peer in _peer_models_unlocked(path)
-            if _job_reserves_resources(peer) and _ticket_identity(peer) == identity
+            if _job_reserves_ticket_ownership(peer)
+            and _ticket_identity(peer) == identity
         ),
         None,
     )
@@ -2103,17 +2114,18 @@ class JobStore:
         if not _job_reserves_resources(job):
             return []
         rows: list[tuple[str, str, str]] = []
-        ticket = _ticket_identity(job)
-        if ticket is not None:
-            rows.append(("ticket", "\x1f".join(ticket), "active ticket ownership"))
-        rows.extend(
-            (
-                "ticket",
-                "\x1f".join(identity),
-                "grouped repository clarification ownership",
+        if _job_reserves_ticket_ownership(job):
+            ticket = _ticket_identity(job)
+            if ticket is not None:
+                rows.append(("ticket", "\x1f".join(ticket), "active ticket ownership"))
+            rows.extend(
+                (
+                    "ticket",
+                    "\x1f".join(identity),
+                    "grouped repository clarification ownership",
+                )
+                for identity in _grouped_ticket_identities(job)
             )
-            for identity in _grouped_ticket_identities(job)
-        )
         values = job.to_dict()
         targets = {
             value
