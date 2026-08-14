@@ -8,8 +8,8 @@ from pathlib import Path
 from typing import Any, Protocol
 from urllib.parse import urlsplit
 
+from ...agents.harness import BeforeDispatch, HarnessSession, SessionRequest
 from ...agents.harness import Checkpoint as HarnessCheckpoint
-from ...agents.harness import HarnessSession, SessionRequest
 
 HERDR_UNIT = "voice-harness-herdr.service"
 SETTLED = {"idle", "done"}
@@ -90,6 +90,7 @@ class HerdrOperations(Protocol):
         request: SessionRequest,
         *,
         checkpoint: HarnessCheckpoint | None = None,
+        before_submit: BeforeDispatch | None = None,
     ) -> HarnessSession: ...
 
 

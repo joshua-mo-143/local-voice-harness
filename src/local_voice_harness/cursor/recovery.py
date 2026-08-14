@@ -27,15 +27,25 @@ from ..integrations.linear import LinearError, LinearIntegration
 from ..integrations.registry import build_integration_registry, issue_provider
 from ..job_lifecycle import CancellationEvent, RecoveryEvent
 from ..prompt_operations import (
+    AmbiguousPrompt,
     PromptOperationError,
-    SubmittedPrompt,
     SubmittingPrompt,
     legacy_prompt_fields,
-    observe_prompt_submission,
+    mark_prompt_ambiguous,
 )
 from ..questions import PromptOperationState, QuestionState
 from ..user_config import default_user_config
 from . import questions as question_adapter
+from .agent_outbox import (
+    CLARIFICATION_REPLY,
+    TASK_SUBMIT,
+    consume_agent_results,
+    lazy_agent_effect_handlers,
+)
+from .coordinator import (
+    CoordinatorCommand,
+    CoordinatorDecision,
+)
 from .lifecycle import (
     CleanupOwned,
     LifecycleTransitionError,
@@ -751,6 +761,113 @@ def reconcile_uncertain_operations(
     reconcile_uncertain_worktree(store, current, now=now, herdr_factory=herdr_factory)
 
 
+def _observe_prompt_effect(
+    store: JobStore,
+    job: CursorJob,
+    client: HerdrClient,
+    operation: SubmittingPrompt,
+    *,
+    now: float,
+) -> None:
+    identity = operation.identity
+    result = next(
+        (
+            candidate
+            for kind in (TASK_SUBMIT, CLARIFICATION_REPLY)
+            if (
+                candidate := store.outbox_result(
+                    f"{kind}:{job.id}:{identity.phase}:{identity.turn_token}"
+                )
+            )
+            is not None
+            and candidate.job_id == job.id
+            and candidate.kind == kind
+            and candidate.status == "unknown"
+            and candidate.outcome.get("outcome") == "OutcomeUnknown"
+            and candidate.payload.get("prompt_job_id") == identity.job_id
+            and candidate.payload.get("phase") == identity.phase
+            and candidate.payload.get("turn") == identity.turn
+            and candidate.payload.get("turn_token") == identity.turn_token
+            and candidate.payload.get("target") == identity.target
+            and candidate.payload.get("session_id") == identity.agent_session
+            and candidate.payload.get("baseline_sequence") == identity.baseline_sequence
+        ),
+        None,
+    )
+    if result is None:
+        return
+
+    try:
+        observation = client.harness.reconcile(
+            identity.target,
+            expected_session_id=identity.agent_session,
+        )
+    except HerdrError:
+        return
+    observed_session = (
+        observation.session
+        if observation.state
+        in {ReconciliationState.ACTIVE, ReconciliationState.SETTLED}
+        else None
+    )
+    # Session sequence is shared by every operation targeting the session. An
+    # advance proves that something happened, not that this exact correlation
+    # was accepted. The reconciliation API cannot currently provide stronger
+    # evidence, so an unknown outbox outcome must remain manual.
+    resolved = mark_prompt_ambiguous(SubmittingPrompt(identity), identity)
+    accepted = False
+    sequence = (
+        observed_session.state_sequence
+        if observed_session is not None
+        else identity.baseline_sequence
+    )
+    if (
+        isinstance(job.prompt_operation, AmbiguousPrompt)
+        and not accepted
+        and job.manual_reconcile_operation == "prompt"
+    ):
+        return
+
+    def decide(current: CursorJob) -> CoordinatorDecision | None:
+        try:
+            current_operation = current.prompt_operation
+        except (PromptOperationError, JobValidationError):
+            return None
+        if (
+            not isinstance(current_operation, SubmittingPrompt | AmbiguousPrompt)
+            or current_operation.identity != identity
+        ):
+            return None
+        return CoordinatorDecision(
+            job=current.evolve_recovery(
+                now=now,
+                **legacy_prompt_fields(resolved),
+                manual_reconcile_operation=None if accepted else "prompt",
+                manual_reconcile_token=None if accepted else uuid.uuid4().hex,
+                manual_reconcile_required_at=None if accepted else now,
+            ),
+            event_kind=f"{result.kind}.reconciled",
+            event_payload={
+                "effect_id": result.effect_id,
+                "idempotency_key": result.idempotency_key,
+                "reconciliation_state": observation.state.value,
+                "observed_sequence": sequence,
+            },
+        )
+
+    store.apply(
+        CoordinatorCommand(
+            job_id=job.id,
+            expected_revision=job.revision,
+            command_id=(
+                f"reconcile:{result.effect_id}:{observation.state.value}:{sequence}"
+            ),
+            kind=f"{result.kind}.reconcile",
+        ),
+        decide,
+    )
+
+
 def reconcile_prompt_and_pane_operations(
     store: JobStore,
     job: CursorJob,
@@ -759,7 +876,7 @@ def reconcile_prompt_and_pane_operations(
     herdr_factory: HerdrFactory = HerdrClient,
 ) -> None:
     """Resolve only externally observable acceptance; never replay a submit."""
-    if job.prompt_operation_state == "submitting":
+    if job.prompt_operation_state in {"submitting", "ambiguous"}:
         try:
             operation = job.prompt_operation
         except (PromptOperationError, JobValidationError):
@@ -767,7 +884,10 @@ def reconcile_prompt_and_pane_operations(
             # carrying the complete typed identity. Crossing the submit boundary
             # without that fence is permanently ambiguous and must never replay.
             def fence_incomplete_prompt(current: CursorJob) -> CursorJob | None:
-                if current.prompt_operation_state != "submitting":
+                if current.prompt_operation_state not in {
+                    "submitting",
+                    "ambiguous",
+                }:
                     return None
                 return current.evolve_recovery(
                     now=now,
@@ -779,64 +899,24 @@ def reconcile_prompt_and_pane_operations(
 
             store.update(job.id, fence_incomplete_prompt)
             return
-        if not isinstance(operation, SubmittingPrompt):
+        if not isinstance(operation, SubmittingPrompt | AmbiguousPrompt):
             return
-        identity = operation.identity
-        target = job.prompt_operation_target or ""
         try:
             client = herdr_factory()
             client.ensure_server()
-            observation = client.reconcile_session(target)
-            if observation.state == ReconciliationState.MISSING or (
-                observation.state == ReconciliationState.UNKNOWN
-                and observation.session is None
-            ):
-                return
-            sequence = (
-                observation.session.state_sequence
-                if observation.session is not None
-                else 0
-            )
-            observed_target = (
-                observation.session.target
-                if observation.session is not None
-                else target
-            )
-            session = (
-                observation.session.session_id
-                if observation.session is not None
-                else None
-            )
-        except (HerdrError, TypeError, ValueError):
-            # A failed observation carries no evidence. Keep the submit fence.
+        except HerdrError:
             return
-
-        def reconcile_prompt(current: CursorJob) -> CursorJob | None:
-            if (
-                current.prompt_operation_state != "submitting"
-                or current.prompt_operation_target != target
-            ):
-                return None
-            try:
-                observed = observe_prompt_submission(
-                    current.prompt_operation,
-                    identity,
-                    target=observed_target,
-                    agent_session=session,
-                    state_sequence=sequence,
-                )
-            except PromptOperationError:
-                return None
-            accepted = isinstance(observed, SubmittedPrompt)
-            return current.evolve_recovery(
-                now=now,
-                **legacy_prompt_fields(observed),
-                manual_reconcile_operation=None if accepted else "prompt",
-                manual_reconcile_token=None if accepted else uuid.uuid4().hex,
-                manual_reconcile_required_at=None if accepted else now,
-            )
-
-        store.update(job.id, reconcile_prompt)
+        _observe_prompt_effect(
+            store,
+            job,
+            client,
+            (
+                operation
+                if isinstance(operation, SubmittingPrompt)
+                else SubmittingPrompt(operation.identity)
+            ),
+            now=now,
+        )
 
     current = store.get(job.id)
     if current.participant_creation_state in {"submitting", "ambiguous"}:
@@ -1776,7 +1856,12 @@ def recover_jobs(
     blocked_legacy_jobs = store.migrate_legacy(inspect_worker=inspect_legacy_worker)
     store.prune(now=now)
     recovered_at = time.time() if now is None else now
+    if outbox_handlers is None:
+        outbox_handlers = lazy_agent_effect_handlers(lambda: herdr_factory().harness)
     recover_outbox(store, handlers=outbox_handlers, now=recovered_at)
+    from .provisioning import _reduce_agent_effect
+
+    consume_agent_results(store, _reduce_agent_effect)
 
     for existing in store.list():
         if not has_legacy_worker_claim(existing):

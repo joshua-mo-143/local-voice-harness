@@ -104,6 +104,19 @@ class OutboxLease:
 
 
 @dataclass(frozen=True, slots=True)
+class OutboxResult:
+    """A terminal effect observation awaiting domain-state consumption."""
+
+    effect_id: str
+    job_id: str
+    kind: str
+    idempotency_key: str
+    payload: Mapping[str, object]
+    status: str
+    outcome: Mapping[str, object]
+
+
+@dataclass(frozen=True, slots=True)
 class EffectObservation:
     """Coordinator observation for one leased effect. Never writes job rows."""
 

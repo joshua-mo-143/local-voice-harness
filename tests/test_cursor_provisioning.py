@@ -3,11 +3,12 @@ from __future__ import annotations
 import json
 import os
 import signal
+import sqlite3
 import subprocess
 import tempfile
 import threading
 import unittest
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, cast
@@ -15,9 +16,14 @@ from unittest import mock
 
 from local_voice_harness import user_config
 from local_voice_harness.agents.harness import (
+    HarnessEvent,
+    HarnessEventKind,
     HarnessSession,
+    HarnessTask,
     ReconciliationState,
     SessionReconciliation,
+    SessionRequest,
+    TaskSubmission,
 )
 from local_voice_harness.cursor import provisioning as production_jobs
 from local_voice_harness.cursor import service, worker_lifecycle
@@ -262,6 +268,176 @@ class _ProvisioningTestAdapter:
 jobs: Any = _ProvisioningTestAdapter()
 
 
+def configure_prompt_harness(client: mock.Mock) -> None:
+    harness = mock.Mock()
+    pending: dict[str, tuple[HarnessTask, bool]] = {}
+    tasks = cast(list[HarnessTask], client.__dict__.setdefault("_harness_tasks", []))
+
+    def create(
+        request: SessionRequest,
+        *,
+        before_submit: Callable[[], None],
+        **_kwargs: object,
+    ) -> HarnessSession:
+        before_submit()
+        recording_owned = client.__dict__.get("_recording_owned")
+        selection = client.start_agent.return_value
+        if isinstance(recording_owned, dict):
+            existing = recording_owned.get(request.name)
+            if isinstance(existing, AgentSelection):
+                selection = existing
+        if isinstance(selection, AgentSelection):
+            if isinstance(client.start_agent.return_value, AgentSelection):
+                started = client.start_agent(
+                    Path(selection.cwd),
+                    Path(selection.cwd).name,
+                    request.launch_context["pane_id"],
+                    request.launch_context["workspace_id"],
+                    name=request.name,
+                    checkpoint=mock.ANY,
+                )
+            else:
+                started = selection
+        else:
+            started = AgentSelection(
+                request.name,
+                request.launch_context["pane_id"],
+                request.launch_context["workspace_id"],
+                "",
+                request.name,
+                provider="cursor/herdr",
+                provider_session_id=f"{request.name}-session",
+                state_sequence=7,
+            )
+        if isinstance(recording_owned, dict):
+            recording_owned[started.target] = started
+        return HarnessSession(
+            started.provider or "cursor/herdr",
+            started.provider_session_id or "test-session",
+            started.target,
+            started.state_sequence or 0,
+            {
+                "pane_id": started.pane_id,
+                "workspace_id": started.workspace_id,
+                "cwd": started.cwd,
+            },
+        )
+
+    def submit(
+        session: HarnessSession,
+        task: HarnessTask,
+        *,
+        before_submit: Callable[[int], None],
+        accepted: Callable[[], None],
+        **_kwargs: object,
+    ) -> TaskSubmission:
+        submit_error = client.__dict__.get("_harness_submit_error")
+        if isinstance(submit_error, BaseException):
+            raise submit_error
+        assert task.baseline_sequence is not None
+        before_submit(task.baseline_sequence)
+        accepted()
+        tasks.append(task)
+        pending[task.correlation_id] = (task, False)
+        return TaskSubmission(
+            session,
+            task.correlation_id,
+            task.baseline_sequence,
+            1,
+        )
+
+    def reply(
+        session: HarnessSession,
+        task: HarnessTask,
+        *,
+        before_submit: Callable[[int], None],
+        accepted: Callable[[], None],
+        **_kwargs: object,
+    ) -> TaskSubmission:
+        submission = submit(
+            session,
+            task,
+            before_submit=before_submit,
+            accepted=accepted,
+        )
+        pending[task.correlation_id] = (task, True)
+        return submission
+
+    def stream(submission: TaskSubmission, **_kwargs: object) -> Iterator[HarnessEvent]:
+        task, clarification = pending[submission.correlation_id]
+        error = client.__dict__.get("_harness_error")
+        if isinstance(error, BaseException):
+            raise error
+        outcomes = client.__dict__.get("_harness_outcomes")
+        if isinstance(outcomes, list) and outcomes:
+            outcome = outcomes.pop(0)
+        else:
+            behavior = client.__dict__.get("_harness_behavior")
+            if not callable(behavior):
+                raise AssertionError("test harness has no configured task outcome")
+            outcome = behavior(
+                submission.session.target,
+                task.text,
+                token=task.correlation_id,
+                baseline_sequence=task.baseline_sequence,
+                expected_agent_session=task.expected_session_id,
+                before_submit=lambda _baseline: None,
+                accepted=lambda: None,
+                checkpoint=lambda: None,
+                allow_enter_fallback=task.allow_fallback_submit,
+                clarification_reply=clarification,
+            )
+        assert isinstance(outcome, PromptOutcome)
+        sequence = outcome.state_change_sequence or submission.baseline_sequence + 1
+        recording_owned = client.__dict__.get("_recording_owned")
+        if isinstance(recording_owned, dict):
+            current = recording_owned.get(submission.session.target)
+            if isinstance(current, AgentSelection):
+                recording_owned[submission.session.target] = replace(
+                    current,
+                    provider_session_id=(
+                        outcome.agent_session or submission.session.session_id
+                    ),
+                    state_sequence=sequence,
+                )
+        yield HarnessEvent(
+            (
+                HarnessEventKind.CLARIFICATION
+                if outcome.question
+                else HarnessEventKind.SUCCEEDED
+            ),
+            HarnessSession(
+                submission.session.provider,
+                outcome.agent_session or submission.session.session_id,
+                submission.session.target,
+                sequence,
+                submission.session.metadata,
+            ),
+            outcome.status,
+            outcome.output,
+            outcome.summary,
+            outcome.question,
+            revision=outcome.revision,
+        )
+
+    def reconcile(target: str, *, expected_session_id: str) -> SessionReconciliation:
+        observation = cast(
+            SessionReconciliation,
+            client.reconcile_session(
+                target,
+                expected_session_id=expected_session_id,
+            ),
+        )
+        return observation
+
+    harness.create_session.side_effect = create
+    harness.submit_task.side_effect = submit
+    harness.reply_to_clarification.side_effect = reply
+    harness.stream_events.side_effect = stream
+    harness.reconcile.side_effect = reconcile
+    client.harness = harness
+
+
 def configure_tiered_outcomes(
     client: mock.Mock,
     checkout: Path,
@@ -270,6 +446,7 @@ def configure_tiered_outcomes(
 ) -> None:
     job_id = "123456789abc"
     owned: dict[str, AgentSelection] = {}
+    client._recording_owned = owned
     initial = client.ensure_agent.return_value
     if isinstance(initial, AgentSelection):
         initial = replace(
@@ -291,11 +468,24 @@ def configure_tiered_outcomes(
                 initial.workspace_id,
                 f"root-{initial.pane_id}",
             )
-            reserve(initial, True)
-            settle(initial)
-            return initial
+            provisional = replace(
+                initial,
+                provider=None,
+                provider_session_id=None,
+                state_sequence=None,
+            )
+            reserve(provisional, True)
+            if bool(kwargs.get("start_session", True)):
+                settle(initial)
+                return initial
+            return provisional
 
         client.ensure_agent.side_effect = ensure_agent
+        client.get_agent.side_effect = lambda target: {
+            "agent_status": "working",
+            "state_change_seq": owned[target].state_sequence,
+            "agent_session": owned[target].provider_session_id,
+        }
     outcomes = [
         PromptOutcome(
             "idle",
@@ -314,8 +504,6 @@ def configure_tiered_outcomes(
                     None,
                     f"WORKFLOW_PLAN[{job_id}-2]: implement safely",
                     boundary_marker="WORKFLOW_PLAN",
-                    agent_session="planner-session",
-                    state_change_sequence=2,
                     revision=2,
                 ),
                 PromptOutcome(
@@ -336,7 +524,8 @@ def configure_tiered_outcomes(
             f"VOICE_SUMMARY[{job_id}-{final_turn}]: done",
         )
     )
-    client.prompt_and_wait.side_effect = outcomes
+    client._harness_outcomes = outcomes
+    configure_prompt_harness(client)
 
     def reconcile(target: str, *, expected_session_id: str) -> SessionReconciliation:
         selection = owned[target]
@@ -381,14 +570,23 @@ def configure_tiered_outcomes(
             provider_session_id="test-session",
             state_sequence=7,
         )
-        owned[selection.target] = selection
         before_pane_submit = cast(Callable[[], None], _kwargs["before_pane_submit"])
         pane_accepted = cast(Callable[[str, str], None], _kwargs["pane_accepted"])
-        reserve(selection, True)
+        provisional = replace(
+            selection,
+            provider=None,
+            provider_session_id=None,
+            state_sequence=None,
+        )
+        reserve(provisional, True)
         before_pane_submit()
         pane_accepted(selection.pane_id, selection.workspace_id)
-        settle(selection)
-        return selection
+        if bool(_kwargs.get("start_session", True)):
+            owned[selection.target] = selection
+            settle(selection)
+            return selection
+        owned[selection.target] = selection
+        return provisional
 
     client.start_fresh_agent.side_effect = start_fresh
 
@@ -398,8 +596,21 @@ class DurablePromptOperationTests(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory()
         root = Path(self.temporary.name)
         self.store = JobStore(root / "jobs", root / "legacy")
+        execute_phase_prompt = production_jobs._execute_phase_prompt
+
+        def execute_with_harness(*args: object, **kwargs: object) -> object:
+            configure_prompt_harness(cast(mock.Mock, args[3]))
+            return execute_phase_prompt(*cast(Any, args), **cast(Any, kwargs))
+
+        self.prompt_patch = mock.patch.object(
+            production_jobs,
+            "_execute_phase_prompt",
+            side_effect=execute_with_harness,
+        )
+        self.prompt_patch.start()
 
     def tearDown(self) -> None:
+        self.prompt_patch.stop()
         self.temporary.cleanup()
 
     def create(self, state: str = "none") -> CursorJob:
@@ -544,7 +755,7 @@ class DurablePromptOperationTests(unittest.TestCase):
                 revision=4,
             )
 
-        client.prompt_and_wait.side_effect = prompt
+        client._harness_behavior = prompt
         with mock.patch.dict(
             os.environ,
             {"VOICE_HARNESS_PLAN_APPROVAL_FILE": str(preferences_path)},
@@ -569,13 +780,10 @@ class DurablePromptOperationTests(unittest.TestCase):
         self.assertEqual(current.plan_approval_state, "observed")
         self.assertTrue(current.plan_approval_counted)
         self.assertEqual(preferences.explicit_approval_count, 1)
-        self.assertTrue(
-            client.prompt_and_wait.call_args.kwargs.get("allow_enter_fallback", True)
-        )
-        self.assertEqual(
-            client.prompt_and_wait.call_args.kwargs["expected_agent_session"],
-            "planner-session",
-        )
+        task = cast(list[HarnessTask], client._harness_tasks)[-1]
+        self.assertTrue(task.allow_fallback_submit)
+        self.assertEqual(task.expected_session_id, "planner-session")
+        client.prompt_and_wait.assert_not_called()
 
     def test_unaccepted_plan_approval_is_not_counted(self) -> None:
         job = self.create_approved_plan()
@@ -588,7 +796,7 @@ class DurablePromptOperationTests(unittest.TestCase):
             "agent_session": "planner-session",
             "interactive_ready": True,
         }
-        client.prompt_and_wait.side_effect = HerdrError(
+        client._harness_submit_error = HerdrError(
             "not accepted",
             code="agent_prompt_stalled",
         )
@@ -614,6 +822,7 @@ class DurablePromptOperationTests(unittest.TestCase):
         preferences = user_config.load_plan_approval_preferences(preferences_path)
         self.assertEqual(preferences.explicit_approval_count, 0)
         self.assertFalse(self.store.get(job.id).plan_approval_counted)
+        client.prompt_and_wait.assert_not_called()
 
     def test_crash_after_approval_submit_recovers_without_duplicate_prompt(
         self,
@@ -922,7 +1131,7 @@ class DurablePromptOperationTests(unittest.TestCase):
             accepted()
             return PromptOutcome("idle", None, None, "output")
 
-        client.prompt_and_wait.side_effect = prompt
+        client._harness_behavior = prompt
 
         outcome = production_jobs._execute_phase_prompt(
             self.store,
@@ -937,6 +1146,7 @@ class DurablePromptOperationTests(unittest.TestCase):
 
         self.assertEqual(outcome, ("output", "idle"))
         self.assertEqual(self.store.get(job.id).prompt_operation_state, "submitted")
+        client.prompt_and_wait.assert_not_called()
 
     def _execute_continuation_with_session(self, session: str) -> tuple[bool, str]:
         created = self.create()
@@ -960,7 +1170,7 @@ class DurablePromptOperationTests(unittest.TestCase):
             cast(Callable[[], None], kwargs["accepted"])()
             return PromptOutcome("idle", None, None, "output")
 
-        client.prompt_and_wait.side_effect = submit
+        client._harness_behavior = submit
         decisions: list[bool] = []
 
         def factory(identity: str, full: bool) -> production_jobs.PromptPayload:
@@ -984,7 +1194,7 @@ class DurablePromptOperationTests(unittest.TestCase):
             prompt_factory=factory,
             token="123456789abc-1",
         )
-        sent = str(client.prompt_and_wait.call_args.args[1])
+        sent = cast(list[HarnessTask], client._harness_tasks)[-1].text
         return decisions[0], sent
 
     def test_same_session_continuation_submits_only_delta(self) -> None:
@@ -1057,14 +1267,14 @@ class DurablePromptOperationTests(unittest.TestCase):
         self.assertIn("User answered: JSON", payload.text)
         self.assertTrue(payload.manifest["full_rehydration"])
 
-    def test_prompt_call_failure_is_ambiguous_even_without_callback(self) -> None:
+    def test_prompt_failure_before_dispatch_remains_retryable(self) -> None:
         job = self.create()
         client = mock.Mock()
         client.get_agent.return_value = {
             "state_change_seq": 7,
             "agent_session": "planner-session",
         }
-        client.prompt_and_wait.side_effect = HerdrError("timeout")
+        client._harness_submit_error = HerdrError("timeout")
 
         with self.assertRaises(HerdrError):
             production_jobs._execute_phase_prompt(
@@ -1078,16 +1288,22 @@ class DurablePromptOperationTests(unittest.TestCase):
                 token="123456789abc-1",
             )
 
-        self.assertEqual(self.store.get(job.id).prompt_operation_state, "ambiguous")
+        self.assertEqual(self.store.get(job.id).prompt_operation_state, "submitting")
+        with sqlite3.connect(self.store.db_path) as connection:
+            self.assertEqual(
+                connection.execute("SELECT status FROM outbox").fetchone(),
+                ("failed-retryable",),
+            )
+        client.prompt_and_wait.assert_not_called()
 
-    def test_pre_submit_questionnaire_keeps_planned_prompt_retryable(self) -> None:
+    def test_questionnaire_after_submit_fence_is_ambiguous(self) -> None:
         job = self.create()
         client = mock.Mock()
         client.get_agent.return_value = {
             "state_change_seq": 7,
             "agent_session": "planner-session",
         }
-        client.prompt_and_wait.side_effect = HerdrError(
+        client._harness_error = HerdrError(
             "questionnaire",
             code="interactive_questionnaire",
         )
@@ -1105,10 +1321,11 @@ class DurablePromptOperationTests(unittest.TestCase):
             )
 
         current = self.store.get(job.id)
-        self.assertEqual(current.prompt_operation_state, "planned")
-        self.assertIsNone(current.manual_reconcile_operation)
+        self.assertEqual(current.prompt_operation_state, "ambiguous")
+        self.assertEqual(current.manual_reconcile_operation, "prompt")
+        client.prompt_and_wait.assert_not_called()
 
-    def test_terminal_intent_invalidates_prompt_before_submit_callback(self) -> None:
+    def test_terminal_intent_rejects_observation_after_submit(self) -> None:
         job = self.create()
         client = mock.Mock()
         client.get_agent.return_value = {
@@ -1133,7 +1350,7 @@ class DurablePromptOperationTests(unittest.TestCase):
             submitted = True
             return PromptOutcome("idle", None, None, "output")
 
-        client.prompt_and_wait.side_effect = prompt
+        client._harness_behavior = prompt
 
         with self.assertRaises(production_jobs.WorkerCancelled):
             production_jobs._execute_phase_prompt(
@@ -1147,10 +1364,11 @@ class DurablePromptOperationTests(unittest.TestCase):
                 token="123456789abc-1",
             )
 
-        self.assertFalse(submitted)
+        self.assertTrue(submitted)
         current = self.store.get(job.id)
         self.assertEqual(current.terminal_intent_status, JobStatus.CANCELLED)
-        self.assertEqual(current.prompt_operation_state, "planned")
+        self.assertEqual(current.prompt_operation_state, "submitting")
+        client.prompt_and_wait.assert_not_called()
 
     def test_participant_plan_uses_observed_checkout_before_job_settlement(
         self,
@@ -2195,6 +2413,7 @@ class CursorJobStateTests(unittest.TestCase):
             before_pane_submit=mock.ANY,
             pane_accepted=mock.ANY,
             participant_name=None,
+            start_session=False,
         )
         github.local_git.checkout_remote_ref.assert_called_once_with(
             worktree,
@@ -2205,7 +2424,7 @@ class CursorJobStateTests(unittest.TestCase):
             checkpoint=mock.ANY,
         )
         updated = jobs.read_job("123456789abc")
-        self.assertEqual(updated["status"], "completed")
+        self.assertEqual(updated["status"], "completed", updated)
         self.assertEqual(updated["worktree_path"], str(worktree))
         self.assertEqual(updated["pull_request_worktree_state"], "retained")
 
@@ -2558,6 +2777,7 @@ class CursorJobStateTests(unittest.TestCase):
             before_pane_submit=mock.ANY,
             pane_accepted=mock.ANY,
             participant_name=None,
+            start_session=False,
         )
         updated = jobs.read_job("123456789abc")
         self.assertEqual(updated["status"], "awaiting_user")
@@ -2592,7 +2812,7 @@ class CursorJobStateTests(unittest.TestCase):
             service.run_worker("123456789abc")
 
         updated = jobs.read_job("123456789abc")
-        self.assertEqual(updated["status"], "completed")
+        self.assertEqual(updated["status"], "completed", updated)
         self.assertEqual(
             [call.kwargs["role"] for call in client.start_fresh_agent.call_args_list],
             ["reviewer", "implementer"],
@@ -2612,7 +2832,9 @@ class CursorJobStateTests(unittest.TestCase):
                 mock.call(participant_targets[1], "pane-implementer", "workspace"),
             ],
         )
-        implementation_prompt_text = client.prompt_and_wait.call_args_list[-1].args[1]
+        implementation_prompt_text = cast(list[HarnessTask], client._harness_tasks)[
+            -1
+        ].text
         self.assertNotIn("lgtm", implementation_prompt_text)
         self.assertIn(
             "Implement only from this approved plan", implementation_prompt_text
@@ -3326,8 +3548,9 @@ class CursorJobStateTests(unittest.TestCase):
             before_pane_submit=mock.ANY,
             pane_accepted=mock.ANY,
             participant_name=None,
+            start_session=False,
         )
-        prompt = client.prompt_and_wait.call_args.args[1]
+        prompt = cast(list[HarnessTask], client._harness_tasks)[-1].text
         self.assertIn("Title: Fix it", prompt)
         self.assertIn(
             'the summary must be exactly "I\'ve finished working on issue 42"',
@@ -3710,16 +3933,16 @@ class CursorJobStateTests(unittest.TestCase):
 
         client.resolve_repository.side_effect = resolve
         configure_tiered_outcomes(client, intended)
-        client.prompt_and_wait.side_effect = [
-            PromptOutcome(
-                "idle",
-                None,
-                None,
-                "ROUTE_REPO[123456789abc-route]: "
-                "local-voice-harness-tiered-batch-fixture\n"
-                "ROUTE_CONFIDENCE[123456789abc-route]: high\n"
-                "ROUTE_REASON[123456789abc-route]: named in the Linear ticket",
-            ),
+        client.prompt_and_wait.return_value = PromptOutcome(
+            "idle",
+            None,
+            None,
+            "ROUTE_REPO[123456789abc-route]: "
+            "local-voice-harness-tiered-batch-fixture\n"
+            "ROUTE_CONFIDENCE[123456789abc-route]: high\n"
+            "ROUTE_REASON[123456789abc-route]: named in the Linear ticket",
+        )
+        client._harness_outcomes = [
             PromptOutcome(
                 "idle",
                 None,
@@ -3773,6 +3996,7 @@ class CursorJobStateTests(unittest.TestCase):
         self.assertEqual(completed["status"], "completed", completed.get("error"))
         self.assertEqual(completed["repository"], str(intended))
         client.ensure_router.assert_called_once()
+        client.prompt_and_wait.assert_called_once()
         client.resolve_repository.assert_called_once_with(
             intended.name, "", repositories
         )
@@ -3853,10 +4077,11 @@ class CursorJobStateTests(unittest.TestCase):
             }
         )
         client = mock.Mock()
-        client.prompt_and_wait.side_effect = HerdrError(
+        client._harness_error = HerdrError(
             "prompt timed out",
             code="operation_timeout",
         )
+        configure_prompt_harness(client)
 
         with mock.patch.object(jobs, "HerdrClient", return_value=client):
             service.run_worker("123456789abc")
@@ -3869,7 +4094,7 @@ class CursorJobStateTests(unittest.TestCase):
         self.assertEqual(failed["prompt_operation_state"], "ambiguous")
         self.assertIn("cursor-agent", jobs.reserved_targets())
 
-    def test_stalled_agent_is_cancelled_and_blocked(self) -> None:
+    def test_stalled_agent_requires_prompt_reconciliation(self) -> None:
         repository = Path(self.temporary.name) / "project"
         checkout = Path(self.temporary.name) / "worktree"
         jobs.write_job(
@@ -3889,23 +4114,19 @@ class CursorJobStateTests(unittest.TestCase):
             }
         )
         client = mock.Mock()
-        client.prompt_and_wait.side_effect = HerdrError(
+        client._harness_error = HerdrError(
             "Herdr agent cursor-agent exceeded its inactivity timeout",
             code="agent_stalled",
         )
+        configure_prompt_harness(client)
 
         with mock.patch.object(jobs, "HerdrClient", return_value=client):
             service.run_worker("123456789abc")
 
         blocked = jobs.read_job("123456789abc")
-        self.assertEqual(blocked["status"], "blocked")
-        self.assertEqual(
-            blocked["result"],
-            "Cursor needs manual attention in Herdr.",
-        )
-        self.assertIn("inactivity timeout", str(blocked["error"]))
-        self.assertFalse(blocked.get("target_release_pending", False))
-        client.cancel_agent.assert_called_once_with("cursor-agent")
+        self.assertEqual(blocked["status"], "reconciling")
+        self.assertEqual(blocked["manual_reconcile_operation"], "prompt")
+        client.cancel_agent.assert_not_called()
 
     def test_uncertain_stalled_agent_cancellation_is_reconciled(self) -> None:
         repository = Path(self.temporary.name) / "project"
@@ -3927,11 +4148,12 @@ class CursorJobStateTests(unittest.TestCase):
             }
         )
         client = mock.Mock()
-        client.prompt_and_wait.side_effect = HerdrError(
+        client._harness_error = HerdrError(
             "Herdr agent cursor-agent exceeded its maximum runtime",
             code="agent_stalled",
         )
         client.cancel_agent.side_effect = HerdrError("agent did not stop")
+        configure_prompt_harness(client)
 
         with mock.patch.object(jobs, "HerdrClient", return_value=client):
             service.run_worker("123456789abc")
@@ -4004,7 +4226,7 @@ class CursorJobStateTests(unittest.TestCase):
         client = mock.Mock()
         client.get_agent.side_effect = [
             HerdrError("not found", code="agent_not_found"),
-            {"state_change_seq": 1, "agent_session": "planned-session"},
+            {"state_change_seq": 8, "agent_session": "test-session"},
         ]
         client.start_agent.return_value = selection
         client.reconcile_session.return_value = SessionReconciliation(
@@ -4013,7 +4235,7 @@ class CursorJobStateTests(unittest.TestCase):
                 "cursor/herdr",
                 "test-session",
                 "planned-agent",
-                8,
+                9,
                 {
                     "pane_id": "pane",
                     "workspace_id": "workspace",
@@ -4023,26 +4245,26 @@ class CursorJobStateTests(unittest.TestCase):
             "active",
             True,
         )
-        client.prompt_and_wait.return_value = PromptOutcome(
-            "idle",
-            "done",
-            None,
-            "VOICE_SUMMARY[123456789abc-1]: done",
-        )
+        client._harness_outcomes = [
+            PromptOutcome(
+                "idle",
+                "done",
+                None,
+                "VOICE_SUMMARY[123456789abc-1]: done",
+            )
+        ]
+        configure_prompt_harness(client)
 
         with mock.patch.object(jobs, "HerdrClient", return_value=client):
             service.run_worker("123456789abc")
 
-        client.start_agent.assert_called_once_with(
-            worktree,
-            "project",
-            "pane",
-            "workspace",
-            name="planned-agent",
-            checkpoint=mock.ANY,
+        client.harness.create_session.assert_called_once_with(
+            mock.ANY,
+            before_submit=mock.ANY,
         )
         client.ensure_agent.assert_not_called()
-        self.assertEqual(jobs.read_job("123456789abc")["status"], "completed")
+        recovered = jobs.read_job("123456789abc")
+        self.assertEqual(recovered["status"], "completed", recovered)
 
     def test_dispatch_reconciliation_defers_on_transient_lookup_failure(self) -> None:
         repository = Path(self.temporary.name) / "project"
@@ -4463,6 +4685,7 @@ class CursorJobStateTests(unittest.TestCase):
             "active",
             True,
         )
+        configure_prompt_harness(client)
 
         def ensure_agent(*_args: object, **kwargs: object) -> AgentSelection:
             reserve = cast(Callable[[AgentSelection, bool], None], kwargs["reserve"])
@@ -4584,6 +4807,7 @@ class CursorJobStateTests(unittest.TestCase):
             )
 
         client.reconcile_session.side_effect = reconcile_session
+        configure_prompt_harness(client)
         worker = threading.Thread(target=service.run_worker, args=("123456789abc",))
         with (
             mock.patch.object(jobs, "HerdrClient", return_value=client),
@@ -4690,7 +4914,7 @@ class CursorJobStateTests(unittest.TestCase):
             "retained",
         )
 
-    def test_cancellation_before_prompt_submission_stops_submission(self) -> None:
+    def test_cancellation_after_prompt_dispatch_rejects_late_observation(self) -> None:
         repository = Path(self.temporary.name) / "project"
         jobs.write_job(
             {
@@ -4734,7 +4958,8 @@ class CursorJobStateTests(unittest.TestCase):
             return PromptOutcome("idle", "done", None, "")
 
         client.ensure_agent.side_effect = ensure_agent
-        client.prompt_and_wait.side_effect = prompt
+        client._harness_behavior = prompt
+        configure_prompt_harness(client)
         worker = threading.Thread(target=service.run_worker, args=("123456789abc",))
         with mock.patch.object(jobs, "HerdrClient", return_value=client):
             worker.start()
@@ -4744,7 +4969,7 @@ class CursorJobStateTests(unittest.TestCase):
             worker.join(2)
 
         self.assertFalse(worker.is_alive())
-        self.assertFalse(submitted.is_set())
+        self.assertTrue(submitted.is_set())
         client.close_owned_pane.assert_not_called()
         self.assertTrue(jobs.read_job("123456789abc")["target_release_pending"])
 

@@ -420,10 +420,10 @@ CLI and `scripts/dev.sh text` admission use the same library through independent
 short-lived SQLite connections. Concurrent callers do not bypass the coordinator:
 `BEGIN IMMEDIATE` serializes their decisions with the wake daemon.
 
-Detached workers are leased effect executors. They may call a fenced observation
-API through their own short-lived connection. They must not invoke typed
-transition helpers or write canonical job, reservation, or outbox rows except
-through that API.
+Detached workers may execute opted-in leased effects and submit fenced
+observations through their own short-lived connections. Other production paths
+continue to use `JobStore` transactions and their existing domain-specific
+reconciliation. `CoordinatorCommand` is not mandatory for every caller.
 
 A dedicated coordinator service is rejected at cutover: it would add an
 operational boundary without changing the existing sole-writer invariant.
@@ -435,18 +435,19 @@ run, each holding a lease token that must be renewed; an expired lease may be
 stolen. Concurrency is limited per effect family so providers that are already
 serialized stay serialized:
 
-| Family | Executor | Concurrency |
+| Opted-in family | Executor | Concurrency |
 |---|---|---|
-| Delivery (`delivery.speak`, `delivery.desktop`) | In-process in the wake daemon, which owns TTS and PipeWire | One live delivery lease (`DELIVERY_WINDOW` remains 1) |
-| `AgentHarness` mutating calls | Detached worker | One lease per `(provider, target)` |
-| Herdr workspace / worktree / pane | Detached worker | One lease per repository or checkout path |
-| GitHub provider writes | Detached worker | One durable concurrency key per canonical repository identity; local clone/materialization additionally retains the clone-root file lock |
-| Linear provider writes and read-only MCP observation prompts | Detached worker | One durable concurrency key for the shared router, retaining `_router_owner` as an in-process guard |
-| Artifact publish | Detached worker | Concurrent across distinct content-addressed references; exclusive-create per path |
+| Managed-job `session.create`, `task.submit`, and `clarification.reply` | Detached worker | One lease per `(provider, target)` |
 
 `herdr ensure_server` and detached-worker spawn are not job-scoped outbox
 effects. Interactive Rofi selection and spoken confirmation are coordinator
 `AskQuestion` commands, not effects.
+
+Outbox adoption is risk-based, not universal. Workspace/worktree and provider
+operations retain their typed operation state and read-only reconciliation;
+delivery retains claim/playback/acknowledgement; artifact publication retains
+content-addressed exclusive-create. Those protocols remain authoritative unless
+a separate issue demonstrates a concrete crash-safety gap.
 
 ### Observation vocabulary
 
@@ -473,7 +474,7 @@ effect and is never accepted after the submit fence.
 
 ### Handler boundaries
 
-Each effect belongs to exactly one handler. `AgentHarness` stays the #63
+Each opted-in effect belongs to exactly one handler. `AgentHarness` stays the #63
 session contract: `create_session`, `submit_task`, `stream_events`,
 `reply_to_clarification`, `cancel`, and `reconcile`. It does not grow
 workspace, worktree, pane, repository, delivery, or artifact APIs. Launch
@@ -482,37 +483,31 @@ context (`pane_id`, `workspace_id`, checkout) is allocated before
 
 | Boundary | Handler | Owns |
 |---|---|---|
-| `AgentHarness` | `agents.AgentHarness` / `HerdrSession` | Session create, task/clarification submit, cancel, read-only reconcile and event streaming |
+| `AgentHarness` | `agents.AgentHarness` / `HerdrSession` | Session create, task/clarification submit, cancel, read-only reconcile and event streaming; only the first three are outbox effects |
 | Herdr workspace/worktree | `HerdrWorkspace` | Worktree create/open, workspace/tab pane create, owned pane close, Cursor MCP-auth launch-context link |
 | Repository/provider | GitHub/Linear providers and `LocalGitRepository` | Fork, clone, remote configuration, pull-request ref checkout, GitHub issue create, Linear ticket create/observe |
 | Delivery | `cursor/delivery.py` plus the wake daemon playback/notify path | Claimed speech and desktop notification |
 | Artifact handling | `JobStore.write_artifact` / `publish_artifact` | Immutable plan/review exclusive-create |
 
-Linear ticket creation and marker observation may use the shared Linear router
-through `AgentHarness.submit_task` as a transport. The provider effect identity
-is the ticket plan and correlation marker; the transport submission is a
-separate sequence-fenced `task.submit` effect using the router's provider,
-session ID, target, and baseline sequence. A timeout in that prompt is
-`OutcomeUnknown`, not a read-only observation that may be blindly repeated.
-The job does not adopt the router as its own `AgentHarness` session.
-
 ### Effect catalogue
 
 Idempotency keys are `kind` plus the payload identity fields, unique in
 `outbox.idempotency_key`. Replay means calling the mutating provider again.
-Reconciliation is a read-only observation that may settle the outbox row.
+Reconciliation is a read-only observation tied back to the original effect
+identity. The catalogue records risk and existing safety contracts; only rows
+explicitly identified as opted in are outbox effects.
 
 #### AgentHarness
 
 | Effect | Payload identity | Idempotency key | Provider guarantee | Confirmed | Failed | `OutcomeUnknown` | Replay / reconcile |
 |---|---|---|---|---|---|---|---|
 | `session.create` | `job_id`, planned `target` name, `pane_id`, `workspace_id`, optional mode | those fields | Herdr `agent start` is not idempotent; the planned name is only a correlation address, never durable session identity | The provider response supplies `(provider, session_id, target)` and a subsequent `reconcile(target, expected_session_id)` returns `active` or `settled` with that exact session | Provider rejected before start (`invalid_session_request`, capability miss) | Timeout or crash before the provider-issued `session_id` is durably observed, or missing session after start (`operation_ambiguous`) | Never adopt or replay from target alone. If the provider-issued session ID was durably observed, reconcile that exact identity. Otherwise inspect the planned target plus pane/workspace only to detect conflicts; absence is not replay proof and any present or indeterminate target becomes `ManualRequired`. A later command may admit a replacement only after operator-confirmed absence. Today's `agent_dispatch_state` `dispatching` / `ambiguous` / `failed_observing` map here. |
-| `task.submit` | `PromptIdentity`: `job_id`, phase, turn, `turn_token`, target, `session_id`, `baseline_sequence` | those fields | Not idempotent. `before_submit` / `accepted` remain the durable fence | Same session and `state_sequence != baseline` (`observe_prompt_submission`) | Pre-submit identity mismatch (`agent_session_changed`, interactive questionnaire) | Crash between `before_submit` and `accepted`, or observation failed | Never replay. Same-session sequence change is acceptance; changed/missing session or failed observation stays `OutcomeUnknown` / `ManualRequired`. |
+| `task.submit` | `PromptIdentity`: `job_id`, phase, turn, `turn_token`, target, `session_id`, `baseline_sequence` | those fields | Not idempotent. `before_submit` / `accepted` remain the durable fence | The live handler returns a matching `TaskSubmission` correlation and baseline, then a terminal event for the same session with `state_sequence > baseline` | Pre-submit identity mismatch (`agent_session_changed`, interactive questionnaire) | Crash between `before_submit` and durable observation, or observation failed | Never replay. Read-only reconciliation currently exposes only shared session sequence, so advancement alone cannot prove this prompt correlation; an unknown outcome remains `ManualRequired`. |
 | `clarification.reply` | Same `PromptIdentity` shape on the fenced session | those fields | Same as `task.submit` | Same as `task.submit` | Same as `task.submit` | Same as `task.submit` | Same as `task.submit`. |
-| `session.cancel` | `(provider, session_id, target)` | those fields | Interrupt is safe to retry if the session still matches; already-stopped is success | Agent missing, or status is not `working` after wait | Ownership mismatch (target/session no longer bound) | Timeout while still `working` | Reconcile first. Replay cancel only when the same session is still observed. Do not cancel a reused target. |
 
 `stream_events` and `reconcile` stay on `AgentHarness` and produce
-observations, not outbox rows.
+observations, not outbox rows. Session cancellation retains the existing
+identity-checked reconcile/cancel/owned-pane cleanup path.
 
 #### Herdr workspace/worktree
 
@@ -551,30 +546,17 @@ effect.
 |---|---|---|---|---|---|---|---|
 | `artifact.publish` | `job_id`, kind (`plan`/`review`), round, content digest, optional source-plan digest | those fields | Exclusive-create: identical bytes reuse the sidecar; different bytes cannot replace it | File exists, hash-verifies, and matches the reference | Workflow fence mismatch (stale worker/turn/phase) before create | Crash after create, before the job reference commits | Replay of the same digest is safe and reuses the sidecar. Never rewrite different bytes. Coordinator stores the artifact reference only after `Confirmed`. |
 
-### Compound path splits
+### Retained compound boundary
 
-Today several production helpers cross more than one uncertain provider
-boundary inside one function. Each bullet is one outbox effect; a crash may
-commit the earlier row without the later one.
+`HerdrWorkspace.ensure_agent` continues to own worktree, workspace, pane, and
+MCP-auth allocation under its existing fences. It can stop before starting the
+provider session. Managed jobs then admit `session.create` with the reserved
+target, pane, workspace, checkout, and worker identity. Follow-up participants
+reuse the retained checkout and apply the same pane/session seam.
 
-| Current compound path | Split effects, in order |
-|---|---|
-| `HerdrWorkspace.ensure_agent` | `worktree.create` or `worktree.open`; `mcp_auth.link`; `pane.create` (workspace then tab are two pane effects when no workspace exists); `session.create` |
-| `_provision_followup_agent` / `_ensure_workflow_participant` | `pane.create`; `session.create`. Follow-ups do not create a worktree; they reuse the retained checkout. |
-| Fork provisioning in `run_claimed_worker` | `github.fork`; `repository.clone`; `repository.remote.ensure` for `upstream`; then the `ensure_agent` chain |
-| Pull-request provisioning | `repository.clone`; any required `repository.remote.ensure`; `worktree.create`; `github.pull_request.checkout`; then session/pane effects without a second worktree create |
-| GitHub issue provisioning (`provision_issue`) | `repository.clone` (or reuse a verified candidate); any required `repository.remote.ensure`; then the `ensure_agent` chain |
-| `cancel_target_and_release` per owned target | `session.cancel` when session identity is complete; then `pane.close`. Uncertain pane targets are not closed and remain unverified. |
-| `JobStore.publish_artifact` | `artifact.publish` file create, then coordinator reference commit from the `Confirmed` observation |
-
-GitHub issue creation is one provider mutation after the plan (including its
-correlation marker) is persisted. Linear ticket creation is one provider
-mutation plus separately fenced shared-router submissions for creation and
-observation. Drafting and confirmation stay coordinator commands.
-
-`ensure_agent` must not remain a single effect: worktree create, pane create,
-and session create each have a distinct unknown boundary and a distinct
-reconcile rule.
+Fork, pull-request, issue-provider, cancellation, delivery, and artifact paths
+retain their existing operation-specific protocols. Their catalogue entries
+above are not a commitment to outbox migration.
 
 ## One-shot JSON to SQLite migration
 

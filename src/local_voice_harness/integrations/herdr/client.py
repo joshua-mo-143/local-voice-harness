@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import Any
 
 from ...agents.harness import (
+    BeforeDispatch,
     HarnessCapability,
     HarnessSession,
     SessionReconciliation,
@@ -100,8 +101,11 @@ class HerdrClient:
         request: SessionRequest,
         *,
         checkpoint: Checkpoint | None = None,
+        before_submit: BeforeDispatch | None = None,
     ) -> HarnessSession:
-        return self.harness.create_session(request, checkpoint=checkpoint)
+        return self.harness.create_session(
+            request, checkpoint=checkpoint, before_submit=before_submit
+        )
 
     def reconcile_session(
         self,
@@ -248,6 +252,7 @@ class HerdrClient:
         before_pane_submit: BeforePaneSubmit | None = None,
         pane_accepted: PaneAccepted | None = None,
         participant_name: str | None = None,
+        start_session: bool = True,
     ) -> AgentSelection:
         return self.workspace.ensure_agent(
             repository,
@@ -268,6 +273,7 @@ class HerdrClient:
             before_pane_submit=before_pane_submit,
             pane_accepted=pane_accepted,
             participant_name=participant_name,
+            start_session=start_session,
         )
 
     def start_fresh_agent(
@@ -285,6 +291,7 @@ class HerdrClient:
         fail_agent: FailOperation | None = None,
         before_pane_submit: BeforePaneSubmit | None = None,
         pane_accepted: PaneAccepted | None = None,
+        start_session: bool = True,
     ) -> AgentSelection:
         return self.workspace.start_fresh_agent(
             checkout,
@@ -299,6 +306,7 @@ class HerdrClient:
             fail_agent=fail_agent,
             before_pane_submit=before_pane_submit,
             pane_accepted=pane_accepted,
+            start_session=start_session,
         )
 
     def ensure_router(

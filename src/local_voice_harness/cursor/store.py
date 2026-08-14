@@ -34,6 +34,7 @@ from .coordinator import (
     CoordinatorDecision,
     EffectObservation,
     OutboxLease,
+    OutboxResult,
 )
 from .model import (
     ACTIVE_STATUSES,
@@ -2742,6 +2743,11 @@ class JobStore:
         token = uuid.uuid4().hex if lease_token is None else lease_token
         self._ensure_ready()
         with self._db.transaction() as connection:
+            self._db.abandon_stale_outbox_effects(
+                connection,
+                kinds=kinds,
+                now=claimed_at,
+            )
             row = self._db.claim_due_outbox(
                 connection,
                 kinds=kinds,
@@ -2769,11 +2775,31 @@ class JobStore:
     def mark_outbox_dispatched(self, lease: OutboxLease) -> bool:
         """Record that an unsafe effect crossed its submit fence."""
 
+        expected = lease.payload.get("expected_revision")
+        expected_revision = (
+            expected
+            if isinstance(expected, int) and not isinstance(expected, bool)
+            else None
+        )
         self._ensure_ready()
         with self._db.transaction() as connection:
             return self._db.mark_outbox_dispatched(
-                connection, effect_id=lease.effect_id, lease_token=lease.lease_token
+                connection,
+                effect_id=lease.effect_id,
+                lease_token=lease.lease_token,
+                expected_revision=expected_revision,
             )
+
+    def outbox_revision_stale(self, lease: OutboxLease) -> bool:
+        """Return whether a revision-fenced effect has been superseded."""
+
+        expected = lease.payload.get("expected_revision")
+        if not isinstance(expected, int) or isinstance(expected, bool) or expected < 0:
+            return False
+        self._ensure_ready()
+        with self._db.connect(readonly=True) as connection:
+            current = self._db.load_job_revision(connection, lease.job_id)
+        return current is None or current != expected
 
     def renew_outbox_lease(
         self, lease: OutboxLease, *, now: float | None = None
@@ -2968,6 +2994,84 @@ class JobStore:
                 if result == "applied":
                     reaped += 1
         return reaped
+
+    def unconsumed_outbox_results(
+        self, kinds: tuple[str, ...], *, limit: int = 32
+    ) -> tuple[OutboxResult, ...]:
+        """Load terminal effect observations not yet reduced into domain state."""
+
+        self._ensure_ready()
+        with self._db.connect(readonly=True) as connection:
+            rows = self._db.unconsumed_outbox_results(
+                connection,
+                kinds=kinds,
+                limit=limit,
+            )
+        results: list[OutboxResult] = []
+        for row in rows:
+            payload = json.loads(str(row["payload_json"] or "{}"))
+            outcome = json.loads(str(row["outcome_json"] or "{}"))
+            if not isinstance(payload, dict) or not isinstance(outcome, dict):
+                continue
+            results.append(
+                OutboxResult(
+                    effect_id=str(row["effect_id"]),
+                    job_id=str(row["job_id"]),
+                    kind=str(row["kind"]),
+                    idempotency_key=str(row["idempotency_key"]),
+                    payload=payload,
+                    status=str(row["status"]),
+                    outcome=outcome,
+                )
+            )
+        return tuple(results)
+
+    def outbox_result(self, idempotency_key: str) -> OutboxResult | None:
+        """Load one terminal effect result by its provider idempotency identity."""
+
+        self._ensure_ready()
+        with self._db.connect(readonly=True) as connection:
+            row = self._db.load_outbox_result(connection, idempotency_key)
+        if row is None:
+            return None
+        payload = json.loads(str(row["payload_json"] or "{}"))
+        outcome = json.loads(str(row["outcome_json"] or "{}"))
+        if not isinstance(payload, dict) or not isinstance(outcome, dict):
+            return None
+        return OutboxResult(
+            effect_id=str(row["effect_id"]),
+            job_id=str(row["job_id"]),
+            kind=str(row["kind"]),
+            idempotency_key=str(row["idempotency_key"]),
+            payload=payload,
+            status=str(row["status"]),
+            outcome=outcome,
+        )
+
+    def mark_outbox_consumed(
+        self,
+        result: OutboxResult,
+        disposition: str,
+        *,
+        now: float | None = None,
+    ) -> bool:
+        consumed_at = time.time() if now is None else now
+        self._ensure_ready()
+        with self._db.transaction() as connection:
+            row = self._db.load_outbox(connection, result.effect_id)
+            if (
+                row is None
+                or str(row["job_id"]) != result.job_id
+                or str(row["idempotency_key"]) != result.idempotency_key
+                or str(row["status"]) not in {"succeeded", "failed", "unknown"}
+            ):
+                return False
+            return self._db.mark_outbox_consumed(
+                connection,
+                effect_id=result.effect_id,
+                disposition=disposition,
+                consumed_at=consumed_at,
+            )
 
     def write_artifact(
         self,

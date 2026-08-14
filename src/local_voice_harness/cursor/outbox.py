@@ -23,6 +23,10 @@ from .store import JobStore
 EffectHandler = Callable[[OutboxLease, Callable[[], None]], EffectObservation]
 
 
+class OutboxDispatchStale(RuntimeError):
+    """The admitting job revision changed before external dispatch."""
+
+
 class _LeaseRenewer:
     def __init__(self, store: JobStore, lease: OutboxLease) -> None:
         self._store = store
@@ -51,6 +55,10 @@ class _LeaseRenewer:
 def _bind_mark(store: JobStore, lease: OutboxLease) -> Callable[[], None]:
     def mark_dispatched() -> None:
         if not store.mark_outbox_dispatched(lease):
+            if store.outbox_revision_stale(lease):
+                raise OutboxDispatchStale(
+                    f"outbox effect {lease.effect_id} was superseded before dispatch"
+                )
             raise OutboxLeaseLost(f"outbox lease lost for effect {lease.effect_id}")
 
     return mark_dispatched
@@ -80,6 +88,17 @@ def drain_outbox(
         try:
             with _LeaseRenewer(store, lease):
                 observation = handler(lease, mark_dispatched)
+        except OutboxDispatchStale as exc:
+            store.observe_outbox(
+                lease,
+                EffectObservation(
+                    outcome="Failed",
+                    detail={"error": str(exc)},
+                ),
+                now=now,
+            )
+            processed += 1
+            continue
         except Exception as exc:
             error = str(exc)
             if store.outbox_dispatched(lease) or not store.release_outbox_lease(

@@ -336,6 +336,13 @@ def test_legal_prompt_transitions_preserve_complete_identity() -> None:
     assert observe_prompt_submission(
         submitting,
         identity,
+        target=identity.target,
+        agent_session=identity.agent_session,
+        state_sequence=6,
+    ) == AmbiguousPrompt(identity)
+    assert observe_prompt_submission(
+        submitting,
+        identity,
         target="replacement-target",
         agent_session=identity.agent_session,
         state_sequence=8,
