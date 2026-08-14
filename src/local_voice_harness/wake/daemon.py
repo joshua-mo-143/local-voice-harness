@@ -2522,21 +2522,22 @@ class WakeConversationDaemon:
         speech_streak = 0
         while self.running:
             actions_allowed = self._retry_retained_recovery()
-            activation_interruption = self._recover_config_activation()
-            if activation_interruption is not None:
-                self.continue_after_barge_in(activation_interruption)
-                speech_streak = 0
-                continue
-            batch = drain_pending_announcements(
-                self.announcements,
-                integrations=self.integrations,
-            )
-            if batch.speak:
-                self._enqueue_announcement_batch(batch.speak)
-            if len(self.playback_queue) > 0:
-                self.continue_after_barge_in(self._play_pending_announcements())
-                speech_streak = 0
-                continue
+            if actions_allowed:
+                activation_interruption = self._recover_config_activation()
+                if activation_interruption is not None:
+                    self.continue_after_barge_in(activation_interruption)
+                    speech_streak = 0
+                    continue
+                batch = drain_pending_announcements(
+                    self.announcements,
+                    integrations=self.integrations,
+                )
+                if batch.speak:
+                    self._enqueue_announcement_batch(batch.speak)
+                if len(self.playback_queue) > 0:
+                    self.continue_after_barge_in(self._play_pending_announcements())
+                    speech_streak = 0
+                    continue
             frame = self.read_frame()
             now = time.monotonic()
             self.pre_roll.append(frame)

@@ -3109,12 +3109,14 @@ class RetainedUtteranceTests(unittest.TestCase):
                 "recover_retained_transcripts",
                 side_effect=HarnessError("STT unavailable"),
             ),
-            mock.patch.object(daemon, "_recover_config_activation", return_value=None),
+            mock.patch.object(
+                daemon, "_recover_config_activation", return_value=None
+            ) as recover_activation,
             mock.patch.object(
                 wake_daemon,
                 "drain_pending_announcements",
                 return_value=announcement_policy.DrainResult(),
-            ),
+            ) as drain_announcements,
             mock.patch.object(daemon, "record_utterance_safely") as record,
             mock.patch.object(wake_daemon, "notify") as notify,
             mock.patch.object(wake_daemon, "log"),
@@ -3123,6 +3125,8 @@ class RetainedUtteranceTests(unittest.TestCase):
 
         daemon.start_microphone.assert_called_once_with()
         daemon.wake_model.predict.assert_called_once()
+        recover_activation.assert_not_called()
+        drain_announcements.assert_not_called()
         record.assert_not_called()
         self.assertTrue(daemon.retained_recovery_required)
         self.assertGreaterEqual(notify.call_count, 1)
