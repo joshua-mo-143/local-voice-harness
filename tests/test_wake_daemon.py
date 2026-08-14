@@ -3087,6 +3087,32 @@ class RetainedUtteranceTests(unittest.TestCase):
 
         process.assert_not_called()
 
+    def test_startup_stays_live_when_retained_recovery_is_unavailable(self) -> None:
+        daemon = _bare_daemon()
+        daemon.start_microphone = mock.Mock()  # type: ignore[method-assign]
+
+        def stop_after_backoff(_seconds: float) -> None:
+            daemon.running = False
+
+        with (
+            mock.patch.object(wake_daemon, "recover_jobs"),
+            mock.patch.object(
+                wake_daemon,
+                "recover_retained_transcripts",
+                side_effect=HarnessError("STT unavailable"),
+            ),
+            mock.patch.object(
+                wake_daemon.time, "sleep", side_effect=stop_after_backoff
+            ),
+            mock.patch.object(wake_daemon, "notify") as notify,
+            mock.patch.object(wake_daemon, "log"),
+        ):
+            daemon.run()
+
+        daemon.start_microphone.assert_called_once_with()
+        self.assertTrue(daemon.retained_recovery_required)
+        self.assertGreaterEqual(notify.call_count, 1)
+
 
 class InboxIntentRoutingTests(unittest.TestCase):
     def test_list_intent_routes_to_inbox(self) -> None:

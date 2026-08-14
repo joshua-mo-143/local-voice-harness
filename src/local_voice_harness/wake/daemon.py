@@ -2511,7 +2511,8 @@ class WakeConversationDaemon:
 
     def run(self) -> None:
         recover_jobs(integrations=self.integrations)
-        self._recover_retained_utterances()
+        self.retained_recovery_required = True
+        self._retry_retained_recovery()
         self.start_microphone()
         speech_streak = 0
         while self.running:

@@ -164,7 +164,7 @@ class TranscriptionRequest:
 
 @dataclass(frozen=True)
 class DeliveryRequest:
-    operation: Literal["recover", "release", "ambiguous"]
+    operation: Literal["recover", "release", "pending", "ambiguous"]
     delivery_id: str | None = None
 
 
@@ -436,7 +436,7 @@ def _parse_request(frame: bytes) -> TranscriptionRequest | DeliveryRequest:
     if value.get("version") != PROTOCOL_VERSION:
         raise ProtocolError("unsupported_protocol", "unsupported STT protocol version")
     request_type = value.get("type")
-    if request_type in {"recover", "release", "ambiguous"}:
+    if request_type in {"recover", "release", "pending", "ambiguous"}:
         delivery_id = value.get("delivery_id")
         if request_type != "recover" and (
             not isinstance(delivery_id, str)
@@ -726,7 +726,7 @@ def _write_retained_claim(
                 "delivery_id": delivery_id,
                 "text": text,
                 "woke": woke,
-                "state": "pending",
+                "state": "ambiguous",
                 "created_at": time.time(),
             }
             metadata_path = temporary / RETAINED_METADATA
@@ -844,7 +844,9 @@ def _recover_retained_deliveries() -> list[dict[str, object]]:
     return recovered
 
 
-def _update_retained_state(delivery_id: str, state: Literal["ambiguous"]) -> None:
+def _update_retained_state(
+    delivery_id: str, state: Literal["pending", "ambiguous"]
+) -> None:
     delivery, metadata = _find_retained_delivery(delivery_id)
     metadata["state"] = state
     replacement = delivery / f".{RETAINED_METADATA}-{uuid.uuid4().hex}"
@@ -1013,7 +1015,7 @@ def _delivery_response(request: DeliveryRequest) -> bytes:
         if request.operation == "release":
             _release_retained_delivery(request.delivery_id)
         else:
-            _update_retained_state(request.delivery_id, "ambiguous")
+            _update_retained_state(request.delivery_id, request.operation)
         payload = {
             "ok": True,
             "version": PROTOCOL_VERSION,

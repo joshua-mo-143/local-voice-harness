@@ -824,7 +824,7 @@ class SpeechToTextProtocolTests(unittest.TestCase):
             self.assertTrue((retained / server.RETAINED_AUDIO).exists())
             self.assertEqual(
                 server._load_retained_delivery(retained)["state"],
-                "pending",
+                "ambiguous",
             )
             self.assertTrue(
                 any(

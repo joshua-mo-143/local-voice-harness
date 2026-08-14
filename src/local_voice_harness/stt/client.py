@@ -155,6 +155,13 @@ def _v2_request(
             if trailing_response.get("ok") is False:
                 return trailing_response
             raise HarnessError("STT server returned unexpected acknowledgment data")
+        if retain:
+            try:
+                _delivery_request("pending", str(response["delivery_id"]))
+            except (HarnessError, OSError):
+                response["_retained_state"] = "uncertain"
+            else:
+                response["_retained_state"] = "pending"
         return response
     finally:
         client.close()

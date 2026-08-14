@@ -387,7 +387,10 @@ class SpeechToTextClientTests(unittest.TestCase):
             json.dumps(response, separators=(",", ":")).encode() + b"\n",
             b"",
         ]
-        with mock.patch.object(stt_client.socket, "socket", return_value=connection):
+        with (
+            mock.patch.object(stt_client.socket, "socket", return_value=connection),
+            mock.patch.object(stt_client, "_delivery_request") as delivery_request,
+        ):
             result = stt_client._v2_request(
                 Path("/runtime/request.wav"),
                 timeout=3,
@@ -395,10 +398,44 @@ class SpeechToTextClientTests(unittest.TestCase):
                 woke=True,
             )
 
-        self.assertEqual(result, response)
+        self.assertEqual(result["delivery_id"], response["delivery_id"])
+        self.assertEqual(result["text"], response["text"])
         acknowledgment = json.loads(connection.sendall.call_args_list[1].args[0])
         self.assertEqual(acknowledgment["disposition"], "retain")
         self.assertIs(acknowledgment["woke"], True)
+        delivery_request.assert_called_once_with("pending", "delivery-id")
+        self.assertEqual(result["_retained_state"], "pending")
+
+    def test_pending_authorization_failure_remains_uncertain(self) -> None:
+        response = {
+            "ok": True,
+            "version": stt_client.PROTOCOL_VERSION,
+            "type": "transcript",
+            "delivery_id": "delivery-id",
+            "text": "do the thing",
+        }
+        connection = mock.Mock()
+        connection.recv.side_effect = [
+            json.dumps(response, separators=(",", ":")).encode() + b"\n",
+            b"",
+        ]
+        with (
+            mock.patch.object(stt_client.socket, "socket", return_value=connection),
+            mock.patch.object(
+                stt_client,
+                "_delivery_request",
+                side_effect=HarnessError("STT unavailable"),
+            ) as delivery_request,
+        ):
+            result = stt_client._v2_request(
+                Path("/runtime/request.wav"),
+                timeout=3,
+                retain=True,
+                woke=True,
+            )
+
+        delivery_request.assert_called_once_with("pending", "delivery-id")
+        self.assertEqual(result["_retained_state"], "uncertain")
 
     def test_retained_ack_transport_failure_is_fenced_in_process(self) -> None:
         response = {
