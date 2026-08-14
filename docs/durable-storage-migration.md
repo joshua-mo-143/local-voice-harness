@@ -37,6 +37,30 @@ state.
 | Worker ownership | `job_worker` (with claim projection in `worker_claims`) | 7 |
 | Import-only compatibility | `schema_version`, `migration_source_schema_version`, `phase_prompt_active`, `agent_identity_legacy_compatible` | 4 |
 
+The executable ownership inventory is
+`cursor/lifecycle_ownership.py`. Tests fail when a schema-v18 field or public
+transition entry point is added without a row. That inventory is the #357
+baseline; it does not change runtime behavior or treat a lower field count as
+success.
+
+| Baseline | Count |
+|---|---:|
+| Persisted field names | 213 |
+| Named table fields | 208 |
+| Import-only fields | 4 |
+| Directly exposed `CursorJob` properties | 152 |
+| Compatibility adapters | 21 |
+| Public transition entry points | 68 |
+| Documented duplicate authorities | 3 |
+| Lifecycle-related module lines | 24102 |
+
+The two prompt-operation vocabularies and the checkout/session label collapse
+are the duplicate authorities that later children remove. #358 unifies prompt
+and clarification submission. #359 then makes that typed prompt operation the
+ordinary runtime representation; it overlaps `model.py`, `provisioning.py`, and
+`recovery.py` with #360, so #360 must follow #359 rather than proceed in
+parallel.
+
 The only JSON-valued columns are the nine intrinsically structured, edge-validated
 values: `voice_question`, `clarifications`, `prompt_context_sessions`,
 `prompt_manifest`, `grouped_repository_targets`,
@@ -723,6 +747,18 @@ for each active reservation.
 - [ ] Move cross-field invariants into transitions/types and retain SQL checks
   only for local relational facts.
 - [ ] Preserve externally visible statuses and existing safety behavior.
+
+### #357 — lifecycle ownership inventory
+
+- [x] Inventory every schema-v18 field, typed runtime representation, transition
+  owner, compatibility adapter, and production caller in
+  `cursor/lifecycle_ownership.py`.
+- [x] Record crash boundaries for identity, revision, token, timestamp, counter,
+  uncertainty, and reconciliation fields.
+- [x] Capture baseline counts and the two prompt-operation vocabularies plus
+  checkout/session label collapse as duplicate authorities.
+- [x] Sequence #358, then #359, then #360 because `model.py`, `provisioning.py`,
+  and `recovery.py` overlap; #360 must follow #359.
 
 ### #142 — coordinator and outbox
 
