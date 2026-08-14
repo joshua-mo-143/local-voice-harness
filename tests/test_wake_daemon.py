@@ -69,6 +69,18 @@ USER_CONFIG = replace(
 )
 
 
+def _run_audio_writer(
+    _paths: recorder.RecorderPaths,
+    writer: Callable[[Path], None],
+    *,
+    conflicts: tuple[recorder.RecorderPaths, ...] = (),
+) -> Path:
+    del conflicts
+    with tempfile.TemporaryDirectory() as temporary:
+        writer(Path(temporary) / "recording.wav")
+    return AUDIO_GENERATION
+
+
 def _playback_batch(
     text: str = "test",
     *,
@@ -4375,7 +4387,7 @@ class WakeRecordingHandoffTests(unittest.TestCase):
         with mock.patch.object(
             wake_daemon.recorder,
             "write_audio_generation",
-            return_value=AUDIO_GENERATION,
+            side_effect=_run_audio_writer,
         ) as handoff:
             result = daemon.record_utterance([b"\x01\x00"])
 
@@ -4396,7 +4408,7 @@ class WakeRecordingHandoffTests(unittest.TestCase):
         with mock.patch.object(
             wake_daemon.recorder,
             "write_audio_generation",
-            return_value=AUDIO_GENERATION,
+            side_effect=_run_audio_writer,
         ):
             result = daemon.record_utterance(
                 [b"wake"],
@@ -4417,11 +4429,120 @@ class WakeRecordingHandoffTests(unittest.TestCase):
         with mock.patch.object(
             wake_daemon.recorder,
             "write_audio_generation",
-            return_value=AUDIO_GENERATION,
+            side_effect=_run_audio_writer,
         ):
             daemon.record_utterance([b"pre-roll"] * wake_daemon.PRE_ROLL_FRAMES)
 
         self.assertEqual(daemon.read_frame.call_count, expected_frames)
+
+    def test_competing_recorder_waits_until_wake_generation_is_durable(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            shared_lock = root / "recording.lock"
+            wake_paths = recorder.RecorderPaths(
+                root / "wake",
+                root / "wake" / "request.wav",
+                root / "wake" / "recording.pid",
+                root / "wake" / "pw-record.log",
+                shared_lock,
+            )
+            dictation_paths = recorder.RecorderPaths(
+                root / "dictation",
+                root / "dictation" / "recording.wav",
+                root / "dictation" / "recording.pid",
+                root / "dictation" / "pw-record.log",
+                shared_lock,
+            )
+            daemon = _bare_daemon()
+            capture_started = threading.Event()
+            contender_reached_lock = threading.Event()
+            release_capture = threading.Event()
+            wake_result: list[Path] = []
+            errors: list[BaseException] = []
+            original_recording_lock = recorder.recording_lock
+
+            @contextlib.contextmanager
+            def observed_recording_lock(state_dir: Path, lock_path: Path | None = None):
+                if threading.current_thread().name == "competing-dictation":
+                    contender_reached_lock.set()
+                with original_recording_lock(state_dir, lock_path):
+                    yield
+
+            def read_frame() -> bytes:
+                capture_started.set()
+                if not release_capture.wait(2):
+                    raise AssertionError("capture was not released")
+                daemon.running = False
+                return b"\x01\x00" * 32
+
+            def capture() -> None:
+                try:
+                    result = daemon.record_utterance_safely([b"\x01\x00" * 32])
+                    if result is not None:
+                        wake_result.append(result)
+                except BaseException as exc:
+                    errors.append(exc)
+
+            def start_dictation() -> None:
+                try:
+                    recorder.start_recording(
+                        dictation_paths,
+                        source="",
+                        ready=lambda: True,
+                        conflicts=(wake_paths,),
+                    )
+                except BaseException as exc:
+                    errors.append(exc)
+
+            daemon.read_frame = read_frame  # type: ignore[method-assign]
+            daemon.is_speech = lambda _frame: True  # type: ignore[method-assign]
+            process = mock.Mock(pid=os.getpid(), returncode=None)
+            process.poll.return_value = None
+            with (
+                mock.patch.object(wake_daemon, "RECORDING_PATHS", wake_paths),
+                mock.patch.object(
+                    wake_daemon, "DICTATION_RECORDING_PATHS", dictation_paths
+                ),
+                mock.patch.object(
+                    wake_daemon,
+                    "CAPTURE_PATHS",
+                    (wake_paths, dictation_paths),
+                ),
+                mock.patch.object(
+                    recorder.subprocess, "Popen", return_value=process
+                ) as popen,
+                mock.patch.object(recorder, "_wait_for_recorder"),
+                mock.patch.object(
+                    recorder, "recording_lock", side_effect=observed_recording_lock
+                ),
+            ):
+                wake_thread = threading.Thread(target=capture)
+                wake_thread.start()
+                self.assertTrue(capture_started.wait(1))
+
+                dictation_thread = threading.Thread(
+                    target=start_dictation,
+                    name="competing-dictation",
+                )
+                dictation_thread.start()
+                self.assertTrue(contender_reached_lock.wait(1))
+
+                self.assertTrue(dictation_thread.is_alive())
+                popen.assert_not_called()
+                self.assertFalse(dictation_paths.process.exists())
+
+                release_capture.set()
+                wake_thread.join(2)
+                dictation_thread.join(2)
+
+            self.assertFalse(wake_thread.is_alive())
+            self.assertFalse(dictation_thread.is_alive())
+            self.assertFalse(errors)
+            self.assertEqual(len(wake_result), 1)
+            self.assertTrue(wake_result[0].exists())
+            self.assertGreater(wake_result[0].stat().st_size, recorder.WAV_HEADER_SIZE)
+            popen.assert_called_once()
+            self.assertTrue(dictation_paths.process.exists())
 
     def test_run_requires_fresh_speech_after_wake_detection(self) -> None:
         daemon = _bare_daemon()
