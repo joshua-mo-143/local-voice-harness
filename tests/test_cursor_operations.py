@@ -21,97 +21,106 @@ from local_voice_harness.cursor.operations import (
 )
 
 
-@pytest.mark.parametrize(
-    ("operation", "next_state"),
-    [
-        (
-            CheckoutOperation(
-                CheckoutState.PLANNED,
-                CheckoutSpec("/repo", "voice/task", "/worktree"),
-            ),
-            CheckoutState.DISPATCHING,
+def test_checkout_state_machine_accepts_legal_transitions() -> None:
+    planned = CheckoutOperation(
+        CheckoutState.PLANNED,
+        CheckoutSpec("/repo", "voice/task", "/worktree"),
+    )
+    dispatching = planned.transition(CheckoutState.DISPATCHING)
+    assert dispatching.state is CheckoutState.DISPATCHING
+    retained = dispatching.transition(
+        CheckoutState.RETAINED,
+        spec=CheckoutSpec(
+            "/repo",
+            "voice/task",
+            "/worktree",
+            workspace_path="/workspace",
+            pane_id="%1",
         ),
-        (
-            ForkOperation(
-                OperationState.ACTIVE,
-                ForkSpec(
-                    "owner/repo",
-                    "https://github.com/owner/repo",
-                    "main",
-                    False,
-                    "me",
-                    "me/repo",
-                ),
-            ),
-            OperationState.UNKNOWN,
-        ),
-        (
-            ParticipantPaneOperation(
-                OperationState.UNKNOWN,
-                ParticipantPaneSpec(
-                    "reviewer",
-                    "reviewer-target",
-                    "task-reviewer",
-                    "/worktree",
-                    "workspace",
-                ),
-            ),
-            OperationState.MANUAL,
-        ),
-    ],
-)
-def test_operation_state_machines_accept_legal_transitions(
-    operation: CheckoutOperation | ForkOperation | ParticipantPaneOperation,
-    next_state: CheckoutState | OperationState,
-) -> None:
-    assert operation.transition(next_state).state == next_state
+    )
+    assert retained.state is CheckoutState.RETAINED
+    assert retained.transition(CheckoutState.READY).state is CheckoutState.READY
 
 
-@pytest.mark.parametrize(
-    ("operation", "next_state"),
-    [
-        (
-            CheckoutOperation(
-                CheckoutState.PLANNED,
-                CheckoutSpec("/repo", "voice/task", "/worktree"),
-            ),
-            CheckoutState.MANUAL_REQUIRED,
+def test_agent_session_state_machine_accepts_legal_transitions() -> None:
+    planned = AgentSessionOperation(AgentSessionState.PLANNED)
+    dispatching = planned.transition(AgentSessionState.DISPATCHING)
+    assert dispatching.state is AgentSessionState.DISPATCHING
+    retained = dispatching.transition(
+        AgentSessionState.RETAINED,
+        spec=AgentSessionSpec("composer-1", "bc-1"),
+    )
+    assert retained.state is AgentSessionState.RETAINED
+    assert retained.transition(AgentSessionState.READY).state is AgentSessionState.READY
+
+
+def test_operation_state_machines_accept_legal_transitions() -> None:
+    fork = ForkOperation(
+        OperationState.ACTIVE,
+        ForkSpec(
+            "owner/repo",
+            "https://github.com/owner/repo",
+            "main",
+            False,
+            "me",
+            "me/repo",
         ),
-        (
-            ForkOperation(
-                OperationState.SETTLED,
-                ForkSpec(
-                    "owner/repo",
-                    "https://github.com/owner/repo",
-                    "main",
-                    False,
-                    "me",
-                    "me/repo",
-                ),
-            ),
-            OperationState.ACTIVE,
+    )
+    pane = ParticipantPaneOperation(
+        OperationState.UNKNOWN,
+        ParticipantPaneSpec(
+            "reviewer",
+            "reviewer-target",
+            "task-reviewer",
+            "/worktree",
+            "workspace",
         ),
-        (
-            ParticipantPaneOperation(
-                OperationState.FAILED,
-                ParticipantPaneSpec(
-                    "reviewer",
-                    "reviewer-target",
-                    "task-reviewer",
-                    "/worktree",
-                    "workspace",
-                ),
-            ),
-            OperationState.SETTLED,
-        ),
-    ],
-)
-def test_operation_state_machines_reject_illegal_transitions(
-    operation: CheckoutOperation | ForkOperation | ParticipantPaneOperation,
-    next_state: CheckoutState | OperationState,
-) -> None:
+    )
+    assert fork.transition(OperationState.UNKNOWN).state is OperationState.UNKNOWN
+    assert pane.transition(OperationState.MANUAL).state is OperationState.MANUAL
+
+
+def test_checkout_state_machine_rejects_illegal_transitions() -> None:
+    planned = CheckoutOperation(
+        CheckoutState.PLANNED,
+        CheckoutSpec("/repo", "voice/task", "/worktree"),
+    )
     with pytest.raises(OperationTransitionError):
-        operation.transition(next_state)
+        planned.transition(CheckoutState.MANUAL_REQUIRED)
+
+
+def test_agent_session_state_machine_rejects_illegal_transitions() -> None:
+    planned = AgentSessionOperation(AgentSessionState.PLANNED)
+    with pytest.raises(OperationTransitionError):
+        planned.transition(AgentSessionState.MANUAL_REQUIRED)
+
+
+def test_operation_state_machines_reject_illegal_transitions() -> None:
+    fork = ForkOperation(
+        OperationState.SETTLED,
+        ForkSpec(
+            "owner/repo",
+            "https://github.com/owner/repo",
+            "main",
+            False,
+            "me",
+            "me/repo",
+        ),
+    )
+    pane = ParticipantPaneOperation(
+        OperationState.FAILED,
+        ParticipantPaneSpec(
+            "reviewer",
+            "reviewer-target",
+            "task-reviewer",
+            "/worktree",
+            "workspace",
+        ),
+    )
+    with pytest.raises(OperationTransitionError):
+        fork.transition(OperationState.ACTIVE)
+    with pytest.raises(OperationTransitionError):
+        pane.transition(OperationState.SETTLED)
 
 
 @pytest.mark.parametrize(
