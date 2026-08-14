@@ -87,6 +87,10 @@ class GitHubOperationAmbiguous(GitHubError):
     pass
 
 
+class GitHubCommandStartError(GitHubError):
+    """A GitHub command failed before its process could be started."""
+
+
 class GitHubIssueLookupReason(StrEnum):
     NOT_FOUND_OR_INACCESSIBLE = "not_found_or_inaccessible"
     UNAUTHORIZED = "unauthorized"
@@ -317,6 +321,7 @@ class GitHubClient:
         *,
         timeout: float | None = None,
         check: bool = True,
+        write: bool = False,
         cwd: Path | None = None,
         stdin: str | None = None,
     ) -> subprocess.CompletedProcess[str]:
@@ -328,7 +333,9 @@ class GitHubClient:
                 stdin=stdin,
             )
         except OSError as exc:
-            raise GitHubError(f"GitHub command failed: {exc}") from exc
+            raise GitHubCommandStartError(
+                f"GitHub command failed to start: {exc}"
+            ) from exc
         except subprocess.TimeoutExpired as exc:
             raise GitHubOperationAmbiguous(
                 "GitHub command timed out; its outcome is ambiguous because an "
@@ -336,9 +343,13 @@ class GitHubClient:
             ) from exc
         if check and process.returncode:
             detail = process.stderr.strip() or process.stdout.strip()
-            raise GitHubError(
-                detail or f"command exited with status {process.returncode}"
-            )
+            message = detail or f"command exited with status {process.returncode}"
+            if write:
+                raise GitHubOperationAmbiguous(
+                    "GitHub write exited without proving its outcome; an external "
+                    f"side effect may already have occurred: {message}"
+                )
+            raise GitHubError(message)
         return process
 
     @staticmethod
@@ -417,9 +428,16 @@ class GitHubClient:
                 "-",
             ],
             timeout=30,
+            write=True,
             stdin=submitted_body,
         )
-        return self._creation_result(plan, process.stdout)
+        try:
+            return self._creation_result(plan, process.stdout)
+        except GitHubError as exc:
+            raise GitHubOperationAmbiguous(
+                "GitHub write completed without a provable result; an external "
+                "side effect may already have occurred"
+            ) from exc
 
     def observe_issue(
         self, plan: GitHubIssueCreationPlan
@@ -702,6 +720,7 @@ class GitHubClient:
                 "--clone=false",
             ],
             timeout=120,
+            write=True,
         )
         fork = self._repo_view(target_name, required=True)
         assert fork is not None
