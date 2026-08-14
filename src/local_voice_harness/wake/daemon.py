@@ -140,7 +140,11 @@ from ..self_management import (
 )
 from ..speech import SpeechRenderer, StreamingSpeechRenderer
 from ..stt.client import transcribe
-from ..ticket_targets import MISSING_ISSUE_SCOPE_RESPONSE, extract_ticket_targets
+from ..ticket_targets import (
+    MISSING_ISSUE_SCOPE_RESPONSE,
+    TicketExtraction,
+    extract_ticket_targets,
+)
 from ..tts.queue import PlaybackQueue, PlaybackRequest
 from ..user_config import AnnouncementSettings, UserConfig, load_user_config
 from ..vad import FRAME_BYTES, FRAME_MS, SAMPLE_RATE, SpeechDetector
@@ -165,12 +169,56 @@ MICROPHONE_START_ATTEMPTS = 30
 MICROPHONE_RETRY_SECONDS = 1
 PLAYBACK_ECHO_WINDOW_SECONDS = 8.0
 RECENT_PLAYBACK_LIMIT = 8
+TARGET_RESOLUTION_CONTEXT_RESPONSE = AssistantResponse.from_text(
+    "I still can't verify the requested issue. Open its exact issue page and say "
+    '"I\'ve opened it," or repeat the request with a fully qualified reference.'
+)
+TARGET_RESOLUTION_CONTINUATION_PATTERN = re.compile(
+    r"\s*(?:(?:okay|ok|yeah|yes|yep|right|well|um|uh)[,\s]+)*"
+    r"(?:(?:i(?:'ve| have)?\s+)?opened\s+(?:it|this|the issue)|"
+    r"(?:this|that)\s+issue|this one)"
+    r"(?:\s*[,;]?\s+(?:now|please|for you|as requested|like you asked|um|uh))*"
+    r"\s*[,!?\.]?\s*",
+    re.IGNORECASE,
+)
 
 
 @dataclass(frozen=True, slots=True)
 class PendingTargetReadback:
     candidate: ReadbackCandidate
     request: CursorTurnRequest
+
+
+@dataclass(frozen=True, slots=True)
+class PendingTargetResolution:
+    trusted_utterance: str
+    route: IntentRoute
+    created_at: float
+
+    @property
+    def expires_at(self) -> float:
+        return self.created_at + CONVERSATION_TIMEOUT_SECONDS
+
+
+def _is_target_resolution_continuation(text: str) -> bool:
+    return TARGET_RESOLUTION_CONTINUATION_PATTERN.fullmatch(text) is not None
+
+
+def _has_exact_target_resolution(
+    extraction: TicketExtraction,
+    context: RequestContext,
+) -> bool:
+    if (
+        context.focused_issue is None
+        or extraction.requested_count != 1
+        or extraction.has_unresolved_scope
+    ):
+        return False
+    selection = select_submit_target(extraction, context)
+    return bool(
+        selection is not None
+        and selection.target.canonical.casefold() == context.focused_issue.casefold()
+    )
 
 
 def _critical_target_request(target: CriticalTarget) -> CursorTurnRequest:
@@ -477,6 +525,7 @@ class WakeConversationDaemon:
             maxlen=RECENT_PLAYBACK_LIMIT
         )
         self.pending_target_readback: PendingTargetReadback | None = None
+        self.pending_target_resolution: PendingTargetResolution | None = None
         self.pending_config_change: PendingConfigChange | None = None
         self.config_activation_store = config_activation_store or ActivationStore()
         self.config_activation_delivery: ActivationDelivery | None = None
@@ -683,6 +732,7 @@ class WakeConversationDaemon:
         self.completed_followup = None
         self.recent_playback.clear()
         self.pending_target_readback = None
+        self.pending_target_resolution = None
         self.pending_config_change = None
         self.conversation_deadline = 0.0
         self.awaiting_followup = False
@@ -1509,8 +1559,12 @@ class WakeConversationDaemon:
             try:
                 text = transcribe(audio_path)
             except NoSpeechError:
+                pending_target_resolution = getattr(
+                    self, "pending_target_resolution", None
+                )
                 if (
                     getattr(self, "pending_target_readback", None) is None
+                    and pending_target_resolution is None
                     and getattr(self, "pending_config_change", None) is None
                 ):
                     raise
@@ -1519,10 +1573,17 @@ class WakeConversationDaemon:
                 self.conversation_deadline = (
                     time.monotonic() + CONVERSATION_TIMEOUT_SECONDS
                 )
+                if pending_target_resolution is not None:
+                    self.conversation_deadline = min(
+                        self.conversation_deadline,
+                        pending_target_resolution.expires_at,
+                    )
                 if getattr(self, "pending_target_readback", None) is not None:
                     notify(
                         "I didn't catch that. Please repeat yes, no, or the correction."
                     )
+                elif pending_target_resolution is not None:
+                    notify(TARGET_RESOLUTION_CONTEXT_RESPONSE.spoken_text)
                 else:
                     notify("I didn't catch that. Please repeat yes or no.")
                 return None
@@ -1555,8 +1616,22 @@ class WakeConversationDaemon:
             if CLOSE_PATTERN.search(text):
                 self.close_conversation("spoken command")
                 return None
+            pending_target_resolution = getattr(self, "pending_target_resolution", None)
+            if (
+                pending_target_resolution is not None
+                and time.monotonic() >= pending_target_resolution.expires_at
+            ):
+                self.pending_target_resolution = None
+                pending_target_resolution = None
+            resuming_target_resolution = bool(
+                pending_target_resolution is not None
+                and _is_target_resolution_continuation(text)
+            )
             self.ensure_components()
             print(f"You: {text}", flush=True)
+            if resuming_target_resolution:
+                assert pending_target_resolution is not None
+                text = pending_target_resolution.trusted_utterance
             next_cursor_session = self.cursor_session
             next_history = list(self.history)
             remember_response = False
@@ -1574,7 +1649,7 @@ class WakeConversationDaemon:
                     platform=self.platform,
                     integrations=self.integrations,
                 )
-                if pending_readback is not None
+                if pending_readback is not None or resuming_target_resolution
                 else routing_context
             )
             if pending_readback is not None:
@@ -1602,7 +1677,9 @@ class WakeConversationDaemon:
                 else None
             )
             active_completed = self._active_completed_followup()
-            pending = self._pending_cursor_question()
+            pending = (
+                None if resuming_target_resolution else self._pending_cursor_question()
+            )
             if (
                 readback_result is not None
                 or confirmed_request is not None
@@ -1610,6 +1687,9 @@ class WakeConversationDaemon:
                 or activation_response is not None
             ):
                 route = IntentRoute(Intent.UNCERTAIN, "low")
+            elif resuming_target_resolution:
+                assert pending_target_resolution is not None
+                route = pending_target_resolution.route
             elif (
                 self.providers.llm_provider == "venice"
                 and pending is None
@@ -1687,6 +1767,12 @@ class WakeConversationDaemon:
                         self.close_pending_capture("non-actionable speech")
                         return None
             if (
+                pending_target_resolution is not None
+                and not resuming_target_resolution
+                and route.actionable
+            ):
+                self.pending_target_resolution = None
+            if (
                 pending_config is not None
                 and config_decision == ConfirmationDecision.AMBIGUOUS
                 and config_response is None
@@ -1701,17 +1787,21 @@ class WakeConversationDaemon:
                         "cancel it."
                     )
                     route = IntentRoute(Intent.UNCERTAIN, "low")
-            if pending_readback is None and (
-                route.intent == Intent.CONVERSATION
-                or (
-                    route.actionable
-                    and route.intent
-                    in {
-                        Intent.AGENT_SUBMIT,
-                        Intent.GITHUB_ISSUE_CREATE,
-                        Intent.LINEAR_TICKET_CREATE,
-                        Intent.WORKSPACE_CONSULTATION,
-                    }
+            if (
+                pending_readback is None
+                and not resuming_target_resolution
+                and (
+                    route.intent == Intent.CONVERSATION
+                    or (
+                        route.actionable
+                        and route.intent
+                        in {
+                            Intent.AGENT_SUBMIT,
+                            Intent.GITHUB_ISSUE_CREATE,
+                            Intent.LINEAR_TICKET_CREATE,
+                            Intent.WORKSPACE_CONSULTATION,
+                        }
+                    )
                 )
             ):
                 context = request_context(
@@ -1745,6 +1835,10 @@ class WakeConversationDaemon:
                 Intent.AGENT_SUBMIT,
                 Intent.UNCERTAIN,
             }
+            invalid_target_resolution = (
+                resuming_target_resolution
+                and not _has_exact_target_resolution(extraction, context)
+            )
             if config_response is not None:
                 response = config_response
             elif activation_response is not None:
@@ -1810,7 +1904,20 @@ class WakeConversationDaemon:
                     )
             elif route.actionable and route.intent == Intent.SELF_HEALTH:
                 response = self_health_response()
+            elif invalid_target_resolution:
+                response = TARGET_RESOLUTION_CONTEXT_RESPONSE
             elif missing_ticket_scope:
+                if (
+                    not resuming_target_resolution
+                    and route.actionable
+                    and route.intent == Intent.AGENT_SUBMIT
+                    and extraction.requested_count == 1
+                ):
+                    self.pending_target_resolution = PendingTargetResolution(
+                        text,
+                        route,
+                        time.monotonic(),
+                    )
                 response = MISSING_ISSUE_SCOPE_RESPONSE
             elif cursor_consultation.is_apply_recommendation_request(text):
                 snapshot = cursor_consultation.pending_question_snapshot(
@@ -2015,6 +2122,8 @@ class WakeConversationDaemon:
                         candidate,
                         _critical_target_request(candidate.target),
                     )
+                    if resuming_target_resolution:
+                        self.pending_target_resolution = None
                     response = readback_response(candidate)
                 else:
                     response, next_cursor_session = cursor_turn(
@@ -2039,6 +2148,8 @@ class WakeConversationDaemon:
                             selection.target,
                             response,
                         )
+                    if resuming_target_resolution:
+                        self.pending_target_resolution = None
             elif route.intent == Intent.AGENT_SUBMIT:
                 response = NON_ACTIONABLE_SUBMIT_RESPONSE
             elif route.intent == Intent.GITHUB_ISSUE_CREATE:
@@ -2184,6 +2295,12 @@ class WakeConversationDaemon:
                 self.cursor_session = next_cursor_session
             self.history = next_history
             self.conversation_deadline = time.monotonic() + CONVERSATION_TIMEOUT_SECONDS
+            unresolved_target = getattr(self, "pending_target_resolution", None)
+            if unresolved_target is not None:
+                self.conversation_deadline = min(
+                    self.conversation_deadline,
+                    unresolved_target.expires_at,
+                )
             self.awaiting_followup = True
             notify("Listening for a follow-up…")
         except NoSpeechError as exc:
@@ -2295,6 +2412,7 @@ class WakeConversationDaemon:
 
     def stop(self) -> None:
         self.running = False
+        self.pending_target_resolution = None
         self.pending_config_change = None
         if self.microphone is not None and self.microphone.poll() is None:
             if self.microphone_paused:
