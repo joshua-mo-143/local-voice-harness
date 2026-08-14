@@ -33,6 +33,7 @@ from local_voice_harness.cursor.lifecycle import (
     take_over_cleanup,
 )
 from local_voice_harness.cursor.model import CURRENT_SCHEMA_VERSION, CursorJob
+from local_voice_harness.cursor.operations import CheckoutState
 from local_voice_harness.prompt_operations import (
     AmbiguousPrompt,
     IdlePrompt,
@@ -640,6 +641,41 @@ def test_cursor_job_evolves_typed_prompt_operation_without_flat_kwargs() -> None
     assert updated.to_dict()["prompt_operation_state"] == "planned"
     restored = CursorJob.from_dict(updated.to_dict())
     assert restored.prompt_operation == planned
+
+
+def test_cursor_job_evolves_typed_checkout_without_flat_kwargs() -> None:
+    job = CursorJob.from_dict(
+        {
+            "schema_version": CURRENT_SCHEMA_VERSION,
+            "id": "123456789abc",
+            "revision": 0,
+            "request": "implement it",
+            "status": "queued",
+            "created_at": 1,
+            "queued_at": 1,
+            "delivered": False,
+            "repository": "/repo",
+            "worktree_branch": "voice/task",
+            "worktree_path": "/worktree",
+            "worktree_provision_state": "dispatching",
+        }
+    )
+    assert job.checkout_operation is not None
+    ready = job.checkout_operation.transition(
+        CheckoutState.READY, workspace_id="ws", root_pane_id="pane"
+    )
+    updated = job.evolve(checkout_operation=ready)
+
+    assert updated.checkout_operation == ready
+    assert updated.worktree_provision_state == "ready"
+    assert updated.worktree_workspace_id == "ws"
+    restored = CursorJob.from_dict(updated.to_dict())
+    assert restored.checkout_operation == ready
+    retained = ready.transition(CheckoutState.RETAINED)
+    kept = updated.evolve(checkout_operation=retained)
+    assert kept.worktree_provision_state == "retained"
+    assert kept.checkout_operation is not None
+    assert kept.checkout_operation.state == CheckoutState.RETAINED
 
 
 def test_answered_question_state_requires_answer_payload() -> None:

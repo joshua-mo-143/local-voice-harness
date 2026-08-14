@@ -123,9 +123,17 @@ from .model import (
     transition,
 )
 from .operations import (
+    AgentSessionOperation,
+    AgentSessionSpec,
+    AgentSessionState,
+    CheckoutOperation,
+    CheckoutSpec,
+    CheckoutState,
     OperationState,
     SessionIdentity,
     WorkerOwnership,
+    uncertain_checkout_state,
+    uncertain_session_state,
 )
 from .outbox import drain_outbox
 from .prompts import (
@@ -1767,7 +1775,28 @@ def _reserve_worker_target(
             worktree_path=worktree_value,
             agent_operation_checkout=worktree_value,
             agent_name=selection.name,
-            agent_dispatch_state=dispatch_state,
+            agent_session_operation=AgentSessionOperation(
+                AgentSessionState(dispatch_state),
+                AgentSessionSpec(
+                    target,
+                    worktree_value or "",
+                    selection.workspace_id,
+                    selection.pane_id,
+                ),
+                (
+                    SessionIdentity(
+                        str(selection.provider),
+                        str(selection.provider_session_id),
+                        target,
+                        selection.state_sequence,
+                    )
+                    if identity_complete
+                    and selection.provider is not None
+                    and selection.provider_session_id is not None
+                    and selection.state_sequence is not None
+                    else None
+                ),
+            ),
             agent_identity_legacy_compatible=False,
             agent_provider=selection.provider if identity_complete else None,
             agent_provider_session_id=(
@@ -1824,8 +1853,18 @@ def _settle_worker_agent(
             selection.state_sequence,
         )
         if operation is None or not all(value is not None for value in identity_values):
+            if operation is None:
+                return job.evolve(
+                    agent_dispatch_state="ambiguous",
+                    agent_dispatch_exited=True,
+                    agent_reconcile_attempts=0,
+                    agent_next_reconcile_at=time.time(),
+                    worker_operation=None,
+                )
             return job.evolve(
-                agent_dispatch_state="ambiguous",
+                agent_session_operation=operation.transition(
+                    AgentSessionState.AMBIGUOUS
+                ),
                 agent_dispatch_exited=True,
                 agent_reconcile_attempts=0,
                 agent_next_reconcile_at=time.time(),
@@ -1840,7 +1879,7 @@ def _settle_worker_agent(
             selection.target,
             selection.state_sequence,
         )
-        operation.transition(OperationState.SETTLED, session=identity)
+        settled = operation.transition(AgentSessionState.READY, session=identity)
         return transition(
             job,
             job.status,
@@ -1852,7 +1891,7 @@ def _settle_worker_agent(
             worktree_path=selection.worktree_path,
             agent_operation_checkout=selection.worktree_path,
             agent_name=selection.name,
-            agent_dispatch_state="ready",
+            agent_session_operation=settled,
             agent_provider=selection.provider,
             agent_provider_session_id=selection.provider_session_id,
             agent_state_sequence=selection.state_sequence,
@@ -1986,24 +2025,24 @@ def _reduce_agent_effect(job: CursorJob, result: OutboxResult) -> CursorJob | No
             session.target,
             session.state_sequence,
         )
-        operation.transition(OperationState.SETTLED, session=identity)
+        settled = operation.transition(AgentSessionState.READY, session=identity)
         return transition(
             job,
             job.status,
-            agent_dispatch_state="ready",
+            agent_session_operation=settled,
             agent_provider=session.provider,
             agent_provider_session_id=session.session_id,
             agent_state_sequence=session.state_sequence,
             worker_operation=None,
         )
-    operation.transition(OperationState.UNKNOWN)
-    outcome = str(result.outcome.get("outcome") or "")
+    observed = operation.transition(
+        uncertain_session_state(
+            ambiguous=str(result.outcome.get("outcome") or "")
+            in {"OutcomeUnknown", "ManualRequired"}
+        )
+    )
     return job.evolve(
-        agent_dispatch_state=(
-            "ambiguous"
-            if outcome in {"OutcomeUnknown", "ManualRequired"}
-            else "failed_observing"
-        ),
+        agent_session_operation=observed,
         agent_dispatch_exited=True,
         agent_reconcile_attempts=0,
         agent_next_reconcile_at=time.time(),
@@ -2095,12 +2134,13 @@ def _execute_session_create_effect(
     )
 
 
-def _failed_operation_state(exc: HerdrError) -> str:
-    return (
-        "ambiguous"
-        if exc.code in {"operation_timeout", "operation_ambiguous"}
-        else "failed_observing"
-    )
+def _session_state_changes(
+    job: CursorJob, state: AgentSessionState
+) -> dict[str, object]:
+    operation = job.agent_session_operation
+    if operation is not None:
+        return {"agent_session_operation": operation.transition(state)}
+    return {"agent_dispatch_state": state.value}
 
 
 def _fail_worker_agent_dispatch(
@@ -2121,9 +2161,13 @@ def _fail_worker_agent_dispatch(
         operation = job.agent_session_operation
         if operation is None:
             return None
-        operation.transition(OperationState.UNKNOWN)
+        failed = operation.transition(
+            uncertain_session_state(
+                ambiguous=exc.code in {"operation_timeout", "operation_ambiguous"}
+            )
+        )
         return job.evolve(
-            agent_dispatch_state=_failed_operation_state(exc),
+            agent_session_operation=failed,
             agent_dispatch_exited=True,
             agent_reconcile_attempts=0,
             agent_next_reconcile_at=time.time(),
@@ -2163,7 +2207,10 @@ def _reserve_worker_worktree(
             repository=str(repository.resolve()),
             worktree_branch=branch,
             worktree_path=checkout_value,
-            worktree_provision_state=persisted_state,
+            checkout_operation=CheckoutOperation(
+                CheckoutState(persisted_state),
+                CheckoutSpec(str(repository.resolve()), branch, checkout_value),
+            ),
             worker_operation=(
                 "worktree_create" if persisted_state == "dispatching" else None
             ),
@@ -2205,24 +2252,24 @@ def _settle_worker_worktree(
             return transition(
                 job,
                 job.status,
-                worktree_provision_state="quarantined",
+                checkout_operation=operation.transition(CheckoutState.QUARANTINED),
                 worktree_provision_error=(
                     "worktree settled without paired workspace and root-pane identity"
                 ),
                 worktree_manual_inspection_required=True,
                 worker_operation=None,
             )
-        operation.transition(
-            OperationState.SETTLED,
+        settled = operation.transition(
+            CheckoutState.RETAINED
+            if job.status.value == "cancelled"
+            else CheckoutState.READY,
             workspace_id=workspace_id,
             root_pane_id=pane_id,
         )
         return transition(
             job,
             job.status,
-            worktree_provision_state=(
-                "retained" if job.status.value == "cancelled" else "ready"
-            ),
+            checkout_operation=settled,
             worktree_workspace_id=workspace_id,
             worktree_root_pane_id=pane_id,
             worker_operation=(
@@ -2253,9 +2300,13 @@ def _fail_worker_worktree(
         operation = job.checkout_operation
         if operation is None:
             return None
-        operation.transition(OperationState.UNKNOWN)
+        failed = operation.transition(
+            uncertain_checkout_state(
+                ambiguous=exc.code in {"operation_timeout", "operation_ambiguous"}
+            )
+        )
         return job.evolve(
-            worktree_provision_state=_failed_operation_state(exc),
+            checkout_operation=failed,
             worktree_dispatch_exited=True,
             worktree_reconcile_attempts=0,
             worktree_next_reconcile_at=time.time(),
@@ -3639,7 +3690,7 @@ def _ensure_workflow_participant(
                 current.participant_lifecycle,
                 creation=ParticipantCreation(),
             ),
-            agent_dispatch_state="confirmed_absent",
+            **_session_state_changes(job, AgentSessionState.CONFIRMED_ABSENT),
             active_participant=None,
             planner_target=None,
             reviewer_target=None,
@@ -4727,7 +4778,9 @@ def run_claimed_worker(  # pyright: ignore[reportGeneralTypeIssues]
                         worker_token,
                         {JobStatus.ROUTING},
                         lambda current: current.evolve(
-                            agent_dispatch_state="manual_required",
+                            **_session_state_changes(
+                                current, AgentSessionState.MANUAL_REQUIRED
+                            ),
                             manual_reconcile_operation="agent",
                             manual_reconcile_token=uuid.uuid4().hex,
                             manual_reconcile_required_at=time.time(),
@@ -4810,7 +4863,9 @@ def run_claimed_worker(  # pyright: ignore[reportGeneralTypeIssues]
                         worker_token,
                         {JobStatus.ROUTING},
                         lambda current: current.evolve(
-                            agent_dispatch_state="manual_required",
+                            **_session_state_changes(
+                                current, AgentSessionState.MANUAL_REQUIRED
+                            ),
                             manual_reconcile_operation="agent",
                             manual_reconcile_token=uuid.uuid4().hex,
                             manual_reconcile_required_at=time.time(),

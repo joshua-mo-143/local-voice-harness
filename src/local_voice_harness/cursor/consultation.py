@@ -18,6 +18,7 @@ from ..process import boot_identity, process_identity
 from ..questions import Choice, Question, QuestionSensitivity, QuestionState
 from . import questions
 from .model import CursorJob, JobStatus
+from .operations import checkout_is_usable
 from .store import JobStore
 
 NO_WORKSPACE = "I couldn't identify one eligible workspace for that consultation."
@@ -179,7 +180,11 @@ def workspace_target(
     elif (
         completed_job is not None
         and completed_job.status == JobStatus.COMPLETED
-        and completed_job.worktree_provision_state in {"ready", "retained"}
+        and checkout_is_usable(
+            None
+            if completed_job.checkout_operation is None
+            else completed_job.checkout_operation.state
+        )
         and completed_job.worktree_path
     ):
         checkout = Path(completed_job.worktree_path).expanduser().resolve()

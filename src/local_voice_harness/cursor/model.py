@@ -86,17 +86,21 @@ from .lifecycle import (
 )
 from .operations import (
     AgentSessionOperation,
-    AgentSessionSpec,
+    AgentSessionState,
     CheckoutOperation,
-    CheckoutSpec,
+    CheckoutState,
     ForkOperation,
     ForkSpec,
     OperationState,
     OperationTransitionError,
     ParticipantPaneOperation,
     ParticipantPaneSpec,
-    SessionIdentity,
     WorkerOwnership,
+    agent_session_fields,
+    checkout_blocks_reservation,
+    checkout_fields,
+    load_agent_session_operation,
+    load_checkout_operation,
     load_worker_ownership,
 )
 from .workflow import (
@@ -1241,6 +1245,187 @@ def _consume_typed_prompt_operation(changes: dict[str, object]) -> None:
     changes.update(legacy_prompt_fields(operation))
 
 
+def _typed_checkout_operation(
+    values: Mapping[str, object], *, loaded_version: int
+) -> CheckoutOperation | None:
+    state = values.get("worktree_provision_state")
+    if state is None:
+        return None
+    parsed = CheckoutState(str(state))
+    workspace_id = (
+        str(values["worktree_workspace_id"])
+        if values.get("worktree_workspace_id") is not None
+        else None
+    )
+    root_pane_id = (
+        str(values["worktree_root_pane_id"])
+        if values.get("worktree_root_pane_id") is not None
+        else None
+    )
+    if (
+        loaded_version < CURRENT_SCHEMA_VERSION
+        and parsed in {CheckoutState.READY, CheckoutState.RETAINED}
+        and (
+            not workspace_id
+            or not root_pane_id
+            or LEGACY_BOOT_ID
+            in {
+                values.get("repository"),
+                values.get("worktree_branch"),
+                values.get("worktree_path"),
+            }
+        )
+    ):
+        parsed = CheckoutState.AMBIGUOUS
+    if loaded_version < CURRENT_SCHEMA_VERSION and bool(workspace_id) != bool(
+        root_pane_id
+    ):
+        workspace_id = None
+        root_pane_id = None
+    try:
+        return load_checkout_operation(
+            state=parsed.value,
+            repository=(
+                str(values["repository"])
+                if values.get("repository") is not None
+                else None
+            ),
+            branch=(
+                str(values["worktree_branch"])
+                if values.get("worktree_branch") is not None
+                else None
+            ),
+            path=(
+                str(values["worktree_path"])
+                if values.get("worktree_path") is not None
+                else None
+            ),
+            workspace_id=workspace_id,
+            root_pane_id=root_pane_id,
+        )
+    except OperationTransitionError as exc:
+        raise JobValidationError(str(exc)) from exc
+
+
+def _optional_typed_checkout_operation(
+    values: Mapping[str, object], *, loaded_version: int
+) -> CheckoutOperation | None:
+    try:
+        return _typed_checkout_operation(values, loaded_version=loaded_version)
+    except (JobValidationError, ValueError):
+        return None
+
+
+def _consume_typed_checkout_operation(changes: dict[str, object]) -> None:
+    operation = changes.pop("checkout_operation", None)
+    if operation is None:
+        return
+    if not isinstance(operation, CheckoutOperation):
+        raise JobValidationError("checkout_operation must be a typed CheckoutOperation")
+    changes.update(checkout_fields(operation))
+
+
+def _typed_agent_session_operation(
+    values: Mapping[str, object], *, loaded_version: int
+) -> AgentSessionOperation | None:
+    state = values.get("agent_dispatch_state")
+    if state is None:
+        return None
+    parsed = AgentSessionState(str(state))
+    session_values = (
+        values.get("agent_provider"),
+        values.get("agent_provider_session_id"),
+        values.get("agent_state_sequence"),
+    )
+    if (
+        parsed in {AgentSessionState.READY, AgentSessionState.RETAINED}
+        and not any(value is not None for value in session_values)
+        and loaded_version < CURRENT_SCHEMA_VERSION
+    ):
+        parsed = AgentSessionState.AMBIGUOUS
+    try:
+        return load_agent_session_operation(
+            state=parsed.value,
+            target=(
+                str(values["agent_operation_target"])
+                if values.get("agent_operation_target") is not None
+                else (
+                    str(values["herdr_target"])
+                    if values.get("herdr_target") is not None
+                    else None
+                )
+            ),
+            checkout=(
+                str(values["agent_operation_checkout"])
+                if values.get("agent_operation_checkout") is not None
+                else (
+                    str(values["worktree_path"])
+                    if values.get("worktree_path") is not None
+                    else (
+                        str(values["repository"])
+                        if values.get("repository") is not None
+                        else None
+                    )
+                )
+            ),
+            workspace_id=(
+                str(values["agent_operation_workspace_id"])
+                if values.get("agent_operation_workspace_id") is not None
+                else (
+                    str(values["herdr_workspace_id"])
+                    if values.get("herdr_workspace_id") is not None
+                    else None
+                )
+            ),
+            pane_id=(
+                str(values["agent_operation_pane_id"])
+                if values.get("agent_operation_pane_id") is not None
+                else (
+                    str(values["herdr_pane_id"])
+                    if values.get("herdr_pane_id") is not None
+                    else None
+                )
+            ),
+            provider=(
+                str(values["agent_provider"])
+                if values.get("agent_provider") is not None
+                else None
+            ),
+            session_id=(
+                str(values["agent_provider_session_id"])
+                if values.get("agent_provider_session_id") is not None
+                else None
+            ),
+            state_sequence=(
+                _integer(values["agent_state_sequence"], "agent_state_sequence")
+                if values.get("agent_state_sequence") is not None
+                else None
+            ),
+        )
+    except OperationTransitionError as exc:
+        raise JobValidationError(str(exc)) from exc
+
+
+def _optional_typed_agent_session_operation(
+    values: Mapping[str, object], *, loaded_version: int
+) -> AgentSessionOperation | None:
+    try:
+        return _typed_agent_session_operation(values, loaded_version=loaded_version)
+    except (JobValidationError, ValueError):
+        return None
+
+
+def _consume_typed_agent_session_operation(changes: dict[str, object]) -> None:
+    operation = changes.pop("agent_session_operation", None)
+    if operation is None:
+        return
+    if not isinstance(operation, AgentSessionOperation):
+        raise JobValidationError(
+            "agent_session_operation must be a typed AgentSessionOperation"
+        )
+    changes.update(agent_session_fields(operation))
+
+
 def _prompt_operation_defaults(values: dict[str, object]) -> None:
     """Translate the schema-v10 boolean prompt fence without a schema bump."""
     if "prompt_operation_state" in values:
@@ -1313,6 +1498,8 @@ class AgentJob:
     _compatibility_layout: bool
     _values: dict[str, object]
     _prompt_operation: PromptOperation | None
+    _checkout_operation: CheckoutOperation | None
+    _agent_session_operation: AgentSessionOperation | None
     _lifecycle_event: JobEvent | None = None
 
     @classmethod
@@ -1609,6 +1796,12 @@ class AgentJob:
             _prompt_operation=_optional_typed_prompt_operation(
                 values, str(values["id"])
             ),
+            _checkout_operation=_optional_typed_checkout_operation(
+                values, loaded_version=loaded_version
+            ),
+            _agent_session_operation=_optional_typed_agent_session_operation(
+                values, loaded_version=loaded_version
+            ),
             _lifecycle_event=None,
         )
         job.validate_invariants(
@@ -1706,6 +1899,8 @@ class AgentJob:
         for field in remove:
             values.pop(field, None)
         _consume_typed_prompt_operation(changes)
+        _consume_typed_checkout_operation(changes)
+        _consume_typed_agent_session_operation(changes)
         values.update(changes)
         _pair_announcement_ack(values)
         _pair_worker_ownership(values)
@@ -1792,9 +1987,13 @@ class AgentJob:
         if dynamic_changes is not None:
             mutable_dynamic = dict(dynamic_changes)
             _consume_typed_prompt_operation(mutable_dynamic)
+            _consume_typed_checkout_operation(mutable_dynamic)
+            _consume_typed_agent_session_operation(mutable_dynamic)
             values.update(mutable_dynamic)
             dynamic_changes = mutable_dynamic
         _consume_typed_prompt_operation(changes)
+        _consume_typed_checkout_operation(changes)
+        _consume_typed_agent_session_operation(changes)
         values.update(changes)
         _pair_worker_ownership(values)
         if "prompt_operation_state" in values:
@@ -1939,9 +2138,26 @@ class AgentJob:
             and absent >= failed_max_attempts
             and can_confirm_absent
         ):
+            if operation == "worktree" and self.checkout_operation is not None:
+                changes.update(
+                    checkout_fields(
+                        self.checkout_operation.transition(
+                            CheckoutState.CONFIRMED_ABSENT
+                        )
+                    )
+                )
+            elif operation == "agent" and self.agent_session_operation is not None:
+                changes.update(
+                    agent_session_fields(
+                        self.agent_session_operation.transition(
+                            AgentSessionState.CONFIRMED_ABSENT
+                        )
+                    )
+                )
+            else:
+                changes[state_key] = "confirmed_absent"
             changes.update(
                 {
-                    state_key: "confirmed_absent",
                     f"{operation}_confirmed_absent_at": now,
                     f"{operation}_next_reconcile_at": None,
                     "worker_operation": None,
@@ -1963,9 +2179,26 @@ class AgentJob:
                 if participant is not None:
                     changes[f"{participant.value}_target"] = None
         elif attempts >= uncertain_max_attempts:
+            if operation == "worktree" and self.checkout_operation is not None:
+                changes.update(
+                    checkout_fields(
+                        self.checkout_operation.transition(
+                            CheckoutState.MANUAL_REQUIRED
+                        )
+                    )
+                )
+            elif operation == "agent" and self.agent_session_operation is not None:
+                changes.update(
+                    agent_session_fields(
+                        self.agent_session_operation.transition(
+                            AgentSessionState.MANUAL_REQUIRED
+                        )
+                    )
+                )
+            else:
+                changes[state_key] = "manual_required"
             changes.update(
                 {
-                    state_key: "manual_required",
                     f"{operation}_next_reconcile_at": None,
                     f"{operation}_automatic_reconcile_stopped_at": now,
                     "manual_reconcile_operation": operation,
@@ -2250,50 +2483,13 @@ class AgentJob:
 
     @property
     def checkout_operation(self) -> CheckoutOperation | None:
+        if self._checkout_operation is not None:
+            return self._checkout_operation
         if self.worktree_provision_state is None:
             return None
-        state = {
-            "planned": OperationState.PLANNED,
-            "dispatching": OperationState.ACTIVE,
-            "ready": OperationState.SETTLED,
-            "retained": OperationState.SETTLED,
-            "quarantined": OperationState.UNKNOWN,
-            "ambiguous": OperationState.UNKNOWN,
-            "failed_observing": OperationState.UNKNOWN,
-            "confirmed_absent": OperationState.FAILED,
-            "manual_required": OperationState.MANUAL,
-        }[self.worktree_provision_state]
-        if (
-            self.loaded_schema_version < CURRENT_SCHEMA_VERSION
-            and state == OperationState.SETTLED
-            and (
-                not self.worktree_workspace_id
-                or not self.worktree_root_pane_id
-                or LEGACY_BOOT_ID
-                in {self.repository, self.worktree_branch, self.worktree_path}
-            )
-        ):
-            state = OperationState.UNKNOWN
-        workspace_id = self.worktree_workspace_id
-        root_pane_id = self.worktree_root_pane_id
-        if self.loaded_schema_version < CURRENT_SCHEMA_VERSION and bool(
-            workspace_id
-        ) != bool(root_pane_id):
-            workspace_id = None
-            root_pane_id = None
-        try:
-            return CheckoutOperation(
-                state,
-                CheckoutSpec(
-                    self.repository or "",
-                    self.worktree_branch or "",
-                    self.worktree_path or "",
-                ),
-                workspace_id,
-                root_pane_id,
-            )
-        except OperationTransitionError as exc:
-            raise JobValidationError(str(exc)) from exc
+        return _typed_checkout_operation(
+            self._values, loaded_version=self.loaded_schema_version
+        )
 
     @property
     def worktree_provision_error(self) -> str | None:
@@ -2430,62 +2626,13 @@ class AgentJob:
 
     @property
     def agent_session_operation(self) -> AgentSessionOperation | None:
+        if self._agent_session_operation is not None:
+            return self._agent_session_operation
         if self.agent_dispatch_state is None:
             return None
-        state = {
-            "dispatching": OperationState.ACTIVE,
-            "ready": OperationState.SETTLED,
-            "retained": OperationState.SETTLED,
-            "ambiguous": OperationState.UNKNOWN,
-            "failed_observing": OperationState.UNKNOWN,
-            "confirmed_absent": OperationState.FAILED,
-            "manual_required": OperationState.MANUAL,
-        }[self.agent_dispatch_state]
-        session_values = (
-            self.agent_provider,
-            self.agent_provider_session_id,
-            self.agent_state_sequence,
+        return _typed_agent_session_operation(
+            self._values, loaded_version=self.loaded_schema_version
         )
-        session = None
-        if any(value is not None for value in session_values):
-            if not all(value is not None for value in session_values):
-                raise JobValidationError(
-                    "agent provider session identity is incomplete"
-                )
-            assert self.agent_provider is not None
-            assert self.agent_provider_session_id is not None
-            assert self.agent_state_sequence is not None
-            session = SessionIdentity(
-                self.agent_provider,
-                self.agent_provider_session_id,
-                self.agent_operation_target or self.herdr_target or "",
-                self.agent_state_sequence,
-            )
-        if (
-            session is None
-            and self.loaded_schema_version < CURRENT_SCHEMA_VERSION
-            and state == OperationState.SETTLED
-        ):
-            # A migrated target-only operation is retained as explicitly unknown
-            # typed state. Only legacy reconciliation paths may use its old
-            # target/workspace evidence; native v18 rows remain strict.
-            state = OperationState.UNKNOWN
-        try:
-            return AgentSessionOperation(
-                state,
-                AgentSessionSpec(
-                    self.agent_operation_target or self.herdr_target or "",
-                    self.agent_operation_checkout
-                    or self.worktree_path
-                    or self.repository
-                    or "",
-                    self.agent_operation_workspace_id or self.herdr_workspace_id or "",
-                    self.agent_operation_pane_id or self.herdr_pane_id or "",
-                ),
-                session,
-            )
-        except OperationTransitionError as exc:
-            raise JobValidationError(str(exc)) from exc
 
     @property
     def delivery_generation(self) -> int:
@@ -3464,7 +3611,11 @@ class AgentJob:
 
     def _updated(self, **changes: object) -> CursorJob:
         values = dict(self._values)
-        values.update(changes)
+        mutable = dict(changes)
+        _consume_typed_prompt_operation(mutable)
+        _consume_typed_checkout_operation(mutable)
+        _consume_typed_agent_session_operation(mutable)
+        values.update(mutable)
         _pair_worker_ownership(values)
         values["schema_version"] = CURRENT_SCHEMA_VERSION
         values["revision"] = self.revision + 1
@@ -4046,12 +4197,12 @@ def _validate_operation_transitions(before: CursorJob, after: CursorJob) -> None
             replacement = (
                 (
                     name == "agent session"
-                    and previous.state == OperationState.FAILED
+                    and previous.state == AgentSessionState.CONFIRMED_ABSENT
                     and current.state
                     in {
-                        OperationState.PLANNED,
-                        OperationState.ACTIVE,
-                        OperationState.SETTLED,
+                        AgentSessionState.DISPATCHING,
+                        AgentSessionState.READY,
+                        AgentSessionState.RETAINED,
                     }
                 )
                 or (
@@ -4061,9 +4212,41 @@ def _validate_operation_transitions(before: CursorJob, after: CursorJob) -> None
                 )
                 or (
                     LEGACY_BOOT_ID in repr(previous.spec)
-                    and previous.state
-                    in {OperationState.UNKNOWN, OperationState.MANUAL}
-                    and current.state == OperationState.SETTLED
+                    and (
+                        (
+                            isinstance(previous, CheckoutOperation)
+                            and isinstance(current, CheckoutOperation)
+                            and previous.state
+                            in {
+                                CheckoutState.QUARANTINED,
+                                CheckoutState.AMBIGUOUS,
+                                CheckoutState.FAILED_OBSERVING,
+                                CheckoutState.MANUAL_REQUIRED,
+                            }
+                            and current.state
+                            in {CheckoutState.READY, CheckoutState.RETAINED}
+                        )
+                        or (
+                            isinstance(previous, AgentSessionOperation)
+                            and isinstance(current, AgentSessionOperation)
+                            and previous.state
+                            in {
+                                AgentSessionState.AMBIGUOUS,
+                                AgentSessionState.FAILED_OBSERVING,
+                                AgentSessionState.MANUAL_REQUIRED,
+                            }
+                            and current.state
+                            in {AgentSessionState.READY, AgentSessionState.RETAINED}
+                        )
+                        or (
+                            not isinstance(
+                                previous, CheckoutOperation | AgentSessionOperation
+                            )
+                            and previous.state
+                            in {OperationState.UNKNOWN, OperationState.MANUAL}
+                            and current.state == OperationState.SETTLED
+                        )
+                    )
                 )
                 or archived_agent
             )
@@ -4079,8 +4262,8 @@ def _validate_operation_transitions(before: CursorJob, after: CursorJob) -> None
                     and before.loaded_schema_version < CURRENT_SCHEMA_VERSION
                     and before.agent_dispatch_state == "manual_required"
                     and after.agent_dispatch_state == "retained"
-                    and previous.state == OperationState.MANUAL
-                    and current.state == OperationState.UNKNOWN
+                    and previous.state == AgentSessionState.MANUAL_REQUIRED
+                    and current.state == AgentSessionState.AMBIGUOUS
                     and isinstance(current, AgentSessionOperation)
                     and current.session is None
                 )
@@ -4103,6 +4286,8 @@ def _validate_operation_transitions(before: CursorJob, after: CursorJob) -> None
                 ):
                     previous.transition(current.state, pane_id=current.pane_id)
                 else:
+                    assert isinstance(previous, ForkOperation)
+                    assert isinstance(current, ForkOperation)
                     previous.transition(current.state)
             if isinstance(previous, AgentSessionOperation) and isinstance(
                 current, AgentSessionOperation
@@ -4303,6 +4488,9 @@ def transition(
             f"illegal Cursor job transition {job.status.value} -> {status.value}"
         )
     values = job.to_dict()
+    _consume_typed_prompt_operation(changes)
+    _consume_typed_checkout_operation(changes)
+    _consume_typed_agent_session_operation(changes)
     values.update(changes)
     _pair_worker_ownership(values)
     if "herdr_target" in changes and "session_id" not in changes:
@@ -4359,7 +4547,9 @@ def validate_reservations(jobs: list[CursorJob]) -> None:
             or job.has_uncertain_operation()
             or job.manual_reconcile_operation is not None
             or job.worktree_manual_inspection_required
-            or job.worktree_provision_state in {"quarantined", "manual_required"}
+            or checkout_blocks_reservation(
+                None if job.checkout_operation is None else job.checkout_operation.state
+            )
             or job.pull_request_worktree_state == "quarantined"
         )
         job_targets = {
@@ -4384,10 +4574,9 @@ def validate_reservations(jobs: list[CursorJob]) -> None:
                         f"Herdr target {target} is reserved by both "
                         f"{owner} and {job.id}"
                     )
-        worktree_blocked = reserves or job.worktree_provision_state in {
-            "quarantined",
-            "manual_required",
-        }
+        worktree_blocked = reserves or checkout_blocks_reservation(
+            None if job.checkout_operation is None else job.checkout_operation.state
+        )
         if worktree_blocked and job.worktree_path:
             owner = worktrees.setdefault(job.worktree_path, job.id)
             if owner != job.id:

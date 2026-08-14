@@ -61,9 +61,7 @@ def test_top_level_and_submachine_inventory_is_complete() -> None:
 
 def test_duplicate_authorities_include_prompt_and_checkout_overlaps() -> None:
     names = {item.name for item in ownership.DUPLICATE_AUTHORITIES}
-    assert names == {
-        "checkout-session-label-collapse",
-    }
+    assert names == set()
     assert JobPromptState is QuestionPromptState
     shared_states = {item.value for item in JobPromptState}
     assert {
@@ -75,12 +73,26 @@ def test_duplicate_authorities_include_prompt_and_checkout_overlaps() -> None:
         "ambiguous",
         "resolved",
     } == shared_states
-    checkout = next(
-        item
-        for item in ownership.DUPLICATE_AUTHORITIES
-        if item.name == "checkout-session-label-collapse"
+    from local_voice_harness.cursor.operations import (
+        AgentSessionState,
+        CheckoutState,
     )
-    assert checkout.child_issue == 360
+
+    assert {item.value for item in CheckoutState} >= {
+        "ready",
+        "retained",
+        "quarantined",
+        "ambiguous",
+        "confirmed_absent",
+        "manual_required",
+    }
+    assert {item.value for item in AgentSessionState} >= {
+        "ready",
+        "retained",
+        "ambiguous",
+        "confirmed_absent",
+        "manual_required",
+    }
 
 
 def test_child_sequence_stacks_because_files_overlap() -> None:

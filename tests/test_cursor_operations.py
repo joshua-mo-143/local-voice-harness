@@ -5,8 +5,10 @@ import pytest
 from local_voice_harness.cursor.operations import (
     AgentSessionOperation,
     AgentSessionSpec,
+    AgentSessionState,
     CheckoutOperation,
     CheckoutSpec,
+    CheckoutState,
     ForkOperation,
     ForkSpec,
     OperationState,
@@ -19,97 +21,95 @@ from local_voice_harness.cursor.operations import (
 )
 
 
-@pytest.mark.parametrize(
-    ("operation", "next_state"),
-    [
-        (
-            CheckoutOperation(
-                OperationState.PLANNED,
-                CheckoutSpec("/repo", "voice/task", "/worktree"),
-            ),
-            OperationState.ACTIVE,
-        ),
-        (
-            ForkOperation(
-                OperationState.ACTIVE,
-                ForkSpec(
-                    "owner/repo",
-                    "https://github.com/owner/repo",
-                    "main",
-                    False,
-                    "me",
-                    "me/repo",
-                ),
-            ),
-            OperationState.UNKNOWN,
-        ),
-        (
-            ParticipantPaneOperation(
-                OperationState.UNKNOWN,
-                ParticipantPaneSpec(
-                    "reviewer",
-                    "reviewer-target",
-                    "task-reviewer",
-                    "/worktree",
-                    "workspace",
-                ),
-            ),
-            OperationState.MANUAL,
-        ),
-    ],
-)
-def test_operation_state_machines_accept_legal_transitions(
-    operation: CheckoutOperation | ForkOperation | ParticipantPaneOperation,
-    next_state: OperationState,
-) -> None:
-    assert operation.transition(next_state).state == next_state
+def test_checkout_state_machine_accepts_legal_transitions() -> None:
+    planned = CheckoutOperation(
+        CheckoutState.PLANNED,
+        CheckoutSpec("/repo", "voice/task", "/worktree"),
+    )
+    dispatching = planned.transition(CheckoutState.DISPATCHING)
+    assert dispatching.state is CheckoutState.DISPATCHING
 
 
-@pytest.mark.parametrize(
-    ("operation", "next_state"),
-    [
-        (
-            CheckoutOperation(
-                OperationState.PLANNED,
-                CheckoutSpec("/repo", "voice/task", "/worktree"),
-            ),
-            OperationState.MANUAL,
+def test_agent_session_state_machine_accepts_legal_transitions() -> None:
+    dispatching = AgentSessionOperation(
+        AgentSessionState.DISPATCHING,
+        AgentSessionSpec("agent", "/worktree", "workspace", "pane"),
+    )
+    ambiguous = dispatching.transition(AgentSessionState.AMBIGUOUS)
+    assert ambiguous.state is AgentSessionState.AMBIGUOUS
+
+
+def test_operation_state_machines_accept_legal_transitions() -> None:
+    fork = ForkOperation(
+        OperationState.ACTIVE,
+        ForkSpec(
+            "owner/repo",
+            "https://github.com/owner/repo",
+            "main",
+            False,
+            "me",
+            "me/repo",
         ),
-        (
-            ForkOperation(
-                OperationState.SETTLED,
-                ForkSpec(
-                    "owner/repo",
-                    "https://github.com/owner/repo",
-                    "main",
-                    False,
-                    "me",
-                    "me/repo",
-                ),
-            ),
-            OperationState.ACTIVE,
+    )
+    pane = ParticipantPaneOperation(
+        OperationState.UNKNOWN,
+        ParticipantPaneSpec(
+            "reviewer",
+            "reviewer-target",
+            "task-reviewer",
+            "/worktree",
+            "workspace",
         ),
-        (
-            ParticipantPaneOperation(
-                OperationState.FAILED,
-                ParticipantPaneSpec(
-                    "reviewer",
-                    "reviewer-target",
-                    "task-reviewer",
-                    "/worktree",
-                    "workspace",
-                ),
-            ),
-            OperationState.SETTLED,
-        ),
-    ],
-)
-def test_operation_state_machines_reject_illegal_transitions(
-    operation: CheckoutOperation | ForkOperation | ParticipantPaneOperation,
-    next_state: OperationState,
-) -> None:
+    )
+    assert fork.transition(OperationState.UNKNOWN).state is OperationState.UNKNOWN
+    assert pane.transition(OperationState.MANUAL).state is OperationState.MANUAL
+
+
+def test_checkout_state_machine_rejects_illegal_transitions() -> None:
+    planned = CheckoutOperation(
+        CheckoutState.PLANNED,
+        CheckoutSpec("/repo", "voice/task", "/worktree"),
+    )
     with pytest.raises(OperationTransitionError):
-        operation.transition(next_state)
+        planned.transition(CheckoutState.MANUAL_REQUIRED)
+
+
+def test_agent_session_state_machine_rejects_illegal_transitions() -> None:
+    ready = AgentSessionOperation(
+        AgentSessionState.READY,
+        AgentSessionSpec("agent", "/worktree", "workspace", "pane"),
+        SessionIdentity("cursor/herdr", "session", "agent", 7),
+    )
+    with pytest.raises(OperationTransitionError):
+        ready.transition(AgentSessionState.AMBIGUOUS)
+
+
+def test_operation_state_machines_reject_illegal_transitions() -> None:
+    fork = ForkOperation(
+        OperationState.SETTLED,
+        ForkSpec(
+            "owner/repo",
+            "https://github.com/owner/repo",
+            "main",
+            False,
+            "me",
+            "me/repo",
+        ),
+    )
+    pane = ParticipantPaneOperation(
+        OperationState.FAILED,
+        ParticipantPaneSpec(
+            "reviewer",
+            "reviewer-target",
+            "task-reviewer",
+            "/worktree",
+            "workspace",
+        ),
+    )
+    with pytest.raises(OperationTransitionError):
+        fork.transition(OperationState.ACTIVE)
+    with pytest.raises(OperationTransitionError):
+        pane.transition(OperationState.SETTLED)
 
 
 @pytest.mark.parametrize(
@@ -174,7 +174,7 @@ def test_agent_reconciliation_uses_complete_identity_and_sequence_fence(
 ) -> None:
     identity = SessionIdentity("cursor/herdr", "session", "agent", 7)
     operation = AgentSessionOperation(
-        OperationState.SETTLED,
+        AgentSessionState.READY,
         AgentSessionSpec("agent", "/worktree", "workspace", "pane"),
         identity,
     )
@@ -184,8 +184,29 @@ def test_agent_reconciliation_uses_complete_identity_and_sequence_fence(
 
 def test_operation_specs_survive_uncertain_and_manual_states() -> None:
     spec = CheckoutSpec("/repo", "voice/task", "/worktree")
-    active = CheckoutOperation(OperationState.ACTIVE, spec)
-    unknown = active.transition(OperationState.UNKNOWN)
-    manual = unknown.transition(OperationState.MANUAL)
+    active = CheckoutOperation(CheckoutState.DISPATCHING, spec)
+    unknown = active.transition(CheckoutState.AMBIGUOUS)
+    manual = unknown.transition(CheckoutState.MANUAL_REQUIRED)
     assert unknown.spec == spec
     assert manual.spec == spec
+
+
+def test_checkout_preserves_ready_versus_retained() -> None:
+    spec = CheckoutSpec("/repo", "voice/task", "/worktree")
+    dispatching = CheckoutOperation(CheckoutState.DISPATCHING, spec)
+    ready = dispatching.transition(
+        CheckoutState.READY, workspace_id="ws", root_pane_id="pane"
+    )
+    retained = ready.transition(CheckoutState.RETAINED)
+    assert ready.state == CheckoutState.READY
+    assert retained.state == CheckoutState.RETAINED
+    assert retained.workspace_id == "ws"
+
+
+def test_checkout_preserves_quarantine_versus_ambiguous() -> None:
+    spec = CheckoutSpec("/repo", "voice/task", "/worktree")
+    dispatching = CheckoutOperation(CheckoutState.DISPATCHING, spec)
+    quarantined = dispatching.transition(CheckoutState.QUARANTINED)
+    ambiguous = quarantined.transition(CheckoutState.AMBIGUOUS)
+    assert quarantined.state == CheckoutState.QUARANTINED
+    assert ambiguous.state == CheckoutState.AMBIGUOUS

@@ -75,9 +75,14 @@ from .model import (
 from .operations import (
     AgentSessionOperation,
     AgentSessionSpec,
+    AgentSessionState,
+    CheckoutState,
     OperationState,
     OperationTransitionError,
     SessionIdentity,
+    agent_session_fields,
+    checkout_blocks_reservation,
+    checkout_fields,
 )
 from .outbox import EffectHandler, recover_outbox
 from .store import JobStore, LegacyWorkerInspector
@@ -180,6 +185,29 @@ def _followup_agent_cwd_matches(job: CursorJob, agent: dict[str, object]) -> boo
         return False
 
 
+def _checkout_state_fields(
+    job: CursorJob, state: CheckoutState, **transition_args: str | None
+) -> dict[str, object]:
+    operation = job.checkout_operation
+    if operation is not None:
+        return checkout_fields(operation.transition(state, **transition_args))
+    return {"worktree_provision_state": state.value}
+
+
+def _session_state_fields(
+    job: CursorJob,
+    state: AgentSessionState,
+    *,
+    session: SessionIdentity | None = None,
+) -> dict[str, object]:
+    operation = job.agent_session_operation
+    if operation is not None:
+        return agent_session_fields(operation.transition(state, session=session))
+    if job.agent_dispatch_state is None and state == AgentSessionState.CONFIRMED_ABSENT:
+        return {}
+    return {"agent_dispatch_state": state.value}
+
+
 def reconcile_uncertain_agent(
     store: JobStore,
     job: CursorJob,
@@ -248,6 +276,18 @@ def reconcile_uncertain_agent(
                     or current.manual_reconcile_operation is not None
                 ):
                     return None
+                operation = current.agent_session_operation
+                if operation is not None:
+                    return current.evolve_recovery(
+                        now=now,
+                        agent_session_operation=operation.transition(
+                            AgentSessionState.MANUAL_REQUIRED
+                        ),
+                        manual_reconcile_operation="agent",
+                        manual_reconcile_token=uuid.uuid4().hex,
+                        manual_reconcile_required_at=now,
+                        worker_operation=None,
+                    )
                 return current.evolve_recovery(
                     now=now,
                     agent_dispatch_state="manual_required",
@@ -333,9 +373,21 @@ def reconcile_uncertain_agent(
                 or current.herdr_target != target
             ):
                 return None
+            next_state = (
+                AgentSessionState.READY
+                if identity is not None
+                else AgentSessionState.AMBIGUOUS
+            )
+            operation = current.agent_session_operation
             changes: dict[str, object] = {
-                "agent_dispatch_state": (
-                    "ready" if identity is not None else "ambiguous"
+                **(
+                    {
+                        "agent_session_operation": operation.transition(
+                            next_state, session=identity
+                        )
+                    }
+                    if operation is not None
+                    else {"agent_dispatch_state": next_state.value}
                 ),
                 "agent_name": str(agent.get("name") or target),
                 "herdr_pane_id": str(
@@ -371,8 +423,22 @@ def reconcile_uncertain_agent(
     def visible(current: CursorJob) -> CursorJob | None:
         if current.agent_dispatch_state not in states or current.herdr_target != target:
             return None
+        next_state = (
+            AgentSessionState.READY
+            if identity is not None
+            else AgentSessionState.AMBIGUOUS
+        )
+        operation = current.agent_session_operation
         changes: dict[str, object] = {
-            "agent_dispatch_state": "ready" if identity is not None else "ambiguous",
+            **(
+                {
+                    "agent_session_operation": operation.transition(
+                        next_state, session=identity
+                    )
+                }
+                if operation is not None
+                else {"agent_dispatch_state": next_state.value}
+            ),
             "agent_name": str(agent.get("name") or target),
             "herdr_pane_id": str(agent.get("pane_id") or current.herdr_pane_id or ""),
             "herdr_workspace_id": str(
@@ -688,15 +754,19 @@ def reconcile_uncertain_worktree(
             return None
         if match is None:
             return current.evolve_recovery(
+                {
+                    **_checkout_state_fields(current, CheckoutState.QUARANTINED),
+                    "worktree_provision_error": (
+                        "reserved worktree path exists but Herdr did not report the "
+                        "expected branch"
+                    ),
+                    "worktree_manual_inspection_required": True,
+                    "worker_operation": None,
+                    **cleanup_fields(
+                        finish_cleanup_reconciliation(current.cleanup_state)
+                    ),
+                },
                 now=now,
-                worktree_provision_state="quarantined",
-                worktree_provision_error=(
-                    "reserved worktree path exists but Herdr did not report the "
-                    "expected branch"
-                ),
-                worktree_manual_inspection_required=True,
-                worker_operation=None,
-                **cleanup_fields(finish_cleanup_reconciliation(current.cleanup_state)),
             )
         observed_workspace = str(match.get("open_workspace_id") or "") or None
         observed_root_pane = str(match.get("root_pane_id") or "") or None
@@ -709,26 +779,37 @@ def reconcile_uncertain_worktree(
             or (observed_root_pane is not None and observed_root_pane != root_pane_id)
         ):
             return current.evolve_recovery(
+                {
+                    **_checkout_state_fields(current, CheckoutState.QUARANTINED),
+                    "worktree_provision_error": (
+                        "worktree is visible without its exact workspace and root-pane "
+                        "identity"
+                    ),
+                    "worktree_manual_inspection_required": True,
+                    "worker_operation": None,
+                    **cleanup_fields(
+                        finish_cleanup_reconciliation(current.cleanup_state)
+                    ),
+                },
                 now=now,
-                worktree_provision_state="quarantined",
-                worktree_provision_error=(
-                    "worktree is visible without its exact workspace and root-pane "
-                    "identity"
-                ),
-                worktree_manual_inspection_required=True,
-                worker_operation=None,
-                **cleanup_fields(finish_cleanup_reconciliation(current.cleanup_state)),
             )
         return current.evolve_recovery(
+            {
+                **_checkout_state_fields(
+                    current,
+                    CheckoutState.RETAINED,
+                    workspace_id=workspace_id,
+                    root_pane_id=root_pane_id,
+                ),
+                "worktree_workspace_id": workspace_id,
+                "worktree_root_pane_id": root_pane_id,
+                "worktree_provision_error": None,
+                "worker_operation": None,
+                "worktree_manual_inspection_required": False,
+                "worktree_next_reconcile_at": None,
+                **cleanup_fields(finish_cleanup_reconciliation(current.cleanup_state)),
+            },
             now=now,
-            worktree_provision_state="retained",
-            worktree_workspace_id=workspace_id,
-            worktree_root_pane_id=root_pane_id,
-            worktree_provision_error=None,
-            worker_operation=None,
-            worktree_manual_inspection_required=False,
-            worktree_next_reconcile_at=None,
-            **cleanup_fields(finish_cleanup_reconciliation(current.cleanup_state)),
         )
 
     store.update(job.id, reconciled)
@@ -1232,7 +1313,7 @@ def cancel_target_and_release(
                     )
                     if historical is not None:
                         agent_operation = AgentSessionOperation(
-                            OperationState.SETTLED,
+                            AgentSessionState.READY,
                             AgentSessionSpec(
                                 str(historical["target"]),
                                 str(historical["checkout"]),
@@ -1455,100 +1536,99 @@ def cancel_target_and_release(
                     intent.error,
                     intent.completed_at,
                 )
-                return job.evolve_for_delivery(
-                    now=outcome.completed_at,
-                    status=JobStatus(outcome.status),
-                    result=outcome.result,
-                    error=outcome.error,
-                    completed_at=outcome.completed_at,
-                    terminal_intent_status=None,
-                    terminal_intent_result=None,
-                    terminal_intent_error=None,
-                    terminal_intent_completed_at=None,
+                delivery_changes: dict[str, Any] = {
                     **cleanup_fields(settled),
-                    worker_operation=None,
-                    worker_pid=None,
-                    worker_boot_id=None,
-                    worker_process_start=None,
-                    worker_token=None,
-                    worker_claim_operation=None,
-                    worker_claimed_at=None,
-                    target_release_manual_required=False,
-                    target_release_unverified_targets=[],
-                    agent_dispatch_state=(
-                        "confirmed_absent"
-                        if job.agent_dispatch_state is not None
-                        else None
-                    ),
-                    agent_operation_target=job.agent_operation_target
+                    **_session_state_fields(job, AgentSessionState.CONFIRMED_ABSENT),
+                    "result": outcome.result,
+                    "error": outcome.error,
+                    "completed_at": outcome.completed_at,
+                    "terminal_intent_status": None,
+                    "terminal_intent_result": None,
+                    "terminal_intent_error": None,
+                    "terminal_intent_completed_at": None,
+                    "worker_operation": None,
+                    "worker_pid": None,
+                    "worker_boot_id": None,
+                    "worker_process_start": None,
+                    "worker_token": None,
+                    "worker_claim_operation": None,
+                    "worker_claimed_at": None,
+                    "target_release_manual_required": False,
+                    "target_release_unverified_targets": [],
+                    "agent_operation_target": job.agent_operation_target
                     or job.herdr_target,
-                    agent_operation_workspace_id=job.agent_operation_workspace_id
+                    "agent_operation_workspace_id": job.agent_operation_workspace_id
                     or job.herdr_workspace_id,
-                    agent_operation_pane_id=job.agent_operation_pane_id
+                    "agent_operation_pane_id": job.agent_operation_pane_id
                     or job.herdr_pane_id,
-                    agent_operation_checkout=job.agent_operation_checkout
+                    "agent_operation_checkout": job.agent_operation_checkout
                     or job.worktree_path
                     or job.repository,
-                    herdr_target=None,
-                    herdr_pane_id=None,
-                    herdr_workspace_id=None,
-                    agent_name=None,
-                    active_participant=None,
-                    planner_target=None,
-                    reviewer_target=None,
-                    implementer_target=None,
-                    participant_admission_state="released",
-                    prompt_operation_state="none",
-                    prompt_operation_phase=None,
-                    prompt_operation_turn=None,
-                    prompt_operation_target=None,
-                    prompt_operation_agent_session=None,
-                    prompt_baseline_sequence=None,
-                    workflow_phase=(
+                    "herdr_target": None,
+                    "herdr_pane_id": None,
+                    "herdr_workspace_id": None,
+                    "agent_name": None,
+                    "active_participant": None,
+                    "planner_target": None,
+                    "reviewer_target": None,
+                    "implementer_target": None,
+                    "participant_admission_state": "released",
+                    "prompt_operation_state": "none",
+                    "prompt_operation_phase": None,
+                    "prompt_operation_turn": None,
+                    "prompt_operation_target": None,
+                    "prompt_operation_agent_session": None,
+                    "prompt_baseline_sequence": None,
+                    "workflow_phase": (
                         "finished"
                         if outcome.status == JobStatus.COMPLETED.value
                         else job.workflow_phase.value
                     ),
+                }
+                return job.evolve_for_delivery(
+                    now=outcome.completed_at,
+                    status=JobStatus(outcome.status),
+                    **delivery_changes,
                 )
             try:
                 settled = settle_cleanup(job.cleanup_state, release_token)
             except LifecycleTransitionError:
                 return None
-            return job.evolve(
+            release_changes: dict[str, Any] = {
                 **cleanup_fields(settled),
-                worker_pid=None,
-                worker_boot_id=None,
-                worker_process_start=None,
-                worker_token=None,
-                worker_claim_operation=None,
-                worker_claimed_at=None,
-                target_release_manual_required=False,
-                target_release_unverified_targets=[],
-                agent_dispatch_state=(
-                    "confirmed_absent" if job.agent_dispatch_state is not None else None
-                ),
-                agent_operation_target=job.agent_operation_target or job.herdr_target,
-                agent_operation_workspace_id=job.agent_operation_workspace_id
+                **_session_state_fields(job, AgentSessionState.CONFIRMED_ABSENT),
+                "worker_pid": None,
+                "worker_boot_id": None,
+                "worker_process_start": None,
+                "worker_token": None,
+                "worker_claim_operation": None,
+                "worker_claimed_at": None,
+                "target_release_manual_required": False,
+                "target_release_unverified_targets": [],
+                "agent_operation_target": job.agent_operation_target
+                or job.herdr_target,
+                "agent_operation_workspace_id": job.agent_operation_workspace_id
                 or job.herdr_workspace_id,
-                agent_operation_pane_id=job.agent_operation_pane_id
+                "agent_operation_pane_id": job.agent_operation_pane_id
                 or job.herdr_pane_id,
-                agent_operation_checkout=job.agent_operation_checkout
+                "agent_operation_checkout": job.agent_operation_checkout
                 or job.worktree_path
                 or job.repository,
-                herdr_target=None,
-                herdr_pane_id=None,
-                herdr_workspace_id=None,
-                agent_name=None,
-                active_participant=None,
-                planner_target=None,
-                reviewer_target=None,
-                implementer_target=None,
-                participant_admission_state=(
+                "herdr_target": None,
+                "herdr_pane_id": None,
+                "herdr_workspace_id": None,
+                "agent_name": None,
+                "active_participant": None,
+                "planner_target": None,
+                "reviewer_target": None,
+                "implementer_target": None,
+                "participant_admission_state": (
                     "released"
                     if job.status in TERMINAL_STATUSES
                     else job.participant_admission_state
                 ),
-            )
+            }
+            return job.evolve(**release_changes)
         cleanup = job.cleanup_state
         if not isinstance(cleanup, CleanupOwned):
             if not unverified_targets:
@@ -1576,17 +1656,22 @@ def acknowledge_worktree_quarantine(
     acknowledged_at = time.time() if now is None else now
 
     def acknowledge(job: CursorJob) -> CursorJob | None:
+        checkout = job.checkout_operation
         if (
-            job.worktree_provision_state != "quarantined"
+            checkout is None
+            or checkout.state != CheckoutState.QUARANTINED
             or not job.worktree_manual_inspection_required
         ):
             return None
+        acknowledged = checkout.transition(
+            CheckoutState.RETAINED
+            if job.worktree_workspace_id and job.worktree_root_pane_id
+            else CheckoutState.AMBIGUOUS,
+            workspace_id=job.worktree_workspace_id,
+            root_pane_id=job.worktree_root_pane_id,
+        )
         return job.evolve(
-            worktree_provision_state=(
-                "retained"
-                if job.worktree_workspace_id and job.worktree_root_pane_id
-                else "ambiguous"
-            ),
+            checkout_operation=acknowledged,
             worktree_manual_inspection_required=False,
             worktree_quarantine_acknowledged_at=acknowledged_at,
         )
@@ -1958,8 +2043,11 @@ def recover_jobs(
                 or is_worker_alive(existing)
                 or existing.has_uncertain_operation()
                 or existing.manual_reconcile_operation
-                or existing.worktree_provision_state
-                in {"quarantined", "manual_required"}
+                or checkout_blocks_reservation(
+                    None
+                    if existing.checkout_operation is None
+                    else existing.checkout_operation.state
+                )
                 or existing.pull_request_worktree_state == "quarantined"
             ):
                 continue
@@ -2088,7 +2176,11 @@ def recover_jobs(
             if (
                 job.has_uncertain_operation()
                 or job.manual_reconcile_operation
-                or job.worktree_provision_state in {"quarantined", "manual_required"}
+                or checkout_blocks_reservation(
+                    None
+                    if job.checkout_operation is None
+                    else job.checkout_operation.state
+                )
                 or job.pull_request_worktree_state == "quarantined"
             ):
                 if take_release:
