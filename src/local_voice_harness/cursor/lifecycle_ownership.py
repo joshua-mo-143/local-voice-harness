@@ -603,26 +603,6 @@ TOP_LEVEL_STATES: frozenset[str] = frozenset(
 
 DUPLICATE_AUTHORITIES: tuple[DuplicateAuthority, ...] = (
     DuplicateAuthority(
-        name="prompt-flat-runtime-reconstruction",
-        representations=(
-            "CursorJob.prompt_operation reconstructed from flat fields",
-            "CursorJob.evolve(**legacy_prompt_fields(...)) flattening",
-            "prompt_operations.load_prompt_operation / legacy_prompt_fields",
-        ),
-        overlapping_files=(
-            "src/local_voice_harness/cursor/model.py",
-            "src/local_voice_harness/prompt_operations.py",
-            "src/local_voice_harness/cursor/provisioning.py",
-            "src/local_voice_harness/cursor/recovery.py",
-        ),
-        crash_risk=(
-            "Ordinary runtime keeps import compatibility coupled to transition "
-            "validation. Flat cross-field checks and typed constructors both "
-            "decide legality."
-        ),
-        child_issue=359,
-    ),
-    DuplicateAuthority(
         name="checkout-session-label-collapse",
         representations=(
             "worktree_provision_state strings "
@@ -671,7 +651,12 @@ CHILD_SEQUENCE: tuple[ChildSequence, ...] = (
         issue=359,
         title="Separate canonical runtime lifecycle state from import compatibility",
         blocked_by=(357, 358),
-        overlapping_files=DUPLICATE_AUTHORITIES[0].overlapping_files,
+        overlapping_files=(
+            "src/local_voice_harness/cursor/model.py",
+            "src/local_voice_harness/prompt_operations.py",
+            "src/local_voice_harness/cursor/provisioning.py",
+            "src/local_voice_harness/cursor/recovery.py",
+        ),
         overlapping_contracts=(
             "CursorJob.prompt_operation",
             "load_prompt_operation",
@@ -682,7 +667,7 @@ CHILD_SEQUENCE: tuple[ChildSequence, ...] = (
         issue=360,
         title="Consolidate checkout and session operation lifecycle ownership",
         blocked_by=(357, 359),
-        overlapping_files=DUPLICATE_AUTHORITIES[1].overlapping_files,
+        overlapping_files=DUPLICATE_AUTHORITIES[0].overlapping_files,
         overlapping_contracts=(
             "CheckoutOperation",
             "AgentSessionOperation",
@@ -1301,6 +1286,9 @@ COMPATIBILITY_ADAPTERS: frozenset[str] = frozenset(
     {
         "local_voice_harness.prompt_operations.load_prompt_operation",
         "local_voice_harness.prompt_operations.legacy_prompt_fields",
+        "local_voice_harness.cursor.model._typed_prompt_operation",
+        "local_voice_harness.cursor.model._optional_typed_prompt_operation",
+        "local_voice_harness.cursor.model._consume_typed_prompt_operation",
         "local_voice_harness.cursor.operations.load_worker_ownership",
         "local_voice_harness.cursor.operations.worker_ownership_fields",
         "local_voice_harness.cursor.lifecycle.load_terminal_state",
@@ -1397,8 +1385,8 @@ BASELINE_COUNTS: dict[str, int] = {
     "named_table_fields": 208,
     "import_only_fields": 4,
     "cursor_job_public_properties": 152,
-    "compatibility_adapters": 25,
+    "compatibility_adapters": 28,
     "transition_entry_points": 72,
-    "duplicate_authorities": 2,
-    "lifecycle_module_lines": 24337,
+    "duplicate_authorities": 1,
+    "lifecycle_module_lines": 24401,
 }

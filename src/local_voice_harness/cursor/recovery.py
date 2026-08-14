@@ -30,7 +30,6 @@ from ..prompt_operations import (
     AmbiguousPrompt,
     PromptOperationError,
     SubmittingPrompt,
-    legacy_prompt_fields,
     mark_prompt_ambiguous,
 )
 from ..questions import (
@@ -846,7 +845,7 @@ def _observe_prompt_effect(
         return CoordinatorDecision(
             job=current.evolve_recovery(
                 now=now,
-                **legacy_prompt_fields(resolved),
+                prompt_operation=resolved,
                 manual_reconcile_operation=None if accepted else "prompt",
                 manual_reconcile_token=None if accepted else uuid.uuid4().hex,
                 manual_reconcile_required_at=None if accepted else now,

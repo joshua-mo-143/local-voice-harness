@@ -62,7 +62,6 @@ from ..prompt_operations import (
     SubmittedPrompt,
     SubmittingPrompt,
     begin_prompt_submission,
-    legacy_prompt_fields,
     mark_prompt_ambiguous,
     observe_prompt_submission,
 )
@@ -1905,7 +1904,7 @@ def _reduce_agent_effect(job: CursorJob, result: OutboxResult) -> CursorJob | No
             return None
         if result.outcome.get("outcome") != "Confirmed":
             return job.evolve(
-                **legacy_prompt_fields(mark_prompt_ambiguous(operation, identity)),
+                prompt_operation=mark_prompt_ambiguous(operation, identity),
                 manual_reconcile_operation="prompt",
                 manual_reconcile_token=uuid.uuid4().hex,
                 manual_reconcile_required_at=time.time(),
@@ -1926,7 +1925,7 @@ def _reduce_agent_effect(job: CursorJob, result: OutboxResult) -> CursorJob | No
         )
         if not isinstance(resolved, SubmittedPrompt):
             return job.evolve(
-                **legacy_prompt_fields(resolved),
+                prompt_operation=resolved,
                 manual_reconcile_operation="prompt",
                 manual_reconcile_token=uuid.uuid4().hex,
                 manual_reconcile_required_at=time.time(),
@@ -1936,7 +1935,7 @@ def _reduce_agent_effect(job: CursorJob, result: OutboxResult) -> CursorJob | No
             sessions[job.active_participant.value] = observed.session_id
         return job.evolve_plan_approval(
             job.plan_approval,
-            **legacy_prompt_fields(resolved),
+            prompt_operation=resolved,
             prompt_context_sessions=sessions,
             agent_state_sequence=observed.state_sequence,
         )
@@ -3870,7 +3869,7 @@ def _execute_phase_prompt(
                 ),
             )
             return current.evolve(
-                **legacy_prompt_fields(operation),
+                prompt_operation=operation,
                 prompt_manifest=planned_manifest,
                 continuation=(
                     False
@@ -3929,7 +3928,7 @@ def _execute_phase_prompt(
                     approval = approval.count()
                 return current.evolve_plan_approval(
                     approval,
-                    **legacy_prompt_fields(submitted_operation),
+                    prompt_operation=submitted_operation,
                     prompt_context_sessions=sessions,
                 )
 
@@ -3953,14 +3952,12 @@ def _execute_phase_prompt(
                 worker_token,
                 MODEL_WORKER_STATUSES,
                 lambda current: current.evolve(
-                    **legacy_prompt_fields(
-                        observe_prompt_submission(
-                            current.prompt_operation,
-                            identity,
-                            target=target,
-                            agent_session=observed_session,
-                            state_sequence=sequence,
-                        )
+                    prompt_operation=observe_prompt_submission(
+                        current.prompt_operation,
+                        identity,
+                        target=target,
+                        agent_session=observed_session,
+                        state_sequence=sequence,
                     ),
                     manual_reconcile_operation="prompt",
                     manual_reconcile_token=uuid.uuid4().hex,
@@ -4134,7 +4131,7 @@ def _execute_phase_prompt(
             prompt_identity,
         )
         return CoordinatorDecision(
-            job=current.evolve(**legacy_prompt_fields(operation)),
+            job=current.evolve(prompt_operation=operation),
             effects=(
                 DurableEffect(
                     kind=effect_kind,

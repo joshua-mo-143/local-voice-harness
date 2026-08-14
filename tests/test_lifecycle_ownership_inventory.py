@@ -62,7 +62,6 @@ def test_top_level_and_submachine_inventory_is_complete() -> None:
 def test_duplicate_authorities_include_prompt_and_checkout_overlaps() -> None:
     names = {item.name for item in ownership.DUPLICATE_AUTHORITIES}
     assert names == {
-        "prompt-flat-runtime-reconstruction",
         "checkout-session-label-collapse",
     }
     assert JobPromptState is QuestionPromptState
