@@ -76,6 +76,9 @@ from ..questions import (
     QuestionSpec,
     QuestionState,
     parse_question_spec,
+    plan_question_prompt,
+    resolve_question_prompt,
+    submit_question_prompt,
 )
 from ..user_config import (
     PlanApprovalMode,
@@ -414,21 +417,23 @@ def complete_from_output(
             now=completed_at,
         )
     pending = question_adapter.current(job)
-    resolved_question = (
-        question_adapter.envelope(
-            pending,
+    if pending is not None and pending.state in {
+        QuestionState.ANSWERED,
+        QuestionState.DISPATCHING,
+    }:
+        resolved = pending
+        if pending.prompt_state is not None:
+            resolved = resolve_question_prompt(
+                pending, question_adapter.shared_prompt_identity(job, pending)
+            )
+        resolved_question = question_adapter.envelope(
+            resolved,
             QuestionState.RESOLVED,
             job=job,
-            prompt_state=(
-                PromptOperationState.RESOLVED
-                if pending.prompt_state is not None
-                else None
-            ),
+            prompt_state=resolved.prompt_state,
         )
-        if pending is not None
-        and pending.state in {QuestionState.ANSWERED, QuestionState.DISPATCHING}
-        else job.voice_question
-    )
+    else:
+        resolved_question = job.voice_question
     if summary and summary_position > question_position:
         if stage_terminal or job.herdr_target is not None:
             return recovery.stage_terminal_intent(
@@ -4391,12 +4396,21 @@ def _begin_prompt_turn(job: CursorJob, turn: int, turn_token: str) -> CursorJob:
                 "Cursor clarification no longer matches its originating turn"
             )
         else:
+            dispatching_question = replace(question, dispatch_token=turn_token)
+            planned = plan_question_prompt(
+                dispatching_question,
+                question_adapter.shared_prompt_identity(
+                    job,
+                    dispatching_question,
+                    turn=turn,
+                ),
+            )
             question_envelope = question_adapter.envelope(
-                question,
+                planned,
                 QuestionState.DISPATCHING,
                 job=job,
                 dispatch_token=turn_token,
-                prompt_state=PromptOperationState.PLANNED,
+                prompt_state=planned.prompt_state,
                 prompt_baseline_seq=None,
                 prompt_submitted_at=None,
                 prompt_absent_observations=0,
@@ -4449,6 +4463,12 @@ def _mark_prompt_boundary(
             or question.dispatch_token != turn_token
         ):
             raise WorkerCancelled
+        identity = question_adapter.shared_prompt_identity(job, question)
+        updated = (
+            submit_question_prompt(question, identity)
+            if state == PromptOperationState.SUBMITTED
+            else question
+        )
         baseline = (
             _state_change_sequence(agent)
             if state == PromptOperationState.SUBMITTED
@@ -4456,10 +4476,14 @@ def _mark_prompt_boundary(
         )
         return job.evolve(
             voice_question=question_adapter.envelope(
-                question,
+                updated,
                 QuestionState.DISPATCHING,
                 job=job,
-                prompt_state=state,
+                prompt_state=(
+                    updated.prompt_state
+                    if state == PromptOperationState.SUBMITTED
+                    else state
+                ),
                 prompt_baseline_seq=baseline,
                 prompt_submitted_at=(
                     time.time()

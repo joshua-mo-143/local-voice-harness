@@ -49,17 +49,17 @@ success.
 | Named table fields | 208 |
 | Import-only fields | 4 |
 | Directly exposed `CursorJob` properties | 152 |
-| Compatibility adapters | 21 |
-| Public transition entry points | 68 |
-| Documented duplicate authorities | 3 |
-| Lifecycle-related module lines | 24102 |
+| Compatibility adapters | 25 |
+| Public transition entry points | 72 |
+| Documented duplicate authorities | 2 |
+| Lifecycle-related module lines | 24337 |
 
-The two prompt-operation vocabularies and the checkout/session label collapse
-are the duplicate authorities that later children remove. #358 unifies prompt
-and clarification submission. #359 then makes that typed prompt operation the
-ordinary runtime representation; it overlaps `model.py`, `provisioning.py`, and
-`recovery.py` with #360, so #360 must follow #359 rather than proceed in
-parallel.
+#358 unified ordinary and clarification submission onto one
+`prompt_operations.PromptOperationState`. Remaining duplicate authorities are
+flat runtime reconstruction of that operation (#359) and checkout/session
+label collapse (#360). Those children still overlap `model.py`,
+`provisioning.py`, and `recovery.py`, so #360 must follow #359 rather than
+proceed in parallel.
 
 The only JSON-valued columns are the nine intrinsically structured, edge-validated
 values: `voice_question`, `clarifications`, `prompt_context_sessions`,

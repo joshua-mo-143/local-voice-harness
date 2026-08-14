@@ -264,10 +264,9 @@ def _build_field_ownership() -> tuple[FieldOwnership, ...]:
             adapter="prompt_operations.load_prompt_operation",
             callers=_PROMPT_CALLERS,
             duplicate=(
-                "Duplicate prompt-operation vocabulary: job flat fields use "
-                "none/planned/submitting/submitted/ambiguous while "
-                "questions.PromptOperationState uses planned/submitted/observed/"
-                "resolved around the same session, turn, baseline, and fence."
+                "Ordinary runtime still reconstructs PromptOperation from flat "
+                "job columns; question JSON prompt_state is a persistence-edge "
+                "copy of the same shared enum."
             ),
         )
     )
@@ -286,9 +285,9 @@ def _build_field_ownership() -> tuple[FieldOwnership, ...]:
             adapter="questions.Question.from_dict / cursor.questions.current",
             callers=_QUESTION_CALLERS,
             duplicate=(
-                "Question.prompt_state is a second prompt-operation enum stored "
-                "inside voice_question JSON; answer policy belongs here, but "
-                "transport-submission state overlaps prompt_operation_*."
+                "Question.prompt_state persists the shared PromptOperationState "
+                "inside voice_question JSON rather than the job-level typed "
+                "operation. Answer policy remains question-owned."
             ),
         )
     )
@@ -604,31 +603,6 @@ TOP_LEVEL_STATES: frozenset[str] = frozenset(
 
 DUPLICATE_AUTHORITIES: tuple[DuplicateAuthority, ...] = (
     DuplicateAuthority(
-        name="prompt-operation-vocabularies",
-        representations=(
-            "prompt_operations.PromptOperationState "
-            "(none/planned/submitting/submitted/ambiguous)",
-            "questions.PromptOperationState (planned/submitted/observed/resolved)",
-            "job_prompt_question.prompt_operation_* flat columns",
-            "voice_question.prompt_state JSON fields",
-        ),
-        overlapping_files=(
-            "src/local_voice_harness/prompt_operations.py",
-            "src/local_voice_harness/questions/__init__.py",
-            "src/local_voice_harness/cursor/model.py",
-            "src/local_voice_harness/cursor/questions.py",
-            "src/local_voice_harness/cursor/provisioning.py",
-            "src/local_voice_harness/cursor/recovery.py",
-        ),
-        crash_risk=(
-            "Recovery and provisioning must interpret both vocabularies around "
-            "the same provider session, turn token, baseline sequence, and "
-            "submit fence. A crash after dispatch can be retried against the "
-            "wrong machine."
-        ),
-        child_issue=358,
-    ),
-    DuplicateAuthority(
         name="prompt-flat-runtime-reconstruction",
         representations=(
             "CursorJob.prompt_operation reconstructed from flat fields",
@@ -679,7 +653,14 @@ CHILD_SEQUENCE: tuple[ChildSequence, ...] = (
         issue=358,
         title="Consolidate prompt and clarification submission lifecycle state",
         blocked_by=(357,),
-        overlapping_files=DUPLICATE_AUTHORITIES[0].overlapping_files,
+        overlapping_files=(
+            "src/local_voice_harness/prompt_operations.py",
+            "src/local_voice_harness/questions/__init__.py",
+            "src/local_voice_harness/cursor/model.py",
+            "src/local_voice_harness/cursor/questions.py",
+            "src/local_voice_harness/cursor/provisioning.py",
+            "src/local_voice_harness/cursor/recovery.py",
+        ),
         overlapping_contracts=(
             "PromptOperationState",
             "Question.prompt_state",
@@ -690,7 +671,7 @@ CHILD_SEQUENCE: tuple[ChildSequence, ...] = (
         issue=359,
         title="Separate canonical runtime lifecycle state from import compatibility",
         blocked_by=(357, 358),
-        overlapping_files=DUPLICATE_AUTHORITIES[1].overlapping_files,
+        overlapping_files=DUPLICATE_AUTHORITIES[0].overlapping_files,
         overlapping_contracts=(
             "CursorJob.prompt_operation",
             "load_prompt_operation",
@@ -701,7 +682,7 @@ CHILD_SEQUENCE: tuple[ChildSequence, ...] = (
         issue=360,
         title="Consolidate checkout and session operation lifecycle ownership",
         blocked_by=(357, 359),
-        overlapping_files=DUPLICATE_AUTHORITIES[2].overlapping_files,
+        overlapping_files=DUPLICATE_AUTHORITIES[1].overlapping_files,
         overlapping_contracts=(
             "CheckoutOperation",
             "AgentSessionOperation",
@@ -718,6 +699,9 @@ _TYPED_PREFIXES: dict[str, tuple[str, ...]] = {
         "accept_",
         "observe_",
         "mark_",
+        "record_",
+        "resolve_",
+        "replan_",
     ),
     "local_voice_harness.questions": ("transition_question",),
     "local_voice_harness.job_lifecycle": ("apply_event", "apply_follow_up"),
@@ -903,6 +887,30 @@ TRANSITION_ENTRY_POINTS: tuple[TransitionEntry, ...] = (
         "local_voice_harness.prompt_operations.mark_prompt_ambiguous",
         "prompt_operations",
         "in-flight prompt to ambiguous",
+        AuthorityKind.CANONICAL,
+    ),
+    _entry(
+        "local_voice_harness.prompt_operations.record_prompt_submitted",
+        "prompt_operations",
+        "planned or submitting to submitted fence",
+        AuthorityKind.CANONICAL,
+    ),
+    _entry(
+        "local_voice_harness.prompt_operations.observe_accepted_prompt",
+        "prompt_operations",
+        "submitted to observed",
+        AuthorityKind.CANONICAL,
+    ),
+    _entry(
+        "local_voice_harness.prompt_operations.resolve_prompt",
+        "prompt_operations",
+        "planned, submitted, or observed to resolved",
+        AuthorityKind.CANONICAL,
+    ),
+    _entry(
+        "local_voice_harness.prompt_operations.replan_unobserved_prompt",
+        "prompt_operations",
+        "submitted to planned after confirmed absence",
         AuthorityKind.CANONICAL,
     ),
     _entry(
@@ -1307,6 +1315,10 @@ COMPATIBILITY_ADAPTERS: frozenset[str] = frozenset(
         "local_voice_harness.questions.Question.to_dict",
         "local_voice_harness.cursor.questions.current",
         "local_voice_harness.cursor.questions.envelope",
+        "local_voice_harness.cursor.questions.shared_prompt_identity",
+        "local_voice_harness.questions.question_prompt_identity",
+        "local_voice_harness.questions.load_question_prompt",
+        "local_voice_harness.questions.bind_question_prompt",
         "local_voice_harness.cursor.sqlite_store.SQLiteJobDatabase.load_job",
         "local_voice_harness.cursor.sqlite_store.SQLiteJobDatabase.save_job",
         "local_voice_harness.cursor.model.AgentJob.checkout_operation",
@@ -1385,8 +1397,8 @@ BASELINE_COUNTS: dict[str, int] = {
     "named_table_fields": 208,
     "import_only_fields": 4,
     "cursor_job_public_properties": 152,
-    "compatibility_adapters": 21,
-    "transition_entry_points": 68,
-    "duplicate_authorities": 3,
-    "lifecycle_module_lines": 24102,
+    "compatibility_adapters": 25,
+    "transition_entry_points": 72,
+    "duplicate_authorities": 2,
+    "lifecycle_module_lines": 24337,
 }

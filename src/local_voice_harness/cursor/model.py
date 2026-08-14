@@ -448,7 +448,15 @@ _UNCERTAIN_OPERATION_STATES = frozenset(
     {"dispatching", "submitted", "ambiguous", "failed_observing"}
 )
 _PROMPT_OPERATION_STATES = frozenset(
-    {"none", "planned", "submitting", "submitted", "ambiguous"}
+    {
+        "none",
+        "planned",
+        "submitting",
+        "submitted",
+        "observed",
+        "ambiguous",
+        "resolved",
+    }
 )
 
 

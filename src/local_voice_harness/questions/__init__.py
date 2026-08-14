@@ -8,6 +8,19 @@ from dataclasses import dataclass, replace
 from enum import StrEnum
 from typing import Any
 
+from ..prompt_operations import (
+    IdlePrompt,
+    PromptIdentity,
+    PromptOperation,
+    PromptOperationState,
+    load_prompt_operation,
+    observe_accepted_prompt,
+    plan_prompt,
+    record_prompt_submitted,
+    replan_unobserved_prompt,
+    resolve_prompt,
+)
+
 QUESTION_VERSION = 1
 
 
@@ -57,13 +70,6 @@ class AnswerProvenance(StrEnum):
     USER_VOICE = "user_voice"
     USER_TEXT = "user_text"
     AUTOMATION = "automation"
-
-
-class PromptOperationState(StrEnum):
-    PLANNED = "planned"
-    SUBMITTED = "submitted"
-    OBSERVED = "observed"
-    RESOLVED = "resolved"
 
 
 @dataclass(frozen=True, slots=True)
@@ -557,3 +563,89 @@ def _validate_question(question: Question) -> None:
         raise QuestionError(
             "dispatching question requires a token and prompt operation state"
         )
+
+
+def question_prompt_identity(
+    question: Question,
+    *,
+    job_id: str,
+    turn: int,
+    target: str,
+    agent_session: str,
+) -> PromptIdentity:
+    """Build the shared submission identity from question and job fences."""
+    return PromptIdentity(
+        job_id=job_id,
+        phase="question",
+        turn=turn,
+        turn_token=question.dispatch_token or question.origin.turn_token,
+        target=target,
+        agent_session=agent_session,
+        baseline_sequence=(
+            question.prompt_baseline_seq
+            if question.prompt_baseline_seq is not None
+            else 0
+        ),
+    )
+
+
+def load_question_prompt(
+    question: Question, identity: PromptIdentity
+) -> PromptOperation:
+    """Adapt question JSON prompt fields at the persistence edge."""
+    if question.prompt_state is None:
+        return IdlePrompt()
+    return load_prompt_operation(
+        state=question.prompt_state.value,
+        job_id=identity.job_id,
+        phase=identity.phase,
+        turn=identity.turn,
+        turn_token=identity.turn_token,
+        target=identity.target,
+        agent_session=identity.agent_session,
+        baseline_sequence=(
+            question.prompt_baseline_seq
+            if question.prompt_baseline_seq is not None
+            else identity.baseline_sequence
+        ),
+    )
+
+
+def bind_question_prompt(question: Question, operation: PromptOperation) -> Question:
+    """Write a shared prompt operation back onto question compatibility fields."""
+    if isinstance(operation, IdlePrompt):
+        return replace(question, prompt_state=None)
+    return replace(question, prompt_state=operation.state)
+
+
+def plan_question_prompt(question: Question, identity: PromptIdentity) -> Question:
+    return bind_question_prompt(
+        question, plan_prompt(load_question_prompt(question, identity), identity)
+    )
+
+
+def submit_question_prompt(question: Question, identity: PromptIdentity) -> Question:
+    return bind_question_prompt(
+        question,
+        record_prompt_submitted(load_question_prompt(question, identity), identity),
+    )
+
+
+def observe_question_prompt(question: Question, identity: PromptIdentity) -> Question:
+    return bind_question_prompt(
+        question,
+        observe_accepted_prompt(load_question_prompt(question, identity), identity),
+    )
+
+
+def resolve_question_prompt(question: Question, identity: PromptIdentity) -> Question:
+    return bind_question_prompt(
+        question, resolve_prompt(load_question_prompt(question, identity), identity)
+    )
+
+
+def replan_question_prompt(question: Question, identity: PromptIdentity) -> Question:
+    return bind_question_prompt(
+        question,
+        replan_unobserved_prompt(load_question_prompt(question, identity), identity),
+    )
