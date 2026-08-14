@@ -73,8 +73,14 @@ def test_command_and_effect_require_identity() -> None:
             command_id="cmd",
             kind="session.create",
         )
-    with pytest.raises(CoordinatorError, match="kind and idempotency_key"):
-        DurableEffect(kind=" ", idempotency_key="session:a")
+    with pytest.raises(CoordinatorError, match="effect requires"):
+        DurableEffect(kind=" ", idempotency_key="session:a", concurrency_key="session")
+    with pytest.raises(CoordinatorError, match="concurrency_key"):
+        DurableEffect(
+            kind="session.create",
+            idempotency_key="session:a",
+            concurrency_key=" ",
+        )
     with pytest.raises(CoordinatorError, match="cannot override command_kind"):
         CoordinatorDecision(
             job=CursorJob.from_dict(_job("aaaaaaaaaaaa")),
@@ -98,6 +104,7 @@ def test_apply_commits_state_event_and_outbox_atomically(tmp_path: Path) -> None
                 DurableEffect(
                     kind="session.create",
                     idempotency_key="session:aaaaaaaaaaaa:voice",
+                    concurrency_key="session:voice",
                     payload={"target": "voice"},
                 ),
             ),
@@ -145,6 +152,16 @@ def test_apply_commits_state_event_and_outbox_atomically(tmp_path: Path) -> None
             "pending",
             json.dumps({"target": "voice"}, separators=(",", ":"), sort_keys=True),
         )
+        assert connection.execute(
+            """
+            SELECT concurrency_key
+            FROM outbox_concurrency
+            WHERE effect_id = (
+                SELECT effect_id FROM outbox WHERE job_id = ?
+            )
+            """,
+            (created.id,),
+        ).fetchone() == ("session:voice",)
 
 
 def test_stale_revision_does_not_write(tmp_path: Path) -> None:
@@ -182,6 +199,7 @@ def test_duplicate_command_does_not_apply_twice(tmp_path: Path) -> None:
     effect = DurableEffect(
         kind="session.create",
         idempotency_key="session:aaaaaaaaaaaa:once",
+        concurrency_key="session:once",
         payload={"target": "once"},
     )
 
@@ -206,6 +224,7 @@ def test_duplicate_command_does_not_apply_twice(tmp_path: Path) -> None:
                 DurableEffect(
                     kind="session.create",
                     idempotency_key="session:aaaaaaaaaaaa:twice",
+                    concurrency_key="session:twice",
                     payload={"target": "twice"},
                 ),
             ),
@@ -296,6 +315,7 @@ def test_reservation_conflict_rolls_back_event_and_outbox(tmp_path: Path) -> Non
                     DurableEffect(
                         kind="session.create",
                         idempotency_key="session:bbbbbbbbbbbb:shared-agent",
+                        concurrency_key="session:shared-agent",
                         payload={"target": "shared-agent"},
                     ),
                 ),

@@ -5,7 +5,7 @@ import os
 import re
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Literal, NamedTuple
@@ -58,6 +58,7 @@ from . import (
     announcements,
     delivery,
     inbox,
+    outbox,
     provisioning,
     questions,
     recovery,
@@ -1906,7 +1907,11 @@ def _defer_or_acknowledge(
     return claimed.job
 
 
-def recover_jobs(*, integrations: IntegrationRegistry | None = None) -> None:
+def recover_jobs(
+    *,
+    integrations: IntegrationRegistry | None = None,
+    outbox_handlers: Mapping[str, outbox.EffectHandler] | None = None,
+) -> None:
     registry = _integration_registry(integrations)
     runtime = registry.platform or default_user_config().platform
     store = _job_store()
@@ -1954,6 +1959,7 @@ def recover_jobs(*, integrations: IntegrationRegistry | None = None) -> None:
             )
         ),
         require_issue_provider=lambda name: require_issue_provider(name, registry),
+        outbox_handlers=outbox_handlers,
     )
     _dispatch_waiting_jobs(
         integrations=integrations,

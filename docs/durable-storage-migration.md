@@ -333,8 +333,10 @@ for #141):
   expired, and releasing it requires the complete owner identity tuple.
 * `outbox(effect_id PRIMARY KEY, job_id REFERENCES jobs, kind, idempotency_key
   UNIQUE, payload_json, status, attempts, next_at, lease_token, leased_at,
-  completed_at, outcome_json, last_error)`; effect status must distinguish
-  pending, running, succeeded, failed-retryable, and unknown.
+  completed_at, outcome_json, last_error)` plus
+  `outbox_concurrency(effect_id REFERENCES outbox, concurrency_key)`; effect
+  status must distinguish pending, running, succeeded, failed,
+  failed-retryable, and unknown.
 * `events(event_id PRIMARY KEY, command_id UNIQUE, job_id REFERENCES jobs,
   revision, kind, payload_json, created_at)` for audit/recovery evidence; event
   insertion and state update are atomic. Duplicate `command_id` delivery is a
@@ -367,6 +369,19 @@ outbox rows commit in one `BEGIN IMMEDIATE` transaction or not at all. Existing
 `JobStore.create` and `JobStore.update` record through that same path so the
 coordinator is production-used before every caller is migrated. Effect execution
 is [#345](https://github.com/joshua-mo-143/local-voice-harness/issues/345).
+
+[#345](https://github.com/joshua-mo-143/local-voice-harness/issues/345) implements
+the execution half: `JobStore.claim_outbox` leases a pending row, handlers run
+after that transaction commits, and `observe_outbox` records `Confirmed`,
+`ConfirmedAbsent`, `Failed`, `OutcomeUnknown`, or `ManualRequired` against the
+effect ID and idempotency key. A supervisor renews the lease while a handler is
+running, and durable concurrency keys prevent two rows for the same provider
+resource from running together. Executors never write canonical job rows.
+`recover_jobs` accepts the registered domain handlers, reaps expired leases,
+and drains due work. A crash before the submit fence schedules a bounded retry
+with backoff; a crash after it becomes `OutcomeUnknown`. Retry exhaustion is
+terminal `Failed`, and a post-fence retry request is forced to
+`OutcomeUnknown`.
 
 An effect executor must lease an outbox row, renew it, and report `Confirmed`,
 `ConfirmedAbsent`, `Failed`, or `OutcomeUnknown`; it must not directly update
@@ -449,12 +464,12 @@ Absence of evidence is not `ConfirmedAbsent`. That matches today's
 `operation_timeout` / `operation_ambiguous` / `failed_observing` handling.
 
 Outbox `status` stores executor progress (`pending`, `running`, `succeeded`,
-`failed-retryable`, `unknown`). The observation above is `outcome_json`.
+`failed`, `failed-retryable`, `unknown`). The observation above is `outcome_json`.
 `Confirmed` / `ConfirmedAbsent` complete the row as `succeeded`. `Failed`
-before the submit fence is terminal failure, not retry. `OutcomeUnknown`
-is `unknown` and must be reconciled. `ManualRequired` stays `unknown` with
-an operator fence. `failed-retryable` is only for delivery's allowed
-at-least-once replay, never for create-once provider writes.
+without a retry allowance completes it as `failed`. `OutcomeUnknown` is
+`unknown` and must be reconciled. `ManualRequired` stays `unknown` with an
+operator fence. `failed-retryable` is only for a contractually replay-safe
+effect and is never accepted after the submit fence.
 
 ### Handler boundaries
 
@@ -735,7 +750,8 @@ for each active reservation.
 - [x] [#342](https://github.com/joshua-mo-143/local-voice-harness/issues/342)
   persist `(state transition, event, reservations, outbox effects)` atomically.
 - [ ] Make the coordinator the sole durable state writer.
-- [ ] Execute named provider effects outside transactions with idempotency keys,
+- [x] [#345](https://github.com/joshua-mo-143/local-voice-harness/issues/345)
+  execute named provider effects outside transactions with idempotency keys,
   leases, observations, and `OutcomeUnknown` recovery.
 - [ ] Remove per-job JSON writes, compatibility layout, and v0–v11 incremental
   migration only after parity and hardware recovery checks pass.
