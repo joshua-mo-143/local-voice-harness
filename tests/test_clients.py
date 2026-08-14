@@ -303,6 +303,23 @@ class SpeechToTextClientTests(unittest.TestCase):
         )
         sleep.assert_called_once_with(stt_client.BUSY_BACKOFF_SECONDS)
 
+    def test_retained_transcribe_propagates_uncertain_ack_state(self) -> None:
+        response = {
+            "ok": True,
+            "version": stt_client.PROTOCOL_VERSION,
+            "type": "transcript",
+            "delivery_id": "delivery",
+            "text": "cancel that job",
+            "_retained_state": "uncertain",
+        }
+        with mock.patch.object(stt_client, "_v2_request", return_value=response):
+            delivery = stt_client.transcribe_retained(
+                Path("/runtime/request.wav"),
+                woke=False,
+            )
+
+        self.assertEqual(delivery.state, "uncertain")
+
     def test_transcribe_exhausted_busy_preserves_retry_path(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             audio = Path(temporary) / "request-generation.wav"
@@ -356,6 +373,124 @@ class SpeechToTextClientTests(unittest.TestCase):
                 "delivery_id": "delivery-id",
             },
         )
+
+    def test_retained_ack_records_wake_context_before_returning(self) -> None:
+        response = {
+            "ok": True,
+            "version": stt_client.PROTOCOL_VERSION,
+            "type": "transcript",
+            "delivery_id": "delivery-id",
+            "text": "do the thing",
+        }
+        connection = mock.Mock()
+        connection.recv.side_effect = [
+            json.dumps(response, separators=(",", ":")).encode() + b"\n",
+            b"",
+        ]
+        with (
+            mock.patch.object(stt_client.socket, "socket", return_value=connection),
+            mock.patch.object(stt_client, "_delivery_request") as delivery_request,
+        ):
+            result = stt_client._v2_request(
+                Path("/runtime/request.wav"),
+                timeout=3,
+                retain=True,
+                woke=True,
+            )
+
+        self.assertEqual(result["delivery_id"], response["delivery_id"])
+        self.assertEqual(result["text"], response["text"])
+        acknowledgment = json.loads(connection.sendall.call_args_list[1].args[0])
+        self.assertEqual(acknowledgment["disposition"], "retain")
+        self.assertIs(acknowledgment["woke"], True)
+        delivery_request.assert_called_once_with("pending", "delivery-id")
+        self.assertEqual(result["_retained_state"], "pending")
+
+    def test_pending_authorization_failure_remains_uncertain(self) -> None:
+        response = {
+            "ok": True,
+            "version": stt_client.PROTOCOL_VERSION,
+            "type": "transcript",
+            "delivery_id": "delivery-id",
+            "text": "do the thing",
+        }
+        connection = mock.Mock()
+        connection.recv.side_effect = [
+            json.dumps(response, separators=(",", ":")).encode() + b"\n",
+            b"",
+        ]
+        with (
+            mock.patch.object(stt_client.socket, "socket", return_value=connection),
+            mock.patch.object(
+                stt_client,
+                "_delivery_request",
+                side_effect=HarnessError("STT unavailable"),
+            ) as delivery_request,
+        ):
+            result = stt_client._v2_request(
+                Path("/runtime/request.wav"),
+                timeout=3,
+                retain=True,
+                woke=True,
+            )
+
+        delivery_request.assert_called_once_with("pending", "delivery-id")
+        self.assertEqual(result["_retained_state"], "uncertain")
+
+    def test_retained_ack_transport_failure_is_fenced_in_process(self) -> None:
+        response = {
+            "ok": True,
+            "version": stt_client.PROTOCOL_VERSION,
+            "type": "transcript",
+            "delivery_id": "delivery-id",
+            "text": "do the thing",
+        }
+        connection = mock.Mock()
+        connection.recv.side_effect = [
+            json.dumps(response, separators=(",", ":")).encode() + b"\n",
+            ConnectionResetError("reset after ack"),
+        ]
+        with (
+            mock.patch.object(stt_client.socket, "socket", return_value=connection),
+            mock.patch.object(stt_client, "_delivery_request") as delivery_request,
+        ):
+            result = stt_client._v2_request(
+                Path("/runtime/request.wav"),
+                timeout=3,
+                retain=True,
+            )
+
+        delivery_request.assert_called_once_with("ambiguous", "delivery-id")
+        self.assertEqual(result["_retained_state"], "ambiguous")
+
+    def test_retained_ack_transport_failure_surfaces_uncertain_recovery(self) -> None:
+        response = {
+            "ok": True,
+            "version": stt_client.PROTOCOL_VERSION,
+            "type": "transcript",
+            "delivery_id": "delivery-id",
+            "text": "do the thing",
+        }
+        connection = mock.Mock()
+        connection.recv.side_effect = [
+            json.dumps(response, separators=(",", ":")).encode() + b"\n",
+            ConnectionResetError("reset after ack"),
+        ]
+        with (
+            mock.patch.object(stt_client.socket, "socket", return_value=connection),
+            mock.patch.object(
+                stt_client,
+                "_delivery_request",
+                side_effect=HarnessError("STT unavailable"),
+            ),
+        ):
+            result = stt_client._v2_request(
+                Path("/runtime/request.wav"),
+                timeout=3,
+                retain=True,
+            )
+
+        self.assertEqual(result["_retained_state"], "uncertain")
 
     def test_transcribe_falls_back_to_legacy_server_once(self) -> None:
         audio = Path("/runtime/recordings/request.wav")

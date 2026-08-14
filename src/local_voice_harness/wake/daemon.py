@@ -139,7 +139,13 @@ from ..self_management import (
     resolve_confirmation,
 )
 from ..speech import SpeechRenderer, StreamingSpeechRenderer
-from ..stt.client import transcribe
+from ..stt.client import (
+    RetainedTranscript,
+    recover_retained_transcripts,
+)
+from ..stt.client import (
+    transcribe_retained as transcribe,
+)
 from ..ticket_targets import (
     MISSING_ISSUE_SCOPE_RESPONSE,
     TicketExtraction,
@@ -167,6 +173,7 @@ CONVERSATION_TIMEOUT_SECONDS = 60
 PRE_ROLL_FRAMES = 25
 MICROPHONE_START_ATTEMPTS = 30
 MICROPHONE_RETRY_SECONDS = 1
+RETAINED_RECOVERY_RETRY_SECONDS = 5.0
 PLAYBACK_ECHO_WINDOW_SECONDS = 8.0
 RECENT_PLAYBACK_LIMIT = 8
 TARGET_RESOLUTION_CONTEXT_RESPONSE = AssistantResponse.from_text(
@@ -180,6 +187,21 @@ TARGET_RESOLUTION_CONTINUATION_PATTERN = re.compile(
     r"(?:\s*[,;]?\s+(?:now|please|for you|as requested|like you asked|um|uh))*"
     r"\s*[,!?\.]?\s*",
     re.IGNORECASE,
+)
+SIDE_EFFECTING_INTENTS = frozenset(
+    {
+        Intent.AGENT_SUBMIT,
+        Intent.AGENT_REPLY,
+        Intent.AGENT_FOLLOWUP,
+        Intent.AGENT_CANCEL,
+        Intent.AGENT_DISMISS,
+        Intent.AGENT_REPEAT,
+        Intent.ANNOUNCEMENT_DIGEST,
+        Intent.GITHUB_ISSUE_CREATE,
+        Intent.LINEAR_TICKET_CREATE,
+        Intent.QUESTION_CONSULTATION,
+        Intent.WORKSPACE_CONSULTATION,
+    }
 )
 
 
@@ -531,6 +553,8 @@ class WakeConversationDaemon:
         self.config_activation_delivery: ActivationDelivery | None = None
         self.launched_config_activations: dict[str, subprocess.Popen[bytes]] = {}
         self.config_activation_dispatch_attempts: dict[str, int] = {}
+        self.retained_recovery_required = False
+        self.retained_recovery_retry_at = 0.0
         self.conversation_deadline = 0.0
         self.awaiting_followup = False
         self.last_wake = 0.0
@@ -1344,6 +1368,8 @@ class WakeConversationDaemon:
         text: str,
         *,
         blocked: bool,
+        before_mutation: Callable[[], None] | None = None,
+        after_mutation: Callable[[], None] | None = None,
     ) -> tuple[
         AssistantResponse | None, ConfirmationDecision, PendingConfigChange | None
     ]:
@@ -1363,8 +1389,12 @@ class WakeConversationDaemon:
                 pending,
             )
         try:
+            if before_mutation is not None:
+                before_mutation()
             result = commit_pending_change(pending)
         except StaleConfigChangeError:
+            if after_mutation is not None:
+                after_mutation()
             response = AssistantResponse.from_text(
                 "The stored value changed before confirmation, so I didn't write "
                 "anything. Please start the change again."
@@ -1377,6 +1407,8 @@ class WakeConversationDaemon:
                 "please start the change again."
             )
         else:
+            activation_error: ActivationStateError | None = None
+            offer = None
             try:
                 expected_config = apply_config_values(
                     self.user_config,
@@ -1388,7 +1420,12 @@ class WakeConversationDaemon:
                     expected_config=expected_config,
                 )
             except ActivationStateError as exc:
-                log(f"activation offer persistence failed: {exc}")
+                activation_error = exc
+            finally:
+                if after_mutation is not None:
+                    after_mutation()
+            if activation_error is not None:
+                log(f"activation offer persistence failed: {activation_error}")
                 response = AssistantResponse.from_text(
                     f"Saved {pending.setting.value}, but I could not durably track "
                     "activation. The running snapshot is unchanged and no service "
@@ -1409,6 +1446,9 @@ class WakeConversationDaemon:
     def _resolve_activation_confirmation(
         self,
         text: str,
+        *,
+        before_mutation: Callable[[], None] | None = None,
+        after_mutation: Callable[[], None] | None = None,
     ) -> AssistantResponse | None:
         record = self.config_activation_store.current()
         if (
@@ -1419,7 +1459,11 @@ class WakeConversationDaemon:
             return None
         decision = resolve_activation_decision(text)
         if decision == ActivationDecision.ACTIVATE:
+            if before_mutation is not None:
+                before_mutation()
             record = self.config_activation_store.accept(record.id)
+            if after_mutation is not None:
+                after_mutation()
             delivery = ActivationDelivery(
                 record,
                 ActivationDeliveryKind.PRE_RESTART,
@@ -1427,7 +1471,11 @@ class WakeConversationDaemon:
             self.config_activation_delivery = delivery
             return render_activation_delivery(delivery)
         if decision == ActivationDecision.DECLINE:
+            if before_mutation is not None:
+                before_mutation()
             record = self.config_activation_store.decline(record.id)
+            if after_mutation is not None:
+                after_mutation()
             delivery = ActivationDelivery(record, ActivationDeliveryKind.RESULT)
             self.config_activation_delivery = delivery
             return render_activation_delivery(delivery)
@@ -1548,16 +1596,101 @@ class WakeConversationDaemon:
         return None, None
 
     def process_utterance(  # pyright: ignore[reportGeneralTypeIssues]
-        self, audio_path: Path, *, woke: bool
+        self,
+        audio_path: Path | None,
+        *,
+        woke: bool,
+        retained: RetainedTranscript | None = None,
     ) -> BargeIn | None:
         had_active_conversation = bool(self.conversation_deadline)
         delivery_claims: DeliveryClaims = []
+        transcript_delivery = retained
+        delivery_ambiguous = retained is not None and retained.state == "ambiguous"
+        delivery_terminal = retained is not None and retained.state == "terminal"
+        preserve_delivery = False
+        turn_failed = False
+
+        def fence_side_effect() -> None:
+            nonlocal delivery_ambiguous, preserve_delivery
+            if transcript_delivery is None or delivery_ambiguous:
+                return
+            preserve_delivery = True
+            try:
+                transcript_delivery.mark_ambiguous()
+            except Exception:
+                self.retained_recovery_required = True
+                log(
+                    "voice turn replay fence failed; retained evidence will be "
+                    f"retried in-process: {transcript_delivery.delivery_id}"
+                )
+                raise
+            delivery_ambiguous = True
+            self.retained_recovery_required = True
+
+        def terminalize_non_side_effect() -> None:
+            nonlocal delivery_terminal, preserve_delivery
+            if transcript_delivery is None or delivery_terminal:
+                return
+            preserve_delivery = True
+            try:
+                transcript_delivery.mark_terminal()
+            except Exception:
+                self.retained_recovery_required = True
+                self.retained_recovery_retry_at = (
+                    time.monotonic() + RETAINED_RECOVERY_RETRY_SECONDS
+                )
+                log(
+                    "voice turn terminalization failed before safe completion; "
+                    f"retained evidence will be retried: "
+                    f"{transcript_delivery.delivery_id}"
+                )
+                raise
+            delivery_terminal = True
+            preserve_delivery = False
+
         self.config_activation_delivery = None
         recent_playback = self._active_recent_playback() if not woke else ()
         self.pause_microphone()
         try:
             try:
-                text = transcribe(audio_path)
+                if transcript_delivery is None:
+                    assert audio_path is not None
+                    transcription = transcribe(audio_path, woke=woke)
+                    if isinstance(transcription, RetainedTranscript):
+                        transcript_delivery = transcription
+                        text = transcription.text
+                    else:  # compatibility for injected transcription test doubles
+                        text = str(transcription)
+                else:
+                    text = transcript_delivery.text
+                if transcript_delivery is not None and transcript_delivery.state in {
+                    "ambiguous",
+                    "uncertain",
+                }:
+                    preserve_delivery = True
+                    turn_failed = True
+                    self.retained_recovery_required = True
+                    self.retained_recovery_retry_at = (
+                        time.monotonic() + RETAINED_RECOVERY_RETRY_SECONDS
+                    )
+                    log(
+                        "voice turn retention acknowledgment requires reconciliation: "
+                        f"{transcript_delivery.delivery_id} "
+                        f"({transcript_delivery.state})"
+                    )
+                    notify(
+                        "I retained that voice request because its handoff was "
+                        "interrupted. I will not run it until recovery confirms "
+                        "whether it is safe.",
+                        error=True,
+                    )
+                    return None
+                if text.startswith("__DICTATION_ERROR__:"):
+                    terminalize_non_side_effect()
+                    raise HarnessError(text.removeprefix("__DICTATION_ERROR__:"))
+                if not text:
+                    terminalize_non_side_effect()
+                    raise NoSpeechError("STT did not recognize any speech")
             except NoSpeechError:
                 pending_target_resolution = getattr(
                     self, "pending_target_resolution", None
@@ -1568,6 +1701,7 @@ class WakeConversationDaemon:
                     and getattr(self, "pending_config_change", None) is None
                 ):
                     raise
+                terminalize_non_side_effect()
                 log("confirmation reply contained no recognizable speech")
                 self.awaiting_followup = True
                 self.conversation_deadline = (
@@ -1596,14 +1730,17 @@ class WakeConversationDaemon:
                             f"{text!r}"
                         )
                     else:
+                        terminalize_non_side_effect()
                         log(f"rejected wake candidate: {text!r}")
                         self.stop_components_when_idle()
                         return None
             if self._is_playback_echo(text, recent_playback):
+                terminalize_non_side_effect()
                 log("rejected follow-up matching recent local playback")
                 self.awaiting_followup = True
                 return None
             if not text:
+                terminalize_non_side_effect()
                 log("wake phrase contained no request; waiting for follow-up")
                 self.awaiting_followup = True
                 self.conversation_deadline = (
@@ -1613,6 +1750,7 @@ class WakeConversationDaemon:
             self.awaiting_followup = False
             log(f"user: {text}")
             if CLOSE_PATTERN.search(text):
+                terminalize_non_side_effect()
                 self.close_conversation("spoken command")
                 return None
             pending_target_resolution = getattr(self, "pending_target_resolution", None)
@@ -1667,9 +1805,15 @@ class WakeConversationDaemon:
             ) = self._resolve_pending_config_confirmation(
                 text,
                 blocked=pending_readback is not None,
+                before_mutation=fence_side_effect,
+                after_mutation=terminalize_non_side_effect,
             )
             activation_response = (
-                self._resolve_activation_confirmation(text)
+                self._resolve_activation_confirmation(
+                    text,
+                    before_mutation=fence_side_effect,
+                    after_mutation=terminalize_non_side_effect,
+                )
                 if pending_readback is None
                 and pending_config is None
                 and config_response is None
@@ -1763,8 +1907,15 @@ class WakeConversationDaemon:
                         # Follow-up VAD can capture nearby conversation. A pending
                         # structured question makes conversational fallback unsafe:
                         # close silently and leave the durable question untouched.
+                        terminalize_non_side_effect()
                         self.close_pending_capture("non-actionable speech")
                         return None
+            if confirmed_request is not None or (
+                route.actionable and route.intent in SIDE_EFFECTING_INTENTS
+            ):
+                fence_side_effect()
+            else:
+                terminalize_non_side_effect()
             if (
                 pending_target_resolution is not None
                 and not resuming_target_resolution
@@ -2303,6 +2454,7 @@ class WakeConversationDaemon:
             self.awaiting_followup = True
             notify("Listening for a follow-up…")
         except NoSpeechError as exc:
+            turn_failed = True
             release_deliveries(delivery_claims)
             if had_active_conversation:
                 log(
@@ -2318,6 +2470,7 @@ class WakeConversationDaemon:
                 self.conversation_deadline = 0.0
                 self.stop_components_when_idle()
         except Exception as exc:
+            turn_failed = True
             release_deliveries(delivery_claims)
             log(f"turn failed: {type(exc).__name__}: {exc}")
             notify(VOICE_REQUEST_FAILURE, error=True)
@@ -2328,35 +2481,156 @@ class WakeConversationDaemon:
                 self.conversation_deadline = 0.0
                 self.stop_components_when_idle()
         finally:
+            if transcript_delivery is not None and not (
+                turn_failed and (delivery_ambiguous or preserve_delivery)
+            ):
+                try:
+                    if not delivery_terminal:
+                        transcript_delivery.mark_terminal()
+                except Exception as exc:  # noqa: BLE001 - retained evidence survives
+                    self.retained_recovery_required = True
+                    self.retained_recovery_retry_at = (
+                        time.monotonic() + RETAINED_RECOVERY_RETRY_SECONDS
+                    )
+                    log(
+                        "could not durably terminalize STT delivery "
+                        f"{transcript_delivery.delivery_id}: "
+                        f"{type(exc).__name__}: {exc}"
+                    )
+                else:
+                    try:
+                        transcript_delivery.release()
+                    except Exception as exc:  # noqa: BLE001 - terminal is durable
+                        self.retained_recovery_required = True
+                        self.retained_recovery_retry_at = (
+                            time.monotonic() + RETAINED_RECOVERY_RETRY_SECONDS
+                        )
+                        log(
+                            "could not clean up terminal STT delivery "
+                            f"{transcript_delivery.delivery_id}: "
+                            f"{type(exc).__name__}: {exc}"
+                        )
+                    else:
+                        self.retained_recovery_required = False
+                        self.retained_recovery_retry_at = 0.0
             self.resume_microphone()
             self.wake_model.reset()
         return None
 
+    def _recover_retained_utterances(self) -> None:
+        for delivery in recover_retained_transcripts():
+            if delivery.state == "terminal":
+                try:
+                    delivery.release()
+                except Exception as exc:  # noqa: BLE001 - retry ordered cleanup
+                    self.retained_recovery_required = True
+                    self.retained_recovery_retry_at = (
+                        time.monotonic() + RETAINED_RECOVERY_RETRY_SECONDS
+                    )
+                    log(
+                        "could not clean up terminal retained voice delivery "
+                        f"{delivery.delivery_id}: {type(exc).__name__}: {exc}"
+                    )
+                    break
+                continue
+            if delivery.state == "ambiguous":
+                self.retained_recovery_required = True
+                self.retained_recovery_retry_at = (
+                    time.monotonic() + RETAINED_RECOVERY_RETRY_SECONDS
+                )
+                log(
+                    "retained voice turn requires reconciliation before retry: "
+                    f"{delivery.delivery_id}"
+                )
+                notify(
+                    "A previous voice request may have started before interruption. "
+                    "I retained it for reconciliation and will not run it again.",
+                    error=True,
+                )
+                break
+            self.process_utterance(
+                None,
+                woke=delivery.woke,
+                retained=delivery,
+            )
+            if getattr(self, "retained_recovery_required", False):
+                log(
+                    "retained voice recovery paused before later deliveries "
+                    "until reconciliation succeeds"
+                )
+                break
+
+    def _retry_retained_recovery(self) -> bool:
+        if not getattr(self, "retained_recovery_required", False):
+            return True
+        now = time.monotonic()
+        if now < getattr(self, "retained_recovery_retry_at", 0.0):
+            return False
+        self.retained_recovery_required = False
+        try:
+            self._recover_retained_utterances()
+        except Exception as exc:
+            self.retained_recovery_required = True
+            self.retained_recovery_retry_at = now + RETAINED_RECOVERY_RETRY_SECONDS
+            log(
+                f"in-process retained turn recovery failed: {type(exc).__name__}: {exc}"
+            )
+            notify(
+                "A retained voice request still needs recovery. I will keep "
+                "actions paused and retry.",
+                error=True,
+            )
+        return not self.retained_recovery_required
+
     def run(self) -> None:
         recover_jobs(integrations=self.integrations)
+        self.retained_recovery_required = True
+        self._retry_retained_recovery()
         self.start_microphone()
         speech_streak = 0
         while self.running:
-            activation_interruption = self._recover_config_activation()
-            if activation_interruption is not None:
-                self.continue_after_barge_in(activation_interruption)
-                speech_streak = 0
-                continue
-            batch = drain_pending_announcements(
-                self.announcements,
-                integrations=self.integrations,
-            )
-            if batch.speak:
-                self._enqueue_announcement_batch(batch.speak)
-            if len(self.playback_queue) > 0:
-                self.continue_after_barge_in(self._play_pending_announcements())
-                speech_streak = 0
-                continue
+            actions_allowed = self._retry_retained_recovery()
+            if actions_allowed:
+                activation_interruption = self._recover_config_activation()
+                if activation_interruption is not None:
+                    self.continue_after_barge_in(activation_interruption)
+                    speech_streak = 0
+                    continue
+                batch = drain_pending_announcements(
+                    self.announcements,
+                    integrations=self.integrations,
+                )
+                if batch.speak:
+                    self._enqueue_announcement_batch(batch.speak)
+                if len(self.playback_queue) > 0:
+                    self.continue_after_barge_in(self._play_pending_announcements())
+                    speech_streak = 0
+                    continue
             frame = self.read_frame()
             now = time.monotonic()
             self.pre_roll.append(frame)
             if self.conversation_deadline and now >= self.conversation_deadline:
                 self.close_conversation("inactivity")
+                speech_streak = 0
+                continue
+            if not actions_allowed:
+                if self.force_listen.is_set():
+                    self.force_listen.clear()
+                    notify(
+                        "Voice actions are paused while a retained request is "
+                        "reconciled.",
+                        error=True,
+                    )
+                samples = self.np.frombuffer(frame, dtype="<i2")
+                score = float(self.wake_model.predict(samples).get(self.wake_key, 0.0))
+                if score >= self.audio.wake_threshold and now - self.last_wake >= 2.0:
+                    self.last_wake = now
+                    log(f"wake detected while retained recovery is paused: {score:.3f}")
+                    notify(
+                        "Wake detected, but voice actions are paused while a "
+                        "retained request is reconciled.",
+                        error=True,
+                    )
                 speech_streak = 0
                 continue
             if self.force_listen.is_set():
