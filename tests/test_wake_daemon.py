@@ -4,6 +4,7 @@ import collections
 import contextlib
 import io
 import json
+import math
 import os
 import tempfile
 import threading
@@ -5911,8 +5912,8 @@ class WakeRecordingHandoffTests(unittest.TestCase):
         daemon = _bare_daemon()
         daemon.is_speech = lambda _frame: False  # type: ignore[method-assign]
         daemon.read_frame = mock.Mock(return_value=b"quiet")  # type: ignore[method-assign]
-        expected_frames = (
-            int(wake_daemon.MAX_UTTERANCE_SECONDS * 1000 / wake_daemon.FRAME_MS) + 1
+        expected_frames = math.ceil(
+            wake_daemon.MAX_UTTERANCE_SECONDS * 1000 / wake_daemon.FRAME_MS
         )
 
         with mock.patch.object(
@@ -5923,6 +5924,28 @@ class WakeRecordingHandoffTests(unittest.TestCase):
             daemon.record_utterance([b"pre-roll"] * wake_daemon.PRE_ROLL_FRAMES)
 
         self.assertEqual(daemon.read_frame.call_count, expected_frames)
+
+    def test_utterance_cap_is_120_seconds_and_silence_still_ends_early(self) -> None:
+        self.assertEqual(wake_daemon.MAX_UTTERANCE_SECONDS, 120)
+        daemon = _bare_daemon()
+        silence_frames = int(wake_daemon.END_SILENCE_MS / wake_daemon.FRAME_MS)
+        frames = [b"speech", *[b"quiet"] * silence_frames]
+        daemon.read_frame = mock.Mock(side_effect=frames)  # type: ignore[method-assign]
+        daemon.is_speech = lambda frame: frame == b"speech"  # type: ignore[method-assign]
+        cap_frames = int(
+            wake_daemon.MAX_UTTERANCE_SECONDS * 1000 / wake_daemon.FRAME_MS
+        )
+
+        with mock.patch.object(
+            wake_daemon.recorder,
+            "write_audio_generation",
+            side_effect=_run_audio_writer,
+        ):
+            result = daemon.record_utterance([b"speech"])
+
+        self.assertEqual(result, AUDIO_GENERATION)
+        self.assertEqual(daemon.read_frame.call_count, len(frames))
+        self.assertLess(daemon.read_frame.call_count, cap_frames)
 
     def test_competing_recorder_waits_until_wake_generation_is_durable(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
