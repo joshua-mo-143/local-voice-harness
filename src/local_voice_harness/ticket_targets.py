@@ -53,7 +53,10 @@ _LINEAR_REFERENCE = re.compile(
     r"(?P<number>\d+)(?![A-Za-z0-9])",
     re.IGNORECASE,
 )
-_SCOPED_PREFIX = re.compile(r"\b(?:issues?|tickets?)\s+", re.IGNORECASE)
+_SCOPED_PREFIX = re.compile(
+    r"\b(?P<kind>issues?|tickets?)\s+",
+    re.IGNORECASE,
+)
 _NUMBER_AT = re.compile(r"#?\d+")
 _RANGE_SEPARATOR_AT = re.compile(
     r"(?:\s+(?:through|to)\s+|\s*[-–—]\s*)",
@@ -109,7 +112,12 @@ def _overlaps(start: int, end: int, spans: list[tuple[int, int]]) -> bool:
     )
 
 
-def _spoken_number_at(text: str, start: int) -> tuple[int, int] | None:
+def _spoken_number_at(
+    text: str,
+    start: int,
+    *,
+    allow_digit_grouped: bool = False,
+) -> tuple[int, int] | None:
     """Parse a bounded English cardinal number beginning at ``start``."""
 
     position = start
@@ -119,25 +127,47 @@ def _spoken_number_at(text: str, start: int) -> tuple[int, int] | None:
     last: str | None = None
     consumed = False
     used_thousand = False
+    invalid = False
     while match := _NUMBER_WORD_AT.match(text, position):
         word = match.group(0).casefold()
         if word in _SMALL_NUMBER_WORDS:
-            if last not in {None, "tens", "hundred", "scale", "and"}:
+            if last not in {
+                None,
+                "tens",
+                "hundred",
+                "scale",
+                "and",
+                "grouped_tens",
+            }:
+                invalid = True
                 break
             group += _SMALL_NUMBER_WORDS[word]
-            last = "small"
+            last = "grouped_small" if last == "grouped_tens" else "small"
         elif word in _TENS_NUMBER_WORDS:
-            if last not in {None, "hundred", "scale", "and"}:
+            if (
+                allow_digit_grouped
+                and last == "small"
+                and not used_thousand
+                and total == 0
+                and 1 <= group <= 99
+            ):
+                group = group * 100 + _TENS_NUMBER_WORDS[word]
+                last = "grouped_tens"
+            elif last in {None, "hundred", "scale", "and"}:
+                group += _TENS_NUMBER_WORDS[word]
+                last = "tens"
+            else:
+                invalid = True
                 break
-            group += _TENS_NUMBER_WORDS[word]
-            last = "tens"
         elif word == "hundred":
             if last != "small" or not 1 <= group <= 9:
+                invalid = True
                 break
             group *= 100
             last = "hundred"
         elif word == "thousand":
             if not 1 <= group <= 999 or used_thousand:
+                invalid = True
                 break
             total += group * 1_000
             group = 0
@@ -166,14 +196,23 @@ def _spoken_number_at(text: str, start: int) -> tuple[int, int] | None:
             break
         position = end + separator.end()
 
-    return (total + group, end) if consumed else None
+    return (total + group, end) if consumed and not invalid else None
 
 
-def _number_at(text: str, position: int) -> tuple[int, int] | None:
+def _number_at(
+    text: str,
+    position: int,
+    *,
+    allow_digit_grouped: bool = False,
+) -> tuple[int, int] | None:
     digit = _NUMBER_AT.match(text, position)
     if digit is not None:
         return int(digit.group(0).removeprefix("#")), digit.end()
-    return _spoken_number_at(text, position)
+    return _spoken_number_at(
+        text,
+        position,
+        allow_digit_grouped=allow_digit_grouped,
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -192,16 +231,29 @@ def _scoped_items(text: str) -> list[_ScopedItem]:
     items: list[_ScopedItem] = []
     for prefix in _SCOPED_PREFIX.finditer(text):
         position = prefix.end()
+        first_item = True
+        singular_prefix = not prefix.group("kind").casefold().endswith("s")
         while True:
             start = position
-            parsed = _number_at(text, start)
+            parsed = _number_at(
+                text,
+                start,
+                allow_digit_grouped=singular_prefix and first_item,
+            )
             if parsed is None:
                 break
             value, end = parsed
+            first_item = False
 
             separator = _RANGE_SEPARATOR_AT.match(text, end)
             range_end = (
-                _number_at(text, separator.end()) if separator is not None else None
+                _number_at(
+                    text,
+                    separator.end(),
+                    allow_digit_grouped=singular_prefix,
+                )
+                if separator is not None
+                else None
             )
             if separator is not None and range_end is not None:
                 final_value, final_end = range_end

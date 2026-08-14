@@ -2125,6 +2125,43 @@ class ProcessUtteranceTests(unittest.TestCase):
         self.assertEqual(request.issue_scope, "ENG")
         self.assertEqual(request.issue_scope_source, "linear")
 
+    def test_digit_grouped_issue_reaches_scoped_wake_submission_boundary(
+        self,
+    ) -> None:
+        daemon = _bare_daemon()
+        text = "Work on issue one thirty one please."
+        context = RequestContext(
+            f"{text}\n\nGitHub repository issue list",
+            issue_scope="example/project",
+            issue_scope_source="github",
+        )
+        with (
+            mock.patch.object(wake_daemon, "transcribe", return_value=text),
+            mock.patch.object(wake_daemon, "start_components"),
+            mock.patch.object(wake_daemon, "request_context", return_value=context),
+            mock.patch.object(
+                wake_daemon,
+                "route_intent",
+                return_value=IntentRoute(Intent.CURSOR_SUBMIT, "high"),
+            ),
+            mock.patch.object(wake_daemon, "cursor_turn") as cursor_turn,
+            mock.patch.object(
+                daemon,
+                "_drain_playback_queue",
+                return_value=(_playback_batch("ok"), None),
+            ),
+            mock.patch.object(wake_daemon, "notify"),
+        ):
+            daemon.process_utterance(AUDIO_GENERATION, woke=False)
+
+        cursor_turn.assert_not_called()
+        self.assertIsNotNone(daemon.pending_target_readback)
+        assert daemon.pending_target_readback is not None
+        self.assertEqual(
+            daemon.pending_target_readback.candidate.target.canonical,
+            "example/project#131",
+        )
+
     def test_uncertain_bare_ticket_batch_requests_repository_scope(self) -> None:
         daemon = _bare_daemon()
         text = "Can you work on issues 92, 93 and 95?"
