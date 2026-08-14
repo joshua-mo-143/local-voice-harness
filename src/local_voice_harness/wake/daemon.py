@@ -1407,6 +1407,8 @@ class WakeConversationDaemon:
                 "please start the change again."
             )
         else:
+            activation_error: ActivationStateError | None = None
+            offer = None
             try:
                 expected_config = apply_config_values(
                     self.user_config,
@@ -1418,17 +1420,18 @@ class WakeConversationDaemon:
                     expected_config=expected_config,
                 )
             except ActivationStateError as exc:
+                activation_error = exc
+            finally:
                 if after_mutation is not None:
                     after_mutation()
-                log(f"activation offer persistence failed: {exc}")
+            if activation_error is not None:
+                log(f"activation offer persistence failed: {activation_error}")
                 response = AssistantResponse.from_text(
                     f"Saved {pending.setting.value}, but I could not durably track "
                     "activation. The running snapshot is unchanged and no service "
                     "was restarted."
                 )
             else:
-                if after_mutation is not None:
-                    after_mutation()
                 if offer is None:
                     response = render_change_committed(pending, result)
                 else:

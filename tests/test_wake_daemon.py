@@ -2747,6 +2747,48 @@ class RetainedUtteranceTests(unittest.TestCase):
         self.assertEqual(order, ["fence", "commit", "offer", "terminal"])
         delivery.release.assert_not_called()
 
+    def test_config_commit_terminalizes_when_offer_io_fails(self) -> None:
+        daemon = _bare_daemon()
+        daemon.pending_config_change = _pending_config()
+        delivery = mock.Mock(spec=wake_daemon.RetainedTranscript)
+        delivery.text = "yes"
+        delivery.woke = False
+        delivery.state = "pending"
+        delivery.delivery_id = "9" * 32
+        order: list[str] = []
+        delivery.mark_ambiguous.side_effect = lambda: order.append("fence")
+        delivery.mark_terminal.side_effect = lambda: order.append("terminal")
+        result = ConfigChangeResult(
+            config=daemon.user_config,
+            changed_keys=("audio.voice",),
+            restart_services=("voice-harness-wake.service",),
+        )
+
+        def fail_offer(*_args: object, **_kwargs: object) -> None:
+            order.append("offer")
+            raise OSError("activation journal unavailable")
+
+        with (
+            mock.patch.object(wake_daemon, "start_components"),
+            mock.patch.object(
+                wake_daemon,
+                "commit_pending_change",
+                side_effect=lambda _pending: order.append("commit") or result,
+            ),
+            mock.patch.object(
+                daemon.config_activation_store,
+                "create_offer",
+                side_effect=fail_offer,
+            ),
+            mock.patch.object(wake_daemon, "release_deliveries"),
+            mock.patch.object(wake_daemon, "notify"),
+            mock.patch.object(wake_daemon, "log"),
+        ):
+            daemon.process_utterance(None, woke=False, retained=delivery)
+
+        self.assertEqual(order, ["fence", "commit", "offer", "terminal"])
+        delivery.release.assert_not_called()
+
     def test_activation_decisions_terminalize_before_response_crash(self) -> None:
         for text, operation in (
             ("activate now", "accept"),
