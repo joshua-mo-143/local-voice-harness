@@ -1788,9 +1788,12 @@ def _reserve_worker_target(
                         str(selection.provider),
                         str(selection.provider_session_id),
                         target,
-                        int(selection.state_sequence),
+                        selection.state_sequence,
                     )
                     if identity_complete
+                    and selection.provider is not None
+                    and selection.provider_session_id is not None
+                    and selection.state_sequence is not None
                     else None
                 ),
             ),

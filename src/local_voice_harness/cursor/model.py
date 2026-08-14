@@ -4286,6 +4286,8 @@ def _validate_operation_transitions(before: CursorJob, after: CursorJob) -> None
                 ):
                     previous.transition(current.state, pane_id=current.pane_id)
                 else:
+                    assert isinstance(previous, ForkOperation)
+                    assert isinstance(current, ForkOperation)
                     previous.transition(current.state)
             if isinstance(previous, AgentSessionOperation) and isinstance(
                 current, AgentSessionOperation
