@@ -297,6 +297,136 @@ def test_interrupted_fresh_bootstrap_rolls_back_and_retries(
     assert database.diagnostics()["schema_version"] == str(DATABASE_SCHEMA_VERSION)
 
 
+@pytest.mark.parametrize(
+    ("table", "field"),
+    [(table, fields[-1]) for table, fields in _NAMED_TABLE_FIELDS.items()],
+)
+def test_v2_initialization_adds_every_missing_named_table_field(
+    tmp_path: Path,
+    table: str,
+    field: str,
+) -> None:
+    database = SQLiteJobDatabase(tmp_path / "jobs")
+    database.initialize()
+    with database.connect() as connection:
+        connection.execute(f'ALTER TABLE "{table}" DROP COLUMN "{field}"')
+
+    database.initialize()
+    with database.connect(readonly=True) as connection:
+        columns = {
+            str(row["name"])
+            for row in connection.execute(f'PRAGMA table_info("{table}")')
+        }
+        schema_after_upgrade = connection.execute(
+            "SELECT type, name, sql FROM sqlite_schema ORDER BY type, name"
+        ).fetchall()
+    assert field in columns
+
+    database.initialize()
+    with database.connect(readonly=True) as connection:
+        assert (
+            connection.execute(
+                "SELECT type, name, sql FROM sqlite_schema ORDER BY type, name"
+            ).fetchall()
+            == schema_after_upgrade
+        )
+
+
+def test_v2_named_schema_upgrade_preserves_rows_and_supports_current_writes(
+    tmp_path: Path,
+) -> None:
+    jobs = tmp_path / "jobs"
+    legacy = tmp_path / "legacy"
+    original = CursorJob.from_dict(
+        _job(
+            "aaaaaaaaaaaa",
+            request="preserve durable evidence",
+            grouped_repository_targets=["owner/repository"],
+            speakable_label="existing job",
+        )
+    )
+    first_store = JobStore(jobs, legacy)
+    first_store.create(original)
+    with sqlite3.connect(first_store.db_path) as connection:
+        evidence_before = connection.execute(
+            "SELECT job_id, revision, status, created_at FROM jobs"
+        ).fetchall()
+        presence_before = connection.execute(
+            "SELECT job_id, field_name FROM job_field_presence ORDER BY field_name"
+        ).fetchall()
+        connection.execute(
+            "ALTER TABLE job_identity DROP COLUMN grouped_repository_coordinator_id"
+        )
+
+    reopened = JobStore(jobs, legacy)
+    preserved = reopened.get(original.id)
+    child = reopened.create(
+        CursorJob.from_dict(
+            _job(
+                "bbbbbbbbbbbb",
+                request="write the current field",
+                grouped_repository_coordinator_id=original.id,
+            )
+        )
+    )
+
+    assert preserved.to_dict() == original.to_dict()
+    assert (
+        reopened.get(child.id).to_dict()["grouped_repository_coordinator_id"]
+        == original.id
+    )
+    with sqlite3.connect(reopened.db_path) as connection:
+        assert (
+            connection.execute(
+                "SELECT job_id, revision, status, created_at FROM jobs "
+                "WHERE job_id = 'aaaaaaaaaaaa'"
+            ).fetchall()
+            == evidence_before
+        )
+        assert (
+            connection.execute(
+                "SELECT job_id, field_name FROM job_field_presence "
+                "WHERE job_id = 'aaaaaaaaaaaa' ORDER BY field_name"
+            ).fetchall()
+            == presence_before
+        )
+        columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(job_identity)")
+        }
+    assert "grouped_repository_coordinator_id" in columns
+
+
+def test_v2_ambiguous_named_schema_fails_without_partial_upgrade(
+    tmp_path: Path,
+) -> None:
+    database = SQLiteJobDatabase(tmp_path / "jobs")
+    database.initialize()
+    with database.connect() as connection:
+        connection.execute(
+            "ALTER TABLE job_identity DROP COLUMN grouped_repository_coordinator_id"
+        )
+        connection.execute("DROP TABLE job_prompt_question")
+        connection.execute("CREATE TABLE job_prompt_question(legacy_value TEXT) STRICT")
+
+    with pytest.raises(
+        sqlite3.DatabaseError,
+        match=r"missing foundational columns: job_prompt_question\.job_id",
+    ):
+        database.initialize()
+
+    with database.connect(readonly=True) as connection:
+        identity_columns = {
+            str(row["name"])
+            for row in connection.execute("PRAGMA table_info(job_identity)")
+        }
+        prompt_columns = {
+            str(row["name"])
+            for row in connection.execute("PRAGMA table_info(job_prompt_question)")
+        }
+    assert "grouped_repository_coordinator_id" not in identity_columns
+    assert prompt_columns == {"legacy_value"}
+
+
 def test_fresh_store_uses_normalized_private_wal_database(tmp_path: Path) -> None:
     store = JobStore(tmp_path / "jobs", tmp_path / "legacy")
     source = _job("123456789abc", voice_question={"version": 1, "id": "q"})
@@ -439,12 +569,22 @@ def test_unknown_database_schema_fails_closed_without_consuming_json(
         connection.execute(
             "INSERT INTO store_meta(key, value) VALUES('schema_version', '999')"
         )
+        schema_before = connection.execute(
+            "SELECT type, name, sql FROM sqlite_schema ORDER BY type, name"
+        ).fetchall()
 
     with pytest.raises(sqlite3.DatabaseError, match="unsupported.*999"):
         JobStore(jobs, tmp_path / "legacy").list()
 
     assert source.exists()
     assert not (jobs / "123456789abc.json.imported").exists()
+    with sqlite3.connect(database) as connection:
+        assert (
+            connection.execute(
+                "SELECT type, name, sql FROM sqlite_schema ORDER BY type, name"
+            ).fetchall()
+            == schema_before
+        )
 
 
 def test_database_quarantine_fence_survives_premature_resolution_file(
