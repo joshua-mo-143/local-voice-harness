@@ -1551,7 +1551,10 @@ class CursorRecoveryTests(unittest.TestCase):
         self.assertEqual(updated.status, JobStatus.BLOCKED)
         self.assertEqual(updated.ticket_merge_operation_state, "manual_required")
         self.assertIn("Updated example/project#12", str(updated.result))
-        self.assertIn("was not closed", str(updated.result))
+        self.assertIn(
+            "Close outcome requires manual verification for: example/project#13",
+            str(updated.result),
+        )
         client.submit_issue_close.assert_not_called()
 
     def test_uncertain_operations_reconcile_ambiguous_issue_merge(self) -> None:

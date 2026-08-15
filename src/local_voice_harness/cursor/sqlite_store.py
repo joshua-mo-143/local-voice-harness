@@ -293,6 +293,7 @@ _NAMED_TABLE_FIELDS: dict[str, tuple[str, ...]] = {
         "ticket_merge_closing",
         "ticket_merge_confirmed",
         "ticket_merge_operation_state",
+        "ticket_merge_snapshots",
         "ticket_merge_prompt_session",
         "ticket_merge_prompt_target",
         "ticket_merge_prompt_token",

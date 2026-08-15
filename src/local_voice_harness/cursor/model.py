@@ -423,6 +423,7 @@ _STRING_FIELDS = frozenset(
         "ticket_merge_survivor_operation_state",
         "ticket_merge_survivor_issue_id",
         "ticket_merge_closing",
+        "ticket_merge_snapshots",
         "ticket_merge_operation_state",
         "ticket_merge_prompt_target",
         "ticket_merge_prompt_session",
@@ -852,6 +853,7 @@ _LINEAR_STATE_FIELDS = frozenset(
         "ticket_merge_survivor_operation_state",
         "ticket_merge_survivor_issue_id",
         "ticket_merge_closing",
+        "ticket_merge_snapshots",
         "ticket_merge_operation_state",
         "ticket_merge_prompt_target",
         "ticket_merge_prompt_session",
@@ -3230,6 +3232,10 @@ class AgentJob:
     @property
     def ticket_merge_closing(self) -> str | None:
         return self._optional_string("ticket_merge_closing")
+
+    @property
+    def ticket_merge_snapshots(self) -> str | None:
+        return self._optional_string("ticket_merge_snapshots")
 
     @property
     def ticket_merge_operation_state(self) -> str | None:

@@ -1637,6 +1637,8 @@ def reconcile_uncertain_ticket_merge(
                 plan = provider.plan_ticket_close(
                     ticket.issue_id or "",
                     ticket.identity,
+                    ticket.terminal_state_id or "",
+                    ticket.terminal_state_name or "",
                     correlation_marker=ticket.marker,
                 )
                 observed_close = (

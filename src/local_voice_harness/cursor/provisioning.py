@@ -56,6 +56,7 @@ from ..integrations.herdr import (
 from ..integrations.linear import (
     LinearError,
     LinearIntegration,
+    LinearIssue,
     LinearOperationAmbiguous,
     LinearTicketCloseResult,
     LinearTicketCreationResult,
@@ -105,18 +106,20 @@ from ..questions import (
     resolve_question_prompt,
     submit_question_prompt,
 )
-from ..ticket_snapshot import TicketSnapshot
 from ..ticket_merge import (
     MergeClosingTicket,
     TicketMergeDraft,
     assign_merge_markers,
     decode_merge_closing,
+    decode_merge_snapshots,
     draft_ticket_merge,
     encode_merge_closing,
+    encode_merge_snapshots,
     merge_preview,
     merge_result_message,
     replace_merge_closing,
 )
+from ..ticket_snapshot import TicketSnapshot
 from ..ticket_split import (
     SplitChild,
     TicketSplitDraft,
@@ -5142,6 +5145,59 @@ def _persist_merge_closing(
     return _persist_merge_job(store, job, token, persist, statuses={JobStatus.RUNNING})
 
 
+def _merge_snapshots_match(
+    expected: tuple[TicketSnapshot, ...],
+    current: tuple[TicketSnapshot, ...],
+) -> bool:
+    return len(expected) == len(current) and all(
+        (
+            left.provider.casefold(),
+            left.identity.casefold(),
+            left.provider_id,
+            left.title,
+            left.body,
+            left.revision,
+        )
+        == (
+            right.provider.casefold(),
+            right.identity.casefold(),
+            right.provider_id,
+            right.title,
+            right.body,
+            right.revision,
+        )
+        for left, right in zip(expected, current, strict=True)
+    )
+
+
+def _linear_merge_snapshots(
+    provider: LinearIntegration,
+    client: HerdrClient,
+    survivor: str,
+    survivor_issue_id: str,
+    closing: tuple[MergeClosingTicket, ...],
+    checkpoint: Callable[[], None],
+) -> tuple[TicketSnapshot, ...]:
+    snapshots = (
+        provider.ticket_snapshot(client, survivor, checkpoint=checkpoint),
+        *(
+            provider.ticket_snapshot(
+                client,
+                ticket.identity,
+                checkpoint=checkpoint,
+            )
+            for ticket in closing
+        ),
+    )
+    expected_ids = (survivor_issue_id, *(ticket.issue_id or "" for ticket in closing))
+    if any(
+        snapshot.provider_id != expected
+        for snapshot, expected in zip(snapshots, expected_ids, strict=True)
+    ):
+        raise HarnessError("Linear merge identity changed during snapshot resolution")
+    return snapshots
+
+
 def _finish_ticket_merge(
     store: JobStore,
     job: CursorJob,
@@ -5301,17 +5357,23 @@ def _run_github_issue_merge(
     repository = source.name_with_owner
     checkpoint()
     closing = decode_merge_closing(job.ticket_merge_closing)
+    current_snapshots: tuple[TicketSnapshot, ...] | None = None
     if not job.ticket_merge_survivor_title:
+        current_snapshots = (
+            github.ticket_snapshot(f"{repository}#{number}"),
+            *(github.ticket_snapshot(ticket.identity) for ticket in closing),
+        )
         config = default_user_config()
         draft, closing, survivor_marker = assign_merge_markers(
             draft_ticket_merge(
                 job.trusted_utterance or job.request,
                 survivor,
-                tuple(ticket.identity for ticket in closing),
+                current_snapshots,
                 settings=config.providers,
             ),
             closing,
         )
+        snapshot_payload = encode_merge_snapshots(current_snapshots)
 
         def persist_draft(current: CursorJob) -> CursorJob:
             return current.evolve(
@@ -5319,6 +5381,7 @@ def _run_github_issue_merge(
                 github_issue=number,
                 ticket_merge_survivor=survivor,
                 ticket_merge_closing=encode_merge_closing(closing),
+                ticket_merge_snapshots=snapshot_payload,
                 ticket_merge_survivor_title=draft.title,
                 ticket_merge_survivor_body=draft.body,
                 ticket_merge_survivor_marker=survivor_marker,
@@ -5333,6 +5396,41 @@ def _run_github_issue_merge(
             return
         job = updated
     closing = decode_merge_closing(job.ticket_merge_closing)
+    expected_snapshots = decode_merge_snapshots(job.ticket_merge_snapshots)
+    if current_snapshots is None:
+        current_snapshots = (
+            github.ticket_snapshot(f"{repository}#{number}"),
+            *(github.ticket_snapshot(ticket.identity) for ticket in closing),
+        )
+    if not _merge_snapshots_match(expected_snapshots, current_snapshots):
+        config = default_user_config()
+        refreshed = draft_ticket_merge(
+            job.trusted_utterance or job.request,
+            survivor,
+            current_snapshots,
+            settings=config.providers,
+        )
+
+        def persist_drift(current: CursorJob) -> CursorJob:
+            return current.evolve(
+                ticket_merge_confirmed=False,
+                ticket_merge_snapshots=encode_merge_snapshots(current_snapshots),
+                ticket_merge_survivor_title=refreshed.title,
+                ticket_merge_survivor_body=refreshed.body,
+                ticket_merge_survivor_operation_state="planned",
+                ticket_merge_operation_state="planned",
+            )
+
+        updated = _persist_merge_job(
+            store,
+            job,
+            token,
+            persist_drift,
+            statuses={JobStatus.ROUTING},
+        )
+        if updated is None:
+            return
+        job = updated
     draft = TicketMergeDraft(
         job.ticket_merge_survivor_title or "",
         job.ticket_merge_survivor_body or "",
@@ -5586,40 +5684,57 @@ def _run_linear_ticket_merge(
     resolved: list[MergeClosingTicket] = []
     changed = False
     for ticket in closing:
-        if ticket.issue_id:
+        if ticket.issue_id and ticket.terminal_state_id and ticket.terminal_state_name:
             resolved.append(ticket)
             continue
-        try:
-            issue_id, issue = provider.resolve_issue(
-                client,
-                ticket.identity,
-                checkpoint=checkpoint,
-            )
-        except LinearError:
-            missing = f"I couldn't find Linear ticket {ticket.identity}."
-
-            def finish_missing_close(
-                current: CursorJob, *, message: str = missing
-            ) -> CursorJob:
-                now = time.time()
-                return recovery.stage_terminal_intent(
-                    current,
-                    JobStatus.FAILED,
-                    now=now,
-                    result=message,
-                    error=message,
+        if ticket.issue_id:
+            issue_id = ticket.issue_id
+            issue = LinearIssue(ticket.identity)
+        else:
+            try:
+                issue_id, issue = provider.resolve_issue(
+                    client,
+                    ticket.identity,
+                    checkpoint=checkpoint,
                 )
+            except LinearError:
+                missing = f"I couldn't find Linear ticket {ticket.identity}."
 
-            _worker_change(
-                store,
-                job.id,
-                token,
-                MODEL_WORKER_STATUSES,
-                finish_missing_close,
-                expected_revision=job.revision,
+                def finish_missing_close(
+                    current: CursorJob, *, message: str = missing
+                ) -> CursorJob:
+                    now = time.time()
+                    return recovery.stage_terminal_intent(
+                        current,
+                        JobStatus.FAILED,
+                        now=now,
+                        result=message,
+                        error=message,
+                    )
+
+                _worker_change(
+                    store,
+                    job.id,
+                    token,
+                    MODEL_WORKER_STATUSES,
+                    finish_missing_close,
+                    expected_revision=job.revision,
+                )
+                return
+        terminal_state = provider.resolve_terminal_state(
+            client,
+            issue.identifier,
+            checkpoint=checkpoint,
+        )
+        resolved.append(
+            replace(
+                ticket,
+                identity=issue.identifier,
+                issue_id=issue_id,
+                terminal_state_id=terminal_state.id,
+                terminal_state_name=terminal_state.name,
             )
-            return
-        resolved.append(replace(ticket, identity=issue.identifier, issue_id=issue_id))
+        )
         changed = True
     if changed:
         closing = tuple(resolved)
@@ -5635,22 +5750,33 @@ def _run_linear_ticket_merge(
         job = updated
     else:
         closing = tuple(resolved)
+    current_snapshots: tuple[TicketSnapshot, ...] | None = None
     if not job.ticket_merge_survivor_title:
+        current_snapshots = _linear_merge_snapshots(
+            provider,
+            client,
+            identifier,
+            job.ticket_merge_survivor_issue_id or "",
+            closing,
+            checkpoint,
+        )
         config = default_user_config()
         draft, closing, survivor_marker = assign_merge_markers(
             draft_ticket_merge(
                 job.trusted_utterance or job.request,
                 identifier,
-                tuple(ticket.identity for ticket in closing),
+                current_snapshots,
                 settings=config.providers,
             ),
             closing,
         )
+        snapshot_payload = encode_merge_snapshots(current_snapshots)
 
         def persist_draft(current: CursorJob) -> CursorJob:
             return current.evolve(
                 ticket_merge_survivor=identifier,
                 ticket_merge_closing=encode_merge_closing(closing),
+                ticket_merge_snapshots=snapshot_payload,
                 ticket_merge_survivor_title=draft.title,
                 ticket_merge_survivor_body=draft.body,
                 ticket_merge_survivor_marker=survivor_marker,
@@ -5665,6 +5791,45 @@ def _run_linear_ticket_merge(
             return
         job = updated
     closing = decode_merge_closing(job.ticket_merge_closing)
+    expected_snapshots = decode_merge_snapshots(job.ticket_merge_snapshots)
+    if current_snapshots is None:
+        current_snapshots = _linear_merge_snapshots(
+            provider,
+            client,
+            identifier,
+            job.ticket_merge_survivor_issue_id or "",
+            closing,
+            checkpoint,
+        )
+    if not _merge_snapshots_match(expected_snapshots, current_snapshots):
+        config = default_user_config()
+        refreshed = draft_ticket_merge(
+            job.trusted_utterance or job.request,
+            identifier,
+            current_snapshots,
+            settings=config.providers,
+        )
+
+        def persist_drift(current: CursorJob) -> CursorJob:
+            return current.evolve(
+                ticket_merge_confirmed=False,
+                ticket_merge_snapshots=encode_merge_snapshots(current_snapshots),
+                ticket_merge_survivor_title=refreshed.title,
+                ticket_merge_survivor_body=refreshed.body,
+                ticket_merge_survivor_operation_state="planned",
+                ticket_merge_operation_state="planned",
+            )
+
+        updated = _persist_merge_job(
+            store,
+            job,
+            token,
+            persist_drift,
+            statuses={JobStatus.ROUTING},
+        )
+        if updated is None:
+            return
+        job = updated
     draft = TicketMergeDraft(
         job.ticket_merge_survivor_title or "",
         job.ticket_merge_survivor_body or "",
@@ -5847,6 +6012,8 @@ def _run_linear_ticket_merge(
         plan = provider.plan_ticket_close(
             ticket.issue_id or "",
             ticket.identity,
+            ticket.terminal_state_id or "",
+            ticket.terminal_state_name or "",
             correlation_marker=ticket.marker,
         )
         if ticket.state in {"submitted", "ambiguous"}:

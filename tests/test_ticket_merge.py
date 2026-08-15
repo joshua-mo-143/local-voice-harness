@@ -17,6 +17,7 @@ from local_voice_harness.ticket_merge import (
     spoken_merge_confirmation,
     wants_ticket_merge_context,
 )
+from local_voice_harness.ticket_snapshot import TicketSnapshot
 from local_voice_harness.ticket_targets import extract_ticket_targets
 
 
@@ -183,11 +184,13 @@ class TicketMergeDraftTests(unittest.TestCase):
         self.assertEqual(decoded, closing)
         self.assertEqual(
             merge_result_message("API-79", closing, survivor_state="created"),
-            "Updated API-79. Closed API-80. API-81 was not closed.",
+            "Updated API-79. Closed API-80. Close outcome requires manual "
+            "verification for: API-81.",
         )
         self.assertEqual(
             merge_result_message("API-79", closing, survivor_state=None),
-            "API-79 was not updated. Closed API-80. API-81 was not closed.",
+            "API-79 was not updated. Closed API-80. Close outcome requires manual "
+            "verification for: API-81.",
         )
 
     def test_draft_uses_forced_tool_call(self) -> None:
@@ -212,8 +215,32 @@ class TicketMergeDraftTests(unittest.TestCase):
             draft = draft_ticket_merge(
                 "merge API-79 and API-80",
                 "API-79",
-                ("API-80",),
+                (
+                    TicketSnapshot(
+                        "linear",
+                        "API-79",
+                        "issue-79",
+                        "Auth",
+                        "Handle login.",
+                        "revision-79",
+                        "https://linear.app/acme/issue/API-79/auth",
+                        "In Progress",
+                    ),
+                    TicketSnapshot(
+                        "linear",
+                        "API-80",
+                        "issue-80",
+                        "Billing",
+                        "Handle invoices.",
+                        "revision-80",
+                        "https://linear.app/acme/issue/API-80/billing",
+                        "In Progress",
+                    ),
+                ),
             )
 
         self.assertEqual(draft.title, "Combined auth")
         self.assertEqual(draft.body, "Handle login and invoices.")
+        request = transport.chat_completion.call_args.args[0]
+        self.assertIn("Handle login.", request.messages[1]["content"])
+        self.assertIn("Handle invoices.", request.messages[1]["content"])

@@ -583,6 +583,7 @@ def _build_field_ownership() -> tuple[FieldOwnership, ...]:
                 "ticket_merge_survivor_operation_state": CrashKind.UNCERTAINTY,
                 "ticket_merge_survivor_issue_id": CrashKind.IDENTITY,
                 "ticket_merge_closing": CrashKind.CONTENT,
+                "ticket_merge_snapshots": CrashKind.CONTENT,
                 "ticket_merge_operation_state": CrashKind.UNCERTAINTY,
                 "ticket_merge_prompt_target": CrashKind.IDENTITY,
                 "ticket_merge_prompt_session": CrashKind.IDENTITY,

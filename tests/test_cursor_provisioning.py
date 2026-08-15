@@ -78,12 +78,13 @@ from local_voice_harness.local_git import (
     LocalGitError,
     LocalGitRefChanged,
 )
-from local_voice_harness.ticket_snapshot import TicketSnapshot
 from local_voice_harness.ticket_merge import (
     MergeClosingTicket,
     TicketMergeDraft,
     encode_merge_closing,
+    encode_merge_snapshots,
 )
+from local_voice_harness.ticket_snapshot import TicketSnapshot
 from local_voice_harness.ticket_split import (
     SplitChild,
     TicketSplitDraft,
@@ -140,6 +141,61 @@ def _linear_update_snapshot(
         "https://linear.app/acme/issue/API-79/current-title",
         "In Progress",
     )
+
+
+def _github_merge_snapshots() -> tuple[TicketSnapshot, ...]:
+    return (
+        _github_update_snapshot("Auth", "Handle login.", "revision-12"),
+        TicketSnapshot(
+            "github",
+            "source/project#13",
+            "https://github.com/source/project/issues/13",
+            "Billing",
+            "Handle invoices.",
+            "revision-13",
+            "https://github.com/source/project/issues/13",
+            "OPEN",
+        ),
+    )
+
+
+def _linear_merge_snapshots() -> tuple[TicketSnapshot, ...]:
+    return (
+        _linear_update_snapshot("Auth", "Handle login.", "revision-79"),
+        TicketSnapshot(
+            "linear",
+            "API-80",
+            "issue-id-api-80",
+            "Billing",
+            "Handle invoices.",
+            "revision-80",
+            "https://linear.app/acme/issue/API-80/billing",
+            "In Progress",
+        ),
+    )
+
+
+def _configure_github_merge_snapshots(
+    github: mock.Mock,
+    current: tuple[TicketSnapshot, ...] | None = None,
+) -> None:
+    snapshots = {
+        snapshot.identity: snapshot
+        for snapshot in (current or _github_merge_snapshots())
+    }
+
+    def details(issue: GitHubIssue) -> dict[str, object]:
+        snapshot = snapshots[issue.reference]
+        return {
+            "number": issue.number,
+            "title": snapshot.title,
+            "body": snapshot.body,
+            "updatedAt": snapshot.revision,
+            "state": snapshot.state,
+            "url": snapshot.url,
+        }
+
+    github.issue_details.side_effect = details
 
 
 WORKER = WorkerOwnership("worker", 42, "boot", "start", "test", 1)
@@ -5655,6 +5711,7 @@ class CursorJobStateTests(unittest.TestCase):
             "main",
         )
         github = mock.Mock()
+        _configure_github_merge_snapshots(github)
         github.inspect_repository.return_value = source
         with (
             mock.patch.object(jobs, "GitHubClient", return_value=github),
@@ -5706,6 +5763,9 @@ class CursorJobStateTests(unittest.TestCase):
                 "github_issue_merge_requested": True,
                 "ticket_merge_confirmed": True,
                 "ticket_merge_survivor": "source/project#12",
+                "ticket_merge_snapshots": encode_merge_snapshots(
+                    _github_merge_snapshots()
+                ),
                 "ticket_merge_survivor_title": "Combined auth",
                 "ticket_merge_survivor_body": "Handle login and invoices.",
                 "ticket_merge_survivor_marker": "a" * 32,
@@ -5735,6 +5795,7 @@ class CursorJobStateTests(unittest.TestCase):
             "b" * 32,
         )
         github = mock.Mock()
+        _configure_github_merge_snapshots(github)
         github.inspect_repository.return_value = source
         github.submit_issue_update.return_value = updated_issue
         github.submit_issue_close.return_value = closed
@@ -5752,6 +5813,85 @@ class CursorJobStateTests(unittest.TestCase):
         github.submit_issue_update.assert_called_once()
         github.submit_issue_close.assert_called_once()
         herdr.assert_not_called()
+
+    def test_confirmed_issue_merge_reconfirms_when_any_snapshot_drifts(self) -> None:
+        closing = encode_merge_closing(
+            (
+                MergeClosingTicket(
+                    "source/project#13",
+                    "b" * 32,
+                    repository="source/project",
+                    number=13,
+                ),
+            )
+        )
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "merge source/project#12 and source/project#13",
+                "trusted_utterance": "merge source/project#12 and source/project#13",
+                "issue_provider": "github",
+                "github_repository": "source/project",
+                "github_issue": 12,
+                "github_issue_merge_requested": True,
+                "ticket_merge_confirmed": True,
+                "ticket_merge_survivor": "source/project#12",
+                "ticket_merge_snapshots": encode_merge_snapshots(
+                    _github_merge_snapshots()
+                ),
+                "ticket_merge_survivor_title": "Combined auth",
+                "ticket_merge_survivor_body": "Handle login and invoices.",
+                "ticket_merge_survivor_marker": "a" * 32,
+                "ticket_merge_survivor_operation_state": "planned",
+                "ticket_merge_closing": closing,
+                "ticket_merge_operation_state": "planned",
+                "status": "queued",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        current = (
+            _github_merge_snapshots()[0],
+            TicketSnapshot(
+                "github",
+                "source/project#13",
+                "https://github.com/source/project/issues/13",
+                "Billing",
+                "Externally revised invoices.",
+                "revision-13b",
+                "https://github.com/source/project/issues/13",
+                "OPEN",
+            ),
+        )
+        github = mock.Mock()
+        github.inspect_repository.return_value = GitHubRepository(
+            "source/project",
+            "https://github.com/source/project",
+            False,
+            "main",
+        )
+        _configure_github_merge_snapshots(github, current)
+        with (
+            mock.patch.object(jobs, "GitHubClient", return_value=github),
+            mock.patch.object(
+                production_jobs,
+                "draft_ticket_merge",
+                return_value=TicketMergeDraft(
+                    "Combined revised auth",
+                    "Handle login and externally revised invoices.",
+                ),
+            ),
+        ):
+            service.run_worker("123456789abc")
+
+        updated = jobs.read_job("123456789abc")
+        self.assertEqual(updated["status"], "awaiting_user")
+        self.assertFalse(updated["ticket_merge_confirmed"])
+        self.assertIn("Combined revised auth", str(updated["question"]))
+        snapshots = json.loads(str(updated["ticket_merge_snapshots"]))
+        self.assertEqual(snapshots[1]["revision"], "revision-13b")
+        github.submit_issue_update.assert_not_called()
+        github.submit_issue_close.assert_not_called()
 
     def test_partial_merge_failure_does_not_retry_landed_survivor(self) -> None:
         closing = encode_merge_closing(
@@ -5775,6 +5915,9 @@ class CursorJobStateTests(unittest.TestCase):
                 "github_issue_merge_requested": True,
                 "ticket_merge_confirmed": True,
                 "ticket_merge_survivor": "source/project#12",
+                "ticket_merge_snapshots": encode_merge_snapshots(
+                    _github_merge_snapshots()
+                ),
                 "ticket_merge_survivor_title": "Combined auth",
                 "ticket_merge_survivor_body": "Handle login and invoices.",
                 "ticket_merge_survivor_marker": "a" * 32,
@@ -5787,6 +5930,7 @@ class CursorJobStateTests(unittest.TestCase):
             }
         )
         github = mock.Mock()
+        _configure_github_merge_snapshots(github)
         github.inspect_repository.return_value = GitHubRepository(
             "source/project",
             "https://github.com/source/project",
@@ -5843,6 +5987,9 @@ class CursorJobStateTests(unittest.TestCase):
                 "github_issue_merge_requested": True,
                 "ticket_merge_confirmed": True,
                 "ticket_merge_survivor": "source/project#12",
+                "ticket_merge_snapshots": encode_merge_snapshots(
+                    _github_merge_snapshots()
+                ),
                 "ticket_merge_survivor_title": "Combined auth",
                 "ticket_merge_survivor_body": "Handle login and invoices.",
                 "ticket_merge_survivor_marker": "a" * 32,
@@ -5855,6 +6002,7 @@ class CursorJobStateTests(unittest.TestCase):
             }
         )
         github = mock.Mock()
+        _configure_github_merge_snapshots(github)
         github.inspect_repository.return_value = GitHubRepository(
             "source/project",
             "https://github.com/source/project",
@@ -5894,6 +6042,9 @@ class CursorJobStateTests(unittest.TestCase):
                 "github_issue_merge_requested": True,
                 "ticket_merge_confirmed": True,
                 "ticket_merge_survivor": "source/project#12",
+                "ticket_merge_snapshots": encode_merge_snapshots(
+                    _github_merge_snapshots()
+                ),
                 "ticket_merge_survivor_title": "Combined auth",
                 "ticket_merge_survivor_body": "Handle login and invoices.",
                 "ticket_merge_survivor_marker": "a" * 32,
@@ -5906,6 +6057,7 @@ class CursorJobStateTests(unittest.TestCase):
             }
         )
         github = mock.Mock()
+        _configure_github_merge_snapshots(github)
         github.inspect_repository.return_value = GitHubRepository(
             "source/project",
             "https://github.com/source/project",
@@ -5974,6 +6126,9 @@ class CursorJobStateTests(unittest.TestCase):
                 "github_issue_merge_requested": True,
                 "ticket_merge_confirmed": True,
                 "ticket_merge_survivor": "source/project#12",
+                "ticket_merge_snapshots": encode_merge_snapshots(
+                    _github_merge_snapshots()
+                ),
                 "ticket_merge_survivor_title": "Combined auth",
                 "ticket_merge_survivor_body": "Handle login and invoices.",
                 "ticket_merge_survivor_marker": "a" * 32,
@@ -5986,6 +6141,7 @@ class CursorJobStateTests(unittest.TestCase):
             }
         )
         github = mock.Mock()
+        _configure_github_merge_snapshots(github)
         github.inspect_repository.return_value = GitHubRepository(
             "source/project",
             "https://github.com/source/project",
@@ -6030,6 +6186,9 @@ class CursorJobStateTests(unittest.TestCase):
                 "github_issue_merge_requested": True,
                 "ticket_merge_confirmed": True,
                 "ticket_merge_survivor": "source/project#12",
+                "ticket_merge_snapshots": encode_merge_snapshots(
+                    _github_merge_snapshots()
+                ),
                 "ticket_merge_survivor_title": "Combined auth",
                 "ticket_merge_survivor_body": "Handle login and invoices.",
                 "ticket_merge_survivor_marker": "a" * 32,
@@ -6042,6 +6201,7 @@ class CursorJobStateTests(unittest.TestCase):
             }
         )
         github = mock.Mock()
+        _configure_github_merge_snapshots(github)
         github.inspect_repository.return_value = GitHubRepository(
             "source/project",
             "https://github.com/source/project",
@@ -6101,6 +6261,9 @@ class CursorJobStateTests(unittest.TestCase):
                 "github_issue_merge_requested": True,
                 "ticket_merge_confirmed": True,
                 "ticket_merge_survivor": "source/project#12",
+                "ticket_merge_snapshots": encode_merge_snapshots(
+                    _github_merge_snapshots()
+                ),
                 "ticket_merge_survivor_title": "Combined auth",
                 "ticket_merge_survivor_body": "Handle login and invoices.",
                 "ticket_merge_survivor_marker": "a" * 32,
@@ -6113,6 +6276,7 @@ class CursorJobStateTests(unittest.TestCase):
             }
         )
         github = mock.Mock()
+        _configure_github_merge_snapshots(github)
         github.inspect_repository.return_value = GitHubRepository(
             "source/project",
             "https://github.com/source/project",
@@ -6163,6 +6327,9 @@ class CursorJobStateTests(unittest.TestCase):
                 "github_issue_merge_requested": True,
                 "ticket_merge_confirmed": True,
                 "ticket_merge_survivor": "source/project#12",
+                "ticket_merge_snapshots": encode_merge_snapshots(
+                    _github_merge_snapshots()
+                ),
                 "ticket_merge_survivor_title": "Combined auth",
                 "ticket_merge_survivor_body": "Handle login and invoices.",
                 "ticket_merge_survivor_marker": "a" * 32,
@@ -6175,6 +6342,7 @@ class CursorJobStateTests(unittest.TestCase):
             }
         )
         github = mock.Mock()
+        _configure_github_merge_snapshots(github)
         github.inspect_repository.return_value = GitHubRepository(
             "source/project",
             "https://github.com/source/project",
@@ -6216,6 +6384,9 @@ class CursorJobStateTests(unittest.TestCase):
                 "github_issue_merge_requested": True,
                 "ticket_merge_confirmed": True,
                 "ticket_merge_survivor": "source/project#12",
+                "ticket_merge_snapshots": encode_merge_snapshots(
+                    _github_merge_snapshots()
+                ),
                 "ticket_merge_survivor_title": "Combined auth",
                 "ticket_merge_survivor_body": "Handle login and invoices.",
                 "ticket_merge_survivor_marker": "a" * 32,
@@ -6228,6 +6399,7 @@ class CursorJobStateTests(unittest.TestCase):
             }
         )
         github = mock.Mock()
+        _configure_github_merge_snapshots(github)
         github.inspect_repository.return_value = GitHubRepository(
             "source/project",
             "https://github.com/source/project",
@@ -6257,6 +6429,8 @@ class CursorJobStateTests(unittest.TestCase):
                     "API-80",
                     "b" * 32,
                     issue_id="issue-id-api-80",
+                    terminal_state_id="state-done",
+                    terminal_state_name="Done",
                 ),
             )
         )
@@ -6270,6 +6444,9 @@ class CursorJobStateTests(unittest.TestCase):
                 "linear_ticket_merge_requested": True,
                 "ticket_merge_confirmed": True,
                 "ticket_merge_survivor": "API-79",
+                "ticket_merge_snapshots": encode_merge_snapshots(
+                    _linear_merge_snapshots()
+                ),
                 "ticket_merge_survivor_title": "Combined auth",
                 "ticket_merge_survivor_body": "Handle login and invoices.",
                 "ticket_merge_survivor_marker": "a" * 32,
@@ -6323,6 +6500,11 @@ class CursorJobStateTests(unittest.TestCase):
             ),
             mock.patch.object(
                 provider,
+                "ticket_snapshot",
+                side_effect=_linear_merge_snapshots(),
+            ),
+            mock.patch.object(
+                provider,
                 "submit_ticket_update",
                 side_effect=submit_update,
             ) as update,
@@ -6350,6 +6532,88 @@ class CursorJobStateTests(unittest.TestCase):
         self.assertIn("Closed API-80", str(updated["result"]))
         update.assert_called_once()
         close.assert_called_once()
+
+    def test_confirmed_linear_merge_reconfirms_when_any_snapshot_drifts(self) -> None:
+        closing = encode_merge_closing(
+            (
+                MergeClosingTicket(
+                    "API-80",
+                    "b" * 32,
+                    issue_id="issue-id-api-80",
+                    terminal_state_id="state-done",
+                    terminal_state_name="Done",
+                ),
+            )
+        )
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "merge API-79 and API-80",
+                "trusted_utterance": "merge API-79 and API-80",
+                "issue_provider": "linear",
+                "issue_key": "API-79",
+                "linear_ticket_merge_requested": True,
+                "ticket_merge_confirmed": True,
+                "ticket_merge_survivor": "API-79",
+                "ticket_merge_snapshots": encode_merge_snapshots(
+                    _linear_merge_snapshots()
+                ),
+                "ticket_merge_survivor_title": "Combined auth",
+                "ticket_merge_survivor_body": "Handle login and invoices.",
+                "ticket_merge_survivor_marker": "a" * 32,
+                "ticket_merge_survivor_issue_id": "issue-id-api-79",
+                "ticket_merge_survivor_operation_state": "planned",
+                "ticket_merge_closing": closing,
+                "ticket_merge_operation_state": "planned",
+                "status": "queued",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        current = (
+            _linear_merge_snapshots()[0],
+            TicketSnapshot(
+                "linear",
+                "API-80",
+                "issue-id-api-80",
+                "Billing",
+                "Externally revised invoices.",
+                "revision-80b",
+                "https://linear.app/acme/issue/API-80/billing",
+                "In Progress",
+            ),
+        )
+        provider = linear.LinearIntegration()
+        herdr = mock.Mock()
+        with (
+            mock.patch.object(jobs, "HerdrClient", return_value=herdr),
+            mock.patch.object(
+                production_jobs,
+                "issue_provider",
+                return_value=provider,
+            ),
+            mock.patch.object(provider, "ticket_snapshot", side_effect=current),
+            mock.patch.object(
+                production_jobs,
+                "draft_ticket_merge",
+                return_value=TicketMergeDraft(
+                    "Combined revised auth",
+                    "Handle login and externally revised invoices.",
+                ),
+            ),
+            mock.patch.object(provider, "submit_ticket_update") as submit_update,
+            mock.patch.object(provider, "submit_ticket_close") as submit_close,
+        ):
+            service.run_worker("123456789abc")
+
+        updated = jobs.read_job("123456789abc")
+        self.assertEqual(updated["status"], "awaiting_user")
+        self.assertFalse(updated["ticket_merge_confirmed"])
+        self.assertIn("Combined revised auth", str(updated["question"]))
+        snapshots = json.loads(str(updated["ticket_merge_snapshots"]))
+        self.assertEqual(snapshots[1]["revision"], "revision-80b")
+        submit_update.assert_not_called()
+        submit_close.assert_not_called()
 
     def test_linear_ticket_merge_missing_survivor_fails_closed(self) -> None:
         closing = encode_merge_closing(
@@ -6409,6 +6673,8 @@ class CursorJobStateTests(unittest.TestCase):
                     "API-80",
                     "b" * 32,
                     issue_id="issue-id-api-80",
+                    terminal_state_id="state-done",
+                    terminal_state_name="Done",
                 ),
             )
         )
@@ -6422,6 +6688,9 @@ class CursorJobStateTests(unittest.TestCase):
                 "linear_ticket_merge_requested": True,
                 "ticket_merge_confirmed": True,
                 "ticket_merge_survivor": "API-79",
+                "ticket_merge_snapshots": encode_merge_snapshots(
+                    _linear_merge_snapshots()
+                ),
                 "ticket_merge_survivor_title": "Combined auth",
                 "ticket_merge_survivor_body": "Handle login and invoices.",
                 "ticket_merge_survivor_marker": "a" * 32,
@@ -6455,6 +6724,11 @@ class CursorJobStateTests(unittest.TestCase):
             ),
             mock.patch.object(
                 provider,
+                "ticket_snapshot",
+                side_effect=_linear_merge_snapshots(),
+            ),
+            mock.patch.object(
+                provider,
                 "submit_ticket_update",
                 side_effect=submit_update,
             ),
@@ -6481,6 +6755,8 @@ class CursorJobStateTests(unittest.TestCase):
                     "API-80",
                     "b" * 32,
                     issue_id="issue-id-api-80",
+                    terminal_state_id="state-done",
+                    terminal_state_name="Done",
                 ),
             )
         )
@@ -6494,6 +6770,9 @@ class CursorJobStateTests(unittest.TestCase):
                 "linear_ticket_merge_requested": True,
                 "ticket_merge_confirmed": True,
                 "ticket_merge_survivor": "API-79",
+                "ticket_merge_snapshots": encode_merge_snapshots(
+                    _linear_merge_snapshots()
+                ),
                 "ticket_merge_survivor_title": "Combined auth",
                 "ticket_merge_survivor_body": "Handle login and invoices.",
                 "ticket_merge_survivor_marker": "a" * 32,
@@ -6535,6 +6814,11 @@ class CursorJobStateTests(unittest.TestCase):
                 production_jobs,
                 "issue_provider",
                 return_value=provider,
+            ),
+            mock.patch.object(
+                provider,
+                "ticket_snapshot",
+                side_effect=_linear_merge_snapshots(),
             ),
             mock.patch.object(
                 provider,
