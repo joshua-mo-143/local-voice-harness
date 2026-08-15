@@ -1139,6 +1139,7 @@ class CursorJobModelTests(unittest.TestCase):
 
     def test_legacy_created_issue_identity_imports_to_canonical_fields(self) -> None:
         job = self._github_issue_create_job(
+            schema_version=16,
             github_issue=None,
             github_issue_url=None,
             github_issue_created_number=42,
@@ -1166,6 +1167,21 @@ class CursorJobModelTests(unittest.TestCase):
         with self.assertRaisesRegex(JobValidationError, "must match"):
             self._github_issue_create_job(
                 github_issue_created_url="https://github.com/example/project/issues/99",
+            )
+        with self.assertRaisesRegex(JobValidationError, "must match"):
+            self._github_issue_create_job(
+                github_issue_created_url="https://github.com/other/project/issues/42",
+            )
+        with self.assertRaisesRegex(JobValidationError, "must match"):
+            self._github_issue_create_job(
+                github_issue=None,
+                github_issue_created_number=99,
+            )
+
+    def test_native_created_issue_identity_rejects_non_issue_url(self) -> None:
+        with self.assertRaisesRegex(JobValidationError, "exact GitHub issue URL"):
+            self._github_issue_create_job(
+                github_issue_created_url="https://github.com/example/project/pull/42",
             )
 
     def test_successful_create_records_canonical_identity_once(self) -> None:

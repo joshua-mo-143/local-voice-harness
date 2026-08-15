@@ -12,6 +12,7 @@ from ..integrations.github import (
     GITHUB_PROVIDER_STATE_FIELDS,
     GitHubError,
     dump_github_provider_state,
+    github_issue_from_url,
     load_github_provider_state,
 )
 from ..job_lifecycle import (
@@ -1029,15 +1030,40 @@ def _canonicalize_github_issue_creation_identity(values: dict[str, object]) -> N
     created_url = values.get("github_issue_created_url")
     issue = values.get("github_issue")
     url = values.get("github_issue_url")
+    repository = values.get("github_repository")
     if created_number is not None:
         created_number = _integer(created_number, "github_issue_created_number")
     if issue is not None:
         issue = _integer(issue, "github_issue")
-    if created_number is not None and issue is not None and created_number != issue:
-        raise JobValidationError(
-            "created GitHub issue identity must match canonical issue identity"
+    parsed_urls = []
+    for field, candidate in (
+        ("github_issue_url", url),
+        ("github_issue_created_url", created_url),
+    ):
+        if candidate is None:
+            continue
+        parsed = github_issue_from_url(str(candidate))
+        if parsed is None:
+            raise JobValidationError(f"{field} must be an exact GitHub issue URL")
+        parsed_urls.append(parsed)
+    repositories = {
+        candidate.casefold()
+        for candidate in (
+            str(repository) if repository is not None else None,
+            *(parsed.name_with_owner for parsed in parsed_urls),
         )
-    if created_url is not None and url is not None and str(created_url) != str(url):
+        if candidate is not None
+    }
+    numbers = {
+        candidate
+        for candidate in (
+            issue,
+            created_number,
+            *(parsed.number for parsed in parsed_urls),
+        )
+        if candidate is not None
+    }
+    if len(repositories) > 1 or len(numbers) > 1:
         raise JobValidationError(
             "created GitHub issue identity must match canonical issue identity"
         )
