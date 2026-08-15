@@ -47,9 +47,11 @@ class IsolatedTestEnvironmentTests(unittest.TestCase):
             CredentialError,
             get_venice_api_key,
             secret_service_available,
+            secret_service_binary_available,
         )
 
-        self.assertTrue(secret_service_available())
+        self.assertTrue(secret_service_binary_available())
+        self.assertFalse(secret_service_available())
         with self.assertRaises(CredentialError):
             get_venice_api_key()
 
