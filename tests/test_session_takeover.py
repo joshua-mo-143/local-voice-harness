@@ -260,9 +260,9 @@ class SessionTakeoverTests(unittest.TestCase):
         self.assertEqual(resolved.prompt_operation_state, "submitted")
         client = mock.Mock()
         client.harness.reconcile.return_value = SessionReconciliation(
-            ReconciliationState.ACTIVE,
+            ReconciliationState.SETTLED,
             HarnessSession("cursor/herdr", "session", "agent", 12),
-            "active",
+            "idle",
             True,
         )
 
@@ -288,13 +288,50 @@ class SessionTakeoverTests(unittest.TestCase):
             worker_claimed_at=1,
         )
 
-        updated = relinquish_session_control(self.store, job.id, now=10)
+        stop_worker = mock.Mock(return_value=True)
+        updated = relinquish_session_control(
+            self.store,
+            job.id,
+            now=10,
+            stop_owned_worker=stop_worker,
+        )
 
+        stop_worker.assert_called_once_with(job)
         self.assertIsNone(updated.worker_token)
         self.assertIsNone(updated.worker_pid)
         self.assertIsNone(updated.worker_boot_id)
         self.assertIsNone(updated.worker_process_start)
         self.assertIsNone(updated.worker_operation)
+
+    def test_takeover_retains_live_worker_ownership_when_stop_blocks(self) -> None:
+        job = self.create(
+            status="running",
+            worker_token="worker",
+            worker_pid=42,
+            worker_boot_id="boot",
+            worker_process_start="start",
+            worker_claim_operation="test",
+            worker_claimed_at=1,
+        )
+        stop_worker = mock.Mock(return_value=False)
+
+        with self.assertRaises(HarnessError) as raised:
+            relinquish_session_control(
+                self.store,
+                job.id,
+                now=10,
+                stop_owned_worker=stop_worker,
+            )
+
+        self.assertIn("worker could not be stopped", str(raised.exception))
+        stop_worker.assert_called_once_with(job)
+        retained = self.store.get(job.id)
+        self.assertEqual(retained.session_control, SessionControlMode.AUTOMATED.value)
+        self.assertEqual(retained.status, JobStatus.RUNNING)
+        self.assertEqual(retained.worker_token, "worker")
+        self.assertEqual(retained.worker_pid, 42)
+        self.assertEqual(retained.worker_boot_id, "boot")
+        self.assertEqual(retained.worker_process_start, "start")
 
     def test_session_replacement_blocks_hand_back(self) -> None:
         job = self.create()
@@ -320,6 +357,57 @@ class SessionTakeoverTests(unittest.TestCase):
         self.assertEqual(current.herdr_target, "agent")
         self.assertEqual(current.worktree_path, "/repo-worktree")
 
+    def test_active_session_blocks_hand_back_until_quiescent(self) -> None:
+        job = self.create()
+        relinquish_session_control(self.store, job.id, now=10)
+        client = mock.Mock()
+        client.harness.reconcile.return_value = SessionReconciliation(
+            ReconciliationState.ACTIVE,
+            HarnessSession("cursor/herdr", "session", "agent", 12),
+            "working",
+            True,
+        )
+
+        with self.assertRaises(HarnessError) as raised:
+            resume_session_control(
+                self.store, job.id, now=20, herdr_factory=lambda: client
+            )
+
+        self.assertIn("not settled and quiescent", str(raised.exception))
+        self.assertEqual(
+            self.store.get(job.id).session_control,
+            SessionControlMode.USER_OWNED.value,
+        )
+
+    def test_sequence_change_between_observations_blocks_hand_back(self) -> None:
+        job = self.create()
+        relinquish_session_control(self.store, job.id, now=10)
+        client = mock.Mock()
+        client.harness.reconcile.side_effect = [
+            SessionReconciliation(
+                ReconciliationState.SETTLED,
+                HarnessSession("cursor/herdr", "session", "agent", 12),
+                "idle",
+                True,
+            ),
+            SessionReconciliation(
+                ReconciliationState.SETTLED,
+                HarnessSession("cursor/herdr", "session", "agent", 13),
+                "idle",
+                True,
+            ),
+        ]
+
+        with self.assertRaises(HarnessError) as raised:
+            resume_session_control(
+                self.store, job.id, now=20, herdr_factory=lambda: client
+            )
+
+        self.assertIn("changed during hand-back observation", str(raised.exception))
+        current = self.store.get(job.id)
+        self.assertEqual(current.session_control, SessionControlMode.USER_OWNED.value)
+        self.assertEqual(current.agent_state_sequence, 7)
+
     def test_hand_back_sets_observed_baseline_and_resumes_idle_automation(
         self,
     ) -> None:
@@ -340,9 +428,9 @@ class SessionTakeoverTests(unittest.TestCase):
         relinquish_session_control(self.store, job.id, now=10)
         client = mock.Mock()
         client.harness.reconcile.return_value = SessionReconciliation(
-            ReconciliationState.ACTIVE,
+            ReconciliationState.SETTLED,
             HarnessSession("cursor/herdr", "session", "agent", 12),
-            "active",
+            "idle",
             True,
         )
 
@@ -357,8 +445,12 @@ class SessionTakeoverTests(unittest.TestCase):
         self.assertEqual(resumed.prompt_baseline_sequence, 12)
         self.assertEqual(resumed.herdr_target, "agent")
         self.assertEqual(resumed.agent_provider_session_id, "session")
-        client.harness.reconcile.assert_called_once_with(
-            "agent", expected_session_id="session"
+        self.assertEqual(
+            client.harness.reconcile.call_args_list,
+            [
+                mock.call("agent", expected_session_id="session"),
+                mock.call("agent", expected_session_id="session"),
+            ],
         )
 
     def test_hand_back_fails_closed_when_prompt_is_confusable(self) -> None:

@@ -1093,6 +1093,61 @@ def test_submitted_dispatch_retries_only_after_repeated_absence(
     assert recovered.continuation_answer == planned.continuation_answer
 
 
+def test_submitted_dispatch_does_not_reconcile_while_user_owned(
+    store: JobStore,
+) -> None:
+    planned = _planned_dispatch(store)
+    question = questions.current(planned)
+    assert question is not None
+    routing = store.update(
+        planned.id,
+        lambda job: job.evolve(
+            status=JobStatus.ROUTING,
+            worker_token="dead-worker",
+            worker_pid=42,
+            worker_boot_id="old-boot",
+            worker_process_start="old-start",
+            worker_claim_operation="test-recovery",
+            worker_claimed_at=2,
+        ),
+    )
+    assert routing is not None
+    running = store.update(
+        planned.id,
+        lambda job: job.evolve(
+            status=JobStatus.RUNNING,
+            voice_question=questions.envelope(
+                question,
+                QuestionState.DISPATCHING,
+                prompt_state=PromptOperationState.SUBMITTED,
+                prompt_baseline_seq=7,
+                prompt_submitted_at=10,
+            ),
+        ),
+    )
+    assert running is not None
+    recovery.relinquish_session_control(store, planned.id, now=20)
+    herdr = mock.Mock()
+    launch = mock.Mock()
+
+    recovery.recover_jobs(
+        store,
+        launch_worker=launch,
+        herdr_factory=lambda: herdr,
+        is_worker_alive=lambda _job: False,
+        now=100,
+    )
+
+    retained = store.get(planned.id)
+    retained_question = questions.current(retained)
+    assert retained.session_control == "user_owned"
+    assert retained_question is not None
+    assert retained_question.prompt_state == PromptOperationState.SUBMITTED
+    assert retained_question.prompt_absent_observations == 0
+    herdr.get_agent.assert_not_called()
+    launch.assert_not_called()
+
+
 def test_observed_dispatch_recovers_by_reading_without_resubmission(
     store: JobStore,
 ) -> None:

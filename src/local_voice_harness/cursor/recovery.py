@@ -1809,12 +1809,44 @@ def relinquish_session_control(
     job_id: str,
     *,
     now: float | None = None,
+    stop_owned_worker: Callable[[CursorJob], bool] = stop_worker,
 ) -> CursorJob:
     """Durably hand a nonterminal session to the user without cancelling it."""
 
     relinquished_at = time.time() if now is None else now
+    snapshot = store.get(job_id)
+    if snapshot.status in TERMINAL_STATUSES:
+        raise HarnessError(f"Cursor job {job_id} is already {snapshot.status.value}")
+    if snapshot.status not in {
+        JobStatus.QUEUED,
+        JobStatus.ROUTING,
+        JobStatus.RUNNING,
+        JobStatus.RECONCILING,
+        JobStatus.AWAITING_USER,
+        JobStatus.BLOCKED,
+    }:
+        raise HarnessError(f"Cursor job {job_id} cannot relinquish session control")
+    try:
+        _session_control_from(snapshot).relinquish()
+    except JobLifecycleError as exc:
+        raise HarnessError(str(exc)) from exc
+    if any(
+        value is not None
+        for value in (
+            snapshot.worker_pid,
+            snapshot.worker_boot_id,
+            snapshot.worker_process_start,
+            snapshot.worker_token,
+        )
+    ) and not stop_owned_worker(snapshot):
+        raise HarnessError(
+            f"Cursor job {job_id} worker could not be stopped; "
+            "session ownership was retained"
+        )
 
     def relinquish(job: CursorJob) -> CursorJob | None:
+        if job.revision != snapshot.revision:
+            return None
         if job.status in TERMINAL_STATUSES:
             raise HarnessError(f"Cursor job {job_id} is already {job.status.value}")
         if job.status not in {
@@ -1920,20 +1952,35 @@ def resume_session_control(
             raise HarnessError(
                 f"could not reconcile session for hand-back: {exc}"
             ) from exc
-        if observation.state not in {
-            ReconciliationState.ACTIVE,
-            ReconciliationState.SETTLED,
-        }:
+        if observation.state != ReconciliationState.SETTLED:
             raise HarnessError(
-                f"Cursor job {job_id} session identity changed or is "
-                "unprovable; explicit reconciliation is required"
+                f"Cursor job {job_id} session is not settled and quiescent; "
+                "hand-back cannot resume automation and explicit reconciliation "
+                "is required"
             )
         if observation.session is None:
             raise HarnessError(
                 f"Cursor job {job_id} session identity is unprovable; "
                 "explicit reconciliation is required"
             )
-        observed_sequence = observation.session.state_sequence
+        confirmation = client.harness.reconcile(
+            target, expected_session_id=expected_session
+        )
+        observed = observation.session
+        confirmed = confirmation.session
+        if (
+            confirmation.state != ReconciliationState.SETTLED
+            or confirmed is None
+            or confirmed.provider != observed.provider
+            or confirmed.session_id != observed.session_id
+            or confirmed.target != observed.target
+            or confirmed.state_sequence != observed.state_sequence
+        ):
+            raise HarnessError(
+                f"Cursor job {job_id} session changed during hand-back "
+                "observation; automation remains paused"
+            )
+        observed_sequence = confirmed.state_sequence
     elif target or expected_session:
         raise HarnessError(
             f"Cursor job {job_id} session identity is incomplete; "
@@ -2007,7 +2054,8 @@ def _reconcile_question_prompt(
 ) -> None:
     question = question_adapter.current(job)
     if (
-        question is None
+        job.session_control == SessionControlMode.USER_OWNED.value
+        or question is None
         or question.state != QuestionState.DISPATCHING
         or question.prompt_state
         not in {PromptOperationState.SUBMITTED, PromptOperationState.OBSERVED}
