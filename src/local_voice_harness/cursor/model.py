@@ -458,6 +458,10 @@ _ISSUE_CREATE_OPERATION_STATES = frozenset(
         "manual_required",
     }
 )
+_REPO_CREATE_OPERATION_STATES = _ISSUE_CREATE_OPERATION_STATES | {
+    "remote_created",
+    "clone_verified",
+}
 _CLONE_OPERATION_STATES = frozenset(
     {
         "planned",
@@ -3940,7 +3944,7 @@ class AgentJob:
         if (
             self.github_repo_create_operation_state is not None
             and self.github_repo_create_operation_state
-            not in _ISSUE_CREATE_OPERATION_STATES
+            not in _REPO_CREATE_OPERATION_STATES
         ):
             raise JobValidationError("github_repo_create_operation_state is invalid")
         if self.github_repo_create_confirmed and not self.github_repo_create_requested:

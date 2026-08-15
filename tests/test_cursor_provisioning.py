@@ -4919,7 +4919,9 @@ class CursorJobStateTests(unittest.TestCase):
 
         updated = jobs.read_job("123456789abc")
         self.assertEqual(updated["status"], "completed")
-        self.assertEqual(updated["github_repo_create_operation_state"], "created")
+        self.assertEqual(
+            updated["github_repo_create_operation_state"], "clone_verified"
+        )
         self.assertEqual(
             updated["github_repo_created_url"],
             "https://github.com/alice/payments",
@@ -5100,7 +5102,9 @@ class CursorJobStateTests(unittest.TestCase):
 
         retried = jobs.read_job("123456789abc")
         self.assertEqual(retried["status"], "completed")
-        self.assertEqual(retried["github_repo_create_operation_state"], "created")
+        self.assertEqual(
+            retried["github_repo_create_operation_state"], "clone_verified"
+        )
         self.assertEqual(github.submit_repository_creation.call_count, 2)
 
     def test_worker_checks_issue_capability_before_herdr_side_effects(self) -> None:

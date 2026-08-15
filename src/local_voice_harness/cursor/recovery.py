@@ -731,7 +731,7 @@ def reconcile_uncertain_repo_creation(
     now: float,
     github_factory: GitHubFactory = GitHubClient,
 ) -> None:
-    states = frozenset({"submitting", "submitted", "ambiguous"})
+    states = frozenset({"submitting", "submitted", "ambiguous", "remote_created"})
     if job.github_repo_create_operation_state not in states:
         return
     repository = job.github_repository or ""
@@ -753,7 +753,10 @@ def reconcile_uncertain_repo_creation(
     except GitHubError:
         result = None
 
-    def reconcile(current: CursorJob) -> CursorJob | None:
+    if result is None and job.github_repo_create_operation_state == "remote_created":
+        return
+
+    def record_remote(current: CursorJob) -> CursorJob | None:
         if current.github_repo_create_operation_state not in states:
             return None
         if result is None:
@@ -777,10 +780,33 @@ def reconcile_uncertain_repo_creation(
             )
         return current.evolve_recovery(
             now=now,
-            status=JobStatus.COMPLETED,
             github_repository=result.repository.name_with_owner,
             github_repo_created_url=result.url,
-            github_repo_create_operation_state="created",
+            github_repo_create_operation_state="remote_created",
+            worker_operation=None,
+        )
+
+    recorded = store.update(job.id, record_remote)
+    if (
+        result is None
+        or recorded.github_repo_create_operation_state != "remote_created"
+    ):
+        return
+    try:
+        checkout = github.materialize_repository(result.repository)
+    except GitHubError:
+        return
+
+    def clone_verified(current: CursorJob) -> CursorJob | None:
+        if current.github_repo_create_operation_state != "remote_created":
+            return None
+        return current.evolve_recovery(
+            now=now,
+            status=JobStatus.COMPLETED,
+            repository=str(checkout),
+            github_repository=result.repository.name_with_owner,
+            github_repo_created_url=result.url,
+            github_repo_create_operation_state="clone_verified",
             result=(
                 f"Created GitHub repository {result.repository.name_with_owner}: "
                 f"{result.url}"
@@ -795,7 +821,7 @@ def reconcile_uncertain_repo_creation(
             prepare_delivery=True,
         )
 
-    store.update(job.id, reconcile)
+    store.update(job.id, clone_verified)
 
 
 def reconcile_uncertain_linear_ticket_creation(

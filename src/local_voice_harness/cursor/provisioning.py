@@ -967,6 +967,30 @@ def _run_github_issue_creation(
     )
 
 
+def _record_github_repo_remote_created(
+    store: JobStore,
+    job_id: str,
+    token: WorkerClaim,
+    result: GitHubRepoCreationResult,
+    *,
+    expected_revision: int,
+) -> CursorJob | None:
+    url = str(result.url)
+
+    return _worker_change(
+        store,
+        job_id,
+        token,
+        {JobStatus.ROUTING, JobStatus.RUNNING},
+        lambda job: job.evolve(
+            github_repository=result.repository.name_with_owner,
+            github_repo_created_url=url,
+            github_repo_create_operation_state="remote_created",
+        ),
+        expected_revision=expected_revision,
+    )
+
+
 def _finish_github_repo_creation(
     store: JobStore,
     job_id: str,
@@ -978,6 +1002,8 @@ def _finish_github_repo_creation(
     url = str(result.url)
 
     def finish(job: CursorJob) -> CursorJob:
+        if not job.repository:
+            raise HarnessError("created GitHub repository clone was not verified")
         now = time.time()
         return job.evolve_for_delivery(
             now=now,
@@ -989,7 +1015,7 @@ def _finish_github_repo_creation(
             completed_at=now,
             github_repository=result.repository.name_with_owner,
             github_repo_created_url=url,
-            github_repo_create_operation_state="created",
+            github_repo_create_operation_state="clone_verified",
             repository=job.repository,
             worker_pid=None,
             worker_boot_id=None,
@@ -1006,6 +1032,69 @@ def _finish_github_repo_creation(
         finish,
         expected_revision=expected_revision,
     )
+
+
+def _materialize_created_github_repo(
+    store: JobStore,
+    job: CursorJob,
+    token: WorkerClaim,
+    github: GitHubProvider,
+    result: GitHubRepoCreationResult,
+    checkpoint: Callable[[], None],
+) -> None:
+    remote_created = _record_github_repo_remote_created(
+        store,
+        job.id,
+        token,
+        result,
+        expected_revision=job.revision,
+    )
+    if remote_created is None:
+        return
+    try:
+        checkout = github.materialize_repository(
+            result.repository,
+            checkpoint=checkpoint,
+        )
+    except GitHubError:
+
+        def queue_recovery(current: CursorJob) -> CursorJob:
+            return current.evolve(
+                status=JobStatus.QUEUED,
+                queued_at=time.time(),
+                reconcile=True,
+                worker_pid=None,
+                worker_boot_id=None,
+                worker_process_start=None,
+                worker_token=None,
+                worker_operation=None,
+            )
+
+        _worker_change(
+            store,
+            job.id,
+            token,
+            {JobStatus.ROUTING, JobStatus.RUNNING},
+            queue_recovery,
+            expected_revision=remote_created.revision,
+        )
+        return
+    updated = _worker_change(
+        store,
+        job.id,
+        token,
+        {JobStatus.ROUTING, JobStatus.RUNNING},
+        lambda current: current.evolve(repository=str(checkout)),
+        expected_revision=remote_created.revision,
+    )
+    if updated is not None:
+        _finish_github_repo_creation(
+            store,
+            job.id,
+            token,
+            result,
+            expected_revision=updated.revision,
+        )
 
 
 def _run_github_repo_creation(
@@ -1110,25 +1199,8 @@ def _run_github_repo_creation(
                 },
             )
             return
-        checkout = github.materialize_repository(
-            observed.repository, checkpoint=checkpoint
-        )
-        updated = _worker_change(
-            store,
-            job.id,
-            token,
-            {JobStatus.ROUTING},
-            lambda current: current.evolve(repository=str(checkout)),
-            expected_revision=job.revision,
-        )
-        if updated is None:
-            return
-        _finish_github_repo_creation(
-            store,
-            job.id,
-            token,
-            observed,
-            expected_revision=updated.revision,
+        _materialize_created_github_repo(
+            store, job, token, github, observed, checkpoint
         )
         return
     if job.github_repo_create_operation_state not in {None, "planned"}:
@@ -1163,25 +1235,8 @@ def _run_github_repo_creation(
         except GitHubError:
             visible = None
         if visible is not None:
-            checkout = github.materialize_repository(
-                visible.repository, checkpoint=checkpoint
-            )
-            updated = _worker_change(
-                store,
-                job.id,
-                token,
-                {JobStatus.RUNNING},
-                lambda current: current.evolve(repository=str(checkout)),
-                expected_revision=submitted.revision,
-            )
-            if updated is None:
-                return
-            _finish_github_repo_creation(
-                store,
-                job.id,
-                token,
-                visible,
-                expected_revision=updated.revision,
+            _materialize_created_github_repo(
+                store, submitted, token, github, visible, checkpoint
             )
             return
         if not isinstance(exc, GitHubCommandStartError):
@@ -1232,23 +1287,8 @@ def _run_github_repo_creation(
             expected_revision=submitted.revision,
         )
         return
-    checkout = github.materialize_repository(result.repository, checkpoint=checkpoint)
-    updated = _worker_change(
-        store,
-        job.id,
-        token,
-        {JobStatus.RUNNING},
-        lambda current: current.evolve(repository=str(checkout)),
-        expected_revision=submitted.revision,
-    )
-    if updated is None:
-        return
-    _finish_github_repo_creation(
-        store,
-        job.id,
-        token,
-        result,
-        expected_revision=updated.revision,
+    _materialize_created_github_repo(
+        store, submitted, token, github, result, checkpoint
     )
 
 

@@ -413,6 +413,8 @@ class CursorRecoveryTests(unittest.TestCase):
             "https://github.com/alice/payments",
             "a" * 32,
         )
+        checkout = self.root / "src" / "alice" / "payments"
+        client.ensure_repository_clone.return_value = checkout
 
         reconcile_uncertain_repo_creation(
             self.store,
@@ -423,10 +425,67 @@ class CursorRecoveryTests(unittest.TestCase):
 
         updated = self.store.get(job.id)
         self.assertEqual(updated.status, JobStatus.COMPLETED)
+        self.assertEqual(updated.repository, str(checkout))
+        self.assertEqual(
+            updated.github_repo_create_operation_state,
+            "clone_verified",
+        )
         self.assertEqual(
             updated.github_repo_created_url,
             "https://github.com/alice/payments",
         )
+        client.submit_repository_creation.assert_not_called()
+
+    def test_repo_creation_recovery_retains_remote_phase_until_clone_verified(
+        self,
+    ) -> None:
+        job = self.create(
+            {
+                "id": "123456789abc",
+                "status": "queued",
+                "request": "create a GitHub repository called payments",
+                "created_at": 1,
+                "queued_at": 1,
+                "delivered": False,
+                "issue_provider": "github",
+                "github_repository": "alice/payments",
+                "github_repo_create_requested": True,
+                "github_repo_create_confirmed": True,
+                "github_repo_create_visibility": "private",
+                "github_repo_create_marker": "a" * 32,
+                "github_repo_create_operation_state": "remote_created",
+                "github_repo_created_url": "https://github.com/alice/payments",
+                "reconcile": True,
+            }
+        )
+        result = GitHubRepoCreationResult(
+            GitHubRepository(
+                "alice/payments",
+                "https://github.com/alice/payments",
+                True,
+                "main",
+            ),
+            "https://github.com/alice/payments",
+            "a" * 32,
+        )
+        client = mock.Mock(spec=GitHubClient)
+        client.observe_repository_creation.return_value = result
+        client.ensure_repository_clone.side_effect = GitHubError("clone unavailable")
+
+        reconcile_uncertain_repo_creation(
+            self.store,
+            job,
+            now=100,
+            github_factory=lambda: client,
+        )
+
+        pending = self.store.get(job.id)
+        self.assertEqual(pending.status, JobStatus.QUEUED)
+        self.assertEqual(
+            pending.github_repo_create_operation_state,
+            "remote_created",
+        )
+        self.assertIsNone(pending.repository)
         client.submit_repository_creation.assert_not_called()
 
     def test_unobserved_repo_creation_requires_manual_check(self) -> None:
