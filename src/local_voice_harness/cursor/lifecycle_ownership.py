@@ -388,6 +388,9 @@ def _build_field_ownership() -> tuple[FieldOwnership, ...]:
         _fields(
             {
                 "repository": CrashKind.IDENTITY,
+                "clone_confirmed": CrashKind.UNCERTAINTY,
+                "clone_source": CrashKind.IDENTITY,
+                "clone_operation_state": CrashKind.UNCERTAINTY,
                 "worktree_branch": CrashKind.IDENTITY,
                 "worktree_path": CrashKind.IDENTITY,
                 "worktree_label": CrashKind.IDENTITY,
@@ -1387,12 +1390,12 @@ def measured_baseline_counts() -> dict[str, int]:
 # Measured on the #357 baseline checkout. Tests fail if these drift without an
 # intentional inventory update. They are evidence, not an optimization target.
 BASELINE_COUNTS: dict[str, int] = {
-    "persisted_field_names": 215,
-    "named_table_fields": 210,
+    "persisted_field_names": 216,
+    "named_table_fields": 211,
     "import_only_fields": 4,
-    "cursor_job_public_properties": 154,
+    "cursor_job_public_properties": 155,
     "compatibility_adapters": 38,
     "transition_entry_points": 74,
     "duplicate_authorities": 0,
-    "lifecycle_module_lines": 26359,
+    "lifecycle_module_lines": 26631,
 }

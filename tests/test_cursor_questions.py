@@ -94,6 +94,36 @@ def _awaiting(store: JobStore, question: Question | None = None) -> CursorJob:
     )
 
 
+def _clone_confirmation_awaiting(store: JobStore) -> CursorJob:
+    pending = replace(
+        _question(sensitivity=QuestionSensitivity.DESTRUCTIVE),
+        text="Please confirm: should I clone example/project under the configured GitHub root?",
+        owner="clone_confirmation",
+    )
+    return store.create(
+        CursorJob.from_dict(
+            {
+                "id": "aaaaaaaaaaaa",
+                "request": "Use Cursor to fix the bug",
+                "trusted_utterance": "example/project",
+                "status": JobStatus.AWAITING_USER.value,
+                "created_at": 1,
+                "updated_at": 10,
+                "delivered": True,
+                "question": pending.text,
+                "result": pending.text,
+                "clarification_kind": pending.owner,
+                "turn": 1,
+                "turn_token": pending.origin.turn_token,
+                "voice_question": pending.to_dict(),
+                "repository_hint": "example/project",
+                "clone_source": "example/project",
+                "clone_operation_state": "planned",
+            }
+        )
+    )
+
+
 def _issue_creation_awaiting(store: JobStore) -> CursorJob:
     pending = replace(
         _question(sensitivity=QuestionSensitivity.DESTRUCTIVE),
@@ -548,6 +578,46 @@ def test_automated_answer_cannot_approve_plan(store: JobStore) -> None:
     assert message is not None
     assert "direct user answer" in message
     assert store.get(original.id).revision == original.revision
+    launch.assert_not_called()
+
+
+def test_only_direct_answer_confirms_clone(store: JobStore) -> None:
+    original = _clone_confirmation_awaiting(store)
+    with mock.patch.object(service, "launch_worker") as launch:
+        message = service.reply_job(
+            original.id,
+            "yes",
+            answer_provenance=AnswerProvenance.AUTOMATION,
+        )
+        assert message is not None
+        assert store.get(original.id).revision == original.revision
+        service.reply_job(
+            original.id,
+            "yes",
+            trusted_utterance="yes",
+            answer_provenance=AnswerProvenance.USER_VOICE,
+        )
+
+    updated = store.get(original.id)
+    assert updated.clone_confirmed
+    assert updated.status == JobStatus.QUEUED
+    launch.assert_called_once_with(original.id)
+
+
+def test_rejecting_clone_completes_without_launch(store: JobStore) -> None:
+    original = _clone_confirmation_awaiting(store)
+    with mock.patch.object(service, "launch_worker") as launch:
+        service.reply_job(
+            original.id,
+            "no",
+            trusted_utterance="no",
+            answer_provenance=AnswerProvenance.USER_VOICE,
+        )
+
+    updated = store.get(original.id)
+    assert updated.status == JobStatus.COMPLETED
+    assert not updated.clone_confirmed
+    assert updated.clone_operation_state == "planned"
     launch.assert_not_called()
 
 

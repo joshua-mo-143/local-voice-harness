@@ -200,6 +200,7 @@ _BOOL_FIELDS = frozenset(
         "reconcile",
         "fork_requested",
         "fork_confirmed",
+        "clone_confirmed",
         "fork_committed",
         "fork_exists",
         "fork_dispatch_exited",
@@ -302,6 +303,8 @@ _STRING_FIELDS = frozenset(
         "grouped_repository_coordinator_id",
         "repository",
         "github_repository",
+        "clone_source",
+        "clone_operation_state",
         "github_issue_url",
         "github_issue_context",
         "github_issue_create_title",
@@ -447,6 +450,14 @@ _ISSUE_CREATE_OPERATION_STATES = frozenset(
         "created",
         "ambiguous",
         "manual_required",
+    }
+)
+_CLONE_OPERATION_STATES = frozenset(
+    {
+        "planned",
+        "submitted",
+        "cloned",
+        "ambiguous",
     }
 )
 _WORKTREE_OPERATION_STATES = frozenset(
@@ -2629,6 +2640,18 @@ class AgentJob:
         return self._boolean_field("fork_confirmed")
 
     @property
+    def clone_confirmed(self) -> bool:
+        return self._boolean_field("clone_confirmed")
+
+    @property
+    def clone_source(self) -> str | None:
+        return self._optional_string("clone_source")
+
+    @property
+    def clone_operation_state(self) -> str | None:
+        return self._optional_string("clone_operation_state")
+
+    @property
     def fork_committed(self) -> bool:
         return self._boolean_field("fork_committed")
 
@@ -3863,6 +3886,13 @@ class AgentJob:
         if self.participant_admission_state not in {"waiting", "held", "released"}:
             raise JobValidationError("participant_admission_state has invalid value")
         if (
+            self.clone_operation_state is not None
+            and self.clone_operation_state not in _CLONE_OPERATION_STATES
+        ):
+            raise JobValidationError("clone_operation_state is invalid")
+        if self.clone_operation_state is not None and not self.clone_source:
+            raise JobValidationError("clone operation requires a clone source")
+        if (
             self.github_issue_create_operation_state is not None
             and self.github_issue_create_operation_state
             not in _ISSUE_CREATE_OPERATION_STATES
@@ -4356,6 +4386,7 @@ class AgentJob:
             or self.fork_operation_state in _UNCERTAIN_OPERATION_STATES
             or self.worktree_provision_state in _UNCERTAIN_OPERATION_STATES
             or self.github_issue_create_operation_state in {"submitted", "ambiguous"}
+            or self.clone_operation_state in {"submitted", "ambiguous"}
             or self.linear_ticket_create_operation_state
             in {"submitting", "submitted", "ambiguous"}
             or self.prompt_operation_state in {"submitting", "ambiguous"}

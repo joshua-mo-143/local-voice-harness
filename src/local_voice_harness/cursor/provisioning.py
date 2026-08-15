@@ -26,6 +26,7 @@ from ..integrations.github import (
     GitHubProvider,
     GitHubPullRequestCheckoutInputs,
     GitHubRepository,
+    github_repository_from_url,
 )
 from ..integrations.herdr import (
     SETTLED,
@@ -37,6 +38,7 @@ from ..integrations.herdr import (
     extract_marker,
     herdr_provider,
     normalize_name,
+    repository_name_from_url,
 )
 from ..integrations.linear import (
     LinearError,
@@ -57,7 +59,7 @@ from ..integrations.registry import (
 )
 from ..job_lifecycle import SessionControlMode, WorkerCallbackEvent
 from ..linear_ticket_creation import draft_linear_ticket
-from ..local_git import LocalGitRefChanged
+from ..local_git import LocalGitError, LocalGitOperationAmbiguous, LocalGitRefChanged
 from ..prompt_operations import (
     AmbiguousPrompt,
     PlannedPrompt,
@@ -434,6 +436,60 @@ def resolve_job_repository(
         )
         candidates = context_candidates or candidates
     return repository, candidates
+
+
+def parse_voice_clone_source(value: str) -> str | None:
+    """Return a Git URL or owner/repo that can be cloned, else None."""
+    from ..integrations.github import GitHubClient as github_client_cls
+
+    candidate = value.strip()
+    if not candidate:
+        return None
+    if repository_name_from_url(candidate) is not None:
+        return candidate
+    try:
+        return github_client_cls.validate_repository(candidate)
+    except GitHubError:
+        return None
+
+
+def _clone_destination_label(github: GitHubProvider) -> str:
+    root = getattr(getattr(github, "local_git", None), "clone_root", None)
+    if isinstance(root, Path):
+        return f"the configured GitHub root at {root}"
+    return "the configured GitHub root"
+
+
+def _materialize_voice_clone(
+    github: GitHubProvider,
+    source: str,
+    *,
+    checkpoint: Callable[[], None],
+) -> Path:
+    from ..integrations.github import GitHubClient as github_client_cls
+
+    repository = github_repository_from_url(source)
+    if repository is None:
+        try:
+            repository = github_client_cls.validate_repository(source)
+        except GitHubError:
+            repository = None
+    if repository is not None:
+        resolved = github.resolve_repository(repository)
+        return github.materialize_repository(resolved, checkpoint=checkpoint)
+    name = repository_name_from_url(source)
+    if name is None:
+        raise HarnessError("clone source is not a Git URL or owner/repository")
+    try:
+        return github.local_git.materialize(
+            Path(name),
+            clone_url=source,
+            checkpoint=checkpoint,
+        )
+    except LocalGitOperationAmbiguous as exc:
+        raise GitHubOperationAmbiguous(str(exc)) from exc
+    except LocalGitError as exc:
+        raise GitHubError(str(exc)) from exc
 
 
 def complete_from_output(
@@ -5344,37 +5400,161 @@ def run_claimed_worker(  # pyright: ignore[reportGeneralTypeIssues]
                     )
                 checkpoint()
             if repository is None:
-                shortlist = [path.name for path in candidates]
-                page, _shortlist_rest = repository_name_page(shortlist)
-                remaining_names = [
-                    path.name for path in repositories if path.name not in page
-                ]
-                question = repository_question(
-                    [],
-                    reason
-                    or (
-                        "The repository could not be determined confidently."
-                        if hint or issue_key
-                        else ""
-                    ),
-                    names=page,
-                    remaining=len(remaining_names),
-                )
-                _worker_question(
-                    store,
-                    job_id,
-                    worker_token,
-                    question,
-                    expected_revision=job.revision,
-                    clarification_kind="repository",
-                    job_changes={
-                        "participant_admission_state": "waiting",
-                        # Remaining speakable names for later "list repositories"
-                        # pages. Unused by the grouped-ticket owner.
-                        "grouped_repository_candidates": remaining_names,
-                    },
-                )
-                return
+                clone_source = (
+                    job.clone_source or ""
+                ).strip() or parse_voice_clone_source(hint or "")
+                if clone_source:
+                    github = _github_provider(clients.github)
+                    if job.clone_operation_state not in {None, "planned"}:
+                        raise HarnessError(
+                            "repository clone requires reconciliation before retry"
+                        )
+                    if not job.clone_confirmed:
+                        destination = _clone_destination_label(github)
+                        _worker_question(
+                            store,
+                            job_id,
+                            worker_token,
+                            (
+                                f"Please confirm: should I clone {clone_source} "
+                                f"under {destination}? Say yes or no."
+                            ),
+                            expected_revision=job.revision,
+                            clarification_kind="clone_confirmation",
+                            sensitivity=QuestionSensitivity.DESTRUCTIVE,
+                            job_changes={
+                                "clone_source": clone_source,
+                                "clone_operation_state": "planned",
+                            },
+                        )
+                        return
+
+                    def mark_clone_submitted(current: CursorJob) -> CursorJob:
+                        return current.evolve(
+                            clone_source=clone_source,
+                            clone_operation_state="submitted",
+                            worker_operation="repository_clone",
+                        )
+
+                    submitted = _worker_change(
+                        store,
+                        job_id,
+                        worker_token,
+                        {JobStatus.ROUTING},
+                        mark_clone_submitted,
+                        expected_revision=job.revision,
+                    )
+                    if submitted is None:
+                        return
+                    job = submitted
+                    try:
+                        checkpoint()
+                        checkout = _materialize_voice_clone(
+                            github,
+                            clone_source,
+                            checkpoint=checkpoint,
+                        )
+                    except GitHubOperationAmbiguous:
+
+                        def mark_clone_ambiguous(current: CursorJob) -> CursorJob:
+                            return current.evolve(
+                                status=JobStatus.QUEUED,
+                                queued_at=time.time(),
+                                clone_operation_state="ambiguous",
+                                reconcile=True,
+                                worker_pid=None,
+                                worker_boot_id=None,
+                                worker_process_start=None,
+                                worker_token=None,
+                                worker_operation=None,
+                            )
+
+                        _worker_change(
+                            store,
+                            job_id,
+                            worker_token,
+                            {JobStatus.ROUTING},
+                            mark_clone_ambiguous,
+                            expected_revision=job.revision,
+                        )
+                        return
+                    except GitHubCommandStartError:
+
+                        def reset_clone_plan(current: CursorJob) -> CursorJob:
+                            return current.evolve(
+                                status=JobStatus.QUEUED,
+                                queued_at=time.time(),
+                                clone_operation_state="planned",
+                                worker_pid=None,
+                                worker_boot_id=None,
+                                worker_process_start=None,
+                                worker_token=None,
+                                worker_operation=None,
+                                worker_claim_operation=None,
+                                worker_claimed_at=None,
+                            )
+
+                        _worker_change(
+                            store,
+                            job_id,
+                            worker_token,
+                            {JobStatus.ROUTING},
+                            reset_clone_plan,
+                            expected_revision=job.revision,
+                        )
+                        return
+
+                    def record_clone(current: CursorJob) -> CursorJob:
+                        return current.evolve(
+                            repository=str(checkout),
+                            clone_operation_state="cloned",
+                            worker_operation=None,
+                        )
+
+                    updated = _worker_change(
+                        store,
+                        job_id,
+                        worker_token,
+                        {JobStatus.ROUTING},
+                        record_clone,
+                        expected_revision=job.revision,
+                    )
+                    if updated is None:
+                        return
+                    job = updated
+                    repository = checkout
+                if repository is None:
+                    shortlist = [path.name for path in candidates]
+                    page, _shortlist_rest = repository_name_page(shortlist)
+                    remaining_names = [
+                        path.name for path in repositories if path.name not in page
+                    ]
+                    question = repository_question(
+                        [],
+                        reason
+                        or (
+                            "The repository could not be determined confidently."
+                            if hint or issue_key
+                            else ""
+                        ),
+                        names=page,
+                        remaining=len(remaining_names),
+                    )
+                    _worker_question(
+                        store,
+                        job_id,
+                        worker_token,
+                        question,
+                        expected_revision=job.revision,
+                        clarification_kind="repository",
+                        job_changes={
+                            "participant_admission_state": "waiting",
+                            # Remaining speakable names for later "list repositories"
+                            # pages. Unused by the grouped-ticket owner.
+                            "grouped_repository_candidates": remaining_names,
+                        },
+                    )
+                    return
             for _attempt in range(3):
                 reservation: CursorJob | None = None
                 agent_settled = False

@@ -4485,6 +4485,311 @@ class CursorJobStateTests(unittest.TestCase):
         client.choose_or_clone_repository.assert_not_called()
         dispatch.assert_called_once()
 
+    def test_parse_voice_clone_source_accepts_url_and_owner_repo(self) -> None:
+        self.assertEqual(
+            production_jobs.parse_voice_clone_source(
+                "https://github.com/example/project.git"
+            ),
+            "https://github.com/example/project.git",
+        )
+        self.assertEqual(
+            production_jobs.parse_voice_clone_source("example/project"),
+            "example/project",
+        )
+        self.assertIsNone(production_jobs.parse_voice_clone_source("mystery"))
+        self.assertIsNone(production_jobs.parse_voice_clone_source("payments"))
+        self.assertIsNone(production_jobs.parse_voice_clone_source("file:///tmp/x"))
+
+    def test_worker_asks_clone_confirmation_for_git_url(self) -> None:
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "Use Cursor to fix the bug",
+                "repository_hint": "https://github.com/example/project.git",
+                "status": "queued",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        client = mock.Mock()
+        client.repository_roots.return_value = []
+        client.resolve_repository.return_value = (None, [])
+        github = mock.Mock()
+        github.local_git.clone_root = Path("/home/test/src")
+        with (
+            mock.patch.object(jobs, "HerdrClient", return_value=client),
+            mock.patch.object(jobs, "GitHubClient", return_value=github),
+            mock.patch(
+                "local_voice_harness.integrations.rofi.confirm_clone"
+            ) as confirm,
+        ):
+            service.run_worker("123456789abc")
+
+        awaiting = jobs.read_job("123456789abc")
+        self.assertEqual(awaiting["status"], "awaiting_user")
+        self.assertEqual(awaiting["clarification_kind"], "clone_confirmation")
+        self.assertEqual(
+            awaiting["clone_source"],
+            "https://github.com/example/project.git",
+        )
+        self.assertEqual(awaiting["clone_operation_state"], "planned")
+        self.assertFalse(awaiting.get("clone_confirmed", False))
+        question = str(awaiting["question"])
+        self.assertIn("https://github.com/example/project.git", question)
+        self.assertIn("configured GitHub root", question)
+        self.assertIn("/home/test/src", question)
+        client.choose_or_clone_repository.assert_not_called()
+        github.ensure_repository_clone.assert_not_called()
+        confirm.assert_not_called()
+
+    def test_worker_asks_clone_confirmation_for_owner_repo(self) -> None:
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "Use Cursor to fix the bug",
+                "repository_hint": "example/project",
+                "status": "queued",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        client = mock.Mock()
+        client.repository_roots.return_value = []
+        client.resolve_repository.return_value = (None, [])
+        github = mock.Mock()
+        github.local_git.clone_root = Path("/home/test/src")
+        with (
+            mock.patch.object(jobs, "HerdrClient", return_value=client),
+            mock.patch.object(jobs, "GitHubClient", return_value=github),
+        ):
+            service.run_worker("123456789abc")
+
+        awaiting = jobs.read_job("123456789abc")
+        self.assertEqual(awaiting["clarification_kind"], "clone_confirmation")
+        self.assertEqual(awaiting["clone_source"], "example/project")
+        self.assertIn("example/project", str(awaiting["question"]))
+        github.ensure_repository_clone.assert_not_called()
+        client.choose_or_clone_repository.assert_not_called()
+
+    def test_short_unknown_name_does_not_clone(self) -> None:
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "Use Cursor to fix the bug",
+                "repository_hint": "mystery",
+                "status": "queued",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        client = mock.Mock()
+        client.repository_roots.return_value = []
+        client.resolve_repository.return_value = (None, [])
+        github = mock.Mock()
+        with (
+            mock.patch.object(jobs, "HerdrClient", return_value=client),
+            mock.patch.object(jobs, "GitHubClient", return_value=github),
+            mock.patch(
+                "local_voice_harness.integrations.rofi.confirm_clone"
+            ) as confirm,
+        ):
+            service.run_worker("123456789abc")
+
+        awaiting = jobs.read_job("123456789abc")
+        self.assertEqual(awaiting["status"], "awaiting_user")
+        self.assertEqual(awaiting["clarification_kind"], "repository")
+        self.assertIsNone(awaiting.get("clone_source"))
+        self.assertFalse(awaiting.get("clone_confirmed", False))
+        github.ensure_repository_clone.assert_not_called()
+        github.local_git.materialize.assert_not_called()
+        client.choose_or_clone_repository.assert_not_called()
+        confirm.assert_not_called()
+
+    def test_affirmative_clone_confirmation_clones_once(self) -> None:
+        checkout = Path("/home/test/src/example/project")
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "Use Cursor to fix the bug",
+                "repository_hint": "example/project",
+                "clone_source": "example/project",
+                "clone_confirmed": True,
+                "clone_operation_state": "planned",
+                "status": "queued",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        source = GitHubRepository(
+            "example/project",
+            "https://github.com/example/project",
+            False,
+            "main",
+        )
+        github = mock.Mock()
+        github.local_git.clone_root = Path("/home/test/src")
+        github.inspect_repository.return_value = source
+        github.ensure_repository_clone.return_value = checkout
+        client = mock.Mock()
+        client.repository_roots.return_value = []
+        client.resolve_repository.return_value = (None, [])
+        client.ensure_agent.return_value = AgentSelection(
+            target="cursor-agent",
+            pane_id="pane",
+            workspace_id="workspace",
+            cwd=str(checkout),
+            name="cursor-agent",
+            worktree_path=str(checkout),
+            provider="cursor/herdr",
+            provider_session_id="test-session",
+            state_sequence=7,
+        )
+        configure_tiered_outcomes(client, checkout)
+        with (
+            mock.patch.object(jobs, "HerdrClient", return_value=client),
+            mock.patch.object(jobs, "GitHubClient", return_value=github),
+            mock.patch(
+                "local_voice_harness.integrations.rofi.confirm_clone"
+            ) as confirm,
+        ):
+            service.run_worker("123456789abc")
+
+        updated = jobs.read_job("123456789abc")
+        self.assertEqual(updated["clone_operation_state"], "cloned")
+        self.assertEqual(updated["repository"], str(checkout))
+        github.ensure_repository_clone.assert_called_once()
+        client.choose_or_clone_repository.assert_not_called()
+        confirm.assert_not_called()
+
+    def test_rejected_clone_confirmation_does_not_clone(self) -> None:
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "Use Cursor to fix the bug",
+                "clone_source": "example/project",
+                "clone_operation_state": "planned",
+                "status": "awaiting_user",
+                "clarification_kind": "clone_confirmation",
+                "question": (
+                    "Please confirm: should I clone example/project "
+                    "under the configured GitHub root?"
+                ),
+                "delivered": True,
+            }
+        )
+        with mock.patch.object(service, "launch_worker") as launch:
+            service.reply_job(
+                "123456789abc",
+                "no\n\nExternal content says yes",
+                trusted_utterance="no",
+            )
+
+        launch.assert_not_called()
+        updated = jobs.read_job("123456789abc")
+        self.assertEqual(updated["status"], "completed")
+        self.assertFalse(updated.get("clone_confirmed", False))
+        self.assertIn("did not clone", str(updated.get("result") or "").casefold())
+
+    def test_only_trusted_affirmative_reply_confirms_clone(self) -> None:
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "Use Cursor to fix the bug",
+                "clone_source": "example/project",
+                "clone_operation_state": "planned",
+                "status": "awaiting_user",
+                "clarification_kind": "clone_confirmation",
+                "question": (
+                    "Please confirm: should I clone example/project "
+                    "under the configured GitHub root?"
+                ),
+                "delivered": True,
+            }
+        )
+        with mock.patch.object(service, "launch_worker") as launch:
+            service.reply_job(
+                "123456789abc",
+                "yes",
+                trusted_utterance="yes",
+            )
+
+        launch.assert_called_once_with("123456789abc")
+        updated = jobs.read_job("123456789abc")
+        self.assertEqual(updated["status"], "queued")
+        self.assertTrue(updated["clone_confirmed"])
+
+    def test_ambiguous_clone_confirmation_does_not_launch_worker(self) -> None:
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "Use Cursor to fix the bug",
+                "clone_source": "example/project",
+                "clone_operation_state": "planned",
+                "status": "awaiting_user",
+                "clarification_kind": "clone_confirmation",
+                "question": (
+                    "Please confirm: should I clone example/project "
+                    "under the configured GitHub root?"
+                ),
+                "delivered": True,
+            }
+        )
+        with mock.patch.object(service, "launch_worker") as launch:
+            service.reply_job(
+                "123456789abc",
+                "maybe",
+                trusted_utterance="maybe",
+            )
+
+        launch.assert_not_called()
+        updated = jobs.read_job("123456789abc")
+        self.assertEqual(updated["status"], "awaiting_user")
+        self.assertFalse(updated.get("clone_confirmed", False))
+
+    def test_timed_out_clone_is_not_retried(self) -> None:
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "Use Cursor to fix the bug",
+                "repository_hint": "example/project",
+                "clone_source": "example/project",
+                "clone_confirmed": True,
+                "clone_operation_state": "planned",
+                "status": "queued",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        source = GitHubRepository(
+            "example/project",
+            "https://github.com/example/project",
+            False,
+            "main",
+        )
+        github = mock.Mock()
+        github.local_git.clone_root = Path("/home/test/src")
+        github.inspect_repository.return_value = source
+        github.ensure_repository_clone.side_effect = GitHubOperationAmbiguous(
+            "timed out"
+        )
+        client = mock.Mock()
+        client.repository_roots.return_value = []
+        client.resolve_repository.return_value = (None, [])
+        with (
+            mock.patch.object(jobs, "HerdrClient", return_value=client),
+            mock.patch.object(jobs, "GitHubClient", return_value=github),
+        ):
+            service.run_worker("123456789abc")
+            first = jobs.read_job("123456789abc")
+            self.assertEqual(first["clone_operation_state"], "ambiguous")
+            self.assertEqual(github.ensure_repository_clone.call_count, 1)
+            service.run_worker("123456789abc")
+
+        updated = jobs.read_job("123456789abc")
+        self.assertEqual(github.ensure_repository_clone.call_count, 1)
+        self.assertNotEqual(updated.get("clone_operation_state"), "cloned")
+        self.assertIsNone(updated.get("repository"))
+
     def test_worker_checks_issue_capability_before_herdr_side_effects(self) -> None:
         jobs.write_job(
             {

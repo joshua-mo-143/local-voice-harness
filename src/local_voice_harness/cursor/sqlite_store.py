@@ -119,6 +119,9 @@ _NAMED_TABLE_FIELDS: dict[str, tuple[str, ...]] = {
         "workflow_turn_phase",
     ),
     "job_checkout_fork": (
+        "clone_confirmed",
+        "clone_operation_state",
+        "clone_source",
         "fork_absent_observations",
         "fork_automatic_reconcile_stopped_at",
         "fork_committed",
@@ -276,6 +279,7 @@ _BOOL_FIELDS = frozenset(
         "announcement_dismissed",
         "announcement_repeated",
         "cancellation_reconciliation_pending",
+        "clone_confirmed",
         "continuation",
         "delivered",
         "fork_committed",

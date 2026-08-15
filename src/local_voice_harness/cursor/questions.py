@@ -300,6 +300,7 @@ def _queue_answer(
     repository_hint: str | None = None,
     github_repository: str | None = None,
     fork_confirmed: bool | None = None,
+    clone_confirmed: bool | None = None,
     github_issue_create_confirmed: bool | None = None,
     linear_ticket_create_team: str | None = None,
     linear_ticket_create_confirmed: bool | None = None,
@@ -324,6 +325,9 @@ def _queue_answer(
         ),
         fork_confirmed=(
             job.fork_confirmed if fork_confirmed is None else fork_confirmed
+        ),
+        clone_confirmed=(
+            job.clone_confirmed if clone_confirmed is None else clone_confirmed
         ),
         github_issue_create_confirmed=(
             job.github_issue_create_confirmed
@@ -523,6 +527,58 @@ def _fork_confirmation_answer(
         question=None,
         clarification_kind=None,
         result="Okay, I did not create a GitHub fork.",
+        completed_at=context.now,
+        worker_pid=None,
+        worker_boot_id=None,
+        worker_process_start=None,
+        worker_token=None,
+        voice_question=envelope(
+            question,
+            QuestionState.RESOLVED,
+            job=job,
+            answer="no",
+            trusted_answer=context.trusted_text or context.text,
+            answered_at=context.now,
+        ),
+    )
+    return AnswerTransition(completed)
+
+
+def _clone_confirmation_answer(
+    job: CursorJob,
+    question: Question,
+    resolution: AnswerResolution,
+    context: AnswerContext,
+) -> AnswerTransition:
+    confirmation = _confirmation(
+        context.trusted_text or context.text,
+        confirmations=_FORK_CONFIRMATIONS | {"clone it", "clone the repository"},
+        rejections=_FORK_REJECTIONS,
+    )
+    if confirmation is None:
+        return AnswerTransition(
+            None,
+            message="Please answer yes or no. Should I clone this repository?",
+        )
+    if confirmation:
+        return AnswerTransition(
+            _queue_answer(
+                job,
+                question,
+                resolution,
+                context,
+                continuation=False,
+                clone_confirmed=True,
+                clear_target=True,
+            ),
+            launch=True,
+        )
+    completed = job.evolve_for_delivery(
+        now=context.now,
+        status=JobStatus.COMPLETED,
+        question=None,
+        clarification_kind=None,
+        result="Okay, I did not clone the repository.",
         completed_at=context.now,
         worker_pid=None,
         worker_boot_id=None,
@@ -998,6 +1054,7 @@ _ANSWER_HANDLERS: dict[str, AnswerHandler] = {
     "repository": _repository_answer,
     "github_repository": _github_repository_answer,
     "fork_confirmation": _fork_confirmation_answer,
+    "clone_confirmation": _clone_confirmation_answer,
     "github_issue_create_confirmation": _github_issue_create_confirmation_answer,
     "linear_team": _linear_team_answer,
     "linear_ticket_create_confirmation": _linear_ticket_create_confirmation_answer,
