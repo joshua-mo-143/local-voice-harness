@@ -1017,8 +1017,6 @@ class LinearTicketUpdateTests(unittest.TestCase):
         submitted = client.prompt_and_wait.call_args.args[1]
         self.assertIn("Identifier: API-79", submitted)
         self.assertIn("Immutable issue ID: issue-id-api-79", submitted)
-        self.assertIn("configured workflow state named Done", submitted)
-        self.assertIn("immutable state ID is state-done", submitted)
         self.assertIn("Update title: yes", submitted)
         self.assertIn("Update description: yes", submitted)
         self.assertIn("Do not create a new issue", submitted)
@@ -1186,6 +1184,8 @@ class LinearTicketCloseTests(unittest.TestCase):
         self.assertIn("voice-harness-linear-ticket:" + "a" * 32, submitted)
         self.assertIn("Identifier: API-79", submitted)
         self.assertIn("Immutable issue ID: issue-id-api-79", submitted)
+        self.assertIn("configured workflow state named Done", submitted)
+        self.assertIn("immutable state ID is state-done", submitted)
         self.assertIn("Do not create a new issue", submitted)
         self.assertEqual(
             client.prompt_and_wait.call_args.kwargs["expected_agent_session"],
