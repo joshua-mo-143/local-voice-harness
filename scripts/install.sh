@@ -11,6 +11,9 @@
 #   PROFILE             Installation profile: showcase or local-cuda
 #   LLM_PROVIDER        LLM backend: local or venice (prompts when unset)
 #   TTS_PROVIDER        TTS backend: local or venice (prompts when unset)
+#   LLM_DEVICE          Local LLM compute: auto, cpu, or cuda
+#   TTS_DEVICE          Local TTS compute: auto, cpu, or cuda
+#   DICTATION_DEVICE    Dictation compute: auto, cpu, or cuda
 #   SKIP_SYSTEM_PACKAGES=1   Skip the paru package steps
 #   SKIP_MODELS=1            Skip Qwen/Chatterbox downloads
 #   SKIP_AUTH=1              Skip the interactive gh/cursor/linear logins
@@ -131,7 +134,7 @@ else
   LLM_PROVIDER="$(select_provider "LLM" "${LLM_PROVIDER:-}")"
   TTS_PROVIDER="$(select_provider "TTS" "${TTS_PROVIDER:-}")"
 fi
-eval "$(resolve_install_plan --format env --profile "$PROFILE" --llm "$LLM_PROVIDER" --tts "$TTS_PROVIDER")"
+eval "$(resolve_install_plan --format env --profile "$PROFILE" --llm "$LLM_PROVIDER" --tts "$TTS_PROVIDER" --llm-device "${LLM_DEVICE:-}" --tts-device "${TTS_DEVICE:-}" --dictation-device "${DICTATION_DEVICE:-}")"
 LLM_PROVIDER="$INSTALL_LLM_PROVIDER"
 TTS_PROVIDER="$INSTALL_TTS_PROVIDER"
 info "Installation profile: $INSTALL_PROFILE"
@@ -186,9 +189,9 @@ provider = "$LLM_PROVIDER"
 [tts]
 provider = "$TTS_PROVIDER"
 EOF
-  if [[ "$INSTALL_DICTATION_DEVICE" == "cpu" ]]; then
-    voice-harness config set compute.dictation_device cpu
-  fi
+  voice-harness config set compute.llm_device "$INSTALL_LLM_DEVICE"
+  voice-harness config set compute.tts_device "$INSTALL_TTS_DEVICE"
+  voice-harness config set compute.dictation_device "$INSTALL_DICTATION_DEVICE"
 fi
 
 if [[ "$LLM_PROVIDER" == venice || "$TTS_PROVIDER" == venice ]]; then
@@ -224,9 +227,15 @@ if [[ "${SKIP_MODELS:-0}" == 1 ]]; then
 else
   if [[ "$INSTALL_DOWNLOAD_CHATTERBOX" == 1 ]]; then
     step "Caching Chatterbox Turbo weights"
-    HF_HUB_OFFLINE=0 "$CHATTERBOX_DIR/.venv/bin/python" - <<'PY'
+    TTS_CACHE_DEVICE="$INSTALL_TTS_DEVICE"
+    if [[ "$TTS_CACHE_DEVICE" == "auto" ]]; then
+      TTS_CACHE_DEVICE="cuda"
+    fi
+    HF_HUB_OFFLINE=0 TTS_CACHE_DEVICE="$TTS_CACHE_DEVICE" \
+      "$CHATTERBOX_DIR/.venv/bin/python" - <<'PY'
+import os
 from chatterbox.tts_turbo import ChatterboxTurboTTS
-ChatterboxTurboTTS.from_pretrained(device="cuda")
+ChatterboxTurboTTS.from_pretrained(device=os.environ["TTS_CACHE_DEVICE"])
 print("Chatterbox Turbo cached")
 PY
   else

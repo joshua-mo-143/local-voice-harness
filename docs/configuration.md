@@ -360,11 +360,22 @@ voice-harness plan-approval ask
 | `DICTATION_VAD_MAX_SECONDS` | Positive maximum duration of each VAD utterance | `120` | Environment override |
 | `DICTATION_VAD_MIN_SPEECH_RMS` | Non-negative VAD speech energy gate | `1100` | Environment override |
 | `DICTATION_BACKEND` | Dictation engine (`parakeet` or `whisper`) | `parakeet` | Environment override; legacy `backend.env` input |
+| `VOICE_HARNESS_LLM_DEVICE` | Local LLM compute device (`auto`, `cpu`, or `cuda`) | `auto` | Environment override |
+| `VOICE_HARNESS_TTS_DEVICE` | Local TTS compute device (`auto`, `cpu`, or `cuda`) | `auto` | Environment override |
 | `DICTATION_DEVICE` | Dictation compute device (`auto`, `cpu`, or `cuda`) | `auto` | Environment override; legacy `backend.env` input |
 | `DICTATION_MODEL` | Backend model | `nemo-parakeet-tdt-0.6b-v2` | Environment override; legacy `backend.env` input |
 | `DICTATION_QUANTIZATION` | Parakeet ONNX quantization (`none` disables it) | `int8` | Environment override; legacy `backend.env` input |
 | `DICTATION_COMPUTE` | faster-whisper compute type | `float16` | Environment override; legacy `backend.env` input |
 | `DICTATION_LANGUAGE` | Spoken language to transcribe (`en`, `zh`, `english`, `chinese`, or `auto`) | `auto` | Environment override; legacy `backend.env` input |
+
+Local LLM and TTS use the same typed `auto`, `cpu`, and `cuda` selectors through
+`compute.llm_device` and `compute.tts_device`. CPU paths never probe or call CUDA:
+llama.cpp is launched with `--n-gpu-layers 0` and no `--device`, and Chatterbox
+loads on `device="cpu"` without `torch.cuda` synchronization. Explicit `cuda`
+fails at service start when the device is unavailable. `auto` prefers CUDA when
+the launcher can prove it and otherwise uses CPU. Installation and `voice-harness
+doctor` report the configured modes and skip CUDA packages/tools when every local
+component is CPU.
 
 `cpu` is a strict CPU path: Parakeet receives only ONNX Runtime's CPU provider,
 faster-whisper receives `device="cpu"`, incompatible half-precision Whisper compute

@@ -17,6 +17,7 @@ from enum import StrEnum
 
 PROVIDERS = frozenset({"local", "venice"})
 PROFILES = frozenset({"showcase", "local-cuda"})
+COMPUTE_DEVICES = frozenset({"auto", "cpu", "cuda"})
 NVIDIA_PACKAGE_MARKERS = ("cuda", "nvidia-", "llama.cpp-cuda")
 BASE_PACKAGES = (
     "pipewire",
@@ -56,6 +57,8 @@ class InstallationPlan:
     profile: str
     llm_provider: str
     tts_provider: str
+    llm_device: str
+    tts_device: str
     dictation_extra: str
     dictation_device: str
     system_packages: tuple[str, ...]
@@ -82,6 +85,30 @@ def _provider(value: str | None, *, label: str) -> str:
     return selected
 
 
+def _compute_device(value: str | None, *, label: str, default: str) -> str:
+    selected = (value or default).strip().casefold()
+    if selected not in COMPUTE_DEVICES:
+        raise InstallProfileError(f"{label} must be auto, cpu, or cuda")
+    return selected
+
+
+def _needs_cuda_packages(
+    *,
+    llm_provider: str,
+    tts_provider: str,
+    llm_device: str,
+    tts_device: str,
+    dictation_device: str,
+) -> bool:
+    if dictation_device != "cpu":
+        return True
+    if llm_provider == "local" and llm_device != "cpu":
+        return True
+    if tts_provider == "local" and tts_device != "cpu":
+        return True
+    return False
+
+
 def _profile(value: str | None) -> str | None:
     if value is None:
         return None
@@ -100,6 +127,9 @@ def resolve_installation_plan(
     profile: str | None = None,
     llm_provider: str | None = None,
     tts_provider: str | None = None,
+    llm_device: str | None = None,
+    tts_device: str | None = None,
+    dictation_device: str | None = None,
 ) -> InstallationPlan:
     """Return the packages and local assets required by one install choice."""
 
@@ -107,28 +137,44 @@ def resolve_installation_plan(
     if selected_profile == InstallProfile.SHOWCASE:
         llm = "venice"
         tts = "venice"
-        dictation_extra = "dictation"
-        dictation_device = "cpu"
-        cuda_packages: tuple[str, ...] = ()
+        llm_compute = "cpu"
+        tts_compute = "cpu"
+        dictation_compute = "cpu"
     else:
         llm = _provider(llm_provider or "local", label="LLM")
         tts = _provider(tts_provider or "local", label="TTS")
-        local_compute = llm == "local" or tts == "local"
-        if selected_profile == InstallProfile.LOCAL_CUDA or local_compute:
-            dictation_extra = "dictation-cuda"
-            dictation_device = "cuda"
-            cuda_packages = CUDA_PACKAGES
-        else:
-            dictation_extra = "dictation"
-            dictation_device = "cpu"
-            cuda_packages = ()
+        default_device = (
+            "cuda" if selected_profile == InstallProfile.LOCAL_CUDA else "auto"
+        )
+        if selected_profile is None and llm == "venice" and tts == "venice":
+            default_device = "cpu"
+        elif selected_profile is None and (llm == "local" or tts == "local"):
+            default_device = "cuda"
+        llm_compute = _compute_device(
+            llm_device, label="LLM device", default=default_device
+        )
+        tts_compute = _compute_device(
+            tts_device, label="TTS device", default=default_device
+        )
+        dictation_compute = _compute_device(
+            dictation_device, label="dictation device", default=default_device
+        )
         if selected_profile is None:
             selected_profile = (
                 InstallProfile.SHOWCASE
-                if not local_compute
+                if llm == "venice" and tts == "venice" and dictation_compute == "cpu"
                 else InstallProfile.LOCAL_CUDA
             )
 
+    needs_cuda = _needs_cuda_packages(
+        llm_provider=llm,
+        tts_provider=tts,
+        llm_device=llm_compute,
+        tts_device=tts_compute,
+        dictation_device=dictation_compute,
+    )
+    dictation_extra = "dictation-cuda" if dictation_compute != "cpu" else "dictation"
+    cuda_packages = CUDA_PACKAGES if needs_cuda else ()
     venice_packages = VENICE_PACKAGES if "venice" in {llm, tts} else ()
     install_tts_extra = tts == "local"
     python_extras = ("wake", dictation_extra)
@@ -138,8 +184,10 @@ def resolve_installation_plan(
         profile=selected_profile,
         llm_provider=llm,
         tts_provider=tts,
+        llm_device=llm_compute,
+        tts_device=tts_compute,
         dictation_extra=dictation_extra,
-        dictation_device=dictation_device,
+        dictation_device=dictation_compute,
         system_packages=BASE_PACKAGES + venice_packages,
         cuda_packages=cuda_packages,
         venice_packages=venice_packages,
@@ -158,6 +206,8 @@ def plan_to_env(plan: InstallationPlan) -> str:
         "INSTALL_PROFILE": plan.profile,
         "INSTALL_LLM_PROVIDER": plan.llm_provider,
         "INSTALL_TTS_PROVIDER": plan.tts_provider,
+        "INSTALL_LLM_DEVICE": plan.llm_device,
+        "INSTALL_TTS_DEVICE": plan.tts_device,
         "INSTALL_DICTATION_EXTRA": plan.dictation_extra,
         "INSTALL_DICTATION_DEVICE": plan.dictation_device,
         "INSTALL_SYSTEM_PACKAGES": " ".join(plan.system_packages),
@@ -184,6 +234,9 @@ def main(arguments: list[str] | None = None) -> int:
     parser.add_argument("--profile", default="")
     parser.add_argument("--llm", dest="llm_provider", default="")
     parser.add_argument("--tts", dest="tts_provider", default="")
+    parser.add_argument("--llm-device", dest="llm_device", default="")
+    parser.add_argument("--tts-device", dest="tts_device", default="")
+    parser.add_argument("--dictation-device", dest="dictation_device", default="")
     parser.add_argument(
         "--format",
         choices=("env", "json"),
@@ -196,6 +249,9 @@ def main(arguments: list[str] | None = None) -> int:
             profile=options.profile or None,
             llm_provider=options.llm_provider or None,
             tts_provider=options.tts_provider or None,
+            llm_device=options.llm_device or None,
+            tts_device=options.tts_device or None,
+            dictation_device=options.dictation_device or None,
         )
     except InstallProfileError as exc:
         print(f"error: {exc}", file=sys.stderr)

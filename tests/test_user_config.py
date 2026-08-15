@@ -34,6 +34,8 @@ class UserConfigDefaultsTests(unittest.TestCase):
         self.assertEqual(config.audio.wake_threshold, 0.55)
         self.assertEqual(config.compute.dictation_backend, "parakeet")
         self.assertIs(config.compute.dictation_device, user_config.DictationDevice.AUTO)
+        self.assertIs(config.compute.llm_device, user_config.ComputeDevice.AUTO)
+        self.assertIs(config.compute.tts_device, user_config.ComputeDevice.AUTO)
         self.assertEqual(config.platform.project_root, self.HOME)
         self.assertEqual(config.platform.github_root, self.HOME / "src")
         self.assertEqual(
@@ -451,6 +453,12 @@ class UserConfigValidationTests(unittest.TestCase):
     def test_invalid_dictation_device_is_rejected(self) -> None:
         with self.assertRaisesRegex(UserConfigurationError, "auto, cpu, cuda"):
             self._load('[compute]\ndictation_device = "vulkan"\n')
+
+    def test_invalid_local_llm_and_tts_devices_are_rejected(self) -> None:
+        with self.assertRaisesRegex(UserConfigurationError, "compute.llm_device"):
+            self._load('[compute]\nllm_device = "vulkan"\n')
+        with self.assertRaisesRegex(UserConfigurationError, "compute.tts_device"):
+            self._load('[compute]\ntts_device = "metal"\n')
 
     def test_empty_legacy_dictation_compute_value_is_rejected(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

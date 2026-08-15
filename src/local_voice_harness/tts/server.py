@@ -25,7 +25,13 @@ from ..config import (
 from ..credentials import get_venice_api_key
 from ..diagnostic_safety import redact_diagnostic
 from ..http_pool import urlopen as pooled_urlopen
-from ..user_config import default_user_config, load_user_config
+from ..user_config import (
+    ComputeDevice,
+    ComputeSettings,
+    default_user_config,
+    load_user_config,
+    resolve_local_compute,
+)
 
 SOCKET_PATH = TTS_SOCKET
 OUTPUT_ROOT = STATE_DIR
@@ -41,6 +47,7 @@ REQUEST_ID = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 MODEL: Any = None
 SETTINGS: BackendSettings | None = None
 VENICE_API_KEY: str | None = None
+TTS_DEVICE: str | None = None
 MAX_AUDIO_BYTES = 32 * 1024 * 1024
 
 
@@ -148,6 +155,27 @@ def _request_bool(
     return value
 
 
+def torch_cuda_available() -> bool:
+    import torch
+
+    return bool(torch.cuda.is_available())
+
+
+def resolve_tts_device(
+    compute: ComputeSettings,
+    *,
+    cuda_available: bool | None = None,
+) -> str:
+    """Resolve local TTS compute without probing CUDA on the CPU path."""
+
+    if compute.tts_device is ComputeDevice.CPU:
+        return "cpu"
+    available = torch_cuda_available() if cuda_available is None else cuda_available
+    return resolve_local_compute(
+        compute.tts_device, cuda_available=available, label="TTS"
+    )
+
+
 def _generate(text: str, voice: Path | None) -> tuple[Any, float]:
     import torch
 
@@ -158,7 +186,8 @@ def _generate(text: str, voice: Path | None) -> tuple[Any, float]:
         temperature=0.8,
         top_p=0.95,
     )
-    torch.cuda.synchronize()
+    if TTS_DEVICE == "cuda":
+        torch.cuda.synchronize()
     return waveform.detach().cpu().float().squeeze().numpy(), (
         time.perf_counter() - started
     )
@@ -578,18 +607,22 @@ class Server(socketserver.ThreadingUnixStreamServer):
 
 
 def main() -> None:
-    global MODEL, SETTINGS, VENICE_API_KEY
+    global MODEL, SETTINGS, VENICE_API_KEY, TTS_DEVICE
     if "--check" in sys.argv[1:]:
         print("voice-harness-tts: ok")
         return
-    SETTINGS = load_user_config().providers
+    snapshot = load_user_config()
+    SETTINGS = snapshot.providers
     if SETTINGS.tts_provider == "local":
-        import torch
         from chatterbox.tts_turbo import ChatterboxTurboTTS
 
-        log("loading Chatterbox Turbo on CUDA")
-        MODEL = ChatterboxTurboTTS.from_pretrained(device="cuda")
-        torch.cuda.synchronize()
+        TTS_DEVICE = resolve_tts_device(snapshot.compute)
+        log(f"loading Chatterbox Turbo on {TTS_DEVICE.upper()}")
+        MODEL = ChatterboxTurboTTS.from_pretrained(device=TTS_DEVICE)
+        if TTS_DEVICE == "cuda":
+            import torch
+
+            torch.cuda.synchronize()
         log("model ready")
     else:
         VENICE_API_KEY = get_venice_api_key()

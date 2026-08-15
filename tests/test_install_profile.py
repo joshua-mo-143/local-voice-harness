@@ -88,6 +88,8 @@ class InstallationProfileDecisionTests(unittest.TestCase):
             resolve_installation_plan(llm_provider="openai")
         with self.assertRaisesRegex(InstallProfileError, "TTS provider"):
             resolve_installation_plan(tts_provider="cloud")
+        with self.assertRaisesRegex(InstallProfileError, "LLM device"):
+            resolve_installation_plan(llm_provider="local", llm_device="metal")
 
     def test_cli_env_format_is_shell_evaluable(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

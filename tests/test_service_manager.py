@@ -175,7 +175,7 @@ class ServiceManagementTests(unittest.TestCase):
         with mock.patch.object(
             llm_launcher, "load_user_config", return_value=configured
         ):
-            command = llm_launcher.command()
+            command = llm_launcher.command(cuda_available=True)
 
         self.assertNotIn("--model", unit)
         self.assertNotIn("--device", unit)

@@ -1,30 +1,82 @@
 from __future__ import annotations
 
 import os
+import subprocess
 import sys
 from pathlib import Path
+from typing import Literal
 
 from .config import PROJECT_ROOT
-from .user_config import load_user_config
+from .user_config import (
+    ComputeDevice,
+    ComputeSettings,
+    UserConfig,
+    load_user_config,
+    resolve_local_compute,
+)
 
 LLAMA_SERVER = Path("/usr/sbin/llama-server")
 MODEL_FILE = PROJECT_ROOT / "models" / "Qwen3.5-4B-Q4_K_M.gguf"
 
 
-def command() -> list[str]:
+def llama_cuda_available(
+    cuda_device: str, *, llama_server: Path = LLAMA_SERVER
+) -> bool:
+    """Return whether llama.cpp reports the configured CUDA device."""
+
+    try:
+        process = subprocess.run(
+            [str(llama_server), "--list-devices"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    if process.returncode:
+        return False
+    return cuda_device.casefold() in process.stdout.casefold()
+
+
+def resolve_llm_device(
+    compute: ComputeSettings,
+    *,
+    cuda_available: bool | None = None,
+) -> Literal["cpu", "cuda"]:
+    """Resolve local LLM compute without probing CUDA on the CPU path."""
+
+    if compute.llm_device is ComputeDevice.CPU:
+        return "cpu"
+    available = (
+        llama_cuda_available(compute.cuda_device)
+        if cuda_available is None
+        else cuda_available
+    )
+    return resolve_local_compute(
+        compute.llm_device, cuda_available=available, label="LLM"
+    )
+
+
+def command(
+    snapshot: UserConfig | None = None,
+    *,
+    cuda_available: bool | None = None,
+) -> list[str]:
     """Build the local LLM command from one validated user-config snapshot."""
 
-    snapshot = load_user_config()
-    if snapshot.providers.llm_provider != "local":
+    resolved = snapshot if snapshot is not None else load_user_config()
+    if resolved.providers.llm_provider != "local":
         raise RuntimeError(
             "voice-harness-llm.service is only used when providers.llm.provider=local"
         )
-    return [
+    device = resolve_llm_device(resolved.compute, cuda_available=cuda_available)
+    arguments = [
         str(LLAMA_SERVER),
         "--model",
         str(MODEL_FILE),
         "--alias",
-        snapshot.providers.llm_model,
+        resolved.providers.llm_model,
         "--host",
         "127.0.0.1",
         "--port",
@@ -34,17 +86,18 @@ def command() -> list[str]:
         "--parallel",
         "1",
         "--n-gpu-layers",
-        "99",
-        "--device",
-        snapshot.compute.cuda_device,
+        "99" if device == "cuda" else "0",
         "--flash-attn",
-        "on",
+        "on" if device == "cuda" else "off",
         "--jinja",
         "--reasoning",
         "off",
         "--reasoning-budget",
         "0",
     ]
+    if device == "cuda":
+        arguments.extend(("--device", resolved.compute.cuda_device))
+    return arguments
 
 
 def main() -> None:

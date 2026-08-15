@@ -272,6 +272,18 @@ _CONFIG_FIELDS: dict[str, ConfigField] = {
         attribute="cuda_device",
         services=(_LLM_SERVICE,),
     ),
+    "compute.llm_device": _field(
+        parse=_parse_str,
+        section="compute",
+        attribute="llm_device",
+        services=(_LLM_SERVICE,),
+    ),
+    "compute.tts_device": _field(
+        parse=_parse_str,
+        section="compute",
+        attribute="tts_device",
+        services=(_TTS_SERVICE,),
+    ),
     "compute.dictation_device": _field(
         parse=_parse_str,
         section="compute",
@@ -913,6 +925,8 @@ def run_setup(
         tts_provider = "venice"
         dictation_backend = "parakeet"
         dictation_device = "cpu" if profile == "showcase" else None
+        llm_device = "cpu" if profile == "showcase" else None
+        tts_device = "cpu" if profile == "showcase" else None
         github_enabled = True
         zendesk_enabled = False
         linear_enabled = False
@@ -969,6 +983,8 @@ def run_setup(
         )
         wake_threshold = input_fn("Wake threshold (0.0-1.0) [0.55]: ").strip() or "0.55"
         dictation_device = None
+        llm_device = None
+        tts_device = None
 
     assignments = {
         "providers.llm.provider": llm_provider,
@@ -981,6 +997,10 @@ def run_setup(
     }
     if dictation_device is not None:
         assignments["compute.dictation_device"] = dictation_device
+    if llm_device is not None:
+        assignments["compute.llm_device"] = llm_device
+    if tts_device is not None:
+        assignments["compute.tts_device"] = tts_device
     result = commit_config_change(
         assignments,
         paths=resolved_paths,

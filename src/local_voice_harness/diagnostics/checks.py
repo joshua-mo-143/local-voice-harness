@@ -35,7 +35,13 @@ from ..integrations.registry import (
 )
 from ..ipc import socket_ready
 from ..process import capability_diagnostics
-from ..user_config import UserConfig, UserConfigurationError, load_user_config
+from ..user_config import (
+    ComputeDevice,
+    UserConfig,
+    UserConfigurationError,
+    load_user_config,
+    resolve_local_compute,
+)
 from .model import CheckResult, Repair, Severity
 
 
@@ -485,6 +491,72 @@ def check_model_caches(
     ]
 
 
+def _local_cuda_expected(config: UserConfig) -> bool:
+    if config.compute.dictation_device is not ComputeDevice.CPU:
+        return True
+    if (
+        config.providers.llm_provider == "local"
+        and config.compute.llm_device is not ComputeDevice.CPU
+    ):
+        return True
+    if (
+        config.providers.tts_provider == "local"
+        and config.compute.tts_device is not ComputeDevice.CPU
+    ):
+        return True
+    return False
+
+
+def check_compute_modes(
+    snapshot: DiagnosticSnapshot | None = None,
+) -> list[CheckResult]:
+    resolved = _resolved(snapshot)
+    if resolved.config is None:
+        return []
+    settings = resolved.config
+    compute = settings.compute
+    results: list[CheckResult] = []
+    for name, requested, local in (
+        ("llm", compute.llm_device, settings.providers.llm_provider == "local"),
+        ("tts", compute.tts_device, settings.providers.tts_provider == "local"),
+        ("dictation", compute.dictation_device, True),
+    ):
+        if not local:
+            results.append(
+                CheckResult(
+                    name=f"compute:{name}",
+                    category="compute",
+                    severity=Severity.OK,
+                    detail=(
+                        f"{name} provider is hosted; configured local compute "
+                        f"{requested} is unused"
+                    ),
+                )
+            )
+            continue
+        if requested is ComputeDevice.CPU:
+            effective = resolve_local_compute(
+                requested, cuda_available=False, label=name
+            )
+            detail = (
+                f"{name} configured compute={requested}; effective compute={effective}"
+            )
+        else:
+            detail = (
+                f"{name} configured compute={requested}; effective compute is "
+                "resolved at service start without changing the configured mode"
+            )
+        results.append(
+            CheckResult(
+                name=f"compute:{name}",
+                category="compute",
+                severity=Severity.OK,
+                detail=detail,
+            )
+        )
+    return results
+
+
 def check_cuda(snapshot: DiagnosticSnapshot | None = None) -> list[CheckResult]:
     resolved = _resolved(snapshot)
     if resolved.config is None:
@@ -496,6 +568,22 @@ def check_cuda(snapshot: DiagnosticSnapshot | None = None) -> list[CheckResult]:
     if settings.providers.tts_provider == "local":
         selected_models.append("TTS")
     model_label = "/".join(selected_models)
+    mode_label = (
+        f"llm={settings.compute.llm_device} tts={settings.compute.tts_device} "
+        f"dictation={settings.compute.dictation_device}"
+    )
+    if not _local_cuda_expected(settings):
+        return [
+            CheckResult(
+                name="gpu:cuda",
+                category="gpu",
+                severity=Severity.OK,
+                detail=(
+                    "CUDA tools were not invoked; configured local compute is "
+                    f"CPU or hosted ({mode_label})"
+                ),
+            )
+        ]
     if _which("nvidia-smi") is None:
         return [
             CheckResult(
@@ -530,7 +618,8 @@ def check_cuda(snapshot: DiagnosticSnapshot | None = None) -> list[CheckResult]:
             severity=Severity.OK,
             detail=(
                 f"nvidia-smi reports a working GPU for {model_label}; "
-                f"the configured CUDA device is {settings.compute.cuda_device}"
+                f"the configured CUDA device is {settings.compute.cuda_device} "
+                f"({mode_label})"
             ),
         )
     ]
@@ -1210,6 +1299,7 @@ ALL_CHECKS: tuple[Check, ...] = (
     check_python_environments,
     check_model_file,
     check_model_caches,
+    check_compute_modes,
     check_cuda,
     check_pipewire_devices,
     check_systemd_units,

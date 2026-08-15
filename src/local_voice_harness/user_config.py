@@ -28,6 +28,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from enum import StrEnum
 from pathlib import Path
+from typing import Literal
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from . import config
@@ -54,6 +55,8 @@ _TTS_KEYS = ("provider", "model", "voice", "speed", "endpoint", "timeout")
 _INTEGRATION_KEYS = ("github", "zendesk", "linear")
 _COMPUTE_KEYS = (
     "cuda_device",
+    "llm_device",
+    "tts_device",
     "dictation_device",
     "dictation_backend",
     "dictation_model",
@@ -143,12 +146,15 @@ class AnnouncementMode(StrEnum):
     QUIET = "quiet"
 
 
-class DictationDevice(StrEnum):
-    """Compute device selected for local speech recognition."""
+class ComputeDevice(StrEnum):
+    """Typed compute selector for local LLM, TTS, and dictation."""
 
     AUTO = "auto"
     CPU = "cpu"
     CUDA = "cuda"
+
+
+DictationDevice = ComputeDevice
 
 
 @dataclass(frozen=True)
@@ -182,15 +188,42 @@ class IntegrationSettings:
 
 @dataclass(frozen=True)
 class ComputeSettings:
-    """GPU device and dictation compute selectors."""
+    """GPU device and local LLM, TTS, and dictation compute selectors."""
 
     cuda_device: str = "CUDA0"
+    llm_device: ComputeDevice = ComputeDevice.AUTO
+    tts_device: ComputeDevice = ComputeDevice.AUTO
     dictation_device: DictationDevice = DictationDevice.AUTO
     dictation_backend: str = "parakeet"
     dictation_model: str = "nemo-parakeet-tdt-0.6b-v2"
     dictation_quantization: str = "int8"
     dictation_compute: str = "float16"
     dictation_language: str = "auto"
+
+
+def resolve_local_compute(
+    requested: ComputeDevice,
+    *,
+    cuda_available: bool,
+    label: str,
+) -> Literal["cpu", "cuda"]:
+    """Resolve a typed local compute selector without probing on the CPU path.
+
+    Callers must not query CUDA when ``requested`` is ``cpu``. ``auto`` and
+    ``cuda`` receive a precomputed availability flag so tests can stay
+    hardware-free.
+    """
+
+    if requested is ComputeDevice.CPU:
+        return "cpu"
+    if requested is ComputeDevice.CUDA and not cuda_available:
+        raise RuntimeError(
+            f"CUDA {label} was requested, but CUDA is unavailable; install the "
+            "matching CUDA dependency profile and verify the NVIDIA driver"
+        )
+    if requested is ComputeDevice.CUDA:
+        return "cuda"
+    return "cuda" if cuda_available else "cpu"
 
 
 @dataclass(frozen=True)
@@ -573,6 +606,32 @@ def _load_compute(
                 "CUDA0",
             ),
             label="compute.cuda_device",
+        ),
+        llm_device=ComputeDevice(
+            _as_choice(
+                _resolve(
+                    environment,
+                    "VOICE_HARNESS_LLM_DEVICE",
+                    section,
+                    "llm_device",
+                    ComputeDevice.AUTO,
+                ),
+                _DICTATION_DEVICES,
+                label="compute.llm_device",
+            )
+        ),
+        tts_device=ComputeDevice(
+            _as_choice(
+                _resolve(
+                    environment,
+                    "VOICE_HARNESS_TTS_DEVICE",
+                    section,
+                    "tts_device",
+                    ComputeDevice.AUTO,
+                ),
+                _DICTATION_DEVICES,
+                label="compute.tts_device",
+            )
         ),
         dictation_device=DictationDevice(
             _as_choice(
@@ -1271,6 +1330,8 @@ def render_user_config(user_config: UserConfig) -> str:
         "compute",
         {
             "cuda_device": compute.cuda_device,
+            "llm_device": compute.llm_device,
+            "tts_device": compute.tts_device,
             "dictation_device": compute.dictation_device,
             "dictation_backend": compute.dictation_backend,
             "dictation_model": compute.dictation_model,

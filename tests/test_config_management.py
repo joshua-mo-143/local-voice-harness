@@ -289,6 +289,8 @@ class ConfigManagementTests(unittest.TestCase):
             self.assertEqual(result.config.providers.tts_provider, "venice")
             self.assertEqual(result.config.compute.dictation_backend, "parakeet")
             self.assertEqual(result.config.compute.dictation_device, "cpu")
+            self.assertEqual(result.config.compute.llm_device, "cpu")
+            self.assertEqual(result.config.compute.tts_device, "cpu")
             self.assertTrue(result.config.integrations.github_enabled)
             self.assertFalse(result.config.integrations.zendesk_enabled)
             self.assertFalse(result.config.integrations.linear_enabled)
