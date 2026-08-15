@@ -45,14 +45,14 @@ success.
 
 | Baseline | Count |
 |---|---:|
-| Persisted field names | 267 |
-| Named table fields | 262 |
+| Persisted field names | 273 |
+| Named table fields | 268 |
 | Import-only fields | 4 |
-| Directly exposed `CursorJob` properties | 206 |
+| Directly exposed `CursorJob` properties | 212 |
 | Compatibility adapters | 38 |
 | Public transition entry points | 80 |
 | Documented duplicate authorities | 0 |
-| Lifecycle-related module lines | 30879 |
+| Lifecycle-related module lines | 31183 |
 
 #358 unified ordinary and clarification submission onto one
 `prompt_operations.PromptOperationState`. #359 made that typed operation the

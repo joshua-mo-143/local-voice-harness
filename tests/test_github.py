@@ -351,7 +351,9 @@ class GitHubClientTests(unittest.TestCase):
         self.assertNotIn(plan.body, command)
         self.assertEqual(
             run.call_args.kwargs["stdin"],
-            "Detailed private body",
+            "Detailed private body\n\n"
+            "<!-- local-voice-harness-correlation:"
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa -->\n",
         )
 
     def test_issue_submission_requires_confirmation_before_running(self) -> None:

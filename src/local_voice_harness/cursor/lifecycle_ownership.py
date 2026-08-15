@@ -506,6 +506,9 @@ def _build_field_ownership() -> tuple[FieldOwnership, ...]:
                 "github_issue_update_confirmed": CrashKind.UNCERTAINTY,
                 "github_issue_update_title": CrashKind.CONTENT,
                 "github_issue_update_body": CrashKind.CONTENT,
+                "github_issue_update_base_title": CrashKind.CONTENT,
+                "github_issue_update_base_body": CrashKind.CONTENT,
+                "github_issue_update_base_revision": CrashKind.COUNTER,
                 "github_issue_update_marker": CrashKind.TOKEN,
                 "github_issue_update_operation_state": CrashKind.UNCERTAINTY,
                 "linear_ticket_create_requested": CrashKind.CONTENT,
@@ -526,6 +529,9 @@ def _build_field_ownership() -> tuple[FieldOwnership, ...]:
                 "linear_ticket_update_confirmed": CrashKind.UNCERTAINTY,
                 "linear_ticket_update_title": CrashKind.CONTENT,
                 "linear_ticket_update_description": CrashKind.CONTENT,
+                "linear_ticket_update_base_title": CrashKind.CONTENT,
+                "linear_ticket_update_base_description": CrashKind.CONTENT,
+                "linear_ticket_update_base_revision": CrashKind.COUNTER,
                 "linear_ticket_update_marker": CrashKind.TOKEN,
                 "linear_ticket_update_operation_state": CrashKind.UNCERTAINTY,
                 "linear_ticket_update_issue_id": CrashKind.IDENTITY,
@@ -1496,12 +1502,12 @@ def measured_baseline_counts() -> dict[str, int]:
 # Measured on the #357 baseline checkout. Tests fail if these drift without an
 # intentional inventory update. They are evidence, not an optimization target.
 BASELINE_COUNTS: dict[str, int] = {
-    "persisted_field_names": 267,
-    "named_table_fields": 262,
+    "persisted_field_names": 273,
+    "named_table_fields": 268,
     "import_only_fields": 4,
-    "cursor_job_public_properties": 206,
+    "cursor_job_public_properties": 212,
     "compatibility_adapters": 38,
     "transition_entry_points": 80,
     "duplicate_authorities": 0,
-    "lifecycle_module_lines": 30879,
+    "lifecycle_module_lines": 31183,
 }
