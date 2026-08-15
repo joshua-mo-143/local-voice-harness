@@ -3081,7 +3081,7 @@ class WakeConversationDaemon:
                         if target is None:
                             response = cursor_consultation.NO_WORKSPACE
                         else:
-                            interruption = self._acknowledge_consultation()
+                            interruption = self._acknowledge_consultation(text)
                             if interruption is not None:
                                 return interruption
                             assert ticket_admission.ticket.canonical is not None
