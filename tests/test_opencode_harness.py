@@ -18,18 +18,42 @@ from local_voice_harness.cursor.model import (
     CURRENT_SCHEMA_VERSION,
     CursorJob,
     HarnessKind,
+    JobStatus,
 )
 from local_voice_harness.cursor.recovery import reconcile_uncertain_agent
-from local_voice_harness.cursor.service import StartJobRequest, start_job
+from local_voice_harness.cursor.service import (
+    CursorTurnRequest,
+    CursorTurnResult,
+    StartJobRequest,
+    cursor_turn,
+    start_follow_up,
+    start_job,
+)
 from local_voice_harness.cursor.store import JobStore
 from local_voice_harness.integrations import herdr
 from local_voice_harness.integrations.herdr import OpenCodeSession
 from local_voice_harness.integrations.linear import CapabilityStatus, LinearIntegration
 from local_voice_harness.integrations.registry import (
+    IntegrationRegistry,
     build_integration_registry,
     require_harness_capabilities,
 )
 from local_voice_harness.user_config import IntegrationSettings, default_user_config
+
+
+def _registry_with_default(
+    tmp_path: Path, kind: str, *, linear: bool = False
+) -> IntegrationRegistry:
+    config = default_user_config(tmp_path)
+    registry = build_integration_registry(
+        replace(
+            config,
+            platform=replace(config.platform, default_harness=kind),
+            integrations=replace(config.integrations, linear_enabled=linear),
+        )
+    )
+    ready = mock.Mock()
+    return replace(registry, herdr_client=lambda: ready)
 
 
 def test_start_job_stamps_opencode_without_changing_cursor_default(
@@ -545,3 +569,144 @@ def test_restart_replays_outbox_through_persisted_opencode_harness(
     client.bind_harness_kind.assert_called_with("opencode")
     opencode_harness.create_session.assert_called_once()
     cursor_harness.create_session.assert_not_called()
+
+
+def test_omitted_harness_kind_uses_configured_default(tmp_path: Path) -> None:
+    store = JobStore(tmp_path / "jobs", tmp_path / "legacy")
+    cursor_registry = _registry_with_default(tmp_path, "cursor")
+    opencode_registry = _registry_with_default(tmp_path, "opencode")
+    with (
+        mock.patch("local_voice_harness.cursor.service._job_store", return_value=store),
+        mock.patch("local_voice_harness.cursor.service.launch_worker"),
+    ):
+        cursor_id = start_job(
+            "fix a local bug", foreground=False, integrations=cursor_registry
+        )
+        opencode_id = start_job(
+            "fix a local bug", foreground=False, integrations=opencode_registry
+        )
+        override_id = start_job(
+            "fix a local bug with Cursor",
+            harness_kind=HarnessKind.CURSOR,
+            foreground=False,
+            integrations=opencode_registry,
+        )
+
+    assert store.get(cursor_id).harness_kind == HarnessKind.CURSOR
+    assert store.get(opencode_id).harness_kind == HarnessKind.OPENCODE
+    assert store.get(override_id).harness_kind == HarnessKind.CURSOR
+
+
+def test_request_override_does_not_mutate_stored_default(tmp_path: Path) -> None:
+    store = JobStore(tmp_path / "jobs", tmp_path / "legacy")
+    registry = _registry_with_default(tmp_path, "cursor")
+    with (
+        mock.patch("local_voice_harness.cursor.service._job_store", return_value=store),
+        mock.patch("local_voice_harness.cursor.service.launch_worker"),
+    ):
+        override_id = start_job(
+            StartJobRequest("use OpenCode once", harness_kind=HarnessKind.OPENCODE),
+            foreground=False,
+            integrations=registry,
+        )
+        later_id = start_job(
+            "back to the default", foreground=False, integrations=registry
+        )
+
+    assert store.get(override_id).harness_kind == HarnessKind.OPENCODE
+    assert store.get(later_id).harness_kind == HarnessKind.CURSOR
+    assert registry.platform is not None
+    assert registry.platform.default_harness == "cursor"
+
+
+def test_configured_opencode_default_fail_closes_linear(tmp_path: Path) -> None:
+    store = JobStore(tmp_path / "jobs", tmp_path / "legacy")
+    registry = _registry_with_default(tmp_path, "opencode", linear=True)
+    with (
+        mock.patch.object(
+            LinearIntegration,
+            "capability_status",
+            return_value=CapabilityStatus(True, "ready"),
+        ),
+        mock.patch("local_voice_harness.cursor.service._job_store", return_value=store),
+        mock.patch("local_voice_harness.cursor.service.launch_worker") as launch,
+        pytest.raises(UnsupportedCapabilityError, match="mcp_connectors") as raised,
+    ):
+        start_job("work on API-42", foreground=False, integrations=registry)
+
+    assert raised.value.provider == "opencode/herdr"
+    assert store.list() == []
+    launch.assert_not_called()
+
+
+def test_follow_up_inherits_parent_harness_despite_default(
+    tmp_path: Path,
+) -> None:
+    store = JobStore(tmp_path / "jobs", tmp_path / "legacy")
+    now = 10.0
+    parent = store.create(
+        CursorJob.from_dict(
+            {
+                "id": "aaaaaaaaaaaa",
+                "schema_version": CURRENT_SCHEMA_VERSION,
+                "revision": 0,
+                "request": "add a feature",
+                "status": JobStatus.COMPLETED.value,
+                "created_at": now,
+                "completed_at": now,
+                "delivered": True,
+                "result": "done",
+                "repository": str(tmp_path / "repo"),
+                "worktree_branch": "voice/feature",
+                "worktree_path": str(tmp_path / "worktrees" / "wt"),
+                "worktree_workspace_id": "workspace-1",
+                "worktree_root_pane_id": "root-pane-1",
+                "worktree_provision_state": "ready",
+                "harness_kind": "opencode",
+            }
+        )
+    )
+    registry = _registry_with_default(tmp_path, "cursor")
+    with (
+        mock.patch("local_voice_harness.cursor.service._job_store", return_value=store),
+        mock.patch("local_voice_harness.cursor.service.launch_worker"),
+        mock.patch("local_voice_harness.cursor.service._dispatch_waiting_jobs"),
+    ):
+        child_id = start_follow_up(
+            parent.id,
+            "review the changes",
+            expected_parent_revision=parent.revision,
+            expected_completed_at=parent.completed_at,
+            integrations=registry,
+        )
+
+    assert store.get(child_id).harness_kind == HarnessKind.OPENCODE
+
+
+def test_cursor_turn_override_selects_opencode_without_changing_default(
+    tmp_path: Path,
+) -> None:
+    store = JobStore(tmp_path / "jobs", tmp_path / "legacy")
+    registry = _registry_with_default(tmp_path, "cursor")
+    with (
+        mock.patch("local_voice_harness.cursor.service._job_store", return_value=store),
+        mock.patch("local_voice_harness.cursor.service.launch_worker"),
+        mock.patch(
+            "local_voice_harness.cursor.service._await_foreground",
+            side_effect=lambda job_id, *_args, **_kwargs: CursorTurnResult(
+                "started", None
+            ),
+        ),
+    ):
+        cursor_turn(
+            CursorTurnRequest(
+                "fix a local bug",
+                harness_kind=HarnessKind.OPENCODE,
+            ),
+            integrations=registry,
+        )
+        later = start_job("another local bug", foreground=False, integrations=registry)
+
+    jobs = store.list()
+    assert any(job.harness_kind == HarnessKind.OPENCODE for job in jobs)
+    assert store.get(later).harness_kind == HarnessKind.CURSOR

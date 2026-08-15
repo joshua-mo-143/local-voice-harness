@@ -159,6 +159,7 @@ class CursorTurnRequest:
     reference: str | None = None
     expected_question_id: str | None = None
     expected_question_turn: str | None = None
+    harness_kind: HarnessKind | None = None
     answer_provenance: AnswerProvenance = AnswerProvenance.USER_TEXT
     expected_parent_revision: int | None = None
     expected_completed_at: float | None = None
@@ -373,7 +374,12 @@ def _build_start_job(
             )
         )
     )
-    harness_kind = request.harness_kind or HarnessKind.CURSOR
+    if request.harness_kind is not None:
+        harness_kind = request.harness_kind
+    elif isinstance(registry.platform, PlatformSettings):
+        harness_kind = HarnessKind(registry.platform.default_harness)
+    else:
+        harness_kind = HarnessKind.CURSOR
     require_harness_capabilities(
         harness_kind,
         provider=issue_provider,
@@ -2608,6 +2614,7 @@ def cursor_turn(
     action: str = "submit",
     job_id: str | None = None,
     reference: str | None = None,
+    harness_kind: HarnessKind | None = None,
     delivery_claims: DeliveryClaims | None = None,
     platform: PlatformSettings | None = None,
     integrations: IntegrationRegistry | None = None,
@@ -2642,6 +2649,7 @@ def cursor_turn(
         reference = request.reference
         expected_question_id = request.expected_question_id
         expected_question_turn = request.expected_question_turn
+        harness_kind = request.harness_kind
         answer_provenance = request.answer_provenance
         expected_completed_at = request.expected_completed_at
         expected_parent_revision = request.expected_parent_revision
@@ -2810,6 +2818,7 @@ def cursor_turn(
                 context_repository=context_repository,
                 issue_key=issue_key,
                 foreground=not extraction.batch_requested,
+                harness_kind=harness_kind,
             )
             outcomes = _submit_extracted_targets(
                 extraction,
@@ -2857,6 +2866,7 @@ def cursor_turn(
                 utterance=utterance,
                 context_repository=context_repository,
                 issue_key=issue_key,
+                harness_kind=harness_kind,
                 foreground_seconds=runtime.cursor_foreground_seconds,
                 integrations=registry,
             )

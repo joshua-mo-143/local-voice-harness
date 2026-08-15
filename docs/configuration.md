@@ -75,6 +75,7 @@ cursor_agent_inactivity_seconds = 900
 cursor_agent_max_runtime_seconds = 3600
 cursor_mcp_auth_source = ""
 agent_job_start_concurrency = 3
+default_harness = "cursor"
 
 [announcements]
 mode = "all"
