@@ -639,8 +639,6 @@ def _finish_github_issue_creation(
             completed_at=now,
             github_issue=issue.number,
             github_issue_url=url,
-            github_issue_created_number=issue.number,
-            github_issue_created_url=url,
             github_issue_create_operation_state="created",
             worker_pid=None,
             worker_boot_id=None,
@@ -1699,6 +1697,11 @@ def _prepare_pull_request_checkout(
                         checkpoint()
                     continue
                 raise
+            if checked_out_branch != branch:
+                raise HarnessError(
+                    "checked-out pull-request branch does not match the planned "
+                    "worktree branch"
+                )
             break
         if checkpoint is not None:
             checkpoint()
@@ -1723,7 +1726,6 @@ def _prepare_pull_request_checkout(
 
     def ready(current: CursorJob) -> CursorJob:
         return current.evolve(
-            pull_request_branch=checked_out_branch or branch,
             pull_request_worktree_state="ready",
             pull_request_worktree_error=None,
         )
@@ -3159,7 +3161,6 @@ def _advance_workflow_output(
                     classification_reason[:500],
                 ),
                 prompt_operation_state="none",
-                review_approved=False,
                 review_decision=None,
                 review_approval_source=None,
             ),
@@ -3280,7 +3281,6 @@ def _advance_workflow_output(
                     prompt_operation_state="none",
                     job_changes={
                         "review_artifact": reference,
-                        "review_approved": True,
                         "review_decision": "approve",
                         "review_approval_source": "reviewer",
                         "plan_approval_state": "awaiting",
@@ -3479,7 +3479,6 @@ def _advance_workflow_output(
                     plan_artifact=None,
                     review_artifact=None,
                     prompt_operation_state="none",
-                    review_approved=False,
                     review_decision=None,
                     review_approval_source=None,
                     plan_approval_state="none",

@@ -574,6 +574,8 @@ class GitHubProviderStateTests(unittest.TestCase):
         }
 
         nested = dump_github_provider_state(flat)
+        expected = dict(flat)
+        expected.pop("pull_request_branch")
 
         self.assertEqual(nested["version"], 1)
         self.assertEqual(
@@ -585,17 +587,70 @@ class GitHubProviderStateTests(unittest.TestCase):
             {
                 "number": 7,
                 "worktree_state": "ready",
-                "branch": "voice/pr",
                 "worktree_error": None,
                 "remote_url": "https://github.com/source/project",
                 "head_ref": "refs/pull/7/head",
                 "head_oid": "a" * 40,
             },
         )
-        self.assertEqual(load_github_provider_state(nested), flat)
+        self.assertEqual(load_github_provider_state(nested), expected)
         self.assertEqual(
-            GitHubProvider.load_state(GitHubProvider.dump_state(flat)), flat
+            GitHubProvider.load_state(GitHubProvider.dump_state(flat)), expected
         )
+
+    def test_legacy_pull_request_branch_still_imports(self) -> None:
+        nested = {
+            "version": 1,
+            "pull_request": {
+                "number": 7,
+                "branch": "voice/pr",
+                "worktree_state": "ready",
+            },
+        }
+
+        loaded = load_github_provider_state(nested)
+        self.assertEqual(loaded["pull_request_branch"], "voice/pr")
+        self.assertEqual(loaded["github_pull_request"], 7)
+
+    def test_legacy_created_identity_loads_and_native_dump_omits_mirrors(
+        self,
+    ) -> None:
+        nested = {
+            "version": 1,
+            "repository": {"name": "source/project"},
+            "issue": {
+                "number": 42,
+                "url": "https://github.com/source/project/issues/42",
+            },
+            "issue_creation": {
+                "requested": True,
+                "created_number": 42,
+                "created_url": "https://github.com/source/project/issues/42",
+            },
+        }
+
+        loaded = load_github_provider_state(nested)
+        self.assertEqual(loaded["github_issue"], 42)
+        self.assertEqual(loaded["github_issue_created_number"], 42)
+        self.assertEqual(
+            loaded["github_issue_created_url"],
+            "https://github.com/source/project/issues/42",
+        )
+
+        dumped = dump_github_provider_state(loaded)
+        self.assertEqual(
+            dumped["issue"],
+            {
+                "number": 42,
+                "url": "https://github.com/source/project/issues/42",
+            },
+        )
+        creation = dumped.get("issue_creation")
+        self.assertIsInstance(creation, dict)
+        assert isinstance(creation, dict)
+        self.assertEqual(creation.get("requested"), True)
+        self.assertNotIn("created_number", creation)
+        self.assertNotIn("created_url", creation)
 
     def test_malformed_provider_state_is_rejected(self) -> None:
         malformed = (

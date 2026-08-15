@@ -1322,13 +1322,26 @@ def load_github_provider_state(state: Mapping[str, object]) -> dict[str, object]
     return flattened
 
 
+_GITHUB_STATE_DERIVED_FIELDS = frozenset(
+    {
+        "github_issue_created_number",
+        "github_issue_created_url",
+        "pull_request_branch",
+    }
+)
+
+
 def dump_github_provider_state(state: Mapping[str, object]) -> dict[str, object]:
     """Serialize GitHub provider fields as clearly nested durable v1 state."""
 
     flat = load_github_provider_state(state)
     serialized: dict[str, object] = {"version": _GITHUB_STATE_VERSION}
     for section_name, fields in _GITHUB_STATE_SECTIONS.items():
-        section = {name: flat[field] for name, field in fields.items() if field in flat}
+        section = {
+            name: flat[field]
+            for name, field in fields.items()
+            if field in flat and field not in _GITHUB_STATE_DERIVED_FIELDS
+        }
         if section:
             serialized[section_name] = section
     return serialized

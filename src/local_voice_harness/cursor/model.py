@@ -12,6 +12,7 @@ from ..integrations.github import (
     GITHUB_PROVIDER_STATE_FIELDS,
     GitHubError,
     dump_github_provider_state,
+    github_issue_from_url,
     load_github_provider_state,
 )
 from ..job_lifecycle import (
@@ -926,24 +927,69 @@ def _pair_announcement_ack(values: dict[str, object]) -> None:
         values["announcement_ack"] = AnnouncementAck.PENDING.value
 
 
+def _legacy_announcement_ack_from_dismissal(values: dict[str, object]) -> str:
+    return (
+        AnnouncementAck.DISMISSED.value
+        if values.get("announcement_dismissed")
+        else AnnouncementAck.SPOKEN.value
+    )
+
+
 def _default_announcement_ack(values: dict[str, object]) -> None:
     ack = values.get("announcement_ack")
     if ack in ANNOUNCEMENT_ACK_STATES:
         if values.get("delivered") and ack == AnnouncementAck.PENDING.value:
-            values["announcement_ack"] = (
-                AnnouncementAck.DISMISSED.value
-                if values.get("announcement_dismissed")
-                else AnnouncementAck.SPOKEN.value
-            )
+            values["announcement_ack"] = _legacy_announcement_ack_from_dismissal(values)
         return
     if values.get("delivered"):
-        values["announcement_ack"] = (
-            AnnouncementAck.DISMISSED.value
-            if values.get("announcement_dismissed")
-            else AnnouncementAck.SPOKEN.value
-        )
+        values["announcement_ack"] = _legacy_announcement_ack_from_dismissal(values)
         return
     values["announcement_ack"] = AnnouncementAck.PENDING.value
+
+
+def _canonicalize_announcement_dismissal(
+    values: dict[str, object], *, legacy_record: bool
+) -> None:
+    """Translate legacy dismissal, fail closed on conflict, then drop the mirror."""
+
+    raw_ack = values.get("announcement_ack")
+    dismissed_present = "announcement_dismissed" in values
+    dismissed = (
+        bool(values.get("announcement_dismissed")) if dismissed_present else None
+    )
+    if (
+        dismissed_present
+        and raw_ack in ANNOUNCEMENT_ACK_STATES
+        and dismissed != (raw_ack == AnnouncementAck.DISMISSED.value)
+        and not (
+            legacy_record
+            and values.get("delivered")
+            and raw_ack == AnnouncementAck.PENDING.value
+        )
+    ):
+        raise JobValidationError("dismissal state and acknowledgement must match")
+    _default_announcement_ack(values)
+    values.pop("announcement_dismissed", None)
+
+
+def _canonicalize_review_approval(
+    values: dict[str, object], *, legacy_record: bool
+) -> None:
+    """Translate legacy approval boolean, fail closed on conflict, then drop it."""
+
+    approved_present = "review_approved" in values
+    source_present = "review_approval_source" in values
+    approved = bool(values.get("review_approved")) if approved_present else None
+    source = values.get("review_approval_source")
+    if approved_present and source_present and approved != (source is not None):
+        raise JobValidationError("review approval and approval source must be paired")
+    if approved_present and not source_present and approved:
+        if not legacy_record:
+            raise JobValidationError(
+                "current-schema review approval requires explicit approval source"
+            )
+        values["review_approval_source"] = "reviewer"
+    values.pop("review_approved", None)
 
 
 def _pair_worker_ownership(values: dict[str, object]) -> None:
@@ -969,9 +1015,78 @@ def _infer_legacy_issue_provider(values: Mapping[str, object]) -> str | None:
         # Historically issue_key was exclusively owned by the Linear
         # integration. GitHub fields could also be present as captured context.
         return "linear"
-    if values.get("github_issue") is not None:
+    if (
+        values.get("github_issue") is not None
+        or values.get("github_issue_created_number") is not None
+    ):
         return "github"
     return None
+
+
+def _canonicalize_github_issue_creation_identity(values: dict[str, object]) -> None:
+    """Translate legacy created identity, fail closed on conflict, then drop it."""
+
+    created_number = values.get("github_issue_created_number")
+    created_url = values.get("github_issue_created_url")
+    issue = values.get("github_issue")
+    url = values.get("github_issue_url")
+    repository = values.get("github_repository")
+    if created_number is not None:
+        created_number = _integer(created_number, "github_issue_created_number")
+    if issue is not None:
+        issue = _integer(issue, "github_issue")
+    parsed_urls = []
+    for field, candidate in (
+        ("github_issue_url", url),
+        ("github_issue_created_url", created_url),
+    ):
+        if candidate is None:
+            continue
+        parsed = github_issue_from_url(str(candidate))
+        if parsed is None:
+            raise JobValidationError(f"{field} must be an exact GitHub issue URL")
+        parsed_urls.append(parsed)
+    repositories = {
+        candidate.casefold()
+        for candidate in (
+            str(repository) if repository is not None else None,
+            *(parsed.name_with_owner for parsed in parsed_urls),
+        )
+        if candidate is not None
+    }
+    numbers = {
+        candidate
+        for candidate in (
+            issue,
+            created_number,
+            *(parsed.number for parsed in parsed_urls),
+        )
+        if candidate is not None
+    }
+    if len(repositories) > 1 or len(numbers) > 1:
+        raise JobValidationError(
+            "created GitHub issue identity must match canonical issue identity"
+        )
+    if created_number is not None and issue is None:
+        values["github_issue"] = created_number
+    if created_url is not None and url is None:
+        values["github_issue_url"] = str(created_url)
+    values.pop("github_issue_created_number", None)
+    values.pop("github_issue_created_url", None)
+
+
+def _canonicalize_pull_request_branch(values: dict[str, object]) -> None:
+    """Translate legacy PR branch, fail closed on conflict, then drop the mirror."""
+
+    stored = values.get("pull_request_branch")
+    planned = values.get("worktree_branch")
+    if stored is not None and planned is not None and str(stored) != str(planned):
+        raise JobValidationError(
+            "pull-request branch must match the planned worktree branch"
+        )
+    if stored is not None and planned is None:
+        values["worktree_branch"] = str(stored)
+    values.pop("pull_request_branch", None)
 
 
 def _default_participant_admission_state(values: Mapping[str, object]) -> str:
@@ -1048,9 +1163,18 @@ def migrate_job_record(raw: Mapping[str, object]) -> tuple[dict[str, object], in
             "participant_admission_state",
             _default_participant_admission_state(values),
         )
-        _default_announcement_ack(values)
     values.setdefault("session_control", SessionControlMode.AUTOMATED.value)
     values.setdefault("session_control_generation", 0)
+    _canonicalize_announcement_dismissal(
+        values,
+        legacy_record=loaded_version < CURRENT_SCHEMA_VERSION,
+    )
+    _canonicalize_review_approval(
+        values,
+        legacy_record=loaded_version < CURRENT_SCHEMA_VERSION,
+    )
+    _canonicalize_github_issue_creation_identity(values)
+    _canonicalize_pull_request_branch(values)
     values["schema_version"] = CURRENT_SCHEMA_VERSION
     return values, loaded_version
 
@@ -2426,11 +2550,15 @@ class AgentJob:
 
     @property
     def github_issue_created_number(self) -> int | None:
-        return self._optional_int("github_issue_created_number")
+        if not self.github_issue_create_requested:
+            return None
+        return self.github_issue
 
     @property
     def github_issue_created_url(self) -> str | None:
-        return self._optional_string("github_issue_created_url")
+        if not self.github_issue_create_requested:
+            return None
+        return self.github_issue_url
 
     @property
     def linear_ticket_create_requested(self) -> bool:
@@ -2549,7 +2677,11 @@ class AgentJob:
 
     @property
     def pull_request_branch(self) -> str | None:
-        return self._optional_string("pull_request_branch")
+        if self.github_pull_request is None:
+            return None
+        if self.pull_request_worktree_state not in {"ready", "retained"}:
+            return None
+        return self.worktree_branch
 
     @property
     def pull_request_worktree_error(self) -> str | None:
@@ -2591,14 +2723,14 @@ class AgentJob:
         if self.delivered:
             return (
                 AnnouncementAck.DISMISSED.value
-                if self.announcement_dismissed
+                if self._values.get("announcement_dismissed")
                 else AnnouncementAck.SPOKEN.value
             )
         return AnnouncementAck.PENDING.value
 
     @property
     def announcement_dismissed(self) -> bool:
-        return self._boolean_field("announcement_dismissed")
+        return self.announcement_ack == AnnouncementAck.DISMISSED.value
 
     @property
     def announcement_repeated(self) -> bool:
@@ -3043,7 +3175,7 @@ class AgentJob:
 
     @property
     def review_approved(self) -> bool:
-        return self._boolean_field("review_approved")
+        return self.review_approval_source is not None
 
     @property
     def review_decision(self) -> str | None:
@@ -3147,7 +3279,6 @@ class AgentJob:
             review_decision=(
                 review.decision.value if review.decision is not None else None
             ),
-            review_approved=review.approved,
             review_approval_source=(
                 review.approval_source.value
                 if review.approval_source is not None
@@ -3576,7 +3707,6 @@ class AgentJob:
                 attempts=self.delivery_attempts,
                 delivered_at=self.delivered_at,
                 acknowledgement=self.announcement_ack,
-                dismissed=self.announcement_dismissed,
                 repeated=self.announcement_repeated,
             )
         except LifecycleTransitionError as exc:

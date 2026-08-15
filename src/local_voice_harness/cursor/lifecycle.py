@@ -257,14 +257,11 @@ def cleanup_fields(state: CleanupState) -> CleanupFields:
 @dataclass(frozen=True, slots=True)
 class AnnouncementState:
     acknowledgement: AnnouncementAck
-    dismissed: bool
-    repeated: bool
+    repeated: bool = False
 
-    def __post_init__(self) -> None:
-        if self.dismissed != (self.acknowledgement == AnnouncementAck.DISMISSED):
-            raise LifecycleTransitionError(
-                "dismissal state and acknowledgement must match"
-            )
+    @property
+    def dismissed(self) -> bool:
+        return self.acknowledgement == AnnouncementAck.DISMISSED
 
 
 def acknowledge_announcement(
@@ -293,21 +290,17 @@ def acknowledge_announcement(
     }
     if acknowledgement not in allowed[state.acknowledgement]:
         raise LifecycleTransitionError("announcement acknowledgement is already final")
-    return replace(
-        state,
-        acknowledgement=acknowledgement,
-        dismissed=acknowledgement == AnnouncementAck.DISMISSED,
-    )
+    return replace(state, acknowledgement=acknowledgement)
 
 
 def dismiss_announcement(state: AnnouncementState) -> AnnouncementState:
-    if state.dismissed and state.acknowledgement == AnnouncementAck.DISMISSED:
+    if state.acknowledgement == AnnouncementAck.DISMISSED:
         raise LifecycleTransitionError("announcement is already dismissed")
-    return AnnouncementState(AnnouncementAck.DISMISSED, True, state.repeated)
+    return AnnouncementState(AnnouncementAck.DISMISSED, state.repeated)
 
 
 def repeat_announcement(state: AnnouncementState) -> AnnouncementState:
-    return AnnouncementState(AnnouncementAck.PENDING, False, True)
+    return AnnouncementState(AnnouncementAck.PENDING, True)
 
 
 @dataclass(frozen=True, slots=True)
@@ -349,8 +342,8 @@ def load_delivery_state(
     attempts: int,
     delivered_at: float | None,
     acknowledgement: str,
-    dismissed: bool,
     repeated: bool,
+    dismissed: bool | None = None,
 ) -> DeliveryState:
     try:
         ack = AnnouncementAck(acknowledgement)
@@ -358,7 +351,9 @@ def load_delivery_state(
         raise LifecycleTransitionError(
             "announcement acknowledgement is invalid"
         ) from exc
-    announcement = AnnouncementState(ack, dismissed, repeated)
+    announcement = AnnouncementState(ack, repeated)
+    if dismissed is not None and dismissed != announcement.dismissed:
+        raise LifecycleTransitionError("dismissal state and acknowledgement must match")
     if bool(claim_token) != (claimed_at is not None):
         raise LifecycleTransitionError(
             "delivery claim token and timestamp must be paired"
@@ -392,7 +387,7 @@ def prepare_delivery(state: DeliveryState) -> PendingDelivery:
         state.generation + 1,
         0,
         0,
-        AnnouncementState(AnnouncementAck.PENDING, False, state.announcement.repeated),
+        AnnouncementState(AnnouncementAck.PENDING, state.announcement.repeated),
     )
 
 
@@ -468,7 +463,6 @@ def acknowledge_without_claim(
     if announcement.acknowledgement != AnnouncementAck.PENDING:
         announcement = AnnouncementState(
             AnnouncementAck.PENDING,
-            False,
             announcement.repeated,
         )
     announcement = acknowledge_announcement(announcement, acknowledgement)
@@ -493,7 +487,6 @@ def delivery_fields(state: DeliveryState) -> dict[str, object]:
         "delivery_generation": state.generation,
         "delivery_attempts": state.attempts,
         "announcement_ack": state.announcement.acknowledgement.value,
-        "announcement_dismissed": state.announcement.dismissed,
         "announcement_repeated": state.announcement.repeated,
         "delivery_claim_token": None,
         "delivery_claimed_at": None,

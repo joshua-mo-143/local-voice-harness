@@ -2626,6 +2626,8 @@ class CursorJobStateTests(unittest.TestCase):
         self.assertEqual(updated["status"], "completed", updated)
         self.assertEqual(updated["worktree_path"], str(worktree))
         self.assertEqual(updated["pull_request_worktree_state"], "retained")
+        self.assertEqual(updated["worktree_branch"], "voice/github-pr-123456789abc")
+        self.assertNotIn("pull_request_branch", updated)
 
     def test_pull_request_shared_clone_is_quarantined_without_checkout(self) -> None:
         repository = Path(self.temporary.name) / "source" / "project"
@@ -2715,6 +2717,8 @@ class CursorJobStateTests(unittest.TestCase):
         self.assertEqual(updated["pull_request_head_ref"], "refs/pull/42/head")
         self.assertEqual(updated["pull_request_head_oid"], "a" * 40)
         self.assertEqual(updated["pull_request_worktree_state"], "ready")
+        self.assertEqual(updated["worktree_branch"], "voice/github-pr-123456789abc")
+        self.assertNotIn("pull_request_branch", updated)
 
     def test_pull_request_head_move_is_re_resolved_once_before_quarantine(
         self,
@@ -2813,6 +2817,63 @@ class CursorJobStateTests(unittest.TestCase):
             jobs.read_job("123456789abc")["pull_request_worktree_state"],
             "quarantined",
         )
+
+    def test_pull_request_checkout_mismatch_is_quarantined(self) -> None:
+        repository = Path(self.temporary.name) / "source" / "project"
+        worktree = Path(self.temporary.name) / "worktrees" / "mismatch-pr"
+        worktree.mkdir(parents=True)
+        (worktree / ".git").write_text("gitdir: shared\n")
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "status": "routing",
+                "worker_token": "worker",
+                "worker_pid": 42,
+                "worker_process_start": "worker-start",
+                "worker_claim_operation": "test",
+                "worker_claimed_at": 1,
+                "repository": str(repository),
+                "worktree_path": str(worktree),
+                "github_repository": "source/project",
+                "github_pull_request": 42,
+                "worktree_branch": "voice/github-pr-123456789abc",
+                "pull_request_worktree_state": "provisioning",
+                "pull_request_remote_url": "https://github.com/source/project",
+                "pull_request_head_ref": "refs/pull/42/head",
+                "pull_request_head_oid": "a" * 40,
+            }
+        )
+        github = mock.Mock()
+        github.inspect_repository.return_value = GitHubRepository(
+            "source/project",
+            "https://github.com/source/project",
+            False,
+            "main",
+        )
+        github.pull_request_details.return_value = {"headRefOid": "a" * 40}
+        github.local_git.checkout_remote_ref.return_value = "voice/other-branch"
+
+        with (
+            mock.patch.object(jobs, "GitHubClient", return_value=github),
+            self.assertRaisesRegex(jobs.HarnessError, "does not match"),
+        ):
+            jobs._prepare_pull_request_checkout(
+                "123456789abc",
+                LEGACY_WORKER,
+                jobs.read_job("123456789abc"),
+            )
+
+        updated = jobs.read_job("123456789abc")
+        self.assertEqual(updated["pull_request_worktree_state"], "quarantined")
+        self.assertIn("does not match", str(updated.get("pull_request_worktree_error")))
+        self.assertEqual(updated["worktree_branch"], "voice/github-pr-123456789abc")
+        self.assertNotIn("pull_request_branch", updated)
+        self.assertEqual(
+            updated["pull_request_remote_url"],
+            "https://github.com/source/project",
+        )
+        self.assertEqual(updated["pull_request_head_ref"], "refs/pull/42/head")
+        self.assertEqual(updated["pull_request_head_oid"], "a" * 40)
 
     def test_concurrent_pull_requests_prepare_distinct_worktrees(self) -> None:
         repository = Path(self.temporary.name) / "source" / "project"
@@ -3218,8 +3279,14 @@ class CursorJobStateTests(unittest.TestCase):
 
         updated = jobs.read_job("123456789abc")
         self.assertEqual(updated["status"], "completed")
-        self.assertEqual(updated["github_issue_created_number"], 42)
+        self.assertEqual(updated["github_issue"], 42)
+        self.assertEqual(
+            updated["github_issue_url"],
+            "https://github.com/source/project/issues/42",
+        )
         self.assertEqual(updated["github_issue_create_operation_state"], "created")
+        self.assertNotIn("github_issue_created_number", updated)
+        self.assertNotIn("github_issue_created_url", updated)
         herdr.assert_not_called()
 
     def test_stale_same_owner_issue_submission_result_is_rejected(self) -> None:
@@ -3370,7 +3437,8 @@ class CursorJobStateTests(unittest.TestCase):
         retried = jobs.read_job("123456789abc")
         self.assertEqual(retried["status"], "completed")
         self.assertEqual(retried["github_issue_create_operation_state"], "created")
-        self.assertEqual(retried["github_issue_created_number"], 42)
+        self.assertEqual(retried["github_issue"], 42)
+        self.assertNotIn("github_issue_created_number", retried)
         self.assertEqual(github.submit_issue.call_count, 2)
         self.assertEqual(github.observe_issue.call_count, 1)
 

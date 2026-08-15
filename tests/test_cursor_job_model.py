@@ -14,7 +14,11 @@ from local_voice_harness.cursor.model import (
     transition,
     validate_reservations,
 )
-from local_voice_harness.cursor.workflow import LegacyPlanApprovalProof
+from local_voice_harness.cursor.workflow import (
+    ArtifactReference,
+    LegacyPlanApprovalProof,
+    ReviewDecision,
+)
 from local_voice_harness.job_lifecycle import ReconcilingJob
 
 
@@ -344,10 +348,122 @@ class CursorJobModelTests(unittest.TestCase):
 
         self.assertEqual(job.speakable_label, "issue 42")
         self.assertTrue(job.announcement_dismissed)
+        self.assertEqual(job.announcement_ack, "dismissed")
         self.assertTrue(job.announcement_repeated)
+        self.assertNotIn("announcement_dismissed", job.to_dict())
         reloaded = CursorJob.from_dict(job.to_dict())
         self.assertEqual(reloaded.speakable_label, "issue 42")
         self.assertTrue(reloaded.announcement_dismissed)
+        self.assertEqual(reloaded.announcement_ack, "dismissed")
+        self.assertNotIn("announcement_dismissed", reloaded.to_dict())
+
+    def test_legacy_boolean_only_dismissal_imports_to_acknowledgement(self) -> None:
+        job = CursorJob.from_dict(
+            {
+                "schema_version": 14,
+                "id": "123456789abc",
+                "revision": 0,
+                "request": "do it",
+                "status": "completed",
+                "created_at": 1,
+                "completed_at": 2,
+                "result": "done",
+                "delivered": True,
+                "announcement_dismissed": True,
+            }
+        )
+
+        self.assertEqual(job.announcement_ack, "dismissed")
+        self.assertTrue(job.announcement_dismissed)
+        self.assertNotIn("announcement_dismissed", job.to_dict())
+
+    def test_legacy_pending_ack_and_dismissal_import_as_dismissed(self) -> None:
+        job = CursorJob.from_dict(
+            {
+                "schema_version": 15,
+                "id": "123456789abc",
+                "revision": 0,
+                "request": "do it",
+                "status": "completed",
+                "created_at": 1,
+                "completed_at": 2,
+                "result": "done",
+                "delivered": True,
+                "announcement_ack": "pending",
+                "announcement_dismissed": True,
+            }
+        )
+
+        self.assertEqual(job.announcement_ack, "dismissed")
+        self.assertTrue(job.announcement_dismissed)
+
+    def test_native_dismissal_cannot_disagree_with_acknowledgement(self) -> None:
+        with self.assertRaisesRegex(JobValidationError, "must match"):
+            CursorJob.from_dict(
+                {
+                    "schema_version": CURRENT_SCHEMA_VERSION,
+                    "id": "123456789abc",
+                    "revision": 0,
+                    "request": "do it",
+                    "status": "completed",
+                    "created_at": 1,
+                    "completed_at": 2,
+                    "result": "done",
+                    "delivered": True,
+                    "announcement_ack": "spoken",
+                    "announcement_dismissed": True,
+                }
+            )
+        with self.assertRaisesRegex(JobValidationError, "must match"):
+            CursorJob.from_dict(
+                {
+                    "schema_version": CURRENT_SCHEMA_VERSION,
+                    "id": "bbbbbbbbbbbb",
+                    "revision": 0,
+                    "request": "do it",
+                    "status": "completed",
+                    "created_at": 1,
+                    "completed_at": 2,
+                    "result": "done",
+                    "delivered": True,
+                    "announcement_ack": "dismissed",
+                    "announcement_dismissed": False,
+                }
+            )
+        with self.assertRaisesRegex(JobValidationError, "must match"):
+            CursorJob.from_dict(
+                {
+                    "schema_version": CURRENT_SCHEMA_VERSION,
+                    "id": "cccccccccccc",
+                    "revision": 0,
+                    "request": "do it",
+                    "status": "completed",
+                    "created_at": 1,
+                    "completed_at": 2,
+                    "result": "done",
+                    "delivered": True,
+                    "announcement_ack": "pending",
+                    "announcement_dismissed": True,
+                }
+            )
+
+    def test_native_dismiss_and_repeat_do_not_emit_dismissal_mirror(self) -> None:
+        job = self.job_for_status(JobStatus.COMPLETED)
+        dismissed = job.dismiss_announcement(delivered_at=3)
+        repeated = dismissed.repeat_announcement(now=4)
+
+        self.assertEqual(dismissed.announcement_ack, "dismissed")
+        self.assertTrue(dismissed.announcement_dismissed)
+        self.assertNotIn("announcement_dismissed", dismissed.to_dict())
+        self.assertEqual(repeated.announcement_ack, "pending")
+        self.assertFalse(repeated.announcement_dismissed)
+        self.assertNotIn("announcement_dismissed", repeated.to_dict())
+        reloaded = CursorJob.from_dict(dismissed.to_dict())
+        self.assertTrue(reloaded.announcement_dismissed)
+        self.assertEqual(
+            reloaded.announcement_ack,
+            reloaded.delivery_state.announcement.acknowledgement.value,
+        )
 
     def test_v8_job_migrates_to_finished_simple_workflow(self) -> None:
         job = CursorJob.from_dict(
@@ -405,6 +521,205 @@ class CursorJobModelTests(unittest.TestCase):
             CursorJob.from_dict(job.to_dict()).plan_approval,
             job.plan_approval,
         )
+        self.assertTrue(job.review_approved)
+        self.assertNotIn("review_approved", job.to_dict())
+
+    def test_legacy_review_boolean_imports_to_approval_source(self) -> None:
+        job = CursorJob.from_dict(
+            {
+                "schema_version": 9,
+                "id": "123456789abc",
+                "revision": 0,
+                "request": "change recovery",
+                "status": "queued",
+                "created_at": 1,
+                "queued_at": 1,
+                "delivered": False,
+                "workflow_tier": "medium",
+                "workflow_classification_reason": "recovery",
+                "workflow_phase": "reviewing",
+                "review_round": 0,
+                "plan_artifact": ".artifacts/123456789abc/plan-0.json",
+                "review_artifact": ".artifacts/123456789abc/review-0.json",
+                "review_decision": "approve",
+                "review_approved": True,
+            }
+        )
+
+        self.assertEqual(job.review_approval_source, "reviewer")
+        self.assertTrue(job.review_approved)
+        self.assertNotIn("review_approved", job.to_dict())
+
+    def test_native_review_boolean_cannot_create_reviewer_provenance(self) -> None:
+        with self.assertRaisesRegex(JobValidationError, "explicit approval source"):
+            CursorJob.from_dict(
+                {
+                    "schema_version": CURRENT_SCHEMA_VERSION,
+                    "id": "123456789abc",
+                    "revision": 0,
+                    "request": "change recovery",
+                    "status": "queued",
+                    "created_at": 1,
+                    "queued_at": 1,
+                    "delivered": False,
+                    "workflow_tier": "medium",
+                    "workflow_classification_reason": "recovery",
+                    "workflow_phase": "reviewing",
+                    "review_round": 0,
+                    "plan_artifact": ".artifacts/123456789abc/plan-0.json",
+                    "review_artifact": ".artifacts/123456789abc/review-0.json",
+                    "review_decision": "approve",
+                    "review_approved": True,
+                }
+            )
+
+    def test_native_review_approval_cannot_disagree_with_source(self) -> None:
+        with self.assertRaisesRegex(JobValidationError, "must be paired"):
+            CursorJob.from_dict(
+                {
+                    "schema_version": CURRENT_SCHEMA_VERSION,
+                    "id": "123456789abc",
+                    "revision": 0,
+                    "request": "change recovery",
+                    "status": "queued",
+                    "created_at": 1,
+                    "queued_at": 1,
+                    "delivered": False,
+                    "workflow_tier": "medium",
+                    "workflow_classification_reason": "recovery",
+                    "workflow_phase": "reviewing",
+                    "review_round": 0,
+                    "plan_artifact": ".artifacts/123456789abc/plan-0.json",
+                    "review_artifact": ".artifacts/123456789abc/review-0.json",
+                    "review_decision": "approve",
+                    "review_approved": True,
+                    "review_approval_source": None,
+                }
+            )
+        with self.assertRaisesRegex(JobValidationError, "must be paired"):
+            CursorJob.from_dict(
+                {
+                    "schema_version": CURRENT_SCHEMA_VERSION,
+                    "id": "bbbbbbbbbbbb",
+                    "revision": 0,
+                    "request": "change recovery",
+                    "status": "queued",
+                    "created_at": 1,
+                    "queued_at": 1,
+                    "delivered": False,
+                    "workflow_tier": "medium",
+                    "workflow_classification_reason": "recovery",
+                    "workflow_phase": "reviewing",
+                    "review_round": 0,
+                    "plan_artifact": ".artifacts/123456789abc/plan-0.json",
+                    "review_artifact": ".artifacts/123456789abc/review-0.json",
+                    "review_decision": "approve",
+                    "review_approved": False,
+                    "review_approval_source": "reviewer",
+                }
+            )
+
+    def test_reviewer_approval_still_requires_decision_and_artifact(self) -> None:
+        with self.assertRaisesRegex(JobValidationError, "approving review decision"):
+            CursorJob.from_dict(
+                {
+                    "schema_version": CURRENT_SCHEMA_VERSION,
+                    "id": "123456789abc",
+                    "revision": 0,
+                    "request": "change recovery",
+                    "status": "queued",
+                    "created_at": 1,
+                    "queued_at": 1,
+                    "delivered": False,
+                    "workflow_tier": "medium",
+                    "workflow_classification_reason": "recovery",
+                    "workflow_phase": "reviewing",
+                    "review_round": 0,
+                    "plan_artifact": ".artifacts/123456789abc/plan-0.json",
+                    "review_artifact": ".artifacts/123456789abc/review-0.json",
+                    "review_decision": "revise",
+                    "review_approval_source": "reviewer",
+                }
+            )
+        with self.assertRaisesRegex(JobValidationError, "review artifact"):
+            CursorJob.from_dict(
+                {
+                    "schema_version": CURRENT_SCHEMA_VERSION,
+                    "id": "bbbbbbbbbbbb",
+                    "revision": 0,
+                    "request": "change recovery",
+                    "status": "queued",
+                    "created_at": 1,
+                    "queued_at": 1,
+                    "delivered": False,
+                    "workflow_tier": "medium",
+                    "workflow_classification_reason": "recovery",
+                    "workflow_phase": "reviewing",
+                    "review_round": 0,
+                    "plan_artifact": ".artifacts/bbbbbbbbbbbb/plan-0.json",
+                    "review_decision": "approve",
+                    "review_approval_source": "reviewer",
+                }
+            )
+
+    def test_user_override_still_requires_exhausted_high_risk_proof(self) -> None:
+        with self.assertRaisesRegex(JobValidationError, "exhausted high-risk"):
+            CursorJob.from_dict(
+                {
+                    "schema_version": CURRENT_SCHEMA_VERSION,
+                    "id": "123456789abc",
+                    "revision": 0,
+                    "request": "change recovery",
+                    "status": "queued",
+                    "created_at": 1,
+                    "queued_at": 1,
+                    "delivered": False,
+                    "workflow_tier": "high-risk",
+                    "workflow_classification_reason": "recovery",
+                    "workflow_phase": "reviewing",
+                    "review_round": 1,
+                    "plan_artifact": ".artifacts/123456789abc/plan-1.json",
+                    "review_artifact": ".artifacts/123456789abc/review-1.json",
+                    "review_decision": "revise",
+                    "review_approval_source": "user",
+                }
+            )
+
+    def test_native_review_transition_does_not_emit_approval_boolean(self) -> None:
+        job = CursorJob.from_dict(
+            {
+                "schema_version": CURRENT_SCHEMA_VERSION,
+                "id": "123456789abc",
+                "revision": 0,
+                "request": "change recovery",
+                "status": "queued",
+                "created_at": 1,
+                "queued_at": 1,
+                "delivered": False,
+                "workflow_tier": "medium",
+                "workflow_classification_reason": "recovery",
+                "workflow_phase": "reviewing",
+                "review_round": 0,
+                "plan_artifact": ".artifacts/123456789abc/plan-0.json",
+            }
+        )
+        approved = job.evolve_review(
+            job.review_state.publish_review(
+                ArtifactReference.parse(
+                    ".artifacts/123456789abc/review-0.json",
+                    job_id=job.id,
+                    kind="review",
+                ),
+                ReviewDecision.APPROVE,
+            )
+        )
+
+        self.assertTrue(approved.review_approved)
+        self.assertEqual(approved.review_approval_source, "reviewer")
+        self.assertNotIn("review_approved", approved.to_dict())
+        reloaded = CursorJob.from_dict(approved.to_dict())
+        self.assertTrue(reloaded.review_approved)
+        self.assertEqual(reloaded.review_state.approved, reloaded.review_approved)
 
     def test_v9_exhausted_review_migrates_to_explicit_clarification(self) -> None:
         job = CursorJob.from_dict(
@@ -797,6 +1112,191 @@ class CursorJobModelTests(unittest.TestCase):
 
         self.assertEqual(job.schema_version, CURRENT_SCHEMA_VERSION)
         self.assertFalse(job.plan_approval_completion_pending)
+
+    def _github_issue_create_job(self, **fields: object) -> CursorJob:
+        values: dict[str, object] = {
+            "schema_version": CURRENT_SCHEMA_VERSION,
+            "id": "123456789abc",
+            "revision": 0,
+            "request": "create an issue",
+            "status": "completed",
+            "created_at": 1,
+            "completed_at": 2,
+            "result": "Created GitHub issue example/project#42.",
+            "delivered": False,
+            "issue_provider": "github",
+            "github_repository": "example/project",
+            "github_issue_create_requested": True,
+            "github_issue_create_confirmed": True,
+            "github_issue_create_title": "Fix startup",
+            "github_issue_create_marker": "a" * 32,
+            "github_issue_create_operation_state": "created",
+            "github_issue": 42,
+            "github_issue_url": "https://github.com/example/project/issues/42",
+        }
+        values.update(fields)
+        return CursorJob.from_dict(values)
+
+    def test_legacy_created_issue_identity_imports_to_canonical_fields(self) -> None:
+        job = self._github_issue_create_job(
+            schema_version=16,
+            github_issue=None,
+            github_issue_url=None,
+            github_issue_created_number=42,
+            github_issue_created_url="https://github.com/example/project/issues/42",
+        )
+
+        self.assertEqual(job.github_issue, 42)
+        self.assertEqual(
+            job.github_issue_url,
+            "https://github.com/example/project/issues/42",
+        )
+        self.assertEqual(job.github_issue_created_number, 42)
+        self.assertEqual(
+            job.github_issue_created_url,
+            "https://github.com/example/project/issues/42",
+        )
+        self.assertNotIn("github_issue_created_number", job.to_dict())
+        self.assertNotIn("github_issue_created_url", job.to_dict())
+
+    def test_native_created_issue_identity_cannot_disagree_with_canonical(
+        self,
+    ) -> None:
+        with self.assertRaisesRegex(JobValidationError, "must match"):
+            self._github_issue_create_job(github_issue_created_number=99)
+        with self.assertRaisesRegex(JobValidationError, "must match"):
+            self._github_issue_create_job(
+                github_issue_created_url="https://github.com/example/project/issues/99",
+            )
+        with self.assertRaisesRegex(JobValidationError, "must match"):
+            self._github_issue_create_job(
+                github_issue_created_url="https://github.com/other/project/issues/42",
+            )
+        with self.assertRaisesRegex(JobValidationError, "must match"):
+            self._github_issue_create_job(
+                github_issue=None,
+                github_issue_created_number=99,
+            )
+
+    def test_native_created_issue_identity_rejects_non_issue_url(self) -> None:
+        with self.assertRaisesRegex(JobValidationError, "exact GitHub issue URL"):
+            self._github_issue_create_job(
+                github_issue_created_url="https://github.com/example/project/pull/42",
+            )
+
+    def test_successful_create_records_canonical_identity_once(self) -> None:
+        job = self._github_issue_create_job()
+
+        self.assertEqual(job.github_issue, 42)
+        self.assertEqual(job.github_issue_created_number, 42)
+        self.assertEqual(
+            job.github_issue_created_url,
+            "https://github.com/example/project/issues/42",
+        )
+        self.assertNotIn("github_issue_created_number", job.to_dict())
+        self.assertNotIn("github_issue_created_url", job.to_dict())
+        reloaded = CursorJob.from_dict(job.to_dict())
+        self.assertEqual(reloaded.github_issue, 42)
+        self.assertEqual(reloaded.github_issue_created_number, 42)
+        self.assertNotIn("github_issue_created_number", reloaded.to_dict())
+
+    def test_targeted_issue_job_is_distinct_from_create_job(self) -> None:
+        targeted = CursorJob.from_dict(
+            {
+                "schema_version": CURRENT_SCHEMA_VERSION,
+                "id": "bbbbbbbbbbbb",
+                "revision": 0,
+                "request": "work on issue 42",
+                "status": "queued",
+                "created_at": 1,
+                "queued_at": 1,
+                "delivered": False,
+                "issue_provider": "github",
+                "github_repository": "example/project",
+                "github_issue": 42,
+                "github_issue_url": "https://github.com/example/project/issues/42",
+            }
+        )
+
+        self.assertFalse(targeted.github_issue_create_requested)
+        self.assertIsNone(targeted.github_issue_create_operation_state)
+        self.assertEqual(targeted.github_issue, 42)
+        self.assertIsNone(targeted.github_issue_created_number)
+        self.assertIsNone(targeted.github_issue_created_url)
+        self.assertNotIn("github_issue_created_number", targeted.to_dict())
+
+    def _pull_request_job(self, **fields: object) -> CursorJob:
+        values: dict[str, object] = {
+            "schema_version": CURRENT_SCHEMA_VERSION,
+            "id": "123456789abc",
+            "revision": 0,
+            "request": "review pull request 42",
+            "status": "queued",
+            "created_at": 1,
+            "queued_at": 1,
+            "delivered": False,
+            "repository": "/repo",
+            "github_repository": "example/project",
+            "github_pull_request": 42,
+            "worktree_branch": "voice/github-pr-123456789abc",
+            "worktree_path": "/repo-wt",
+            "worktree_workspace_id": "workspace",
+            "worktree_root_pane_id": "root-pane",
+            "worktree_provision_state": "ready",
+            "pull_request_worktree_state": "ready",
+            "pull_request_remote_url": "https://github.com/example/project",
+            "pull_request_head_ref": "refs/pull/42/head",
+            "pull_request_head_oid": "a" * 40,
+        }
+        values.update(fields)
+        return CursorJob.from_dict(values)
+
+    def test_legacy_pull_request_branch_imports_to_worktree_branch(self) -> None:
+        job = self._pull_request_job(
+            worktree_branch=None,
+            pull_request_branch="voice/github-pr-123456789abc",
+        )
+
+        self.assertEqual(job.worktree_branch, "voice/github-pr-123456789abc")
+        self.assertEqual(job.pull_request_branch, "voice/github-pr-123456789abc")
+        self.assertNotIn("pull_request_branch", job.to_dict())
+
+    def test_native_pull_request_branch_cannot_disagree_with_worktree_branch(
+        self,
+    ) -> None:
+        with self.assertRaisesRegex(JobValidationError, "must match"):
+            self._pull_request_job(pull_request_branch="voice/other-branch")
+
+    def test_ready_pull_request_job_does_not_emit_branch_mirror(self) -> None:
+        job = self._pull_request_job()
+
+        self.assertEqual(job.worktree_branch, "voice/github-pr-123456789abc")
+        self.assertEqual(job.pull_request_branch, "voice/github-pr-123456789abc")
+        self.assertNotIn("pull_request_branch", job.to_dict())
+        reloaded = CursorJob.from_dict(job.to_dict())
+        self.assertEqual(reloaded.pull_request_branch, reloaded.worktree_branch)
+        self.assertNotIn("pull_request_branch", reloaded.to_dict())
+
+    def test_unfinished_create_states_keep_marker_without_created_identity(
+        self,
+    ) -> None:
+        for state in ("submitted", "ambiguous", "manual_required"):
+            with self.subTest(state=state):
+                job = self._github_issue_create_job(
+                    status="queued",
+                    queued_at=1,
+                    completed_at=None,
+                    result=None,
+                    github_issue=None,
+                    github_issue_url=None,
+                    github_issue_create_operation_state=state,
+                )
+                self.assertEqual(job.github_issue_create_operation_state, state)
+                self.assertEqual(job.github_issue_create_marker, "a" * 32)
+                self.assertIsNone(job.github_issue)
+                self.assertIsNone(job.github_issue_created_number)
+                self.assertIsNone(job.github_issue_created_url)
+                self.assertNotIn("github_issue_created_number", job.to_dict())
 
     def test_deferred_plan_completion_requires_durable_finished_output(self) -> None:
         with self.assertRaisesRegex(

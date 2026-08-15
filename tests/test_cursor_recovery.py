@@ -281,11 +281,18 @@ class CursorRecoveryTests(unittest.TestCase):
 
         updated = self.store.get(job.id)
         self.assertEqual(updated.status, JobStatus.COMPLETED)
+        self.assertEqual(updated.github_issue, 42)
+        self.assertEqual(
+            updated.github_issue_url,
+            "https://github.com/example/project/issues/42",
+        )
         self.assertEqual(updated.github_issue_created_number, 42)
         self.assertEqual(
             updated.github_issue_created_url,
             "https://github.com/example/project/issues/42",
         )
+        self.assertNotIn("github_issue_created_number", updated.to_dict())
+        self.assertNotIn("github_issue_created_url", updated.to_dict())
         client.submit_issue.assert_not_called()
 
     def test_unobserved_issue_creation_requires_manual_check(self) -> None:
