@@ -100,12 +100,17 @@ def _needs_cuda_packages(
     llm_device: str,
     tts_device: str,
     dictation_device: str,
+    cuda_available: bool,
 ) -> bool:
-    if dictation_device != "cpu":
+    if dictation_device == "cuda" or (dictation_device == "auto" and cuda_available):
         return True
-    if llm_provider == "local" and llm_device != "cpu":
+    if llm_provider == "local" and (
+        llm_device == "cuda" or (llm_device == "auto" and cuda_available)
+    ):
         return True
-    if tts_provider == "local" and tts_device != "cpu":
+    if tts_provider == "local" and (
+        tts_device == "cuda" or (tts_device == "auto" and cuda_available)
+    ):
         return True
     return False
 
@@ -131,6 +136,7 @@ def resolve_installation_plan(
     llm_device: str | None = None,
     tts_device: str | None = None,
     dictation_device: str | None = None,
+    cuda_available: bool = False,
 ) -> InstallationPlan:
     """Return the packages and local assets required by one install choice."""
 
@@ -149,8 +155,6 @@ def resolve_installation_plan(
         )
         if selected_profile is None and llm == "venice" and tts == "venice":
             default_device = "cpu"
-        elif selected_profile is None and (llm == "local" or tts == "local"):
-            default_device = "cuda"
         llm_compute = _compute_device(
             llm_device, label="LLM device", default=default_device
         )
@@ -173,14 +177,16 @@ def resolve_installation_plan(
         llm_device=llm_compute,
         tts_device=tts_compute,
         dictation_device=dictation_compute,
+        cuda_available=cuda_available,
     )
-    dictation_extra = "dictation-cuda" if dictation_compute != "cpu" else "dictation"
+    dictation_uses_cuda = dictation_compute == "cuda" or (
+        dictation_compute == "auto" and cuda_available
+    )
+    dictation_extra = "dictation-cuda" if dictation_uses_cuda else "dictation"
     cuda_packages = CUDA_PACKAGES if needs_cuda else ()
     venice_packages = VENICE_PACKAGES if "venice" in {llm, tts} else ()
     local_llm_packages = (
-        LOCAL_CPU_LLM_PACKAGES
-        if llm == "local" and llm_compute == "cpu" and not needs_cuda
-        else ()
+        LOCAL_CPU_LLM_PACKAGES if llm == "local" and not needs_cuda else ()
     )
     install_tts_extra = tts == "local"
     python_extras = ("wake", dictation_extra)
@@ -244,6 +250,11 @@ def main(arguments: list[str] | None = None) -> int:
     parser.add_argument("--tts-device", dest="tts_device", default="")
     parser.add_argument("--dictation-device", dest="dictation_device", default="")
     parser.add_argument(
+        "--cuda-available",
+        action="store_true",
+        help="a bounded runtime probe confirmed usable CUDA on this host",
+    )
+    parser.add_argument(
         "--format",
         choices=("env", "json"),
         default="env",
@@ -258,6 +269,7 @@ def main(arguments: list[str] | None = None) -> int:
             llm_device=options.llm_device or None,
             tts_device=options.tts_device or None,
             dictation_device=options.dictation_device or None,
+            cuda_available=options.cuda_available,
         )
     except InstallProfileError as exc:
         print(f"error: {exc}", file=sys.stderr)

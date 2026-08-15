@@ -117,6 +117,34 @@ class LocalTtsComputeTests(unittest.TestCase):
 
 
 class InstallAndDiagnosticComputeTests(unittest.TestCase):
+    def test_auto_install_uses_cpu_artifacts_without_confirmed_cuda(self) -> None:
+        plan = resolve_installation_plan(
+            llm_provider="local",
+            tts_provider="local",
+            llm_device="auto",
+            tts_device="auto",
+            dictation_device="auto",
+            cuda_available=False,
+        )
+
+        self.assertEqual(plan.cuda_packages, ())
+        self.assertIn("llama.cpp", plan.system_packages)
+        self.assertEqual(plan.dictation_extra, "dictation")
+
+    def test_auto_install_uses_cuda_artifacts_when_probe_succeeds(self) -> None:
+        plan = resolve_installation_plan(
+            llm_provider="local",
+            tts_provider="local",
+            llm_device="auto",
+            tts_device="auto",
+            dictation_device="auto",
+            cuda_available=True,
+        )
+
+        self.assertIn("llama.cpp-cuda", plan.cuda_packages)
+        self.assertNotIn("llama.cpp", plan.system_packages)
+        self.assertEqual(plan.dictation_extra, "dictation-cuda")
+
     def test_cpu_local_install_omits_cuda_packages(self) -> None:
         plan = resolve_installation_plan(
             llm_provider="local",
@@ -186,3 +214,39 @@ class InstallAndDiagnosticComputeTests(unittest.TestCase):
 
         which.assert_not_called()
         self.assertIn("CUDA tools were not invoked", results[0].detail)
+
+    def test_explicit_cuda_unavailable_is_fatal(self) -> None:
+        config = default_user_config()
+        snapshot = checks.DiagnosticSnapshot(
+            config=replace(
+                config,
+                compute=replace(
+                    config.compute,
+                    dictation_device=ComputeDevice.CUDA,
+                ),
+            ),
+            registry=checks.build_integration_registry(config),
+        )
+        with mock.patch.object(checks, "_which", return_value=None):
+            results = checks.check_cuda(snapshot)
+
+        self.assertIs(results[0].severity, Severity.FATAL)
+        self.assertIn("cannot start", results[0].detail)
+
+    def test_auto_cuda_unavailable_warns_about_cpu_fallback(self) -> None:
+        config = default_user_config()
+        snapshot = checks.DiagnosticSnapshot(
+            config=replace(
+                config,
+                compute=replace(
+                    config.compute,
+                    dictation_device=ComputeDevice.AUTO,
+                ),
+            ),
+            registry=checks.build_integration_registry(config),
+        )
+        with mock.patch.object(checks, "_which", return_value=None):
+            results = checks.check_cuda(snapshot)
+
+        self.assertIs(results[0].severity, Severity.WARNING)
+        self.assertIn("auto mode will fall back", results[0].detail)

@@ -507,6 +507,22 @@ def _local_cuda_expected(config: UserConfig) -> bool:
     return False
 
 
+def _explicit_local_cuda_required(config: UserConfig) -> bool:
+    if config.compute.dictation_device is ComputeDevice.CUDA:
+        return True
+    if (
+        config.providers.llm_provider == "local"
+        and config.compute.llm_device is ComputeDevice.CUDA
+    ):
+        return True
+    if (
+        config.providers.tts_provider == "local"
+        and config.compute.tts_device is ComputeDevice.CUDA
+    ):
+        return True
+    return False
+
+
 def check_compute_modes(
     snapshot: DiagnosticSnapshot | None = None,
 ) -> list[CheckResult]:
@@ -584,15 +600,22 @@ def check_cuda(snapshot: DiagnosticSnapshot | None = None) -> list[CheckResult]:
                 ),
             )
         ]
+    explicit_cuda = _explicit_local_cuda_required(settings)
+    unavailable_severity = Severity.FATAL if explicit_cuda else Severity.WARNING
+    unavailable_behavior = (
+        "explicit CUDA configuration cannot start"
+        if explicit_cuda
+        else "auto mode will fall back to substantially slower CPU execution"
+    )
     if _which("nvidia-smi") is None:
         return [
             CheckResult(
                 name="gpu:cuda",
                 category="gpu",
-                severity=Severity.WARNING,
+                severity=unavailable_severity,
                 detail=(
                     f"nvidia-smi not found; GPU acceleration for {model_label} is "
-                    "unavailable and CPU fallback is substantially slower"
+                    f"unavailable; {unavailable_behavior}"
                 ),
                 suggestion=INSTALL_HINTS.get("nvidia-smi"),
             )
@@ -606,8 +629,8 @@ def check_cuda(snapshot: DiagnosticSnapshot | None = None) -> list[CheckResult]:
             CheckResult(
                 name="gpu:cuda",
                 category="gpu",
-                severity=Severity.WARNING,
-                detail=detail,
+                severity=unavailable_severity,
+                detail=f"{detail}; {unavailable_behavior}",
                 suggestion="nvidia-smi  # confirm the driver is loaded",
             )
         ]

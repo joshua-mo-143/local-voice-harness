@@ -72,7 +72,11 @@ class InstallationProfileDecisionTests(unittest.TestCase):
         self.assertIn("tts", plan.python_extras)
 
     def test_mixed_local_llm_keeps_cuda_and_skips_chatterbox(self) -> None:
-        plan = resolve_installation_plan(llm_provider="local", tts_provider="venice")
+        plan = resolve_installation_plan(
+            llm_provider="local",
+            tts_provider="venice",
+            llm_device="cuda",
+        )
 
         self.assertEqual(plan.profile, "local-cuda")
         self.assertEqual(plan.cuda_packages, CUDA_PACKAGES)

@@ -95,6 +95,12 @@ resolve_install_plan() {
   PYTHONPATH="$PROJECT_DIR/src" "$python" -m local_voice_harness.install_profile "$@"
 }
 
+cuda_capability_args() {
+  if have nvidia-smi && timeout 10 nvidia-smi >/dev/null 2>&1; then
+    printf '%s\n' "--cuda-available"
+  fi
+}
+
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --profile)
@@ -134,7 +140,8 @@ else
   LLM_PROVIDER="$(select_provider "LLM" "${LLM_PROVIDER:-}")"
   TTS_PROVIDER="$(select_provider "TTS" "${TTS_PROVIDER:-}")"
 fi
-eval "$(resolve_install_plan --format env --profile "$PROFILE" --llm "$LLM_PROVIDER" --tts "$TTS_PROVIDER" --llm-device "${LLM_DEVICE:-}" --tts-device "${TTS_DEVICE:-}" --dictation-device "${DICTATION_DEVICE:-}")"
+mapfile -t CUDA_CAPABILITY_ARGS < <(cuda_capability_args)
+eval "$(resolve_install_plan --format env --profile "$PROFILE" --llm "$LLM_PROVIDER" --tts "$TTS_PROVIDER" --llm-device "${LLM_DEVICE:-}" --tts-device "${TTS_DEVICE:-}" --dictation-device "${DICTATION_DEVICE:-}" "${CUDA_CAPABILITY_ARGS[@]}")"
 LLM_PROVIDER="$INSTALL_LLM_PROVIDER"
 TTS_PROVIDER="$INSTALL_TTS_PROVIDER"
 info "Installation profile: $INSTALL_PROFILE"
