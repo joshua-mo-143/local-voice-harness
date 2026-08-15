@@ -195,6 +195,8 @@ CURSOR_STORE = JobStore(JOBS_DIR, LEGACY_JOBS_DIR)
 END_SILENCE_MS = 720
 MAX_UTTERANCE_SECONDS = 120
 CONVERSATION_TIMEOUT_SECONDS = 60
+HOLD_EXTENSION_SECONDS = 120
+MAX_HOLD_EXTENSIONS = 2
 PRE_ROLL_FRAMES = 25
 MICROPHONE_START_ATTEMPTS = 30
 MICROPHONE_RETRY_SECONDS = 1
@@ -459,6 +461,15 @@ OMIT_CONTEXT_PATTERN = re.compile(
     r")\s*[?.!]?\s*$",
     re.IGNORECASE,
 )
+HOLD_PATTERN = re.compile(
+    r"^\s*(?:"
+    r"hold\s+on|"
+    r"give\s+me\s+a\s+(?:minute|moment|sec(?:ond)?s?)|"
+    r"wait\s+(?:a\s+(?:minute|moment|second)|please)|"
+    r"hang\s+on"
+    r")\s*[!.]?\s*$",
+    re.IGNORECASE,
+)
 PENDING_SUBMIT_PATTERN = re.compile(
     r"\b(?:work\s+on|fix|change|update|implement|add|remove|run|review|inspect|"
     r"start|create|build|refactor|test)\b",
@@ -504,6 +515,11 @@ NO_FOCUSED_CONTEXT_RESPONSE = "I'm not looking at a focused source."
 OMIT_FOCUSED_CONTEXT_RESPONSE = (
     "Okay, I won't use the focused tab or app for the rest of this conversation."
 )
+HOLD_ACCEPTED_RESPONSE = "Okay, I'll keep listening."
+HOLD_EXHAUSTED_RESPONSE = (
+    "I'm already holding. I'll keep listening until this window ends."
+)
+HOLD_INACTIVE_RESPONSE = "I can only hold while I'm already listening for a follow-up."
 
 
 @dataclass
@@ -679,6 +695,7 @@ class WakeConversationDaemon:
         self.last_transcript: LastTranscript | None = None
         self.omit_focused_context = False
         self.last_focused_identity: FocusedIdentity | None = None
+        self.hold_extensions = 0
         self.last_wake = 0.0
         self.force_listen = threading.Event()
         self.running = True
@@ -887,6 +904,7 @@ class WakeConversationDaemon:
         self.last_transcript = None
         self.omit_focused_context = False
         self.last_focused_identity = None
+        self.hold_extensions = 0
         self.pause_microphone()
         try:
             self.stop_components_when_idle()
@@ -1389,6 +1407,46 @@ class WakeConversationDaemon:
             app_class=context.focused_app_class,
             source_kinds=context.focused_app_sources,
         )
+
+    def _followup_listening_armed(self) -> bool:
+        return bool(
+            self.awaiting_followup
+            or (
+                self.conversation_deadline
+                and time.monotonic() < self.conversation_deadline
+            )
+        )
+
+    def _extend_conversation_hold(self) -> bool:
+        if self.hold_extensions >= MAX_HOLD_EXTENSIONS:
+            return False
+        self.hold_extensions += 1
+        now = time.monotonic()
+        base = self.conversation_deadline if self.conversation_deadline > now else now
+        self.conversation_deadline = base + HOLD_EXTENSION_SECONDS
+        pending = self.pending_target_readback
+        if pending is not None:
+            self.pending_target_readback = PendingTargetReadback(
+                replace(
+                    pending.candidate,
+                    created_at=pending.candidate.created_at + HOLD_EXTENSION_SECONDS,
+                ),
+                pending.request,
+            )
+        resolution = self.pending_target_resolution
+        if resolution is not None:
+            self.pending_target_resolution = replace(
+                resolution,
+                created_at=resolution.created_at + HOLD_EXTENSION_SECONDS,
+            )
+        slot = self.last_transcript
+        if slot is not None:
+            self.last_transcript = LastTranscript(
+                utterance=slot.utterance,
+                dispatched=slot.dispatched,
+                expires_at=slot.expires_at + HOLD_EXTENSION_SECONDS,
+            )
+        return True
 
     def _capture_request_context(self, text: str) -> RequestContext:
         context = request_context(
@@ -2282,6 +2340,24 @@ class WakeConversationDaemon:
                 self.omit_focused_context = True
                 self.last_focused_identity = None
                 return self._speak_control_notice(OMIT_FOCUSED_CONTEXT_RESPONSE)
+            if HOLD_PATTERN.search(text):
+                terminalize_non_side_effect()
+                if not self._followup_listening_armed():
+                    return self._speak_control_notice(HOLD_INACTIVE_RESPONSE)
+                spoken = (
+                    HOLD_ACCEPTED_RESPONSE
+                    if self._extend_conversation_hold()
+                    else HOLD_EXHAUSTED_RESPONSE
+                )
+                self.ensure_components()
+                response = AssistantResponse.from_text(spoken)
+                print(f"Assistant: {response.display_text}", flush=True)
+                _playback, interruption = self.play_response(response)
+                if interruption is not None:
+                    return interruption
+                self.awaiting_followup = True
+                notify("Listening for a follow-up…")
+                return None
             pending_resolution = getattr(self, "pending_target_resolution", None)
             resolution_active = (
                 pending_resolution is not None

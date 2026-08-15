@@ -183,6 +183,7 @@ def _bare_daemon() -> WakeConversationDaemon:
     instance.last_transcript = None
     instance.omit_focused_context = False
     instance.last_focused_identity = None
+    instance.hold_extensions = 0
     instance.last_wake = 0.0
     instance.force_listen = threading.Event()
     instance.running = True
@@ -8264,6 +8265,157 @@ class FocusedContextInspectTests(unittest.TestCase):
             daemon.close_conversation("inactivity")
         self.assertFalse(daemon.omit_focused_context)
         self.assertIsNone(daemon.last_focused_identity)
+
+
+class SpokenHoldTests(unittest.TestCase):
+    def _hold(
+        self,
+        daemon: WakeConversationDaemon,
+        phrase: str = "hold on",
+        *,
+        pending: wake_daemon.PendingQuestionSnapshot | None = None,
+    ) -> mock.Mock:
+        cursor_turn = mock.Mock()
+        with (
+            mock.patch.object(wake_daemon, "transcribe", return_value=phrase),
+            mock.patch.object(wake_daemon, "start_components"),
+            mock.patch.object(wake_daemon, "cursor_turn", cursor_turn),
+            mock.patch.object(wake_daemon, "qwen_turn") as qwen_turn,
+            mock.patch.object(
+                wake_daemon,
+                "route_intent",
+                return_value=IntentRoute(Intent.AGENT_REPLY, "high"),
+            ) as route_intent,
+            mock.patch.object(daemon, "_pending_cursor_question", return_value=pending),
+            mock.patch.object(
+                daemon,
+                "play_response",
+                return_value=({"played_text": "ok"}, None),
+            ),
+            mock.patch.object(wake_daemon, "notify"),
+        ):
+            daemon.process_utterance(AUDIO_GENERATION, woke=False)
+        qwen_turn.assert_not_called()
+        route_intent.assert_not_called()
+        return cursor_turn
+
+    def test_hold_extends_deadline_once_then_caps(self) -> None:
+        daemon = _bare_daemon()
+        daemon.awaiting_followup = True
+        original = time.monotonic() + 20
+        daemon.conversation_deadline = original
+        announcements = daemon.announcements
+        pending = _pending_choice_snapshot()
+        daemon.cursor_session = pending.job_id
+
+        cursor_turn = self._hold(daemon, "give me a minute", pending=pending)
+        cursor_turn.assert_not_called()
+        self.assertAlmostEqual(
+            daemon.conversation_deadline,
+            original + wake_daemon.HOLD_EXTENSION_SECONDS,
+            delta=1,
+        )
+        self.assertEqual(daemon.hold_extensions, 1)
+        self.assertTrue(daemon.awaiting_followup)
+        self.assertIs(daemon.announcements, announcements)
+
+        second_deadline = daemon.conversation_deadline
+        self._hold(daemon, "hold on", pending=pending)
+        self.assertAlmostEqual(
+            daemon.conversation_deadline,
+            second_deadline + wake_daemon.HOLD_EXTENSION_SECONDS,
+            delta=1,
+        )
+        self.assertEqual(daemon.hold_extensions, 2)
+
+        capped = daemon.conversation_deadline
+        self._hold(daemon, "hold on", pending=pending)
+        self.assertEqual(daemon.conversation_deadline, capped)
+        self.assertEqual(daemon.hold_extensions, 2)
+
+    def test_hold_keeps_pending_readback_and_resolution_live(self) -> None:
+        daemon = _bare_daemon()
+        daemon.awaiting_followup = True
+        daemon.conversation_deadline = time.monotonic() + 10
+        target = wake_daemon.CriticalTarget(
+            "github", "example/payments", "42", "submit"
+        )
+        created = time.monotonic() - 25
+        candidate = wake_daemon.new_candidate(
+            wake_daemon.TargetSelection(target, (None,) * 5),
+            origin_turn="hold-turn",
+        )
+        candidate = replace(candidate, created_at=created)
+        daemon.pending_target_readback = wake_daemon.PendingTargetReadback(
+            candidate,
+            wake_daemon._critical_target_request(target),
+        )
+        daemon.pending_target_resolution = wake_daemon.PendingTargetResolution(
+            "work on issue 384",
+            IntentRoute(Intent.AGENT_SUBMIT, "high"),
+            created_at=time.monotonic() - 50,
+        )
+        resolution_created = daemon.pending_target_resolution.created_at
+
+        self._hold(daemon)
+        assert daemon.pending_target_readback is not None
+        self.assertAlmostEqual(
+            daemon.pending_target_readback.candidate.created_at,
+            created + wake_daemon.HOLD_EXTENSION_SECONDS,
+            delta=1,
+        )
+        assert daemon.pending_target_resolution is not None
+        self.assertAlmostEqual(
+            daemon.pending_target_resolution.created_at,
+            resolution_created + wake_daemon.HOLD_EXTENSION_SECONDS,
+            delta=1,
+        )
+        later = daemon.pending_target_readback.candidate.created_at + 29
+        context = RequestContext("yes")
+        resolution = wake_daemon.resolve_readback(
+            daemon.pending_target_readback.candidate,
+            "yes",
+            context,
+            now=later,
+        )
+        self.assertNotEqual(resolution.reply, wake_daemon.ReadbackReply.EXPIRED)
+
+    def test_hold_when_inactive_does_not_start_work(self) -> None:
+        daemon = _bare_daemon()
+        with (
+            mock.patch.object(wake_daemon, "transcribe", return_value="hold on"),
+            mock.patch.object(wake_daemon, "start_components"),
+            mock.patch.object(wake_daemon, "cursor_turn") as cursor_turn,
+            mock.patch.object(
+                daemon,
+                "play_response",
+                return_value=(
+                    {"played_text": wake_daemon.HOLD_INACTIVE_RESPONSE},
+                    None,
+                ),
+            ) as play,
+            mock.patch.object(wake_daemon, "notify"),
+        ):
+            daemon.process_utterance(AUDIO_GENERATION, woke=False)
+
+        play.assert_called_once_with(
+            AssistantResponse.from_text(wake_daemon.HOLD_INACTIVE_RESPONSE)
+        )
+        cursor_turn.assert_not_called()
+        self.assertEqual(daemon.hold_extensions, 0)
+
+    def test_hang_up_discards_hold(self) -> None:
+        daemon = _bare_daemon()
+        daemon.awaiting_followup = True
+        daemon.conversation_deadline = time.monotonic() + 30
+        daemon.hold_extensions = 1
+        with (
+            mock.patch.object(wake_daemon, "stop_components"),
+            mock.patch.object(wake_daemon, "notify"),
+        ):
+            daemon.close_conversation("spoken command")
+        self.assertEqual(daemon.hold_extensions, 0)
+        self.assertEqual(daemon.conversation_deadline, 0.0)
 
 
 if __name__ == "__main__":
