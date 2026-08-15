@@ -66,6 +66,7 @@ from local_voice_harness.integrations.github import (
     GitHubPullRequest,
     GitHubPullRequestCreationResult,
     GitHubPullRequestMergeResult,
+    GitHubPullRequestMergeSnapshot,
     GitHubRepoCreationResult,
     GitHubRepository,
 )
@@ -83,6 +84,29 @@ from local_voice_harness.prompt_operations import (
 )
 
 WORKER = WorkerOwnership("worker", 42, "boot", "start", "test", 1)
+
+
+def _merge_snapshot() -> str:
+    return GitHubPullRequestMergeSnapshot(
+        "example/project",
+        7,
+        "https://github.com/example/project/pull/7",
+        "Safe change",
+        "main",
+        "main",
+        "feature/safe",
+        "b" * 40,
+        "OPEN",
+        False,
+        "passing",
+        "APPROVED",
+        "MERGEABLE",
+        "CLEAN",
+        False,
+        None,
+        False,
+        False,
+    ).serialize()
 
 
 class CursorRecoveryTests(unittest.TestCase):
@@ -551,6 +575,8 @@ class CursorRecoveryTests(unittest.TestCase):
                 "github_pr_merge_number": 7,
                 "github_pr_merge_url": "https://github.com/example/project/pull/7",
                 "github_pr_merge_marker": "a" * 32,
+                "github_pr_merge_snapshot": _merge_snapshot(),
+                "github_pr_merge_method": "squash",
                 "github_pr_merge_operation_state": "ambiguous",
             }
         )
@@ -589,6 +615,8 @@ class CursorRecoveryTests(unittest.TestCase):
                 "github_pr_merge_number": 7,
                 "github_pr_merge_url": "https://github.com/example/project/pull/7",
                 "github_pr_merge_marker": "a" * 32,
+                "github_pr_merge_snapshot": _merge_snapshot(),
+                "github_pr_merge_method": "squash",
                 "github_pr_merge_operation_state": "ambiguous",
             }
         )

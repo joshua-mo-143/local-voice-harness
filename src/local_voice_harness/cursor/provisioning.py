@@ -25,7 +25,9 @@ from ..integrations.github import (
     GitHubIssue,
     GitHubIssueCreationResult,
     GitHubIssueLookupError,
+    GitHubMergeQueueArmedError,
     GitHubOperationAmbiguous,
+    GitHubPreconditionError,
     GitHubProvider,
     GitHubPullRequestCheckoutInputs,
     GitHubPullRequestCreationPlan,
@@ -1570,6 +1572,76 @@ def _finish_github_pr_merge(
     )
 
 
+def _finish_github_pr_merge_without_write(
+    store: JobStore,
+    job_id: str,
+    token: WorkerClaim,
+    message: str,
+    *,
+    expected_revision: int,
+) -> None:
+    def finish(job: CursorJob) -> CursorJob:
+        now = time.time()
+        return job.evolve_for_delivery(
+            now=now,
+            status=JobStatus.COMPLETED,
+            result=message,
+            completed_at=now,
+            github_pr_merge_confirmed=False,
+            github_pr_merge_operation_state="planned",
+            worker_pid=None,
+            worker_boot_id=None,
+            worker_process_start=None,
+            worker_token=None,
+            worker_operation=None,
+        )
+
+    _worker_change(
+        store,
+        job_id,
+        token,
+        {JobStatus.ROUTING, JobStatus.RUNNING},
+        finish,
+        expected_revision=expected_revision,
+    )
+
+
+def _finish_github_pr_merge_queued(
+    store: JobStore,
+    job_id: str,
+    token: WorkerClaim,
+    *,
+    expected_revision: int,
+) -> None:
+    def finish(job: CursorJob) -> CursorJob:
+        now = time.time()
+        return job.evolve_for_delivery(
+            now=now,
+            status=JobStatus.BLOCKED,
+            result=(
+                "GitHub reports that this pull request remains queued for merge. "
+                "The queue side effect is armed and requires manual review; I will "
+                "not submit another merge."
+            ),
+            completed_at=now,
+            github_pr_merge_operation_state="manual_required",
+            worker_pid=None,
+            worker_boot_id=None,
+            worker_process_start=None,
+            worker_token=None,
+            worker_operation=None,
+        )
+
+    _worker_change(
+        store,
+        job_id,
+        token,
+        {JobStatus.ROUTING, JobStatus.RUNNING},
+        finish,
+        expected_revision=expected_revision,
+    )
+
+
 def _run_github_pr_merge(
     store: JobStore,
     job: CursorJob,
@@ -1634,6 +1706,8 @@ def _run_github_pr_merge(
                 github_pr_merge_number=plan.number,
                 github_pr_merge_url=plan.url,
                 github_pr_merge_marker=plan.correlation_marker,
+                github_pr_merge_snapshot=plan.snapshot.serialize(),
+                github_pr_merge_method=plan.method,
                 github_pr_merge_operation_state="planned",
             )
 
@@ -1652,11 +1726,22 @@ def _run_github_pr_merge(
         job.github_repository or repository,
         job.github_pr_merge_number or number,
         correlation_marker=job.github_pr_merge_marker,
+        snapshot=job.github_pr_merge_snapshot,
+        method=job.github_pr_merge_method or "squash",
     )
     if not job.github_pr_merge_confirmed:
         preview = (
             f"Merge GitHub pull request {plan.number} in {plan.repository}?\n\n"
-            f"{plan.url}\n\n"
+            f"{plan.url}\n\nTitle: {plan.snapshot.title}\n\n"
+            f"Target: {plan.snapshot.base_ref} "
+            f"({'default branch' if plan.snapshot.base_ref == plan.snapshot.default_branch else 'non-default branch'})\n\n"
+            f"Head: {plan.snapshot.head_ref} at {plan.snapshot.head_oid}\n\n"
+            f"Draft: {'yes' if plan.snapshot.is_draft else 'no'}\n\n"
+            f"Checks: {plan.snapshot.checks}\n\n"
+            f"Reviews: {plan.snapshot.review_decision or 'not required'}\n\n"
+            f"Mergeability: {plan.snapshot.mergeable} "
+            f"({plan.snapshot.merge_state_status})\n\n"
+            f"Method: {plan.method}\n\n"
             "Say yes to merge it or no to cancel."
         )
         _worker_question(
@@ -1673,6 +1758,18 @@ def _run_github_pr_merge(
         raise HarnessError(
             "GitHub pull request merge requires reconciliation before retry"
         )
+    try:
+        checkpoint()
+        github.confirm_pull_request_merge_state(plan)
+    except GitHubPreconditionError as exc:
+        _finish_github_pr_merge_without_write(
+            store,
+            job.id,
+            token,
+            str(exc),
+            expected_revision=job.revision,
+        )
+        return
 
     def mark_submitted(current: CursorJob) -> CursorJob:
         return current.evolve(
@@ -1694,6 +1791,23 @@ def _run_github_pr_merge(
     try:
         checkpoint()
         result = github.submit_pull_request_merge(plan, confirmed=True)
+    except GitHubMergeQueueArmedError:
+        _finish_github_pr_merge_queued(
+            store,
+            job.id,
+            token,
+            expected_revision=submitted.revision,
+        )
+        return
+    except GitHubPreconditionError as exc:
+        _finish_github_pr_merge_without_write(
+            store,
+            job.id,
+            token,
+            str(exc),
+            expected_revision=submitted.revision,
+        )
+        return
     except GitHubError as exc:
         checkpoint()
         try:

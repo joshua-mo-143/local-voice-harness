@@ -16,12 +16,15 @@ from local_voice_harness.integrations.github import (
     GitHubIssueCreationResult,
     GitHubIssueLookupError,
     GitHubIssueLookupReason,
+    GitHubMergeQueueArmedError,
     GitHubOperationAmbiguous,
+    GitHubPreconditionError,
     GitHubPullRequest,
     GitHubPullRequestCreationPlan,
     GitHubPullRequestCreationResult,
     GitHubPullRequestMergePlan,
     GitHubPullRequestMergeResult,
+    GitHubPullRequestMergeSnapshot,
     GitHubRepoCreationPlan,
     GitHubRepoCreationResult,
     GitHubRepository,
@@ -50,6 +53,31 @@ def _repository(
         default_branch="main",
         parent=parent,
     )
+
+
+def _merge_snapshot(**changes: object) -> GitHubPullRequestMergeSnapshot:
+    values: dict[str, object] = {
+        "repository": "example/project",
+        "number": 7,
+        "url": "https://github.com/example/project/pull/7",
+        "title": "Safe change",
+        "default_branch": "main",
+        "base_ref": "main",
+        "head_ref": "feature/safe",
+        "head_oid": "b" * 40,
+        "state": "OPEN",
+        "is_draft": False,
+        "checks": "passing",
+        "review_decision": "APPROVED",
+        "mergeable": "MERGEABLE",
+        "merge_state_status": "CLEAN",
+        "is_stack": False,
+        "stack_parent_url": None,
+        "merge_queue_required": False,
+        "auto_merge_requested": False,
+    }
+    values.update(changes)
+    return GitHubPullRequestMergeSnapshot(**values)  # type: ignore[arg-type]
 
 
 class GitHubClientTests(unittest.TestCase):
@@ -578,6 +606,8 @@ class GitHubClientTests(unittest.TestCase):
             7,
             "https://github.com/example/project/pull/7",
             "a" * 32,
+            _merge_snapshot(),
+            "squash",
         )
         with (
             mock.patch.object(client, "_run") as run,
@@ -592,11 +622,16 @@ class GitHubClientTests(unittest.TestCase):
             "state": "MERGED",
             "mergedAt": "2026-01-01T00:00:00Z",
         }
-        with mock.patch.object(
-            client,
-            "_run",
-            side_effect=[_completed(""), _completed(json.dumps(view))],
-        ) as run:
+        with (
+            mock.patch.object(
+                client, "inspect_pull_request_merge", return_value=plan.snapshot
+            ),
+            mock.patch.object(
+                client,
+                "_run",
+                side_effect=[_completed(""), _completed(json.dumps(view))],
+            ) as run,
+        ):
             result = client.submit_pull_request_merge(plan, confirmed=True)
 
         self.assertEqual(
@@ -610,11 +645,21 @@ class GitHubClientTests(unittest.TestCase):
         merge_command = run.call_args_list[0].args[0]
         self.assertEqual(
             merge_command,
-            ["gh", "pr", "merge", "7", "--repo", "example/project"],
+            [
+                "gh",
+                "pr",
+                "merge",
+                "7",
+                "--repo",
+                "example/project",
+                "--squash",
+                "--match-head-commit",
+                "b" * 40,
+            ],
         )
         self.assertNotIn("--admin", merge_command)
         self.assertNotIn("--delete-branch", merge_command)
-        self.assertNotIn("--squash", merge_command)
+        self.assertIn("--squash", merge_command)
 
     def test_open_pull_request_observation_is_not_merged(self) -> None:
         client = GitHubClient()
@@ -623,6 +668,8 @@ class GitHubClientTests(unittest.TestCase):
             7,
             "https://github.com/example/project/pull/7",
             "a" * 32,
+            _merge_snapshot(),
+            "squash",
         )
         view = {
             "number": 7,
@@ -635,6 +682,31 @@ class GitHubClientTests(unittest.TestCase):
         ):
             self.assertIsNone(client.observe_pull_request_merge(plan))
 
+    def test_queued_observation_is_not_reported_as_ambiguous(self) -> None:
+        client = GitHubClient()
+        plan = GitHubPullRequestMergePlan(
+            "example/project",
+            7,
+            "https://github.com/example/project/pull/7",
+            "a" * 32,
+            _merge_snapshot(),
+            "squash",
+        )
+        queued = {
+            "number": 7,
+            "url": plan.url,
+            "state": "OPEN",
+            "mergedAt": None,
+            "autoMergeRequest": {"enabledAt": "2026-01-01T00:00:00Z"},
+        }
+        with (
+            mock.patch.object(
+                client, "_run", return_value=_completed(json.dumps(queued))
+            ),
+            self.assertRaisesRegex(GitHubMergeQueueArmedError, "remains armed"),
+        ):
+            client.observe_pull_request_merge(plan)
+
     def test_unprovable_merge_result_is_ambiguous(self) -> None:
         client = GitHubClient()
         plan = GitHubPullRequestMergePlan(
@@ -642,8 +714,13 @@ class GitHubClientTests(unittest.TestCase):
             7,
             "https://github.com/example/project/pull/7",
             "a" * 32,
+            _merge_snapshot(),
+            "squash",
         )
         with (
+            mock.patch.object(
+                client, "inspect_pull_request_merge", return_value=plan.snapshot
+            ),
             mock.patch(
                 "local_voice_harness.integrations.github.run_command",
                 side_effect=subprocess.TimeoutExpired(["gh"], 1),
@@ -651,6 +728,61 @@ class GitHubClientTests(unittest.TestCase):
             self.assertRaises(GitHubOperationAmbiguous),
         ):
             client.submit_pull_request_merge(plan, confirmed=True)
+
+    def test_stale_merge_head_is_rejected_before_write(self) -> None:
+        client = GitHubClient()
+        plan = GitHubPullRequestMergePlan(
+            "example/project",
+            7,
+            "https://github.com/example/project/pull/7",
+            "a" * 32,
+            _merge_snapshot(),
+            "rebase",
+        )
+        with (
+            mock.patch.object(
+                client,
+                "inspect_pull_request_merge",
+                return_value=_merge_snapshot(head_oid="c" * 40),
+            ),
+            mock.patch.object(client, "_run") as run,
+            self.assertRaisesRegex(GitHubPreconditionError, "changed"),
+        ):
+            client.submit_pull_request_merge(plan, confirmed=True)
+        run.assert_not_called()
+
+    def test_ineligible_merge_states_fail_closed(self) -> None:
+        cases = {
+            "draft": {"is_draft": True},
+            "failing": {"checks": "failing"},
+            "pending": {"checks": "pending"},
+            "unapproved": {"review_decision": "REVIEW_REQUIRED"},
+            "unmergeable": {"mergeable": "CONFLICTING"},
+            "nondefault": {"base_ref": "release"},
+            "stack": {
+                "base_ref": "stack/parent",
+                "is_stack": True,
+                "stack_parent_url": "https://github.com/example/project/pull/6",
+            },
+            "merge_queue": {"merge_queue_required": True},
+        }
+        for name, changes in cases.items():
+            with self.subTest(name=name), self.assertRaises(GitHubPreconditionError):
+                GitHubClient.validate_pull_request_merge_eligibility(
+                    _merge_snapshot(**changes)
+                )
+
+    def test_merge_method_is_explicit_and_validated(self) -> None:
+        plan = GitHubPullRequestMergePlan(
+            "example/project",
+            7,
+            "https://github.com/example/project/pull/7",
+            "a" * 32,
+            _merge_snapshot(),
+            "octopus",
+        )
+        with self.assertRaisesRegex(GitHubError, "method"):
+            GitHubClient.validate_pull_request_merge_plan(plan)
 
     def test_merge_identity_uses_utterance_and_asks_when_sources_conflict(self) -> None:
         self.assertEqual(

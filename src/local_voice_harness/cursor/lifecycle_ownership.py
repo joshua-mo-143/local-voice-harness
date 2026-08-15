@@ -490,6 +490,8 @@ def _build_field_ownership() -> tuple[FieldOwnership, ...]:
                 "github_pr_merge_number": CrashKind.IDENTITY,
                 "github_pr_merge_url": CrashKind.IDENTITY,
                 "github_pr_merge_marker": CrashKind.TOKEN,
+                "github_pr_merge_snapshot": CrashKind.TOKEN,
+                "github_pr_merge_method": CrashKind.CONTENT,
                 "github_pr_merge_operation_state": CrashKind.UNCERTAINTY,
                 "github_repo_create_requested": CrashKind.CONTENT,
                 "github_repo_create_org_requested": CrashKind.CONTENT,
@@ -1461,12 +1463,12 @@ def measured_baseline_counts() -> dict[str, int]:
 # Measured on the #357 baseline checkout. Tests fail if these drift without an
 # intentional inventory update. They are evidence, not an optimization target.
 BASELINE_COUNTS: dict[str, int] = {
-    "persisted_field_names": 248,
-    "named_table_fields": 243,
+    "persisted_field_names": 250,
+    "named_table_fields": 245,
     "import_only_fields": 4,
-    "cursor_job_public_properties": 187,
+    "cursor_job_public_properties": 189,
     "compatibility_adapters": 38,
-    "transition_entry_points": 79,
+    "transition_entry_points": 78,
     "duplicate_authorities": 0,
-    "lifecycle_module_lines": 29499,
+    "lifecycle_module_lines": 29739,
 }

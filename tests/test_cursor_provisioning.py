@@ -50,6 +50,7 @@ from local_voice_harness.integrations.github import (
     GitHubPullRequest,
     GitHubPullRequestCreationResult,
     GitHubPullRequestMergeResult,
+    GitHubPullRequestMergeSnapshot,
     GitHubRepoCreationResult,
     GitHubRepository,
     ProvisionedIssue,
@@ -275,6 +276,29 @@ class _ProvisioningTestAdapter:
             include_process_group=include_process_group,
             is_alive=lambda current: service._worker_is_alive(current),
         )
+
+
+def _merge_snapshot() -> GitHubPullRequestMergeSnapshot:
+    return GitHubPullRequestMergeSnapshot(
+        "source/project",
+        7,
+        "https://github.com/source/project/pull/7",
+        "Safe change",
+        "main",
+        "main",
+        "feature/safe",
+        "b" * 40,
+        "OPEN",
+        False,
+        "passing",
+        "APPROVED",
+        "MERGEABLE",
+        "CLEAN",
+        False,
+        None,
+        False,
+        False,
+    )
 
 
 jobs: Any = _ProvisioningTestAdapter()
@@ -3832,6 +3856,7 @@ class CursorJobStateTests(unittest.TestCase):
         )
         github = mock.Mock()
         github.inspect_repository.return_value = source
+        github.inspect_pull_request_merge.return_value = _merge_snapshot()
         with mock.patch.object(jobs, "GitHubClient", return_value=github):
             service.run_worker("123456789abc")
 
@@ -3856,6 +3881,8 @@ class CursorJobStateTests(unittest.TestCase):
                 "github_pr_merge_number": 7,
                 "github_pr_merge_url": "https://github.com/source/project/pull/7",
                 "github_pr_merge_marker": "a" * 32,
+                "github_pr_merge_snapshot": _merge_snapshot().serialize(),
+                "github_pr_merge_method": "squash",
                 "github_pr_merge_operation_state": "planned",
                 "github_repository": "source/project",
                 "status": "queued",
@@ -3876,6 +3903,7 @@ class CursorJobStateTests(unittest.TestCase):
         )
         github = mock.Mock()
         github.inspect_repository.return_value = source
+        github.inspect_pull_request_merge.return_value = _merge_snapshot()
         github.submit_pull_request_merge.return_value = result
         herdr = mock.Mock()
         with (
@@ -3926,6 +3954,8 @@ class CursorJobStateTests(unittest.TestCase):
                 "github_pr_merge_number": 7,
                 "github_pr_merge_url": "https://github.com/source/project/pull/7",
                 "github_pr_merge_marker": "a" * 32,
+                "github_pr_merge_snapshot": _merge_snapshot().serialize(),
+                "github_pr_merge_method": "squash",
                 "github_pr_merge_operation_state": "planned",
                 "github_repository": "source/project",
                 "status": "queued",
@@ -3941,6 +3971,7 @@ class CursorJobStateTests(unittest.TestCase):
         )
         github = mock.Mock()
         github.inspect_repository.return_value = source
+        github.inspect_pull_request_merge.return_value = _merge_snapshot()
         github.submit_pull_request_merge.side_effect = GitHubOperationAmbiguous(
             "timed out"
         )

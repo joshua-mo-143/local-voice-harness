@@ -223,6 +223,8 @@ def _pr_merge_awaiting(store: JobStore) -> CursorJob:
                 "github_pr_merge_number": 7,
                 "github_pr_merge_url": "https://github.com/example/project/pull/7",
                 "github_pr_merge_marker": "a" * 32,
+                "github_pr_merge_snapshot": "{}",
+                "github_pr_merge_method": "squash",
                 "github_pr_merge_operation_state": "planned",
             }
         )

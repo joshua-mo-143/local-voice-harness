@@ -335,6 +335,8 @@ _STRING_FIELDS = frozenset(
         "github_pr_create_operation_state",
         "github_pr_created_url",
         "github_pr_merge_marker",
+        "github_pr_merge_snapshot",
+        "github_pr_merge_method",
         "github_pr_merge_operation_state",
         "github_pr_merge_url",
         "github_repo_create_owner",
@@ -2709,6 +2711,14 @@ class AgentJob:
         return self._optional_string("github_pr_merge_marker")
 
     @property
+    def github_pr_merge_snapshot(self) -> str | None:
+        return self._optional_string("github_pr_merge_snapshot")
+
+    @property
+    def github_pr_merge_method(self) -> str | None:
+        return self._optional_string("github_pr_merge_method")
+
+    @property
     def github_pr_merge_operation_state(self) -> str | None:
         return self._optional_string("github_pr_merge_operation_state")
 
@@ -4109,12 +4119,24 @@ class AgentJob:
                 self.github_pr_merge_number,
                 self.github_pr_merge_url,
                 self.github_pr_merge_marker,
+                self.github_pr_merge_snapshot,
+                self.github_pr_merge_method,
             )
         ):
             raise JobValidationError(
                 "GitHub pull request merge operation requires repository, number, "
-                "URL, and marker"
+                "URL, marker, immutable snapshot, and merge method"
             )
+        if (
+            self.github_pr_merge_method is not None
+            and self.github_pr_merge_method
+            not in {
+                "merge",
+                "squash",
+                "rebase",
+            }
+        ):
+            raise JobValidationError("github_pr_merge_method is invalid")
         if (
             self.github_repo_create_operation_state is not None
             and self.github_repo_create_operation_state
