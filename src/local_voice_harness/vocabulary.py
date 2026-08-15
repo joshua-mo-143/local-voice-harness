@@ -29,8 +29,9 @@ Three entry kinds are stored:
     case-insensitive phrase.
 ``aliases``
     A spoken ``phrase`` that resolves to a canonical entity ``target`` before
-    routing. ``kind`` is ``repository`` for an ``owner/repo`` target or ``issue``
-    for an ``owner/repo#number`` target; it is inferred from the target form.
+    routing. ``kind`` is inferred from the target form: ``repository`` for
+    ``owner/repo``, ``issue`` for ``owner/repo#number``, or ``linear`` for a
+    Linear ``TEAM-79`` identifier. The spoken add path remains GitHub-only.
 ``pronunciations``
     A displayed ``written`` name and its user-owned ``spoken`` pronunciation.
     These entries are consumed only by the TTS speech renderer.
@@ -92,6 +93,10 @@ _ISSUE = re.compile(
     r"^(?P<owner>[A-Za-z0-9](?:[A-Za-z0-9-]{0,38}))/"
     r"(?P<repo>[A-Za-z0-9_.-]+)#(?P<number>[1-9]\d*)$"
 )
+_LINEAR = re.compile(
+    r"^(?P<team>[A-Za-z][A-Za-z0-9]+)-(?P<number>[1-9]\d*)$",
+    re.IGNORECASE,
+)
 
 
 class VocabularyError(HarnessError):
@@ -101,6 +106,7 @@ class VocabularyError(HarnessError):
 class AliasKind(StrEnum):
     REPOSITORY = "repository"
     ISSUE = "issue"
+    LINEAR = "linear"
 
 
 class SpokenAliasStatus(StrEnum):
@@ -140,9 +146,13 @@ def _canonical_target(target: str) -> tuple[str, AliasKind]:
     if repository is not None and repository.group("repo") not in {".", ".."}:
         owner, repo = repository.group("owner", "repo")
         return f"{owner}/{repo}", AliasKind.REPOSITORY
+    linear = _LINEAR.fullmatch(candidate)
+    if linear is not None:
+        team, number = linear.group("team", "number")
+        return f"{team.upper()}-{int(number)}", AliasKind.LINEAR
     raise VocabularyError(
-        f"alias target {target!r} must be an owner/repository or "
-        "owner/repository#number reference"
+        f"alias target {target!r} must be an owner/repository, "
+        "owner/repository#number, or TEAM-79 Linear reference"
     )
 
 
@@ -237,6 +247,8 @@ def prepare_spoken_alias(
     try:
         target, kind = _canonical_target(selected)
     except VocabularyError:
+        return SpokenAliasPreparation(SpokenAliasStatus.INVALID_TARGET)
+    if kind not in {AliasKind.REPOSITORY, AliasKind.ISSUE}:
         return SpokenAliasPreparation(SpokenAliasStatus.INVALID_TARGET)
     if kind_hint is not None and kind != kind_hint:
         return SpokenAliasPreparation(SpokenAliasStatus.INVALID_TARGET)
