@@ -68,6 +68,12 @@ ROUTER_SYSTEM_PROMPT = (
     "announcement policy, quiet mode, or desktop-only announcements also uses "
     "harness_config_change. Unsupported changes still "
     "use harness_config_change so the first-party allow-list can reject them. "
+    "Use vocabulary_alias_add when the user asks to call or name the focused or "
+    "just-used repository or issue, for example 'call this repo the harness' or "
+    "'call this the launcher issue'. Extract only the spoken phrase into raw_value. "
+    "Never invent an owner/repo or issue number from speech; the focused or just-used "
+    "identity is the only target authority. Do not use this intent for replacements, "
+    "pronunciations, or remembering a transcript correction. "
     "Use self_health only when the user explicitly asks whether the local voice harness "
     "itself is healthy, working, or having problems. Do not use self_health for code, "
     "repository, service-provider, personal, or general system health questions. "
@@ -123,6 +129,7 @@ ROUTE_TOOL = {
                         "announcement_digest",
                         "harness_config_inspect",
                         "harness_config_change",
+                        "vocabulary_alias_add",
                         "self_health",
                         "question_consultation",
                         "conversation_continue",
@@ -171,6 +178,7 @@ class Intent(StrEnum):
     ANNOUNCEMENT_DIGEST = "announcement_digest"
     HARNESS_CONFIG_INSPECT = "harness_config_inspect"
     HARNESS_CONFIG_CHANGE = "harness_config_change"
+    VOCABULARY_ALIAS_ADD = "vocabulary_alias_add"
     SELF_HEALTH = "self_health"
     QUESTION_CONSULTATION = "question_consultation"
     CONVERSATION_CONTINUE = "conversation_continue"

@@ -50,7 +50,13 @@ from local_voice_harness.self_management import (
 from local_voice_harness.speech import SpeechRenderer
 from local_voice_harness.tts.queue import PlaybackQueue, PlaybackRequest
 from local_voice_harness.user_config import default_user_config, load_user_config
-from local_voice_harness.vocabulary import Pronunciation
+from local_voice_harness.vocabulary import (
+    AliasKind,
+    PendingSpokenAlias,
+    Pronunciation,
+    SpokenAliasPreparation,
+    SpokenAliasStatus,
+)
 from local_voice_harness.wake import daemon as wake_daemon
 from local_voice_harness.wake.daemon import WakeConversationDaemon
 
@@ -162,6 +168,7 @@ def _bare_daemon() -> WakeConversationDaemon:
     instance.pending_target_readback = None
     instance.pending_target_resolution = None
     instance.pending_config_change = None
+    instance.pending_spoken_alias = None
     instance.config_activation_store = mock.Mock(spec=wake_daemon.ActivationStore)
     instance.config_activation_store.current.return_value = None
     instance.config_activation_store.create_offer.return_value = None
@@ -4740,6 +4747,389 @@ class ConfigChangeConversationTests(unittest.TestCase):
         self.assertTrue(current.acknowledged)
         response = play.call_args.args[0]
         self.assertIn("expected voice snapshot", response.spoken_text)
+
+
+def _pending_alias(
+    *,
+    phrase: str = "the harness",
+    target: str = "owner/repo",
+    existing_target: str | None = None,
+    replace: bool = False,
+) -> PendingSpokenAlias:
+    return PendingSpokenAlias(
+        trusted_utterance=f"Call this repo {phrase}",
+        phrase=phrase,
+        target=target,
+        kind=AliasKind.REPOSITORY,
+        existing_target=existing_target,
+        replace=replace,
+    )
+
+
+class SpokenAliasConversationTests(unittest.TestCase):
+    def _run_turn(
+        self,
+        daemon: WakeConversationDaemon,
+        text: str,
+        *,
+        identities: tuple[str | None, str | None] = ("owner/repo", None),
+        preparation: SpokenAliasPreparation | None = None,
+        commit_effect: object = None,
+    ) -> dict[str, mock.Mock]:
+        commit_error = (
+            commit_effect if isinstance(commit_effect, BaseException) else None
+        )
+        with (
+            mock.patch.object(wake_daemon, "transcribe", return_value=text),
+            mock.patch.object(wake_daemon, "start_components"),
+            mock.patch.object(
+                wake_daemon,
+                "route_intent",
+                return_value=IntentRoute(Intent.CONVERSATION, "high"),
+            ) as route_intent,
+            mock.patch.object(
+                daemon,
+                "_trusted_github_alias_identities",
+                return_value=identities,
+            ),
+            mock.patch.object(
+                wake_daemon,
+                "prepare_spoken_alias",
+                return_value=preparation,
+            ) as prepare,
+            mock.patch.object(
+                wake_daemon,
+                "commit_spoken_alias",
+                return_value=None,
+                side_effect=commit_error,
+            ) as commit,
+            mock.patch.object(wake_daemon, "cursor_turn") as cursor_turn,
+            mock.patch.object(wake_daemon, "qwen_turn") as qwen_turn,
+            mock.patch.object(
+                daemon,
+                "play_response",
+                return_value=({"played_text": "ok"}, None),
+            ) as play,
+            mock.patch.object(wake_daemon, "notify"),
+        ):
+            daemon.process_utterance(AUDIO_GENERATION, woke=False)
+        return {
+            "route": route_intent,
+            "prepare": prepare,
+            "commit": commit,
+            "cursor": cursor_turn,
+            "qwen": qwen_turn,
+            "play": play,
+        }
+
+    def test_call_this_repo_installs_pending_alias_without_writing(self) -> None:
+        daemon = _bare_daemon()
+        pending = _pending_alias()
+        preparation = SpokenAliasPreparation(SpokenAliasStatus.READY, pending)
+
+        calls = self._run_turn(
+            daemon,
+            "Call this repo the harness",
+            preparation=preparation,
+        )
+
+        self.assertIs(daemon.pending_spoken_alias, pending)
+        calls["prepare"].assert_called_once()
+        self.assertEqual(
+            calls["prepare"].call_args.kwargs["focused_repository"],
+            "owner/repo",
+        )
+        self.assertIsNone(calls["prepare"].call_args.kwargs["focused_issue"])
+        calls["commit"].assert_not_called()
+        calls["cursor"].assert_not_called()
+        calls["qwen"].assert_not_called()
+        calls["route"].assert_not_called()
+        response = calls["play"].call_args.args[0]
+        self.assertIn("the harness", response.spoken_text)
+        self.assertIn("owner/repo", response.spoken_text)
+
+    def test_just_used_issue_is_the_trusted_target(self) -> None:
+        daemon = _bare_daemon()
+        pending = PendingSpokenAlias(
+            trusted_utterance="call this the launcher issue",
+            phrase="the launcher issue",
+            target="owner/repo#35",
+            kind=AliasKind.ISSUE,
+        )
+        preparation = SpokenAliasPreparation(SpokenAliasStatus.READY, pending)
+
+        calls = self._run_turn(
+            daemon,
+            "call this the launcher issue",
+            identities=(None, "owner/repo#35"),
+            preparation=preparation,
+        )
+
+        self.assertEqual(
+            calls["prepare"].call_args.kwargs["focused_issue"],
+            "owner/repo#35",
+        )
+        self.assertIsNone(calls["prepare"].call_args.kwargs["focused_repository"])
+        calls["commit"].assert_not_called()
+
+    def test_uttered_owner_repo_is_not_used_as_the_target(self) -> None:
+        daemon = _bare_daemon()
+        preparation = SpokenAliasPreparation(SpokenAliasStatus.MISSING_TARGET)
+
+        calls = self._run_turn(
+            daemon,
+            "Call this repo owner/stt-guess",
+            identities=(None, None),
+            preparation=preparation,
+        )
+
+        self.assertIsNone(daemon.pending_spoken_alias)
+        calls["commit"].assert_not_called()
+        self.assertEqual(
+            calls["prepare"].call_args.kwargs["focused_repository"],
+            None,
+        )
+        response = calls["play"].call_args.args[0]
+        self.assertIn("didn't write anything", response.spoken_text)
+
+    def test_affirmative_confirmation_commits_once_through_add_alias(self) -> None:
+        daemon = _bare_daemon()
+        pending = _pending_alias()
+        daemon.pending_spoken_alias = pending
+
+        calls = self._run_turn(daemon, "yes")
+
+        calls["route"].assert_not_called()
+        calls["commit"].assert_called_once_with(pending, force=False)
+        self.assertIsNone(daemon.pending_spoken_alias)
+        response = calls["play"].call_args.args[0]
+        self.assertIn("the harness", response.spoken_text)
+        self.assertIn("owner/repo", response.spoken_text)
+
+    def test_cancellation_writes_nothing(self) -> None:
+        daemon = _bare_daemon()
+        daemon.pending_spoken_alias = _pending_alias()
+
+        calls = self._run_turn(daemon, "no")
+
+        calls["commit"].assert_not_called()
+        self.assertIsNone(daemon.pending_spoken_alias)
+        response = calls["play"].call_args.args[0]
+        self.assertIn("Nothing was written", response.spoken_text)
+
+    def test_conflict_requires_a_separate_replace_confirmation(self) -> None:
+        daemon = _bare_daemon()
+        pending = _pending_alias(existing_target="owner/old")
+        daemon.pending_spoken_alias = pending
+
+        calls = self._run_turn(daemon, "yes")
+
+        calls["commit"].assert_not_called()
+        replacement = daemon.pending_spoken_alias
+        assert replacement is not None
+        self.assertTrue(replacement.replace)
+        self.assertEqual(replacement.existing_target, "owner/old")
+        self.assertEqual(replacement.target, "owner/repo")
+        response = calls["play"].call_args.args[0]
+        self.assertIn("already resolves to owner/old", response.spoken_text)
+        self.assertIn("Replace it with owner/repo", response.spoken_text)
+
+        calls = self._run_turn(daemon, "yes")
+        calls["commit"].assert_called_once_with(replacement, force=True)
+        self.assertIsNone(daemon.pending_spoken_alias)
+
+    def test_generic_yes_cannot_skip_replace_confirmation(self) -> None:
+        daemon = _bare_daemon()
+        daemon.pending_spoken_alias = _pending_alias(existing_target="owner/old")
+
+        self._run_turn(daemon, "yes")
+        self.assertIsNotNone(daemon.pending_spoken_alias)
+        assert daemon.pending_spoken_alias is not None
+        self.assertTrue(daemon.pending_spoken_alias.replace)
+
+    def test_ambiguous_confirmation_keeps_pending(self) -> None:
+        daemon = _bare_daemon()
+        pending = _pending_alias()
+        daemon.pending_spoken_alias = pending
+
+        calls = self._run_turn(daemon, "maybe")
+
+        calls["commit"].assert_not_called()
+        self.assertIs(daemon.pending_spoken_alias, pending)
+        response = calls["play"].call_args.args[0]
+        self.assertIn("say yes", response.spoken_text)
+
+    def test_missing_phrase_or_target_does_not_write(self) -> None:
+        for status in (
+            SpokenAliasStatus.MISSING_PHRASE,
+            SpokenAliasStatus.MISSING_TARGET,
+            SpokenAliasStatus.INVALID_TARGET,
+        ):
+            with self.subTest(status=status):
+                daemon = _bare_daemon()
+                calls = self._run_turn(
+                    daemon,
+                    "Call this repo the harness",
+                    identities=(None, None),
+                    preparation=SpokenAliasPreparation(status),
+                )
+                self.assertIsNone(daemon.pending_spoken_alias)
+                calls["commit"].assert_not_called()
+                calls["cursor"].assert_not_called()
+
+    def test_write_failure_clears_pending_without_a_second_write(self) -> None:
+        daemon = _bare_daemon()
+        daemon.pending_spoken_alias = _pending_alias()
+
+        calls = self._run_turn(daemon, "yes", commit_effect=OSError("disk full"))
+
+        self.assertIsNone(daemon.pending_spoken_alias)
+        response = calls["play"].call_args.args[0]
+        self.assertIn("didn't write anything", response.spoken_text)
+
+    def test_timeout_and_process_exit_discard_pending_without_writing(self) -> None:
+        for action in ("timeout", "exit"):
+            with self.subTest(action=action):
+                daemon = _bare_daemon()
+                daemon.pending_spoken_alias = _pending_alias()
+                with (
+                    mock.patch.object(wake_daemon, "commit_spoken_alias") as commit,
+                    mock.patch.object(wake_daemon, "stop_components"),
+                    mock.patch.object(wake_daemon, "notify"),
+                ):
+                    if action == "timeout":
+                        daemon.close_conversation("inactivity")
+                    else:
+                        daemon.stop()
+
+                self.assertIsNone(daemon.pending_spoken_alias)
+                commit.assert_not_called()
+
+    def test_ordinary_repeat_does_not_steal_alias_confirmation(self) -> None:
+        daemon = _bare_daemon()
+        daemon.last_ordinary_reply = "It is noon."
+        pending = _pending_alias()
+        daemon.pending_spoken_alias = pending
+        with (
+            mock.patch.object(wake_daemon, "transcribe", return_value="repeat that"),
+            mock.patch.object(wake_daemon, "start_components"),
+            mock.patch.object(
+                wake_daemon,
+                "route_intent",
+                return_value=IntentRoute(Intent.AGENT_REPEAT, "high"),
+            ),
+            mock.patch.object(daemon, "_pending_cursor_question", return_value=None),
+            mock.patch.object(daemon, "_has_announceable_jobs", return_value=False),
+            mock.patch.object(wake_daemon, "cursor_turn") as cursor_turn,
+            mock.patch.object(wake_daemon, "qwen_turn") as qwen_turn,
+            mock.patch.object(
+                daemon,
+                "play_response",
+                return_value=({"played_text": "Please say yes"}, None),
+            ) as play,
+            mock.patch.object(wake_daemon, "notify"),
+        ):
+            daemon.process_utterance(AUDIO_GENERATION, woke=False)
+
+        cursor_turn.assert_not_called()
+        qwen_turn.assert_not_called()
+        self.assertIs(daemon.pending_spoken_alias, pending)
+        played = play.call_args.args[0]
+        self.assertIn("say yes to confirm", played.spoken_text)
+        self.assertNotEqual(played.spoken_text, "It is noon.")
+
+    def test_focused_identity_beats_just_used_and_ignores_text_context(self) -> None:
+        daemon = _bare_daemon()
+        fragment = mock.Mock(
+            source="github",
+            repository_reference="focused/repo",
+            issue_reference="focused/repo#1",
+        )
+        followup = wake_daemon.CompletedFollowup(
+            job_id="aaaaaaaaaaaa",
+            parent_revision=1,
+            completed_at=1.0,
+            expires_at=time.monotonic() + 60,
+        )
+        daemon.completed_followup = followup
+        job = CursorJob.from_dict(
+            {
+                "id": "aaaaaaaaaaaa",
+                "status": "completed",
+                "request": "test",
+                "created_at": 1,
+                "completed_at": 1.0,
+                "github_repository": "justused/repo",
+                "github_issue": 99,
+            }
+        )
+        with (
+            mock.patch.object(
+                wake_daemon, "focused_browser_url", return_value="https://x"
+            ),
+            mock.patch.object(wake_daemon, "capture_context", return_value=fragment),
+            mock.patch.object(wake_daemon, "CURSOR_STORE") as store,
+        ):
+            store.get.return_value = job
+            repository, issue = daemon._trusted_github_alias_identities()
+
+        self.assertEqual(repository, "focused/repo")
+        self.assertEqual(issue, "focused/repo#1")
+        store.get.assert_not_called()
+
+    def test_just_used_is_used_only_when_nothing_is_focused(self) -> None:
+        daemon = _bare_daemon()
+        followup = wake_daemon.CompletedFollowup(
+            job_id="aaaaaaaaaaaa",
+            parent_revision=1,
+            completed_at=1.0,
+            expires_at=time.monotonic() + 60,
+        )
+        daemon.completed_followup = followup
+        job = CursorJob.from_dict(
+            {
+                "id": "aaaaaaaaaaaa",
+                "status": "completed",
+                "request": "test",
+                "created_at": 1,
+                "completed_at": 1.0,
+                "github_repository": "justused/repo",
+                "github_issue": 99,
+            }
+        )
+        with (
+            mock.patch.object(wake_daemon, "focused_browser_url", return_value=None),
+            mock.patch.object(
+                wake_daemon, "focused_herdr_github_context", return_value=None
+            ),
+            mock.patch.object(wake_daemon, "CURSOR_STORE") as store,
+        ):
+            store.get.return_value = job
+            repository, issue = daemon._trusted_github_alias_identities()
+
+        self.assertEqual(repository, "justused/repo")
+        self.assertEqual(issue, "justused/repo#99")
+
+    def test_linear_focused_fragment_is_not_a_github_alias_target(self) -> None:
+        daemon = _bare_daemon()
+        fragment = mock.Mock(
+            source="linear",
+            repository_reference=None,
+            issue_reference="API-79",
+        )
+        with (
+            mock.patch.object(
+                wake_daemon, "focused_browser_url", return_value="https://x"
+            ),
+            mock.patch.object(wake_daemon, "capture_context", return_value=fragment),
+            mock.patch.object(
+                wake_daemon, "focused_herdr_github_context", return_value=None
+            ),
+        ):
+            repository, issue = daemon._trusted_github_alias_identities()
+
+        self.assertIsNone(repository)
+        self.assertIsNone(issue)
 
 
 class AnnounceJobTests(unittest.TestCase):

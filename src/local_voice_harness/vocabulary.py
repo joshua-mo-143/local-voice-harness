@@ -15,6 +15,12 @@ because it round-trips losslessly with only the standard library, so the harness
 keeps its zero-runtime-dependency policy. The file is written privately
 (``0o600``) with sorted keys so backups and diffs are stable.
 
+Repository and issue aliases may also be created by a confirmation-gated spoken
+path. That path writes only through :func:`add_alias` and takes the target from a
+trusted focused or just-used ``owner/repo`` or ``owner/repo#number`` identity. It
+never parses a target from a second transcription. Replacements and
+pronunciations remain CLI-only. The store still never silently learns.
+
 Three entry kinds are stored:
 
 ``replacements``
@@ -67,9 +73,17 @@ from pathlib import Path
 
 from . import config
 from .errors import HarnessError
+from .responses import AssistantResponse
 
 SCHEMA_VERSION = 2
 _SUPPORTED_SCHEMA_VERSIONS = {1, SCHEMA_VERSION}
+_MAX_SPOKEN_ALIAS_PHRASE_CHARS = 80
+_SPOKEN_ALIAS_REQUEST = re.compile(
+    r"^\s*(?:please\s+)?(?:call|name)\s+(?:this|that)\s+"
+    r"(?:(?P<kind>repo(?:sitory)?|issue)\s+)?"
+    r"(?P<phrase>.+?)\s*$",
+    re.IGNORECASE,
+)
 
 _REPOSITORY = re.compile(
     r"^(?P<owner>[A-Za-z0-9](?:[A-Za-z0-9-]{0,38}))/(?P<repo>[A-Za-z0-9_.-]+)$"
@@ -87,6 +101,16 @@ class VocabularyError(HarnessError):
 class AliasKind(StrEnum):
     REPOSITORY = "repository"
     ISSUE = "issue"
+
+
+class SpokenAliasStatus(StrEnum):
+    """Outcome of preparing one confirmation-gated spoken alias write."""
+
+    READY = "ready"
+    MISSING_PHRASE = "missing_phrase"
+    MISSING_TARGET = "missing_target"
+    INVALID_TARGET = "invalid_target"
+    NO_CHANGE = "no_change"
 
 
 _SPOKEN_PRONUNCIATION_PUNCTUATION = frozenset(" -'’.,+")
@@ -120,6 +144,174 @@ def _canonical_target(target: str) -> tuple[str, AliasKind]:
         f"alias target {target!r} must be an owner/repository or "
         "owner/repository#number reference"
     )
+
+
+def _spoken_kind_hint(value: str | None) -> AliasKind | None:
+    if value is None:
+        return None
+    folded = value.casefold()
+    if folded in {"repo", "repository"}:
+        return AliasKind.REPOSITORY
+    if folded == "issue":
+        return AliasKind.ISSUE
+    return None
+
+
+def parse_spoken_alias_request(utterance: str) -> tuple[str, AliasKind | None] | None:
+    """Extract a spoken alias phrase from the original utterance.
+
+    The target is never taken from this text. A missing or empty phrase fails
+    closed so a second transcription cannot become the written identity.
+    """
+
+    match = _SPOKEN_ALIAS_REQUEST.fullmatch(utterance.strip().rstrip(".?!"))
+    if match is None:
+        return None
+    phrase = " ".join(match.group("phrase").split())
+    if (
+        not phrase
+        or len(phrase) > _MAX_SPOKEN_ALIAS_PHRASE_CHARS
+        or phrase.casefold() in {"repo", "repository", "issue"}
+    ):
+        return None
+    return phrase, _spoken_kind_hint(match.group("kind"))
+
+
+def select_trusted_alias_target(
+    kind_hint: AliasKind | None,
+    *,
+    focused_repository: str | None = None,
+    focused_issue: str | None = None,
+) -> str | None:
+    """Choose one trusted GitHub identity. Never parse the utterance."""
+
+    repository = focused_repository.strip() if focused_repository else None
+    issue = focused_issue.strip() if focused_issue else None
+    if kind_hint == AliasKind.REPOSITORY:
+        return repository
+    if kind_hint == AliasKind.ISSUE:
+        return issue
+    return issue or repository
+
+
+@dataclass(frozen=True, slots=True)
+class PendingSpokenAlias:
+    """One validated spoken alias awaiting an explicit user decision."""
+
+    trusted_utterance: str
+    phrase: str
+    target: str
+    kind: AliasKind
+    existing_target: str | None = None
+    replace: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class SpokenAliasPreparation:
+    """Typed preflight result; only ``READY`` carries pending state."""
+
+    status: SpokenAliasStatus
+    pending: PendingSpokenAlias | None = None
+
+
+def prepare_spoken_alias(
+    utterance: str,
+    *,
+    focused_repository: str | None = None,
+    focused_issue: str | None = None,
+    path: Path | None = None,
+) -> SpokenAliasPreparation:
+    """Resolve one spoken alias without persisting it."""
+
+    parsed = parse_spoken_alias_request(utterance)
+    if parsed is None:
+        return SpokenAliasPreparation(SpokenAliasStatus.MISSING_PHRASE)
+    phrase, kind_hint = parsed
+    selected = select_trusted_alias_target(
+        kind_hint,
+        focused_repository=focused_repository,
+        focused_issue=focused_issue,
+    )
+    if selected is None:
+        return SpokenAliasPreparation(SpokenAliasStatus.MISSING_TARGET)
+    try:
+        target, kind = _canonical_target(selected)
+    except VocabularyError:
+        return SpokenAliasPreparation(SpokenAliasStatus.INVALID_TARGET)
+    if kind_hint is not None and kind != kind_hint:
+        return SpokenAliasPreparation(SpokenAliasStatus.INVALID_TARGET)
+    normalized = _normalize_phrase(phrase)
+    existing = load(path).alias_for(normalized)
+    if existing is not None and existing.target == target:
+        return SpokenAliasPreparation(SpokenAliasStatus.NO_CHANGE)
+    return SpokenAliasPreparation(
+        SpokenAliasStatus.READY,
+        PendingSpokenAlias(
+            trusted_utterance=utterance,
+            phrase=normalized,
+            target=target,
+            kind=kind,
+            existing_target=None if existing is None else existing.target,
+        ),
+    )
+
+
+def commit_spoken_alias(
+    pending: PendingSpokenAlias,
+    *,
+    force: bool = False,
+    path: Path | None = None,
+) -> None:
+    """Write one previously confirmed alias through :func:`add_alias`."""
+
+    add_alias(pending.phrase, pending.target, force=force, path=path)
+
+
+def render_spoken_alias_preparation(
+    preparation: SpokenAliasPreparation,
+) -> AssistantResponse:
+    """Speak the phrase and canonical target, or a fail-closed refusal."""
+
+    if preparation.status == SpokenAliasStatus.NO_CHANGE:
+        return AssistantResponse.from_text(
+            "That alias already maps to the current target, so I didn't write anything."
+        )
+    if preparation.status == SpokenAliasStatus.MISSING_PHRASE:
+        return AssistantResponse.from_text(
+            "I couldn't hear the alias phrase, so I didn't write anything."
+        )
+    if preparation.status == SpokenAliasStatus.MISSING_TARGET:
+        return AssistantResponse.from_text(
+            "I don't have a focused or just-used repository or issue to alias, "
+            "so I didn't write anything."
+        )
+    if preparation.status != SpokenAliasStatus.READY:
+        return AssistantResponse.from_text(
+            "I couldn't validate that repository alias, so I didn't write anything."
+        )
+    pending = preparation.pending
+    assert pending is not None
+    if pending.replace:
+        existing = pending.existing_target or "a different target"
+        spoken = (
+            f"{pending.phrase} already resolves to {existing}. "
+            f"Replace it with {pending.target}? "
+            "Say yes to replace or no to cancel."
+        )
+    else:
+        spoken = (
+            f"Call {pending.phrase} {pending.target}? "
+            "Say yes to confirm or no to cancel."
+        )
+    return AssistantResponse(spoken_text=spoken, display_text=spoken)
+
+
+def render_spoken_alias_committed(pending: PendingSpokenAlias) -> AssistantResponse:
+    """Report one completed alias write."""
+
+    verb = "Replaced" if pending.replace else "Saved"
+    spoken = f"{verb} alias {pending.phrase} as {pending.target}."
+    return AssistantResponse(spoken_text=spoken, display_text=spoken)
 
 
 @dataclass(frozen=True)

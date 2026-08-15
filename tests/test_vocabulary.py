@@ -356,6 +356,186 @@ class RoutingPrepassTests(unittest.TestCase):
         )
 
 
+class SpokenAliasPreparationTests(unittest.TestCase):
+    def _store(self) -> Path:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        return Path(temporary.name) / "vocabulary.json"
+
+    def test_call_this_repo_uses_focused_repository_not_uttered_target(self) -> None:
+        store = self._store()
+        preparation = vocabulary.prepare_spoken_alias(
+            "Call this repo owner/stt-guess the harness",
+            focused_repository="joshua-mo-143/local-voice-harness",
+            focused_issue="joshua-mo-143/local-voice-harness#419",
+            path=store,
+        )
+
+        self.assertEqual(preparation.status, vocabulary.SpokenAliasStatus.READY)
+        pending = preparation.pending
+        assert pending is not None
+        self.assertEqual(pending.phrase, "owner/stt-guess the harness")
+        self.assertEqual(pending.target, "joshua-mo-143/local-voice-harness")
+        self.assertEqual(pending.kind, vocabulary.AliasKind.REPOSITORY)
+        self.assertFalse(pending.replace)
+        self.assertIsNone(vocabulary.load(store).alias_for("the harness"))
+
+    def test_call_this_issue_uses_focused_issue_identity(self) -> None:
+        preparation = vocabulary.prepare_spoken_alias(
+            "call this the launcher issue",
+            focused_repository="owner/repo",
+            focused_issue="owner/repo#35",
+            path=self._store(),
+        )
+
+        pending = preparation.pending
+        assert pending is not None
+        self.assertEqual(pending.phrase, "the launcher issue")
+        self.assertEqual(pending.target, "owner/repo#35")
+        self.assertEqual(pending.kind, vocabulary.AliasKind.ISSUE)
+
+    def test_missing_phrase_or_target_fails_closed(self) -> None:
+        store = self._store()
+        missing_phrase = vocabulary.prepare_spoken_alias(
+            "please alias this",
+            focused_repository="owner/repo",
+            path=store,
+        )
+        missing_target = vocabulary.prepare_spoken_alias(
+            "Call this repo the harness",
+            path=store,
+        )
+        uttered_only = vocabulary.prepare_spoken_alias(
+            "Call this repo owner/stt-guess",
+            path=store,
+        )
+
+        self.assertEqual(
+            missing_phrase.status, vocabulary.SpokenAliasStatus.MISSING_PHRASE
+        )
+        self.assertEqual(
+            missing_target.status, vocabulary.SpokenAliasStatus.MISSING_TARGET
+        )
+        self.assertEqual(
+            uttered_only.status, vocabulary.SpokenAliasStatus.MISSING_TARGET
+        )
+        self.assertEqual(vocabulary.load(store).aliases, ())
+
+    def test_issue_kind_without_issue_identity_fails_closed(self) -> None:
+        preparation = vocabulary.prepare_spoken_alias(
+            "call this issue the launcher",
+            focused_repository="owner/repo",
+            path=self._store(),
+        )
+
+        self.assertEqual(
+            preparation.status, vocabulary.SpokenAliasStatus.MISSING_TARGET
+        )
+        self.assertIsNone(preparation.pending)
+
+    def test_invalid_trusted_target_fails_closed(self) -> None:
+        preparation = vocabulary.prepare_spoken_alias(
+            "Call this repo the harness",
+            focused_repository="not a repository",
+            path=self._store(),
+        )
+
+        self.assertEqual(
+            preparation.status, vocabulary.SpokenAliasStatus.INVALID_TARGET
+        )
+
+    def test_identical_alias_is_no_change(self) -> None:
+        store = self._store()
+        with redirect_stdout(io.StringIO()):
+            vocabulary.add_alias("the harness", "owner/repo", path=store)
+        preparation = vocabulary.prepare_spoken_alias(
+            "Call this repo the harness",
+            focused_repository="owner/repo",
+            path=store,
+        )
+
+        self.assertEqual(preparation.status, vocabulary.SpokenAliasStatus.NO_CHANGE)
+        self.assertIsNone(preparation.pending)
+
+    def test_conflict_is_ready_but_not_written_until_replace(self) -> None:
+        store = self._store()
+        with redirect_stdout(io.StringIO()):
+            vocabulary.add_alias("the harness", "owner/old", path=store)
+        preparation = vocabulary.prepare_spoken_alias(
+            "Call this repo the harness",
+            focused_repository="owner/new",
+            path=store,
+        )
+
+        pending = preparation.pending
+        assert pending is not None
+        self.assertEqual(pending.existing_target, "owner/old")
+        self.assertFalse(pending.replace)
+        existing = vocabulary.load(store).alias_for("the harness")
+        assert existing is not None
+        self.assertEqual(existing.target, "owner/old")
+
+        spoken = vocabulary.render_spoken_alias_preparation(preparation)
+        self.assertIn("the harness", spoken.spoken_text)
+        self.assertIn("owner/new", spoken.spoken_text)
+        self.assertNotIn("Replace it", spoken.spoken_text)
+
+    def test_yes_commits_through_add_alias_and_no_keeps_store_empty(self) -> None:
+        store = self._store()
+        preparation = vocabulary.prepare_spoken_alias(
+            "Call this repo the harness",
+            focused_repository="owner/repo",
+            path=store,
+        )
+        pending = preparation.pending
+        assert pending is not None
+        with redirect_stdout(io.StringIO()):
+            vocabulary.commit_spoken_alias(pending, path=store)
+        alias = vocabulary.load(store).alias_for("the harness")
+        assert alias is not None
+        self.assertEqual(alias.target, "owner/repo")
+        self.assertEqual(alias.kind, vocabulary.AliasKind.REPOSITORY)
+
+    def test_replace_confirmation_uses_force(self) -> None:
+        store = self._store()
+        with redirect_stdout(io.StringIO()):
+            vocabulary.add_alias("the harness", "owner/old", path=store)
+        pending = vocabulary.PendingSpokenAlias(
+            trusted_utterance="Call this repo the harness",
+            phrase="the harness",
+            target="owner/new",
+            kind=vocabulary.AliasKind.REPOSITORY,
+            existing_target="owner/old",
+            replace=True,
+        )
+        with redirect_stdout(io.StringIO()):
+            vocabulary.commit_spoken_alias(pending, force=True, path=store)
+        alias = vocabulary.load(store).alias_for("the harness")
+        assert alias is not None
+        self.assertEqual(alias.target, "owner/new")
+
+    def test_spoken_route_does_not_add_replacements_or_pronunciations(self) -> None:
+        store = self._store()
+        preparation = vocabulary.prepare_spoken_alias(
+            "Call this repo the harness",
+            focused_repository="owner/repo",
+            path=store,
+        )
+        pending = preparation.pending
+        assert pending is not None
+        with redirect_stdout(io.StringIO()):
+            vocabulary.commit_spoken_alias(pending, path=store)
+        loaded = vocabulary.load(store)
+        self.assertEqual(loaded.replacements, ())
+        self.assertEqual(loaded.pronunciations, ())
+        self.assertEqual(len(loaded.aliases), 1)
+
+    def test_parse_rejects_remember_that_and_empty_phrase(self) -> None:
+        self.assertIsNone(vocabulary.parse_spoken_alias_request("remember that"))
+        self.assertIsNone(vocabulary.parse_spoken_alias_request("call this repo"))
+        self.assertIsNone(vocabulary.parse_spoken_alias_request("work on the harness"))
+
+
 class VocabularyCliTests(unittest.TestCase):
     def test_add_replacement_parses_and_dispatches(self) -> None:
         arguments = cli.parser().parse_args(
