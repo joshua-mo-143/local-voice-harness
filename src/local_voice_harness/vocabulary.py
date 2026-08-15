@@ -8,12 +8,19 @@ explicitly asked an agent to run.
 
 Storage
 -------
-The store is a single JSON document (schema ``version`` 2) at
+The store is a single JSON document (schema ``version`` 3) at
 ``$XDG_CONFIG_HOME/voice-harness/vocabulary.json`` (default
 ``~/.config/voice-harness/vocabulary.json``). JSON is used instead of TOML
 because it round-trips losslessly with only the standard library, so the harness
 keeps its zero-runtime-dependency policy. The file is written privately
 (``0o600``) with sorted keys so backups and diffs are stable.
+
+Repository and issue aliases may also be created by a confirmation-gated spoken
+path. That path writes only through :func:`add_alias` and takes ``source`` plus
+``issue_reference`` or ``repository_reference`` from a trusted focused or
+just-used fragment. It never parses a target from a second transcription.
+Replacements and pronunciations remain CLI-only. The store still never silently
+learns.
 
 Three entry kinds are stored:
 
@@ -23,8 +30,9 @@ Three entry kinds are stored:
     case-insensitive phrase.
 ``aliases``
     A spoken ``phrase`` that resolves to a canonical entity ``target`` before
-    routing. ``kind`` is ``repository`` for an ``owner/repo`` target or ``issue``
-    for an ``owner/repo#number`` target; it is inferred from the target form.
+    routing. Each alias persists ``phrase``, provider ``source``, and that
+    provider's canonical ``target``. ``kind`` remains inferred from the target
+    form for display. Legacy untagged GitHub and ``TEAM-79`` aliases still load.
 ``pronunciations``
     A displayed ``written`` name and its user-owned ``spoken`` pronunciation.
     These entries are consumed only by the TTS speech renderer.
@@ -67,9 +75,18 @@ from pathlib import Path
 
 from . import config
 from .errors import HarnessError
+from .integrations.registry import RegistryInput, enabled_integrations
+from .responses import AssistantResponse
 
-SCHEMA_VERSION = 2
-_SUPPORTED_SCHEMA_VERSIONS = {1, SCHEMA_VERSION}
+SCHEMA_VERSION = 3
+_SUPPORTED_SCHEMA_VERSIONS = {1, 2, SCHEMA_VERSION}
+_MAX_SPOKEN_ALIAS_PHRASE_CHARS = 80
+_SPOKEN_ALIAS_REQUEST = re.compile(
+    r"^\s*(?:please\s+)?(?:call|name)\s+(?:this|that)\s+"
+    r"(?:(?P<kind>repo(?:sitory)?|issue)\s+)?"
+    r"(?P<phrase>.+?)\s*$",
+    re.IGNORECASE,
+)
 
 _REPOSITORY = re.compile(
     r"^(?P<owner>[A-Za-z0-9](?:[A-Za-z0-9-]{0,38}))/(?P<repo>[A-Za-z0-9_.-]+)$"
@@ -77,6 +94,15 @@ _REPOSITORY = re.compile(
 _ISSUE = re.compile(
     r"^(?P<owner>[A-Za-z0-9](?:[A-Za-z0-9-]{0,38}))/"
     r"(?P<repo>[A-Za-z0-9_.-]+)#(?P<number>[1-9]\d*)$"
+)
+_LINEAR = re.compile(
+    r"^(?P<team>[A-Za-z][A-Za-z0-9]+)-(?P<number>[1-9]\d*)$",
+    re.IGNORECASE,
+)
+_ZENDESK = re.compile(
+    r"^(?P<subdomain>[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)#"
+    r"(?P<number>\d+)$",
+    re.IGNORECASE,
 )
 
 
@@ -87,6 +113,17 @@ class VocabularyError(HarnessError):
 class AliasKind(StrEnum):
     REPOSITORY = "repository"
     ISSUE = "issue"
+    LINEAR = "linear"
+
+
+class SpokenAliasStatus(StrEnum):
+    """Outcome of preparing one confirmation-gated spoken alias write."""
+
+    READY = "ready"
+    MISSING_PHRASE = "missing_phrase"
+    MISSING_TARGET = "missing_target"
+    INVALID_TARGET = "invalid_target"
+    NO_CHANGE = "no_change"
 
 
 _SPOKEN_PRONUNCIATION_PUNCTUATION = frozenset(" -'’.,+")
@@ -116,10 +153,269 @@ def _canonical_target(target: str) -> tuple[str, AliasKind]:
     if repository is not None and repository.group("repo") not in {".", ".."}:
         owner, repo = repository.group("owner", "repo")
         return f"{owner}/{repo}", AliasKind.REPOSITORY
+    linear = _LINEAR.fullmatch(candidate)
+    if linear is not None:
+        team, number = linear.group("team", "number")
+        return f"{team.upper()}-{int(number)}", AliasKind.LINEAR
     raise VocabularyError(
-        f"alias target {target!r} must be an owner/repository or "
-        "owner/repository#number reference"
+        f"alias target {target!r} must be an owner/repository, "
+        "owner/repository#number, or TEAM-79 Linear reference"
     )
+
+
+def _legacy_alias_source(kind: AliasKind) -> str:
+    return "linear" if kind == AliasKind.LINEAR else "github"
+
+
+def _alias_identity(target: str) -> tuple[str, str, AliasKind]:
+    """Infer canonical target, owning source, and kind from target form."""
+
+    try:
+        canonical, kind = _canonical_target(target)
+    except VocabularyError:
+        zendesk = _ZENDESK.fullmatch(target.strip())
+        if zendesk is None:
+            raise
+        subdomain = zendesk.group("subdomain").casefold()
+        return f"{subdomain}#{int(zendesk.group('number'))}", "zendesk", AliasKind.ISSUE
+    return canonical, _legacy_alias_source(kind), kind
+
+
+def _owned_canonical(integration: object, target: str) -> tuple[str, AliasKind] | None:
+    for owns_name, canonicalize_name, default_kind in (
+        ("owns_issue_reference", "canonicalize_issue_reference", AliasKind.ISSUE),
+        (
+            "owns_repository_reference",
+            "canonicalize_repository_reference",
+            AliasKind.REPOSITORY,
+        ),
+    ):
+        owns = getattr(integration, owns_name, None)
+        if owns is None or not owns(target):
+            continue
+        canonicalize = getattr(integration, canonicalize_name, None)
+        canonical = str(canonicalize(target)) if canonicalize is not None else target
+        canonical = canonical.strip()
+        if not canonical or not owns(canonical):
+            continue
+        try:
+            canonical, kind = _canonical_target(canonical)
+        except VocabularyError:
+            kind = default_kind
+        return canonical, kind
+    return None
+
+
+def resolve_owned_alias_target(
+    target: str,
+    *,
+    source: str | None = None,
+    integrations: RegistryInput = None,
+) -> tuple[str, str, AliasKind]:
+    """Canonicalize ``target`` through one enabled provider ownership hook."""
+
+    expected = source.strip().casefold() if source else None
+    owners: list[tuple[str, str, AliasKind]] = []
+    for integration in enabled_integrations(integrations):
+        name = str(getattr(integration, "name", "")).strip().casefold()
+        if not name or (expected is not None and name != expected):
+            continue
+        owned = _owned_canonical(integration, target)
+        if owned is None:
+            continue
+        canonical, kind = owned
+        owners.append((canonical, name, kind))
+    if len(owners) > 1:
+        raise VocabularyError("multiple enabled providers own that alias target")
+    if owners:
+        return owners[0]
+    raise VocabularyError("no enabled provider owns that alias target")
+
+
+def _spoken_kind_hint(value: str | None) -> AliasKind | None:
+    if value is None:
+        return None
+    folded = value.casefold()
+    if folded in {"repo", "repository"}:
+        return AliasKind.REPOSITORY
+    if folded == "issue":
+        return AliasKind.ISSUE
+    return None
+
+
+def parse_spoken_alias_request(utterance: str) -> tuple[str, AliasKind | None] | None:
+    """Extract a spoken alias phrase from the original utterance.
+
+    The target is never taken from this text. A missing or empty phrase fails
+    closed so a second transcription cannot become the written identity.
+    """
+
+    match = _SPOKEN_ALIAS_REQUEST.fullmatch(utterance.strip().rstrip(".?!"))
+    if match is None:
+        return None
+    phrase = " ".join(match.group("phrase").split())
+    if (
+        not phrase
+        or len(phrase) > _MAX_SPOKEN_ALIAS_PHRASE_CHARS
+        or phrase.casefold() in {"repo", "repository", "issue"}
+    ):
+        return None
+    return phrase, _spoken_kind_hint(match.group("kind"))
+
+
+def select_trusted_alias_target(
+    kind_hint: AliasKind | None,
+    *,
+    focused_repository: str | None = None,
+    focused_issue: str | None = None,
+) -> str | None:
+    """Choose one trusted fragment identity. Never parse the utterance."""
+
+    repository = focused_repository.strip() if focused_repository else None
+    issue = focused_issue.strip() if focused_issue else None
+    if kind_hint == AliasKind.REPOSITORY:
+        return repository
+    if kind_hint == AliasKind.ISSUE:
+        return issue
+    return issue or repository
+
+
+@dataclass(frozen=True, slots=True)
+class PendingSpokenAlias:
+    """One validated spoken alias awaiting an explicit user decision."""
+
+    trusted_utterance: str
+    phrase: str
+    target: str
+    kind: AliasKind
+    source: str = "github"
+    existing_target: str | None = None
+    replace: bool = False
+
+
+@dataclass(frozen=True, slots=True)
+class SpokenAliasPreparation:
+    """Typed preflight result; only ``READY`` carries pending state."""
+
+    status: SpokenAliasStatus
+    pending: PendingSpokenAlias | None = None
+
+
+def prepare_spoken_alias(
+    utterance: str,
+    *,
+    focused_repository: str | None = None,
+    focused_issue: str | None = None,
+    source: str | None = None,
+    path: Path | None = None,
+    integrations: RegistryInput = None,
+) -> SpokenAliasPreparation:
+    """Resolve one spoken alias from a focused or just-used fragment identity."""
+
+    parsed = parse_spoken_alias_request(utterance)
+    if parsed is None:
+        return SpokenAliasPreparation(SpokenAliasStatus.MISSING_PHRASE)
+    phrase, kind_hint = parsed
+    selected = select_trusted_alias_target(
+        kind_hint,
+        focused_repository=focused_repository,
+        focused_issue=focused_issue,
+    )
+    if selected is None:
+        return SpokenAliasPreparation(SpokenAliasStatus.MISSING_TARGET)
+    try:
+        target, resolved_source, kind = resolve_owned_alias_target(
+            selected,
+            source=source,
+            integrations=integrations,
+        )
+    except VocabularyError:
+        return SpokenAliasPreparation(SpokenAliasStatus.INVALID_TARGET)
+    if kind_hint == AliasKind.REPOSITORY and kind != AliasKind.REPOSITORY:
+        return SpokenAliasPreparation(SpokenAliasStatus.INVALID_TARGET)
+    if kind_hint == AliasKind.ISSUE and kind == AliasKind.REPOSITORY:
+        return SpokenAliasPreparation(SpokenAliasStatus.INVALID_TARGET)
+    normalized = _normalize_phrase(phrase)
+    existing = load(path).alias_for(normalized)
+    if existing is not None and existing.target == target:
+        return SpokenAliasPreparation(SpokenAliasStatus.NO_CHANGE)
+    return SpokenAliasPreparation(
+        SpokenAliasStatus.READY,
+        PendingSpokenAlias(
+            trusted_utterance=utterance,
+            phrase=normalized,
+            target=target,
+            kind=kind,
+            source=resolved_source,
+            existing_target=None if existing is None else existing.target,
+        ),
+    )
+
+
+def commit_spoken_alias(
+    pending: PendingSpokenAlias,
+    *,
+    force: bool = False,
+    path: Path | None = None,
+    integrations: RegistryInput = None,
+) -> None:
+    """Write one previously confirmed alias through :func:`add_alias`."""
+
+    add_alias(
+        pending.phrase,
+        pending.target,
+        force=force,
+        path=path,
+        source=pending.source,
+        integrations=integrations,
+    )
+
+
+def render_spoken_alias_preparation(
+    preparation: SpokenAliasPreparation,
+) -> AssistantResponse:
+    """Speak the phrase and canonical target, or a fail-closed refusal."""
+
+    if preparation.status == SpokenAliasStatus.NO_CHANGE:
+        return AssistantResponse.from_text(
+            "That alias already maps to the current target, so I didn't write anything."
+        )
+    if preparation.status == SpokenAliasStatus.MISSING_PHRASE:
+        return AssistantResponse.from_text(
+            "I couldn't hear the alias phrase, so I didn't write anything."
+        )
+    if preparation.status == SpokenAliasStatus.MISSING_TARGET:
+        return AssistantResponse.from_text(
+            "I don't have a focused or just-used repository or issue to alias, "
+            "so I didn't write anything."
+        )
+    if preparation.status != SpokenAliasStatus.READY:
+        return AssistantResponse.from_text(
+            "I couldn't validate that repository alias, so I didn't write anything."
+        )
+    pending = preparation.pending
+    assert pending is not None
+    if pending.replace:
+        existing = pending.existing_target or "a different target"
+        spoken = (
+            f"{pending.phrase} already resolves to {existing}. "
+            f"Replace it with {pending.target}? "
+            "Say yes to replace or no to cancel."
+        )
+    else:
+        spoken = (
+            f"Call {pending.phrase} {pending.target}? "
+            "Say yes to confirm or no to cancel."
+        )
+    return AssistantResponse(spoken_text=spoken, display_text=spoken)
+
+
+def render_spoken_alias_committed(pending: PendingSpokenAlias) -> AssistantResponse:
+    """Report one completed alias write."""
+
+    verb = "Replaced" if pending.replace else "Saved"
+    spoken = f"{verb} alias {pending.phrase} as {pending.target}."
+    return AssistantResponse(spoken_text=spoken, display_text=spoken)
 
 
 @dataclass(frozen=True)
@@ -138,6 +434,7 @@ class Alias:
     phrase: str
     target: str
     kind: AliasKind
+    source: str = "github"
 
 
 @dataclass(frozen=True)
@@ -210,7 +507,12 @@ class Vocabulary:
                 for item in sorted(self.replacements, key=lambda item: item.spoken)
             ],
             "aliases": [
-                {"phrase": item.phrase, "target": item.target, "kind": str(item.kind)}
+                {
+                    "phrase": item.phrase,
+                    "source": item.source,
+                    "target": item.target,
+                    "kind": str(item.kind),
+                }
                 for item in sorted(self.aliases, key=lambda item: item.phrase)
             ],
             "pronunciations": [
@@ -270,7 +572,21 @@ def _parse_aliases(value: object) -> tuple[Alias, ...]:
         if not isinstance(phrase_raw, str) or not isinstance(target_raw, str):
             raise VocabularyError("alias 'phrase' and 'target' must be strings")
         phrase = _normalize_phrase(phrase_raw)
-        target, kind = _canonical_target(target_raw)
+        if not target_raw.strip():
+            raise VocabularyError("alias 'target' must not be empty")
+        source_raw = record.get("source")
+        if isinstance(source_raw, str) and source_raw.strip():
+            source = source_raw.strip().casefold()
+            target = target_raw.strip()
+            kind_raw = record.get("kind")
+            try:
+                kind = AliasKind(kind_raw)
+            except (TypeError, ValueError) as exc:
+                raise VocabularyError(
+                    f"alias {phrase!r} has invalid kind {kind_raw!r}"
+                ) from exc
+        else:
+            target, source, kind = _alias_identity(target_raw)
         if phrase in seen and seen[phrase] != target:
             raise VocabularyError(
                 f"alias {phrase!r} is ambiguous: it maps to both "
@@ -279,7 +595,7 @@ def _parse_aliases(value: object) -> tuple[Alias, ...]:
         if phrase in seen:
             continue
         seen[phrase] = target
-        aliases.append(Alias(phrase=phrase, target=target, kind=kind))
+        aliases.append(Alias(phrase=phrase, target=target, kind=kind, source=source))
     return tuple(aliases)
 
 
@@ -434,11 +750,21 @@ def add_replacement(
 
 
 def add_alias(
-    phrase: str, target: str, *, force: bool = False, path: Path | None = None
+    phrase: str,
+    target: str,
+    *,
+    force: bool = False,
+    path: Path | None = None,
+    source: str | None = None,
+    integrations: RegistryInput = None,
 ) -> None:
     vocabulary = load(path)
     normalized = _normalize_phrase(phrase)
-    canonical, kind = _canonical_target(target)
+    canonical, resolved_source, kind = resolve_owned_alias_target(
+        target,
+        source=source,
+        integrations=integrations,
+    )
     existing = vocabulary.alias_for(normalized)
     if existing is not None and existing.target != canonical and not force:
         raise VocabularyError(
@@ -449,7 +775,15 @@ def add_alias(
     updated = Vocabulary(
         version=SCHEMA_VERSION,
         replacements=vocabulary.replacements,
-        aliases=(*kept, Alias(phrase=normalized, target=canonical, kind=kind)),
+        aliases=(
+            *kept,
+            Alias(
+                phrase=normalized,
+                target=canonical,
+                kind=kind,
+                source=resolved_source,
+            ),
+        ),
         pronunciations=vocabulary.pronunciations,
     )
     save(updated, path)

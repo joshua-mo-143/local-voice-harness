@@ -495,6 +495,32 @@ class HarnessConfigChangeIntentTests(LocalRouterTestCase):
         self.assertEqual(route, intent.FALLBACK_ROUTE)
 
 
+class VocabularyAliasIntentTests(LocalRouterTestCase):
+    def test_route_tool_exposes_spoken_alias_intent(self) -> None:
+        properties = intent.ROUTE_TOOL["function"]["parameters"]["properties"]
+        self.assertIn("vocabulary_alias_add", properties["intent"]["enum"])
+        self.assertIn("call this repo the harness", intent.ROUTER_SYSTEM_PROMPT)
+        self.assertIn("just-used", intent.ROUTER_SYSTEM_PROMPT)
+
+    def test_alias_route_retains_phrase_raw_value(self) -> None:
+        with mock.patch.object(
+            llm_transport.urllib.request,
+            "urlopen",
+            return_value=_response(
+                "vocabulary_alias_add",
+                raw_value="the harness",
+            ),
+        ):
+            route = intent.route_intent(
+                "Call this repo the harness",
+                RequestContext("Call this repo the harness"),
+            )
+
+        self.assertEqual(route.intent, intent.Intent.VOCABULARY_ALIAS_ADD)
+        self.assertEqual(route.raw_value, "the harness")
+        self.assertTrue(route.actionable)
+
+
 class SelfHealthIntentTests(LocalRouterTestCase):
     def test_route_tool_exposes_explicit_self_health_intent(self) -> None:
         enum = intent.ROUTE_TOOL["function"]["parameters"]["properties"]["intent"][

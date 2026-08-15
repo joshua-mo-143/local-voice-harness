@@ -25,7 +25,12 @@ from ..agents.model import JobStatus
 from ..agents.service import AgentTurnRequest as CursorTurnRequest
 from ..agents.service import agent_turn as cursor_turn
 from ..agents.service import recover_jobs
-from ..browser_context import RequestContext, request_context
+from ..browser_context import (
+    RequestContext,
+    focused_browser_url,
+    focused_herdr_github_context,
+    request_context,
+)
 from ..components import start_components, stop_components
 from ..config import (
     DICTATION_PID_PATH,
@@ -106,7 +111,11 @@ from ..diagnostics.health import self_health_response
 from ..diagnostics.help import harness_help_response
 from ..errors import HarnessError, NoSpeechError, SpeechDeliveryError
 from ..github_issue_creation import repository_from_utterance
-from ..integrations.registry import IntegrationRegistry, build_integration_registry
+from ..integrations.registry import (
+    IntegrationRegistry,
+    build_integration_registry,
+    capture_context,
+)
 from ..intent import (
     NON_ACTIONABLE_SUBMIT_RESPONSE,
     ForkIntent,
@@ -157,6 +166,19 @@ from ..ticket_targets import (
 from ..tts.queue import PlaybackQueue, PlaybackRequest
 from ..user_config import AnnouncementSettings, UserConfig, load_user_config
 from ..vad import FRAME_BYTES, FRAME_MS, SAMPLE_RATE, SpeechDetector
+from ..vocabulary import (
+    PendingSpokenAlias,
+    SpokenAliasPreparation,
+    SpokenAliasStatus,
+    commit_spoken_alias,
+    parse_spoken_alias_request,
+    prepare_spoken_alias,
+    render_spoken_alias_committed,
+    render_spoken_alias_preparation,
+)
+from ..vocabulary import (
+    load as load_vocabulary,
+)
 
 RECORDING_PATHS = recorder.RecorderPaths(
     STATE_DIR, WAV_PATH, PID_PATH, RECORDER_LOG, RECORDING_LOCK
@@ -553,6 +575,7 @@ class WakeConversationDaemon:
         self.pending_target_readback: PendingTargetReadback | None = None
         self.pending_target_resolution: PendingTargetResolution | None = None
         self.pending_config_change: PendingConfigChange | None = None
+        self.pending_spoken_alias: PendingSpokenAlias | None = None
         self.config_activation_store = config_activation_store or ActivationStore()
         self.config_activation_delivery: ActivationDelivery | None = None
         self.launched_config_activations: dict[str, subprocess.Popen[bytes]] = {}
@@ -763,6 +786,7 @@ class WakeConversationDaemon:
         self.pending_target_readback = None
         self.pending_target_resolution = None
         self.pending_config_change = None
+        self.pending_spoken_alias = None
         self.conversation_deadline = 0.0
         self.awaiting_followup = False
         self.last_ordinary_reply = None
@@ -779,6 +803,7 @@ class WakeConversationDaemon:
         self.history.clear()
         self.completed_followup = None
         self.pending_config_change = None
+        self.pending_spoken_alias = None
         self.conversation_deadline = 0.0
         self.awaiting_followup = False
         self.pause_microphone()
@@ -1461,6 +1486,160 @@ class WakeConversationDaemon:
                     response = render_activation_delivery(delivery)
         return response, decision, pending
 
+    def _focused_alias_identity(
+        self,
+    ) -> tuple[str | None, str | None, str | None]:
+        """Return focused fragment source and references, never from STT."""
+
+        try:
+            url = focused_browser_url()
+            fragment = (
+                capture_context(url, self.integrations) if url is not None else None
+            )
+        except Exception:
+            fragment = None
+        if fragment is None:
+            try:
+                fragment = focused_herdr_github_context(self.integrations)
+            except Exception:
+                fragment = None
+        if fragment is None:
+            return None, None, None
+        source = fragment.source.strip() if fragment.source else None
+        return source, fragment.repository_reference, fragment.issue_reference
+
+    def _just_used_alias_identity(
+        self,
+    ) -> tuple[str | None, str | None, str | None]:
+        """Return fragment identity from the live just-used completed job."""
+
+        followup = self._active_completed_followup()
+        if followup is None:
+            return None, None, None
+        try:
+            job = CURSOR_STORE.get(followup.job_id)
+        except Exception:
+            return None, None, None
+        if (
+            job.status != JobStatus.COMPLETED
+            or job.completed_at != followup.completed_at
+        ):
+            return None, None, None
+        if job.issue_key:
+            source = job.issue_provider.strip() if job.issue_provider else None
+            return source, None, job.issue_key
+        if job.github_repository or job.github_issue:
+            repository = job.github_repository
+            issue = (
+                f"{job.github_repository}#{job.github_issue}"
+                if job.github_repository and job.github_issue
+                else None
+            )
+            return "github", repository, issue
+        return None, None, None
+
+    def _trusted_alias_identity(self) -> tuple[str | None, str | None, str | None]:
+        """Prefer focused fragment identity; fall back to just-used when absent."""
+
+        source, repository, issue = self._focused_alias_identity()
+        if source or repository or issue:
+            return source, repository, issue
+        return self._just_used_alias_identity()
+
+    def _resolve_pending_spoken_alias_confirmation(
+        self,
+        text: str,
+        *,
+        blocked: bool,
+        before_mutation: Callable[[], None] | None = None,
+        after_mutation: Callable[[], None] | None = None,
+    ) -> tuple[
+        AssistantResponse | None, ConfirmationDecision, PendingSpokenAlias | None
+    ]:
+        pending = self.pending_spoken_alias
+        if pending is None or blocked:
+            return None, ConfirmationDecision.AMBIGUOUS, pending
+        decision = resolve_confirmation(text)
+        if decision == ConfirmationDecision.AMBIGUOUS:
+            return None, decision, pending
+        self.pending_spoken_alias = None
+        if decision == ConfirmationDecision.CANCEL:
+            return (
+                AssistantResponse.from_text(
+                    "Okay, I cancelled that alias. Nothing was written."
+                ),
+                decision,
+                pending,
+            )
+        if pending.existing_target is not None and not pending.replace:
+            replacement = PendingSpokenAlias(
+                trusted_utterance=pending.trusted_utterance,
+                phrase=pending.phrase,
+                target=pending.target,
+                kind=pending.kind,
+                source=pending.source,
+                existing_target=pending.existing_target,
+                replace=True,
+            )
+            self.pending_spoken_alias = replacement
+            return (
+                render_spoken_alias_preparation(
+                    SpokenAliasPreparation(SpokenAliasStatus.READY, replacement)
+                ),
+                decision,
+                pending,
+            )
+        if pending.replace:
+            current = load_vocabulary().alias_for(pending.phrase)
+            current_target = None if current is None else current.target
+            if current_target != pending.existing_target:
+                if current_target == pending.target:
+                    return (
+                        render_spoken_alias_preparation(
+                            SpokenAliasPreparation(SpokenAliasStatus.NO_CHANGE)
+                        ),
+                        decision,
+                        pending,
+                    )
+                refreshed = PendingSpokenAlias(
+                    trusted_utterance=pending.trusted_utterance,
+                    phrase=pending.phrase,
+                    target=pending.target,
+                    kind=pending.kind,
+                    existing_target=current_target,
+                    replace=current_target is not None,
+                )
+                self.pending_spoken_alias = refreshed
+                return (
+                    render_spoken_alias_preparation(
+                        SpokenAliasPreparation(SpokenAliasStatus.READY, refreshed)
+                    ),
+                    decision,
+                    pending,
+                )
+        try:
+            if before_mutation is not None:
+                before_mutation()
+            commit_spoken_alias(
+                pending,
+                force=pending.replace,
+                integrations=self.integrations,
+            )
+        except Exception as exc:  # noqa: BLE001 - report a bounded write failure
+            if after_mutation is not None:
+                after_mutation()
+            log(f"confirmed alias write failed: {type(exc).__name__}: {exc}")
+            return (
+                AssistantResponse.from_text(
+                    "I couldn't save that alias, so I didn't write anything."
+                ),
+                decision,
+                pending,
+            )
+        if after_mutation is not None:
+            after_mutation()
+        return render_spoken_alias_committed(pending), decision, pending
+
     def _resolve_activation_confirmation(
         self,
         text: str,
@@ -1784,6 +1963,7 @@ class WakeConversationDaemon:
                     getattr(self, "pending_target_readback", None) is None
                     and pending_target_resolution is None
                     and getattr(self, "pending_config_change", None) is None
+                    and getattr(self, "pending_spoken_alias", None) is None
                 ):
                     raise
                 terminalize_non_side_effect()
@@ -1870,6 +2050,7 @@ class WakeConversationDaemon:
                 and self._pending_cursor_question() is None
                 and not self._has_announceable_jobs()
                 and self.pending_config_change is None
+                and getattr(self, "pending_spoken_alias", None) is None
                 and getattr(self, "pending_target_readback", None) is None
                 and not resolution_active
                 and not activation_offer_pending
@@ -1953,6 +2134,16 @@ class WakeConversationDaemon:
                 before_mutation=fence_side_effect,
                 after_mutation=terminalize_non_side_effect,
             )
+            (
+                alias_response,
+                alias_decision,
+                pending_alias,
+            ) = self._resolve_pending_spoken_alias_confirmation(
+                text,
+                blocked=pending_readback is not None or pending_config is not None,
+                before_mutation=fence_side_effect,
+                after_mutation=terminalize_non_side_effect,
+            )
             activation_response = (
                 self._resolve_activation_confirmation(
                     text,
@@ -1962,6 +2153,8 @@ class WakeConversationDaemon:
                 if pending_readback is None
                 and pending_config is None
                 and config_response is None
+                and pending_alias is None
+                and alias_response is None
                 else None
             )
             active_completed = self._active_completed_followup()
@@ -1972,12 +2165,15 @@ class WakeConversationDaemon:
                 readback_result is not None
                 or confirmed_request is not None
                 or config_response is not None
+                or alias_response is not None
                 or activation_response is not None
             ):
                 route = IntentRoute(Intent.UNCERTAIN, "low")
             elif resuming_target_resolution:
                 assert pending_target_resolution is not None
                 route = pending_target_resolution.route
+            elif parse_spoken_alias_request(text) is not None:
+                route = IntentRoute(Intent.VOCABULARY_ALIAS_ADD, "high")
             elif (
                 self.providers.llm_provider == "venice"
                 and pending is None
@@ -2090,6 +2286,22 @@ class WakeConversationDaemon:
                     )
                     route = IntentRoute(Intent.UNCERTAIN, "low")
             if (
+                pending_alias is not None
+                and alias_decision == ConfirmationDecision.AMBIGUOUS
+                and alias_response is None
+            ):
+                if route.intent == Intent.VOCABULARY_ALIAS_ADD:
+                    self.pending_spoken_alias = None
+                elif (
+                    route.actionable and question_control(text) != AnswerOutcome.REPEAT
+                ):
+                    self.pending_spoken_alias = None
+                else:
+                    alias_response = AssistantResponse.from_text(
+                        "Please say yes to confirm that alias or no to cancel it."
+                    )
+                    route = IntentRoute(Intent.UNCERTAIN, "low")
+            if (
                 pending_readback is None
                 and not resuming_target_resolution
                 and (
@@ -2143,6 +2355,8 @@ class WakeConversationDaemon:
             )
             if config_response is not None:
                 response = config_response
+            elif alias_response is not None:
+                response = alias_response
             elif activation_response is not None:
                 response = activation_response
             elif readback_result is not None:
@@ -2197,11 +2411,33 @@ class WakeConversationDaemon:
                         self.user_config,
                     )
                     self.pending_config_change = preparation.pending
+                    self.pending_spoken_alias = None
                     response = render_change_preparation(preparation)
                 else:
                     self.pending_config_change = None
                     response = AssistantResponse.from_text(
                         "I couldn't identify a safe configuration change, so I didn't "
+                        "write anything."
+                    )
+            elif route.intent == Intent.VOCABULARY_ALIAS_ADD:
+                if route.actionable:
+                    source, focused_repository, focused_issue = (
+                        self._trusted_alias_identity()
+                    )
+                    preparation = prepare_spoken_alias(
+                        text,
+                        focused_repository=focused_repository,
+                        focused_issue=focused_issue,
+                        source=source,
+                        integrations=self.integrations,
+                    )
+                    self.pending_spoken_alias = preparation.pending
+                    self.pending_config_change = None
+                    response = render_spoken_alias_preparation(preparation)
+                else:
+                    self.pending_spoken_alias = None
+                    response = AssistantResponse.from_text(
+                        "I couldn't identify a safe repository alias, so I didn't "
                         "write anything."
                     )
             elif route.actionable and route.intent == Intent.SELF_HEALTH:
@@ -2866,6 +3102,7 @@ class WakeConversationDaemon:
         self.running = False
         self.pending_target_resolution = None
         self.pending_config_change = None
+        self.pending_spoken_alias = None
         if self.microphone is not None and self.microphone.poll() is None:
             if self.microphone_paused:
                 with contextlib.suppress(ProcessLookupError):

@@ -56,7 +56,7 @@ from .speech import SpeechRenderer
 from .ticket_targets import MISSING_ISSUE_SCOPE_RESPONSE, extract_ticket_targets
 from .tts.client import stream_and_play
 from .user_config import UserConfig, load_user_config
-from .vocabulary import resolve_aliases
+from .vocabulary import parse_spoken_alias_request, resolve_aliases
 
 CURSOR_STORE = JobStore(JOBS_DIR, LEGACY_JOBS_DIR)
 
@@ -179,6 +179,8 @@ def respond(text: str, *, user_config: UserConfig | None = None) -> None:
             pending_job = _single_pending_job() if pending is None else None
             if grouped_reply is not None or repository_reply is not None:
                 route = IntentRoute(Intent.AGENT_REPLY, "high")
+            elif parse_spoken_alias_request(text) is not None:
+                route = IntentRoute(Intent.VOCABULARY_ALIAS_ADD, "high")
             elif CURSOR_PATTERN.search(text):
                 route = IntentRoute(Intent.AGENT_SUBMIT, "high")
             else:
@@ -305,6 +307,12 @@ def respond(text: str, *, user_config: UserConfig | None = None) -> None:
                     "Configuration changes require a wake conversation so I can read "
                     "back the exact change and receive confirmation. I didn't write "
                     "anything."
+                )
+            elif route.intent == Intent.VOCABULARY_ALIAS_ADD:
+                response = AssistantResponse.from_text(
+                    "Adding a spoken alias requires a wake conversation so I can read "
+                    "back the phrase and target and receive confirmation. I didn't "
+                    "write anything."
                 )
             elif route.actionable and route.intent == Intent.SELF_HEALTH:
                 response = self_health_response()

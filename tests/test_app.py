@@ -7,7 +7,7 @@ from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
-from local_voice_harness import app
+from local_voice_harness import app, vocabulary
 from local_voice_harness.agents.model import JobStatus
 from local_voice_harness.browser_context import RequestContext
 from local_voice_harness.cursor import consultation
@@ -253,6 +253,25 @@ class AppContextTests(unittest.TestCase):
         cursor_turn.assert_not_called()
         qwen_response.assert_not_called()
         self.assertIn("require a wake conversation", play.call_args.args[0])
+        self.assertIn("didn't write anything", play.call_args.args[0])
+
+    def test_spoken_alias_requires_wake_confirmation_without_writing(self) -> None:
+        config = default_user_config(home=Path("/home/example"))
+        with (
+            mock.patch.object(app, "start_components"),
+            mock.patch.object(app, "request_context") as request_context,
+            mock.patch.object(app, "cursor_turn") as cursor_turn,
+            mock.patch.object(app, "qwen_response") as qwen_response,
+            mock.patch.object(app, "stream_and_play") as play,
+            mock.patch.object(vocabulary, "add_alias") as add_alias,
+        ):
+            app.respond("Call this repo the harness", user_config=config)
+
+        request_context.assert_not_called()
+        cursor_turn.assert_not_called()
+        qwen_response.assert_not_called()
+        add_alias.assert_not_called()
+        self.assertIn("requires a wake conversation", play.call_args.args[0])
         self.assertIn("didn't write anything", play.call_args.args[0])
 
     def test_text_mapping_answers_single_durable_grouped_question(self) -> None:
