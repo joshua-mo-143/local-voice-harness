@@ -15,6 +15,8 @@ from local_voice_harness.integrations.github import (
     GitHubProvider,
     GitHubPullRequest,
     GitHubPullRequestCheckoutInputs,
+    GitHubPullRequestCreationPlan,
+    GitHubPullRequestCreationResult,
     GitHubPullRequestPlan,
     GitHubRepoCreationPlan,
     GitHubRepoCreationResult,
@@ -232,6 +234,46 @@ class GitHubProviderTests(unittest.TestCase):
         self.assertRegex(first.correlation_marker, r"^[0-9a-f]{32}$")
         self.assertRegex(second.correlation_marker, r"^[0-9a-f]{32}$")
         self.assertNotEqual(first.correlation_marker, second.correlation_marker)
+
+    def test_provider_plans_observes_and_submits_pull_request_creation(self) -> None:
+        result = GitHubPullRequestCreationResult(
+            GitHubPullRequest("example", "project", 7),
+            "https://github.com/example/project/pull/7",
+            "a" * 32,
+        )
+        self.client.observe_pull_request_creation.return_value = None
+        self.client.submit_pull_request_creation.return_value = result
+
+        plan = self.provider.plan_pull_request_creation(
+            " example/project.git ",
+            " Open the change ",
+            " Detailed body ",
+            " voice/job ",
+            correlation_marker="a" * 32,
+        )
+
+        self.assertEqual(
+            plan,
+            GitHubPullRequestCreationPlan(
+                "example/project",
+                "Open the change",
+                "Detailed body",
+                "voice/job",
+                "a" * 32,
+            ),
+        )
+        self.assertIsNone(self.provider.observe_pull_request_creation(plan))
+        self.assertEqual(
+            self.provider.submit_pull_request_creation(plan, confirmed=True),
+            result,
+        )
+        self.client.observe_pull_request_creation.assert_called_once_with(plan)
+        self.client.submit_pull_request_creation.assert_called_once_with(
+            plan, confirmed=True
+        )
+        with self.assertRaisesRegex(GitHubError, "confirmation"):
+            self.provider.submit_pull_request_creation(plan, confirmed=False)
+        self.assertEqual(self.client.submit_pull_request_creation.call_count, 1)
 
     def test_provider_plans_observes_and_submits_repo_creation(self) -> None:
         created = GitHubRepoCreationResult(

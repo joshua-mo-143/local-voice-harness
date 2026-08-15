@@ -777,3 +777,84 @@ class LocalGitRepositoryTests(unittest.TestCase):
             self.assertFalse(thread.is_alive())
             self.assertEqual(len(errors), 1)
             self.assertIsInstance(errors[0], Cancelled)
+
+    def test_commit_and_push_require_confirmation_and_leave_clean_checkout(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkout = root / "project"
+            (checkout / ".git").mkdir(parents=True)
+            repository = LocalGitRepository(clone_root=root, allowed_root=root)
+            with self.assertRaisesRegex(LocalGitError, "confirmation"):
+                repository.commit_unpublished_changes(
+                    checkout, "Subject", confirmed=False
+                )
+            with self.assertRaisesRegex(LocalGitError, "confirmation"):
+                repository.push_current_branch(checkout, confirmed=False)
+
+            with mock.patch.object(
+                repository,
+                "git",
+                side_effect=[
+                    _completed(""),
+                    _completed("voice/job\n"),
+                    _completed(),
+                    _completed(),
+                ],
+            ) as git:
+                self.assertIsNone(
+                    repository.commit_unpublished_changes(
+                        checkout, "Subject", confirmed=True
+                    )
+                )
+                self.assertEqual(
+                    repository.push_current_branch(checkout, confirmed=True),
+                    "voice/job",
+                )
+            commands = [call.args[1:] for call in git.call_args_list]
+            self.assertIn(("status", "--porcelain"), commands)
+            self.assertNotIn(("add", "-A"), commands)
+            self.assertIn(("push", "-u", "origin", "voice/job"), commands)
+
+    def test_commit_unpublished_changes_adds_and_returns_head(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkout = root / "project"
+            (checkout / ".git").mkdir(parents=True)
+            repository = LocalGitRepository(clone_root=root, allowed_root=root)
+            with mock.patch.object(
+                repository,
+                "git",
+                side_effect=[
+                    _completed(" M file.py\n"),
+                    _completed(),
+                    _completed(),
+                    _completed("abc123\n"),
+                ],
+            ) as git:
+                oid = repository.commit_unpublished_changes(
+                    checkout, "Fix the reader", confirmed=True
+                )
+            self.assertEqual(oid, "abc123")
+            commands = [call.args[1:] for call in git.call_args_list]
+            self.assertEqual(commands[1], ("add", "-A"))
+            self.assertEqual(commands[2], ("commit", "-m", "Fix the reader"))
+
+    def test_push_timeout_is_ambiguous(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkout = root / "project"
+            (checkout / ".git").mkdir(parents=True)
+            repository = LocalGitRepository(clone_root=root, allowed_root=root)
+
+            def git(*_args: object, **kwargs: object) -> object:
+                if kwargs.get("timeout") == 180:
+                    raise LocalGitOperationAmbiguous("timed out")
+                return _completed("voice/job\n")
+
+            with (
+                mock.patch.object(repository, "git", side_effect=git),
+                self.assertRaises(LocalGitOperationAmbiguous),
+            ):
+                repository.push_current_branch(checkout, confirmed=True)

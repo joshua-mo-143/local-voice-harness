@@ -18,6 +18,8 @@ from local_voice_harness.integrations.github import (
     GitHubIssueLookupReason,
     GitHubOperationAmbiguous,
     GitHubPullRequest,
+    GitHubPullRequestCreationPlan,
+    GitHubPullRequestCreationResult,
     GitHubRepoCreationPlan,
     GitHubRepoCreationResult,
     GitHubRepository,
@@ -406,6 +408,129 @@ class GitHubClientTests(unittest.TestCase):
             client, "_run", return_value=_completed(json.dumps(payload[:1]))
         ):
             self.assertIsNone(client.observe_issue(plan))
+
+    def test_pull_request_submission_requires_confirmation(self) -> None:
+        client = GitHubClient()
+        plan = GitHubPullRequestCreationPlan(
+            "example/project",
+            "Open the change",
+            "Detailed body",
+            "voice/job",
+            "a" * 32,
+        )
+        with (
+            mock.patch.object(client, "_run") as run,
+            self.assertRaisesRegex(GitHubError, "confirmation"),
+        ):
+            client.submit_pull_request_creation(plan, confirmed=False)
+        run.assert_not_called()
+
+    def test_pull_request_submission_uses_stdin_and_validates_canonical_result(
+        self,
+    ) -> None:
+        client = GitHubClient()
+        plan = GitHubPullRequestCreationPlan(
+            "example/project",
+            "Open the change",
+            "Detailed body",
+            "voice/job",
+            "a" * 32,
+        )
+        with mock.patch.object(
+            client,
+            "_run",
+            return_value=_completed("https://github.com/example/project/pull/7\n"),
+        ) as run:
+            result = client.submit_pull_request_creation(plan, confirmed=True)
+
+        self.assertEqual(
+            result,
+            GitHubPullRequestCreationResult(
+                GitHubPullRequest("example", "project", 7),
+                "https://github.com/example/project/pull/7",
+                "a" * 32,
+            ),
+        )
+        self.assertEqual(
+            run.call_args.args[0],
+            [
+                "gh",
+                "pr",
+                "create",
+                "--repo",
+                "example/project",
+                "--title",
+                "Open the change",
+                "--head",
+                "voice/job",
+                "--body-file",
+                "-",
+            ],
+        )
+        self.assertEqual(
+            run.call_args.kwargs["stdin"],
+            f"Detailed body\n\n<!-- local-voice-harness-correlation:{'a' * 32} -->\n",
+        )
+
+    def test_pull_request_observation_matches_marker_without_resubmitting(self) -> None:
+        client = GitHubClient()
+        plan = GitHubPullRequestCreationPlan(
+            "example/project",
+            "Title",
+            "Body",
+            "voice/job",
+            "a" * 32,
+        )
+        payload = [
+            {
+                "number": 8,
+                "url": "https://github.com/example/project/pull/8",
+                "body": "Other",
+            },
+            {
+                "number": 7,
+                "url": "https://github.com/example/project/pull/7",
+                "body": (
+                    f"Body\n\n<!-- local-voice-harness-correlation:{'a' * 32} -->"
+                ),
+            },
+        ]
+        with mock.patch.object(
+            client, "_run", return_value=_completed(json.dumps(payload))
+        ) as run:
+            result = client.observe_pull_request_creation(plan)
+
+        self.assertEqual(
+            result,
+            GitHubPullRequestCreationResult(
+                GitHubPullRequest("example", "project", 7),
+                "https://github.com/example/project/pull/7",
+                "a" * 32,
+            ),
+        )
+        self.assertEqual(
+            run.call_args.args[0][:4],
+            ["gh", "pr", "list", "--repo"],
+        )
+        with mock.patch.object(
+            client, "_run", return_value=_completed(json.dumps(payload[:1]))
+        ):
+            self.assertIsNone(client.observe_pull_request_creation(plan))
+
+    def test_unprovable_pull_request_result_is_ambiguous(self) -> None:
+        client = GitHubClient()
+        plan = GitHubPullRequestCreationPlan(
+            "example/project",
+            "Title",
+            "Body",
+            "voice/job",
+            "a" * 32,
+        )
+        with (
+            mock.patch.object(client, "_run", return_value=_completed("not-a-url\n")),
+            self.assertRaises(GitHubOperationAmbiguous),
+        ):
+            client.submit_pull_request_creation(plan, confirmed=True)
 
     def test_repo_creation_uses_description_marker_and_observes(self) -> None:
         client = GitHubClient()

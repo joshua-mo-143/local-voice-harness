@@ -226,6 +226,7 @@ SIDE_EFFECTING_INTENTS = frozenset(
         Intent.AGENT_REPEAT,
         Intent.ANNOUNCEMENT_DIGEST,
         Intent.GITHUB_ISSUE_CREATE,
+        Intent.GITHUB_PR_CREATE,
         Intent.GITHUB_REPO_CREATE,
         Intent.GITHUB_ORG_REPO_CREATE,
         Intent.LINEAR_TICKET_CREATE,
@@ -2951,6 +2952,7 @@ class WakeConversationDaemon:
                         in {
                             Intent.AGENT_SUBMIT,
                             Intent.GITHUB_ISSUE_CREATE,
+                            Intent.GITHUB_PR_CREATE,
                             Intent.GITHUB_REPO_CREATE,
                             Intent.GITHUB_ORG_REPO_CREATE,
                             Intent.LINEAR_TICKET_CREATE,
@@ -3382,10 +3384,44 @@ class WakeConversationDaemon:
                     "I did not create a Linear ticket because the request was unclear. "
                     "Please name the Linear team and ticket."
                 )
-            elif route.intent == Intent.AGENT_PR_UNSUPPORTED:
+            elif route.actionable and route.intent == Intent.GITHUB_PR_CREATE:
+                current_completed = self._active_completed_followup()
+                if (
+                    self.cursor_session is not None
+                    or current_completed is None
+                    or current_completed is not active_completed
+                ):
+                    response = (
+                        "I don't have a recent completed job checkout to open a "
+                        "pull request from."
+                    )
+                else:
+                    log(
+                        "pull-request create dispatched for completed job "
+                        f"{current_completed.job_id}"
+                    )
+
+                    def consume_pr_create_followup() -> None:
+                        if self.completed_followup is current_completed:
+                            self.completed_followup = None
+
+                    response, next_cursor_session = cursor_turn(
+                        CursorTurnRequest(
+                            context.text,
+                            utterance=text,
+                            action="follow_up",
+                            job_id=current_completed.job_id,
+                            expected_parent_revision=current_completed.parent_revision,
+                            expected_completed_at=current_completed.completed_at,
+                            github_pr_create_requested=True,
+                            on_follow_up_started=consume_pr_create_followup,
+                        ),
+                        delivery_claims=delivery_claims,
+                        integrations=self.integrations,
+                    )
+            elif route.intent == Intent.GITHUB_PR_CREATE:
                 response = (
-                    "I can't open pull requests. I can review the changes or run "
-                    "the tests in that checkout instead."
+                    "I did not open a pull request because the request was unclear."
                 )
             elif route.intent == Intent.AGENT_DETAILS:
                 current_completed = self._active_completed_followup()

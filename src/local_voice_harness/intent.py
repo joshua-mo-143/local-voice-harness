@@ -28,8 +28,9 @@ ROUTER_SYSTEM_PROMPT = (
     "cursor_followup only when recent_completed_job is true and the request refers to "
     "that just-finished work, for example reviewing the changes, running the tests, or "
     "inspecting the diff; a new or different task or ticket is always cursor_submit even "
-    "then. Use cursor_pr_unsupported when the user asks to open or create a pull "
-    "request. Use "
+    "then. Use github_pr_create when the user asks to open or create a pull "
+    "request from recent completed work. Do not use it for merging, reviewing, or "
+    "checking out a pull request. Use "
     "cursor_status and cursor_cancel for requests about a specific job. Use "
     "cursor_list when the user asks what jobs exist or what is in progress. Use "
     "cursor_dismiss to silence or acknowledge a job announcement, and cursor_repeat "
@@ -132,7 +133,7 @@ ROUTE_TOOL = {
                         "cursor_submit",
                         "cursor_reply",
                         "cursor_followup",
-                        "cursor_pr_unsupported",
+                        "github_pr_create",
                         "cursor_status",
                         "cursor_cancel",
                         "cursor_list",
@@ -184,8 +185,8 @@ class Intent(StrEnum):
     AGENT_SUBMIT = "cursor_submit"
     AGENT_REPLY = "cursor_reply"
     AGENT_FOLLOWUP = "cursor_followup"
-    AGENT_PR_UNSUPPORTED = "cursor_pr_unsupported"
-    AGENT_STATUS = "cursor_status"
+    GITHUB_PR_CREATE = "github_pr_create"
+    AGENT_STATUS = ("cursor_status",)
     AGENT_CANCEL = "cursor_cancel"
     AGENT_LIST = "cursor_list"
     AGENT_DISMISS = "cursor_dismiss"
@@ -208,7 +209,6 @@ class Intent(StrEnum):
     CURSOR_SUBMIT = "cursor_submit"
     CURSOR_REPLY = "cursor_reply"
     CURSOR_FOLLOWUP = "cursor_followup"
-    CURSOR_PR_UNSUPPORTED = "cursor_pr_unsupported"
     CURSOR_STATUS = "cursor_status"
     CURSOR_CANCEL = "cursor_cancel"
     CURSOR_LIST = "cursor_list"

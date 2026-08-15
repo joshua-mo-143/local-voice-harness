@@ -263,6 +263,26 @@ class GitHubPullRequest:
     def name_with_owner(self) -> str:
         return f"{self.owner}/{self.repository}"
 
+    @property
+    def url(self) -> str:
+        return f"https://github.com/{self.name_with_owner}/pull/{self.number}"
+
+
+@dataclass(frozen=True)
+class GitHubPullRequestCreationPlan:
+    repository: str
+    title: str
+    body: str
+    head: str
+    correlation_marker: str
+
+
+@dataclass(frozen=True)
+class GitHubPullRequestCreationResult:
+    pull_request: GitHubPullRequest
+    url: str
+    correlation_marker: str
+
 
 @dataclass(frozen=True)
 class GitHubForkPlan:
@@ -518,6 +538,152 @@ class GitHubClient:
             matches.append(result)
         if len(matches) > 1:
             raise GitHubError("GitHub issue correlation marker is not unique")
+        return matches[0] if matches else None
+
+    @staticmethod
+    def validate_pull_request_creation_plan(
+        plan: GitHubPullRequestCreationPlan,
+    ) -> None:
+        if not isinstance(plan.repository, str):
+            raise GitHubError("GitHub pull request repository must be text")
+        repository = GitHubClient.validate_repository(plan.repository)
+        if repository != plan.repository:
+            raise GitHubError("GitHub pull request plan repository is not normalized")
+        if not isinstance(plan.title, str) or not plan.title.strip():
+            raise GitHubError("GitHub pull request title must not be empty")
+        if len(plan.title) > MAX_ISSUE_TITLE_CHARS:
+            raise GitHubError(
+                "GitHub pull request title must be at most "
+                f"{MAX_ISSUE_TITLE_CHARS} characters"
+            )
+        if not isinstance(plan.body, str) or not plan.body.strip():
+            raise GitHubError("GitHub pull request body must not be empty")
+        if len(plan.body) > MAX_ISSUE_BODY_CHARS:
+            raise GitHubError(
+                "GitHub pull request body must be at most "
+                f"{MAX_ISSUE_BODY_CHARS} characters"
+            )
+        if not isinstance(plan.head, str) or not plan.head.strip():
+            raise GitHubError("GitHub pull request head must not be empty")
+        if any(character.isspace() for character in plan.head) or plan.head in {
+            ".",
+            "..",
+            "HEAD",
+        }:
+            raise GitHubError("GitHub pull request head is invalid")
+        if (
+            not isinstance(plan.correlation_marker, str)
+            or ISSUE_CORRELATION_MARKER.fullmatch(plan.correlation_marker) is None
+        ):
+            raise GitHubError(
+                "GitHub pull request correlation marker must be 32 lowercase "
+                "hex characters"
+            )
+        if plan.correlation_marker in plan.body:
+            raise GitHubError(
+                "GitHub pull request body must not contain its correlation marker"
+            )
+
+    @staticmethod
+    def _pull_request_creation_result(
+        plan: GitHubPullRequestCreationPlan, url: object
+    ) -> GitHubPullRequestCreationResult:
+        value = str(url or "").strip()
+        pull_request = github_pull_request_from_url(value)
+        if pull_request is None or value != pull_request.url:
+            raise GitHubError("GitHub returned a non-canonical pull request URL")
+        if pull_request.name_with_owner.casefold() != plan.repository.casefold():
+            raise GitHubError(
+                "GitHub created a pull request in an unexpected repository"
+            )
+        return GitHubPullRequestCreationResult(
+            pull_request, value, plan.correlation_marker
+        )
+
+    def submit_pull_request_creation(
+        self,
+        plan: GitHubPullRequestCreationPlan,
+        *,
+        confirmed: bool,
+    ) -> GitHubPullRequestCreationResult:
+        if not confirmed:
+            raise GitHubError(
+                "GitHub pull request creation requires explicit confirmation"
+            )
+        self.validate_pull_request_creation_plan(plan)
+        submitted_body = (
+            f"{plan.body.rstrip()}\n\n{self._issue_marker(plan.correlation_marker)}\n"
+        )
+        process = self._run(
+            [
+                self.gh_executable,
+                "pr",
+                "create",
+                "--repo",
+                plan.repository,
+                "--title",
+                plan.title,
+                "--head",
+                plan.head,
+                "--body-file",
+                "-",
+            ],
+            timeout=30,
+            write=True,
+            stdin=submitted_body,
+        )
+        try:
+            return self._pull_request_creation_result(plan, process.stdout)
+        except GitHubError as exc:
+            raise GitHubOperationAmbiguous(
+                "GitHub write completed without a provable pull request result; "
+                "an external side effect may already have occurred"
+            ) from exc
+
+    def observe_pull_request_creation(
+        self, plan: GitHubPullRequestCreationPlan
+    ) -> GitHubPullRequestCreationResult | None:
+        self.validate_pull_request_creation_plan(plan)
+        process = self._run(
+            [
+                self.gh_executable,
+                "pr",
+                "list",
+                "--repo",
+                plan.repository,
+                "--state",
+                "all",
+                "--limit",
+                str(ISSUE_OBSERVATION_LIMIT),
+                "--json",
+                "number,url,body",
+            ],
+            timeout=15,
+        )
+        try:
+            values = json.loads(process.stdout)
+        except json.JSONDecodeError as exc:
+            raise GitHubError(
+                "GitHub returned malformed recent pull request metadata"
+            ) from exc
+        if not isinstance(values, list):
+            raise GitHubError("GitHub returned malformed recent pull request metadata")
+        marker = self._issue_marker(plan.correlation_marker)
+        matches: list[GitHubPullRequestCreationResult] = []
+        for value in values:
+            if not isinstance(value, dict) or marker not in str(
+                value.get("body") or ""
+            ):
+                continue
+            result = self._pull_request_creation_result(plan, value.get("url"))
+            number = value.get("number")
+            if not isinstance(number, int) or number != result.pull_request.number:
+                raise GitHubError(
+                    "GitHub returned malformed recent pull request metadata"
+                )
+            matches.append(result)
+        if len(matches) > 1:
+            raise GitHubError("GitHub pull request correlation marker is not unique")
         return matches[0] if matches else None
 
     def _repo_view(self, repository: str, *, required: bool) -> GitHubRepository | None:
@@ -1419,6 +1585,17 @@ _GITHUB_STATE_SECTIONS: dict[str, dict[str, str]] = {
         "created_number": "github_issue_created_number",
         "created_url": "github_issue_created_url",
     },
+    "pull_request_creation": {
+        "requested": "github_pr_create_requested",
+        "confirmed": "github_pr_create_confirmed",
+        "title": "github_pr_create_title",
+        "body": "github_pr_create_body",
+        "marker": "github_pr_create_marker",
+        "commit_subject": "github_pr_create_commit_subject",
+        "operation_state": "github_pr_create_operation_state",
+        "created_number": "github_pr_created_number",
+        "created_url": "github_pr_created_url",
+    },
     "repo_creation": {
         "requested": "github_repo_create_requested",
         "org_requested": "github_repo_create_org_requested",
@@ -1565,6 +1742,9 @@ class GitHubProvider:
 
         return self._client.local_git
 
+    def repository_for_checkout(self, checkout: Path) -> str:
+        return self._client.repository_for_checkout(checkout)
+
     def provision_issue(
         self,
         issue: GitHubIssue,
@@ -1639,6 +1819,58 @@ class GitHubProvider:
         confirmed: bool,
     ) -> GitHubIssueCreationResult:
         return self.submit_issue(plan, confirmed=confirmed)
+
+    def plan_pull_request_creation(
+        self,
+        repository: str,
+        title: str,
+        body: str,
+        head: str,
+        *,
+        correlation_marker: str | None = None,
+    ) -> GitHubPullRequestCreationPlan:
+        if not isinstance(repository, str):
+            raise GitHubError("GitHub pull request repository must be text")
+        if not isinstance(title, str):
+            raise GitHubError("GitHub pull request title must be text")
+        if not isinstance(body, str):
+            raise GitHubError("GitHub pull request body must be text")
+        if not isinstance(head, str):
+            raise GitHubError("GitHub pull request head must be text")
+        plan = GitHubPullRequestCreationPlan(
+            repository=GitHubClient.validate_repository(repository),
+            title=title.strip(),
+            body=body.strip(),
+            head=head.strip(),
+            correlation_marker=correlation_marker or secrets.token_hex(16),
+        )
+        self.validate_pull_request_creation_plan(plan)
+        return plan
+
+    @staticmethod
+    def validate_pull_request_creation_plan(
+        plan: GitHubPullRequestCreationPlan,
+    ) -> None:
+        GitHubClient.validate_pull_request_creation_plan(plan)
+
+    def observe_pull_request_creation(
+        self, plan: GitHubPullRequestCreationPlan
+    ) -> GitHubPullRequestCreationResult | None:
+        self.validate_pull_request_creation_plan(plan)
+        return self._client.observe_pull_request_creation(plan)
+
+    def submit_pull_request_creation(
+        self,
+        plan: GitHubPullRequestCreationPlan,
+        *,
+        confirmed: bool,
+    ) -> GitHubPullRequestCreationResult:
+        if not confirmed:
+            raise GitHubError(
+                "GitHub pull request creation requires explicit confirmation"
+            )
+        self.validate_pull_request_creation_plan(plan)
+        return self._client.submit_pull_request_creation(plan, confirmed=True)
 
     def plan_repository_creation(
         self,

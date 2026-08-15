@@ -7695,26 +7695,56 @@ class CompletedFollowupContextTests(unittest.TestCase):
         self.assertEqual(request.linear_team, "API")
         self._last_qwen.assert_not_called()
 
-    def test_pr_unsupported_declines_without_starting_a_job(self) -> None:
+    def test_pr_create_without_completed_job_fails_closed(self) -> None:
         daemon = _bare_daemon()
         cursor_turn = self._run_route(
             daemon,
-            IntentRoute(Intent.CURSOR_PR_UNSUPPORTED, "high"),
+            IntentRoute(Intent.GITHUB_PR_CREATE, "high"),
             transcript="open a pull request",
         )
         cursor_turn.assert_not_called()
         self._last_qwen.assert_not_called()
         self.assertTrue(daemon.awaiting_followup)
 
-    def test_medium_confidence_pr_is_still_declined_without_tools(self) -> None:
+    def test_pr_create_from_completed_job_dispatches_follow_up(self) -> None:
         daemon = _bare_daemon()
+        daemon.completed_followup = wake_daemon.CompletedFollowup(
+            job_id="bbbbbbbbbbbb",
+            parent_revision=0,
+            completed_at=9.0,
+            expires_at=time.monotonic() + 60,
+        )
         cursor_turn = self._run_route(
             daemon,
-            IntentRoute(Intent.CURSOR_PR_UNSUPPORTED, "medium"),
+            IntentRoute(Intent.GITHUB_PR_CREATE, "high"),
+            transcript="open a pull request",
+        )
+
+        cursor_turn.assert_called_once()
+        request = cursor_turn.call_args.args[0]
+        self.assertEqual(request.action, "follow_up")
+        self.assertTrue(request.github_pr_create_requested)
+        self.assertEqual(request.job_id, "bbbbbbbbbbbb")
+        self.assertEqual(request.expected_completed_at, 9.0)
+        self.assertIsNone(daemon.completed_followup)
+        self._last_qwen.assert_not_called()
+
+    def test_medium_confidence_pr_does_not_write(self) -> None:
+        daemon = _bare_daemon()
+        daemon.completed_followup = wake_daemon.CompletedFollowup(
+            job_id="bbbbbbbbbbbb",
+            parent_revision=0,
+            completed_at=9.0,
+            expires_at=time.monotonic() + 60,
+        )
+        cursor_turn = self._run_route(
+            daemon,
+            IntentRoute(Intent.GITHUB_PR_CREATE, "medium"),
             transcript="open a pull request",
         )
         cursor_turn.assert_not_called()
         self._last_qwen.assert_not_called()
+        self.assertIsNotNone(daemon.completed_followup)
 
 
 class LastTranscriptReplayTests(unittest.TestCase):

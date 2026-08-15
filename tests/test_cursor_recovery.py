@@ -46,6 +46,7 @@ from local_voice_harness.cursor.recovery import (
     reconcile_uncertain_fork,
     reconcile_uncertain_issue_creation,
     reconcile_uncertain_linear_ticket_creation,
+    reconcile_uncertain_pr_creation,
     reconcile_uncertain_repo_creation,
     recover_jobs,
     resolve_manual_reconciliation,
@@ -61,6 +62,8 @@ from local_voice_harness.integrations.github import (
     GitHubError,
     GitHubIssue,
     GitHubIssueCreationResult,
+    GitHubPullRequest,
+    GitHubPullRequestCreationResult,
     GitHubRepoCreationResult,
     GitHubRepository,
 )
@@ -437,6 +440,87 @@ class CursorRecoveryTests(unittest.TestCase):
             "manual_required",
         )
         client.submit_issue.assert_not_called()
+
+    def test_reconciles_ambiguous_pr_creation_without_resubmitting(self) -> None:
+        job = self.create(
+            {
+                "id": "123456789abc",
+                "status": "reconciling",
+                "request": "open a pull request",
+                "created_at": 1,
+                "delivered": False,
+                "github_repository": "example/project",
+                "worktree_branch": "voice/job",
+                "github_pr_create_requested": True,
+                "github_pr_create_confirmed": True,
+                "github_pr_create_title": "Open the change",
+                "github_pr_create_body": "Detailed body",
+                "github_pr_create_marker": "a" * 32,
+                "github_pr_create_operation_state": "ambiguous",
+            }
+        )
+        client = mock.Mock(spec=GitHubClient)
+        client.observe_pull_request_creation.return_value = (
+            GitHubPullRequestCreationResult(
+                GitHubPullRequest("example", "project", 7),
+                "https://github.com/example/project/pull/7",
+                "a" * 32,
+            )
+        )
+
+        reconcile_uncertain_pr_creation(
+            self.store,
+            job,
+            now=100,
+            github_factory=lambda: client,
+        )
+
+        updated = self.store.get(job.id)
+        self.assertEqual(updated.status, JobStatus.COMPLETED)
+        self.assertEqual(updated.github_pr_created_number, 7)
+        self.assertEqual(
+            updated.github_pr_created_url,
+            "https://github.com/example/project/pull/7",
+        )
+        self.assertIn("https://github.com/example/project/pull/7", updated.result or "")
+        client.submit_pull_request_creation.assert_not_called()
+
+    def test_unobserved_pr_creation_requires_manual_check(self) -> None:
+        job = self.create(
+            {
+                "id": "123456789abc",
+                "status": "queued",
+                "request": "open a pull request",
+                "created_at": 1,
+                "queued_at": 1,
+                "delivered": False,
+                "github_repository": "example/project",
+                "worktree_branch": "voice/job",
+                "github_pr_create_requested": True,
+                "github_pr_create_confirmed": True,
+                "github_pr_create_title": "Open the change",
+                "github_pr_create_body": "Detailed body",
+                "github_pr_create_marker": "a" * 32,
+                "github_pr_create_operation_state": "ambiguous",
+            }
+        )
+        client = mock.Mock(spec=GitHubClient)
+        client.observe_pull_request_creation.return_value = None
+
+        reconcile_uncertain_pr_creation(
+            self.store,
+            job,
+            now=100,
+            github_factory=lambda: client,
+        )
+
+        updated = self.store.get(job.id)
+        self.assertEqual(updated.status, JobStatus.BLOCKED)
+        self.assertEqual(
+            updated.github_pr_create_operation_state,
+            "manual_required",
+        )
+        client.submit_pull_request_creation.assert_not_called()
 
     def test_reconciles_ambiguous_repo_creation_without_resubmitting(self) -> None:
         job = self.create(

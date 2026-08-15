@@ -303,6 +303,7 @@ def _queue_answer(
     clone_confirmed: bool | None = None,
     github_issue_create_confirmed: bool | None = None,
     github_issue_create_requested: bool | None = None,
+    github_pr_create_confirmed: bool | None = None,
     github_repo_create_confirmed: bool | None = None,
     github_repo_create_continue_workflow: bool | None = None,
     github_repo_create_owner: str | None = None,
@@ -343,6 +344,11 @@ def _queue_answer(
             job.github_issue_create_requested
             if github_issue_create_requested is None
             else github_issue_create_requested
+        ),
+        github_pr_create_confirmed=(
+            job.github_pr_create_confirmed
+            if github_pr_create_confirmed is None
+            else github_pr_create_confirmed
         ),
         github_repo_create_confirmed=(
             job.github_repo_create_confirmed
@@ -854,6 +860,64 @@ def _github_issue_create_confirmation_answer(
         question=None,
         clarification_kind=None,
         result="Okay, I did not create the GitHub issue.",
+        completed_at=context.now,
+        worker_pid=None,
+        worker_boot_id=None,
+        worker_process_start=None,
+        worker_token=None,
+        voice_question=envelope(
+            question,
+            QuestionState.RESOLVED,
+            job=job,
+            answer="no",
+            trusted_answer=context.trusted_text,
+            answered_at=context.now,
+        ),
+    )
+    return AnswerTransition(completed)
+
+
+def _github_pr_create_confirmation_answer(
+    job: CursorJob,
+    question: Question,
+    resolution: AnswerResolution,
+    context: AnswerContext,
+) -> AnswerTransition:
+    if context.trusted_text is None:
+        return AnswerTransition(
+            None,
+            message="Please confirm directly. Should I open this pull request?",
+        )
+    confirmation = _confirmation(
+        context.trusted_text,
+        confirmations=_FORK_CONFIRMATIONS
+        | {"open the pull request", "create the pull request", "open it"},
+        rejections=_FORK_REJECTIONS,
+    )
+    if confirmation is None:
+        return AnswerTransition(
+            None,
+            message="Please answer yes or no. Should I open this pull request?",
+        )
+    if confirmation:
+        return AnswerTransition(
+            _queue_answer(
+                job,
+                question,
+                resolution,
+                context,
+                continuation=False,
+                clear_target=True,
+                github_pr_create_confirmed=True,
+            ),
+            launch=True,
+        )
+    completed = job.evolve_for_delivery(
+        now=context.now,
+        status=JobStatus.COMPLETED,
+        question=None,
+        clarification_kind=None,
+        result="Okay, I did not open a pull request.",
         completed_at=context.now,
         worker_pid=None,
         worker_boot_id=None,
@@ -1409,6 +1473,7 @@ _ANSWER_HANDLERS: dict[str, AnswerHandler] = {
     "clone_confirmation": _clone_confirmation_answer,
     "github_issue_create_confirmation": _github_issue_create_confirmation_answer,
     "github_issue_file_as_one": _github_issue_file_as_one_answer,
+    "github_pr_create_confirmation": _github_pr_create_confirmation_answer,
     "github_repo_create_org": _github_repo_create_org_answer,
     "github_repo_create_slug": _github_repo_create_slug_answer,
     "github_repo_create_confirmation": _github_repo_create_confirmation_answer,

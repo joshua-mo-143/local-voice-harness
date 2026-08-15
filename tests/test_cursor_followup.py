@@ -429,6 +429,27 @@ def test_start_follow_up_creates_and_launches_child(
     assert child.worktree_path == parent.worktree_path
 
 
+def test_start_follow_up_can_request_pull_request_creation(
+    store: JobStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    parent = _completed_parent(store, tmp_path)
+    monkeypatch.setattr(service, "launch_worker", lambda _job_id: None)
+
+    child_id = service.start_follow_up(
+        parent.id,
+        "open a pull request",
+        expected_parent_revision=parent.revision,
+        expected_completed_at=parent.completed_at,
+        github_pr_create_requested=True,
+    )
+
+    child = store.get(child_id)
+    assert child.github_pr_create_requested
+    assert child.worktree_path == parent.worktree_path
+    assert child.worktree_branch == parent.worktree_branch
+    assert child.repository == parent.repository
+
+
 def test_start_follow_up_checks_capability_before_creating_child(
     store: JobStore, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

@@ -415,3 +415,51 @@ class LocalGitRepository:
             finally:
                 self._cleanup_temporary(temporary)
             return destination.resolve()
+
+    def _require_allowed_checkout(self, checkout: Path) -> Path:
+        resolved = checkout.expanduser().resolve()
+        try:
+            resolved.relative_to(self.allowed_root)
+        except ValueError as exc:
+            raise LocalGitError(
+                "Git checkout escapes the allowed project root"
+            ) from exc
+        self.verify_checkout(resolved)
+        return resolved
+
+    def has_unpublished_changes(self, checkout: Path) -> bool:
+        checkout = self._require_allowed_checkout(checkout)
+        status = self.git(checkout, "status", "--porcelain").stdout
+        return bool(status.strip())
+
+    def commit_unpublished_changes(
+        self,
+        checkout: Path,
+        subject: str,
+        *,
+        confirmed: bool,
+    ) -> str | None:
+        if not confirmed:
+            raise LocalGitError("Git commit requires explicit confirmation")
+        checkout = self._require_allowed_checkout(checkout)
+        message = " ".join(subject.split())
+        if not message:
+            raise LocalGitError("Git commit requires a non-empty subject")
+        if len(message) > 72:
+            raise LocalGitError("Git commit subject is too long")
+        if not self.has_unpublished_changes(checkout):
+            return None
+        self.git(checkout, "add", "-A")
+        self.git(checkout, "commit", "-m", message)
+        return self.git(checkout, "rev-parse", "HEAD").stdout.strip() or None
+
+    def push_current_branch(self, checkout: Path, *, confirmed: bool) -> str:
+        if not confirmed:
+            raise LocalGitError("Git push requires explicit confirmation")
+        checkout = self._require_allowed_checkout(checkout)
+        branch = self.current_branch(checkout)
+        if not branch or branch == "HEAD":
+            raise LocalGitError("Git checkout is not on a named branch")
+        self.git(checkout, "check-ref-format", "--branch", branch)
+        self.git(checkout, "push", "-u", "origin", branch, timeout=180)
+        return branch

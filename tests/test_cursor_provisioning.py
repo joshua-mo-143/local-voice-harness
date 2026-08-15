@@ -46,6 +46,8 @@ from local_voice_harness.integrations.github import (
     GitHubIssue,
     GitHubIssueCreationResult,
     GitHubOperationAmbiguous,
+    GitHubPullRequest,
+    GitHubPullRequestCreationResult,
     GitHubRepoCreationResult,
     GitHubRepository,
     ProvisionedIssue,
@@ -3442,6 +3444,196 @@ class CursorJobStateTests(unittest.TestCase):
         self.assertNotIn("github_issue_created_number", retried)
         self.assertEqual(github.submit_issue.call_count, 2)
         self.assertEqual(github.observe_issue.call_count, 1)
+
+    def _pr_checkout(self) -> Path:
+        checkout = Path(self.temporary.name) / "worktrees" / "wt"
+        checkout.mkdir(parents=True, exist_ok=True)
+        (checkout / ".git").mkdir(exist_ok=True)
+        return checkout
+
+    def test_worker_drafts_pull_request_before_requesting_confirmation(self) -> None:
+        checkout = self._pr_checkout()
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "open a pull request",
+                "trusted_utterance": "open a pull request",
+                "github_pr_create_requested": True,
+                "worktree_path": str(checkout),
+                "worktree_branch": "voice/job",
+                "github_repository": "source/project",
+                "status": "queued",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        source = GitHubRepository(
+            "source/project",
+            "https://github.com/source/project",
+            False,
+            "main",
+        )
+        github = mock.Mock()
+        github.inspect_repository.return_value = source
+        github.local_git = mock.Mock()
+        github.local_git.verify_checkout.return_value = None
+        github.local_git.current_branch.return_value = "voice/job"
+        github.local_git.has_unpublished_changes.return_value = True
+        with mock.patch.object(jobs, "GitHubClient", return_value=github):
+            service.run_worker("123456789abc")
+
+        updated = jobs.read_job("123456789abc")
+        self.assertEqual(updated["status"], "awaiting_user")
+        self.assertEqual(
+            updated["clarification_kind"],
+            "github_pr_create_confirmation",
+        )
+        self.assertEqual(updated["github_pr_create_title"], "open a pull request")
+        self.assertEqual(updated["github_pr_create_operation_state"], "planned")
+        self.assertEqual(
+            updated["github_pr_create_commit_subject"], "open a pull request"
+        )
+        github.submit_pull_request_creation.assert_not_called()
+        github.local_git.commit_unpublished_changes.assert_not_called()
+        github.local_git.push_current_branch.assert_not_called()
+
+    def test_confirmed_pull_request_creation_commits_pushes_and_speaks_url(
+        self,
+    ) -> None:
+        checkout = self._pr_checkout()
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "open a pull request",
+                "trusted_utterance": "open a pull request",
+                "github_pr_create_requested": True,
+                "github_pr_create_confirmed": True,
+                "github_pr_create_title": "open a pull request",
+                "github_pr_create_body": "open a pull request",
+                "github_pr_create_marker": "a" * 32,
+                "github_pr_create_commit_subject": "open a pull request",
+                "github_pr_create_operation_state": "planned",
+                "worktree_path": str(checkout),
+                "worktree_branch": "voice/job",
+                "github_repository": "source/project",
+                "status": "queued",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        source = GitHubRepository(
+            "source/project",
+            "https://github.com/source/project",
+            False,
+            "main",
+        )
+        result = GitHubPullRequestCreationResult(
+            GitHubPullRequest("source", "project", 7),
+            "https://github.com/source/project/pull/7",
+            "a" * 32,
+        )
+        github = mock.Mock()
+        github.inspect_repository.return_value = source
+        github.local_git = mock.Mock()
+        github.local_git.verify_checkout.return_value = None
+        github.local_git.current_branch.return_value = "voice/job"
+        github.submit_pull_request_creation.return_value = result
+        herdr = mock.Mock()
+        with (
+            mock.patch.object(jobs, "GitHubClient", return_value=github),
+            mock.patch.object(jobs, "HerdrClient", return_value=herdr),
+        ):
+            service.run_worker("123456789abc")
+
+        updated = jobs.read_job("123456789abc")
+        self.assertEqual(updated["status"], "completed")
+        self.assertEqual(updated["github_pr_created_number"], 7)
+        self.assertEqual(
+            updated["github_pr_created_url"],
+            "https://github.com/source/project/pull/7",
+        )
+        self.assertIn(
+            "https://github.com/source/project/pull/7",
+            updated["result"],
+        )
+        github.local_git.commit_unpublished_changes.assert_called_once()
+        github.local_git.push_current_branch.assert_called_once()
+        github.submit_pull_request_creation.assert_called_once()
+        herdr.assert_not_called()
+
+    def test_missing_checkout_completes_pull_request_without_write(self) -> None:
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "open a pull request",
+                "trusted_utterance": "open a pull request",
+                "github_pr_create_requested": True,
+                "status": "queued",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        github = mock.Mock()
+        herdr = mock.Mock()
+        with (
+            mock.patch.object(jobs, "GitHubClient", return_value=github),
+            mock.patch.object(jobs, "HerdrClient", return_value=herdr),
+        ):
+            service.run_worker("123456789abc")
+
+        updated = jobs.read_job("123456789abc")
+        self.assertEqual(updated["status"], "completed")
+        self.assertIsNone(updated.get("github_pr_created_number"))
+        github.submit_pull_request_creation.assert_not_called()
+        herdr.assert_not_called()
+
+    def test_timed_out_pull_request_creation_is_reconciled_without_resubmission(
+        self,
+    ) -> None:
+        checkout = self._pr_checkout()
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "open a pull request",
+                "trusted_utterance": "open a pull request",
+                "github_pr_create_requested": True,
+                "github_pr_create_confirmed": True,
+                "github_pr_create_title": "open a pull request",
+                "github_pr_create_body": "open a pull request",
+                "github_pr_create_marker": "a" * 32,
+                "github_pr_create_operation_state": "planned",
+                "worktree_path": str(checkout),
+                "worktree_branch": "voice/job",
+                "github_repository": "source/project",
+                "status": "queued",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        source = GitHubRepository(
+            "source/project",
+            "https://github.com/source/project",
+            False,
+            "main",
+        )
+        github = mock.Mock()
+        github.inspect_repository.return_value = source
+        github.local_git = mock.Mock()
+        github.local_git.verify_checkout.return_value = None
+        github.local_git.current_branch.return_value = "voice/job"
+        github.submit_pull_request_creation.side_effect = GitHubOperationAmbiguous(
+            "timed out"
+        )
+        github.observe_pull_request_creation.return_value = None
+        with mock.patch.object(jobs, "GitHubClient", return_value=github):
+            service.run_worker("123456789abc")
+
+        updated = jobs.read_job("123456789abc")
+        self.assertEqual(updated["github_pr_create_operation_state"], "ambiguous")
+        self.assertTrue(updated.get("reconcile"))
+        self.assertIsNone(updated.get("github_pr_created_number"))
+        github.submit_pull_request_creation.assert_called_once()
+        github.observe_pull_request_creation.assert_called_once()
 
     def test_worker_drafts_linear_ticket_before_requesting_confirmation(self) -> None:
         jobs.write_job(

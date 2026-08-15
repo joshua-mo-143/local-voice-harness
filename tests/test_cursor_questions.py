@@ -157,6 +157,40 @@ def _issue_creation_awaiting(store: JobStore) -> CursorJob:
     )
 
 
+def _pr_creation_awaiting(store: JobStore) -> CursorJob:
+    pending = replace(
+        _question(sensitivity=QuestionSensitivity.DESTRUCTIVE),
+        text="Open this pull request?",
+        owner="github_pr_create_confirmation",
+    )
+    return store.create(
+        CursorJob.from_dict(
+            {
+                "id": "aaaaaaaaaaaa",
+                "request": "open a pull request",
+                "trusted_utterance": "open a pull request",
+                "status": JobStatus.AWAITING_USER.value,
+                "created_at": 1,
+                "updated_at": 10,
+                "delivered": True,
+                "question": pending.text,
+                "result": pending.text,
+                "clarification_kind": pending.owner,
+                "turn": 1,
+                "turn_token": pending.origin.turn_token,
+                "voice_question": pending.to_dict(),
+                "github_repository": "example/project",
+                "worktree_branch": "voice/job",
+                "github_pr_create_requested": True,
+                "github_pr_create_title": "Open the change",
+                "github_pr_create_body": "Detailed body",
+                "github_pr_create_marker": "a" * 32,
+                "github_pr_create_operation_state": "planned",
+            }
+        )
+    )
+
+
 def _repo_creation_awaiting(store: JobStore) -> CursorJob:
     pending = replace(
         _question(sensitivity=QuestionSensitivity.DESTRUCTIVE),
@@ -820,6 +854,49 @@ def test_rejecting_github_issue_creation_completes_without_launch(
     assert updated.status == JobStatus.COMPLETED
     assert not updated.github_issue_create_confirmed
     assert updated.github_issue_create_operation_state == "planned"
+    launch.assert_not_called()
+
+
+def test_only_direct_answer_confirms_github_pr_creation(store: JobStore) -> None:
+    original = _pr_creation_awaiting(store)
+    with mock.patch.object(service, "launch_worker") as launch:
+        message = service.reply_job(
+            original.id,
+            "yes",
+            answer_provenance=AnswerProvenance.AUTOMATION,
+        )
+        assert message is not None
+        assert store.get(original.id).revision == original.revision
+        service.reply_job(
+            original.id,
+            "yes",
+            trusted_utterance="yes",
+            answer_provenance=AnswerProvenance.USER_VOICE,
+        )
+
+    updated = store.get(original.id)
+    assert updated.github_pr_create_confirmed
+    assert updated.status == JobStatus.QUEUED
+    launch.assert_called_once_with(original.id)
+
+
+def test_rejecting_github_pr_creation_completes_without_launch(
+    store: JobStore,
+) -> None:
+    original = _pr_creation_awaiting(store)
+    with mock.patch.object(service, "launch_worker") as launch:
+        service.reply_job(
+            original.id,
+            "no",
+            trusted_utterance="no",
+            answer_provenance=AnswerProvenance.USER_VOICE,
+        )
+
+    updated = store.get(original.id)
+    assert updated.status == JobStatus.COMPLETED
+    assert not updated.github_pr_create_confirmed
+    assert updated.github_pr_create_operation_state == "planned"
+    assert "did not open a pull request" in (updated.result or "")
     launch.assert_not_called()
 
 

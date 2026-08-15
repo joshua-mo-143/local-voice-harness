@@ -580,7 +580,7 @@ class AppContextTests(unittest.TestCase):
         )
         self.assertFalse(qwen.call_args.kwargs["allow_tools"])
 
-    def test_pull_request_request_is_declined_without_tools(self) -> None:
+    def test_unclear_pull_request_request_does_not_write(self) -> None:
         with (
             mock.patch.object(app, "start_components"),
             mock.patch.object(
@@ -592,7 +592,7 @@ class AppContextTests(unittest.TestCase):
                 app,
                 "route_intent",
                 return_value=IntentRoute(
-                    Intent.CURSOR_PR_UNSUPPORTED,
+                    Intent.GITHUB_PR_CREATE,
                     "medium",
                 ),
             ),
@@ -604,7 +604,36 @@ class AppContextTests(unittest.TestCase):
 
         qwen.assert_not_called()
         cursor.assert_not_called()
-        self.assertIn("can't open pull requests", play.call_args.args[0])
+        self.assertIn(
+            "did not open a pull request because the request was unclear",
+            play.call_args.args[0],
+        )
+
+    def test_high_confidence_pull_request_fails_closed_without_checkout(self) -> None:
+        with (
+            mock.patch.object(app, "start_components"),
+            mock.patch.object(
+                app,
+                "request_context",
+                side_effect=lambda text, **_settings: RequestContext(text),
+            ),
+            mock.patch.object(
+                app,
+                "route_intent",
+                return_value=IntentRoute(Intent.GITHUB_PR_CREATE, "high"),
+            ),
+            mock.patch.object(app, "qwen_response") as qwen,
+            mock.patch.object(app, "cursor_turn") as cursor,
+            mock.patch.object(app, "stream_and_play") as play,
+        ):
+            app.respond("open a pull request")
+
+        qwen.assert_not_called()
+        cursor.assert_not_called()
+        self.assertIn(
+            "don't have a recent completed job checkout",
+            play.call_args.args[0],
+        )
 
     def test_actionable_github_issue_metadata_reaches_cursor(self) -> None:
         context = RequestContext(

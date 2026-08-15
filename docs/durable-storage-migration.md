@@ -14,10 +14,10 @@ inventory remains as historical design context for the compatibility importer.
 
 ## Current schema-v18 relational inventory
 
-`CursorJob` currently produces 225 persisted field names, including the
+`CursorJob` currently produces 234 persisted field names, including the
 dynamically emitted `pane_retained_at` cleanup and
 `grouped_repository_coordinator_id` handoff fields. Database schema v2
-assigns each exactly once: 207 named lifecycle columns, two immutable artifact
+assigns each exactly once: 216 named lifecycle columns, two immutable artifact
 references, and four import-only compatibility values. The executable exhaustive
 inventory is `_NAMED_TABLE_FIELDS` in `cursor/sqlite_store.py`; startup rejects a
 v18 value not present in that inventory rather than silently creating generic
@@ -32,7 +32,7 @@ state.
 | Workflow, review, approval, and participant | `job_workflow_review_approval_participant` | 31 lifecycle values |
 | Immutable artifact references | `plan_artifact` and `review_artifact` columns, foreign-key evidence in `artifacts` | 2 |
 | Checkout and fork | `job_checkout_fork` | 49 |
-| Provider and ticket creation | `job_provider_ticket` | 37 |
+| Provider and ticket creation | `job_provider_ticket` | 46 |
 | Session, pane, reconciliation, and release | `job_session_pane` | 39 |
 | Worker ownership | `job_worker` (with claim projection in `worker_claims`) | 7 |
 | Import-only compatibility | `schema_version`, `migration_source_schema_version`, `phase_prompt_active`, `agent_identity_legacy_compatible` | 4 |
@@ -45,14 +45,14 @@ success.
 
 | Baseline | Count |
 |---|---:|
-| Persisted field names | 227 |
-| Named table fields | 222 |
+| Persisted field names | 234 |
+| Named table fields | 229 |
 | Import-only fields | 4 |
-| Directly exposed `CursorJob` properties | 166 |
+| Directly exposed `CursorJob` properties | 173 |
 | Compatibility adapters | 38 |
 | Public transition entry points | 76 |
 | Documented duplicate authorities | 0 |
-| Lifecycle-related module lines | 28189 |
+| Lifecycle-related module lines | 28777 |
 
 #358 unified ordinary and clarification submission onto one
 `prompt_operations.PromptOperationState`. #359 made that typed operation the

@@ -206,6 +206,8 @@ _BOOL_FIELDS = frozenset(
         "fork_dispatch_exited",
         "github_issue_create_requested",
         "github_issue_create_confirmed",
+        "github_pr_create_requested",
+        "github_pr_create_confirmed",
         "github_repo_create_requested",
         "github_repo_create_org_requested",
         "github_repo_create_continue_workflow",
@@ -237,6 +239,7 @@ _INT_FIELDS = frozenset(
         "turn",
         "github_issue",
         "github_issue_created_number",
+        "github_pr_created_number",
         "github_pull_request",
         "worker_pid",
         "target_release_owner_pid",
@@ -316,6 +319,12 @@ _STRING_FIELDS = frozenset(
         "github_issue_create_marker",
         "github_issue_create_operation_state",
         "github_issue_created_url",
+        "github_pr_create_title",
+        "github_pr_create_body",
+        "github_pr_create_marker",
+        "github_pr_create_commit_subject",
+        "github_pr_create_operation_state",
+        "github_pr_created_url",
         "github_repo_create_owner",
         "github_repo_create_visibility",
         "github_repo_create_marker",
@@ -520,6 +529,7 @@ class NewAgentJob:
     github_issue_create_title: str | None = None
     github_issue_create_body: str | None = None
     github_issue_create_marker: str | None = None
+    github_pr_create_requested: bool = False
     github_repo_create_requested: bool = False
     github_repo_create_org_requested: bool = False
     linear_ticket_create_requested: bool = False
@@ -2028,6 +2038,7 @@ class AgentJob:
                 "github_issue_create_title": spec.github_issue_create_title,
                 "github_issue_create_body": spec.github_issue_create_body,
                 "github_issue_create_marker": spec.github_issue_create_marker,
+                "github_pr_create_requested": spec.github_pr_create_requested,
                 "github_repo_create_requested": spec.github_repo_create_requested,
                 "github_repo_create_org_requested": (
                     spec.github_repo_create_org_requested
@@ -2589,6 +2600,42 @@ class AgentJob:
         if not self.github_issue_create_requested:
             return None
         return self.github_issue_url
+
+    @property
+    def github_pr_create_requested(self) -> bool:
+        return self._boolean_field("github_pr_create_requested")
+
+    @property
+    def github_pr_create_confirmed(self) -> bool:
+        return self._boolean_field("github_pr_create_confirmed")
+
+    @property
+    def github_pr_create_title(self) -> str | None:
+        return self._optional_string("github_pr_create_title")
+
+    @property
+    def github_pr_create_body(self) -> str | None:
+        return self._optional_string("github_pr_create_body")
+
+    @property
+    def github_pr_create_marker(self) -> str | None:
+        return self._optional_string("github_pr_create_marker")
+
+    @property
+    def github_pr_create_commit_subject(self) -> str | None:
+        return self._optional_string("github_pr_create_commit_subject")
+
+    @property
+    def github_pr_create_operation_state(self) -> str | None:
+        return self._optional_string("github_pr_create_operation_state")
+
+    @property
+    def github_pr_created_number(self) -> int | None:
+        return self._optional_int("github_pr_created_number")
+
+    @property
+    def github_pr_created_url(self) -> str | None:
+        return self._optional_string("github_pr_created_url")
 
     @property
     def github_repo_create_requested(self) -> bool:
@@ -3601,6 +3648,7 @@ class AgentJob:
             "agent": self.agent_dispatch_state,
             "fork": self.fork_operation_state,
             "issue_create": self.github_issue_create_operation_state,
+            "pr_create": self.github_pr_create_operation_state,
             "linear_ticket_create": self.linear_ticket_create_operation_state,
             "worktree": self.worktree_provision_state,
             "prompt": self.prompt_operation_state,
@@ -3961,6 +4009,16 @@ class AgentJob:
                 "GitHub issue creation confirmation requires a creation request"
             )
         if (
+            self.github_pr_create_operation_state is not None
+            and self.github_pr_create_operation_state
+            not in _ISSUE_CREATE_OPERATION_STATES
+        ):
+            raise JobValidationError("github_pr_create_operation_state is invalid")
+        if self.github_pr_create_confirmed and not self.github_pr_create_requested:
+            raise JobValidationError(
+                "GitHub pull request creation confirmation requires a creation request"
+            )
+        if (
             self.github_repo_create_operation_state is not None
             and self.github_repo_create_operation_state
             not in _REPO_CREATE_OPERATION_STATES
@@ -4008,6 +4066,17 @@ class AgentJob:
         ):
             raise JobValidationError(
                 "GitHub issue creation operation requires repository, title, and marker"
+            )
+        if self.github_pr_create_operation_state is not None and not all(
+            (
+                self.github_repository,
+                self.github_pr_create_title,
+                self.github_pr_create_marker,
+            )
+        ):
+            raise JobValidationError(
+                "GitHub pull request creation operation requires repository, "
+                "title, and marker"
             )
         if (
             self.linear_ticket_create_operation_state is not None
@@ -4060,6 +4129,7 @@ class AgentJob:
             and self.github_issue is None
             and not self.github_issue_create_requested
             and not self.github_repo_create_requested
+            and not self.github_pr_create_requested
         ):
             raise JobValidationError(
                 "github issue_provider requires a GitHub issue identity"
@@ -4481,6 +4551,7 @@ class AgentJob:
             or self.fork_operation_state in _UNCERTAIN_OPERATION_STATES
             or self.worktree_provision_state in _UNCERTAIN_OPERATION_STATES
             or self.github_issue_create_operation_state in {"submitted", "ambiguous"}
+            or self.github_pr_create_operation_state in {"submitted", "ambiguous"}
             or self.clone_operation_state in {"submitted", "ambiguous"}
             or self.github_repo_create_operation_state in {"submitted", "ambiguous"}
             or self.linear_ticket_create_operation_state
