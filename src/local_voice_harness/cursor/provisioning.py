@@ -3810,7 +3810,7 @@ def _run_linear_ticket_close(
     checkpoint()
     if not job.linear_ticket_close_issue_id:
         try:
-            issue_id, issue = provider.resolve_issue(
+            issue_id, issue = provider.resolve_issue_for_update(
                 client,
                 identifier,
                 checkpoint=checkpoint,

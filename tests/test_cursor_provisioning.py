@@ -5032,7 +5032,7 @@ class CursorJobStateTests(unittest.TestCase):
             ),
             mock.patch.object(
                 provider,
-                "resolve_issue",
+                "resolve_issue_for_update",
                 return_value=("issue-id-api-79", LinearIssue("API-79")),
             ),
             mock.patch.object(
