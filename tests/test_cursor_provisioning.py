@@ -3940,7 +3940,8 @@ class CursorJobStateTests(unittest.TestCase):
         configure_tiered_outcomes(
             client, repository, tier="high-risk", provider="opencode/herdr"
         )
-        preferences_path = Path(self.temporary.name) / "plan-approval.json"
+        preferences_path = Path(self.temporary.name) / "prefs" / "plan-approval.json"
+        preferences_path.parent.mkdir()
         isolated_preferences = mock.patch.dict(
             os.environ,
             {"VOICE_HARNESS_PLAN_APPROVAL_FILE": str(preferences_path)},
@@ -3955,6 +3956,7 @@ class CursorJobStateTests(unittest.TestCase):
         first = jobs.read_job("123456789abc")
         self.assertEqual(first["status"], "awaiting_user")
         self.assertEqual(first["harness_kind"], "opencode")
+        self.assertEqual(first["workflow_phase"], "reviewing")
         self.assertEqual(
             [call.kwargs["role"] for call in client.start_fresh_agent.call_args_list],
             ["reviewer"],
@@ -3974,12 +3976,14 @@ class CursorJobStateTests(unittest.TestCase):
             [call.kwargs["role"] for call in client.start_fresh_agent.call_args_list],
             ["reviewer", "implementer"],
         )
+        participant_targets = [
+            call.kwargs["name"] for call in client.start_fresh_agent.call_args_list
+        ]
+        self.assertEqual(len(set(participant_targets)), 2)
         self.assertNotEqual(
-            completed.get("planner_target"), completed.get("reviewer_target")
+            client.ensure_agent.return_value.target, participant_targets[0]
         )
-        self.assertNotEqual(
-            completed.get("reviewer_target"), completed.get("implementer_target")
-        )
+        self.assertNotEqual(participant_targets[0], participant_targets[1])
 
     def test_opencode_linear_job_fails_before_session_creation(self) -> None:
         jobs.write_job(
