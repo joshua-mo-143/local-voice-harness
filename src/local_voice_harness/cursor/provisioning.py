@@ -5638,7 +5638,7 @@ def _run_linear_ticket_merge(
     checkpoint()
     if not job.ticket_merge_survivor_issue_id:
         try:
-            issue_id, issue = provider.resolve_issue(
+            issue_id, issue = provider.resolve_issue_for_update(
                 client,
                 identifier,
                 checkpoint=checkpoint,
@@ -5692,7 +5692,7 @@ def _run_linear_ticket_merge(
             issue = LinearIssue(ticket.identity)
         else:
             try:
-                issue_id, issue = provider.resolve_issue(
+                issue_id, issue = provider.resolve_issue_for_update(
                     client,
                     ticket.identity,
                     checkpoint=checkpoint,

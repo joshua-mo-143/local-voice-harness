@@ -5771,7 +5771,7 @@ class CursorJobStateTests(unittest.TestCase):
             ),
             mock.patch.object(
                 provider,
-                "resolve_issue",
+                "resolve_issue_for_update",
                 side_effect=[
                     ("issue-id-api-79", LinearIssue("API-79")),
                     ("issue-id-api-80", LinearIssue("API-80")),
@@ -6731,7 +6731,7 @@ class CursorJobStateTests(unittest.TestCase):
             ),
             mock.patch.object(
                 provider,
-                "resolve_issue",
+                "resolve_issue_for_update",
                 side_effect=LinearError("not found"),
             ),
         ):
