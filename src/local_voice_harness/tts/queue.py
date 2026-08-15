@@ -364,16 +364,21 @@ def _open_playback(
     sample_rate: int, settings: AudioSettings | None = None
 ) -> subprocess.Popen[bytes]:
     audio = settings or default_user_config().audio
-    return subprocess.Popen(
-        [
-            "pw-play",
+    command = ["pw-play"]
+    if audio.sink:
+        command.extend(("--target", audio.sink))
+    command.extend(
+        (
             "--raw",
             "--channels=1",
             f"--rate={sample_rate}",
             "--format=s16",
             f"--latency={audio.playback_latency}",
             "-",
-        ],
+        )
+    )
+    return subprocess.Popen(
+        command,
         stdin=subprocess.PIPE,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.PIPE,

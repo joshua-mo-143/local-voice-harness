@@ -66,6 +66,7 @@ _COMPUTE_KEYS = (
 )
 _AUDIO_KEYS = (
     "source",
+    "sink",
     "voice",
     "wake_threshold",
     "min_speech_rms",
@@ -231,6 +232,7 @@ class AudioSettings:
     """Microphone, wake, barge-in, and playback tuning."""
 
     source: str = config.DEFAULT_SOURCE
+    sink: str = ""
     voice: str = ""
     wake_threshold: float = 0.55
     min_speech_rms: float = 1100.0
@@ -813,7 +815,7 @@ def _load_audio(
             "us, ms, or s"
         )
     return AudioSettings(
-        source=_as_nonempty(
+        source=str(
             _resolve(
                 environment,
                 "VOICE_HARNESS_SOURCE",
@@ -821,8 +823,16 @@ def _load_audio(
                 "source",
                 config.DEFAULT_SOURCE,
             ),
-            label="audio.source",
-        ),
+        ).strip(),
+        sink=str(
+            _resolve(
+                environment,
+                "VOICE_HARNESS_SINK",
+                section,
+                "sink",
+                "",
+            ),
+        ).strip(),
         voice=str(
             _resolve(environment, "VOICE_HARNESS_VOICE", section, "voice", "")
         ).strip(),
@@ -1344,6 +1354,7 @@ def render_user_config(user_config: UserConfig) -> str:
         "audio",
         {
             "source": audio.source,
+            "sink": audio.sink,
             "voice": audio.voice,
             "wake_threshold": audio.wake_threshold,
             "min_speech_rms": audio.min_speech_rms,

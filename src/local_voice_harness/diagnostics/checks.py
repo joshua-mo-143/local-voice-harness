@@ -353,9 +353,11 @@ def check_focus_automation(
     ]
 
 
-def _python_environments() -> tuple[tuple[str, Path, Path, str], ...]:
+def _python_environments(
+    config: UserConfig | None,
+) -> tuple[tuple[str, Path, Path, str], ...]:
     home = Path.home()
-    return (
+    environments = [
         (
             "wake/management (.venv)",
             PROJECT_ROOT / ".venv",
@@ -369,21 +371,26 @@ def _python_environments() -> tuple[tuple[str, Path, Path, str], ...]:
             "env UV_PROJECT_ENVIRONMENT=.venv-dictation "
             "uv sync --python 3.11 --extra dictation --no-dev",
         ),
-        (
-            "chatterbox tts",
-            home / "chatterbox-audition" / ".venv",
-            home / "chatterbox-audition" / ".venv" / "bin" / "voice-harness-tts",
-            'UV_PROJECT_ENVIRONMENT="$HOME/chatterbox-audition/.venv" '
-            "uv sync --python 3.11 --extra tts --no-dev",
-        ),
-    )
+    ]
+    if config is None or config.providers.tts_provider == "local":
+        environments.append(
+            (
+                "chatterbox tts",
+                home / "chatterbox-audition" / ".venv",
+                home / "chatterbox-audition" / ".venv" / "bin" / "voice-harness-tts",
+                'UV_PROJECT_ENVIRONMENT="$HOME/chatterbox-audition/.venv" '
+                "uv sync --python 3.11 --extra tts --no-dev",
+            )
+        )
+    return tuple(environments)
 
 
 def check_python_environments(
-    _snapshot: DiagnosticSnapshot | None = None,
+    snapshot: DiagnosticSnapshot | None = None,
 ) -> list[CheckResult]:
     results: list[CheckResult] = []
-    for label, venv_dir, executable, suggestion in _python_environments():
+    config = _resolved(snapshot).config
+    for label, venv_dir, executable, suggestion in _python_environments(config):
         if executable.exists():
             results.append(
                 CheckResult(
@@ -648,22 +655,58 @@ def check_cuda(snapshot: DiagnosticSnapshot | None = None) -> list[CheckResult]:
     ]
 
 
+def pipewire_section_devices(status: str, section: str) -> tuple[str, ...]:
+    """Return device names listed under a ``wpctl status`` Audio section."""
+
+    lines = status.splitlines()
+    collecting = False
+    names: list[str] = []
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("Audio"):
+            collecting = False
+        if stripped.rstrip(":") in {section, f"├─ {section}", f"│  {section}"}:
+            collecting = True
+            continue
+        if collecting and (
+            stripped.startswith("├─")
+            or stripped.startswith("└─")
+            or stripped == "Video"
+        ):
+            break
+        if not collecting:
+            continue
+        label = stripped.lstrip("│").strip()
+        if not label or label.startswith("├") or label.startswith("└"):
+            continue
+        label = label.lstrip("* ").strip()
+        if label[:1].isdigit():
+            _, _, remainder = label.partition(".")
+            label = remainder.strip() or label
+        name, _, _volume = label.partition("[")
+        name = name.strip()
+        if name:
+            names.append(name)
+    return tuple(names)
+
+
 def check_pipewire_devices(
     snapshot: DiagnosticSnapshot | None = None,
 ) -> list[CheckResult]:
     resolved = _resolved(snapshot)
-    configured_source = (
-        resolved.config.audio.source if resolved.config is not None else "unavailable"
-    )
+    source = resolved.config.audio.source if resolved.config is not None else ""
+    sink = resolved.config.audio.sink if resolved.config is not None else ""
+    source_label = source or "PipeWire system default source"
+    sink_label = sink or "PipeWire system default sink"
     if _which("wpctl") is None:
         return [
             CheckResult(
                 name="audio:pipewire",
                 category="audio",
-                severity=Severity.WARNING,
+                severity=Severity.FATAL,
                 detail=(
                     "wpctl not found; cannot enumerate PipeWire capture/playback "
-                    f"devices. Configured source: {configured_source}"
+                    f"devices. Configured source: {source_label}; sink: {sink_label}"
                 ),
                 suggestion=INSTALL_HINTS.get("wpctl"),
             )
@@ -674,12 +717,53 @@ def check_pipewire_devices(
             CheckResult(
                 name="audio:pipewire",
                 category="audio",
-                severity=Severity.WARNING,
+                severity=Severity.FATAL,
                 detail=(
                     "wpctl status failed; PipeWire may not be running for this "
-                    f"session. Configured source: {configured_source}"
+                    f"session. Configured source: {source_label}; sink: {sink_label}"
                 ),
                 suggestion="systemctl --user status pipewire wireplumber",
+            )
+        ]
+    sources = pipewire_section_devices(process.stdout, "Sources")
+    sinks = pipewire_section_devices(process.stdout, "Sinks")
+    if not sources or not sinks:
+        return [
+            CheckResult(
+                name="audio:pipewire",
+                category="audio",
+                severity=Severity.FATAL,
+                detail=(
+                    "PipeWire reported no capture or playback devices. "
+                    f"Configured source: {source_label}; sink: {sink_label}"
+                ),
+                suggestion="wpctl status  # confirm a source and sink are available",
+            )
+        ]
+    if source and source not in sources:
+        return [
+            CheckResult(
+                name="audio:pipewire",
+                category="audio",
+                severity=Severity.FATAL,
+                detail=(
+                    f"configured capture source {source} was not found among "
+                    f"PipeWire sources: {', '.join(sources)}"
+                ),
+                suggestion="voice-harness config set audio.source '<PIPEWIRE_SOURCE_NAME>'",
+            )
+        ]
+    if sink and sink not in sinks:
+        return [
+            CheckResult(
+                name="audio:pipewire",
+                category="audio",
+                severity=Severity.FATAL,
+                detail=(
+                    f"configured playback sink {sink} was not found among "
+                    f"PipeWire sinks: {', '.join(sinks)}"
+                ),
+                suggestion="voice-harness config set audio.sink '<PIPEWIRE_SINK_NAME>'",
             )
         ]
     return [
@@ -688,8 +772,8 @@ def check_pipewire_devices(
             category="audio",
             severity=Severity.OK,
             detail=(
-                "PipeWire is responding to wpctl; configured capture source is "
-                f"{configured_source} (override with VOICE_HARNESS_SOURCE)"
+                "PipeWire is responding to wpctl; capture uses "
+                f"{source_label}; playback uses {sink_label}"
             ),
         )
     ]

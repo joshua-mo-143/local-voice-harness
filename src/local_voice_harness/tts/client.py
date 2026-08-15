@@ -170,16 +170,21 @@ class StreamingPlayback:
                 stream_socket.shutdown(socket.SHUT_RDWR)
 
     def _open_playback(self, sample_rate: int) -> subprocess.Popen[bytes]:
-        process = subprocess.Popen(
-            [
-                "pw-play",
+        command = ["pw-play"]
+        if self.audio.sink:
+            command.extend(("--target", self.audio.sink))
+        command.extend(
+            (
                 "--raw",
                 "--channels=1",
                 f"--rate={sample_rate}",
                 "--format=s16",
                 f"--latency={self.audio.playback_latency}",
                 "-",
-            ],
+            )
+        )
+        process = subprocess.Popen(
+            command,
             stdin=subprocess.PIPE,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,

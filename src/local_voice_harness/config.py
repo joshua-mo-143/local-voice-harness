@@ -326,7 +326,7 @@ STT_SOCKET = RUNTIME / "dictation.sock"
 TTS_SOCKET = RUNTIME / "voice-harness-tts.sock"
 LLM_HEALTH = "http://127.0.0.1:8090/health"
 LLM_CHAT = "http://127.0.0.1:8090/v1/chat/completions"
-DEFAULT_SOURCE = "alsa_input.pci-0000_00_1f.3-platform-sof_sdw.HiFi__Mic__source"
+DEFAULT_SOURCE = ""
 CURSOR_PATTERN = re.compile(
     r"^\s*(?P<verb>use|ask|call)\s+(?:cursor|curser|cursa)\b", re.IGNORECASE
 )

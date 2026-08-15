@@ -82,8 +82,8 @@ NVIDIA packages, and omits local LLM/TTS extras, models, and the local LLM
 service. The existing local CUDA path remains the default when a local provider
 is selected.
 
-After installation, select the PipeWire microphone and, when using the local LLM,
-the llama.cpp CUDA device:
+After installation, override PipeWire's system-selected microphone only when
+needed. When using the local LLM, also confirm the llama.cpp CUDA device:
 
 ```bash
 wpctl status

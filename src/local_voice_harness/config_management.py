@@ -326,6 +326,12 @@ _CONFIG_FIELDS: dict[str, ConfigField] = {
         attribute="source",
         services=(_WAKE_SERVICE,),
     ),
+    "audio.sink": _field(
+        parse=_parse_str,
+        section="audio",
+        attribute="sink",
+        services=(_WAKE_SERVICE, _TTS_SERVICE),
+    ),
     "audio.voice": _field(
         parse=_parse_str,
         section="audio",

@@ -317,11 +317,12 @@ Find the PipeWire microphone:
 wpctl status
 ```
 
-The source currently defaults to the microphone from the original development
-machine. Store the selected source in unified configuration:
+Capture and playback default to PipeWire's system-selected source and sink.
+Store an explicit source or sink only when you need to override that default:
 
 ```bash
 voice-harness config set audio.source '<PIPEWIRE_SOURCE_NAME>'
+voice-harness config set audio.sink '<PIPEWIRE_SINK_NAME>'
 ```
 
 Optional Chatterbox voice cloning accepts a reference WAV:

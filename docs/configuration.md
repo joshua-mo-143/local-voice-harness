@@ -324,7 +324,8 @@ voice-harness plan-approval ask
 
 | Variable | Purpose | Default | Configuration channel |
 | --- | --- | --- | --- |
-| `VOICE_HARNESS_SOURCE` | PipeWire microphone source | Development-machine source | Process environment override |
+| `VOICE_HARNESS_SOURCE` | PipeWire microphone source; empty uses the system default | System default | Process environment override |
+| `VOICE_HARNESS_SINK` | PipeWire playback sink; empty uses the system default | System default | Process environment override |
 | `VOICE_HARNESS_VOICE` | Absolute Chatterbox reference WAV path | Built-in voice | Process environment override |
 | `VOICE_HARNESS_WAKE_THRESHOLD` | OpenWakeWord activation threshold (`0`–`1`) | `0.55` | Process environment override |
 | `VOICE_HARNESS_MIN_SPEECH_RMS` | Non-negative speech energy gate | `1100` | Process environment override |

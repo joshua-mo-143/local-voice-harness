@@ -375,15 +375,25 @@ class ExecutableCheckTests(unittest.TestCase):
         self.assertIs(results[0].severity, Severity.WARNING)
 
 
+def _local_tts_snapshot():
+    config = default_user_config()
+    config = replace(config, providers=replace(config.providers, tts_provider="local"))
+    return checks.DiagnosticSnapshot(
+        config=config,
+        registry=checks.build_integration_registry(config),
+    )
+
+
 class PythonEnvironmentTests(unittest.TestCase):
     def test_present_environment_is_ok(self) -> None:
         with mock.patch.object(Path, "exists", return_value=True):
-            results = checks.check_python_environments()
+            results = checks.check_python_environments(_local_tts_snapshot())
         self.assertTrue(all(r.severity is Severity.OK for r in results))
+        self.assertTrue(any("chatterbox" in result.name for result in results))
 
     def test_missing_environment_is_fatal(self) -> None:
         with mock.patch.object(Path, "exists", return_value=False):
-            results = checks.check_python_environments()
+            results = checks.check_python_environments(_local_tts_snapshot())
         self.assertTrue(all(r.severity is Severity.FATAL for r in results))
         self.assertTrue(all(r.suggestion for r in results))
 
@@ -392,8 +402,14 @@ class PythonEnvironmentTests(unittest.TestCase):
             return "bin" not in self.parts
 
         with mock.patch.object(Path, "exists", exists):
-            results = checks.check_python_environments()
+            results = checks.check_python_environments(_local_tts_snapshot())
         self.assertTrue(all(r.severity is Severity.WARNING for r in results))
+
+    def test_hosted_tts_skips_local_chatterbox_environment(self) -> None:
+        with mock.patch.object(Path, "exists", return_value=False):
+            results = checks.check_python_environments(_snapshot())
+        self.assertFalse(any("chatterbox" in result.name for result in results))
+        self.assertTrue(results)
 
 
 class ModelAndCudaTests(unittest.TestCase):
@@ -460,27 +476,64 @@ class ModelAndCudaTests(unittest.TestCase):
         self.assertIs(results[0].severity, Severity.WARNING)
 
 
-class PipewireTests(unittest.TestCase):
-    def test_missing_wpctl_is_warning(self) -> None:
-        with mock.patch.object(checks, "_which", return_value=None):
-            results = checks.check_pipewire_devices()
-        self.assertIs(results[0].severity, Severity.WARNING)
+_WPCTL_STATUS = """\
+Audio
+ ├─ Devices:
+ │      40. Built-in Audio
+ ├─ Sinks:
+ │  *   62. Built-in Audio Analog Stereo [vol: 0.50]
+ ├─ Sources:
+ │  *   63. Built-in Audio Analog Stereo [vol: 1.00]
+ ├─ Filters:
+"""
 
-    def test_wpctl_ok(self) -> None:
+
+class PipewireTests(unittest.TestCase):
+    def test_missing_wpctl_is_fatal(self) -> None:
+        with mock.patch.object(checks, "_which", return_value=None):
+            results = checks.check_pipewire_devices(_snapshot())
+        self.assertIs(results[0].severity, Severity.FATAL)
+        self.assertIn("system default source", results[0].detail)
+
+    def test_wpctl_ok_uses_system_default_when_unconfigured(self) -> None:
         with (
             mock.patch.object(checks, "_which", return_value="/usr/bin/wpctl"),
-            mock.patch.object(checks, "_run", return_value=_completed(0, "audio")),
+            mock.patch.object(
+                checks, "_run", return_value=_completed(0, _WPCTL_STATUS)
+            ),
         ):
-            results = checks.check_pipewire_devices()
+            results = checks.check_pipewire_devices(_snapshot())
         self.assertIs(results[0].severity, Severity.OK)
+        self.assertIn("system default source", results[0].detail)
+        self.assertIn("system default sink", results[0].detail)
 
-    def test_wpctl_failure_is_warning(self) -> None:
+    def test_wpctl_failure_is_fatal(self) -> None:
         with (
             mock.patch.object(checks, "_which", return_value="/usr/bin/wpctl"),
             mock.patch.object(checks, "_run", return_value=_completed(1)),
         ):
-            results = checks.check_pipewire_devices()
-        self.assertIs(results[0].severity, Severity.WARNING)
+            results = checks.check_pipewire_devices(_snapshot())
+        self.assertIs(results[0].severity, Severity.FATAL)
+
+    def test_missing_configured_source_is_fatal(self) -> None:
+        snapshot = _snapshot()
+        assert snapshot.config is not None
+        snapshot = checks.DiagnosticSnapshot(
+            config=replace(
+                snapshot.config,
+                audio=replace(snapshot.config.audio, source="missing-mic"),
+            ),
+            registry=snapshot.registry,
+        )
+        with (
+            mock.patch.object(checks, "_which", return_value="/usr/bin/wpctl"),
+            mock.patch.object(
+                checks, "_run", return_value=_completed(0, _WPCTL_STATUS)
+            ),
+        ):
+            results = checks.check_pipewire_devices(snapshot)
+        self.assertIs(results[0].severity, Severity.FATAL)
+        self.assertIn("missing-mic", results[0].detail)
 
 
 class SystemdUnitTests(unittest.TestCase):
