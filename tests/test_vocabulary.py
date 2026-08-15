@@ -55,6 +55,7 @@ class VocabularyStoreTests(unittest.TestCase):
             [
                 {
                     "phrase": "the harness repo",
+                    "source": "github",
                     "target": "Joshua-MO-143/Local-Voice-Harness",
                     "kind": "repository",
                 }
@@ -69,6 +70,7 @@ class VocabularyStoreTests(unittest.TestCase):
         assert alias is not None
         self.assertEqual(alias.kind, vocabulary.AliasKind.ISSUE)
         self.assertEqual(alias.target, "owner/repo#35")
+        self.assertEqual(alias.source, "github")
 
     def test_invalid_alias_target_is_rejected(self) -> None:
         store = self._store()
@@ -283,37 +285,73 @@ class LinearAliasTargetTests(unittest.TestCase):
         self.addCleanup(temporary.cleanup)
         return Path(temporary.name) / "vocabulary.json"
 
+    def _linear(self) -> IntegrationSettings:
+        return IntegrationSettings(github_enabled=True, linear_enabled=True)
+
     def test_cli_add_stores_canonical_linear_identifier(self) -> None:
         store = self._store()
         with redirect_stdout(io.StringIO()):
-            vocabulary.add_alias("launcher ticket", "API-79", path=store)
+            vocabulary.add_alias(
+                "launcher ticket",
+                "API-79",
+                path=store,
+                integrations=self._linear(),
+            )
         alias = vocabulary.load(store).alias_for("launcher ticket")
         assert alias is not None
         self.assertEqual(alias.target, "API-79")
         self.assertEqual(alias.kind, vocabulary.AliasKind.LINEAR)
+        self.assertEqual(alias.source, "linear")
         document = json.loads(store.read_text())
         self.assertEqual(document["aliases"][0]["kind"], "linear")
+        self.assertEqual(document["aliases"][0]["source"], "linear")
 
     def test_linear_target_uses_team_syntax_and_positive_number(self) -> None:
         store = self._store()
         with redirect_stdout(io.StringIO()):
-            vocabulary.add_alias("launcher ticket", "api-79", path=store)
+            vocabulary.add_alias(
+                "launcher ticket",
+                "api-79",
+                path=store,
+                integrations=self._linear(),
+            )
         alias = vocabulary.load(store).alias_for("launcher ticket")
         assert alias is not None
         self.assertEqual(alias.target, "API-79")
-        for invalid in ("API", "API-", "API-0", "1-79", "-79"):
+        for invalid in ("API", "API-", "1-79", "-79"):
             with self.subTest(target=invalid):
                 with self.assertRaises(vocabulary.VocabularyError):
-                    vocabulary.add_alias("bad", invalid, path=store)
+                    vocabulary.add_alias(
+                        "bad",
+                        invalid,
+                        path=store,
+                        integrations=self._linear(),
+                    )
 
     def test_load_conflict_and_force_match_github_aliases(self) -> None:
         store = self._store()
         with redirect_stdout(io.StringIO()):
-            vocabulary.add_alias("launcher ticket", "API-79", path=store)
+            vocabulary.add_alias(
+                "launcher ticket",
+                "API-79",
+                path=store,
+                integrations=self._linear(),
+            )
         with self.assertRaises(vocabulary.VocabularyError):
-            vocabulary.add_alias("launcher ticket", "ENG-12", path=store)
+            vocabulary.add_alias(
+                "launcher ticket",
+                "ENG-12",
+                path=store,
+                integrations=self._linear(),
+            )
         with redirect_stdout(io.StringIO()):
-            vocabulary.add_alias("launcher ticket", "ENG-12", path=store, force=True)
+            vocabulary.add_alias(
+                "launcher ticket",
+                "ENG-12",
+                path=store,
+                force=True,
+                integrations=self._linear(),
+            )
         alias = vocabulary.load(store).alias_for("launcher ticket")
         assert alias is not None
         self.assertEqual(alias.target, "ENG-12")
@@ -335,7 +373,12 @@ class LinearAliasTargetTests(unittest.TestCase):
     def test_resolve_aliases_substitutes_stored_linear_identifier(self) -> None:
         store = self._store()
         with redirect_stdout(io.StringIO()):
-            vocabulary.add_alias("launcher ticket", "API-79", path=store)
+            vocabulary.add_alias(
+                "launcher ticket",
+                "API-79",
+                path=store,
+                integrations=self._linear(),
+            )
         self.assertEqual(
             vocabulary.resolve_aliases("work on the launcher ticket", path=store),
             "work on the API-79",
@@ -346,7 +389,12 @@ class LinearAliasTargetTests(unittest.TestCase):
         with redirect_stdout(io.StringIO()):
             vocabulary.add_alias("harness", "owner/repo", path=store)
             vocabulary.add_alias("harness bug", "owner/repo#35", path=store)
-            vocabulary.add_alias("launcher ticket", "API-79", path=store)
+            vocabulary.add_alias(
+                "launcher ticket",
+                "API-79",
+                path=store,
+                integrations=self._linear(),
+            )
         loaded = vocabulary.load(store)
         repo = loaded.alias_for("harness")
         issue = loaded.alias_for("harness bug")
@@ -355,17 +403,28 @@ class LinearAliasTargetTests(unittest.TestCase):
         self.assertEqual(repo.kind, vocabulary.AliasKind.REPOSITORY)
         self.assertEqual(issue.kind, vocabulary.AliasKind.ISSUE)
         self.assertEqual(linear_alias.kind, vocabulary.AliasKind.LINEAR)
+        self.assertEqual(repo.source, "github")
+        self.assertEqual(linear_alias.source, "linear")
 
-    def test_vocabulary_module_does_not_import_linear(self) -> None:
+    def test_vocabulary_module_does_not_import_provider_modules(self) -> None:
         source = Path(vocabulary.__file__).read_text(encoding="utf-8")
         self.assertNotIn("LinearIntegration", source)
+        self.assertNotIn("ZendeskProvider", source)
+        self.assertNotIn("GitHubProvider", source)
         self.assertNotIn("integrations.linear", source)
-        self.assertNotIn("from .integrations", source)
+        self.assertNotIn("integrations.zendesk", source)
+        self.assertNotIn("integrations.github", source)
+        self.assertIn("integrations.registry", source)
 
     def test_disabled_linear_fails_like_a_typed_identifier(self) -> None:
         store = self._store()
         with redirect_stdout(io.StringIO()):
-            vocabulary.add_alias("launcher ticket", "API-79", path=store)
+            vocabulary.add_alias(
+                "launcher ticket",
+                "API-79",
+                path=store,
+                integrations=self._linear(),
+            )
         expanded = vocabulary.resolve_aliases("work on launcher ticket", path=store)
         disabled = IntegrationSettings(linear_enabled=False)
         self.assertEqual(expanded, "work on API-79")
@@ -382,16 +441,181 @@ class LinearAliasTargetTests(unittest.TestCase):
             service.start_job(expanded, issue_key="API-79", integrations=registry)
         store_mock.return_value.create.assert_not_called()
 
-    def test_spoken_alias_path_rejects_linear_targets(self) -> None:
+    def test_spoken_alias_path_rejects_linear_when_provider_is_disabled(self) -> None:
         preparation = vocabulary.prepare_spoken_alias(
             "call this the launcher issue",
             focused_issue="API-79",
+            source="linear",
             path=self._store(),
+            integrations=IntegrationSettings(github_enabled=True, linear_enabled=False),
         )
         self.assertEqual(
             preparation.status, vocabulary.SpokenAliasStatus.INVALID_TARGET
         )
         self.assertIsNone(preparation.pending)
+
+
+class ProviderAliasIdentityTests(unittest.TestCase):
+    def _store(self) -> Path:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        return Path(temporary.name) / "vocabulary.json"
+
+    def test_cli_add_is_rejected_when_no_enabled_provider_owns_target(self) -> None:
+        store = self._store()
+        with self.assertRaisesRegex(vocabulary.VocabularyError, "no enabled provider"):
+            vocabulary.add_alias(
+                "launcher ticket",
+                "API-79",
+                path=store,
+                integrations=IntegrationSettings(
+                    github_enabled=True, linear_enabled=False
+                ),
+            )
+        with self.assertRaisesRegex(vocabulary.VocabularyError, "no enabled provider"):
+            vocabulary.add_alias(
+                "harness",
+                "owner/repo",
+                path=store,
+                integrations=IntegrationSettings(github_enabled=False),
+            )
+        self.assertEqual(vocabulary.load(store).aliases, ())
+
+    def test_legacy_untagged_github_and_linear_aliases_still_load(self) -> None:
+        store = self._store()
+        store.write_text(
+            json.dumps(
+                {
+                    "version": 2,
+                    "aliases": [
+                        {
+                            "phrase": "harness",
+                            "target": "owner/repo",
+                            "kind": "repository",
+                        },
+                        {
+                            "phrase": "harness bug",
+                            "target": "owner/repo#35",
+                            "kind": "issue",
+                        },
+                        {
+                            "phrase": "launcher ticket",
+                            "target": "API-79",
+                            "kind": "linear",
+                        },
+                    ],
+                }
+            )
+        )
+        loaded = vocabulary.load(store)
+        repo = loaded.alias_for("harness")
+        issue = loaded.alias_for("harness bug")
+        linear_alias = loaded.alias_for("launcher ticket")
+        assert repo is not None and issue is not None and linear_alias is not None
+        self.assertEqual(repo.source, "github")
+        self.assertEqual(issue.source, "github")
+        self.assertEqual(linear_alias.source, "linear")
+        self.assertEqual(repo.target, "owner/repo")
+        self.assertEqual(issue.target, "owner/repo#35")
+        self.assertEqual(linear_alias.target, "API-79")
+        self.assertEqual(
+            vocabulary.resolve_aliases(
+                "work on harness and the launcher ticket", path=store
+            ),
+            "work on owner/repo and the API-79",
+        )
+
+    def test_voice_add_copies_fragment_source_and_issue_reference(self) -> None:
+        store = self._store()
+        linear = IntegrationSettings(github_enabled=True, linear_enabled=True)
+        preparation = vocabulary.prepare_spoken_alias(
+            "call this the launcher issue",
+            focused_issue="API-79",
+            source="linear",
+            path=store,
+            integrations=linear,
+        )
+        pending = preparation.pending
+        assert pending is not None
+        self.assertEqual(pending.source, "linear")
+        self.assertEqual(pending.target, "API-79")
+        self.assertEqual(pending.kind, vocabulary.AliasKind.LINEAR)
+        with redirect_stdout(io.StringIO()):
+            vocabulary.commit_spoken_alias(pending, path=store, integrations=linear)
+        alias = vocabulary.load(store).alias_for("the launcher issue")
+        assert alias is not None
+        self.assertEqual(alias.source, "linear")
+        self.assertEqual(alias.target, "API-79")
+
+    def test_voice_add_does_not_parse_a_second_stt_guess(self) -> None:
+        store = self._store()
+        preparation = vocabulary.prepare_spoken_alias(
+            "Call this repo owner/stt-guess the harness",
+            focused_repository="focused/repo",
+            source="github",
+            path=store,
+            integrations=IntegrationSettings(github_enabled=True),
+        )
+        pending = preparation.pending
+        assert pending is not None
+        self.assertEqual(pending.target, "focused/repo")
+        self.assertEqual(pending.source, "github")
+        self.assertNotIn("stt-guess", pending.target)
+
+    def test_zendesk_can_store_an_owned_identity_without_a_work_on_route(self) -> None:
+        store = self._store()
+        zendesk = IntegrationSettings(github_enabled=True, zendesk_enabled=True)
+        with redirect_stdout(io.StringIO()):
+            vocabulary.add_alias(
+                "the login ticket",
+                "Example#42",
+                path=store,
+                integrations=zendesk,
+            )
+        alias = vocabulary.load(store).alias_for("the login ticket")
+        assert alias is not None
+        self.assertEqual(alias.source, "zendesk")
+        self.assertEqual(alias.target, "example#42")
+        self.assertEqual(alias.kind, vocabulary.AliasKind.ISSUE)
+        expanded = vocabulary.resolve_aliases("work on the login ticket", path=store)
+        self.assertEqual(expanded, "work on example#42")
+        self.assertIsNone(
+            extract_issue_reference(
+                expanded,
+                IntegrationSettings(github_enabled=True, zendesk_enabled=True),
+            )
+        )
+
+    def test_disabled_owner_still_expands_but_does_not_start_work(self) -> None:
+        store = self._store()
+        store.write_text(
+            json.dumps(
+                {
+                    "version": 2,
+                    "aliases": [
+                        {
+                            "phrase": "launcher ticket",
+                            "target": "API-79",
+                            "kind": "linear",
+                        }
+                    ],
+                }
+            )
+        )
+        expanded = vocabulary.resolve_aliases("work on launcher ticket", path=store)
+        disabled = IntegrationSettings(github_enabled=True, linear_enabled=False)
+        self.assertEqual(expanded, "work on API-79")
+        self.assertIsNone(extract_issue_reference(expanded, disabled))
+        registry = build_integration_registry(
+            replace(default_user_config(), integrations=disabled)
+        )
+        with (
+            mock.patch.object(service, "_job_store") as store_mock,
+            mock.patch.object(service, "launch_worker"),
+            self.assertRaisesRegex(HarnessError, "provider is unavailable"),
+        ):
+            service.start_job(expanded, issue_key="API-79", integrations=registry)
+        store_mock.return_value.create.assert_not_called()
 
 
 class SpeechToTextCorrectionTests(unittest.TestCase):
@@ -502,6 +726,7 @@ class SpokenAliasPreparationTests(unittest.TestCase):
         self.assertEqual(pending.phrase, "owner/stt-guess the harness")
         self.assertEqual(pending.target, "joshua-mo-143/local-voice-harness")
         self.assertEqual(pending.kind, vocabulary.AliasKind.REPOSITORY)
+        self.assertEqual(pending.source, "github")
         self.assertFalse(pending.replace)
         self.assertIsNone(vocabulary.load(store).alias_for("the harness"))
 
@@ -518,6 +743,7 @@ class SpokenAliasPreparationTests(unittest.TestCase):
         self.assertEqual(pending.phrase, "the launcher issue")
         self.assertEqual(pending.target, "owner/repo#35")
         self.assertEqual(pending.kind, vocabulary.AliasKind.ISSUE)
+        self.assertEqual(pending.source, "github")
 
     def test_missing_phrase_or_target_fails_closed(self) -> None:
         store = self._store()

@@ -27,6 +27,10 @@ REPOSITORY = re.compile(
     r"^(?P<owner>[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?)/"
     r"(?P<repo>[A-Za-z0-9_.-]{1,100})$"
 )
+ISSUE_IDENTITY = re.compile(
+    r"^(?P<owner>[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?)/"
+    r"(?P<repo>[A-Za-z0-9_.-]{1,100})#(?P<number>[1-9]\d*)$"
+)
 GITHUB_HOSTS = {"github.com", "www.github.com"}
 ISSUE_PATH = re.compile(
     r"^/(?P<owner>[A-Za-z0-9_.-]+)/(?P<repo>[A-Za-z0-9_.-]+)/issues/"
@@ -314,6 +318,16 @@ class GitHubClient:
         if match is None or match.group("repo") in {".", ".."}:
             raise GitHubError("GitHub repository must be in owner/repository form")
         return f"{match.group('owner')}/{match.group('repo')}"
+
+    @staticmethod
+    def validate_issue_identity(value: str) -> str:
+        match = ISSUE_IDENTITY.fullmatch(value.strip())
+        if match is None or match.group("repo") in {".", ".."}:
+            raise GitHubError("GitHub issue must be in owner/repository#number form")
+        repository = GitHubClient.validate_repository(
+            f"{match.group('owner')}/{match.group('repo')}"
+        )
+        return f"{repository}#{int(match.group('number'))}"
 
     def _run(
         self,
@@ -1681,3 +1695,23 @@ class GitHubProvider:
     def capture_text(self, text: str) -> ContextFragment | None:
         issue = github_issue_from_text(text)
         return self._issue_fragment(issue, url=issue.url) if issue is not None else None
+
+    def owns_issue_reference(self, reference: str) -> bool:
+        try:
+            GitHubClient.validate_issue_identity(reference)
+        except GitHubError:
+            return False
+        return True
+
+    def canonicalize_issue_reference(self, reference: str) -> str:
+        return GitHubClient.validate_issue_identity(reference)
+
+    def owns_repository_reference(self, reference: str) -> bool:
+        try:
+            GitHubClient.validate_repository(reference)
+        except GitHubError:
+            return False
+        return True
+
+    def canonicalize_repository_reference(self, reference: str) -> str:
+        return GitHubClient.validate_repository(reference)

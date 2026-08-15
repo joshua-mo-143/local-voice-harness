@@ -119,6 +119,7 @@ class ZendeskProviderTests(unittest.TestCase):
         self.assertIsInstance(fragment, ContextFragment)
         assert fragment is not None
         self.assertEqual(fragment.source, "zendesk")
+        self.assertEqual(fragment.issue_reference, "example#42")
         self.assertIn("untrusted external context", fragment.text)
         self.assertIn("Tenant: example", fragment.text)
         self.assertIn("Ticket: #42", fragment.text)
@@ -133,9 +134,21 @@ class ZendeskProviderTests(unittest.TestCase):
             fragment = zendesk.ZendeskProvider().capture(self.URL)
 
         assert fragment is not None
+        self.assertEqual(fragment.issue_reference, "example#42")
         self.assertIn("Tenant: example", fragment.text)
         self.assertIn("Ticket: #42", fragment.text)
         self.assertIn("could not be read", fragment.text)
+
+    def test_owns_and_canonicalizes_ticket_identity(self) -> None:
+        provider = zendesk.ZendeskProvider()
+        self.assertTrue(provider.owns_issue_reference("Example#42"))
+        self.assertTrue(provider.owns_issue_reference(self.URL))
+        self.assertFalse(provider.owns_issue_reference("owner/repo#42"))
+        self.assertFalse(provider.owns_issue_reference("API-79"))
+        self.assertEqual(
+            provider.canonicalize_issue_reference("Example#42"), "example#42"
+        )
+        self.assertEqual(provider.canonicalize_issue_reference(self.URL), "example#42")
 
     def test_capture_ignores_non_zendesk_url_without_copying(self) -> None:
         with mock.patch.object(zendesk, "_focused_firefox_page_text") as page_text:

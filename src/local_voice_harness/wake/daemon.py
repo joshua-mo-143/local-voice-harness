@@ -1480,8 +1480,10 @@ class WakeConversationDaemon:
                     response = render_activation_delivery(delivery)
         return response, decision, pending
 
-    def _focused_github_alias_identities(self) -> tuple[str | None, str | None]:
-        """Return focused GitHub identities from browser or Herdr, never from STT."""
+    def _focused_alias_identity(
+        self,
+    ) -> tuple[str | None, str | None, str | None]:
+        """Return focused fragment source and references, never from STT."""
 
         try:
             url = focused_browser_url()
@@ -1495,40 +1497,48 @@ class WakeConversationDaemon:
                 fragment = focused_herdr_github_context(self.integrations)
             except Exception:
                 fragment = None
-        if fragment is None or fragment.source != "github":
-            return None, None
-        return fragment.repository_reference, fragment.issue_reference
+        if fragment is None:
+            return None, None, None
+        source = fragment.source.strip() if fragment.source else None
+        return source, fragment.repository_reference, fragment.issue_reference
 
-    def _just_used_github_alias_identities(self) -> tuple[str | None, str | None]:
-        """Return GitHub identities from the live just-used completed job."""
+    def _just_used_alias_identity(
+        self,
+    ) -> tuple[str | None, str | None, str | None]:
+        """Return fragment identity from the live just-used completed job."""
 
         followup = self._active_completed_followup()
         if followup is None:
-            return None, None
+            return None, None, None
         try:
             job = CURSOR_STORE.get(followup.job_id)
         except Exception:
-            return None, None
+            return None, None, None
         if (
             job.status != JobStatus.COMPLETED
             or job.completed_at != followup.completed_at
         ):
-            return None, None
-        repository = job.github_repository
-        issue = (
-            f"{job.github_repository}#{job.github_issue}"
-            if job.github_repository and job.github_issue
-            else None
-        )
-        return repository, issue
+            return None, None, None
+        if job.github_repository or job.github_issue:
+            repository = job.github_repository
+            issue = (
+                f"{job.github_repository}#{job.github_issue}"
+                if job.github_repository and job.github_issue
+                else None
+            )
+            return "github", repository, issue
+        if job.issue_key:
+            source = job.issue_provider.strip() if job.issue_provider else None
+            return source, None, job.issue_key
+        return None, None, None
 
-    def _trusted_github_alias_identities(self) -> tuple[str | None, str | None]:
-        """Prefer focused GitHub identity; fall back to just-used when absent."""
+    def _trusted_alias_identity(self) -> tuple[str | None, str | None, str | None]:
+        """Prefer focused fragment identity; fall back to just-used when absent."""
 
-        focused_repository, focused_issue = self._focused_github_alias_identities()
-        if focused_repository or focused_issue:
-            return focused_repository, focused_issue
-        return self._just_used_github_alias_identities()
+        source, repository, issue = self._focused_alias_identity()
+        if source or repository or issue:
+            return source, repository, issue
+        return self._just_used_alias_identity()
 
     def _resolve_pending_spoken_alias_confirmation(
         self,
@@ -1561,6 +1571,7 @@ class WakeConversationDaemon:
                 phrase=pending.phrase,
                 target=pending.target,
                 kind=pending.kind,
+                source=pending.source,
                 existing_target=pending.existing_target,
                 replace=True,
             )
@@ -1603,7 +1614,11 @@ class WakeConversationDaemon:
         try:
             if before_mutation is not None:
                 before_mutation()
-            commit_spoken_alias(pending, force=pending.replace)
+            commit_spoken_alias(
+                pending,
+                force=pending.replace,
+                integrations=self.integrations,
+            )
         except Exception as exc:  # noqa: BLE001 - report a bounded write failure
             if after_mutation is not None:
                 after_mutation()
@@ -2399,13 +2414,15 @@ class WakeConversationDaemon:
                     )
             elif route.intent == Intent.VOCABULARY_ALIAS_ADD:
                 if route.actionable:
-                    focused_repository, focused_issue = (
-                        self._trusted_github_alias_identities()
+                    source, focused_repository, focused_issue = (
+                        self._trusted_alias_identity()
                     )
                     preparation = prepare_spoken_alias(
                         text,
                         focused_repository=focused_repository,
                         focused_issue=focused_issue,
+                        source=source,
+                        integrations=self.integrations,
                     )
                     self.pending_spoken_alias = preparation.pending
                     self.pending_config_change = None

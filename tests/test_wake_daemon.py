@@ -4775,7 +4775,11 @@ class SpokenAliasConversationTests(unittest.TestCase):
         daemon: WakeConversationDaemon,
         text: str,
         *,
-        identities: tuple[str | None, str | None] = ("owner/repo", None),
+        identities: tuple[str | None, str | None, str | None] = (
+            "github",
+            "owner/repo",
+            None,
+        ),
         preparation: SpokenAliasPreparation | None = None,
         commit_effect: object = None,
         stored_target: str | None | object = _PENDING_ALIAS_TARGET,
@@ -4801,7 +4805,7 @@ class SpokenAliasConversationTests(unittest.TestCase):
             ) as route_intent,
             mock.patch.object(
                 daemon,
-                "_trusted_github_alias_identities",
+                "_trusted_alias_identity",
                 return_value=identities,
             ),
             mock.patch.object(
@@ -4852,6 +4856,11 @@ class SpokenAliasConversationTests(unittest.TestCase):
             "owner/repo",
         )
         self.assertIsNone(calls["prepare"].call_args.kwargs["focused_issue"])
+        self.assertEqual(calls["prepare"].call_args.kwargs["source"], "github")
+        self.assertIs(
+            calls["prepare"].call_args.kwargs["integrations"],
+            daemon.integrations,
+        )
         calls["commit"].assert_not_called()
         calls["cursor"].assert_not_called()
         calls["qwen"].assert_not_called()
@@ -4873,7 +4882,7 @@ class SpokenAliasConversationTests(unittest.TestCase):
         calls = self._run_turn(
             daemon,
             "call this the launcher issue",
-            identities=(None, "owner/repo#35"),
+            identities=("github", None, "owner/repo#35"),
             preparation=preparation,
         )
 
@@ -4891,7 +4900,7 @@ class SpokenAliasConversationTests(unittest.TestCase):
         calls = self._run_turn(
             daemon,
             "Call this repo owner/stt-guess",
-            identities=(None, None),
+            identities=(None, None, None),
             preparation=preparation,
         )
 
@@ -4901,6 +4910,7 @@ class SpokenAliasConversationTests(unittest.TestCase):
             calls["prepare"].call_args.kwargs["focused_repository"],
             None,
         )
+        self.assertIsNone(calls["prepare"].call_args.kwargs["source"])
         response = calls["play"].call_args.args[0]
         self.assertIn("didn't write anything", response.spoken_text)
 
@@ -4912,7 +4922,9 @@ class SpokenAliasConversationTests(unittest.TestCase):
         calls = self._run_turn(daemon, "yes")
 
         calls["route"].assert_not_called()
-        calls["commit"].assert_called_once_with(pending, force=False)
+        calls["commit"].assert_called_once_with(
+            pending, force=False, integrations=daemon.integrations
+        )
         self.assertIsNone(daemon.pending_spoken_alias)
         response = calls["play"].call_args.args[0]
         self.assertIn("the harness", response.spoken_text)
@@ -4947,7 +4959,9 @@ class SpokenAliasConversationTests(unittest.TestCase):
         self.assertIn("Replace it with owner/repo", response.spoken_text)
 
         calls = self._run_turn(daemon, "yes")
-        calls["commit"].assert_called_once_with(replacement, force=True)
+        calls["commit"].assert_called_once_with(
+            replacement, force=True, integrations=daemon.integrations
+        )
         self.assertIsNone(daemon.pending_spoken_alias)
 
     def test_stale_replace_confirmation_restarts_with_current_target(self) -> None:
@@ -5023,7 +5037,7 @@ class SpokenAliasConversationTests(unittest.TestCase):
                 calls = self._run_turn(
                     daemon,
                     "Call this repo the harness",
-                    identities=(None, None),
+                    identities=(None, None, None),
                     preparation=SpokenAliasPreparation(status),
                 )
                 self.assertIsNone(daemon.pending_spoken_alias)
@@ -5124,8 +5138,9 @@ class SpokenAliasConversationTests(unittest.TestCase):
             mock.patch.object(wake_daemon, "CURSOR_STORE") as store,
         ):
             store.get.return_value = job
-            repository, issue = daemon._trusted_github_alias_identities()
+            source, repository, issue = daemon._trusted_alias_identity()
 
+        self.assertEqual(source, "github")
         self.assertEqual(repository, "focused/repo")
         self.assertEqual(issue, "focused/repo#1")
         store.get.assert_not_called()
@@ -5158,12 +5173,13 @@ class SpokenAliasConversationTests(unittest.TestCase):
             mock.patch.object(wake_daemon, "CURSOR_STORE") as store,
         ):
             store.get.return_value = job
-            repository, issue = daemon._trusted_github_alias_identities()
+            source, repository, issue = daemon._trusted_alias_identity()
 
+        self.assertEqual(source, "github")
         self.assertEqual(repository, "justused/repo")
         self.assertEqual(issue, "justused/repo#99")
 
-    def test_linear_focused_fragment_is_not_a_github_alias_target(self) -> None:
+    def test_linear_focused_fragment_copies_source_and_issue_reference(self) -> None:
         daemon = _bare_daemon()
         fragment = mock.Mock(
             source="linear",
@@ -5179,10 +5195,45 @@ class SpokenAliasConversationTests(unittest.TestCase):
                 wake_daemon, "focused_herdr_github_context", return_value=None
             ),
         ):
-            repository, issue = daemon._trusted_github_alias_identities()
+            source, repository, issue = daemon._trusted_alias_identity()
 
+        self.assertEqual(source, "linear")
         self.assertIsNone(repository)
-        self.assertIsNone(issue)
+        self.assertEqual(issue, "API-79")
+
+    def test_just_used_linear_job_copies_provider_and_issue_key(self) -> None:
+        daemon = _bare_daemon()
+        followup = wake_daemon.CompletedFollowup(
+            job_id="aaaaaaaaaaaa",
+            parent_revision=1,
+            completed_at=1.0,
+            expires_at=time.monotonic() + 60,
+        )
+        daemon.completed_followup = followup
+        job = CursorJob.from_dict(
+            {
+                "id": "aaaaaaaaaaaa",
+                "status": "completed",
+                "request": "test",
+                "created_at": 1,
+                "completed_at": 1.0,
+                "issue_key": "API-79",
+                "issue_provider": "linear",
+            }
+        )
+        with (
+            mock.patch.object(wake_daemon, "focused_browser_url", return_value=None),
+            mock.patch.object(
+                wake_daemon, "focused_herdr_github_context", return_value=None
+            ),
+            mock.patch.object(wake_daemon, "CURSOR_STORE") as store,
+        ):
+            store.get.return_value = job
+            source, repository, issue = daemon._trusted_alias_identity()
+
+        self.assertEqual(source, "linear")
+        self.assertIsNone(repository)
+        self.assertEqual(issue, "API-79")
 
 
 class AnnounceJobTests(unittest.TestCase):

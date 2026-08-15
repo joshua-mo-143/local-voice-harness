@@ -127,6 +127,23 @@ class GitHubProviderTests(unittest.TestCase):
     def test_satisfies_context_provider_contract(self) -> None:
         self.assertIsInstance(self.provider, ContextProvider)
 
+    def test_owns_and_canonicalizes_repository_and_issue_identities(self) -> None:
+        self.assertTrue(self.provider.owns_repository_reference("Owner/Repo.git"))
+        self.assertFalse(self.provider.owns_repository_reference("owner/repo#35"))
+        self.assertFalse(self.provider.owns_repository_reference("API-79"))
+        self.assertEqual(
+            self.provider.canonicalize_repository_reference("Owner/Repo.git"),
+            "Owner/Repo",
+        )
+        self.assertTrue(self.provider.owns_issue_reference("owner/repo#35"))
+        self.assertFalse(self.provider.owns_issue_reference("owner/repo"))
+        self.assertFalse(self.provider.owns_issue_reference("example#42"))
+        self.assertFalse(self.provider.owns_issue_reference("API-79"))
+        self.assertEqual(
+            self.provider.canonicalize_issue_reference("owner/repo#35"),
+            "owner/repo#35",
+        )
+
     def test_provider_plans_observes_and_submits_fork(self) -> None:
         source = GitHubRepository(
             "source/project",

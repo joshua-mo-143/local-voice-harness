@@ -30,6 +30,11 @@ ZENDESK_HOST = re.compile(
     re.IGNORECASE,
 )
 ZENDESK_TICKET_PATH = re.compile(r"^/agent/tickets/(?P<number>\d+)/?$")
+ZENDESK_REFERENCE = re.compile(
+    r"^(?P<subdomain>[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)#"
+    r"(?P<number>\d+)$",
+    re.IGNORECASE,
+)
 MAX_ZENDESK_PAGE_CHARS = 10_000
 
 PROVIDER_NAME = "zendesk"
@@ -78,6 +83,24 @@ def zendesk_ticket_from_url(url: str) -> ZendeskTicket | None:
     return ZendeskTicket(
         subdomain=host_match.group("subdomain").casefold(),
         number=int(path_match.group("number")),
+    )
+
+
+def zendesk_reference(ticket: ZendeskTicket) -> str:
+    return f"{ticket.subdomain}#{ticket.number}"
+
+
+def zendesk_ticket_from_reference(reference: str) -> ZendeskTicket | None:
+    candidate = reference.strip()
+    ticket = zendesk_ticket_from_url(candidate)
+    if ticket is not None:
+        return ticket
+    match = ZENDESK_REFERENCE.fullmatch(candidate)
+    if match is None:
+        return None
+    return ZendeskTicket(
+        subdomain=match.group("subdomain").casefold(),
+        number=int(match.group("number")),
     )
 
 
@@ -178,7 +201,21 @@ class ZendeskProvider:
         return zendesk_ticket_from_url(url) is not None
 
     def capture(self, url: str) -> ContextFragment | None:
+        ticket = zendesk_ticket_from_url(url)
         text = zendesk_context_from_url(url)
-        if text is None:
+        if ticket is None or text is None:
             return None
-        return ContextFragment(source=self.name, text=text)
+        return ContextFragment(
+            source=self.name,
+            text=text,
+            issue_reference=zendesk_reference(ticket),
+        )
+
+    def owns_issue_reference(self, reference: str) -> bool:
+        return zendesk_ticket_from_reference(reference) is not None
+
+    def canonicalize_issue_reference(self, reference: str) -> str:
+        ticket = zendesk_ticket_from_reference(reference)
+        if ticket is None:
+            return reference.strip()
+        return zendesk_reference(ticket)
