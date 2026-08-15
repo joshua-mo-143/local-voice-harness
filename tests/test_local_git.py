@@ -841,6 +841,29 @@ class LocalGitRepositoryTests(unittest.TestCase):
             self.assertEqual(commands[1], ("add", "-A"))
             self.assertEqual(commands[2], ("commit", "-m", "Fix the reader"))
 
+    def test_commit_and_push_reject_invalid_checkout_and_subject(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkout = root / "project"
+            (checkout / ".git").mkdir(parents=True)
+            repository = LocalGitRepository(clone_root=root, allowed_root=root)
+            outside = Path(temporary).resolve().parent / "outside-checkout"
+            with self.assertRaisesRegex(LocalGitError, "allowed project root"):
+                repository.has_unpublished_changes(outside)
+            with self.assertRaisesRegex(LocalGitError, "non-empty subject"):
+                repository.commit_unpublished_changes(checkout, "   ", confirmed=True)
+            with self.assertRaisesRegex(LocalGitError, "too long"):
+                repository.commit_unpublished_changes(
+                    checkout, "x" * 73, confirmed=True
+                )
+            with mock.patch.object(
+                repository,
+                "git",
+                return_value=_completed("HEAD\n"),
+            ):
+                with self.assertRaisesRegex(LocalGitError, "named branch"):
+                    repository.push_current_branch(checkout, confirmed=True)
+
     def test_push_timeout_is_ambiguous(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
