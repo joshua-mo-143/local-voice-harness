@@ -4766,6 +4766,9 @@ def _pending_alias(
     )
 
 
+_PENDING_ALIAS_TARGET = object()
+
+
 class SpokenAliasConversationTests(unittest.TestCase):
     def _run_turn(
         self,
@@ -4775,13 +4778,22 @@ class SpokenAliasConversationTests(unittest.TestCase):
         identities: tuple[str | None, str | None] = ("owner/repo", None),
         preparation: SpokenAliasPreparation | None = None,
         commit_effect: object = None,
+        stored_target: str | None | object = _PENDING_ALIAS_TARGET,
     ) -> dict[str, mock.Mock]:
         commit_error = (
             commit_effect if isinstance(commit_effect, BaseException) else None
         )
+        if stored_target is _PENDING_ALIAS_TARGET:
+            pending = daemon.pending_spoken_alias
+            stored_target = None if pending is None else pending.existing_target
+        loaded = mock.Mock()
+        loaded.alias_for.return_value = (
+            None if stored_target is None else mock.Mock(target=stored_target)
+        )
         with (
             mock.patch.object(wake_daemon, "transcribe", return_value=text),
             mock.patch.object(wake_daemon, "start_components"),
+            mock.patch.object(wake_daemon, "load_vocabulary", return_value=loaded),
             mock.patch.object(
                 wake_daemon,
                 "route_intent",
@@ -4936,6 +4948,47 @@ class SpokenAliasConversationTests(unittest.TestCase):
 
         calls = self._run_turn(daemon, "yes")
         calls["commit"].assert_called_once_with(replacement, force=True)
+        self.assertIsNone(daemon.pending_spoken_alias)
+
+    def test_stale_replace_confirmation_restarts_with_current_target(self) -> None:
+        daemon = _bare_daemon()
+        pending = _pending_alias(
+            existing_target="owner/old",
+            replace=True,
+        )
+        daemon.pending_spoken_alias = pending
+
+        calls = self._run_turn(daemon, "yes", stored_target="owner/intervening")
+
+        calls["commit"].assert_not_called()
+        refreshed = daemon.pending_spoken_alias
+        assert refreshed is not None
+        self.assertTrue(refreshed.replace)
+        self.assertEqual(refreshed.existing_target, "owner/intervening")
+        response = calls["play"].call_args.args[0]
+        self.assertIn("already resolves to owner/intervening", response.spoken_text)
+        self.assertIn("Replace it with owner/repo", response.spoken_text)
+
+    def test_stale_deleted_alias_restarts_without_force(
+        self,
+    ) -> None:
+        daemon = _bare_daemon()
+        pending = _pending_alias(
+            existing_target="owner/old",
+            replace=True,
+        )
+        daemon.pending_spoken_alias = pending
+
+        first = self._run_turn(daemon, "yes", stored_target=None)
+
+        first["commit"].assert_not_called()
+        refreshed = daemon.pending_spoken_alias
+        assert refreshed is not None
+        self.assertFalse(refreshed.replace)
+        self.assertIsNone(refreshed.existing_target)
+
+        second = self._run_turn(daemon, "yes", stored_target="owner/recreated")
+        second["commit"].assert_called_once_with(refreshed, force=False)
         self.assertIsNone(daemon.pending_spoken_alias)
 
     def test_generic_yes_cannot_skip_replace_confirmation(self) -> None:

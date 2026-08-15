@@ -174,6 +174,9 @@ from ..vocabulary import (
     render_spoken_alias_committed,
     render_spoken_alias_preparation,
 )
+from ..vocabulary import (
+    load as load_vocabulary,
+)
 
 RECORDING_PATHS = recorder.RecorderPaths(
     STATE_DIR, WAV_PATH, PID_PATH, RECORDER_LOG, RECORDING_LOCK
@@ -1569,6 +1572,34 @@ class WakeConversationDaemon:
                 decision,
                 pending,
             )
+        if pending.replace:
+            current = load_vocabulary().alias_for(pending.phrase)
+            current_target = None if current is None else current.target
+            if current_target != pending.existing_target:
+                if current_target == pending.target:
+                    return (
+                        render_spoken_alias_preparation(
+                            SpokenAliasPreparation(SpokenAliasStatus.NO_CHANGE)
+                        ),
+                        decision,
+                        pending,
+                    )
+                refreshed = PendingSpokenAlias(
+                    trusted_utterance=pending.trusted_utterance,
+                    phrase=pending.phrase,
+                    target=pending.target,
+                    kind=pending.kind,
+                    existing_target=current_target,
+                    replace=current_target is not None,
+                )
+                self.pending_spoken_alias = refreshed
+                return (
+                    render_spoken_alias_preparation(
+                        SpokenAliasPreparation(SpokenAliasStatus.READY, refreshed)
+                    ),
+                    decision,
+                    pending,
+                )
         try:
             if before_mutation is not None:
                 before_mutation()
