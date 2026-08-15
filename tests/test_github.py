@@ -351,8 +351,7 @@ class GitHubClientTests(unittest.TestCase):
         self.assertNotIn(plan.body, command)
         self.assertEqual(
             run.call_args.kwargs["stdin"],
-            "Detailed private body\n\n"
-            f"<!-- local-voice-harness-correlation:{'a' * 32} -->\n",
+            "Detailed private body",
         )
 
     def test_issue_submission_requires_confirmation_before_running(self) -> None:
@@ -483,10 +482,41 @@ class GitHubClientTests(unittest.TestCase):
         self.assertNotIn(plan.body, command)
         self.assertEqual(
             run.call_args.kwargs["stdin"],
-            "Detailed private body\n\n"
-            f"<!-- local-voice-harness-correlation:{'a' * 32} -->\n",
+            "Detailed private body",
         )
         self.assertTrue(run.call_args.kwargs["write"])
+
+    def test_issue_update_omits_body_for_title_only_patch(self) -> None:
+        client = GitHubClient()
+        plan = GitHubIssueUpdatePlan(
+            "example/project",
+            12,
+            "Fix the reader",
+            "Preserve this body exactly.",
+            "a" * 32,
+            update_body=False,
+        )
+        with mock.patch.object(
+            client,
+            "_run",
+            return_value=_completed("https://github.com/example/project/issues/12\n"),
+        ) as run:
+            client.submit_issue_update(plan, confirmed=True)
+
+        self.assertEqual(
+            run.call_args.args[0],
+            [
+                "gh",
+                "issue",
+                "edit",
+                "12",
+                "--repo",
+                "example/project",
+                "--title",
+                "Fix the reader",
+            ],
+        )
+        self.assertIsNone(run.call_args.kwargs["stdin"])
 
     def test_issue_update_requires_confirmation_before_running(self) -> None:
         client = GitHubClient()
@@ -510,7 +540,7 @@ class GitHubClientTests(unittest.TestCase):
         ):
             client.submit_issue_update(plan, confirmed=True)
 
-    def test_issue_update_observation_requires_marker_and_title(self) -> None:
+    def test_issue_update_observation_requires_exact_snapshot(self) -> None:
         client = GitHubClient()
         plan = GitHubIssueUpdatePlan(
             "example/project", 12, "Fix startup", "Body", "a" * 32
@@ -519,7 +549,7 @@ class GitHubClientTests(unittest.TestCase):
             "number": 12,
             "html_url": "https://github.com/example/project/issues/12",
             "title": "Fix startup",
-            "body": (f"Body\n\n<!-- local-voice-harness-correlation:{'a' * 32} -->"),
+            "body": "Body",
         }
         with mock.patch.object(
             client, "_run", return_value=_completed(json.dumps(payload))

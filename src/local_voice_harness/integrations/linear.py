@@ -125,6 +125,8 @@ class LinearTicketUpdatePlan:
     title: str
     description: str
     correlation_marker: str
+    update_title: bool = True
+    update_description: bool = True
 
 
 @dataclass(frozen=True)
@@ -501,7 +503,7 @@ class LinearIntegration:
             identity=identifier,
             provider_id=issue_id.strip(),
             title=title.strip(),
-            body=body.strip(),
+            body=body,
             revision=revision.strip(),
             url=url.strip(),
             state=state.strip(),
@@ -895,8 +897,10 @@ class LinearIntegration:
         if LINEAR_IDENTIFIER.fullmatch(identifier) is None:
             raise LinearError("Linear ticket update requires a valid identifier")
         issue_id = plan.issue_id.strip()
+        if not isinstance(plan.description, str):
+            raise LinearError("Linear ticket update description must be text")
         title = " ".join(plan.title.split())
-        description = plan.description.strip()
+        description = plan.description
         marker = plan.correlation_marker.strip()
         if (
             not issue_id
@@ -906,16 +910,24 @@ class LinearIntegration:
             raise LinearError("Linear ticket update requires a valid issue ID")
         if not title or len(title) > 255:
             raise LinearError("Linear ticket update requires a bounded title")
-        if not description or len(description) > 10_000:
+        if len(description) > 10_000:
             raise LinearError("Linear ticket update requires a bounded description")
         if not re.fullmatch(r"[0-9a-f]{32}", marker):
             raise LinearError("Linear ticket update marker is invalid")
+        if not isinstance(plan.update_title, bool) or not isinstance(
+            plan.update_description, bool
+        ):
+            raise LinearError("Linear ticket update field selection is invalid")
+        if not plan.update_title and not plan.update_description:
+            raise LinearError("Linear ticket update must change at least one field")
         return LinearTicketUpdatePlan(
             issue_id,
             identifier,
             title,
             description,
             marker,
+            plan.update_title,
+            plan.update_description,
         )
 
     def plan_ticket_update(
@@ -926,6 +938,8 @@ class LinearIntegration:
         description: str,
         *,
         correlation_marker: str | None = None,
+        update_title: bool = True,
+        update_description: bool = True,
     ) -> LinearTicketUpdatePlan:
         return self.validate_ticket_update_plan(
             LinearTicketUpdatePlan(
@@ -934,6 +948,8 @@ class LinearIntegration:
                 title,
                 description,
                 correlation_marker or uuid.uuid4().hex,
+                update_title,
+                update_description,
             )
         )
 
@@ -1025,10 +1041,6 @@ class LinearIntegration:
         plan = self.validate_ticket_update_plan(plan)
         self.require_capabilities()
         token = f"linear-update-{uuid.uuid4().hex[:12]}"
-        description = (
-            f"{plan.description.rstrip()}\n\n"
-            f"{self._ticket_marker(plan.correlation_marker)}"
-        )
         with _router_owner(checkpoint):
             try:
                 router = client.ensure_router(set(), checkpoint=checkpoint)
@@ -1063,12 +1075,16 @@ class LinearIntegration:
             prompt = (
                 "Update exactly one existing Linear issue using the configured Linear "
                 "MCP tools. This is an explicitly confirmed external write. Use only "
-                "the exact bounded values below; do not infer or add fields. Do not "
-                "create a new issue.\n\n"
+                "the exact bounded values below; do not infer or add fields. Update "
+                "only fields marked yes and omit every field marked no from the MCP "
+                "write. Do not create a new issue.\n\n"
                 f"Immutable issue ID: {plan.issue_id}\n"
                 f"Identifier: {plan.identifier}\n"
+                f"Update title: {'yes' if plan.update_title else 'no'}\n"
                 f"Title: {plan.title}\n"
-                f"Description:\n{description}\n\n"
+                "Update description: "
+                f"{'yes' if plan.update_description else 'no'}\n"
+                f"Description:\n{plan.description}\n\n"
                 "After the MCP call succeeds, return exactly:\n"
                 f"VOICE_LINEAR_IDENTIFIER[{token}]: <updated identifier>\n"
                 f"VOICE_LINEAR_URL[{token}]: <https URL>"
@@ -1113,7 +1129,6 @@ class LinearIntegration:
         plan = self.validate_ticket_update_plan(plan)
         self.require_capabilities()
         token = f"linear-observe-update-{uuid.uuid4().hex[:12]}"
-        marker = self._ticket_marker(plan.correlation_marker)
         with _router_owner(checkpoint):
             try:
                 router = client.ensure_router(set(), checkpoint=checkpoint)
@@ -1123,12 +1138,13 @@ class LinearIntegration:
                         "Use configured Linear MCP tools read-only. Do not create or "
                         "modify anything. Fetch the issue whose identifier is "
                         f"{plan.identifier}. Return exactly one status. If that issue "
-                        "exists and its description contains this exact correlation "
-                        f"marker:\n{marker}\n"
+                        "exists with title and description exactly equal to these "
+                        f"expected values:\nTitle: {plan.title}\n"
+                        f"Description:\n{plan.description}\n"
                         f"VOICE_LINEAR_STATUS[{token}]: found\n"
                         f"VOICE_LINEAR_IDENTIFIER[{token}]: <identifier>\n"
                         f"VOICE_LINEAR_URL[{token}]: <https URL>\n"
-                        "If the issue exists but the marker is absent:\n"
+                        "If either exact field differs:\n"
                         f"VOICE_LINEAR_STATUS[{token}]: not_found\n"
                         "If the issue cannot be found:\n"
                         f"VOICE_LINEAR_STATUS[{token}]: not_found\n"

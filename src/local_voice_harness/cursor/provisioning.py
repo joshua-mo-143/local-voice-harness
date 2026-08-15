@@ -103,6 +103,7 @@ from ..questions import (
     resolve_question_prompt,
     submit_question_prompt,
 )
+from ..ticket_snapshot import TicketSnapshot
 from ..ticket_update import draft_ticket_update
 from ..user_config import (
     PlanApprovalMode,
@@ -2797,6 +2798,41 @@ def _finish_github_issue_update(
     )
 
 
+def _snapshot_is_current(
+    snapshot: TicketSnapshot,
+    *,
+    base_title: str | None,
+    base_body: str | None,
+    base_revision: str | None,
+) -> bool:
+    return (
+        base_title is not None
+        and base_body is not None
+        and base_revision is not None
+        and snapshot.title == base_title
+        and snapshot.body == base_body
+        and snapshot.revision == base_revision
+    )
+
+
+def _rebased_update_values(
+    snapshot: TicketSnapshot,
+    *,
+    proposed_title: str,
+    proposed_body: str,
+    base_title: str | None,
+    base_body: str | None,
+) -> tuple[str, str]:
+    """Apply only fields changed in the confirmed proposal to a fresh snapshot."""
+
+    if base_title is None or base_body is None:
+        return proposed_title, proposed_body
+    return (
+        proposed_title if proposed_title != base_title else snapshot.title,
+        proposed_body if proposed_body != base_body else snapshot.body,
+    )
+
+
 def _run_github_issue_update(
     store: JobStore,
     job: CursorJob,
@@ -2813,11 +2849,12 @@ def _run_github_issue_update(
     source = github.resolve_repository(repository)
     repository = source.name_with_owner
     checkpoint()
+    snapshot = github.ticket_snapshot(f"{repository}#{number}")
     if not job.github_issue_update_title or job.github_issue_update_body is None:
         config = default_user_config()
         draft = draft_ticket_update(
             job.trusted_utterance or job.request,
-            f"{repository}#{number}",
+            snapshot,
             settings=config.providers,
         )
         plan = github.plan_issue_update(
@@ -2826,6 +2863,8 @@ def _run_github_issue_update(
             draft.title,
             draft.body,
             correlation_marker=uuid.uuid4().hex,
+            update_title=draft.title_changed,
+            update_body=draft.body_changed,
         )
 
         def persist_draft(current: CursorJob) -> CursorJob:
@@ -2834,6 +2873,9 @@ def _run_github_issue_update(
                 github_issue=plan.number,
                 github_issue_update_title=plan.title,
                 github_issue_update_body=plan.body,
+                github_issue_update_base_title=snapshot.title,
+                github_issue_update_base_body=snapshot.body,
+                github_issue_update_base_revision=snapshot.revision,
                 github_issue_update_marker=plan.correlation_marker,
                 github_issue_update_operation_state="planned",
             )
@@ -2849,17 +2891,57 @@ def _run_github_issue_update(
         if updated is None:
             return
         job = updated
+    elif not _snapshot_is_current(
+        snapshot,
+        base_title=job.github_issue_update_base_title,
+        base_body=job.github_issue_update_base_body,
+        base_revision=job.github_issue_update_base_revision,
+    ):
+        title, body = _rebased_update_values(
+            snapshot,
+            proposed_title=job.github_issue_update_title,
+            proposed_body=job.github_issue_update_body,
+            base_title=job.github_issue_update_base_title,
+            base_body=job.github_issue_update_base_body,
+        )
+
+        def persist_drift(current: CursorJob) -> CursorJob:
+            return current.evolve(
+                github_issue_update_confirmed=False,
+                github_issue_update_title=title,
+                github_issue_update_body=body,
+                github_issue_update_base_title=snapshot.title,
+                github_issue_update_base_body=snapshot.body,
+                github_issue_update_base_revision=snapshot.revision,
+                github_issue_update_operation_state="planned",
+            )
+
+        updated = _worker_change(
+            store,
+            job.id,
+            token,
+            {JobStatus.ROUTING},
+            persist_drift,
+            expected_revision=job.revision,
+        )
+        if updated is None:
+            return
+        job = updated
     plan = github.plan_issue_update(
         job.github_repository or repository,
         job.github_issue or number,
         job.github_issue_update_title or "",
         job.github_issue_update_body or "",
         correlation_marker=job.github_issue_update_marker,
+        update_title=job.github_issue_update_title
+        != job.github_issue_update_base_title,
+        update_body=job.github_issue_update_body != job.github_issue_update_base_body,
     )
     if not job.github_issue_update_confirmed:
         preview = (
             f"Update GitHub issue {plan.repository}#{plan.number}?\n\n"
-            f"Title: {plan.title}\n\nBody:\n{plan.body}\n\n"
+            f"Snapshot revision: {job.github_issue_update_base_revision}\n\n"
+            f"Exact title: {plan.title}\n\nExact body:\n{plan.body}\n\n"
             "Say yes to update it or no to cancel."
         )
         _worker_question(
@@ -2874,6 +2956,71 @@ def _run_github_issue_update(
         return
     if job.github_issue_update_operation_state not in {None, "planned"}:
         raise HarnessError("GitHub issue update requires reconciliation before retry")
+    checkpoint()
+    latest = github.ticket_snapshot(f"{plan.repository}#{plan.number}")
+    if not _snapshot_is_current(
+        latest,
+        base_title=job.github_issue_update_base_title,
+        base_body=job.github_issue_update_base_body,
+        base_revision=job.github_issue_update_base_revision,
+    ):
+        title, body = _rebased_update_values(
+            latest,
+            proposed_title=plan.title,
+            proposed_body=plan.body,
+            base_title=job.github_issue_update_base_title,
+            base_body=job.github_issue_update_base_body,
+        )
+
+        def reconfirm_drift(current: CursorJob) -> CursorJob:
+            return current.evolve(
+                github_issue_update_confirmed=False,
+                github_issue_update_title=title,
+                github_issue_update_body=body,
+                github_issue_update_base_title=latest.title,
+                github_issue_update_base_body=latest.body,
+                github_issue_update_base_revision=latest.revision,
+                github_issue_update_operation_state="planned",
+            )
+
+        updated = _worker_change(
+            store,
+            job.id,
+            token,
+            {JobStatus.ROUTING},
+            reconfirm_drift,
+            expected_revision=job.revision,
+        )
+        if updated is None:
+            return
+        refreshed = github.plan_issue_update(
+            updated.github_repository or repository,
+            updated.github_issue or number,
+            updated.github_issue_update_title or "",
+            updated.github_issue_update_body or "",
+            correlation_marker=updated.github_issue_update_marker,
+            update_title=updated.github_issue_update_title
+            != updated.github_issue_update_base_title,
+            update_body=updated.github_issue_update_body
+            != updated.github_issue_update_base_body,
+        )
+        preview = (
+            f"Ticket changed. Reconfirm GitHub issue {refreshed.repository}"
+            f"#{refreshed.number}?\n\n"
+            f"Snapshot revision: {updated.github_issue_update_base_revision}\n\n"
+            f"Exact title: {refreshed.title}\n\nExact body:\n{refreshed.body}\n\n"
+            "Say yes to update it or no to cancel."
+        )
+        _worker_question(
+            store,
+            job.id,
+            token,
+            preview,
+            expected_revision=updated.revision,
+            clarification_kind="github_issue_update_confirmation",
+            sensitivity=QuestionSensitivity.DESTRUCTIVE,
+        )
+        return
 
     def mark_submitted(current: CursorJob) -> CursorJob:
         return current.evolve(
@@ -3016,40 +3163,41 @@ def _run_linear_ticket_update(
         raise HarnessError("selected Linear provider cannot update tickets")
     client = clients.herdr()
     checkpoint()
+    try:
+        snapshot = provider.ticket_snapshot(
+            client,
+            identifier,
+            checkpoint=checkpoint,
+        )
+    except LinearError:
+        message = f"I couldn't find Linear ticket {identifier}."
+
+        def finish_missing(current: CursorJob) -> CursorJob:
+            now = time.time()
+            return recovery.stage_terminal_intent(
+                current,
+                JobStatus.FAILED,
+                now=now,
+                result=message,
+                error=message,
+            )
+
+        _worker_change(
+            store,
+            job.id,
+            token,
+            MODEL_WORKER_STATUSES,
+            finish_missing,
+            expected_revision=job.revision,
+        )
+        return
+
     if not job.linear_ticket_update_issue_id:
-        try:
-            issue_id, issue = provider.resolve_issue_for_update(
-                client,
-                identifier,
-                checkpoint=checkpoint,
-            )
-        except LinearError:
-            message = f"I couldn't find Linear ticket {identifier}."
-
-            def finish_missing(current: CursorJob) -> CursorJob:
-                now = time.time()
-                return recovery.stage_terminal_intent(
-                    current,
-                    JobStatus.FAILED,
-                    now=now,
-                    result=message,
-                    error=message,
-                )
-
-            _worker_change(
-                store,
-                job.id,
-                token,
-                MODEL_WORKER_STATUSES,
-                finish_missing,
-                expected_revision=job.revision,
-            )
-            return
 
         def persist_issue(current: CursorJob) -> CursorJob:
             return current.evolve(
-                issue_key=issue.identifier,
-                linear_ticket_update_issue_id=issue_id,
+                issue_key=snapshot.identity,
+                linear_ticket_update_issue_id=snapshot.provider_id,
             )
 
         updated = _worker_change(
@@ -3063,7 +3211,7 @@ def _run_linear_ticket_update(
         if updated is None:
             return
         job = updated
-        identifier = issue.identifier
+        identifier = snapshot.identity
     if (
         not job.linear_ticket_update_title
         or job.linear_ticket_update_description is None
@@ -3071,7 +3219,7 @@ def _run_linear_ticket_update(
         config = default_user_config()
         draft = draft_ticket_update(
             job.trusted_utterance or job.request,
-            identifier,
+            snapshot,
             settings=config.providers,
         )
         plan = provider.plan_ticket_update(
@@ -3080,6 +3228,8 @@ def _run_linear_ticket_update(
             draft.title,
             draft.body,
             correlation_marker=uuid.uuid4().hex,
+            update_title=draft.title_changed,
+            update_description=draft.body_changed,
         )
 
         def persist_draft(current: CursorJob) -> CursorJob:
@@ -3087,6 +3237,9 @@ def _run_linear_ticket_update(
                 linear_ticket_update_issue_id=plan.issue_id,
                 linear_ticket_update_title=plan.title,
                 linear_ticket_update_description=plan.description,
+                linear_ticket_update_base_title=snapshot.title,
+                linear_ticket_update_base_description=snapshot.body,
+                linear_ticket_update_base_revision=snapshot.revision,
                 linear_ticket_update_marker=plan.correlation_marker,
                 linear_ticket_update_operation_state="planned",
             )
@@ -3102,17 +3255,59 @@ def _run_linear_ticket_update(
         if updated is None:
             return
         job = updated
+    elif not _snapshot_is_current(
+        snapshot,
+        base_title=job.linear_ticket_update_base_title,
+        base_body=job.linear_ticket_update_base_description,
+        base_revision=job.linear_ticket_update_base_revision,
+    ):
+        title, description = _rebased_update_values(
+            snapshot,
+            proposed_title=job.linear_ticket_update_title,
+            proposed_body=job.linear_ticket_update_description,
+            base_title=job.linear_ticket_update_base_title,
+            base_body=job.linear_ticket_update_base_description,
+        )
+
+        def persist_drift(current: CursorJob) -> CursorJob:
+            return current.evolve(
+                linear_ticket_update_confirmed=False,
+                linear_ticket_update_issue_id=snapshot.provider_id,
+                linear_ticket_update_title=title,
+                linear_ticket_update_description=description,
+                linear_ticket_update_base_title=snapshot.title,
+                linear_ticket_update_base_description=snapshot.body,
+                linear_ticket_update_base_revision=snapshot.revision,
+                linear_ticket_update_operation_state="planned",
+            )
+
+        updated = _worker_change(
+            store,
+            job.id,
+            token,
+            {JobStatus.ROUTING},
+            persist_drift,
+            expected_revision=job.revision,
+        )
+        if updated is None:
+            return
+        job = updated
     plan = provider.plan_ticket_update(
         job.linear_ticket_update_issue_id or "",
         job.issue_key or identifier,
         job.linear_ticket_update_title or "",
         job.linear_ticket_update_description or "",
         correlation_marker=job.linear_ticket_update_marker,
+        update_title=job.linear_ticket_update_title
+        != job.linear_ticket_update_base_title,
+        update_description=job.linear_ticket_update_description
+        != job.linear_ticket_update_base_description,
     )
     if not job.linear_ticket_update_confirmed:
         preview = (
             f"Update Linear ticket {plan.identifier}?\n\n"
-            f"Title: {plan.title}\n\nDescription:\n{plan.description}\n\n"
+            f"Snapshot revision: {job.linear_ticket_update_base_revision}\n\n"
+            f"Exact title: {plan.title}\n\nExact description:\n{plan.description}\n\n"
             "Say yes to update it or no to cancel."
         )
         _worker_question(
@@ -3127,6 +3322,76 @@ def _run_linear_ticket_update(
         return
     if job.linear_ticket_update_operation_state not in {None, "planned"}:
         raise HarnessError("Linear ticket update requires reconciliation before retry")
+    checkpoint()
+    latest = provider.ticket_snapshot(
+        client,
+        plan.identifier,
+        checkpoint=checkpoint,
+    )
+    if not _snapshot_is_current(
+        latest,
+        base_title=job.linear_ticket_update_base_title,
+        base_body=job.linear_ticket_update_base_description,
+        base_revision=job.linear_ticket_update_base_revision,
+    ):
+        title, description = _rebased_update_values(
+            latest,
+            proposed_title=plan.title,
+            proposed_body=plan.description,
+            base_title=job.linear_ticket_update_base_title,
+            base_body=job.linear_ticket_update_base_description,
+        )
+
+        def reconfirm_drift(current: CursorJob) -> CursorJob:
+            return current.evolve(
+                linear_ticket_update_confirmed=False,
+                linear_ticket_update_issue_id=latest.provider_id,
+                linear_ticket_update_title=title,
+                linear_ticket_update_description=description,
+                linear_ticket_update_base_title=latest.title,
+                linear_ticket_update_base_description=latest.body,
+                linear_ticket_update_base_revision=latest.revision,
+                linear_ticket_update_operation_state="planned",
+            )
+
+        updated = _worker_change(
+            store,
+            job.id,
+            token,
+            {JobStatus.ROUTING},
+            reconfirm_drift,
+            expected_revision=job.revision,
+        )
+        if updated is None:
+            return
+        refreshed = provider.plan_ticket_update(
+            updated.linear_ticket_update_issue_id or "",
+            updated.issue_key or identifier,
+            updated.linear_ticket_update_title or "",
+            updated.linear_ticket_update_description or "",
+            correlation_marker=updated.linear_ticket_update_marker,
+            update_title=updated.linear_ticket_update_title
+            != updated.linear_ticket_update_base_title,
+            update_description=updated.linear_ticket_update_description
+            != updated.linear_ticket_update_base_description,
+        )
+        preview = (
+            f"Ticket changed. Reconfirm Linear ticket {refreshed.identifier}?\n\n"
+            f"Snapshot revision: {updated.linear_ticket_update_base_revision}\n\n"
+            f"Exact title: {refreshed.title}\n\n"
+            f"Exact description:\n{refreshed.description}\n\n"
+            "Say yes to update it or no to cancel."
+        )
+        _worker_question(
+            store,
+            job.id,
+            token,
+            preview,
+            expected_revision=updated.revision,
+            clarification_kind="linear_ticket_update_confirmation",
+            sensitivity=QuestionSensitivity.DESTRUCTIVE,
+        )
+        return
 
     def mark_running(current: CursorJob) -> CursorJob:
         return current.evolve(

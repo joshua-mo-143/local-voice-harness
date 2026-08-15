@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from .config import BackendSettings
 from .errors import HarnessError
 from .llm_transport import ChatCompletionRequest, LlmTransport
+from .ticket_snapshot import TicketSnapshot
 from .ticket_targets import TicketExtraction, TicketReference, resolve_named_ticket
 
 MAX_UPDATE_TITLE_CHARS = 200
@@ -37,8 +38,14 @@ _DRAFT_TOOL = {
         "parameters": {
             "type": "object",
             "properties": {
-                "title": {"type": "string", "maxLength": MAX_UPDATE_TITLE_CHARS},
-                "body": {"type": "string", "maxLength": MAX_UPDATE_BODY_CHARS},
+                "title": {
+                    "type": ["string", "null"],
+                    "maxLength": MAX_UPDATE_TITLE_CHARS,
+                },
+                "body": {
+                    "type": ["string", "null"],
+                    "maxLength": MAX_UPDATE_BODY_CHARS,
+                },
             },
             "required": ["title", "body"],
             "additionalProperties": False,
@@ -60,6 +67,8 @@ class TicketUpdateAdmission:
 class TicketUpdateDraft:
     title: str
     body: str
+    title_changed: bool = True
+    body_changed: bool = True
 
 
 def wants_ticket_update_context(utterance: str) -> bool:
@@ -130,23 +139,33 @@ def update_turn_arguments(ticket: TicketReference) -> TicketUpdateDispatch:
     )
 
 
-def _validated_draft(title: object, body: object) -> TicketUpdateDraft:
-    if not isinstance(title, str) or not title.strip():
-        raise HarnessError("Ticket update draft requires a non-empty title")
-    if not isinstance(body, str) or not body.strip():
-        raise HarnessError("Ticket update draft requires a non-empty body")
-    title = " ".join(title.split())
-    body = body.strip()
+def _validated_draft(
+    title: object,
+    body: object,
+    snapshot: TicketSnapshot,
+) -> TicketUpdateDraft:
+    if title is not None and (not isinstance(title, str) or not title.strip()):
+        raise HarnessError("Ticket update draft requires a non-empty changed title")
+    if body is not None and not isinstance(body, str):
+        raise HarnessError("Ticket update draft body must be text")
+    if title is None and body is None:
+        raise HarnessError("Ticket update draft did not change a requested field")
+    title = " ".join(title.split()) if isinstance(title, str) else snapshot.title
+    body = body if isinstance(body, str) else snapshot.body
+    title_changed = title != snapshot.title
+    body_changed = body != snapshot.body
+    if not title_changed and not body_changed:
+        raise HarnessError("Ticket update draft did not change a requested field")
     if len(title) > MAX_UPDATE_TITLE_CHARS:
         raise HarnessError("Ticket update draft title is too long")
     if len(body) > MAX_UPDATE_BODY_CHARS:
         raise HarnessError("Ticket update draft body is too long")
-    return TicketUpdateDraft(title, body)
+    return TicketUpdateDraft(title, body, title_changed, body_changed)
 
 
 def draft_ticket_update(
     utterance: str,
-    ticket: str,
+    snapshot: TicketSnapshot,
     *,
     settings: BackendSettings | None = None,
 ) -> TicketUpdateDraft:
@@ -161,16 +180,24 @@ def draft_ticket_update(
                     "role": "system",
                     "content": (
                         "Convert the user's trusted spoken request into an exact "
-                        "replacement title and body for one existing ticket. Preserve "
-                        "concrete requirements, do not invent acceptance criteria, and "
-                        "do not include the ticket identity in the title. Return only "
-                        "the forced tool call."
+                        "patch for one existing ticket. Return a new value only for a "
+                        "field the user explicitly requested to change; return null for "
+                        "every untouched field so current provider content is preserved. "
+                        "Preserve concrete requirements, do not invent acceptance "
+                        "criteria, and do not include the ticket identity in the title. "
+                        "Return only the forced tool call."
                     ),
                 },
                 {
                     "role": "user",
                     "content": json.dumps(
-                        {"ticket": ticket, "request": trusted_request}
+                        {
+                            "ticket": snapshot.identity,
+                            "current_title": snapshot.title,
+                            "current_body": snapshot.body,
+                            "current_revision": snapshot.revision,
+                            "request": trusted_request,
+                        }
                     ),
                 },
             ],
@@ -198,4 +225,8 @@ def draft_ticket_update(
         raise HarnessError("LLM returned a malformed ticket update draft") from exc
     if not isinstance(arguments, dict):
         raise HarnessError("LLM returned a malformed ticket update draft")
-    return _validated_draft(arguments.get("title"), arguments.get("body"))
+    return _validated_draft(
+        arguments.get("title"),
+        arguments.get("body"),
+        snapshot,
+    )

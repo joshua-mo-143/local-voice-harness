@@ -5,6 +5,7 @@ import unittest
 from unittest import mock
 
 from local_voice_harness.errors import HarnessError
+from local_voice_harness.ticket_snapshot import TicketSnapshot
 from local_voice_harness.ticket_targets import extract_ticket_targets
 from local_voice_harness.ticket_update import (
     MISSING_TICKET_IDENTITY,
@@ -125,6 +126,17 @@ class TicketUpdateAdmissionTests(unittest.TestCase):
 
 
 class TicketUpdateDraftTests(unittest.TestCase):
+    snapshot = TicketSnapshot(
+        "github",
+        "owner/repo#12",
+        "https://github.com/owner/repo/issues/12",
+        "Current title",
+        "Current body",
+        "2026-08-15T10:00:00Z",
+        "https://github.com/owner/repo/issues/12",
+        "OPEN",
+    )
+
     def test_generates_a_bounded_structured_draft(self) -> None:
         transport = mock.Mock()
         transport.chat_completion.return_value = {
@@ -148,7 +160,7 @@ class TicketUpdateDraftTests(unittest.TestCase):
         ):
             draft = draft_ticket_update(
                 "Rewrite the title of owner/repo#12 to mention startup",
-                "owner/repo#12",
+                self.snapshot,
             )
 
         self.assertEqual(draft.title, "Fix launcher startup")
@@ -178,7 +190,30 @@ class TicketUpdateDraftTests(unittest.TestCase):
             ),
             self.assertRaisesRegex(HarnessError, "title is too long"),
         ):
-            draft_ticket_update("Update the ticket", "owner/repo#12")
+            draft_ticket_update("Update the ticket", self.snapshot)
+
+    def test_preserves_fields_not_requested_by_the_user(self) -> None:
+        transport = mock.Mock()
+        transport.chat_completion.return_value = {
+            "tool_calls": [
+                {
+                    "function": {
+                        "name": "draft_ticket_update",
+                        "arguments": json.dumps({"title": "New title", "body": None}),
+                    }
+                }
+            ]
+        }
+        with mock.patch(
+            "local_voice_harness.ticket_update.LlmTransport.from_settings",
+            return_value=transport,
+        ):
+            draft = draft_ticket_update("Change only the title", self.snapshot)
+
+        self.assertEqual(draft.title, "New title")
+        self.assertEqual(draft.body, "Current body")
+        self.assertTrue(draft.title_changed)
+        self.assertFalse(draft.body_changed)
 
 
 if __name__ == "__main__":

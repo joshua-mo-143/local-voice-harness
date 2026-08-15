@@ -980,9 +980,10 @@ class LinearTicketUpdateTests(unittest.TestCase):
 
         self.assertEqual(result.issue.identifier, "API-79")
         submitted = client.prompt_and_wait.call_args.args[1]
-        self.assertIn("voice-harness-linear-ticket:" + "a" * 32, submitted)
         self.assertIn("Identifier: API-79", submitted)
         self.assertIn("Immutable issue ID: issue-id-api-79", submitted)
+        self.assertIn("Update title: yes", submitted)
+        self.assertIn("Update description: yes", submitted)
         self.assertIn("Do not create a new issue", submitted)
         self.assertEqual(
             client.prompt_and_wait.call_args.kwargs["expected_agent_session"],
@@ -1030,7 +1031,7 @@ class LinearTicketUpdateTests(unittest.TestCase):
                 confirmed=True,
             )
 
-    def test_observe_uses_read_only_marker_search(self) -> None:
+    def test_observe_uses_read_only_exact_snapshot(self) -> None:
         client = mock.Mock()
         client.ensure_router.return_value = mock.Mock(target="voice-router")
 
@@ -1062,7 +1063,7 @@ class LinearTicketUpdateTests(unittest.TestCase):
         prompt_text = client.prompt_and_wait.call_args.args[1]
         self.assertIn("read-only", prompt_text)
         self.assertIn("Do not create or modify anything", prompt_text)
-        self.assertIn("<!-- voice-harness-linear-ticket:", prompt_text)
+        self.assertIn("title and description exactly equal", prompt_text)
 
     def test_ticket_update_preflights_capability_before_persistence(self) -> None:
         with (

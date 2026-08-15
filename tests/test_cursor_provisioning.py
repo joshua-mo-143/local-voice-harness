@@ -75,8 +75,59 @@ from local_voice_harness.local_git import (
     LocalGitError,
     LocalGitRefChanged,
 )
+from local_voice_harness.ticket_snapshot import TicketSnapshot
 from local_voice_harness.ticket_update import TicketUpdateDraft
 from tests.support import join_threads
+
+
+def _github_update_snapshot(
+    title: str = "Current title",
+    body: str = "Current body",
+    revision: str = "revision-1",
+) -> TicketSnapshot:
+    return TicketSnapshot(
+        "github",
+        "source/project#12",
+        "https://github.com/source/project/issues/12",
+        title,
+        body,
+        revision,
+        "https://github.com/source/project/issues/12",
+        "OPEN",
+    )
+
+
+def _github_update_details(
+    title: str = "Current title",
+    body: str = "Current body",
+    revision: str = "revision-1",
+) -> dict[str, object]:
+    return {
+        "number": 12,
+        "title": title,
+        "body": body,
+        "updatedAt": revision,
+        "state": "OPEN",
+        "url": "https://github.com/source/project/issues/12",
+    }
+
+
+def _linear_update_snapshot(
+    title: str = "Current title",
+    body: str = "Current body",
+    revision: str = "revision-1",
+) -> TicketSnapshot:
+    return TicketSnapshot(
+        "linear",
+        "API-79",
+        "issue-id-api-79",
+        title,
+        body,
+        revision,
+        "https://linear.app/acme/issue/API-79/current-title",
+        "In Progress",
+    )
+
 
 WORKER = WorkerOwnership("worker", 42, "boot", "start", "test", 1)
 WORKER_2 = WorkerOwnership("worker-2", 43, "boot-2", "start-2", "test", 1)
@@ -4235,6 +4286,7 @@ class CursorJobStateTests(unittest.TestCase):
         )
         github = mock.Mock()
         github.inspect_repository.return_value = source
+        github.issue_details.return_value = _github_update_details()
         with (
             mock.patch.object(jobs, "GitHubClient", return_value=github),
             mock.patch.object(
@@ -4273,6 +4325,9 @@ class CursorJobStateTests(unittest.TestCase):
                 "github_issue_update_confirmed": True,
                 "github_issue_update_title": "Fix startup",
                 "github_issue_update_body": "Startup fails after reboot.",
+                "github_issue_update_base_title": "Old title",
+                "github_issue_update_base_body": "Startup fails after reboot.",
+                "github_issue_update_base_revision": "revision-1",
                 "github_issue_update_marker": "a" * 32,
                 "github_issue_update_operation_state": "planned",
                 "status": "queued",
@@ -4294,6 +4349,9 @@ class CursorJobStateTests(unittest.TestCase):
         )
         github = mock.Mock()
         github.inspect_repository.return_value = source
+        github.issue_details.return_value = _github_update_details(
+            "Old title", "Startup fails after reboot."
+        )
         github.submit_issue_update.return_value = result
         herdr = mock.Mock()
         with (
@@ -4306,7 +4364,59 @@ class CursorJobStateTests(unittest.TestCase):
         self.assertEqual(updated["status"], "completed")
         self.assertEqual(updated["github_issue_update_operation_state"], "created")
         github.submit_issue_update.assert_called_once()
+        plan = github.submit_issue_update.call_args.args[0]
+        self.assertTrue(plan.update_title)
+        self.assertFalse(plan.update_body)
         herdr.assert_not_called()
+
+    def test_confirmed_issue_update_reconfirms_after_snapshot_drift(self) -> None:
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "update the title of source/project#12",
+                "trusted_utterance": "update the title of source/project#12",
+                "issue_provider": "github",
+                "github_repository": "source/project",
+                "github_issue": 12,
+                "github_issue_update_requested": True,
+                "github_issue_update_confirmed": True,
+                "github_issue_update_title": "Fix startup",
+                "github_issue_update_body": "Original body",
+                "github_issue_update_base_title": "Old title",
+                "github_issue_update_base_body": "Original body",
+                "github_issue_update_base_revision": "revision-1",
+                "github_issue_update_marker": "a" * 32,
+                "github_issue_update_operation_state": "planned",
+                "status": "queued",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        github = mock.Mock()
+        github.inspect_repository.return_value = GitHubRepository(
+            "source/project",
+            "https://github.com/source/project",
+            False,
+            "main",
+        )
+        github.issue_details.side_effect = [
+            _github_update_details("Old title", "Original body", "revision-1"),
+            _github_update_details(
+                "Old title",
+                "Externally changed body",
+                "revision-2",
+            ),
+        ]
+        with mock.patch.object(jobs, "GitHubClient", return_value=github):
+            service.run_worker("123456789abc")
+
+        updated = jobs.read_job("123456789abc")
+        self.assertEqual(updated["status"], "awaiting_user")
+        self.assertFalse(updated["github_issue_update_confirmed"])
+        self.assertEqual(updated["github_issue_update_body"], "Externally changed body")
+        self.assertEqual(updated["github_issue_update_base_revision"], "revision-2")
+        self.assertIn("Externally changed body", str(updated["question"]))
+        github.submit_issue_update.assert_not_called()
 
     def test_timed_out_issue_update_is_reconciled_without_resubmission(self) -> None:
         jobs.write_job(
@@ -4321,6 +4431,9 @@ class CursorJobStateTests(unittest.TestCase):
                 "github_issue_update_confirmed": True,
                 "github_issue_update_title": "Fix startup",
                 "github_issue_update_body": "Startup fails.",
+                "github_issue_update_base_title": "Old title",
+                "github_issue_update_base_body": "Startup fails.",
+                "github_issue_update_base_revision": "revision-1",
                 "github_issue_update_marker": "a" * 32,
                 "github_issue_update_operation_state": "planned",
                 "status": "queued",
@@ -4334,6 +4447,9 @@ class CursorJobStateTests(unittest.TestCase):
             "https://github.com/source/project",
             False,
             "main",
+        )
+        github.issue_details.return_value = _github_update_details(
+            "Old title", "Startup fails."
         )
         github.submit_issue_update.side_effect = GitHubOperationAmbiguous("timed out")
         github.observe_issue_update.return_value = None
@@ -4360,6 +4476,9 @@ class CursorJobStateTests(unittest.TestCase):
                 "github_issue_update_confirmed": True,
                 "github_issue_update_title": "Fix startup",
                 "github_issue_update_body": "Startup fails.",
+                "github_issue_update_base_title": "Old title",
+                "github_issue_update_base_body": "Startup fails.",
+                "github_issue_update_base_revision": "revision-1",
                 "github_issue_update_marker": "a" * 32,
                 "github_issue_update_operation_state": "planned",
                 "status": "queued",
@@ -4373,6 +4492,9 @@ class CursorJobStateTests(unittest.TestCase):
             "https://github.com/source/project",
             False,
             "main",
+        )
+        github.issue_details.return_value = _github_update_details(
+            "Old title", "Startup fails."
         )
         result = GitHubIssueUpdateResult(
             GitHubIssue("source", "project", 12),
@@ -4435,8 +4557,8 @@ class CursorJobStateTests(unittest.TestCase):
             ),
             mock.patch.object(
                 provider,
-                "resolve_issue",
-                return_value=("issue-id-api-79", LinearIssue("API-79")),
+                "ticket_snapshot",
+                return_value=_linear_update_snapshot(),
             ),
             mock.patch.object(
                 production_jobs,
@@ -4485,7 +4607,7 @@ class CursorJobStateTests(unittest.TestCase):
             ),
             mock.patch.object(
                 provider,
-                "resolve_issue",
+                "ticket_snapshot",
                 side_effect=LinearError("I couldn't find Linear ticket API-79."),
             ),
             mock.patch.object(production_jobs, "draft_ticket_update") as draft,
@@ -4511,6 +4633,9 @@ class CursorJobStateTests(unittest.TestCase):
                 "linear_ticket_update_issue_id": "issue-id-api-79",
                 "linear_ticket_update_title": "Fix startup",
                 "linear_ticket_update_description": "Startup fails after reboot.",
+                "linear_ticket_update_base_title": "Old title",
+                "linear_ticket_update_base_description": "Startup fails after reboot.",
+                "linear_ticket_update_base_revision": "revision-1",
                 "linear_ticket_update_marker": "a" * 32,
                 "linear_ticket_update_operation_state": "planned",
                 "status": "queued",
@@ -4526,6 +4651,7 @@ class CursorJobStateTests(unittest.TestCase):
             "a" * 32,
         )
         herdr = mock.Mock()
+        snapshot = _linear_update_snapshot("Old title", "Startup fails after reboot.")
 
         def submit(*_args: object, **kwargs: object) -> LinearTicketUpdateResult:
             before_submit = kwargs["before_submit"]
@@ -4543,6 +4669,7 @@ class CursorJobStateTests(unittest.TestCase):
                 "issue_provider",
                 return_value=provider,
             ),
+            mock.patch.object(provider, "ticket_snapshot", return_value=snapshot),
             mock.patch.object(
                 provider,
                 "submit_ticket_update",
@@ -4567,11 +4694,74 @@ class CursorJobStateTests(unittest.TestCase):
             before_submit=mock.ANY,
             accepted=mock.ANY,
         )
+        plan = submit.call_args.args[1]
+        self.assertTrue(plan.update_title)
+        self.assertFalse(plan.update_description)
         observe.assert_called_once_with(
             herdr,
             mock.ANY,
             checkpoint=mock.ANY,
         )
+
+    def test_confirmed_linear_update_reconfirms_after_snapshot_drift(self) -> None:
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "update the title of API-79",
+                "trusted_utterance": "update the title of API-79",
+                "issue_provider": "linear",
+                "issue_key": "API-79",
+                "linear_ticket_update_requested": True,
+                "linear_ticket_update_confirmed": True,
+                "linear_ticket_update_issue_id": "issue-id-api-79",
+                "linear_ticket_update_title": "Fix startup",
+                "linear_ticket_update_description": "Original description",
+                "linear_ticket_update_base_title": "Old title",
+                "linear_ticket_update_base_description": "Original description",
+                "linear_ticket_update_base_revision": "revision-1",
+                "linear_ticket_update_marker": "a" * 32,
+                "linear_ticket_update_operation_state": "planned",
+                "status": "queued",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        provider = linear.LinearIntegration()
+        snapshots = [
+            _linear_update_snapshot(
+                "Old title",
+                "Original description",
+                "revision-1",
+            ),
+            _linear_update_snapshot(
+                "Old title",
+                "Externally changed description",
+                "revision-2",
+            ),
+        ]
+        herdr = mock.Mock()
+        with (
+            mock.patch.object(jobs, "HerdrClient", return_value=herdr),
+            mock.patch.object(
+                production_jobs,
+                "issue_provider",
+                return_value=provider,
+            ),
+            mock.patch.object(provider, "ticket_snapshot", side_effect=snapshots),
+            mock.patch.object(provider, "submit_ticket_update") as submit,
+        ):
+            service.run_worker("123456789abc")
+
+        updated = jobs.read_job("123456789abc")
+        self.assertEqual(updated["status"], "awaiting_user")
+        self.assertFalse(updated["linear_ticket_update_confirmed"])
+        self.assertEqual(
+            updated["linear_ticket_update_description"],
+            "Externally changed description",
+        )
+        self.assertEqual(updated["linear_ticket_update_base_revision"], "revision-2")
+        self.assertIn("Externally changed description", str(updated["question"]))
+        submit.assert_not_called()
 
     def test_ambiguous_linear_ticket_update_queues_reconciliation(self) -> None:
         jobs.write_job(
@@ -4586,6 +4776,9 @@ class CursorJobStateTests(unittest.TestCase):
                 "linear_ticket_update_issue_id": "issue-id-api-79",
                 "linear_ticket_update_title": "Fix startup",
                 "linear_ticket_update_description": "Startup fails.",
+                "linear_ticket_update_base_title": "Old title",
+                "linear_ticket_update_base_description": "Startup fails.",
+                "linear_ticket_update_base_revision": "revision-1",
                 "linear_ticket_update_marker": "a" * 32,
                 "linear_ticket_update_operation_state": "planned",
                 "status": "queued",
@@ -4595,6 +4788,7 @@ class CursorJobStateTests(unittest.TestCase):
         )
         provider = linear.LinearIntegration()
         herdr = mock.Mock()
+        snapshot = _linear_update_snapshot("Old title", "Startup fails.")
 
         def submit(*_args: object, **kwargs: object) -> object:
             before_submit = kwargs["before_submit"]
@@ -4612,6 +4806,7 @@ class CursorJobStateTests(unittest.TestCase):
                 "issue_provider",
                 return_value=provider,
             ),
+            mock.patch.object(provider, "ticket_snapshot", return_value=snapshot),
             mock.patch.object(
                 provider,
                 "submit_ticket_update",

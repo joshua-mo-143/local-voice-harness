@@ -351,6 +351,9 @@ _STRING_FIELDS = frozenset(
         "github_repo_created_url",
         "github_issue_update_title",
         "github_issue_update_body",
+        "github_issue_update_base_title",
+        "github_issue_update_base_body",
+        "github_issue_update_base_revision",
         "github_issue_update_marker",
         "github_issue_update_operation_state",
         "linear_ticket_create_team",
@@ -366,6 +369,9 @@ _STRING_FIELDS = frozenset(
         "linear_ticket_created_url",
         "linear_ticket_update_title",
         "linear_ticket_update_description",
+        "linear_ticket_update_base_title",
+        "linear_ticket_update_base_description",
+        "linear_ticket_update_base_revision",
         "linear_ticket_update_marker",
         "linear_ticket_update_operation_state",
         "linear_ticket_update_issue_id",
@@ -741,6 +747,9 @@ _LINEAR_STATE_FIELDS = frozenset(
         "linear_ticket_update_confirmed",
         "linear_ticket_update_title",
         "linear_ticket_update_description",
+        "linear_ticket_update_base_title",
+        "linear_ticket_update_base_description",
+        "linear_ticket_update_base_revision",
         "linear_ticket_update_marker",
         "linear_ticket_update_operation_state",
         "linear_ticket_update_issue_id",
@@ -2807,6 +2816,18 @@ class AgentJob:
         return self._optional_string("github_issue_update_body")
 
     @property
+    def github_issue_update_base_title(self) -> str | None:
+        return self._optional_string("github_issue_update_base_title")
+
+    @property
+    def github_issue_update_base_body(self) -> str | None:
+        return self._optional_string("github_issue_update_base_body")
+
+    @property
+    def github_issue_update_base_revision(self) -> str | None:
+        return self._optional_string("github_issue_update_base_revision")
+
+    @property
     def github_issue_update_marker(self) -> str | None:
         return self._optional_string("github_issue_update_marker")
 
@@ -2885,6 +2906,18 @@ class AgentJob:
     @property
     def linear_ticket_update_description(self) -> str | None:
         return self._optional_string("linear_ticket_update_description")
+
+    @property
+    def linear_ticket_update_base_title(self) -> str | None:
+        return self._optional_string("linear_ticket_update_base_title")
+
+    @property
+    def linear_ticket_update_base_description(self) -> str | None:
+        return self._optional_string("linear_ticket_update_base_description")
+
+    @property
+    def linear_ticket_update_base_revision(self) -> str | None:
+        return self._optional_string("linear_ticket_update_base_revision")
 
     @property
     def linear_ticket_update_marker(self) -> str | None:

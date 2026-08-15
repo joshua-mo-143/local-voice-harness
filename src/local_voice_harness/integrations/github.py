@@ -297,6 +297,8 @@ class GitHubIssueUpdatePlan:
     title: str
     body: str
     correlation_marker: str
+    update_title: bool = True
+    update_body: bool = True
 
 
 @dataclass(frozen=True)
@@ -669,16 +671,28 @@ class GitHubClient:
 
     @staticmethod
     def validate_issue_update_plan(plan: GitHubIssueUpdatePlan) -> None:
+        if not isinstance(plan.body, str):
+            raise GitHubError("GitHub issue body must be text")
         GitHubClient.validate_issue_creation_plan(
             GitHubIssueCreationPlan(
                 plan.repository,
                 plan.title,
-                plan.body,
+                plan.body if plan.body.strip() else "empty body allowed for updates",
                 plan.correlation_marker,
             )
         )
+        if len(plan.body) > MAX_ISSUE_BODY_CHARS:
+            raise GitHubError(
+                f"GitHub issue body must be at most {MAX_ISSUE_BODY_CHARS} characters"
+            )
         if not isinstance(plan.number, int) or plan.number < 1:
             raise GitHubError("GitHub issue number must be positive")
+        if not isinstance(plan.update_title, bool) or not isinstance(
+            plan.update_body, bool
+        ):
+            raise GitHubError("GitHub issue update field selection is invalid")
+        if not plan.update_title and not plan.update_body:
+            raise GitHubError("GitHub issue update must change at least one field")
 
     def submit_issue_update(
         self,
@@ -689,25 +703,23 @@ class GitHubClient:
         if not confirmed:
             raise GitHubError("GitHub issue update requires explicit confirmation")
         self.validate_issue_update_plan(plan)
-        submitted_body = (
-            f"{plan.body.rstrip()}\n\n{self._issue_marker(plan.correlation_marker)}\n"
-        )
+        command = [
+            self.gh_executable,
+            "issue",
+            "edit",
+            str(plan.number),
+            "--repo",
+            plan.repository,
+        ]
+        if plan.update_title:
+            command.extend(("--title", plan.title))
+        if plan.update_body:
+            command.extend(("--body-file", "-"))
         process = self._run(
-            [
-                self.gh_executable,
-                "issue",
-                "edit",
-                str(plan.number),
-                "--repo",
-                plan.repository,
-                "--title",
-                plan.title,
-                "--body-file",
-                "-",
-            ],
+            command,
             timeout=30,
             write=True,
-            stdin=submitted_body,
+            stdin=plan.body if plan.update_body else None,
         )
         try:
             return self._update_result(plan, process.stdout)
@@ -737,8 +749,7 @@ class GitHubClient:
             raise GitHubError("GitHub returned malformed issue metadata") from exc
         if not isinstance(value, dict) or "pull_request" in value:
             raise GitHubError("GitHub returned malformed issue metadata")
-        marker = self._issue_marker(plan.correlation_marker)
-        if marker not in str(value.get("body") or ""):
+        if str(value.get("body") or "") != plan.body:
             return None
         if str(value.get("title") or "").strip() != plan.title:
             return None
@@ -2388,6 +2399,9 @@ _GITHUB_STATE_SECTIONS: dict[str, dict[str, str]] = {
         "confirmed": "github_issue_update_confirmed",
         "title": "github_issue_update_title",
         "body": "github_issue_update_body",
+        "base_title": "github_issue_update_base_title",
+        "base_body": "github_issue_update_base_body",
+        "base_revision": "github_issue_update_base_revision",
         "marker": "github_issue_update_marker",
         "operation_state": "github_issue_update_operation_state",
     },
@@ -2585,7 +2599,7 @@ class GitHubProvider:
             identity=issue.reference,
             provider_id=url,
             title=title.strip(),
-            body=body.strip(),
+            body=body,
             revision=revision.strip(),
             url=url,
             state=state.strip(),
@@ -2829,6 +2843,8 @@ class GitHubProvider:
         body: str,
         *,
         correlation_marker: str | None = None,
+        update_title: bool = True,
+        update_body: bool = True,
     ) -> GitHubIssueUpdatePlan:
         if not isinstance(repository, str):
             raise GitHubError("GitHub issue repository must be text")
@@ -2842,8 +2858,10 @@ class GitHubProvider:
             repository=GitHubClient.validate_repository(repository),
             number=number,
             title=title.strip(),
-            body=body.strip(),
+            body=body,
             correlation_marker=correlation_marker or secrets.token_hex(16),
+            update_title=update_title,
+            update_body=update_body,
         )
         self.validate_issue_update_plan(plan)
         return plan
