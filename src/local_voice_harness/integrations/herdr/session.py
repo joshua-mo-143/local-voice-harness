@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import hashlib
+import re
+import shutil
 import subprocess
 import time
 from collections.abc import Iterator
@@ -51,28 +53,131 @@ class HerdrSessionClient(Protocol):
     def get_agent(self, target: str) -> dict[str, Any]: ...
 
 
+CURSOR_PROVIDER = "cursor/herdr"
+OPENCODE_PROVIDER = "opencode/herdr"
+_SUPPORTED_KINDS = frozenset({"cursor", "opencode"})
+_OPENCODE_AUTH_COUNT = re.compile(
+    r"\b(\d+)\s+(?:credentials?|environment variables?)\b",
+    re.IGNORECASE,
+)
+
+
+def herdr_provider(kind: str) -> str:
+    """Return the durable AgentHarness provider id for a Herdr agent kind."""
+
+    if kind == "opencode":
+        return OPENCODE_PROVIDER
+    return CURSOR_PROVIDER
+
+
+def opencode_launch_args(mode: str | None) -> list[str]:
+    """Map Cursor plan/ask modes onto OpenCode Plan/Build agents."""
+
+    if mode == "plan":
+        return ["--agent", "plan"]
+    if mode == "ask":
+        return ["--agent", "plan"]
+    if mode is None:
+        return ["--agent", "build"]
+    raise HerdrError("invalid OpenCode mode", code="invalid_session_request")
+
+
 class HerdrSession(AgentHarness):
     """Agent prompt, completion, and cancellation handling."""
 
-    def __init__(self, client: HerdrSessionClient) -> None:
+    def __init__(self, client: HerdrSessionClient, *, kind: str = "cursor") -> None:
+        if kind not in _SUPPORTED_KINDS:
+            raise HerdrError(
+                f"unsupported Herdr agent kind {kind!r}",
+                code="unsupported_provider",
+            )
         self._client = client
+        self._kind = kind
+
+    @property
+    def kind(self) -> str:
+        return self._kind
 
     @property
     def provider(self) -> str:
-        return "cursor/herdr"
+        return herdr_provider(self._kind)
 
     @property
     def capabilities(self) -> frozenset[HarnessCapability]:
+        if self._kind == "opencode":
+            return frozenset(
+                {
+                    HarnessCapability.CLARIFICATION_REPLIES,
+                    HarnessCapability.CANCELLATION,
+                    HarnessCapability.RECOVERY,
+                }
+            )
         return frozenset(HarnessCapability)
 
-    @staticmethod
-    def _session(agent: dict[str, Any], target: str) -> HarnessSession | None:
+    def require_ready(self) -> None:
+        """Prove OpenCode can start before any durable job or pane is created."""
+
+        if self._kind != "opencode":
+            return
+        executable = shutil.which("opencode")
+        if executable is None:
+            raise HerdrError(
+                "OpenCode is selected but the `opencode` executable is unavailable. "
+                "Install OpenCode and ensure `opencode` is on PATH before retrying.",
+                code="operation_spawn_failed",
+            )
+        try:
+            process = subprocess.run(
+                [executable, "auth", "list"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise HerdrError(
+                "OpenCode authentication readiness could not be checked. Run "
+                "`opencode auth list`, repair the reported problem, and retry.",
+                code="authentication_unavailable",
+            ) from exc
+        if process.returncode:
+            raise HerdrError(
+                "OpenCode authentication is unavailable. Run `opencode auth list`, "
+                "then `opencode auth login` if needed, and retry.",
+                code="authentication_unavailable",
+            )
+        counts = [
+            int(match.group(1))
+            for match in _OPENCODE_AUTH_COUNT.finditer(
+                f"{process.stdout}\n{process.stderr}"
+            )
+        ]
+        if not counts or not any(counts):
+            raise HerdrError(
+                "OpenCode has no authenticated provider. Run `opencode auth login` "
+                "or configure a supported provider credential in the service "
+                "environment, then retry.",
+                code="authentication_unavailable",
+            )
+
+    def validate_agent_kind(self, agent: dict[str, Any]) -> None:
+        observed = str(agent.get("agent") or "")
+        if not observed or observed == self._kind:
+            return
+        raise HerdrError(
+            f"Herdr reported agent kind {observed!r}; expected {self._kind!r}. "
+            "Refusing to operate on a different harness session.",
+            code="agent_kind_mismatch",
+        )
+
+    def _session(self, agent: dict[str, Any], target: str) -> HarnessSession | None:
+        self.validate_agent_kind(agent)
         identity = agent_session_identity(agent.get("agent_session"))
         if identity is None:
             return None
         sequence = agent.get("state_change_seq")
         return HarnessSession(
-            provider="cursor/herdr",
+            provider=self.provider,
             session_id=identity,
             target=target,
             state_sequence=(
@@ -85,6 +190,13 @@ class HerdrSession(AgentHarness):
                 for key in ("name", "pane_id", "workspace_id", "cwd")
             },
         )
+
+    def _session_ready(self, agent: dict[str, Any], target: str) -> bool:
+        if self._session(agent, target) is None:
+            return False
+        if self._kind == "opencode":
+            return agent.get("interactive_ready") is not False
+        return agent.get("interactive_ready") is True
 
     def create_session(
         self,
@@ -102,27 +214,34 @@ class HerdrSession(AgentHarness):
                 code="unsupported_provider",
             )
         if request.mode not in {None, "plan", "ask"}:
-            raise HerdrError("invalid Cursor mode", code="invalid_session_request")
+            raise HerdrError(
+                f"invalid {self._kind} mode",
+                code="invalid_session_request",
+            )
         pane = request.launch_context.get("pane_id", "")
         workspace = request.launch_context.get("workspace_id", "")
         if not request.name or not pane or not workspace:
             raise HerdrError(
-                "Cursor/Herdr session creation requires name, pane_id, and workspace_id",
+                f"{self.provider} session creation requires name, pane_id, and "
+                "workspace_id",
                 code="invalid_session_request",
             )
         if checkpoint is not None:
             checkpoint()
         if before_submit is not None:
             before_submit()
-        agent_args = ["--trust", "--approve-mcps"]
-        if request.mode is not None:
-            agent_args.extend(["--mode", request.mode])
+        if self._kind == "opencode":
+            agent_args = opencode_launch_args(request.mode)
+        else:
+            agent_args = ["--trust", "--approve-mcps"]
+            if request.mode is not None:
+                agent_args.extend(["--mode", request.mode])
         result = self._client.run_json(
             "agent",
             "start",
             request.name,
             "--kind",
-            "cursor",
+            self._kind,
             "--pane",
             pane,
             "--timeout",
@@ -134,13 +253,11 @@ class HerdrSession(AgentHarness):
         agent = dict(result.get("agent") or {})
         target = str(agent.get("name") or agent.get("pane_id") or request.name)
         deadline = time.monotonic() + AGENT_START_READY_TIMEOUT_SECONDS
-        while (
-            agent.get("interactive_ready") is not True
-            or self._session(agent, target) is None
-        ):
+        while not self._session_ready(agent, target):
             if time.monotonic() >= deadline:
+                label = "OpenCode" if self._kind == "opencode" else "Cursor"
                 raise HerdrError(
-                    f"Herdr agent {target} did not expose a ready Cursor session "
+                    f"Herdr agent {target} did not expose a ready {label} session "
                     "after startup",
                     code="operation_ambiguous",
                 )
@@ -373,7 +490,7 @@ class HerdrSession(AgentHarness):
         session = self._session(before, target)
         if session is None:
             raise HerdrError(
-                f"Herdr agent {target} has no durable Cursor session",
+                f"Herdr agent {target} has no durable {self.provider} session",
                 code="agent_session_missing",
             )
         return TaskSubmission(
@@ -401,7 +518,7 @@ class HerdrSession(AgentHarness):
             session.session_id
         ):
             raise HerdrError(
-                "task submission does not match the durable Cursor/Herdr session",
+                f"task submission does not match the durable {self.provider} session",
                 code="agent_session_changed",
             )
         return self._submit_task(
@@ -761,6 +878,8 @@ class HerdrSession(AgentHarness):
         try:
             agent = self._client.get_agent(target)
         except HerdrError as exc:
+            if exc.code == "agent_kind_mismatch":
+                raise
             if exc.code in {"agent_not_found", "not_found"}:
                 return SessionReconciliation(
                     ReconciliationState.MISSING,
@@ -944,3 +1063,10 @@ class HerdrSession(AgentHarness):
             f"Herdr agent {target} still exists after pane close",
             code="pane_close_unconfirmed",
         )
+
+
+class OpenCodeSession(HerdrSession):
+    """Herdr-backed OpenCode transport. No Cursor MCP or Cursor CLI flags."""
+
+    def __init__(self, client: HerdrSessionClient) -> None:
+        super().__init__(client, kind="opencode")

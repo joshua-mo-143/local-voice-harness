@@ -75,6 +75,7 @@ cursor_agent_inactivity_seconds = 900
 cursor_agent_max_runtime_seconds = 3600
 cursor_mcp_auth_source = ""
 agent_job_start_concurrency = 3
+default_harness = "cursor"
 
 [announcements]
 mode = "all"
@@ -82,6 +83,17 @@ quiet_hours_start = ""
 quiet_hours_end = ""
 timezone = ""
 ```
+
+`platform.default_harness` accepts `cursor` or `opencode`; omission remains
+`cursor`. A non-spoken request can override that default once without changing
+configuration:
+
+```fish
+voice-harness jobs submit --harness opencode "Fix the local startup bug"
+```
+
+OpenCode submissions check that the executable is on `PATH` and that
+`opencode auth list` reports an authenticated provider before persisting a job.
 
 GitHub is enabled by default for compatibility. Setting `github = false` prevents
 the GitHub provider from parsing focused URLs or spoken issue references, calling

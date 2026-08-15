@@ -91,6 +91,15 @@ def _parse_barge_in_mode(value: str) -> str:
     return mode
 
 
+def _parse_default_harness(value: str) -> str:
+    kind = value.strip().casefold()
+    if kind not in {"cursor", "opencode"}:
+        raise UserConfigurationError(
+            "platform.default_harness must be one of: cursor, opencode"
+        )
+    return kind
+
+
 def _parse_announcement_mode(value: str) -> AnnouncementMode:
     mode = value.strip().casefold().replace("_", "-").replace(" ", "-")
     aliases = {
@@ -535,6 +544,12 @@ _CONFIG_FIELDS: dict[str, ConfigField] = {
         parse=_parse_int,
         section="platform",
         attribute="agent_job_start_concurrency",
+        services=(_WAKE_SERVICE,),
+    ),
+    "platform.default_harness": _field(
+        parse=_parse_default_harness,
+        section="platform",
+        attribute="default_harness",
         services=(_WAKE_SERVICE,),
     ),
     "announcements.mode": _field(

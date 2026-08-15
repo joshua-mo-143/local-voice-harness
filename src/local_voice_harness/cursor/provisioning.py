@@ -35,6 +35,7 @@ from ..integrations.herdr import (
     PromptOutcome,
     agent_session_identity,
     extract_marker,
+    herdr_provider,
     normalize_name,
 )
 from ..integrations.linear import (
@@ -48,6 +49,7 @@ from ..integrations.registry import (
     build_integration_registry,
     issue_provider,
     prompt_instructions,
+    require_harness_capabilities,
     require_issue_capabilities,
     require_issue_provider,
     resolve_issue_reference,
@@ -116,6 +118,7 @@ from .model import (
 )
 from .model import (
     CursorJob,
+    HarnessKind,
     JobStatus,
     JobValidationError,
     WorkflowParticipant,
@@ -2125,15 +2128,20 @@ def _execute_session_create_effect(
         raise HarnessError("session.create requires a reserved launch context")
     idempotency_key = f"{SESSION_CREATE}:{job.id}:{target}:{pane_id}:{workspace_id}"
     expected_observation_revision = job.revision + 1
+    provider = herdr_provider(job.harness_kind.value)
     payload: Mapping[str, object] = {
         "name": job.agent_name or target,
-        "provider": "cursor/herdr",
+        "provider": provider,
         "mode": mode,
         "launch_context": {
             "pane_id": pane_id,
             "workspace_id": workspace_id,
         },
-        "required_capabilities": [HarnessCapability.MCP_CONNECTORS.value],
+        "required_capabilities": (
+            []
+            if job.harness_kind == HarnessKind.OPENCODE
+            else [HarnessCapability.MCP_CONNECTORS.value]
+        ),
         "target": target,
         "pane_id": pane_id,
         "workspace_id": workspace_id,
@@ -2154,7 +2162,7 @@ def _execute_session_create_effect(
                 DurableEffect(
                     kind=SESSION_CREATE,
                     idempotency_key=idempotency_key,
-                    concurrency_key=f"cursor/herdr:{target}",
+                    concurrency_key=f"{provider}:{target}",
                     payload=payload,
                 ),
             ),
@@ -4236,7 +4244,7 @@ def _execute_phase_prompt(
     idempotency_key = f"{effect_kind}:{job.id}:{phase.value}:{token}"
     provider_session = job.prompt_operation_agent_session or ""
     session = HarnessSession(
-        provider=job.agent_provider or "cursor/herdr",
+        provider=job.agent_provider or herdr_provider(job.harness_kind.value),
         session_id=provider_session,
         target=target,
         state_sequence=operation_baseline,
@@ -4689,6 +4697,12 @@ def run_claimed_worker(  # pyright: ignore[reportGeneralTypeIssues]
         context.checkpoint()
 
     try:
+        require_harness_capabilities(
+            job.harness_kind,
+            provider=job.issue_provider,
+            linear_ticket_create_requested=job.linear_ticket_create_requested,
+            integrations=registry,
+        )
         if job.plan_approval_completion_pending:
             checkpoint()
             _resume_plan_approval_completion(store, job, worker_token)
@@ -4724,6 +4738,9 @@ def run_claimed_worker(  # pyright: ignore[reportGeneralTypeIssues]
                 provider=job.issue_provider,
             )
         client = clients.herdr()
+        client.bind_harness_kind(job.harness_kind.value)
+        checkpoint()
+        client.require_harness_ready()
         checkpoint()
         client.ensure_server()
         checkpoint()
@@ -4839,7 +4856,11 @@ def run_claimed_worker(  # pyright: ignore[reportGeneralTypeIssues]
                         cwd=str(legacy_agent.get("cwd") or checkout_value),
                         name=str(legacy_agent.get("name") or target),
                         worktree_path=checkout_value,
-                        provider="cursor/herdr" if session_id is not None else None,
+                        provider=(
+                            herdr_provider(job.harness_kind.value)
+                            if session_id is not None
+                            else None
+                        ),
                         provider_session_id=session_id,
                         state_sequence=sequence,
                     )

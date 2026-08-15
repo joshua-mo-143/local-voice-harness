@@ -37,6 +37,7 @@ from ..integrations.registry import (
     integration_enabled,
     issue_provider,
     issue_provider_identity,
+    require_harness_capabilities,
     require_issue_capabilities,
     require_issue_provider,
     resolve_issue_reference,
@@ -82,6 +83,7 @@ from .model import (
     TERMINAL_STATUSES,
     WORKER_STATUSES,
     CursorJob,
+    HarnessKind,
     JobStatus,
     JobValidationError,
     NewCursorJob,
@@ -130,6 +132,7 @@ class StartJobRequest:
     context_repository: str | None = None
     issue_key: str | None = None
     foreground: bool = True
+    harness_kind: HarnessKind | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -156,6 +159,7 @@ class CursorTurnRequest:
     reference: str | None = None
     expected_question_id: str | None = None
     expected_question_turn: str | None = None
+    harness_kind: HarnessKind | None = None
     answer_provenance: AnswerProvenance = AnswerProvenance.USER_TEXT
     expected_parent_revision: int | None = None
     expected_completed_at: float | None = None
@@ -370,6 +374,18 @@ def _build_start_job(
             )
         )
     )
+    if request.harness_kind is not None:
+        harness_kind = request.harness_kind
+    elif isinstance(registry.platform, PlatformSettings):
+        harness_kind = HarnessKind(registry.platform.default_harness)
+    else:
+        harness_kind = HarnessKind.CURSOR
+    require_harness_capabilities(
+        harness_kind,
+        provider=issue_provider,
+        linear_ticket_create_requested=request.linear_ticket_create_requested,
+        integrations=registry,
+    )
     if resolved_issue_key:
         assert issue_provider is not None
         require_issue_capabilities(
@@ -381,6 +397,10 @@ def _build_start_job(
         raise HarnessError("selected issue provider is unavailable")
     if issue_provider == "github" or request.linear_ticket_create_requested:
         require_issue_provider(issue_provider, registry)
+    if harness_kind == HarnessKind.OPENCODE:
+        client = registry.herdr_client()
+        client.bind_harness_kind(harness_kind.value)
+        client.require_harness_ready()
     issue_repository = (request.github_repository or "").strip()
     github_issue_url = (
         f"https://github.com/{issue_repository}/issues/{request.github_issue}"
@@ -440,6 +460,7 @@ def _build_start_job(
                 "pending" if request.github_pull_request else None
             ),
             agent_hint=request.agent,
+            harness_kind=harness_kind,
             issue_key=resolved_issue_key,
             issue_provider=issue_provider,
             speakable_label=inbox.build_speakable_label(
@@ -470,6 +491,7 @@ def start_job(
     context_repository: str | None = None,
     issue_key: str | None = None,
     foreground: bool = True,
+    harness_kind: HarnessKind | None = None,
     foreground_seconds: float = 5.0,
     integrations: IntegrationRegistry | None = None,
 ) -> str:
@@ -492,6 +514,7 @@ def start_job(
             context_repository=context_repository,
             issue_key=issue_key,
             foreground=foreground,
+            harness_kind=harness_kind,
         )
     )
     job_id = uuid.uuid4().hex[:12]
@@ -677,6 +700,7 @@ def _github_target(
             utterance=f"Work only on GitHub issue {target}.",
             context_repository=issue.name_with_owner,
             foreground=foreground,
+            harness_kind=base.harness_kind,
         ),
     )
 
@@ -727,6 +751,7 @@ def _linear_target(
             context_repository=base.context_repository,
             issue_key=identity,
             foreground=foreground,
+            harness_kind=base.harness_kind,
         ),
     )
 
@@ -818,6 +843,9 @@ def _serialize_start_request(request: StartJobRequest) -> dict[str, object]:
         "context_repository": request.context_repository,
         "issue_key": request.issue_key,
         "foreground": request.foreground,
+        "harness_kind": (
+            request.harness_kind.value if request.harness_kind is not None else None
+        ),
     }
 
 
@@ -849,6 +877,17 @@ def _deserialize_start_request(raw: object) -> StartJobRequest | None:
         raw.get("foreground", False), bool
     ):
         return None
+    raw_kind = raw.get("harness_kind")
+    harness_kind: HarnessKind | None
+    if raw_kind is None:
+        harness_kind = None
+    elif isinstance(raw_kind, str):
+        try:
+            harness_kind = HarnessKind(raw_kind)
+        except ValueError:
+            return None
+    else:
+        return None
     return StartJobRequest(
         text=str(raw["text"]),
         repository=raw.get("repository"),
@@ -862,6 +901,7 @@ def _deserialize_start_request(raw: object) -> StartJobRequest | None:
         context_repository=raw.get("context_repository"),
         issue_key=raw.get("issue_key"),
         foreground=bool(raw.get("foreground", False)),
+        harness_kind=harness_kind,
     )
 
 
@@ -2574,6 +2614,7 @@ def cursor_turn(
     action: str = "submit",
     job_id: str | None = None,
     reference: str | None = None,
+    harness_kind: HarnessKind | None = None,
     delivery_claims: DeliveryClaims | None = None,
     platform: PlatformSettings | None = None,
     integrations: IntegrationRegistry | None = None,
@@ -2608,6 +2649,7 @@ def cursor_turn(
         reference = request.reference
         expected_question_id = request.expected_question_id
         expected_question_turn = request.expected_question_turn
+        harness_kind = request.harness_kind
         answer_provenance = request.answer_provenance
         expected_completed_at = request.expected_completed_at
         expected_parent_revision = request.expected_parent_revision
@@ -2776,6 +2818,7 @@ def cursor_turn(
                 context_repository=context_repository,
                 issue_key=issue_key,
                 foreground=not extraction.batch_requested,
+                harness_kind=harness_kind,
             )
             outcomes = _submit_extracted_targets(
                 extraction,
@@ -2823,6 +2866,7 @@ def cursor_turn(
                 utterance=utterance,
                 context_repository=context_repository,
                 issue_key=issue_key,
+                harness_kind=harness_kind,
                 foreground_seconds=runtime.cursor_foreground_seconds,
                 integrations=registry,
             )

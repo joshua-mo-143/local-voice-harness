@@ -53,6 +53,7 @@ class UserConfigDefaultsTests(unittest.TestCase):
         self.assertEqual(config.platform.cursor_agent_max_runtime_seconds, 3600)
         self.assertIsNone(config.platform.cursor_mcp_auth_source)
         self.assertEqual(config.platform.agent_job_start_concurrency, 3)
+        self.assertEqual(config.platform.default_harness, "cursor")
         self.assertEqual(config.announcements.mode.value, "all")
         self.assertEqual(config.announcements.quiet_hours_start, "")
         self.assertEqual(config.announcements.quiet_hours_end, "")
@@ -503,6 +504,25 @@ class UserConfigValidationTests(unittest.TestCase):
     def test_non_positive_agent_job_start_concurrency_is_rejected(self) -> None:
         with self.assertRaisesRegex(UserConfigurationError, "positive integer"):
             self._load("[platform]\nagent_job_start_concurrency = 0\n")
+
+    def test_omitted_default_harness_remains_cursor(self) -> None:
+        config = self._load("[platform]\nagent_job_start_concurrency = 4\n")
+        self.assertEqual(config.platform.default_harness, "cursor")
+
+    def test_default_harness_can_select_opencode(self) -> None:
+        config = self._load('[platform]\ndefault_harness = "OpenCode"\n')
+        self.assertEqual(config.platform.default_harness, "opencode")
+
+    def test_invalid_default_harness_is_rejected(self) -> None:
+        with self.assertRaisesRegex(UserConfigurationError, "cursor, opencode"):
+            self._load('[platform]\ndefault_harness = "claude"\n')
+
+    def test_default_harness_environment_overrides_config(self) -> None:
+        config = self._load(
+            '[platform]\ndefault_harness = "opencode"\n',
+            {"VOICE_HARNESS_DEFAULT_HARNESS": "cursor"},
+        )
+        self.assertEqual(config.platform.default_harness, "cursor")
 
     def test_file_based_credentials_are_rejected(self) -> None:
         with self.assertRaisesRegex(UserConfigurationError, "credentials set"):

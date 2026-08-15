@@ -105,8 +105,14 @@ class PersistentEffects:
 class PersistentHerdr(HerdrClient):
     def __init__(self, effects: PersistentEffects) -> None:
         self.effects = effects
+        self.harness_kind = "cursor"
         self.session = HerdrSession(self)
         self.harness = self
+
+    def bind_harness_kind(self, kind: str) -> None:
+        if kind not in {"cursor", "opencode"}:
+            raise ValueError(f"unsupported fake harness kind: {kind}")
+        self.harness_kind = kind
 
     def ensure_server(self, timeout: float | None = None) -> None:
         return None

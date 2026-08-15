@@ -5,7 +5,7 @@ from __future__ import annotations
 from ..rofi import choose_repository, confirm_clone
 from .client import HerdrClient
 from .repository import HerdrRepository
-from .session import HerdrSession
+from .session import HerdrSession, OpenCodeSession, herdr_provider, opencode_launch_args
 from .transport import HerdrTransport
 from .types import (
     AGENT_COMPLETION_POLL_SECONDS,
@@ -40,6 +40,9 @@ __all__ = [
     "HerdrSession",
     "HerdrTransport",
     "HerdrWorkspace",
+    "OpenCodeSession",
+    "herdr_provider",
+    "opencode_launch_args",
     "PromptOutcome",
     "agent_session_identity",
     "extract_marker",

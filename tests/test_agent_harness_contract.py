@@ -16,7 +16,11 @@ from local_voice_harness.agents import (
     UnsupportedCapabilityError,
     require_capabilities,
 )
-from local_voice_harness.integrations.herdr import HerdrSession, PromptOutcome
+from local_voice_harness.integrations.herdr import (
+    HerdrSession,
+    OpenCodeSession,
+    PromptOutcome,
+)
 
 from .harness_contract import HarnessContractTests
 
@@ -133,6 +137,34 @@ class _HerdrScenario:
             )
 
 
+class _OpenCodeScenario(_HerdrScenario):
+    def __init__(self) -> None:
+        super().__init__()
+        self.client.agent["agent"] = "opencode"
+        self.harness = OpenCodeSession(self.client)
+
+    def create(self) -> HarnessSession:
+        if self.session is None:
+            self.session = self.harness.create_session(
+                SessionRequest(
+                    name="contract-agent",
+                    provider="opencode/herdr",
+                    launch_context={
+                        "pane_id": "workspace:pane",
+                        "workspace_id": "workspace",
+                    },
+                )
+            )
+        return self.session
+
+    def restart_state(self) -> ReconciliationState:
+        restarted = OpenCodeSession(self.client)
+        return restarted.reconcile(
+            self.create().target,
+            expected_session_id=self.create().session_id,
+        ).state
+
+
 class CursorHerdrHarnessContractTests(HarnessContractTests):
     __test__ = True
 
@@ -157,6 +189,62 @@ class CursorHerdrHarnessContractTests(HarnessContractTests):
         )
         self.assertIn("--approve-mcps", start)
         self.assertIn(HarnessCapability.MCP_CONNECTORS, scenario.harness.capabilities)
+
+
+class OpenCodeHerdrHarnessContractTests(HarnessContractTests):
+    __test__ = True
+
+    def scenario(self) -> _OpenCodeScenario:
+        return _OpenCodeScenario()
+
+    def test_advertised_capabilities_exclude_cursor_mcp(self) -> None:
+        scenario = self.scenario()
+        self.assertNotIn(
+            HarnessCapability.MCP_CONNECTORS, scenario.harness.capabilities
+        )
+        self.assertEqual(
+            scenario.harness.capabilities,
+            frozenset(
+                {
+                    HarnessCapability.CLARIFICATION_REPLIES,
+                    HarnessCapability.CANCELLATION,
+                    HarnessCapability.RECOVERY,
+                }
+            ),
+        )
+
+    def test_mcp_capability_fails_before_session_creation(self) -> None:
+        scenario = self.scenario()
+        with self.assertRaises(UnsupportedCapabilityError) as raised:
+            scenario.harness.create_session(
+                SessionRequest(
+                    name="contract-agent",
+                    provider="opencode/herdr",
+                    launch_context={
+                        "pane_id": "workspace:pane",
+                        "workspace_id": "workspace",
+                    },
+                    required_capabilities=frozenset({HarnessCapability.MCP_CONNECTORS}),
+                )
+            )
+        self.assertEqual(raised.exception.code, "unsupported_capability")
+        self.assertFalse(
+            any(call[:2] == ("agent", "start") for call in scenario.client.calls)
+        )
+
+    def test_session_creation_uses_opencode_kind_without_cursor_flags(self) -> None:
+        scenario = self.scenario()
+        scenario.create()
+        start = next(
+            call for call in scenario.client.calls if call[:2] == ("agent", "start")
+        )
+        self.assertIn("--kind", start)
+        self.assertEqual(start[start.index("--kind") + 1], "opencode")
+        self.assertNotIn("--trust", start)
+        self.assertNotIn("--approve-mcps", start)
+        self.assertNotIn("--mode", start)
+        self.assertIn("--agent", start)
+        self.assertEqual(start[start.index("--agent") + 1], "build")
 
 
 if __name__ == "__main__":

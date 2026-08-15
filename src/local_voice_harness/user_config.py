@@ -105,6 +105,7 @@ _PLATFORM_KEYS = (
     "cursor_agent_max_runtime_seconds",
     "cursor_mcp_auth_source",
     "agent_job_start_concurrency",
+    "default_harness",
 )
 _ANNOUNCEMENT_KEYS = (
     "mode",
@@ -293,6 +294,7 @@ class PlatformSettings:
     cursor_agent_max_runtime_seconds: float = 60 * 60
     cursor_mcp_auth_source: Path | None = None
     agent_job_start_concurrency: int = 3
+    default_harness: str = "cursor"
 
 
 @dataclass(frozen=True)
@@ -1087,6 +1089,17 @@ def _load_platform(
             ),
             label="platform.agent_job_start_concurrency",
         ),
+        default_harness=_as_choice(
+            _resolve(
+                environment,
+                "VOICE_HARNESS_DEFAULT_HARNESS",
+                section,
+                "default_harness",
+                "cursor",
+            ),
+            {"cursor", "opencode"},
+            label="platform.default_harness",
+        ),
     )
     for label, path in (
         ("platform.project_root", settings.project_root),
@@ -1407,6 +1420,7 @@ def render_user_config(user_config: UserConfig) -> str:
                 else ""
             ),
             "agent_job_start_concurrency": platform.agent_job_start_concurrency,
+            "default_harness": platform.default_harness,
         },
     )
     announcements = user_config.announcements

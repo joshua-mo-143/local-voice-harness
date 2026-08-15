@@ -62,6 +62,21 @@ class ConfigManagementTests(unittest.TestCase):
             self.assertEqual(stat.S_IMODE(paths.config.stat().st_mode), 0o600)
             self.assertEqual(paths.backend_env.read_text(), legacy)
 
+    def test_set_default_harness_without_mutating_other_platform_values(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            paths = self.paths(root)
+            paths.config.parent.mkdir(parents=True)
+            result = config_management.commit_config_change(
+                {"platform.default_harness": "opencode"},
+                paths=paths,
+            )
+
+            self.assertEqual(result.config.platform.default_harness, "opencode")
+            self.assertEqual(result.config.platform.agent_job_start_concurrency, 3)
+            reloaded = config_management.load_managed_config(paths=paths)
+            self.assertEqual(reloaded.platform.default_harness, "opencode")
+
     def test_reset_does_not_create_or_update_legacy_backend_env(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

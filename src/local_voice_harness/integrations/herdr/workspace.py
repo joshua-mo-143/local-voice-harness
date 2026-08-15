@@ -9,6 +9,7 @@ from typing import Any
 
 from ...agents.harness import HarnessCapability, SessionRequest
 from .cursor_auth import CursorMcpAuthError, CursorMcpAuthLinker
+from .session import herdr_provider
 from .types import (
     SETTLED,
     AgentSelection,
@@ -55,6 +56,15 @@ class HerdrWorkspace:
             if cursor_mcp_auth_source is not None
             else None
         )
+        self._kind = "cursor"
+
+    def bind_kind(self, kind: str) -> None:
+        if kind not in {"cursor", "opencode"}:
+            raise HerdrError(
+                f"unsupported harness kind {kind!r}",
+                code="unsupported_provider",
+            )
+        self._kind = kind
 
     def list_workspaces(self) -> list[dict[str, Any]]:
         return list(self._operations.list_workspaces())
@@ -90,11 +100,12 @@ class HerdrWorkspace:
     def target(agent: dict[str, Any]) -> str:
         return str(agent.get("name") or agent.get("pane_id") or "")
 
-    def live_agents(self) -> list[dict[str, Any]]:
+    def live_agents(self, kind: str | None = None) -> list[dict[str, Any]]:
+        agent_kind = kind or self._kind
         return [
             agent
             for agent in self._operations.list_agents()
-            if agent.get("agent") == "cursor"
+            if agent.get("agent") == agent_kind
             and agent.get("interactive_ready") is not False
             and agent.get("agent_status") in SETTLED
         ]
@@ -114,7 +125,7 @@ class HerdrWorkspace:
             cwd=str(agent.get("cwd") or ""),
             name=str(agent.get("name") or target),
             worktree_path=worktree,
-            provider="cursor/herdr" if session_id is not None else None,
+            provider=herdr_provider(self._kind) if session_id is not None else None,
             provider_session_id=session_id,
             state_sequence=(
                 sequence
@@ -150,7 +161,8 @@ class HerdrWorkspace:
         if len(matches) > 1:
             targets = ", ".join(sorted(self.target(agent) for agent in matches))
             raise HerdrError(
-                f"multiple settled Cursor agents match the requested checkout: {targets}",
+                f"multiple settled {self._kind} agents match the requested checkout: "
+                f"{targets}",
                 code="agent_ambiguous",
             )
         if not matches:
@@ -230,9 +242,11 @@ class HerdrWorkspace:
         *,
         name: str | None = None,
         mode: str | None = None,
+        kind: str | None = None,
         checkpoint: Checkpoint | None = None,
     ) -> AgentSelection:
-        if self._cursor_mcp_auth is not None:
+        agent_kind = kind or self._kind
+        if agent_kind != "opencode" and self._cursor_mcp_auth is not None:
             try:
                 self._cursor_mcp_auth.link(checkout)
             except (CursorMcpAuthError, OSError) as exc:
@@ -248,7 +262,7 @@ class HerdrWorkspace:
                 session = self._operations.create_session(
                     SessionRequest(
                         name=name,
-                        provider="cursor/herdr",
+                        provider=herdr_provider(agent_kind),
                         mode=mode,
                         launch_context={
                             "pane_id": pane,
@@ -256,7 +270,8 @@ class HerdrWorkspace:
                         },
                         required_capabilities=(
                             frozenset({HarnessCapability.MCP_CONNECTORS})
-                            if self._cursor_mcp_auth is not None
+                            if agent_kind != "opencode"
+                            and self._cursor_mcp_auth is not None
                             else frozenset()
                         ),
                     ),

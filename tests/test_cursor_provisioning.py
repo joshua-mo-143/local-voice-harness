@@ -308,7 +308,7 @@ def configure_prompt_harness(client: mock.Mock) -> None:
                 request.launch_context["workspace_id"],
                 "",
                 request.name,
-                provider="cursor/herdr",
+                provider=request.provider,
                 provider_session_id=f"{request.name}-session",
                 state_sequence=7,
             )
@@ -446,6 +446,7 @@ def configure_tiered_outcomes(
     checkout: Path,
     *,
     tier: str = "simple",
+    provider: str = "cursor/herdr",
 ) -> None:
     job_id = "123456789abc"
     owned: dict[str, AgentSelection] = {}
@@ -535,7 +536,7 @@ def configure_tiered_outcomes(
         return SessionReconciliation(
             ReconciliationState.ACTIVE,
             HarnessSession(
-                selection.provider or "cursor/herdr",
+                selection.provider or provider,
                 expected_session_id,
                 target,
                 (selection.state_sequence or 0) + 1,
@@ -569,7 +570,7 @@ def configure_tiered_outcomes(
             str(checkout),
             role,
             str(checkout),
-            provider="cursor/herdr",
+            provider=provider,
             provider_session_id="test-session",
             state_sequence=7,
         )
@@ -3822,6 +3823,193 @@ class CursorJobStateTests(unittest.TestCase):
         self.assertEqual(updated["status"], "completed")
         self.assertEqual(updated["github_issue_url"], issue.url)
 
+    def test_opencode_job_reaches_terminal_success_and_inbox_delivery(self) -> None:
+        repository = Path(self.temporary.name) / "source" / "project"
+        source = GitHubRepository(
+            "source/project",
+            "https://github.com/source/project",
+            True,
+            "main",
+        )
+        issue = GitHubIssue("source", "project", 42)
+        provisioned = ProvisionedIssue(source, repository, issue)
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "work on source/project#42",
+                "utterance": "work on source/project#42",
+                "harness_kind": "opencode",
+                "github_repository": "source/project",
+                "github_issue": 42,
+                "github_issue_context": "Title: Fix it",
+                "worktree_branch": "voice/github-issue-42",
+                "worktree_label": "issue-42",
+                "status": "queued",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        github = mock.Mock()
+        github.provision_issue.return_value = provisioned
+        client = mock.Mock()
+        client.ensure_agent.return_value = AgentSelection(
+            "agent",
+            "pane",
+            "workspace",
+            str(repository),
+            "agent",
+            "/worktree/issue-42",
+            provider="opencode/herdr",
+            provider_session_id="test-session",
+            state_sequence=7,
+        )
+        configure_tiered_outcomes(client, repository, provider="opencode/herdr")
+        session_requests: list[SessionRequest] = []
+        inner_create = client.harness.create_session.side_effect
+
+        def capture_create(request: SessionRequest, **kwargs: object) -> HarnessSession:
+            session_requests.append(request)
+            return inner_create(request, **kwargs)
+
+        client.harness.create_session.side_effect = capture_create
+        with (
+            mock.patch.object(jobs, "GitHubClient", return_value=github),
+            mock.patch.object(jobs, "HerdrClient", return_value=client),
+        ):
+            service.run_worker("123456789abc")
+
+        client.bind_harness_kind.assert_called_with("opencode")
+        self.assertTrue(session_requests)
+        self.assertTrue(
+            all(request.provider == "opencode/herdr" for request in session_requests)
+        )
+        self.assertTrue(
+            all(not request.required_capabilities for request in session_requests)
+        )
+        updated = jobs.read_job("123456789abc")
+        self.assertEqual(updated["status"], "completed")
+        self.assertEqual(updated["harness_kind"], "opencode")
+        self.assertEqual(updated["github_issue_url"], issue.url)
+        claimed = service.claim_delivery("123456789abc", foreground=True)
+        self.assertIsNotNone(claimed)
+        delivered = service.mark_delivered("123456789abc")
+        self.assertTrue(delivered.delivered)
+        self.assertIn("issue 42", service.inbox.speakable_label_for(delivered))
+
+    def test_opencode_tiered_workflow_uses_distinct_herdr_participants(self) -> None:
+        repository = Path(self.temporary.name) / "source" / "project"
+        source = GitHubRepository(
+            "source/project",
+            "https://github.com/source/project",
+            True,
+            "main",
+        )
+        issue = GitHubIssue("source", "project", 42)
+        provisioned = ProvisionedIssue(source, repository, issue)
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "work on source/project#42",
+                "utterance": "work on source/project#42",
+                "harness_kind": "opencode",
+                "github_repository": "source/project",
+                "github_issue": 42,
+                "github_issue_context": "Title: Fix it",
+                "worktree_branch": "voice/github-issue-42",
+                "worktree_label": "issue-42",
+                "status": "queued",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        github = mock.Mock()
+        github.provision_issue.return_value = provisioned
+        github.resolve_issue.return_value = issue
+        client = mock.Mock()
+        client.ensure_agent.return_value = AgentSelection(
+            "planner",
+            "pane",
+            "workspace",
+            str(repository),
+            "planner",
+            "/worktree/issue-42",
+            provider="opencode/herdr",
+            provider_session_id="planner-session",
+            state_sequence=7,
+        )
+        configure_tiered_outcomes(
+            client, repository, tier="high-risk", provider="opencode/herdr"
+        )
+        preferences_path = Path(self.temporary.name) / "prefs" / "plan-approval.json"
+        preferences_path.parent.mkdir()
+        isolated_preferences = mock.patch.dict(
+            os.environ,
+            {"VOICE_HARNESS_PLAN_APPROVAL_FILE": str(preferences_path)},
+        )
+        with (
+            isolated_preferences,
+            mock.patch.object(jobs, "GitHubClient", return_value=github),
+            mock.patch.object(jobs, "HerdrClient", return_value=client),
+        ):
+            service.run_worker("123456789abc")
+
+        first = jobs.read_job("123456789abc")
+        self.assertEqual(first["status"], "awaiting_user")
+        self.assertEqual(first["harness_kind"], "opencode")
+        self.assertEqual(first["workflow_phase"], "reviewing")
+        self.assertEqual(
+            [call.kwargs["role"] for call in client.start_fresh_agent.call_args_list],
+            ["reviewer"],
+        )
+        with mock.patch.object(service, "launch_worker"):
+            service.reply_job("123456789abc", "yes", trusted_utterance="yes")
+        with (
+            isolated_preferences,
+            mock.patch.object(jobs, "GitHubClient", return_value=github),
+            mock.patch.object(jobs, "HerdrClient", return_value=client),
+        ):
+            service.run_worker("123456789abc")
+
+        completed = jobs.read_job("123456789abc")
+        self.assertEqual(completed["status"], "completed", completed)
+        self.assertEqual(
+            [call.kwargs["role"] for call in client.start_fresh_agent.call_args_list],
+            ["reviewer", "implementer"],
+        )
+        participant_targets = [
+            call.kwargs["name"] for call in client.start_fresh_agent.call_args_list
+        ]
+        self.assertEqual(len(set(participant_targets)), 2)
+        self.assertNotEqual(
+            client.ensure_agent.return_value.target, participant_targets[0]
+        )
+        self.assertNotEqual(participant_targets[0], participant_targets[1])
+
+    def test_opencode_linear_job_fails_before_session_creation(self) -> None:
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "work on ENG-123",
+                "harness_kind": "opencode",
+                "issue_key": "ENG-123",
+                "issue_provider": "linear",
+                "status": "queued",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        client = mock.Mock()
+        with mock.patch.object(jobs, "HerdrClient", return_value=client):
+            service.run_worker("123456789abc")
+
+        client.ensure_agent.assert_not_called()
+        client.start_fresh_agent.assert_not_called()
+        client.bind_harness_kind.assert_not_called()
+        updated = jobs.read_job("123456789abc")
+        self.assertEqual(updated["status"], "failed")
+        self.assertIn("mcp_connectors", updated["error"])
+        self.assertIn("opencode/herdr", updated["error"])
+
     def test_reservation_rejects_an_active_shared_worktree(self) -> None:
         jobs.write_job(
             {
@@ -3909,6 +4097,7 @@ class CursorJobStateTests(unittest.TestCase):
             utterance=None,
             context_repository=None,
             issue_key=None,
+            harness_kind=None,
             foreground_seconds=5.0,
             integrations=mock.ANY,
         )
