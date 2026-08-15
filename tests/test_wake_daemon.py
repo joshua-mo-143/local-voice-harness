@@ -8481,6 +8481,31 @@ class AnnouncementSnoozeTests(unittest.TestCase):
         self.assertFalse(snooze.mute_everything)
         self.assertGreater(snooze.until, time.time() + 29 * 60)
 
+    def test_custom_snooze_duration_is_spoken_and_applied(self) -> None:
+        daemon = _bare_daemon()
+        spoken = wake_daemon.snooze_started_response(5)
+        with (
+            mock.patch.object(
+                wake_daemon, "transcribe", return_value="snooze for 5 minutes"
+            ),
+            mock.patch.object(wake_daemon, "start_components"),
+            mock.patch.object(
+                daemon,
+                "play_response",
+                return_value=({"played_text": spoken}, None),
+            ) as play,
+            mock.patch.object(wake_daemon, "notify"),
+        ):
+            daemon.process_utterance(AUDIO_GENERATION, woke=False)
+
+        play.assert_called_once_with(AssistantResponse.from_text(spoken))
+        self.assertIn("5 minutes", spoken)
+        snooze = daemon._active_announcement_snooze()
+        self.assertIsNotNone(snooze)
+        assert snooze is not None
+        self.assertLess(snooze.until, time.time() + 6 * 60)
+        self.assertGreater(snooze.until, time.time() + 4 * 60)
+
     def test_mute_everything_and_clear(self) -> None:
         daemon = _bare_daemon()
         with (

@@ -544,6 +544,15 @@ DEFAULT_SNOOZE_SECONDS = 30 * 60
 SNOOZE_STARTED_RESPONSE = (
     "Okay, I'll hold ordinary background announcements for 30 minutes."
 )
+
+
+def snooze_started_response(minutes: int | None) -> str:
+    if minutes is None:
+        return SNOOZE_STARTED_RESPONSE
+    label = "1 minute" if minutes == 1 else f"{minutes} minutes"
+    return f"Okay, I'll hold ordinary background announcements for {label}."
+
+
 SNOOZE_MUTE_ALL_RESPONSE = (
     "Okay, I'll mute background announcements, including questions and failures."
 )
@@ -2416,7 +2425,12 @@ class WakeConversationDaemon:
             if snooze_match is not None:
                 terminalize_non_side_effect()
                 minutes = snooze_match.group("minutes")
-                duration = int(minutes) * 60 if minutes else DEFAULT_SNOOZE_SECONDS
+                parsed_minutes = int(minutes) if minutes else None
+                duration = (
+                    parsed_minutes * 60
+                    if parsed_minutes is not None
+                    else DEFAULT_SNOOZE_SECONDS
+                )
                 target = (snooze_match.group("target") or "").casefold()
                 mute_everything = (
                     target == "everything"
@@ -2430,7 +2444,7 @@ class WakeConversationDaemon:
                 return self._speak_control_notice(
                     SNOOZE_MUTE_ALL_RESPONSE
                     if mute_everything
-                    else SNOOZE_STARTED_RESPONSE
+                    else snooze_started_response(parsed_minutes)
                 )
             pending_resolution = getattr(self, "pending_target_resolution", None)
             resolution_active = (
