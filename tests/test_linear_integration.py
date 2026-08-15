@@ -927,5 +927,170 @@ class LinearIssueResolveTests(unittest.TestCase):
         self.assertIn("Do not create or modify anything", prompt_text)
 
 
+class LinearTicketUpdateTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.integration = linear.LinearIntegration()
+        self.plan = self.integration.plan_ticket_update(
+            "issue-id-api-79",
+            "API-79",
+            "Fix startup",
+            "The launcher fails after reboot.",
+            correlation_marker="a" * 32,
+        )
+
+    def test_submit_requires_confirmation_and_returns_validated_identity(self) -> None:
+        client = mock.Mock()
+        client.ensure_router.return_value = mock.Mock(target="voice-router")
+        client.get_agent.return_value = {
+            "agent_session": "router-session",
+            "state_change_seq": 7,
+        }
+
+        def prompt(*_args: object, **kwargs: object) -> object:
+            before_submit = kwargs["before_submit"]
+            assert callable(before_submit)
+            before_submit(7)
+            accepted = kwargs["accepted"]
+            assert callable(accepted)
+            accepted()
+            token = str(kwargs["token"])
+            return mock.Mock(
+                output=(
+                    f"VOICE_LINEAR_IDENTIFIER[{token}]: API-79\n"
+                    f"VOICE_LINEAR_URL[{token}]: "
+                    "https://linear.app/acme/issue/API-79/fix-startup"
+                )
+            )
+
+        client.prompt_and_wait.side_effect = prompt
+        with (
+            tempfile.TemporaryDirectory() as temporary,
+            mock.patch.object(
+                linear,
+                "LINEAR_ROUTER_LOCK",
+                Path(temporary) / "router.lock",
+            ),
+            mock.patch.object(self.integration, "require_capabilities"),
+        ):
+            result = self.integration.submit_ticket_update(
+                client,
+                self.plan,
+                confirmed=True,
+            )
+
+        self.assertEqual(result.issue.identifier, "API-79")
+        submitted = client.prompt_and_wait.call_args.args[1]
+        self.assertIn("voice-harness-linear-ticket:" + "a" * 32, submitted)
+        self.assertIn("Identifier: API-79", submitted)
+        self.assertIn("Immutable issue ID: issue-id-api-79", submitted)
+        self.assertIn("Do not create a new issue", submitted)
+        self.assertEqual(
+            client.prompt_and_wait.call_args.kwargs["expected_agent_session"],
+            "router-session",
+        )
+
+        with self.assertRaisesRegex(linear.LinearError, "explicit confirmation"):
+            self.integration.submit_ticket_update(
+                client,
+                self.plan,
+                confirmed=False,
+            )
+
+    def test_accepted_prompt_failure_is_ambiguous(self) -> None:
+        client = mock.Mock()
+        client.ensure_router.return_value = mock.Mock(target="voice-router")
+        client.get_agent.return_value = {
+            "agent_session": "router-session",
+            "state_change_seq": 7,
+        }
+
+        def prompt(*_args: object, **kwargs: object) -> object:
+            before_submit = kwargs["before_submit"]
+            assert callable(before_submit)
+            before_submit(7)
+            accepted = kwargs["accepted"]
+            assert callable(accepted)
+            accepted()
+            raise HerdrError("timeout", code="operation_ambiguous")
+
+        client.prompt_and_wait.side_effect = prompt
+        with (
+            tempfile.TemporaryDirectory() as temporary,
+            mock.patch.object(
+                linear,
+                "LINEAR_ROUTER_LOCK",
+                Path(temporary) / "router.lock",
+            ),
+            mock.patch.object(self.integration, "require_capabilities"),
+            self.assertRaises(linear.LinearOperationAmbiguous),
+        ):
+            self.integration.submit_ticket_update(
+                client,
+                self.plan,
+                confirmed=True,
+            )
+
+    def test_observe_uses_read_only_marker_search(self) -> None:
+        client = mock.Mock()
+        client.ensure_router.return_value = mock.Mock(target="voice-router")
+
+        def prompt(*_args: object, **kwargs: object) -> object:
+            token = str(kwargs["token"])
+            return mock.Mock(
+                output=(
+                    f"VOICE_LINEAR_STATUS[{token}]: found\n"
+                    f"VOICE_LINEAR_IDENTIFIER[{token}]: API-79\n"
+                    f"VOICE_LINEAR_URL[{token}]: "
+                    "https://linear.app/acme/issue/API-79/fix-startup"
+                )
+            )
+
+        client.prompt_and_wait.side_effect = prompt
+        with (
+            tempfile.TemporaryDirectory() as temporary,
+            mock.patch.object(
+                linear,
+                "LINEAR_ROUTER_LOCK",
+                Path(temporary) / "router.lock",
+            ),
+            mock.patch.object(self.integration, "require_capabilities"),
+        ):
+            result = self.integration.observe_ticket_update(client, self.plan)
+
+        assert result is not None
+        self.assertEqual(result.issue.identifier, "API-79")
+        prompt_text = client.prompt_and_wait.call_args.args[1]
+        self.assertIn("read-only", prompt_text)
+        self.assertIn("Do not create or modify anything", prompt_text)
+        self.assertIn("<!-- voice-harness-linear-ticket:", prompt_text)
+
+    def test_ticket_update_preflights_capability_before_persistence(self) -> None:
+        with (
+            mock.patch.object(
+                linear.LinearIntegration,
+                "capability_status",
+                return_value=linear.CapabilityStatus(
+                    False, "cursor-mcp unavailable", "configure Cursor MCP"
+                ),
+            ),
+            mock.patch.object(service, "_job_store") as store,
+            mock.patch.object(service, "launch_worker") as launch,
+            self.assertRaisesRegex(
+                HarnessError, "cursor-mcp unavailable.*configure Cursor MCP"
+            ),
+        ):
+            service.start_job(
+                "update Linear ticket API-79",
+                issue_key="API-79",
+                linear_ticket_update_requested=True,
+                integrations=registry.build_integration_registry(
+                    replace(default_user_config(), integrations=ENABLED)
+                ),
+            )
+
+        store.return_value.create.assert_not_called()
+        launch.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()

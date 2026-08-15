@@ -313,6 +313,8 @@ def _queue_answer(
     github_repo_create_requested: bool | None = None,
     linear_ticket_create_team: str | None = None,
     linear_ticket_create_confirmed: bool | None = None,
+    github_issue_update_confirmed: bool | None = None,
+    linear_ticket_update_confirmed: bool | None = None,
     clear_target: bool = False,
     clear_issue_create_draft: bool = False,
 ) -> CursorJob:
@@ -393,6 +395,16 @@ def _queue_answer(
             job.linear_ticket_create_confirmed
             if linear_ticket_create_confirmed is None
             else linear_ticket_create_confirmed
+        ),
+        github_issue_update_confirmed=(
+            job.github_issue_update_confirmed
+            if github_issue_update_confirmed is None
+            else github_issue_update_confirmed
+        ),
+        linear_ticket_update_confirmed=(
+            job.linear_ticket_update_confirmed
+            if linear_ticket_update_confirmed is None
+            else linear_ticket_update_confirmed
         ),
         linear_ticket_create_team=(
             job.linear_ticket_create_team
@@ -1314,6 +1326,120 @@ def _linear_ticket_create_confirmation_answer(
     return AnswerTransition(completed)
 
 
+def _github_issue_update_confirmation_answer(
+    job: CursorJob,
+    question: Question,
+    resolution: AnswerResolution,
+    context: AnswerContext,
+) -> AnswerTransition:
+    if context.trusted_text is None:
+        return AnswerTransition(
+            None,
+            message="Please confirm directly. Should I update this GitHub issue?",
+        )
+    confirmation = _confirmation(
+        context.trusted_text,
+        confirmations=_FORK_CONFIRMATIONS | {"update the issue", "update it"},
+        rejections=_FORK_REJECTIONS,
+    )
+    if confirmation is None:
+        return AnswerTransition(
+            None,
+            message="Please answer yes or no. Should I update this GitHub issue?",
+        )
+    if confirmation:
+        return AnswerTransition(
+            _queue_answer(
+                job,
+                question,
+                resolution,
+                context,
+                continuation=False,
+                clear_target=True,
+                github_issue_update_confirmed=True,
+            ),
+            launch=True,
+        )
+    completed = job.evolve_for_delivery(
+        now=context.now,
+        status=JobStatus.COMPLETED,
+        question=None,
+        clarification_kind=None,
+        result="Okay, I did not update the GitHub issue.",
+        completed_at=context.now,
+        worker_pid=None,
+        worker_boot_id=None,
+        worker_process_start=None,
+        worker_token=None,
+        voice_question=envelope(
+            question,
+            QuestionState.RESOLVED,
+            job=job,
+            answer="no",
+            trusted_answer=context.trusted_text,
+            answered_at=context.now,
+        ),
+    )
+    return AnswerTransition(completed)
+
+
+def _linear_ticket_update_confirmation_answer(
+    job: CursorJob,
+    question: Question,
+    resolution: AnswerResolution,
+    context: AnswerContext,
+) -> AnswerTransition:
+    if context.trusted_text is None:
+        return AnswerTransition(
+            None,
+            message="Please confirm directly. Should I update this Linear ticket?",
+        )
+    confirmation = _confirmation(
+        context.trusted_text,
+        confirmations=_FORK_CONFIRMATIONS | {"update the ticket", "update it"},
+        rejections=_FORK_REJECTIONS,
+    )
+    if confirmation is None:
+        return AnswerTransition(
+            None,
+            message="Please answer yes or no. Should I update this Linear ticket?",
+        )
+    if confirmation:
+        return AnswerTransition(
+            _queue_answer(
+                job,
+                question,
+                resolution,
+                context,
+                continuation=False,
+                clear_target=True,
+                linear_ticket_update_confirmed=True,
+            ),
+            launch=True,
+        )
+    completed = job.evolve_for_delivery(
+        now=context.now,
+        status=JobStatus.COMPLETED,
+        question=None,
+        clarification_kind=None,
+        result="Okay, I did not update the Linear ticket.",
+        completed_at=context.now,
+        worker_pid=None,
+        worker_boot_id=None,
+        worker_process_start=None,
+        worker_token=None,
+        voice_question=envelope(
+            question,
+            QuestionState.RESOLVED,
+            job=job,
+            answer="no",
+            trusted_answer=context.trusted_text,
+            answered_at=context.now,
+        ),
+    )
+    return AnswerTransition(completed)
+
+
 _REVIEW_APPROVALS = {"approve", "approved", "proceed", "go ahead"}
 _REVIEW_ABORTS = {"abort", "cancel", "stop"}
 
@@ -1632,8 +1758,10 @@ _ANSWER_HANDLERS: dict[str, AnswerHandler] = {
     "github_repo_create_org": _github_repo_create_org_answer,
     "github_repo_create_slug": _github_repo_create_slug_answer,
     "github_repo_create_confirmation": _github_repo_create_confirmation_answer,
+    "github_issue_update_confirmation": _github_issue_update_confirmation_answer,
     "linear_team": _linear_team_answer,
     "linear_ticket_create_confirmation": _linear_ticket_create_confirmation_answer,
+    "linear_ticket_update_confirmation": _linear_ticket_update_confirmation_answer,
     "workflow": _workflow_answer,
     "workflow_review": _workflow_review_answer,
     "workflow_review_exhausted": _workflow_review_exhausted_answer,

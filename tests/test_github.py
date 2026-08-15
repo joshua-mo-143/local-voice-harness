@@ -16,6 +16,8 @@ from local_voice_harness.integrations.github import (
     GitHubIssueCreationResult,
     GitHubIssueLookupError,
     GitHubIssueLookupReason,
+    GitHubIssueUpdatePlan,
+    GitHubIssueUpdateResult,
     GitHubMergeQueueArmedError,
     GitHubOperationAmbiguous,
     GitHubPreconditionError,
@@ -436,6 +438,117 @@ class GitHubClientTests(unittest.TestCase):
             self.assertRaisesRegex(GitHubCommandStartError, "failed to start"),
         ):
             client.submit_issue(plan, confirmed=True)
+
+    def test_issue_update_uses_stdin_and_validates_canonical_result(self) -> None:
+        client = GitHubClient()
+        plan = GitHubIssueUpdatePlan(
+            "example/project",
+            12,
+            "Fix the reader",
+            "Detailed private body",
+            "a" * 32,
+        )
+        with mock.patch.object(
+            client,
+            "_run",
+            return_value=_completed("https://github.com/example/project/issues/12\n"),
+        ) as run:
+            result = client.submit_issue_update(plan, confirmed=True)
+
+        self.assertEqual(
+            result,
+            GitHubIssueUpdateResult(
+                GitHubIssue("example", "project", 12),
+                "https://github.com/example/project/issues/12",
+                "Fix the reader",
+                "a" * 32,
+            ),
+        )
+        command = run.call_args.args[0]
+        self.assertEqual(
+            command,
+            [
+                "gh",
+                "issue",
+                "edit",
+                "12",
+                "--repo",
+                "example/project",
+                "--title",
+                "Fix the reader",
+                "--body-file",
+                "-",
+            ],
+        )
+        self.assertNotIn(plan.body, command)
+        self.assertEqual(
+            run.call_args.kwargs["stdin"],
+            "Detailed private body\n\n"
+            f"<!-- local-voice-harness-correlation:{'a' * 32} -->\n",
+        )
+        self.assertTrue(run.call_args.kwargs["write"])
+
+    def test_issue_update_requires_confirmation_before_running(self) -> None:
+        client = GitHubClient()
+        plan = GitHubIssueUpdatePlan("example/project", 12, "Title", "Body", "a" * 32)
+        with (
+            mock.patch.object(client, "_run") as run,
+            self.assertRaisesRegex(GitHubError, "confirmation"),
+        ):
+            client.submit_issue_update(plan, confirmed=False)
+        run.assert_not_called()
+
+    def test_issue_update_timeout_is_ambiguous(self) -> None:
+        client = GitHubClient()
+        plan = GitHubIssueUpdatePlan("example/project", 12, "Title", "Body", "a" * 32)
+        with (
+            mock.patch(
+                "local_voice_harness.integrations.github.run_command",
+                side_effect=subprocess.TimeoutExpired(["gh", "issue", "edit"], 30),
+            ),
+            self.assertRaises(GitHubOperationAmbiguous),
+        ):
+            client.submit_issue_update(plan, confirmed=True)
+
+    def test_issue_update_observation_requires_marker_and_title(self) -> None:
+        client = GitHubClient()
+        plan = GitHubIssueUpdatePlan(
+            "example/project", 12, "Fix startup", "Body", "a" * 32
+        )
+        payload = {
+            "number": 12,
+            "html_url": "https://github.com/example/project/issues/12",
+            "title": "Fix startup",
+            "body": (f"Body\n\n<!-- local-voice-harness-correlation:{'a' * 32} -->"),
+        }
+        with mock.patch.object(
+            client, "_run", return_value=_completed(json.dumps(payload))
+        ) as run:
+            result = client.observe_issue_update(plan)
+
+        self.assertEqual(result, client._update_result(plan, payload["html_url"]))
+        self.assertEqual(
+            run.call_args.args[0],
+            [
+                "gh",
+                "api",
+                "--method",
+                "GET",
+                "repos/example/project/issues/12",
+            ],
+        )
+
+        missing_marker = dict(payload, body="Body without marker")
+        with mock.patch.object(
+            client, "_run", return_value=_completed(json.dumps(missing_marker))
+        ):
+            self.assertIsNone(client.observe_issue_update(plan))
+
+        wrong_title = dict(payload, title="Other title")
+        with mock.patch.object(
+            client, "_run", return_value=_completed(json.dumps(wrong_title))
+        ):
+            self.assertIsNone(client.observe_issue_update(plan))
 
     def test_issue_observation_lists_recent_issues_and_matches_marker(self) -> None:
         client = GitHubClient()

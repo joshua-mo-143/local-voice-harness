@@ -1073,6 +1073,140 @@ def reconcile_uncertain_linear_ticket_creation(
     store.update(job.id, reconcile)
 
 
+def reconcile_uncertain_issue_update(
+    store: JobStore,
+    job: CursorJob,
+    *,
+    now: float,
+    github_factory: GitHubFactory = GitHubClient,
+) -> None:
+    states = frozenset({"submitting", "submitted", "ambiguous"})
+    if job.github_issue_update_operation_state not in states:
+        return
+    repository = job.github_repository or ""
+    number = job.github_issue
+    title = job.github_issue_update_title or ""
+    body = job.github_issue_update_body or ""
+    marker = job.github_issue_update_marker
+    if number is None:
+        return
+    try:
+        github = _github_provider(github_factory)
+        plan = github.plan_issue_update(
+            repository,
+            number,
+            title,
+            body,
+            correlation_marker=marker,
+        )
+        result = github.observe_issue_update(plan)
+    except GitHubError:
+        result = None
+
+    def reconcile(current: CursorJob) -> CursorJob | None:
+        if current.github_issue_update_operation_state not in states:
+            return None
+        if result is None:
+            message = (
+                "GitHub issue update could not be reconciled automatically. "
+                "Check the issue before trying again."
+            )
+            return current.evolve_recovery(
+                now=now,
+                status=JobStatus.BLOCKED,
+                github_issue_update_operation_state="manual_required",
+                result=message,
+                completed_at=now,
+                reconcile=False,
+                worker_operation=None,
+                worker_pid=None,
+                worker_boot_id=None,
+                worker_process_start=None,
+                worker_token=None,
+                prepare_delivery=True,
+            )
+        return current.evolve_recovery(
+            now=now,
+            status=JobStatus.COMPLETED,
+            github_issue_update_operation_state="created",
+            result=f"Updated GitHub issue {result.issue.reference}: {result.url}",
+            completed_at=now,
+            reconcile=False,
+            worker_operation=None,
+            worker_pid=None,
+            worker_boot_id=None,
+            worker_process_start=None,
+            worker_token=None,
+            prepare_delivery=True,
+        )
+
+    store.update(job.id, reconcile)
+
+
+def reconcile_uncertain_linear_ticket_update(
+    store: JobStore,
+    job: CursorJob,
+    *,
+    now: float,
+    herdr_factory: HerdrFactory = HerdrClient,
+    linear_factory: LinearFactory | None = None,
+) -> None:
+    states = frozenset({"submitted", "ambiguous"})
+    if job.linear_ticket_update_operation_state not in states:
+        return
+    try:
+        provider = _linear_provider(linear_factory)
+        plan = provider.plan_ticket_update(
+            job.linear_ticket_update_issue_id or "",
+            job.issue_key or "",
+            job.linear_ticket_update_title or "",
+            job.linear_ticket_update_description or "",
+            correlation_marker=job.linear_ticket_update_marker,
+        )
+        result = provider.observe_ticket_update(herdr_factory(), plan)
+    except (HarnessError, LinearError):
+        return
+
+    def reconcile(current: CursorJob) -> CursorJob | None:
+        if current.linear_ticket_update_operation_state not in states:
+            return None
+        if result is None:
+            message = (
+                "Linear ticket update could not be reconciled automatically. "
+                "Check the ticket before trying again."
+            )
+            return current.evolve_recovery(
+                now=now,
+                status=JobStatus.BLOCKED,
+                linear_ticket_update_operation_state="manual_required",
+                result=message,
+                completed_at=now,
+                reconcile=False,
+                worker_operation=None,
+                worker_pid=None,
+                worker_boot_id=None,
+                worker_process_start=None,
+                worker_token=None,
+                prepare_delivery=True,
+            )
+        return current.evolve_recovery(
+            now=now,
+            status=JobStatus.COMPLETED,
+            linear_ticket_update_operation_state="created",
+            result=f"Updated Linear ticket {result.issue.identifier}: {result.url}",
+            completed_at=now,
+            reconcile=False,
+            worker_operation=None,
+            worker_pid=None,
+            worker_boot_id=None,
+            worker_process_start=None,
+            worker_token=None,
+            prepare_delivery=True,
+        )
+
+    store.update(job.id, reconcile)
+
+
 def reconcile_uncertain_worktree(
     store: JobStore,
     job: CursorJob,
@@ -1261,6 +1395,21 @@ def reconcile_uncertain_operations(
     )
     current = store.get(job.id)
     reconcile_uncertain_clone(store, current, now=now, github_factory=github_factory)
+    current = store.get(job.id)
+    reconcile_uncertain_issue_update(
+        store,
+        current,
+        now=now,
+        github_factory=github_factory,
+    )
+    current = store.get(job.id)
+    reconcile_uncertain_linear_ticket_update(
+        store,
+        current,
+        now=now,
+        herdr_factory=herdr_factory,
+        linear_factory=linear_factory,
+    )
     current = store.get(job.id)
     reconcile_uncertain_fork(store, current, now=now, github_factory=github_factory)
     current = store.get(job.id)

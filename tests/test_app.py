@@ -1739,6 +1739,76 @@ class CursorFastPathTests(unittest.TestCase):
             settings=mock.ANY,
         )
 
+    def test_ticket_update_without_identity_asks_which_ticket(self) -> None:
+        context = RequestContext("update this ticket title")
+        with (
+            mock.patch.object(app, "start_components"),
+            mock.patch.object(app, "request_context", return_value=context),
+            mock.patch.object(
+                app,
+                "route_intent",
+                return_value=IntentRoute(Intent.GITHUB_ISSUE_UPDATE, "high"),
+            ),
+            mock.patch.object(app, "cursor_turn") as cursor,
+            mock.patch.object(app, "qwen_response") as qwen,
+            mock.patch.object(app, "stream_and_play") as play,
+        ):
+            app.respond("update this ticket title")
+
+        cursor.assert_not_called()
+        qwen.assert_not_called()
+        play.assert_called_once_with("Which ticket should I update?", settings=mock.ANY)
+
+    def test_ticket_update_dispatches_dedicated_durable_job(self) -> None:
+        context = RequestContext(
+            "update this ticket title",
+            focused_issue="owner/repo#12",
+        )
+        with (
+            mock.patch.object(app, "start_components"),
+            mock.patch.object(app, "request_context", return_value=context),
+            mock.patch.object(
+                app,
+                "route_intent",
+                return_value=IntentRoute(Intent.GITHUB_ISSUE_UPDATE, "high"),
+            ),
+            mock.patch.object(
+                app, "cursor_turn", return_value=("drafted", "job")
+            ) as cursor,
+            mock.patch.object(app, "stream_and_play"),
+        ):
+            app.respond("update this ticket title")
+
+        request = cursor.call_args.args[0]
+        self.assertTrue(request.github_issue_update_requested)
+        self.assertEqual(request.github_repository, "owner/repo")
+        self.assertEqual(request.github_issue, 12)
+        self.assertFalse(request.github_issue_create_requested)
+
+    def test_low_confidence_ticket_update_does_not_write(self) -> None:
+        context = RequestContext(
+            "update this ticket title",
+            focused_issue="owner/repo#12",
+        )
+        with (
+            mock.patch.object(app, "start_components"),
+            mock.patch.object(app, "request_context", return_value=context),
+            mock.patch.object(
+                app,
+                "route_intent",
+                return_value=IntentRoute(Intent.GITHUB_ISSUE_UPDATE, "low"),
+            ),
+            mock.patch.object(app, "cursor_turn") as cursor,
+            mock.patch.object(app, "qwen_response") as qwen,
+            mock.patch.object(app, "stream_and_play") as play,
+        ):
+            app.respond("update this ticket title")
+
+        cursor.assert_not_called()
+        qwen.assert_not_called()
+        play.assert_called_once()
+        self.assertIn("did not update a ticket", play.call_args.args[0])
+
     def test_github_issue_creation_dispatches_dedicated_durable_job(self) -> None:
         context = RequestContext(
             "create an issue in this repo",

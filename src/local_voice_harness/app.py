@@ -59,6 +59,11 @@ from .self_management import (
 )
 from .speech import SpeechRenderer
 from .ticket_targets import MISSING_ISSUE_SCOPE_RESPONSE, extract_ticket_targets
+from .ticket_update import (
+    admit_ticket_update,
+    update_turn_arguments,
+    wants_ticket_update_context,
+)
 from .tts.client import stream_and_play
 from .user_config import UserConfig, load_user_config
 from .vocabulary import parse_spoken_alias_request, resolve_aliases
@@ -95,10 +100,13 @@ def _context_for_route(
                 Intent.GITHUB_REPO_CREATE,
                 Intent.GITHUB_ORG_REPO_CREATE,
                 Intent.LINEAR_TICKET_CREATE,
+                Intent.GITHUB_ISSUE_UPDATE,
+                Intent.LINEAR_TICKET_UPDATE,
                 Intent.WORKSPACE_CONSULTATION,
             }
         )
         or cursor_consultation.wants_ticket_consultation_context(text)
+        or wants_ticket_update_context(text)
     ):
         return request_context(
             text,
@@ -273,6 +281,11 @@ def respond(text: str, *, user_config: UserConfig | None = None) -> None:
                 extraction,
                 focused_issue=context.focused_issue,
             )
+            update_admission = admit_ticket_update(
+                text,
+                extraction,
+                focused_issue=context.focused_issue,
+            )
             if cursor_consultation.is_apply_recommendation_request(text):
                 choice_id = (
                     cursor_consultation.applicable_choice_id(
@@ -330,6 +343,33 @@ def respond(text: str, *, user_config: UserConfig | None = None) -> None:
                             )
                     except Exception:  # noqa: BLE001 - consultation fails closed
                         response = cursor_consultation.CONSULTATION_FAILED
+            elif update_admission is not None:
+                if update_admission.ticket is None:
+                    response = update_admission.missing_identity_response
+                elif not route.actionable:
+                    response = (
+                        "I did not update a ticket because the request was unclear. "
+                        "Please name the ticket and the title or body change."
+                    )
+                else:
+                    dispatch = update_turn_arguments(update_admission.ticket)
+                    response = cursor_turn(
+                        CursorTurnRequest(
+                            context.text,
+                            utterance=text,
+                            github_repository=dispatch.github_repository,
+                            github_issue=dispatch.github_issue,
+                            github_issue_update_requested=(
+                                dispatch.github_issue_update_requested
+                            ),
+                            issue_key=dispatch.issue_key,
+                            linear_ticket_update_requested=(
+                                dispatch.linear_ticket_update_requested
+                            ),
+                        ),
+                        delivery_claims=delivery_claims,
+                        integrations=integrations,
+                    )[0]
             elif route.actionable and route.intent == Intent.GITHUB_PR_MERGE:
                 identity = resolve_pull_request_merge_identity(
                     utterance=text,
@@ -526,6 +566,14 @@ def respond(text: str, *, user_config: UserConfig | None = None) -> None:
                 response = (
                     "I did not create a Linear ticket because the request was unclear. "
                     "Please name the Linear team and ticket."
+                )
+            elif route.intent in {
+                Intent.GITHUB_ISSUE_UPDATE,
+                Intent.LINEAR_TICKET_UPDATE,
+            }:
+                response = (
+                    "I did not update a ticket because the request was unclear. "
+                    "Please name the ticket and the title or body change."
                 )
             elif route.actionable and route.intent in CURSOR_MANAGEMENT_ACTIONS:
                 response = cursor_turn(

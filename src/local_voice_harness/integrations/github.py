@@ -291,6 +291,23 @@ class GitHubRepoCreationResult:
 
 
 @dataclass(frozen=True)
+class GitHubIssueUpdatePlan:
+    repository: str
+    number: int
+    title: str
+    body: str
+    correlation_marker: str
+
+
+@dataclass(frozen=True)
+class GitHubIssueUpdateResult:
+    issue: GitHubIssue
+    url: str
+    title: str
+    correlation_marker: str
+
+
+@dataclass(frozen=True)
 class GitHubPullRequest:
     owner: str
     repository: str
@@ -649,6 +666,99 @@ class GitHubClient:
         if len(matches) > 1:
             raise GitHubError("GitHub issue correlation marker is not unique")
         return matches[0] if matches else None
+
+    @staticmethod
+    def validate_issue_update_plan(plan: GitHubIssueUpdatePlan) -> None:
+        GitHubClient.validate_issue_creation_plan(
+            GitHubIssueCreationPlan(
+                plan.repository,
+                plan.title,
+                plan.body,
+                plan.correlation_marker,
+            )
+        )
+        if not isinstance(plan.number, int) or plan.number < 1:
+            raise GitHubError("GitHub issue number must be positive")
+
+    def submit_issue_update(
+        self,
+        plan: GitHubIssueUpdatePlan,
+        *,
+        confirmed: bool,
+    ) -> GitHubIssueUpdateResult:
+        if not confirmed:
+            raise GitHubError("GitHub issue update requires explicit confirmation")
+        self.validate_issue_update_plan(plan)
+        submitted_body = (
+            f"{plan.body.rstrip()}\n\n{self._issue_marker(plan.correlation_marker)}\n"
+        )
+        process = self._run(
+            [
+                self.gh_executable,
+                "issue",
+                "edit",
+                str(plan.number),
+                "--repo",
+                plan.repository,
+                "--title",
+                plan.title,
+                "--body-file",
+                "-",
+            ],
+            timeout=30,
+            write=True,
+            stdin=submitted_body,
+        )
+        try:
+            return self._update_result(plan, process.stdout)
+        except GitHubError as exc:
+            raise GitHubOperationAmbiguous(
+                "GitHub write completed without a provable result; an external "
+                "side effect may already have occurred"
+            ) from exc
+
+    def observe_issue_update(
+        self, plan: GitHubIssueUpdatePlan
+    ) -> GitHubIssueUpdateResult | None:
+        self.validate_issue_update_plan(plan)
+        process = self._run(
+            [
+                self.gh_executable,
+                "api",
+                "--method",
+                "GET",
+                f"repos/{plan.repository}/issues/{plan.number}",
+            ],
+            timeout=15,
+        )
+        try:
+            value = json.loads(process.stdout)
+        except json.JSONDecodeError as exc:
+            raise GitHubError("GitHub returned malformed issue metadata") from exc
+        if not isinstance(value, dict) or "pull_request" in value:
+            raise GitHubError("GitHub returned malformed issue metadata")
+        marker = self._issue_marker(plan.correlation_marker)
+        if marker not in str(value.get("body") or ""):
+            return None
+        if str(value.get("title") or "").strip() != plan.title:
+            return None
+        return self._update_result(plan, value.get("html_url"))
+
+    def _update_result(
+        self, plan: GitHubIssueUpdatePlan, url: object
+    ) -> GitHubIssueUpdateResult:
+        value = str(url or "").strip()
+        issue = github_issue_from_url(value)
+        if issue is None or value != issue.url:
+            raise GitHubError("GitHub returned a non-canonical issue URL")
+        if (
+            issue.name_with_owner.casefold() != plan.repository.casefold()
+            or issue.number != plan.number
+        ):
+            raise GitHubError("GitHub updated an unexpected issue")
+        return GitHubIssueUpdateResult(
+            issue, value, plan.title, plan.correlation_marker
+        )
 
     @staticmethod
     def validate_pull_request_creation_plan(
@@ -2273,6 +2383,14 @@ _GITHUB_STATE_SECTIONS: dict[str, dict[str, str]] = {
         "operation_state": "github_repo_create_operation_state",
         "created_url": "github_repo_created_url",
     },
+    "issue_update": {
+        "requested": "github_issue_update_requested",
+        "confirmed": "github_issue_update_confirmed",
+        "title": "github_issue_update_title",
+        "body": "github_issue_update_body",
+        "marker": "github_issue_update_marker",
+        "operation_state": "github_issue_update_operation_state",
+    },
     "pull_request": {
         "number": "github_pull_request",
         "worktree_state": "pull_request_worktree_state",
@@ -2702,6 +2820,54 @@ class GitHubProvider:
 
     def require_organization_membership(self, organization: str) -> str:
         return self._client.require_organization_membership(organization)
+
+    def plan_issue_update(
+        self,
+        repository: str,
+        number: int,
+        title: str,
+        body: str,
+        *,
+        correlation_marker: str | None = None,
+    ) -> GitHubIssueUpdatePlan:
+        if not isinstance(repository, str):
+            raise GitHubError("GitHub issue repository must be text")
+        if not isinstance(title, str):
+            raise GitHubError("GitHub issue title must be text")
+        if not isinstance(body, str):
+            raise GitHubError("GitHub issue body must be text")
+        if not isinstance(number, int) or number < 1:
+            raise GitHubError("GitHub issue number must be positive")
+        plan = GitHubIssueUpdatePlan(
+            repository=GitHubClient.validate_repository(repository),
+            number=number,
+            title=title.strip(),
+            body=body.strip(),
+            correlation_marker=correlation_marker or secrets.token_hex(16),
+        )
+        self.validate_issue_update_plan(plan)
+        return plan
+
+    @staticmethod
+    def validate_issue_update_plan(plan: GitHubIssueUpdatePlan) -> None:
+        GitHubClient.validate_issue_update_plan(plan)
+
+    def observe_issue_update(
+        self, plan: GitHubIssueUpdatePlan
+    ) -> GitHubIssueUpdateResult | None:
+        self.validate_issue_update_plan(plan)
+        return self._client.observe_issue_update(plan)
+
+    def submit_issue_update(
+        self,
+        plan: GitHubIssueUpdatePlan,
+        *,
+        confirmed: bool,
+    ) -> GitHubIssueUpdateResult:
+        if not confirmed:
+            raise GitHubError("GitHub issue update requires explicit confirmation")
+        self.validate_issue_update_plan(plan)
+        return self._client.submit_issue_update(plan, confirmed=True)
 
     def materialize_repository(
         self,

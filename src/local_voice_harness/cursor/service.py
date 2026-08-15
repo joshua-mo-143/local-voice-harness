@@ -128,8 +128,10 @@ class StartJobRequest:
     github_pr_merge_number: int | None = None
     github_repo_create_requested: bool = False
     github_repo_create_org_requested: bool = False
+    github_issue_update_requested: bool = False
     linear_team: str | None = None
     linear_ticket_create_requested: bool = False
+    linear_ticket_update_requested: bool = False
     fork_requested: bool = False
     github_pull_request: int | None = None
     agent: str | None = None
@@ -154,8 +156,10 @@ class CursorTurnRequest:
     github_pr_merge_number: int | None = None
     github_repo_create_requested: bool = False
     github_repo_create_org_requested: bool = False
+    github_issue_update_requested: bool = False
     linear_team: str | None = None
     linear_ticket_create_requested: bool = False
+    linear_ticket_update_requested: bool = False
     fork_requested: bool = False
     github_pull_request: int | None = None
     agent: str | None = None
@@ -389,6 +393,10 @@ def _build_start_job(
             or request.github_repo_create_requested
             or request.linear_ticket_create_requested
         )
+        and not (
+            request.github_issue_update_requested
+            or request.linear_ticket_update_requested
+        )
         else (
             request.issue_key
             if request.issue_key is not None
@@ -401,7 +409,10 @@ def _build_start_job(
         if resolved_issue_key
         else (
             "linear"
-            if request.linear_ticket_create_requested
+            if (
+                request.linear_ticket_create_requested
+                or request.linear_ticket_update_requested
+            )
             else (
                 "github"
                 if (
@@ -409,6 +420,7 @@ def _build_start_job(
                     or request.github_issue_create_requested
                     or request.github_pr_merge_requested
                     or request.github_repo_create_requested
+                    or request.github_issue_update_requested
                 )
                 else None
             )
@@ -435,7 +447,9 @@ def _build_start_job(
         )
     elif request.issue_key is not None:
         raise HarnessError("selected issue provider is unavailable")
-    if issue_provider == "github" or request.linear_ticket_create_requested:
+    if issue_provider == "github" or (
+        request.linear_ticket_create_requested or request.linear_ticket_update_requested
+    ):
         require_issue_provider(issue_provider, registry)
     if harness_kind == HarnessKind.OPENCODE:
         client = registry.herdr_client()
@@ -471,7 +485,9 @@ def _build_start_job(
             github_pr_merge_number=request.github_pr_merge_number,
             github_repo_create_requested=request.github_repo_create_requested,
             github_repo_create_org_requested=request.github_repo_create_org_requested,
+            github_issue_update_requested=request.github_issue_update_requested,
             linear_ticket_create_requested=request.linear_ticket_create_requested,
+            linear_ticket_update_requested=request.linear_ticket_update_requested,
             linear_ticket_create_team=request.linear_team,
             fork_requested=request.fork_requested,
             github_pull_request=request.github_pull_request,
@@ -532,8 +548,10 @@ def start_job(
     github_pr_merge_number: int | None = None,
     github_repo_create_requested: bool = False,
     github_repo_create_org_requested: bool = False,
+    github_issue_update_requested: bool = False,
     linear_team: str | None = None,
     linear_ticket_create_requested: bool = False,
+    linear_ticket_update_requested: bool = False,
     fork_requested: bool = False,
     github_pull_request: int | None = None,
     agent: str | None = None,
@@ -560,8 +578,10 @@ def start_job(
             github_pr_merge_number=github_pr_merge_number,
             github_repo_create_requested=github_repo_create_requested,
             github_repo_create_org_requested=github_repo_create_org_requested,
+            github_issue_update_requested=github_issue_update_requested,
             linear_team=linear_team,
             linear_ticket_create_requested=linear_ticket_create_requested,
+            linear_ticket_update_requested=linear_ticket_update_requested,
             fork_requested=fork_requested,
             github_pull_request=github_pull_request,
             agent=agent,
@@ -2666,8 +2686,10 @@ def cursor_turn(
     github_pr_merge_number: int | None = None,
     github_repo_create_requested: bool = False,
     github_repo_create_org_requested: bool = False,
+    github_issue_update_requested: bool = False,
     linear_team: str | None = None,
     linear_ticket_create_requested: bool = False,
+    linear_ticket_update_requested: bool = False,
     fork_requested: bool = False,
     github_pull_request: int | None = None,
     agent: str | None = None,
@@ -2704,8 +2726,10 @@ def cursor_turn(
         github_pr_merge_number = request.github_pr_merge_number
         github_repo_create_requested = request.github_repo_create_requested
         github_repo_create_org_requested = request.github_repo_create_org_requested
+        github_issue_update_requested = request.github_issue_update_requested
         linear_team = request.linear_team
         linear_ticket_create_requested = request.linear_ticket_create_requested
+        linear_ticket_update_requested = request.linear_ticket_update_requested
         fork_requested = request.fork_requested
         github_pull_request = request.github_pull_request
         agent = request.agent
@@ -2889,8 +2913,10 @@ def cursor_turn(
                 github_pr_merge_number=github_pr_merge_number,
                 github_repo_create_requested=github_repo_create_requested,
                 github_repo_create_org_requested=github_repo_create_org_requested,
+                github_issue_update_requested=github_issue_update_requested,
                 linear_team=linear_team,
                 linear_ticket_create_requested=linear_ticket_create_requested,
+                linear_ticket_update_requested=linear_ticket_update_requested,
                 fork_requested=fork_requested,
                 github_pull_request=github_pull_request,
                 agent=agent,
@@ -2944,8 +2970,10 @@ def cursor_turn(
                 github_pr_merge_number=github_pr_merge_number,
                 github_repo_create_requested=github_repo_create_requested,
                 github_repo_create_org_requested=github_repo_create_org_requested,
+                github_issue_update_requested=github_issue_update_requested,
                 linear_team=linear_team,
                 linear_ticket_create_requested=linear_ticket_create_requested,
+                linear_ticket_update_requested=linear_ticket_update_requested,
                 fork_requested=fork_requested,
                 github_pull_request=github_pull_request,
                 agent=agent,
@@ -3049,11 +3077,27 @@ def render_job_announcement(job: CursorJob) -> AssistantResponse:
                 spoken_text=(f"Created GitHub repository {job.github_repository}."),
                 display_text=detail,
             )
+        if (
+            job.github_issue_update_requested
+            and job.github_issue_update_operation_state == "created"
+        ):
+            return AssistantResponse(
+                spoken_text=f"Updated GitHub issue {job.github_repository}#{job.github_issue}.",
+                display_text=detail,
+            )
         if job.linear_ticket_create_requested and job.linear_ticket_created_identifier:
             return AssistantResponse(
                 spoken_text=(
                     f"Created Linear ticket {job.linear_ticket_created_identifier}."
                 ),
+                display_text=detail,
+            )
+        if (
+            job.linear_ticket_update_requested
+            and job.linear_ticket_update_operation_state == "created"
+        ):
+            return AssistantResponse(
+                spoken_text=f"Updated Linear ticket {job.issue_key}.",
                 display_text=detail,
             )
         return AssistantResponse(
@@ -3123,6 +3167,22 @@ def render_job_announcement(job: CursorJob) -> AssistantResponse:
                 spoken_text=(
                     f"I drafted “{job.linear_ticket_create_title}” for Linear team "
                     f"{job.linear_ticket_create_team}. Should I create it?"
+                ),
+                display_text=question,
+            )
+        if job.clarification_kind == "github_issue_update_confirmation":
+            return AssistantResponse(
+                spoken_text=(
+                    f"I drafted “{job.github_issue_update_title}” for "
+                    f"{job.github_repository}#{job.github_issue}. Should I update it?"
+                ),
+                display_text=question,
+            )
+        if job.clarification_kind == "linear_ticket_update_confirmation":
+            return AssistantResponse(
+                spoken_text=(
+                    f"I drafted “{job.linear_ticket_update_title}” for "
+                    f"{job.issue_key}. Should I update it?"
                 ),
                 display_text=question,
             )
@@ -3254,6 +3314,8 @@ def _foreground_delivery_result(
             or completed.github_pr_merge_requested
             or completed.github_repo_create_requested
             or completed.linear_ticket_create_requested
+            or completed.github_issue_update_requested
+            or completed.linear_ticket_update_requested
         ):
             return CursorTurnResult(
                 render_job_announcement(completed), None, mutated=True
@@ -3345,6 +3407,31 @@ def _foreground_delivery_result(
                         f"I drafted “{awaiting.linear_ticket_create_title}” for "
                         f"Linear team {awaiting.linear_ticket_create_team}. "
                         "Should I create it?"
+                    ),
+                    display_text=rendered_question,
+                ),
+                job_id,
+                mutated=True,
+            )
+        if awaiting.clarification_kind == "github_issue_update_confirmation":
+            return CursorTurnResult(
+                AssistantResponse(
+                    spoken_text=(
+                        f"I drafted “{awaiting.github_issue_update_title}” for "
+                        f"{awaiting.github_repository}#{awaiting.github_issue}. "
+                        "Should I update it?"
+                    ),
+                    display_text=rendered_question,
+                ),
+                job_id,
+                mutated=True,
+            )
+        if awaiting.clarification_kind == "linear_ticket_update_confirmation":
+            return CursorTurnResult(
+                AssistantResponse(
+                    spoken_text=(
+                        f"I drafted “{awaiting.linear_ticket_update_title}” for "
+                        f"{awaiting.issue_key}. Should I update it?"
                     ),
                     display_text=rendered_question,
                 ),

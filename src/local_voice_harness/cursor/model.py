@@ -214,8 +214,12 @@ _BOOL_FIELDS = frozenset(
         "github_repo_create_org_requested",
         "github_repo_create_continue_workflow",
         "github_repo_create_confirmed",
+        "github_issue_update_requested",
+        "github_issue_update_confirmed",
         "linear_ticket_create_requested",
         "linear_ticket_create_confirmed",
+        "linear_ticket_update_requested",
+        "linear_ticket_update_confirmed",
         "fork_operation_source_private",
         "agent_dispatch_exited",
         "worktree_dispatch_exited",
@@ -260,6 +264,7 @@ _INT_FIELDS = frozenset(
         "plan_approval_state_change_sequence",
         "plan_approval_revision",
         "linear_ticket_create_baseline_sequence",
+        "linear_ticket_update_baseline_sequence",
         "agent_state_sequence",
         "session_control_generation",
     }
@@ -344,6 +349,10 @@ _STRING_FIELDS = frozenset(
         "github_repo_create_marker",
         "github_repo_create_operation_state",
         "github_repo_created_url",
+        "github_issue_update_title",
+        "github_issue_update_body",
+        "github_issue_update_marker",
+        "github_issue_update_operation_state",
         "linear_ticket_create_team",
         "linear_ticket_create_team_id",
         "linear_ticket_create_title",
@@ -355,6 +364,14 @@ _STRING_FIELDS = frozenset(
         "linear_ticket_create_prompt_token",
         "linear_ticket_created_identifier",
         "linear_ticket_created_url",
+        "linear_ticket_update_title",
+        "linear_ticket_update_description",
+        "linear_ticket_update_marker",
+        "linear_ticket_update_operation_state",
+        "linear_ticket_update_issue_id",
+        "linear_ticket_update_prompt_target",
+        "linear_ticket_update_prompt_session",
+        "linear_ticket_update_prompt_token",
         "worktree_branch",
         "worktree_label",
         "worktree_path",
@@ -559,7 +576,9 @@ class NewAgentJob:
     github_pr_merge_number: int | None = None
     github_repo_create_requested: bool = False
     github_repo_create_org_requested: bool = False
+    github_issue_update_requested: bool = False
     linear_ticket_create_requested: bool = False
+    linear_ticket_update_requested: bool = False
     linear_ticket_create_team: str | None = None
     linear_ticket_create_team_id: str | None = None
     linear_ticket_create_title: str | None = None
@@ -718,6 +737,17 @@ _LINEAR_STATE_FIELDS = frozenset(
         "linear_ticket_create_baseline_sequence",
         "linear_ticket_created_identifier",
         "linear_ticket_created_url",
+        "linear_ticket_update_requested",
+        "linear_ticket_update_confirmed",
+        "linear_ticket_update_title",
+        "linear_ticket_update_description",
+        "linear_ticket_update_marker",
+        "linear_ticket_update_operation_state",
+        "linear_ticket_update_issue_id",
+        "linear_ticket_update_prompt_target",
+        "linear_ticket_update_prompt_session",
+        "linear_ticket_update_prompt_token",
+        "linear_ticket_update_baseline_sequence",
     }
 )
 _CHECKOUT_ALIASES = {
@@ -2072,7 +2102,9 @@ class AgentJob:
                 "github_repo_create_org_requested": (
                     spec.github_repo_create_org_requested
                 ),
+                "github_issue_update_requested": spec.github_issue_update_requested,
                 "linear_ticket_create_requested": spec.linear_ticket_create_requested,
+                "linear_ticket_update_requested": spec.linear_ticket_update_requested,
                 "linear_ticket_create_team": spec.linear_ticket_create_team,
                 "linear_ticket_create_team_id": spec.linear_ticket_create_team_id,
                 "linear_ticket_create_title": spec.linear_ticket_create_title,
@@ -2759,6 +2791,30 @@ class AgentJob:
         return self._optional_string("github_repo_created_url")
 
     @property
+    def github_issue_update_requested(self) -> bool:
+        return self._boolean_field("github_issue_update_requested")
+
+    @property
+    def github_issue_update_confirmed(self) -> bool:
+        return self._boolean_field("github_issue_update_confirmed")
+
+    @property
+    def github_issue_update_title(self) -> str | None:
+        return self._optional_string("github_issue_update_title")
+
+    @property
+    def github_issue_update_body(self) -> str | None:
+        return self._optional_string("github_issue_update_body")
+
+    @property
+    def github_issue_update_marker(self) -> str | None:
+        return self._optional_string("github_issue_update_marker")
+
+    @property
+    def github_issue_update_operation_state(self) -> str | None:
+        return self._optional_string("github_issue_update_operation_state")
+
+    @property
     def linear_ticket_create_requested(self) -> bool:
         return self._boolean_field("linear_ticket_create_requested")
 
@@ -2813,6 +2869,50 @@ class AgentJob:
     @property
     def linear_ticket_created_url(self) -> str | None:
         return self._optional_string("linear_ticket_created_url")
+
+    @property
+    def linear_ticket_update_requested(self) -> bool:
+        return self._boolean_field("linear_ticket_update_requested")
+
+    @property
+    def linear_ticket_update_confirmed(self) -> bool:
+        return self._boolean_field("linear_ticket_update_confirmed")
+
+    @property
+    def linear_ticket_update_title(self) -> str | None:
+        return self._optional_string("linear_ticket_update_title")
+
+    @property
+    def linear_ticket_update_description(self) -> str | None:
+        return self._optional_string("linear_ticket_update_description")
+
+    @property
+    def linear_ticket_update_marker(self) -> str | None:
+        return self._optional_string("linear_ticket_update_marker")
+
+    @property
+    def linear_ticket_update_operation_state(self) -> str | None:
+        return self._optional_string("linear_ticket_update_operation_state")
+
+    @property
+    def linear_ticket_update_issue_id(self) -> str | None:
+        return self._optional_string("linear_ticket_update_issue_id")
+
+    @property
+    def linear_ticket_update_prompt_target(self) -> str | None:
+        return self._optional_string("linear_ticket_update_prompt_target")
+
+    @property
+    def linear_ticket_update_prompt_session(self) -> str | None:
+        return self._optional_string("linear_ticket_update_prompt_session")
+
+    @property
+    def linear_ticket_update_prompt_token(self) -> str | None:
+        return self._optional_string("linear_ticket_update_prompt_token")
+
+    @property
+    def linear_ticket_update_baseline_sequence(self) -> int | None:
+        return self._optional_int("linear_ticket_update_baseline_sequence")
 
     @property
     def github_pull_request(self) -> int | None:
@@ -4176,6 +4276,31 @@ class AgentJob:
                 "GitHub repository creation operation requires repository, "
                 "visibility, and marker"
             )
+        if (
+            self.github_issue_update_operation_state is not None
+            and self.github_issue_update_operation_state
+            not in _ISSUE_CREATE_OPERATION_STATES
+        ):
+            raise JobValidationError("github_issue_update_operation_state is invalid")
+        if (
+            self.github_issue_update_confirmed
+            and not self.github_issue_update_requested
+        ):
+            raise JobValidationError(
+                "GitHub issue update confirmation requires an update request"
+            )
+        if self.github_issue_update_operation_state is not None and not all(
+            (
+                self.github_repository,
+                self.github_issue,
+                self.github_issue_update_title,
+                self.github_issue_update_marker,
+            )
+        ):
+            raise JobValidationError(
+                "GitHub issue update operation requires repository, issue, title, "
+                "and marker"
+            )
         if self.github_issue_create_operation_state is not None and not all(
             (
                 self.github_repository,
@@ -4241,6 +4366,44 @@ class AgentJob:
                     "Linear ticket submission requires a durable prompt fence"
                 )
         if (
+            self.linear_ticket_update_operation_state is not None
+            and self.linear_ticket_update_operation_state
+            not in _ISSUE_CREATE_OPERATION_STATES
+        ):
+            raise JobValidationError("linear_ticket_update_operation_state is invalid")
+        if (
+            self.linear_ticket_update_confirmed
+            and not self.linear_ticket_update_requested
+        ):
+            raise JobValidationError(
+                "Linear ticket update confirmation requires an update request"
+            )
+        if self.linear_ticket_update_operation_state is not None and not all(
+            (
+                self.issue_key,
+                self.linear_ticket_update_title,
+                self.linear_ticket_update_marker,
+            )
+        ):
+            raise JobValidationError(
+                "Linear ticket update operation requires identifier, title, and marker"
+            )
+        if self.linear_ticket_update_operation_state in {"submitting", "submitted"}:
+            if (
+                not all(
+                    (
+                        self.linear_ticket_update_issue_id,
+                        self.linear_ticket_update_prompt_target,
+                        self.linear_ticket_update_prompt_session,
+                        self.linear_ticket_update_prompt_token,
+                    )
+                )
+                or self.linear_ticket_update_baseline_sequence is None
+            ):
+                raise JobValidationError(
+                    "Linear ticket update submission requires a durable prompt fence"
+                )
+        if (
             self.github_issue is not None
             and self.issue_key is None
             and self.issue_provider != "github"
@@ -4255,6 +4418,7 @@ class AgentJob:
             and not self.github_repo_create_requested
             and not self.github_pr_create_requested
             and not self.github_pr_merge_requested
+            and not self.github_issue_update_requested
         ):
             raise JobValidationError(
                 "github issue_provider requires a GitHub issue identity"
@@ -4263,7 +4427,11 @@ class AgentJob:
             self.issue_provider not in {None, "github"}
             and self.issue_key is None
             and not (
-                self.issue_provider == "linear" and self.linear_ticket_create_requested
+                self.issue_provider == "linear"
+                and (
+                    self.linear_ticket_create_requested
+                    or self.linear_ticket_update_requested
+                )
             )
         ):
             raise JobValidationError("selected issue_provider requires an issue key")
@@ -4680,7 +4848,10 @@ class AgentJob:
             or self.github_pr_merge_operation_state in {"submitted", "ambiguous"}
             or self.clone_operation_state in {"submitted", "ambiguous"}
             or self.github_repo_create_operation_state in {"submitted", "ambiguous"}
+            or self.github_issue_update_operation_state in {"submitted", "ambiguous"}
             or self.linear_ticket_create_operation_state
+            in {"submitting", "submitted", "ambiguous"}
+            or self.linear_ticket_update_operation_state
             in {"submitting", "submitted", "ambiguous"}
             or self.prompt_operation_state in {"submitting", "ambiguous"}
             or self.participant_creation_state

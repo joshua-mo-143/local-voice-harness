@@ -25,6 +25,7 @@ from ..integrations.github import (
     GitHubIssue,
     GitHubIssueCreationResult,
     GitHubIssueLookupError,
+    GitHubIssueUpdateResult,
     GitHubMergeQueueArmedError,
     GitHubOperationAmbiguous,
     GitHubPreconditionError,
@@ -56,6 +57,7 @@ from ..integrations.linear import (
     LinearIntegration,
     LinearOperationAmbiguous,
     LinearTicketCreationResult,
+    LinearTicketUpdateResult,
 )
 from ..integrations.registry import (
     IntegrationRegistry,
@@ -101,6 +103,7 @@ from ..questions import (
     resolve_question_prompt,
     submit_question_prompt,
 )
+from ..ticket_update import draft_ticket_update
 from ..user_config import (
     PlanApprovalMode,
     PlanApprovalPreferences,
@@ -2753,6 +2756,544 @@ def _run_linear_ticket_creation(
         queue_ambiguous()
         return
     _finish_linear_ticket_creation(
+        store,
+        job.id,
+        token,
+        visible,
+        expected_revision=callback_revision,
+    )
+
+
+def _finish_github_issue_update(
+    store: JobStore,
+    job_id: str,
+    token: WorkerClaim,
+    result: GitHubIssueUpdateResult,
+    *,
+    expected_revision: int,
+) -> None:
+    def finish(job: CursorJob) -> CursorJob:
+        now = time.time()
+        return job.evolve_for_delivery(
+            now=now,
+            status=JobStatus.COMPLETED,
+            result=f"Updated GitHub issue {result.issue.reference}: {result.url}",
+            completed_at=now,
+            github_issue_update_operation_state="created",
+            worker_pid=None,
+            worker_boot_id=None,
+            worker_process_start=None,
+            worker_token=None,
+            worker_operation=None,
+        )
+
+    _worker_change(
+        store,
+        job_id,
+        token,
+        {JobStatus.ROUTING, JobStatus.RUNNING},
+        finish,
+        expected_revision=expected_revision,
+    )
+
+
+def _run_github_issue_update(
+    store: JobStore,
+    job: CursorJob,
+    token: WorkerClaim,
+    clients: ClientFactories,
+    checkpoint: Callable[[], None],
+) -> None:
+    repository = (job.github_repository or "").strip()
+    number = job.github_issue
+    if not repository or number is None:
+        raise HarnessError("GitHub issue update requires a trusted ticket identity")
+    github = _github_provider(clients.github)
+    checkpoint()
+    source = github.resolve_repository(repository)
+    repository = source.name_with_owner
+    checkpoint()
+    if not job.github_issue_update_title or job.github_issue_update_body is None:
+        config = default_user_config()
+        draft = draft_ticket_update(
+            job.trusted_utterance or job.request,
+            f"{repository}#{number}",
+            settings=config.providers,
+        )
+        plan = github.plan_issue_update(
+            repository,
+            number,
+            draft.title,
+            draft.body,
+            correlation_marker=uuid.uuid4().hex,
+        )
+
+        def persist_draft(current: CursorJob) -> CursorJob:
+            return current.evolve(
+                github_repository=plan.repository,
+                github_issue=plan.number,
+                github_issue_update_title=plan.title,
+                github_issue_update_body=plan.body,
+                github_issue_update_marker=plan.correlation_marker,
+                github_issue_update_operation_state="planned",
+            )
+
+        updated = _worker_change(
+            store,
+            job.id,
+            token,
+            {JobStatus.ROUTING},
+            persist_draft,
+            expected_revision=job.revision,
+        )
+        if updated is None:
+            return
+        job = updated
+    plan = github.plan_issue_update(
+        job.github_repository or repository,
+        job.github_issue or number,
+        job.github_issue_update_title or "",
+        job.github_issue_update_body or "",
+        correlation_marker=job.github_issue_update_marker,
+    )
+    if not job.github_issue_update_confirmed:
+        preview = (
+            f"Update GitHub issue {plan.repository}#{plan.number}?\n\n"
+            f"Title: {plan.title}\n\nBody:\n{plan.body}\n\n"
+            "Say yes to update it or no to cancel."
+        )
+        _worker_question(
+            store,
+            job.id,
+            token,
+            preview,
+            expected_revision=job.revision,
+            clarification_kind="github_issue_update_confirmation",
+            sensitivity=QuestionSensitivity.DESTRUCTIVE,
+        )
+        return
+    if job.github_issue_update_operation_state not in {None, "planned"}:
+        raise HarnessError("GitHub issue update requires reconciliation before retry")
+
+    def mark_submitted(current: CursorJob) -> CursorJob:
+        return current.evolve(
+            status=JobStatus.RUNNING,
+            github_issue_update_operation_state="submitted",
+            worker_operation="github_issue_update",
+        )
+
+    submitted = _worker_change(
+        store,
+        job.id,
+        token,
+        {JobStatus.ROUTING},
+        mark_submitted,
+        expected_revision=job.revision,
+    )
+    if submitted is None:
+        return
+    try:
+        checkpoint()
+        result = github.submit_issue_update(plan, confirmed=True)
+    except GitHubError as exc:
+        checkpoint()
+        try:
+            visible = github.observe_issue_update(plan)
+        except GitHubError:
+            visible = None
+        if visible is not None:
+            _finish_github_issue_update(
+                store,
+                job.id,
+                token,
+                visible,
+                expected_revision=submitted.revision,
+            )
+            return
+        if not isinstance(exc, GitHubCommandStartError):
+
+            def ambiguous(current: CursorJob) -> CursorJob:
+                return current.evolve(
+                    status=JobStatus.QUEUED,
+                    queued_at=time.time(),
+                    github_issue_update_operation_state="ambiguous",
+                    reconcile=True,
+                    worker_pid=None,
+                    worker_boot_id=None,
+                    worker_process_start=None,
+                    worker_token=None,
+                    worker_operation=None,
+                )
+
+            _worker_change(
+                store,
+                job.id,
+                token,
+                {JobStatus.RUNNING},
+                ambiguous,
+                expected_revision=submitted.revision,
+            )
+            return
+
+        def retry_after_start_failure(current: CursorJob) -> CursorJob:
+            return current.evolve(
+                status=JobStatus.QUEUED,
+                queued_at=time.time(),
+                github_issue_update_operation_state="planned",
+                worker_pid=None,
+                worker_boot_id=None,
+                worker_process_start=None,
+                worker_token=None,
+                worker_operation=None,
+                worker_claim_operation=None,
+                worker_claimed_at=None,
+            )
+
+        _worker_change(
+            store,
+            job.id,
+            token,
+            {JobStatus.RUNNING},
+            retry_after_start_failure,
+            expected_revision=submitted.revision,
+        )
+        return
+    _finish_github_issue_update(
+        store,
+        job.id,
+        token,
+        result,
+        expected_revision=submitted.revision,
+    )
+
+
+def _finish_linear_ticket_update(
+    store: JobStore,
+    job_id: str,
+    token: WorkerClaim,
+    result: LinearTicketUpdateResult,
+    *,
+    expected_revision: int,
+) -> None:
+    def finish(job: CursorJob) -> CursorJob:
+        now = time.time()
+        return job.evolve_for_delivery(
+            now=now,
+            status=JobStatus.COMPLETED,
+            result=f"Updated Linear ticket {result.issue.identifier}: {result.url}",
+            completed_at=now,
+            linear_ticket_update_operation_state="created",
+            worker_pid=None,
+            worker_boot_id=None,
+            worker_process_start=None,
+            worker_token=None,
+            worker_operation=None,
+        )
+
+    _worker_change(
+        store,
+        job_id,
+        token,
+        {JobStatus.ROUTING, JobStatus.RUNNING},
+        finish,
+        expected_revision=expected_revision,
+    )
+
+
+def _run_linear_ticket_update(
+    store: JobStore,
+    job: CursorJob,
+    token: WorkerClaim,
+    clients: ClientFactories,
+    checkpoint: Callable[[], None],
+) -> None:
+    identifier = (job.issue_key or "").strip()
+    if not identifier:
+        raise HarnessError("Linear ticket update requires a trusted ticket identity")
+    registry = clients.integrations or build_integration_registry(default_user_config())
+    provider = issue_provider("linear", registry)
+    if not isinstance(provider, LinearIntegration):
+        raise HarnessError("selected Linear provider cannot update tickets")
+    client = clients.herdr()
+    checkpoint()
+    if not job.linear_ticket_update_issue_id:
+        try:
+            issue_id, issue = provider.resolve_issue_for_update(
+                client,
+                identifier,
+                checkpoint=checkpoint,
+            )
+        except LinearError:
+            message = f"I couldn't find Linear ticket {identifier}."
+
+            def finish_missing(current: CursorJob) -> CursorJob:
+                now = time.time()
+                return recovery.stage_terminal_intent(
+                    current,
+                    JobStatus.FAILED,
+                    now=now,
+                    result=message,
+                    error=message,
+                )
+
+            _worker_change(
+                store,
+                job.id,
+                token,
+                MODEL_WORKER_STATUSES,
+                finish_missing,
+                expected_revision=job.revision,
+            )
+            return
+
+        def persist_issue(current: CursorJob) -> CursorJob:
+            return current.evolve(
+                issue_key=issue.identifier,
+                linear_ticket_update_issue_id=issue_id,
+            )
+
+        updated = _worker_change(
+            store,
+            job.id,
+            token,
+            {JobStatus.ROUTING},
+            persist_issue,
+            expected_revision=job.revision,
+        )
+        if updated is None:
+            return
+        job = updated
+        identifier = issue.identifier
+    if (
+        not job.linear_ticket_update_title
+        or job.linear_ticket_update_description is None
+    ):
+        config = default_user_config()
+        draft = draft_ticket_update(
+            job.trusted_utterance or job.request,
+            identifier,
+            settings=config.providers,
+        )
+        plan = provider.plan_ticket_update(
+            job.linear_ticket_update_issue_id or "",
+            identifier,
+            draft.title,
+            draft.body,
+            correlation_marker=uuid.uuid4().hex,
+        )
+
+        def persist_draft(current: CursorJob) -> CursorJob:
+            return current.evolve(
+                linear_ticket_update_issue_id=plan.issue_id,
+                linear_ticket_update_title=plan.title,
+                linear_ticket_update_description=plan.description,
+                linear_ticket_update_marker=plan.correlation_marker,
+                linear_ticket_update_operation_state="planned",
+            )
+
+        updated = _worker_change(
+            store,
+            job.id,
+            token,
+            {JobStatus.ROUTING},
+            persist_draft,
+            expected_revision=job.revision,
+        )
+        if updated is None:
+            return
+        job = updated
+    plan = provider.plan_ticket_update(
+        job.linear_ticket_update_issue_id or "",
+        job.issue_key or identifier,
+        job.linear_ticket_update_title or "",
+        job.linear_ticket_update_description or "",
+        correlation_marker=job.linear_ticket_update_marker,
+    )
+    if not job.linear_ticket_update_confirmed:
+        preview = (
+            f"Update Linear ticket {plan.identifier}?\n\n"
+            f"Title: {plan.title}\n\nDescription:\n{plan.description}\n\n"
+            "Say yes to update it or no to cancel."
+        )
+        _worker_question(
+            store,
+            job.id,
+            token,
+            preview,
+            expected_revision=job.revision,
+            clarification_kind="linear_ticket_update_confirmation",
+            sensitivity=QuestionSensitivity.DESTRUCTIVE,
+        )
+        return
+    if job.linear_ticket_update_operation_state not in {None, "planned"}:
+        raise HarnessError("Linear ticket update requires reconciliation before retry")
+
+    def mark_running(current: CursorJob) -> CursorJob:
+        return current.evolve(
+            status=JobStatus.RUNNING,
+            worker_operation="linear_ticket_update",
+        )
+
+    running = _worker_change(
+        store,
+        job.id,
+        token,
+        {JobStatus.ROUTING},
+        mark_running,
+        expected_revision=job.revision,
+    )
+    if running is None:
+        return
+    callback_revision = running.revision
+
+    def persist_submit_fence(
+        target: str,
+        session: str,
+        prompt_token: str,
+        baseline: int,
+    ) -> None:
+        nonlocal callback_revision
+
+        def fence(current: CursorJob) -> CursorJob:
+            return current.evolve(
+                linear_ticket_update_operation_state="submitting",
+                linear_ticket_update_prompt_target=target,
+                linear_ticket_update_prompt_session=session,
+                linear_ticket_update_prompt_token=prompt_token,
+                linear_ticket_update_baseline_sequence=baseline,
+            )
+
+        if (
+            _worker_change(
+                store,
+                job.id,
+                token,
+                {JobStatus.RUNNING},
+                fence,
+                expected_revision=callback_revision,
+            )
+            is None
+        ):
+            raise WorkerCancelled
+        callback_revision += 1
+
+    def persist_prompt_acceptance() -> None:
+        nonlocal callback_revision
+
+        def accepted(current: CursorJob) -> CursorJob:
+            if current.linear_ticket_update_operation_state != "submitting":
+                raise JobValidationError(
+                    "Linear ticket update prompt acceptance requires a submit fence"
+                )
+            return current.evolve(
+                linear_ticket_update_operation_state="submitted",
+            )
+
+        if (
+            _worker_change(
+                store,
+                job.id,
+                token,
+                {JobStatus.RUNNING},
+                accepted,
+                expected_revision=callback_revision,
+            )
+            is None
+        ):
+            raise WorkerCancelled
+        callback_revision += 1
+
+    def queue_ambiguous() -> None:
+        def ambiguous(current: CursorJob) -> CursorJob:
+            return current.evolve(
+                status=JobStatus.QUEUED,
+                queued_at=time.time(),
+                linear_ticket_update_operation_state="ambiguous",
+                reconcile=True,
+                worker_pid=None,
+                worker_boot_id=None,
+                worker_process_start=None,
+                worker_token=None,
+                worker_operation=None,
+            )
+
+        _worker_change(
+            store,
+            job.id,
+            token,
+            {JobStatus.RUNNING},
+            ambiguous,
+            expected_revision=callback_revision,
+        )
+
+    try:
+        checkpoint()
+        provider.submit_ticket_update(
+            client,
+            plan,
+            confirmed=True,
+            checkpoint=checkpoint,
+            before_submit=persist_submit_fence,
+            accepted=persist_prompt_acceptance,
+        )
+    except LinearError as exc:
+        checkpoint()
+        current = store.get(job.id)
+        uncertain = isinstance(
+            exc, LinearOperationAmbiguous
+        ) or current.linear_ticket_update_operation_state in {"submitting", "submitted"}
+        if uncertain:
+            try:
+                visible = provider.observe_ticket_update(
+                    client,
+                    plan,
+                    checkpoint=checkpoint,
+                )
+            except LinearError:
+                visible = None
+            if visible is not None:
+                _finish_linear_ticket_update(
+                    store,
+                    job.id,
+                    token,
+                    visible,
+                    expected_revision=callback_revision,
+                )
+                return
+            queue_ambiguous()
+            return
+
+        def failed_before_submit(current: CursorJob) -> CursorJob:
+            return current.evolve(
+                worker_operation=None,
+            )
+
+        fenced = _worker_change(
+            store,
+            job.id,
+            token,
+            {JobStatus.RUNNING},
+            failed_before_submit,
+            expected_revision=callback_revision,
+        )
+        _carry_observed_revision(exc, fenced)
+        raise
+    current = store.get(job.id)
+    if current.linear_ticket_update_operation_state != "submitted":
+        queue_ambiguous()
+        return
+    try:
+        visible = provider.observe_ticket_update(
+            client,
+            plan,
+            checkpoint=checkpoint,
+        )
+    except LinearError:
+        visible = None
+    if visible is None:
+        queue_ambiguous()
+        return
+    _finish_linear_ticket_update(
         store,
         job.id,
         token,
@@ -6370,6 +6911,24 @@ def run_claimed_worker(  # pyright: ignore[reportGeneralTypeIssues]
                 return
         if job.linear_ticket_create_requested:
             _run_linear_ticket_creation(
+                store,
+                job,
+                worker_token,
+                clients,
+                checkpoint,
+            )
+            return
+        if job.github_issue_update_requested:
+            _run_github_issue_update(
+                store,
+                job,
+                worker_token,
+                clients,
+                checkpoint,
+            )
+            return
+        if job.linear_ticket_update_requested:
+            _run_linear_ticket_update(
                 store,
                 job,
                 worker_token,

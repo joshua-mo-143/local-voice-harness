@@ -170,6 +170,11 @@ from ..ticket_targets import (
     TicketExtraction,
     extract_ticket_targets,
 )
+from ..ticket_update import (
+    admit_ticket_update,
+    update_turn_arguments,
+    wants_ticket_update_context,
+)
 from ..tts.queue import PlaybackQueue, PlaybackRequest
 from ..user_config import AnnouncementSettings, UserConfig, load_user_config
 from ..vad import FRAME_BYTES, FRAME_MS, SAMPLE_RATE, SpeechDetector
@@ -236,7 +241,9 @@ SIDE_EFFECTING_INTENTS = frozenset(
         Intent.GITHUB_PR_MERGE,
         Intent.GITHUB_REPO_CREATE,
         Intent.GITHUB_ORG_REPO_CREATE,
+        Intent.GITHUB_ISSUE_UPDATE,
         Intent.LINEAR_TICKET_CREATE,
+        Intent.LINEAR_TICKET_UPDATE,
         Intent.QUESTION_CONSULTATION,
         Intent.WORKSPACE_CONSULTATION,
     }
@@ -2973,11 +2980,14 @@ class WakeConversationDaemon:
                             Intent.GITHUB_PR_MERGE,
                             Intent.GITHUB_REPO_CREATE,
                             Intent.GITHUB_ORG_REPO_CREATE,
+                            Intent.GITHUB_ISSUE_UPDATE,
                             Intent.LINEAR_TICKET_CREATE,
+                            Intent.LINEAR_TICKET_UPDATE,
                             Intent.WORKSPACE_CONSULTATION,
                         }
                     )
                     or cursor_consultation.wants_ticket_consultation_context(text)
+                    or wants_ticket_update_context(text)
                 )
             ):
                 context = self._capture_request_context(text)
@@ -3008,6 +3018,11 @@ class WakeConversationDaemon:
                 Intent.UNCERTAIN,
             }
             ticket_admission = cursor_consultation.admit_ticket_consultation(
+                text,
+                extraction,
+                focused_issue=context.focused_issue,
+            )
+            update_admission = admit_ticket_update(
                 text,
                 extraction,
                 focused_issue=context.focused_issue,
@@ -3104,6 +3119,36 @@ class WakeConversationDaemon:
                     except Exception:  # noqa: BLE001 - consultation fails closed
                         response = cursor_consultation.CONSULTATION_FAILED
                         ordinary_reply = True
+            elif update_admission is not None:
+                if update_admission.ticket is None:
+                    response = update_admission.missing_identity_response
+                    ordinary_reply = True
+                elif not route.actionable:
+                    response = (
+                        "I did not update a ticket because the request was unclear. "
+                        "Please name the ticket and the title or body change."
+                    )
+                    ordinary_reply = True
+                else:
+                    self.completed_followup = None
+                    dispatch = update_turn_arguments(update_admission.ticket)
+                    response, next_cursor_session = cursor_turn(
+                        CursorTurnRequest(
+                            context.text,
+                            utterance=text,
+                            github_repository=dispatch.github_repository,
+                            github_issue=dispatch.github_issue,
+                            github_issue_update_requested=(
+                                dispatch.github_issue_update_requested
+                            ),
+                            issue_key=dispatch.issue_key,
+                            linear_ticket_update_requested=(
+                                dispatch.linear_ticket_update_requested
+                            ),
+                        ),
+                        delivery_claims=delivery_claims,
+                        integrations=self.integrations,
+                    )
             elif route.actionable and route.intent == Intent.GITHUB_ISSUE_CREATE:
                 self.completed_followup = None
                 response, next_cursor_session = self._dispatch_cursor_turn(
@@ -3520,7 +3565,18 @@ class WakeConversationDaemon:
                         delivery_claims=delivery_claims,
                         integrations=self.integrations,
                     )
-            elif route.intent == Intent.GITHUB_PR_CREATE:
+            elif route.intent in {
+                Intent.GITHUB_ISSUE_UPDATE,
+                Intent.LINEAR_TICKET_UPDATE,
+            }:
+                response = (
+                    "I did not update a ticket because the request was unclear. "
+                    "Please name the ticket and the title or body change."
+                )
+            elif route.intent in {
+                Intent.GITHUB_PR_CREATE,
+                Intent.AGENT_PR_UNSUPPORTED,
+            }:
                 response = (
                     "I did not open a pull request because the request was unclear."
                 )

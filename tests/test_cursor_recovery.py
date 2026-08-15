@@ -45,7 +45,9 @@ from local_voice_harness.cursor.recovery import (
     reconcile_uncertain_clone,
     reconcile_uncertain_fork,
     reconcile_uncertain_issue_creation,
+    reconcile_uncertain_issue_update,
     reconcile_uncertain_linear_ticket_creation,
+    reconcile_uncertain_linear_ticket_update,
     reconcile_uncertain_pr_creation,
     reconcile_uncertain_pr_merge,
     reconcile_uncertain_repo_creation,
@@ -63,6 +65,7 @@ from local_voice_harness.integrations.github import (
     GitHubError,
     GitHubIssue,
     GitHubIssueCreationResult,
+    GitHubIssueUpdateResult,
     GitHubPullRequest,
     GitHubPullRequestCreationResult,
     GitHubPullRequestMergeResult,
@@ -76,6 +79,7 @@ from local_voice_harness.integrations.linear import (
     LinearIntegration,
     LinearIssue,
     LinearTicketCreationResult,
+    LinearTicketUpdateResult,
 )
 from local_voice_harness.prompt_operations import (
     AmbiguousPrompt,
@@ -1003,6 +1007,169 @@ class CursorRecoveryTests(unittest.TestCase):
         updated = self.store.get(job.id)
         self.assertEqual(updated.status, JobStatus.QUEUED)
         self.assertEqual(updated.linear_ticket_create_operation_state, "ambiguous")
+
+    def test_reconciles_ambiguous_issue_update_without_resubmitting(self) -> None:
+        job = self.create(
+            {
+                "id": "123456789abc",
+                "status": "reconciling",
+                "request": "update the issue",
+                "created_at": 1,
+                "delivered": False,
+                "issue_provider": "github",
+                "github_repository": "example/project",
+                "github_issue": 12,
+                "github_issue_update_requested": True,
+                "github_issue_update_confirmed": True,
+                "github_issue_update_title": "Fix startup",
+                "github_issue_update_body": "Startup fails.",
+                "github_issue_update_marker": "a" * 32,
+                "github_issue_update_operation_state": "ambiguous",
+            }
+        )
+        client = mock.Mock(spec=GitHubClient)
+        client.observe_issue_update.return_value = GitHubIssueUpdateResult(
+            GitHubIssue("example", "project", 12),
+            "https://github.com/example/project/issues/12",
+            "Fix startup",
+            "a" * 32,
+        )
+
+        reconcile_uncertain_issue_update(
+            self.store,
+            job,
+            now=100,
+            github_factory=lambda: client,
+        )
+
+        updated = self.store.get(job.id)
+        self.assertEqual(updated.status, JobStatus.COMPLETED)
+        self.assertEqual(updated.github_issue_update_operation_state, "created")
+        client.submit_issue_update.assert_not_called()
+
+    def test_unobserved_issue_update_requires_manual_check(self) -> None:
+        job = self.create(
+            {
+                "id": "123456789abc",
+                "status": "queued",
+                "request": "update the issue",
+                "created_at": 1,
+                "queued_at": 1,
+                "delivered": False,
+                "issue_provider": "github",
+                "github_repository": "example/project",
+                "github_issue": 12,
+                "github_issue_update_requested": True,
+                "github_issue_update_confirmed": True,
+                "github_issue_update_title": "Fix startup",
+                "github_issue_update_body": "Startup fails.",
+                "github_issue_update_marker": "a" * 32,
+                "github_issue_update_operation_state": "ambiguous",
+            }
+        )
+        client = mock.Mock(spec=GitHubClient)
+        client.observe_issue_update.return_value = None
+
+        reconcile_uncertain_issue_update(
+            self.store,
+            job,
+            now=100,
+            github_factory=lambda: client,
+        )
+
+        updated = self.store.get(job.id)
+        self.assertEqual(updated.status, JobStatus.BLOCKED)
+        self.assertEqual(
+            updated.github_issue_update_operation_state,
+            "manual_required",
+        )
+        client.submit_issue_update.assert_not_called()
+
+    def test_reconciles_ambiguous_linear_update_without_resubmitting(self) -> None:
+        job = self.create(
+            {
+                "id": "123456789abc",
+                "status": "queued",
+                "request": "update the Linear ticket",
+                "created_at": 1,
+                "queued_at": 1,
+                "delivered": False,
+                "issue_provider": "linear",
+                "issue_key": "API-79",
+                "linear_ticket_update_requested": True,
+                "linear_ticket_update_confirmed": True,
+                "linear_ticket_update_issue_id": "issue-id-api-79",
+                "linear_ticket_update_title": "Fix startup",
+                "linear_ticket_update_description": "Startup fails.",
+                "linear_ticket_update_marker": "a" * 32,
+                "linear_ticket_update_operation_state": "ambiguous",
+            }
+        )
+        provider = LinearIntegration()
+        result = LinearTicketUpdateResult(
+            LinearIssue("API-79"),
+            "https://linear.app/acme/issue/API-79/fix-startup",
+            "Fix startup",
+            "a" * 32,
+        )
+        with mock.patch.object(
+            provider,
+            "observe_ticket_update",
+            return_value=result,
+        ) as observe:
+            reconcile_uncertain_linear_ticket_update(
+                self.store,
+                job,
+                now=100,
+                herdr_factory=mock.Mock,
+                linear_factory=lambda: provider,
+            )
+
+        updated = self.store.get(job.id)
+        self.assertEqual(updated.status, JobStatus.COMPLETED)
+        self.assertEqual(updated.linear_ticket_update_operation_state, "created")
+        observe.assert_called_once()
+
+    def test_unobserved_linear_update_requires_manual_check(self) -> None:
+        job = self.create(
+            {
+                "id": "123456789abc",
+                "status": "queued",
+                "request": "update the Linear ticket",
+                "created_at": 1,
+                "queued_at": 1,
+                "delivered": False,
+                "issue_provider": "linear",
+                "issue_key": "API-79",
+                "linear_ticket_update_requested": True,
+                "linear_ticket_update_confirmed": True,
+                "linear_ticket_update_issue_id": "issue-id-api-79",
+                "linear_ticket_update_title": "Fix startup",
+                "linear_ticket_update_description": "Startup fails.",
+                "linear_ticket_update_marker": "a" * 32,
+                "linear_ticket_update_operation_state": "ambiguous",
+            }
+        )
+        provider = LinearIntegration()
+        with mock.patch.object(
+            provider,
+            "observe_ticket_update",
+            return_value=None,
+        ):
+            reconcile_uncertain_linear_ticket_update(
+                self.store,
+                job,
+                now=100,
+                herdr_factory=mock.Mock,
+                linear_factory=lambda: provider,
+            )
+
+        updated = self.store.get(job.id)
+        self.assertEqual(updated.status, JobStatus.BLOCKED)
+        self.assertEqual(
+            updated.linear_ticket_update_operation_state,
+            "manual_required",
+        )
 
     def test_migration_and_pruning_precede_recovery_scans(self) -> None:
         store = mock.Mock(spec=JobStore)

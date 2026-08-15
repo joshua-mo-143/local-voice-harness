@@ -46,6 +46,7 @@ from local_voice_harness.integrations.github import (
     GitHubError,
     GitHubIssue,
     GitHubIssueCreationResult,
+    GitHubIssueUpdateResult,
     GitHubOperationAmbiguous,
     GitHubPullRequest,
     GitHubPullRequestCreationResult,
@@ -66,6 +67,7 @@ from local_voice_harness.integrations.linear import (
     LinearOperationAmbiguous,
     LinearTeam,
     LinearTicketCreationResult,
+    LinearTicketUpdateResult,
 )
 from local_voice_harness.linear_ticket_creation import LinearTicketDraft
 from local_voice_harness.local_git import (
@@ -73,6 +75,7 @@ from local_voice_harness.local_git import (
     LocalGitError,
     LocalGitRefChanged,
 )
+from local_voice_harness.ticket_update import TicketUpdateDraft
 from tests.support import join_threads
 
 WORKER = WorkerOwnership("worker", 42, "boot", "start", "test", 1)
@@ -4209,6 +4212,427 @@ class CursorJobStateTests(unittest.TestCase):
         )
         submit.assert_called_once()
 
+    def test_worker_drafts_issue_update_before_requesting_confirmation(self) -> None:
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "update the title of source/project#12",
+                "trusted_utterance": "update the title of source/project#12",
+                "issue_provider": "github",
+                "github_repository": "source/project",
+                "github_issue": 12,
+                "github_issue_update_requested": True,
+                "status": "queued",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        source = GitHubRepository(
+            "source/project",
+            "https://github.com/source/project",
+            False,
+            "main",
+        )
+        github = mock.Mock()
+        github.inspect_repository.return_value = source
+        with (
+            mock.patch.object(jobs, "GitHubClient", return_value=github),
+            mock.patch.object(
+                production_jobs,
+                "draft_ticket_update",
+                return_value=TicketUpdateDraft(
+                    "Fix startup",
+                    "Startup fails after reboot.",
+                ),
+            ),
+        ):
+            service.run_worker("123456789abc")
+
+        updated = jobs.read_job("123456789abc")
+        self.assertEqual(updated["status"], "awaiting_user")
+        self.assertEqual(
+            updated["clarification_kind"],
+            "github_issue_update_confirmation",
+        )
+        self.assertEqual(updated["github_issue_update_title"], "Fix startup")
+        self.assertEqual(updated["github_issue_update_operation_state"], "planned")
+        self.assertIn("source/project#12", str(updated["question"]))
+        self.assertIn("Fix startup", str(updated["question"]))
+        github.submit_issue_update.assert_not_called()
+
+    def test_confirmed_issue_update_completes_without_starting_herdr(self) -> None:
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "update the title of source/project#12",
+                "trusted_utterance": "update the title of source/project#12",
+                "issue_provider": "github",
+                "github_repository": "source/project",
+                "github_issue": 12,
+                "github_issue_update_requested": True,
+                "github_issue_update_confirmed": True,
+                "github_issue_update_title": "Fix startup",
+                "github_issue_update_body": "Startup fails after reboot.",
+                "github_issue_update_marker": "a" * 32,
+                "github_issue_update_operation_state": "planned",
+                "status": "queued",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        source = GitHubRepository(
+            "source/project",
+            "https://github.com/source/project",
+            False,
+            "main",
+        )
+        result = GitHubIssueUpdateResult(
+            GitHubIssue("source", "project", 12),
+            "https://github.com/source/project/issues/12",
+            "Fix startup",
+            "a" * 32,
+        )
+        github = mock.Mock()
+        github.inspect_repository.return_value = source
+        github.submit_issue_update.return_value = result
+        herdr = mock.Mock()
+        with (
+            mock.patch.object(jobs, "GitHubClient", return_value=github),
+            mock.patch.object(jobs, "HerdrClient", return_value=herdr),
+        ):
+            service.run_worker("123456789abc")
+
+        updated = jobs.read_job("123456789abc")
+        self.assertEqual(updated["status"], "completed")
+        self.assertEqual(updated["github_issue_update_operation_state"], "created")
+        github.submit_issue_update.assert_called_once()
+        herdr.assert_not_called()
+
+    def test_timed_out_issue_update_is_reconciled_without_resubmission(self) -> None:
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "update the issue",
+                "trusted_utterance": "update the issue",
+                "issue_provider": "github",
+                "github_repository": "source/project",
+                "github_issue": 12,
+                "github_issue_update_requested": True,
+                "github_issue_update_confirmed": True,
+                "github_issue_update_title": "Fix startup",
+                "github_issue_update_body": "Startup fails.",
+                "github_issue_update_marker": "a" * 32,
+                "github_issue_update_operation_state": "planned",
+                "status": "queued",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        github = mock.Mock()
+        github.inspect_repository.return_value = GitHubRepository(
+            "source/project",
+            "https://github.com/source/project",
+            False,
+            "main",
+        )
+        github.submit_issue_update.side_effect = GitHubOperationAmbiguous("timed out")
+        github.observe_issue_update.return_value = None
+        with mock.patch.object(jobs, "GitHubClient", return_value=github):
+            service.run_worker("123456789abc")
+
+        updated = jobs.read_job("123456789abc")
+        self.assertEqual(updated["status"], "queued")
+        self.assertEqual(updated["github_issue_update_operation_state"], "ambiguous")
+        self.assertEqual(github.submit_issue_update.call_count, 1)
+
+    def test_issue_update_start_failure_is_queued_and_retried_after_restart(
+        self,
+    ) -> None:
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "update the issue",
+                "trusted_utterance": "update the issue",
+                "issue_provider": "github",
+                "github_repository": "source/project",
+                "github_issue": 12,
+                "github_issue_update_requested": True,
+                "github_issue_update_confirmed": True,
+                "github_issue_update_title": "Fix startup",
+                "github_issue_update_body": "Startup fails.",
+                "github_issue_update_marker": "a" * 32,
+                "github_issue_update_operation_state": "planned",
+                "status": "queued",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        github = mock.Mock()
+        github.inspect_repository.return_value = GitHubRepository(
+            "source/project",
+            "https://github.com/source/project",
+            False,
+            "main",
+        )
+        result = GitHubIssueUpdateResult(
+            GitHubIssue("source", "project", 12),
+            "https://github.com/source/project/issues/12",
+            "Fix startup",
+            "a" * 32,
+        )
+        github.submit_issue_update.side_effect = [
+            GitHubCommandStartError("missing gh"),
+            result,
+        ]
+        github.observe_issue_update.side_effect = GitHubError("gh still missing")
+        with (
+            mock.patch.object(jobs, "GitHubClient", return_value=github),
+            mock.patch.object(service, "launch_worker") as launch,
+        ):
+            service.run_worker("123456789abc")
+
+        updated = jobs.read_job("123456789abc")
+        self.assertEqual(updated["status"], "queued")
+        self.assertEqual(updated["github_issue_update_operation_state"], "planned")
+        self.assertFalse(updated.get("reconcile", False))
+        self.assertEqual(github.submit_issue_update.call_count, 1)
+        self.assertEqual(github.observe_issue_update.call_count, 1)
+        launch.assert_called_once_with("123456789abc")
+
+        with mock.patch.object(jobs, "GitHubClient", return_value=github):
+            service.run_worker("123456789abc")
+
+        retried = jobs.read_job("123456789abc")
+        self.assertEqual(retried["status"], "completed")
+        self.assertEqual(retried["github_issue_update_operation_state"], "created")
+        self.assertEqual(github.submit_issue_update.call_count, 2)
+        self.assertEqual(github.observe_issue_update.call_count, 1)
+
+    def test_worker_drafts_linear_ticket_update_before_requesting_confirmation(
+        self,
+    ) -> None:
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "update the title of API-79",
+                "trusted_utterance": "update the title of API-79",
+                "issue_provider": "linear",
+                "issue_key": "API-79",
+                "linear_ticket_update_requested": True,
+                "status": "queued",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        provider = linear.LinearIntegration()
+        herdr = mock.Mock()
+        with (
+            mock.patch.object(jobs, "HerdrClient", return_value=herdr),
+            mock.patch.object(
+                production_jobs,
+                "issue_provider",
+                return_value=provider,
+            ),
+            mock.patch.object(
+                provider,
+                "resolve_issue",
+                return_value=("issue-id-api-79", LinearIssue("API-79")),
+            ),
+            mock.patch.object(
+                production_jobs,
+                "draft_ticket_update",
+                return_value=TicketUpdateDraft(
+                    "Fix startup",
+                    "Startup fails after reboot.",
+                ),
+            ),
+        ):
+            service.run_worker("123456789abc")
+
+        updated = jobs.read_job("123456789abc")
+        self.assertEqual(updated["status"], "awaiting_user")
+        self.assertEqual(
+            updated["clarification_kind"],
+            "linear_ticket_update_confirmation",
+        )
+        self.assertEqual(updated["linear_ticket_update_title"], "Fix startup")
+        self.assertEqual(updated["linear_ticket_update_operation_state"], "planned")
+        self.assertIn("API-79", str(updated["question"]))
+        herdr.ensure_router.assert_not_called()
+
+    def test_worker_says_it_could_not_find_the_linear_ticket_to_update(self) -> None:
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "update the title of API-79",
+                "trusted_utterance": "update the title of API-79",
+                "issue_provider": "linear",
+                "issue_key": "API-79",
+                "linear_ticket_update_requested": True,
+                "status": "queued",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        provider = linear.LinearIntegration()
+        herdr = mock.Mock()
+        with (
+            mock.patch.object(jobs, "HerdrClient", return_value=herdr),
+            mock.patch.object(
+                production_jobs,
+                "issue_provider",
+                return_value=provider,
+            ),
+            mock.patch.object(
+                provider,
+                "resolve_issue",
+                side_effect=LinearError("I couldn't find Linear ticket API-79."),
+            ),
+            mock.patch.object(production_jobs, "draft_ticket_update") as draft,
+        ):
+            service.run_worker("123456789abc")
+
+        updated = jobs.read_job("123456789abc")
+        self.assertEqual(updated["status"], "failed")
+        self.assertEqual(updated["result"], "I couldn't find Linear ticket API-79.")
+        draft.assert_not_called()
+        herdr.ensure_router.assert_not_called()
+
+    def test_confirmed_linear_ticket_update_completes(self) -> None:
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "update the title of API-79",
+                "trusted_utterance": "update the title of API-79",
+                "issue_provider": "linear",
+                "issue_key": "API-79",
+                "linear_ticket_update_requested": True,
+                "linear_ticket_update_confirmed": True,
+                "linear_ticket_update_issue_id": "issue-id-api-79",
+                "linear_ticket_update_title": "Fix startup",
+                "linear_ticket_update_description": "Startup fails after reboot.",
+                "linear_ticket_update_marker": "a" * 32,
+                "linear_ticket_update_operation_state": "planned",
+                "status": "queued",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        provider = linear.LinearIntegration()
+        result = LinearTicketUpdateResult(
+            LinearIssue("API-79"),
+            "https://linear.app/acme/issue/API-79/fix-startup",
+            "Fix startup",
+            "a" * 32,
+        )
+        herdr = mock.Mock()
+
+        def submit(*_args: object, **kwargs: object) -> LinearTicketUpdateResult:
+            before_submit = kwargs["before_submit"]
+            accepted = kwargs["accepted"]
+            assert callable(before_submit)
+            assert callable(accepted)
+            before_submit("voice-router", "router-session", "prompt-token", 7)
+            accepted()
+            return result
+
+        with (
+            mock.patch.object(jobs, "HerdrClient", return_value=herdr),
+            mock.patch.object(
+                production_jobs,
+                "issue_provider",
+                return_value=provider,
+            ),
+            mock.patch.object(
+                provider,
+                "submit_ticket_update",
+                side_effect=submit,
+            ) as submit,
+            mock.patch.object(
+                provider,
+                "observe_ticket_update",
+                return_value=result,
+            ) as observe,
+        ):
+            service.run_worker("123456789abc")
+
+        updated = jobs.read_job("123456789abc")
+        self.assertEqual(updated["status"], "completed")
+        self.assertEqual(updated["linear_ticket_update_operation_state"], "created")
+        submit.assert_called_once_with(
+            herdr,
+            mock.ANY,
+            confirmed=True,
+            checkpoint=mock.ANY,
+            before_submit=mock.ANY,
+            accepted=mock.ANY,
+        )
+        observe.assert_called_once_with(
+            herdr,
+            mock.ANY,
+            checkpoint=mock.ANY,
+        )
+
+    def test_ambiguous_linear_ticket_update_queues_reconciliation(self) -> None:
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "update the Linear ticket",
+                "trusted_utterance": "update the Linear ticket",
+                "issue_provider": "linear",
+                "issue_key": "API-79",
+                "linear_ticket_update_requested": True,
+                "linear_ticket_update_confirmed": True,
+                "linear_ticket_update_issue_id": "issue-id-api-79",
+                "linear_ticket_update_title": "Fix startup",
+                "linear_ticket_update_description": "Startup fails.",
+                "linear_ticket_update_marker": "a" * 32,
+                "linear_ticket_update_operation_state": "planned",
+                "status": "queued",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        provider = linear.LinearIntegration()
+        herdr = mock.Mock()
+
+        def submit(*_args: object, **kwargs: object) -> object:
+            before_submit = kwargs["before_submit"]
+            accepted = kwargs["accepted"]
+            assert callable(before_submit)
+            assert callable(accepted)
+            before_submit("voice-router", "router-session", "prompt-token", 7)
+            accepted()
+            raise LinearOperationAmbiguous("timed out")
+
+        with (
+            mock.patch.object(jobs, "HerdrClient", return_value=herdr),
+            mock.patch.object(
+                production_jobs,
+                "issue_provider",
+                return_value=provider,
+            ),
+            mock.patch.object(
+                provider,
+                "submit_ticket_update",
+                side_effect=submit,
+            ) as submit,
+            mock.patch.object(
+                provider,
+                "observe_ticket_update",
+                return_value=None,
+            ),
+        ):
+            service.run_worker("123456789abc")
+
+        updated = jobs.read_job("123456789abc")
+        self.assertEqual(updated["status"], "queued")
+        self.assertEqual(
+            updated["linear_ticket_update_operation_state"],
+            "ambiguous",
+        )
+        submit.assert_called_once()
+
     def test_only_trusted_affirmative_reply_confirms_fork(self) -> None:
         job = {
             "id": "123456789abc",
@@ -4706,8 +5130,10 @@ class CursorJobStateTests(unittest.TestCase):
             github_pr_merge_number=None,
             github_repo_create_requested=False,
             github_repo_create_org_requested=False,
+            github_issue_update_requested=False,
             linear_team=None,
             linear_ticket_create_requested=False,
+            linear_ticket_update_requested=False,
             fork_requested=False,
             github_pull_request=None,
             agent=None,
