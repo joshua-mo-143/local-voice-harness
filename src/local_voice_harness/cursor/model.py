@@ -1073,7 +1073,6 @@ def migrate_job_record(raw: Mapping[str, object]) -> tuple[dict[str, object], in
             "participant_admission_state",
             _default_participant_admission_state(values),
         )
-        _default_announcement_ack(values)
     values.setdefault("session_control", SessionControlMode.AUTOMATED.value)
     values.setdefault("session_control_generation", 0)
     _canonicalize_announcement_dismissal(
