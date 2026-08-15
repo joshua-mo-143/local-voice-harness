@@ -44,8 +44,10 @@ from local_voice_harness.cursor.recovery import (
     reconcile_uncertain_agent,
     reconcile_uncertain_clone,
     reconcile_uncertain_fork,
+    reconcile_uncertain_issue_close,
     reconcile_uncertain_issue_creation,
     reconcile_uncertain_issue_update,
+    reconcile_uncertain_linear_ticket_close,
     reconcile_uncertain_linear_ticket_creation,
     reconcile_uncertain_linear_ticket_update,
     reconcile_uncertain_pr_creation,
@@ -64,6 +66,7 @@ from local_voice_harness.integrations.github import (
     GitHubClient,
     GitHubError,
     GitHubIssue,
+    GitHubIssueCloseResult,
     GitHubIssueCreationResult,
     GitHubIssueUpdateResult,
     GitHubPullRequest,
@@ -78,6 +81,7 @@ from local_voice_harness.integrations.linear import (
     LinearError,
     LinearIntegration,
     LinearIssue,
+    LinearTicketCloseResult,
     LinearTicketCreationResult,
     LinearTicketUpdateResult,
 )
@@ -1168,6 +1172,159 @@ class CursorRecoveryTests(unittest.TestCase):
         self.assertEqual(updated.status, JobStatus.BLOCKED)
         self.assertEqual(
             updated.linear_ticket_update_operation_state,
+            "manual_required",
+        )
+
+    def test_reconciles_ambiguous_issue_close_without_resubmitting(self) -> None:
+        job = self.create(
+            {
+                "id": "123456789abc",
+                "status": "reconciling",
+                "request": "close the issue",
+                "created_at": 1,
+                "delivered": False,
+                "issue_provider": "github",
+                "github_repository": "example/project",
+                "github_issue": 12,
+                "github_issue_close_requested": True,
+                "github_issue_close_confirmed": True,
+                "github_issue_close_marker": "a" * 32,
+                "github_issue_close_operation_state": "ambiguous",
+            }
+        )
+        client = mock.Mock(spec=GitHubClient)
+        client.observe_issue_close.return_value = GitHubIssueCloseResult(
+            GitHubIssue("example", "project", 12),
+            "https://github.com/example/project/issues/12",
+            "a" * 32,
+        )
+
+        reconcile_uncertain_issue_close(
+            self.store,
+            job,
+            now=100,
+            github_factory=lambda: client,
+        )
+
+        updated = self.store.get(job.id)
+        self.assertEqual(updated.status, JobStatus.COMPLETED)
+        self.assertEqual(updated.github_issue_close_operation_state, "created")
+        client.submit_issue_close.assert_not_called()
+
+    def test_unobserved_issue_close_requires_manual_check(self) -> None:
+        job = self.create(
+            {
+                "id": "123456789abc",
+                "status": "queued",
+                "request": "close the issue",
+                "created_at": 1,
+                "queued_at": 1,
+                "delivered": False,
+                "issue_provider": "github",
+                "github_repository": "example/project",
+                "github_issue": 12,
+                "github_issue_close_requested": True,
+                "github_issue_close_confirmed": True,
+                "github_issue_close_marker": "a" * 32,
+                "github_issue_close_operation_state": "ambiguous",
+            }
+        )
+        client = mock.Mock(spec=GitHubClient)
+        client.observe_issue_close.return_value = None
+
+        reconcile_uncertain_issue_close(
+            self.store,
+            job,
+            now=100,
+            github_factory=lambda: client,
+        )
+
+        updated = self.store.get(job.id)
+        self.assertEqual(updated.status, JobStatus.BLOCKED)
+        self.assertEqual(
+            updated.github_issue_close_operation_state,
+            "manual_required",
+        )
+        client.submit_issue_close.assert_not_called()
+
+    def test_reconciles_ambiguous_linear_close_without_resubmitting(self) -> None:
+        job = self.create(
+            {
+                "id": "123456789abc",
+                "status": "queued",
+                "request": "close the Linear ticket",
+                "created_at": 1,
+                "queued_at": 1,
+                "delivered": False,
+                "issue_provider": "linear",
+                "issue_key": "API-79",
+                "linear_ticket_close_requested": True,
+                "linear_ticket_close_confirmed": True,
+                "linear_ticket_close_issue_id": "issue-id-api-79",
+                "linear_ticket_close_marker": "a" * 32,
+                "linear_ticket_close_operation_state": "ambiguous",
+            }
+        )
+        provider = LinearIntegration()
+        result = LinearTicketCloseResult(
+            LinearIssue("API-79"),
+            "https://linear.app/acme/issue/API-79/fix-startup",
+            "a" * 32,
+        )
+        with mock.patch.object(
+            provider,
+            "observe_ticket_close",
+            return_value=result,
+        ) as observe:
+            reconcile_uncertain_linear_ticket_close(
+                self.store,
+                job,
+                now=100,
+                herdr_factory=mock.Mock,
+                linear_factory=lambda: provider,
+            )
+
+        updated = self.store.get(job.id)
+        self.assertEqual(updated.status, JobStatus.COMPLETED)
+        self.assertEqual(updated.linear_ticket_close_operation_state, "created")
+        observe.assert_called_once()
+
+    def test_unobserved_linear_close_requires_manual_check(self) -> None:
+        job = self.create(
+            {
+                "id": "123456789abc",
+                "status": "queued",
+                "request": "close the Linear ticket",
+                "created_at": 1,
+                "queued_at": 1,
+                "delivered": False,
+                "issue_provider": "linear",
+                "issue_key": "API-79",
+                "linear_ticket_close_requested": True,
+                "linear_ticket_close_confirmed": True,
+                "linear_ticket_close_issue_id": "issue-id-api-79",
+                "linear_ticket_close_marker": "a" * 32,
+                "linear_ticket_close_operation_state": "ambiguous",
+            }
+        )
+        provider = LinearIntegration()
+        with mock.patch.object(
+            provider,
+            "observe_ticket_close",
+            return_value=None,
+        ):
+            reconcile_uncertain_linear_ticket_close(
+                self.store,
+                job,
+                now=100,
+                herdr_factory=mock.Mock,
+                linear_factory=lambda: provider,
+            )
+
+        updated = self.store.get(job.id)
+        self.assertEqual(updated.status, JobStatus.BLOCKED)
+        self.assertEqual(
+            updated.linear_ticket_close_operation_state,
             "manual_required",
         )
 

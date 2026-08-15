@@ -162,6 +162,37 @@ class IntentRouterTests(LocalRouterTestCase):
         self.assertEqual(route.intent, intent.Intent.LINEAR_TICKET_UPDATE)
         self.assertTrue(route.actionable)
 
+    def test_routes_github_issue_close_as_a_distinct_action(self) -> None:
+        with mock.patch.object(
+            llm_transport.urllib.request,
+            "urlopen",
+            return_value=_response("github_issue_close"),
+        ):
+            route = intent.route_intent(
+                "Close this GitHub issue",
+                RequestContext(
+                    "Close this GitHub issue",
+                    focused_issue="example/project#12",
+                ),
+            )
+
+        self.assertEqual(route.intent, intent.Intent.GITHUB_ISSUE_CLOSE)
+        self.assertTrue(route.actionable)
+
+    def test_routes_linear_ticket_close_as_a_distinct_action(self) -> None:
+        with mock.patch.object(
+            llm_transport.urllib.request,
+            "urlopen",
+            return_value=_response("linear_ticket_close"),
+        ):
+            route = intent.route_intent(
+                "Close API-79",
+                RequestContext("Close API-79"),
+            )
+
+        self.assertEqual(route.intent, intent.Intent.LINEAR_TICKET_CLOSE)
+        self.assertTrue(route.actionable)
+
     def test_sends_bounded_context_to_forced_router_tool(self) -> None:
         context = RequestContext(
             text="work on this\n\nuntrusted issue body",
@@ -205,6 +236,8 @@ class IntentRouterTests(LocalRouterTestCase):
         )
         self.assertIn("github_issue_update", payload["messages"][0]["content"])
         self.assertIn("linear_ticket_update", payload["messages"][0]["content"])
+        self.assertIn("github_issue_close", payload["messages"][0]["content"])
+        self.assertIn("linear_ticket_close", payload["messages"][0]["content"])
         self.assertEqual(payload["temperature"], 0)
         # Reasoning models drop the required ``confidence`` field when the
         # completion budget is too small to finish the forced tool call.

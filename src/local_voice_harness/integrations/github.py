@@ -310,6 +310,20 @@ class GitHubIssueUpdateResult:
 
 
 @dataclass(frozen=True)
+class GitHubIssueClosePlan:
+    repository: str
+    number: int
+    correlation_marker: str
+
+
+@dataclass(frozen=True)
+class GitHubIssueCloseResult:
+    issue: GitHubIssue
+    url: str
+    correlation_marker: str
+
+
+@dataclass(frozen=True)
 class GitHubPullRequest:
     owner: str
     repository: str
@@ -754,6 +768,111 @@ class GitHubClient:
         if str(value.get("title") or "").strip() != plan.title:
             return None
         return self._update_result(plan, value.get("html_url"))
+
+    @staticmethod
+    def validate_issue_close_plan(plan: GitHubIssueClosePlan) -> None:
+        GitHubClient.validate_repository(plan.repository)
+        if not isinstance(plan.number, int) or plan.number < 1:
+            raise GitHubError("GitHub issue number must be positive")
+        if ISSUE_CORRELATION_MARKER.fullmatch(plan.correlation_marker) is None:
+            raise GitHubError(
+                "GitHub issue correlation marker must be 32 lowercase hex characters"
+            )
+
+    def submit_issue_close(
+        self,
+        plan: GitHubIssueClosePlan,
+        *,
+        confirmed: bool,
+    ) -> GitHubIssueCloseResult:
+        if not confirmed:
+            raise GitHubError("GitHub issue close requires explicit confirmation")
+        self.validate_issue_close_plan(plan)
+        process = self._run(
+            [
+                self.gh_executable,
+                "issue",
+                "close",
+                str(plan.number),
+                "--repo",
+                plan.repository,
+                "--comment",
+                self._issue_marker(plan.correlation_marker),
+            ],
+            timeout=30,
+            write=True,
+        )
+        url = process.stdout.strip() or (
+            f"https://github.com/{plan.repository}/issues/{plan.number}"
+        )
+        try:
+            return self._close_result(plan, url)
+        except GitHubError as exc:
+            raise GitHubOperationAmbiguous(
+                "GitHub write completed without a provable result; an external "
+                "side effect may already have occurred"
+            ) from exc
+
+    def observe_issue_close(
+        self, plan: GitHubIssueClosePlan
+    ) -> GitHubIssueCloseResult | None:
+        self.validate_issue_close_plan(plan)
+        process = self._run(
+            [
+                self.gh_executable,
+                "api",
+                "--method",
+                "GET",
+                f"repos/{plan.repository}/issues/{plan.number}",
+            ],
+            timeout=15,
+        )
+        try:
+            value = json.loads(process.stdout)
+        except json.JSONDecodeError as exc:
+            raise GitHubError("GitHub returned malformed issue metadata") from exc
+        if not isinstance(value, dict) or "pull_request" in value:
+            raise GitHubError("GitHub returned malformed issue metadata")
+        if str(value.get("state") or "").strip().casefold() != "closed":
+            return None
+        comments = self._run(
+            [
+                self.gh_executable,
+                "api",
+                "--method",
+                "GET",
+                f"repos/{plan.repository}/issues/{plan.number}/comments",
+                "--paginate",
+            ],
+            timeout=15,
+        )
+        try:
+            items = json.loads(comments.stdout or "[]")
+        except json.JSONDecodeError as exc:
+            raise GitHubError("GitHub returned malformed issue comments") from exc
+        if not isinstance(items, list):
+            raise GitHubError("GitHub returned malformed issue comments")
+        marker = self._issue_marker(plan.correlation_marker)
+        if not any(
+            marker in str(item.get("body") or "")
+            for item in items
+            if isinstance(item, dict)
+        ):
+            return None
+        return self._close_result(plan, value.get("html_url"))
+
+    def _close_result(
+        self, plan: GitHubIssueClosePlan, url: object
+    ) -> GitHubIssueCloseResult:
+        value = str(url or "").strip()
+        issue = github_issue_from_url(value)
+        if issue is None or value != issue.url:
+            raise GitHubError("GitHub returned a non-canonical issue URL")
+        if issue.name_with_owner.casefold() != plan.repository.casefold():
+            raise GitHubError("GitHub closed an issue in an unexpected repository")
+        if issue.number != plan.number:
+            raise GitHubError("GitHub closed an unexpected issue")
+        return GitHubIssueCloseResult(issue, value, plan.correlation_marker)
 
     def _update_result(
         self, plan: GitHubIssueUpdatePlan, url: object
@@ -2405,6 +2524,12 @@ _GITHUB_STATE_SECTIONS: dict[str, dict[str, str]] = {
         "marker": "github_issue_update_marker",
         "operation_state": "github_issue_update_operation_state",
     },
+    "issue_close": {
+        "requested": "github_issue_close_requested",
+        "confirmed": "github_issue_close_confirmed",
+        "marker": "github_issue_close_marker",
+        "operation_state": "github_issue_close_operation_state",
+    },
     "pull_request": {
         "number": "github_pull_request",
         "worktree_state": "pull_request_worktree_state",
@@ -2886,6 +3011,46 @@ class GitHubProvider:
             raise GitHubError("GitHub issue update requires explicit confirmation")
         self.validate_issue_update_plan(plan)
         return self._client.submit_issue_update(plan, confirmed=True)
+
+    def plan_issue_close(
+        self,
+        repository: str,
+        number: int,
+        *,
+        correlation_marker: str | None = None,
+    ) -> GitHubIssueClosePlan:
+        if not isinstance(repository, str):
+            raise GitHubError("GitHub issue repository must be text")
+        if not isinstance(number, int) or number < 1:
+            raise GitHubError("GitHub issue number must be positive")
+        plan = GitHubIssueClosePlan(
+            repository=GitHubClient.validate_repository(repository),
+            number=number,
+            correlation_marker=correlation_marker or secrets.token_hex(16),
+        )
+        self.validate_issue_close_plan(plan)
+        return plan
+
+    @staticmethod
+    def validate_issue_close_plan(plan: GitHubIssueClosePlan) -> None:
+        GitHubClient.validate_issue_close_plan(plan)
+
+    def observe_issue_close(
+        self, plan: GitHubIssueClosePlan
+    ) -> GitHubIssueCloseResult | None:
+        self.validate_issue_close_plan(plan)
+        return self._client.observe_issue_close(plan)
+
+    def submit_issue_close(
+        self,
+        plan: GitHubIssueClosePlan,
+        *,
+        confirmed: bool,
+    ) -> GitHubIssueCloseResult:
+        if not confirmed:
+            raise GitHubError("GitHub issue close requires explicit confirmation")
+        self.validate_issue_close_plan(plan)
+        return self._client.submit_issue_close(plan, confirmed=True)
 
     def materialize_repository(
         self,

@@ -12,6 +12,8 @@ from local_voice_harness.integrations.github import (
     GitHubCommandStartError,
     GitHubError,
     GitHubIssue,
+    GitHubIssueClosePlan,
+    GitHubIssueCloseResult,
     GitHubIssueCreationPlan,
     GitHubIssueCreationResult,
     GitHubIssueLookupError,
@@ -581,6 +583,104 @@ class GitHubClientTests(unittest.TestCase):
             client, "_run", return_value=_completed(json.dumps(wrong_title))
         ):
             self.assertIsNone(client.observe_issue_update(plan))
+
+    def test_issue_close_uses_comment_marker_and_validates_canonical_result(
+        self,
+    ) -> None:
+        client = GitHubClient()
+        plan = GitHubIssueClosePlan("example/project", 12, "a" * 32)
+        with mock.patch.object(
+            client,
+            "_run",
+            return_value=_completed("https://github.com/example/project/issues/12\n"),
+        ) as run:
+            result = client.submit_issue_close(plan, confirmed=True)
+
+        self.assertEqual(
+            result,
+            GitHubIssueCloseResult(
+                GitHubIssue("example", "project", 12),
+                "https://github.com/example/project/issues/12",
+                "a" * 32,
+            ),
+        )
+        self.assertEqual(
+            run.call_args.args[0],
+            [
+                "gh",
+                "issue",
+                "close",
+                "12",
+                "--repo",
+                "example/project",
+                "--comment",
+                f"<!-- local-voice-harness-correlation:{'a' * 32} -->",
+            ],
+        )
+        self.assertTrue(run.call_args.kwargs["write"])
+
+    def test_issue_close_requires_confirmation_before_running(self) -> None:
+        client = GitHubClient()
+        plan = GitHubIssueClosePlan("example/project", 12, "a" * 32)
+        with (
+            mock.patch.object(client, "_run") as run,
+            self.assertRaisesRegex(GitHubError, "confirmation"),
+        ):
+            client.submit_issue_close(plan, confirmed=False)
+        run.assert_not_called()
+
+    def test_issue_close_timeout_is_ambiguous(self) -> None:
+        client = GitHubClient()
+        plan = GitHubIssueClosePlan("example/project", 12, "a" * 32)
+        with (
+            mock.patch(
+                "local_voice_harness.integrations.github.run_command",
+                side_effect=subprocess.TimeoutExpired(["gh", "issue", "close"], 30),
+            ),
+            self.assertRaises(GitHubOperationAmbiguous),
+        ):
+            client.submit_issue_close(plan, confirmed=True)
+
+    def test_issue_close_observation_requires_closed_state_and_marker(self) -> None:
+        client = GitHubClient()
+        plan = GitHubIssueClosePlan("example/project", 12, "a" * 32)
+        issue = {
+            "number": 12,
+            "html_url": "https://github.com/example/project/issues/12",
+            "state": "closed",
+        }
+        comments = [
+            {
+                "body": f"<!-- local-voice-harness-correlation:{'a' * 32} -->",
+            }
+        ]
+        with mock.patch.object(
+            client,
+            "_run",
+            side_effect=[
+                _completed(json.dumps(issue)),
+                _completed(json.dumps(comments)),
+            ],
+        ):
+            result = client.observe_issue_close(plan)
+
+        self.assertEqual(result, client._close_result(plan, issue["html_url"]))
+
+        open_issue = dict(issue, state="open")
+        with mock.patch.object(
+            client, "_run", return_value=_completed(json.dumps(open_issue))
+        ):
+            self.assertIsNone(client.observe_issue_close(plan))
+
+        with mock.patch.object(
+            client,
+            "_run",
+            side_effect=[
+                _completed(json.dumps(issue)),
+                _completed(json.dumps([{"body": "no marker"}])),
+            ],
+        ):
+            self.assertIsNone(client.observe_issue_close(plan))
 
     def test_issue_observation_lists_recent_issues_and_matches_marker(self) -> None:
         client = GitHubClient()

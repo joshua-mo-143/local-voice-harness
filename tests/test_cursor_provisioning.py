@@ -45,6 +45,7 @@ from local_voice_harness.integrations.github import (
     GitHubCommandStartError,
     GitHubError,
     GitHubIssue,
+    GitHubIssueCloseResult,
     GitHubIssueCreationResult,
     GitHubIssueUpdateResult,
     GitHubOperationAmbiguous,
@@ -66,6 +67,7 @@ from local_voice_harness.integrations.linear import (
     LinearIssue,
     LinearOperationAmbiguous,
     LinearTeam,
+    LinearTicketCloseResult,
     LinearTicketCreationResult,
     LinearTicketUpdateResult,
 )
@@ -4828,6 +4830,342 @@ class CursorJobStateTests(unittest.TestCase):
         )
         submit.assert_called_once()
 
+    def test_worker_persists_issue_close_before_requesting_confirmation(self) -> None:
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "close source/project#12",
+                "trusted_utterance": "close source/project#12",
+                "issue_provider": "github",
+                "github_repository": "source/project",
+                "github_issue": 12,
+                "github_issue_close_requested": True,
+                "status": "queued",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        source = GitHubRepository(
+            "source/project",
+            "https://github.com/source/project",
+            False,
+            "main",
+        )
+        github = mock.Mock()
+        github.inspect_repository.return_value = source
+        with mock.patch.object(jobs, "GitHubClient", return_value=github):
+            service.run_worker("123456789abc")
+
+        updated = jobs.read_job("123456789abc")
+        self.assertEqual(updated["status"], "awaiting_user")
+        self.assertEqual(
+            updated["clarification_kind"],
+            "github_issue_close_confirmation",
+        )
+        self.assertEqual(updated["github_issue_close_operation_state"], "planned")
+        self.assertIn("source/project#12", str(updated["question"]))
+        github.submit_issue_close.assert_not_called()
+
+    def test_confirmed_issue_close_completes_without_starting_herdr(self) -> None:
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "close source/project#12",
+                "trusted_utterance": "close source/project#12",
+                "issue_provider": "github",
+                "github_repository": "source/project",
+                "github_issue": 12,
+                "github_issue_close_requested": True,
+                "github_issue_close_confirmed": True,
+                "github_issue_close_marker": "a" * 32,
+                "github_issue_close_operation_state": "planned",
+                "status": "queued",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        source = GitHubRepository(
+            "source/project",
+            "https://github.com/source/project",
+            False,
+            "main",
+        )
+        result = GitHubIssueCloseResult(
+            GitHubIssue("source", "project", 12),
+            "https://github.com/source/project/issues/12",
+            "a" * 32,
+        )
+        github = mock.Mock()
+        github.inspect_repository.return_value = source
+        github.submit_issue_close.return_value = result
+        herdr = mock.Mock()
+        with (
+            mock.patch.object(jobs, "GitHubClient", return_value=github),
+            mock.patch.object(jobs, "HerdrClient", return_value=herdr),
+        ):
+            service.run_worker("123456789abc")
+
+        updated = jobs.read_job("123456789abc")
+        self.assertEqual(updated["status"], "completed")
+        self.assertEqual(updated["github_issue_close_operation_state"], "created")
+        github.submit_issue_close.assert_called_once()
+        herdr.assert_not_called()
+
+    def test_timed_out_issue_close_is_reconciled_without_resubmission(self) -> None:
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "close the issue",
+                "trusted_utterance": "close the issue",
+                "issue_provider": "github",
+                "github_repository": "source/project",
+                "github_issue": 12,
+                "github_issue_close_requested": True,
+                "github_issue_close_confirmed": True,
+                "github_issue_close_marker": "a" * 32,
+                "github_issue_close_operation_state": "planned",
+                "status": "queued",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        github = mock.Mock()
+        github.inspect_repository.return_value = GitHubRepository(
+            "source/project",
+            "https://github.com/source/project",
+            False,
+            "main",
+        )
+        github.submit_issue_close.side_effect = GitHubOperationAmbiguous("timed out")
+        github.observe_issue_close.return_value = None
+        with mock.patch.object(jobs, "GitHubClient", return_value=github):
+            service.run_worker("123456789abc")
+
+        updated = jobs.read_job("123456789abc")
+        self.assertEqual(updated["status"], "queued")
+        self.assertEqual(updated["github_issue_close_operation_state"], "ambiguous")
+        self.assertEqual(github.submit_issue_close.call_count, 1)
+
+    def test_issue_close_start_failure_is_queued_and_retried_after_restart(
+        self,
+    ) -> None:
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "close the issue",
+                "trusted_utterance": "close the issue",
+                "issue_provider": "github",
+                "github_repository": "source/project",
+                "github_issue": 12,
+                "github_issue_close_requested": True,
+                "github_issue_close_confirmed": True,
+                "github_issue_close_marker": "a" * 32,
+                "github_issue_close_operation_state": "planned",
+                "status": "queued",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        github = mock.Mock()
+        github.inspect_repository.return_value = GitHubRepository(
+            "source/project",
+            "https://github.com/source/project",
+            False,
+            "main",
+        )
+        result = GitHubIssueCloseResult(
+            GitHubIssue("source", "project", 12),
+            "https://github.com/source/project/issues/12",
+            "a" * 32,
+        )
+        github.submit_issue_close.side_effect = [
+            GitHubCommandStartError("missing gh"),
+            result,
+        ]
+        github.observe_issue_close.side_effect = GitHubError("gh still missing")
+        with (
+            mock.patch.object(jobs, "GitHubClient", return_value=github),
+            mock.patch.object(service, "launch_worker") as launch,
+        ):
+            service.run_worker("123456789abc")
+
+        updated = jobs.read_job("123456789abc")
+        self.assertEqual(updated["status"], "queued")
+        self.assertEqual(updated["github_issue_close_operation_state"], "planned")
+        self.assertFalse(updated.get("reconcile", False))
+        self.assertEqual(github.submit_issue_close.call_count, 1)
+        launch.assert_called_once_with("123456789abc")
+
+        with mock.patch.object(jobs, "GitHubClient", return_value=github):
+            service.run_worker("123456789abc")
+
+        retried = jobs.read_job("123456789abc")
+        self.assertEqual(retried["status"], "completed")
+        self.assertEqual(retried["github_issue_close_operation_state"], "created")
+        self.assertEqual(github.submit_issue_close.call_count, 2)
+
+    def test_worker_persists_linear_ticket_close_before_requesting_confirmation(
+        self,
+    ) -> None:
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "close API-79",
+                "trusted_utterance": "close API-79",
+                "issue_provider": "linear",
+                "issue_key": "API-79",
+                "linear_ticket_close_requested": True,
+                "status": "queued",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        provider = linear.LinearIntegration()
+        herdr = mock.Mock()
+        with (
+            mock.patch.object(jobs, "HerdrClient", return_value=herdr),
+            mock.patch.object(
+                production_jobs,
+                "issue_provider",
+                return_value=provider,
+            ),
+            mock.patch.object(
+                provider,
+                "resolve_issue",
+                return_value=("issue-id-api-79", LinearIssue("API-79")),
+            ),
+        ):
+            service.run_worker("123456789abc")
+
+        updated = jobs.read_job("123456789abc")
+        self.assertEqual(updated["status"], "awaiting_user")
+        self.assertEqual(
+            updated["clarification_kind"],
+            "linear_ticket_close_confirmation",
+        )
+        self.assertEqual(updated["linear_ticket_close_operation_state"], "planned")
+        self.assertIn("API-79", str(updated["question"]))
+        herdr.ensure_router.assert_not_called()
+
+    def test_confirmed_linear_ticket_close_completes(self) -> None:
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "close API-79",
+                "trusted_utterance": "close API-79",
+                "issue_provider": "linear",
+                "issue_key": "API-79",
+                "linear_ticket_close_requested": True,
+                "linear_ticket_close_confirmed": True,
+                "linear_ticket_close_issue_id": "issue-id-api-79",
+                "linear_ticket_close_marker": "a" * 32,
+                "linear_ticket_close_operation_state": "planned",
+                "status": "queued",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        provider = linear.LinearIntegration()
+        result = LinearTicketCloseResult(
+            LinearIssue("API-79"),
+            "https://linear.app/acme/issue/API-79/fix-startup",
+            "a" * 32,
+        )
+        herdr = mock.Mock()
+
+        def submit(*_args: object, **kwargs: object) -> LinearTicketCloseResult:
+            before_submit = kwargs["before_submit"]
+            accepted = kwargs["accepted"]
+            assert callable(before_submit)
+            assert callable(accepted)
+            before_submit("voice-router", "router-session", "prompt-token", 7)
+            accepted()
+            return result
+
+        with (
+            mock.patch.object(jobs, "HerdrClient", return_value=herdr),
+            mock.patch.object(
+                production_jobs,
+                "issue_provider",
+                return_value=provider,
+            ),
+            mock.patch.object(
+                provider,
+                "submit_ticket_close",
+                side_effect=submit,
+            ) as submit,
+            mock.patch.object(
+                provider,
+                "observe_ticket_close",
+                return_value=result,
+            ) as observe,
+        ):
+            service.run_worker("123456789abc")
+
+        updated = jobs.read_job("123456789abc")
+        self.assertEqual(updated["status"], "completed")
+        self.assertEqual(updated["linear_ticket_close_operation_state"], "created")
+        submit.assert_called_once()
+        observe.assert_called_once()
+
+    def test_ambiguous_linear_ticket_close_queues_reconciliation(self) -> None:
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "close the Linear ticket",
+                "trusted_utterance": "close the Linear ticket",
+                "issue_provider": "linear",
+                "issue_key": "API-79",
+                "linear_ticket_close_requested": True,
+                "linear_ticket_close_confirmed": True,
+                "linear_ticket_close_issue_id": "issue-id-api-79",
+                "linear_ticket_close_marker": "a" * 32,
+                "linear_ticket_close_operation_state": "planned",
+                "status": "queued",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        provider = linear.LinearIntegration()
+        herdr = mock.Mock()
+
+        def submit(*_args: object, **kwargs: object) -> object:
+            before_submit = kwargs["before_submit"]
+            accepted = kwargs["accepted"]
+            assert callable(before_submit)
+            assert callable(accepted)
+            before_submit("voice-router", "router-session", "prompt-token", 7)
+            accepted()
+            raise LinearOperationAmbiguous("timed out")
+
+        with (
+            mock.patch.object(jobs, "HerdrClient", return_value=herdr),
+            mock.patch.object(
+                production_jobs,
+                "issue_provider",
+                return_value=provider,
+            ),
+            mock.patch.object(
+                provider,
+                "submit_ticket_close",
+                side_effect=submit,
+            ) as submit,
+            mock.patch.object(
+                provider,
+                "observe_ticket_close",
+                return_value=None,
+            ),
+        ):
+            service.run_worker("123456789abc")
+
+        updated = jobs.read_job("123456789abc")
+        self.assertEqual(updated["status"], "queued")
+        self.assertEqual(
+            updated["linear_ticket_close_operation_state"],
+            "ambiguous",
+        )
+        submit.assert_called_once()
+
     def test_only_trusted_affirmative_reply_confirms_fork(self) -> None:
         job = {
             "id": "123456789abc",
@@ -5326,9 +5664,11 @@ class CursorJobStateTests(unittest.TestCase):
             github_repo_create_requested=False,
             github_repo_create_org_requested=False,
             github_issue_update_requested=False,
+            github_issue_close_requested=False,
             linear_team=None,
             linear_ticket_create_requested=False,
             linear_ticket_update_requested=False,
+            linear_ticket_close_requested=False,
             fork_requested=False,
             github_pull_request=None,
             agent=None,

@@ -72,6 +72,10 @@ ROUTER_SYSTEM_PROMPT = (
     "Use linear_ticket_update when the user asks to update, edit, rewrite, or change "
     "the title or description of an existing Linear ticket. Do not use it for "
     "implementing the ticket or creating a new one. "
+    "Use github_issue_close when the user asks to close or resolve an existing GitHub "
+    "issue. Do not use it for updating, implementing, or creating an issue. "
+    "Use linear_ticket_close when the user asks to close or resolve an existing Linear "
+    "ticket. Do not use it for updating, implementing, or creating a ticket. "
     "Use cursor_details when the user asks to see or hear more detail about the "
     "just-announced completed result, such as 'tell me more' or 'show me the details'; "
     "this is read-only and must not start more work. "
@@ -166,8 +170,10 @@ ROUTE_TOOL = {
                         "github_repo_create",
                         "github_org_repo_create",
                         "github_issue_update",
+                        "github_issue_close",
                         "linear_ticket_create",
                         "linear_ticket_update",
+                        "linear_ticket_close",
                         "end_conversation",
                         "uncertain",
                     ],
@@ -221,8 +227,10 @@ class Intent(StrEnum):
     GITHUB_REPO_CREATE = "github_repo_create"
     GITHUB_ORG_REPO_CREATE = "github_org_repo_create"
     GITHUB_ISSUE_UPDATE = "github_issue_update"
+    GITHUB_ISSUE_CLOSE = "github_issue_close"
     LINEAR_TICKET_CREATE = "linear_ticket_create"
     LINEAR_TICKET_UPDATE = "linear_ticket_update"
+    LINEAR_TICKET_CLOSE = "linear_ticket_close"
     # Compatibility aliases for the original Cursor-specific intent names.
     CURSOR_SUBMIT = "cursor_submit"
     CURSOR_REPLY = "cursor_reply"

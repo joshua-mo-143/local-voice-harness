@@ -7927,6 +7927,66 @@ class CompletedFollowupContextTests(unittest.TestCase):
         cursor_turn.assert_not_called()
         self._last_qwen.assert_not_called()
 
+    def test_ticket_close_without_identity_asks_which_ticket(self) -> None:
+        daemon = _bare_daemon()
+        played: list[str] = []
+
+        def play(response: AssistantResponse) -> tuple[dict[str, object], None]:
+            rendered = as_assistant_response(response)
+            played.append(rendered.spoken_text)
+            return {"played_text": rendered.spoken_text, "interrupted": False}, None
+
+        with (
+            mock.patch.object(
+                wake_daemon, "transcribe", return_value="close this ticket"
+            ),
+            mock.patch.object(wake_daemon, "start_components"),
+            mock.patch.object(
+                wake_daemon,
+                "request_context",
+                return_value=RequestContext("close this ticket"),
+            ),
+            mock.patch.object(
+                wake_daemon,
+                "route_intent",
+                return_value=IntentRoute(Intent.GITHUB_ISSUE_CLOSE, "high"),
+            ),
+            mock.patch.object(wake_daemon, "cursor_turn") as cursor_turn,
+            mock.patch.object(wake_daemon, "qwen_turn") as qwen_turn,
+            mock.patch.object(daemon, "play_response", side_effect=play),
+            mock.patch.object(wake_daemon, "notify"),
+        ):
+            daemon.process_utterance(AUDIO_GENERATION, woke=True)
+
+        cursor_turn.assert_not_called()
+        qwen_turn.assert_not_called()
+        self.assertEqual(played, ["Which ticket should I close?"])
+
+    def test_ticket_close_dispatches_dedicated_job(self) -> None:
+        daemon = _bare_daemon()
+        cursor_turn = self._run_route(
+            daemon,
+            IntentRoute(Intent.GITHUB_ISSUE_CLOSE, "high"),
+            transcript="close example/project#12",
+        )
+
+        request = cursor_turn.call_args.args[0]
+        self.assertTrue(request.github_issue_close_requested)
+        self.assertEqual(request.github_repository, "example/project")
+        self.assertEqual(request.github_issue, 12)
+        self._last_qwen.assert_not_called()
+
+    def test_low_confidence_ticket_close_does_not_write(self) -> None:
+        daemon = _bare_daemon()
+        cursor_turn = self._run_route(
+            daemon,
+            IntentRoute(Intent.GITHUB_ISSUE_CLOSE, "low"),
+            transcript="close example/project#12",
+        )
+
+        cursor_turn.assert_not_called()
+        self._last_qwen.assert_not_called()
+
     def test_github_issue_creation_dispatches_dedicated_job(self) -> None:
         daemon = _bare_daemon()
         cursor_turn = self._run_route(

@@ -165,6 +165,11 @@ from ..stt.client import (
 from ..stt.client import (
     transcribe_retained as transcribe,
 )
+from ..ticket_close import (
+    admit_ticket_close,
+    close_turn_arguments,
+    wants_ticket_close_context,
+)
 from ..ticket_targets import (
     MISSING_ISSUE_SCOPE_RESPONSE,
     TicketExtraction,
@@ -242,8 +247,10 @@ SIDE_EFFECTING_INTENTS = frozenset(
         Intent.GITHUB_REPO_CREATE,
         Intent.GITHUB_ORG_REPO_CREATE,
         Intent.GITHUB_ISSUE_UPDATE,
+        Intent.GITHUB_ISSUE_CLOSE,
         Intent.LINEAR_TICKET_CREATE,
         Intent.LINEAR_TICKET_UPDATE,
+        Intent.LINEAR_TICKET_CLOSE,
         Intent.QUESTION_CONSULTATION,
         Intent.WORKSPACE_CONSULTATION,
     }
@@ -2981,13 +2988,16 @@ class WakeConversationDaemon:
                             Intent.GITHUB_REPO_CREATE,
                             Intent.GITHUB_ORG_REPO_CREATE,
                             Intent.GITHUB_ISSUE_UPDATE,
+                            Intent.GITHUB_ISSUE_CLOSE,
                             Intent.LINEAR_TICKET_CREATE,
                             Intent.LINEAR_TICKET_UPDATE,
+                            Intent.LINEAR_TICKET_CLOSE,
                             Intent.WORKSPACE_CONSULTATION,
                         }
                     )
                     or cursor_consultation.wants_ticket_consultation_context(text)
                     or wants_ticket_update_context(text)
+                    or wants_ticket_close_context(text)
                 )
             ):
                 context = self._capture_request_context(text)
@@ -3023,6 +3033,11 @@ class WakeConversationDaemon:
                 focused_issue=context.focused_issue,
             )
             update_admission = admit_ticket_update(
+                text,
+                extraction,
+                focused_issue=context.focused_issue,
+            )
+            close_admission = admit_ticket_close(
                 text,
                 extraction,
                 focused_issue=context.focused_issue,
@@ -3144,6 +3159,36 @@ class WakeConversationDaemon:
                             issue_key=dispatch.issue_key,
                             linear_ticket_update_requested=(
                                 dispatch.linear_ticket_update_requested
+                            ),
+                        ),
+                        delivery_claims=delivery_claims,
+                        integrations=self.integrations,
+                    )
+            elif close_admission is not None:
+                if close_admission.ticket is None:
+                    response = close_admission.missing_identity_response
+                    ordinary_reply = True
+                elif not route.actionable:
+                    response = (
+                        "I did not close a ticket because the request was unclear. "
+                        "Please name the ticket to close."
+                    )
+                    ordinary_reply = True
+                else:
+                    self.completed_followup = None
+                    dispatch = close_turn_arguments(close_admission.ticket)
+                    response, next_cursor_session = cursor_turn(
+                        CursorTurnRequest(
+                            context.text,
+                            utterance=text,
+                            github_repository=dispatch.github_repository,
+                            github_issue=dispatch.github_issue,
+                            github_issue_close_requested=(
+                                dispatch.github_issue_close_requested
+                            ),
+                            issue_key=dispatch.issue_key,
+                            linear_ticket_close_requested=(
+                                dispatch.linear_ticket_close_requested
                             ),
                         ),
                         delivery_claims=delivery_claims,
@@ -3572,6 +3617,14 @@ class WakeConversationDaemon:
                 response = (
                     "I did not update a ticket because the request was unclear. "
                     "Please name the ticket and the title or body change."
+                )
+            elif route.intent in {
+                Intent.GITHUB_ISSUE_CLOSE,
+                Intent.LINEAR_TICKET_CLOSE,
+            }:
+                response = (
+                    "I did not close a ticket because the request was unclear. "
+                    "Please name the ticket to close."
                 )
             elif route.intent == Intent.GITHUB_PR_CREATE:
                 response = (
