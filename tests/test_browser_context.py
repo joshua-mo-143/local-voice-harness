@@ -351,9 +351,7 @@ class BrowserDispatchTests(unittest.TestCase):
                 browser_context, "capture_text_context", return_value=fragment
             ) as text_context,
             mock.patch.object(browser_context, "focused_browser_url") as focused_url,
-            mock.patch.object(
-                browser_context, "focused_app_context"
-            ) as focused_app,
+            mock.patch.object(browser_context, "focused_app_context") as focused_app,
         ):
             context = browser_context.request_context(
                 "review https://github.com/spoken/project/pull/9",
