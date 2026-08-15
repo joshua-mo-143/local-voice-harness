@@ -305,7 +305,12 @@ class ForegroundDeliveryTests(unittest.TestCase):
         qwen.assert_not_called()
         self.assertEqual(
             [call.args[0] for call in play.call_args_list],
-            [consultation.ACKNOWLEDGEMENT, "Scope mixes two children."],
+            [
+                consultation.acknowledgement(
+                    "adversarially review this ticket"
+                ).spoken_text,
+                "Scope mixes two children.",
+            ],
         )
 
 

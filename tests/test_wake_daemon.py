@@ -2759,7 +2759,9 @@ class ProcessUtteranceTests(unittest.TestCase):
         self.assertEqual(
             played,
             [
-                wake_daemon.cursor_consultation.ACKNOWLEDGEMENT,
+                wake_daemon.cursor_consultation.acknowledgement(
+                    "adversarially review this ticket"
+                ).spoken_text,
                 "Scope mixes two children.",
             ],
         )
