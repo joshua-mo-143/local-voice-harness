@@ -6139,6 +6139,60 @@ class CursorJobStateTests(unittest.TestCase):
         github.observe_issue_update.assert_called()
         github.submit_issue_close.assert_called_once()
 
+    def test_issue_merge_unobserved_submitted_survivor_queues_reconciliation(
+        self,
+    ) -> None:
+        closing = encode_merge_closing(
+            (
+                MergeClosingTicket(
+                    "source/project#13",
+                    "b" * 32,
+                    repository="source/project",
+                    number=13,
+                ),
+            )
+        )
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "merge the issues",
+                "trusted_utterance": "merge the issues",
+                "issue_provider": "github",
+                "github_repository": "source/project",
+                "github_issue": 12,
+                "github_issue_merge_requested": True,
+                "ticket_merge_confirmed": True,
+                "ticket_merge_survivor": "source/project#12",
+                "ticket_merge_survivor_title": "Combined auth",
+                "ticket_merge_survivor_body": "Handle login and invoices.",
+                "ticket_merge_survivor_marker": "a" * 32,
+                "ticket_merge_survivor_operation_state": "submitted",
+                "ticket_merge_closing": closing,
+                "ticket_merge_operation_state": "planned",
+                "status": "queued",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        github = mock.Mock()
+        github.inspect_repository.return_value = GitHubRepository(
+            "source/project",
+            "https://github.com/source/project",
+            False,
+            "main",
+        )
+        github.observe_issue_update.side_effect = GitHubError("lookup failed")
+        with mock.patch.object(jobs, "GitHubClient", return_value=github):
+            service.run_worker("123456789abc")
+
+        updated = jobs.read_job("123456789abc")
+        self.assertEqual(updated["status"], "queued")
+        self.assertEqual(updated["ticket_merge_operation_state"], "ambiguous")
+        self.assertEqual(updated["ticket_merge_survivor_operation_state"], "ambiguous")
+        self.assertTrue(updated.get("reconcile", False))
+        github.submit_issue_update.assert_not_called()
+        github.submit_issue_close.assert_not_called()
+
     def test_issue_merge_observes_ambiguous_close_without_resubmitting(self) -> None:
         closing = encode_merge_closing(
             (
