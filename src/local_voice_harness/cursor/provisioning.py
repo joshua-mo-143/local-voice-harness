@@ -29,6 +29,7 @@ from ..integrations.github import (
     GitHubOperationAmbiguous,
     GitHubProvider,
     GitHubPullRequestCheckoutInputs,
+    GitHubPullRequestCreationPlan,
     GitHubPullRequestCreationResult,
     GitHubRepoCreationResult,
     GitHubRepository,
@@ -67,6 +68,7 @@ from ..job_lifecycle import SessionControlMode, WorkerCallbackEvent
 from ..linear_ticket_creation import draft_linear_ticket
 from ..local_git import (
     ExpectedRemote,
+    GitPublicationSnapshot,
     LocalGitError,
     LocalGitOperationAmbiguous,
     LocalGitRefChanged,
@@ -1198,75 +1200,52 @@ def _run_github_pr_creation(
     github = _github_provider(clients.github)
     checkpoint()
     try:
-        github.local_git.verify_checkout(checkout)
-    except LocalGitError:
-        _complete_github_repo_creation_without_write(
-            store,
-            job.id,
-            token,
-            "I don't have a verified checkout to open a pull request from.",
-            expected_revision=job.revision,
-        )
-        return
-    repository = (job.github_repository or "").strip()
-    if not repository:
-        try:
-            repository = github.repository_for_checkout(checkout)
-        except GitHubError:
-            _complete_github_repo_creation_without_write(
-                store,
-                job.id,
-                token,
-                "I couldn't identify the GitHub repository for that checkout.",
-                expected_revision=job.revision,
+        checkout_repository = github.repository_for_checkout(checkout)
+        requested_repository = (job.github_repository or "").strip()
+        if (
+            requested_repository
+            and requested_repository.casefold() != checkout_repository.casefold()
+        ):
+            raise GitHubError(
+                "retained checkout origin does not match the target repository"
             )
-            return
-    try:
-        source = github.resolve_repository(repository)
+        source = github.resolve_repository(checkout_repository)
         repository = source.name_with_owner
-        head = github.local_git.current_branch(checkout)
+        if not source.default_branch:
+            raise GitHubError("target repository default branch could not be verified")
+        snapshot = github.local_git.publication_snapshot(checkout)
+        expected_origin = f"github.com/{checkout_repository.casefold()}"
+        if snapshot.origin_identity != expected_origin:
+            raise GitHubError("retained checkout origin changed unexpectedly")
     except (GitHubError, LocalGitError):
         _complete_github_repo_creation_without_write(
             store,
             job.id,
             token,
-            "I couldn't identify the branch or repository for that checkout.",
+            "I couldn't verify one repository, branch, base, and checkout snapshot "
+            "for that pull request.",
             expected_revision=job.revision,
         )
         return
-    if not head or head == "HEAD":
-        _complete_github_repo_creation_without_write(
-            store,
-            job.id,
-            token,
-            "That checkout is not on a named branch I can open a pull request from.",
-            expected_revision=job.revision,
-        )
-        return
-    if job.worktree_branch and job.worktree_branch != head:
-        _complete_github_repo_creation_without_write(
-            store,
-            job.id,
-            token,
-            "The retained checkout branch changed, so I did not open a pull request.",
-            expected_revision=job.revision,
-        )
-        return
+    head = snapshot.branch
+    head_owner = checkout_repository.split("/", 1)[0]
+    qualified_head = f"{head_owner}:{head}"
     if not job.github_pr_create_title or job.github_pr_create_body is None:
         draft = issue_draft_from_trusted_brief(
             job.trusted_utterance or job.request,
             repository,
         )
-        try:
-            dirty = github.local_git.has_unpublished_changes(checkout)
-        except LocalGitError:
-            dirty = False
-        commit_subject = _pr_create_commit_subject(draft.title) if dirty else None
+        commit_subject = (
+            _pr_create_commit_subject(draft.title) if snapshot.dirty else None
+        )
         plan = github.plan_pull_request_creation(
             draft.repository,
             draft.title,
             draft.body,
-            head,
+            qualified_head,
+            source.default_branch,
+            snapshot.head_oid,
+            checkout_repository,
             correlation_marker=uuid.uuid4().hex,
         )
 
@@ -1278,6 +1257,12 @@ def _run_github_pr_creation(
                 github_pr_create_body=plan.body,
                 github_pr_create_marker=plan.correlation_marker,
                 github_pr_create_commit_subject=commit_subject,
+                github_pr_create_base=plan.base,
+                github_pr_create_head_oid=snapshot.head_oid,
+                github_pr_create_published_head_oid=None,
+                github_pr_create_head_repository=plan.head_repository,
+                github_pr_create_checkout_origin=snapshot.origin_identity,
+                github_pr_create_status_digest=snapshot.status_digest,
                 github_pr_create_operation_state="planned",
             )
 
@@ -1296,27 +1281,100 @@ def _run_github_pr_creation(
         job.github_repository or repository,
         job.github_pr_create_title or "",
         job.github_pr_create_body or "",
-        job.worktree_branch or head,
+        (
+            f"{(job.github_pr_create_head_repository or checkout_repository).split('/', 1)[0]}:"
+            f"{job.worktree_branch or head}"
+        ),
+        job.github_pr_create_base or "",
+        job.github_pr_create_published_head_oid or job.github_pr_create_head_oid or "",
+        job.github_pr_create_head_repository or "",
         correlation_marker=job.github_pr_create_marker,
     )
-    if not job.github_pr_create_confirmed:
+
+    def confirmation_preview(
+        confirmation_plan: GitHubPullRequestCreationPlan,
+        status_digest: str,
+    ) -> str:
         commit_line = (
             f"Commit: {job.github_pr_create_commit_subject}\n\n"
             if job.github_pr_create_commit_subject
             else ""
         )
-        preview = (
-            f"Open a pull request in {plan.repository} from {plan.head}?\n\n"
-            f"Title: {plan.title}\n\nBody:\n{plan.body}\n\n"
+        return (
+            f"Open a pull request in {confirmation_plan.repository} from "
+            f"{confirmation_plan.head} into {confirmation_plan.base}?\n\n"
+            f"Checkout origin: {confirmation_plan.head_repository}\n"
+            f"Confirmed HEAD: {confirmation_plan.head_oid}\n"
+            f"Status digest: {status_digest}\n\n"
+            f"Title: {confirmation_plan.title}\n\n"
+            f"Body:\n{confirmation_plan.body}\n\n"
             f"{commit_line}"
             "Say yes to open it or no to cancel."
         )
+
+    if not job.github_pr_create_confirmed:
         _worker_question(
             store,
             job.id,
             token,
-            preview,
+            confirmation_preview(plan, job.github_pr_create_status_digest or ""),
             expected_revision=job.revision,
+            clarification_kind="github_pr_create_confirmation",
+            sensitivity=QuestionSensitivity.DESTRUCTIVE,
+        )
+        return
+    expected_snapshot = GitPublicationSnapshot(
+        origin_identity=job.github_pr_create_checkout_origin or "",
+        branch=job.worktree_branch or "",
+        head_oid=job.github_pr_create_head_oid or "",
+        status_digest=job.github_pr_create_status_digest or "",
+        dirty=bool(job.github_pr_create_commit_subject),
+    )
+    if snapshot != expected_snapshot:
+        refreshed_plan = github.plan_pull_request_creation(
+            plan.repository,
+            plan.title,
+            plan.body,
+            f"{head_owner}:{snapshot.branch}",
+            plan.base,
+            snapshot.head_oid,
+            checkout_repository,
+            correlation_marker=plan.correlation_marker,
+        )
+
+        def require_reconfirmation(current: CursorJob) -> CursorJob:
+            return current.evolve(
+                github_pr_create_confirmed=False,
+                worktree_branch=snapshot.branch,
+                github_pr_create_head_oid=snapshot.head_oid,
+                github_pr_create_published_head_oid=None,
+                github_pr_create_checkout_origin=snapshot.origin_identity,
+                github_pr_create_status_digest=snapshot.status_digest,
+                github_pr_create_commit_subject=(
+                    current.github_pr_create_commit_subject
+                    or _pr_create_commit_subject(plan.title)
+                    if snapshot.dirty
+                    else None
+                ),
+                github_pr_create_operation_state="planned",
+            )
+
+        refreshed = _worker_change(
+            store,
+            job.id,
+            token,
+            {JobStatus.ROUTING},
+            require_reconfirmation,
+            expected_revision=job.revision,
+        )
+        if refreshed is None:
+            return
+        _worker_question(
+            store,
+            job.id,
+            token,
+            confirmation_preview(refreshed_plan, snapshot.status_digest),
+            expected_revision=refreshed.revision,
             clarification_kind="github_pr_create_confirmation",
             sensitivity=QuestionSensitivity.DESTRUCTIVE,
         )
@@ -1343,6 +1401,7 @@ def _run_github_pr_creation(
     )
     if submitted is None:
         return
+    operation_job = submitted
     try:
         checkpoint()
         if job.github_pr_create_commit_subject:
@@ -1350,9 +1409,50 @@ def _run_github_pr_creation(
                 checkout,
                 job.github_pr_create_commit_subject,
                 confirmed=True,
+                expected=expected_snapshot,
             )
         checkpoint()
-        github.local_git.push_current_branch(checkout, confirmed=True)
+        published_snapshot = github.local_git.publication_snapshot(checkout)
+        if published_snapshot.origin_identity != expected_snapshot.origin_identity:
+            raise LocalGitRefChanged(
+                "Git checkout origin changed after pull request confirmation"
+            )
+        if published_snapshot.branch != expected_snapshot.branch:
+            raise LocalGitRefChanged(
+                "Git checkout branch changed after pull request confirmation"
+            )
+
+        def record_published_head(current: CursorJob) -> CursorJob:
+            return current.evolve(
+                github_pr_create_published_head_oid=published_snapshot.head_oid,
+            )
+
+        persisted = _worker_change(
+            store,
+            job.id,
+            token,
+            {JobStatus.RUNNING},
+            record_published_head,
+            expected_revision=submitted.revision,
+        )
+        if persisted is None:
+            return
+        operation_job = persisted
+        plan = github.plan_pull_request_creation(
+            plan.repository,
+            plan.title,
+            plan.body,
+            plan.head,
+            plan.base,
+            published_snapshot.head_oid,
+            plan.head_repository,
+            correlation_marker=plan.correlation_marker,
+        )
+        github.local_git.push_current_branch(
+            checkout,
+            confirmed=True,
+            expected=published_snapshot,
+        )
         checkpoint()
         result = github.submit_pull_request_creation(plan, confirmed=True)
     except (GitHubError, LocalGitError) as exc:
@@ -1367,7 +1467,7 @@ def _run_github_pr_creation(
                 job.id,
                 token,
                 visible,
-                expected_revision=submitted.revision,
+                expected_revision=operation_job.revision,
             )
             return
         retryable_start = isinstance(exc, GitHubCommandStartError) and not isinstance(
@@ -1394,7 +1494,7 @@ def _run_github_pr_creation(
                 token,
                 {JobStatus.ROUTING, JobStatus.RUNNING},
                 ambiguous,
-                expected_revision=submitted.revision,
+                expected_revision=operation_job.revision,
             )
             return
 
@@ -1418,7 +1518,7 @@ def _run_github_pr_creation(
             token,
             {JobStatus.ROUTING, JobStatus.RUNNING},
             retry_after_start_failure,
-            expected_revision=submitted.revision,
+            expected_revision=operation_job.revision,
         )
         return
     _finish_github_pr_creation(
@@ -1426,7 +1526,7 @@ def _run_github_pr_creation(
         job.id,
         token,
         result,
-        expected_revision=submitted.revision,
+        expected_revision=operation_job.revision,
     )
 
 
@@ -1601,7 +1701,7 @@ def _finish_github_repo_creation(
             return job.evolve(
                 github_repository=result.repository.name_with_owner,
                 github_repo_created_url=url,
-                github_repo_create_operation_state="created",
+                github_repo_create_operation_state="clone_verified",
                 repository=job.repository,
                 worker_operation=None,
             )
@@ -5797,7 +5897,7 @@ def run_claimed_worker(  # pyright: ignore[reportGeneralTypeIssues]
             )
             return
         if job.github_repo_create_requested:
-            if job.github_repo_create_operation_state != "created":
+            if job.github_repo_create_operation_state != "clone_verified":
                 _run_github_repo_creation(
                     store,
                     job,
@@ -5808,7 +5908,7 @@ def run_claimed_worker(  # pyright: ignore[reportGeneralTypeIssues]
                 job = store.get(job_id)
             if not (
                 job.github_repo_create_continue_workflow
-                and job.github_repo_create_operation_state == "created"
+                and job.github_repo_create_operation_state == "clone_verified"
             ):
                 return
             if not job.repository and job.github_repository:
@@ -6220,7 +6320,7 @@ def run_claimed_worker(  # pyright: ignore[reportGeneralTypeIssues]
             reason = ""
             if (
                 job.github_repo_create_continue_workflow
-                and job.github_repo_create_operation_state == "created"
+                and job.github_repo_create_operation_state == "clone_verified"
                 and job.repository
             ):
                 repository = Path(job.repository)

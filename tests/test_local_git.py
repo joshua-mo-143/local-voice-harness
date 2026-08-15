@@ -10,8 +10,10 @@ from unittest import mock
 
 from local_voice_harness.local_git import (
     ExpectedRemote,
+    GitPublicationSnapshot,
     LocalGitError,
     LocalGitOperationAmbiguous,
+    LocalGitRefChanged,
     LocalGitRepository,
     remote_identity,
 )
@@ -796,12 +798,19 @@ class LocalGitRepositoryTests(unittest.TestCase):
             with mock.patch.object(
                 repository,
                 "git",
-                side_effect=[
-                    _completed(""),
-                    _completed("voice/job\n"),
-                    _completed(),
-                    _completed(),
-                ],
+                side_effect=lambda _checkout, *arguments, **_kwargs: (
+                    _completed("https://github.com/example/project\n")
+                    if arguments == ("remote", "get-url", "origin")
+                    else (
+                        _completed("voice/job\n")
+                        if arguments == ("rev-parse", "--abbrev-ref", "HEAD")
+                        else (
+                            _completed("b" * 40 + "\n")
+                            if arguments == ("rev-parse", "HEAD")
+                            else _completed()
+                        )
+                    )
+                ),
             ) as git:
                 self.assertIsNone(
                     repository.commit_unpublished_changes(
@@ -813,7 +822,10 @@ class LocalGitRepositoryTests(unittest.TestCase):
                     "voice/job",
                 )
             commands = [call.args[1:] for call in git.call_args_list]
-            self.assertIn(("status", "--porcelain"), commands)
+            self.assertIn(
+                ("status", "--porcelain=v1", "-z", "--untracked-files=all"),
+                commands,
+            )
             self.assertNotIn(("add", "-A"), commands)
             self.assertIn(("push", "-u", "origin", "voice/job"), commands)
 
@@ -823,23 +835,95 @@ class LocalGitRepositoryTests(unittest.TestCase):
             checkout = root / "project"
             (checkout / ".git").mkdir(parents=True)
             repository = LocalGitRepository(clone_root=root, allowed_root=root)
+            (checkout / "file.py").write_text("change")
             with mock.patch.object(
                 repository,
                 "git",
-                side_effect=[
-                    _completed(" M file.py\n"),
-                    _completed(),
-                    _completed(),
-                    _completed("abc123\n"),
-                ],
+                side_effect=lambda _checkout, *arguments, **_kwargs: (
+                    _completed("https://github.com/example/project\n")
+                    if arguments == ("remote", "get-url", "origin")
+                    else (
+                        _completed("voice/job\n")
+                        if arguments == ("rev-parse", "--abbrev-ref", "HEAD")
+                        else (
+                            _completed("c" * 40 + "\n")
+                            if arguments == ("rev-parse", "HEAD")
+                            else (
+                                _completed(" M file.py\0")
+                                if arguments
+                                == (
+                                    "status",
+                                    "--porcelain=v1",
+                                    "-z",
+                                    "--untracked-files=all",
+                                )
+                                else _completed()
+                            )
+                        )
+                    )
+                ),
             ) as git:
                 oid = repository.commit_unpublished_changes(
                     checkout, "Fix the reader", confirmed=True
                 )
-            self.assertEqual(oid, "abc123")
+            self.assertEqual(oid, "c" * 40)
             commands = [call.args[1:] for call in git.call_args_list]
-            self.assertEqual(commands[1], ("add", "-A"))
-            self.assertEqual(commands[2], ("commit", "-m", "Fix the reader"))
+            self.assertIn(("add", "-A"), commands)
+            self.assertIn(("commit", "-m", "Fix the reader"), commands)
+
+    def test_publication_snapshot_rejects_stale_commit_and_push_state(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkout = root / "project"
+            (checkout / ".git").mkdir(parents=True)
+            repository = LocalGitRepository(clone_root=root, allowed_root=root)
+            expected = GitPublicationSnapshot(
+                "github.com/example/project",
+                "voice/job",
+                "a" * 40,
+                "b" * 64,
+                True,
+            )
+            changed = GitPublicationSnapshot(
+                "github.com/example/project",
+                "voice/job",
+                "c" * 40,
+                "d" * 64,
+                True,
+            )
+
+            with mock.patch.object(
+                repository, "publication_snapshot", return_value=changed
+            ):
+                with self.assertRaises(LocalGitRefChanged):
+                    repository.require_publication_snapshot(checkout, expected)
+                with self.assertRaises(LocalGitRefChanged):
+                    repository.commit_unpublished_changes(
+                        checkout,
+                        "Fix the reader",
+                        confirmed=True,
+                        expected=expected,
+                    )
+                with self.assertRaises(LocalGitRefChanged):
+                    repository.push_current_branch(
+                        checkout,
+                        confirmed=True,
+                        expected=expected,
+                    )
+
+    def test_status_digest_binds_symlink_directory_and_absent_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            checkout = Path(temporary)
+            (checkout / "folder").mkdir()
+            (checkout / "target").write_text("content")
+            (checkout / "link").symlink_to("target")
+
+            digest = LocalGitRepository._status_digest(
+                checkout,
+                "?? link\0?? folder\0?? missing\0malformed\0",
+            )
+
+            self.assertEqual(len(digest), 64)
 
     def test_commit_and_push_reject_invalid_checkout_and_subject(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -859,7 +943,11 @@ class LocalGitRepositoryTests(unittest.TestCase):
             with mock.patch.object(
                 repository,
                 "git",
-                return_value=_completed("HEAD\n"),
+                side_effect=lambda _checkout, *arguments, **_kwargs: (
+                    _completed("https://github.com/example/project\n")
+                    if arguments == ("remote", "get-url", "origin")
+                    else _completed("HEAD\n")
+                ),
             ):
                 with self.assertRaisesRegex(LocalGitError, "named branch"):
                     repository.push_current_branch(checkout, confirmed=True)
@@ -871,10 +959,18 @@ class LocalGitRepositoryTests(unittest.TestCase):
             (checkout / ".git").mkdir(parents=True)
             repository = LocalGitRepository(clone_root=root, allowed_root=root)
 
-            def git(*_args: object, **kwargs: object) -> object:
+            def git(
+                _checkout: Path, *arguments: str, **kwargs: object
+            ) -> subprocess.CompletedProcess[str]:
                 if kwargs.get("timeout") == 180:
                     raise LocalGitOperationAmbiguous("timed out")
-                return _completed("voice/job\n")
+                if arguments == ("remote", "get-url", "origin"):
+                    return _completed("https://github.com/example/project\n")
+                if arguments == ("rev-parse", "--abbrev-ref", "HEAD"):
+                    return _completed("voice/job\n")
+                if arguments == ("rev-parse", "HEAD"):
+                    return _completed("b" * 40 + "\n")
+                return _completed()
 
             with (
                 mock.patch.object(repository, "git", side_effect=git),

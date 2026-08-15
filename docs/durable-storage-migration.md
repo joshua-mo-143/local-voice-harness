@@ -14,10 +14,10 @@ inventory remains as historical design context for the compatibility importer.
 
 ## Current schema-v18 relational inventory
 
-`CursorJob` currently produces 234 persisted field names, including the
+`CursorJob` currently produces 240 persisted field names, including the
 dynamically emitted `pane_retained_at` cleanup and
 `grouped_repository_coordinator_id` handoff fields. Database schema v2
-assigns each exactly once: 216 named lifecycle columns, two immutable artifact
+assigns each exactly once: 222 named lifecycle columns, two immutable artifact
 references, and four import-only compatibility values. The executable exhaustive
 inventory is `_NAMED_TABLE_FIELDS` in `cursor/sqlite_store.py`; startup rejects a
 v18 value not present in that inventory rather than silently creating generic
@@ -45,14 +45,14 @@ success.
 
 | Baseline | Count |
 |---|---:|
-| Persisted field names | 234 |
-| Named table fields | 229 |
+| Persisted field names | 240 |
+| Named table fields | 235 |
 | Import-only fields | 4 |
-| Directly exposed `CursorJob` properties | 173 |
+| Directly exposed `CursorJob` properties | 179 |
 | Compatibility adapters | 38 |
-| Public transition entry points | 76 |
+| Public transition entry points | 75 |
 | Documented duplicate authorities | 0 |
-| Lifecycle-related module lines | 28777 |
+| Lifecycle-related module lines | 28924 |
 
 #358 unified ordinary and clarification submission onto one
 `prompt_operations.PromptOperationState`. #359 made that typed operation the

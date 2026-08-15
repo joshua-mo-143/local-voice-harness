@@ -754,7 +754,9 @@ def reconcile_uncertain_pr_creation(
     title = job.github_pr_create_title or ""
     body = job.github_pr_create_body or ""
     marker = job.github_pr_create_marker
-    head = job.worktree_branch or ""
+    head_repository = job.github_pr_create_head_repository or ""
+    head_owner = head_repository.split("/", 1)[0] if "/" in head_repository else ""
+    head = f"{head_owner}:{job.worktree_branch or ''}"
     try:
         github = _github_provider(github_factory)
         plan = github.plan_pull_request_creation(
@@ -762,6 +764,9 @@ def reconcile_uncertain_pr_creation(
             title,
             body,
             head,
+            job.github_pr_create_base or "",
+            job.github_pr_create_published_head_oid or "",
+            head_repository,
             correlation_marker=marker,
         )
         result = github.observe_pull_request_creation(plan)
@@ -867,21 +872,6 @@ def reconcile_uncertain_repo_creation(
                 worker_token=None,
                 prepare_delivery=True,
             )
-        if current.github_repo_create_continue_workflow:
-            return current.evolve_recovery(
-                now=now,
-                status=JobStatus.QUEUED,
-                queued_at=now,
-                github_repository=result.repository.name_with_owner,
-                github_repo_created_url=result.url,
-                github_repo_create_operation_state="created",
-                reconcile=False,
-                worker_operation=None,
-                worker_pid=None,
-                worker_boot_id=None,
-                worker_process_start=None,
-                worker_token=None,
-            )
         return current.evolve_recovery(
             now=now,
             github_repository=result.repository.name_with_owner,
@@ -903,6 +893,22 @@ def reconcile_uncertain_repo_creation(
     def clone_verified(current: CursorJob) -> CursorJob | None:
         if current.github_repo_create_operation_state != "remote_created":
             return None
+        if current.github_repo_create_continue_workflow:
+            return current.evolve_recovery(
+                now=now,
+                status=JobStatus.QUEUED,
+                queued_at=now,
+                repository=str(checkout),
+                github_repository=result.repository.name_with_owner,
+                github_repo_created_url=result.url,
+                github_repo_create_operation_state="clone_verified",
+                reconcile=False,
+                worker_operation=None,
+                worker_pid=None,
+                worker_boot_id=None,
+                worker_process_start=None,
+                worker_token=None,
+            )
         return current.evolve_recovery(
             now=now,
             status=JobStatus.COMPLETED,

@@ -323,6 +323,12 @@ _STRING_FIELDS = frozenset(
         "github_pr_create_body",
         "github_pr_create_marker",
         "github_pr_create_commit_subject",
+        "github_pr_create_base",
+        "github_pr_create_head_oid",
+        "github_pr_create_published_head_oid",
+        "github_pr_create_head_repository",
+        "github_pr_create_checkout_origin",
+        "github_pr_create_status_digest",
         "github_pr_create_operation_state",
         "github_pr_created_url",
         "github_repo_create_owner",
@@ -2626,6 +2632,30 @@ class AgentJob:
         return self._optional_string("github_pr_create_commit_subject")
 
     @property
+    def github_pr_create_base(self) -> str | None:
+        return self._optional_string("github_pr_create_base")
+
+    @property
+    def github_pr_create_head_oid(self) -> str | None:
+        return self._optional_string("github_pr_create_head_oid")
+
+    @property
+    def github_pr_create_published_head_oid(self) -> str | None:
+        return self._optional_string("github_pr_create_published_head_oid")
+
+    @property
+    def github_pr_create_head_repository(self) -> str | None:
+        return self._optional_string("github_pr_create_head_repository")
+
+    @property
+    def github_pr_create_checkout_origin(self) -> str | None:
+        return self._optional_string("github_pr_create_checkout_origin")
+
+    @property
+    def github_pr_create_status_digest(self) -> str | None:
+        return self._optional_string("github_pr_create_status_digest")
+
+    @property
     def github_pr_create_operation_state(self) -> str | None:
         return self._optional_string("github_pr_create_operation_state")
 
@@ -4072,6 +4102,11 @@ class AgentJob:
                 self.github_repository,
                 self.github_pr_create_title,
                 self.github_pr_create_marker,
+                self.github_pr_create_base,
+                self.github_pr_create_head_oid,
+                self.github_pr_create_head_repository,
+                self.github_pr_create_checkout_origin,
+                self.github_pr_create_status_digest,
             )
         ):
             raise JobValidationError(

@@ -472,6 +472,12 @@ def _build_field_ownership() -> tuple[FieldOwnership, ...]:
                 "github_pr_create_body": CrashKind.CONTENT,
                 "github_pr_create_marker": CrashKind.TOKEN,
                 "github_pr_create_commit_subject": CrashKind.CONTENT,
+                "github_pr_create_base": CrashKind.IDENTITY,
+                "github_pr_create_head_oid": CrashKind.IDENTITY,
+                "github_pr_create_published_head_oid": CrashKind.IDENTITY,
+                "github_pr_create_head_repository": CrashKind.IDENTITY,
+                "github_pr_create_checkout_origin": CrashKind.IDENTITY,
+                "github_pr_create_status_digest": CrashKind.CONTENT,
                 "github_pr_create_operation_state": CrashKind.UNCERTAINTY,
                 "github_pr_created_number": CrashKind.IDENTITY,
                 "github_pr_created_url": CrashKind.IDENTITY,
@@ -1431,12 +1437,12 @@ def measured_baseline_counts() -> dict[str, int]:
 # Measured on the #357 baseline checkout. Tests fail if these drift without an
 # intentional inventory update. They are evidence, not an optimization target.
 BASELINE_COUNTS: dict[str, int] = {
-    "persisted_field_names": 234,
-    "named_table_fields": 229,
+    "persisted_field_names": 240,
+    "named_table_fields": 235,
     "import_only_fields": 4,
-    "cursor_job_public_properties": 173,
+    "cursor_job_public_properties": 179,
     "compatibility_adapters": 38,
-    "transition_entry_points": 76,
+    "transition_entry_points": 75,
     "duplicate_authorities": 0,
-    "lifecycle_module_lines": 28777,
+    "lifecycle_module_lines": 28924,
 }

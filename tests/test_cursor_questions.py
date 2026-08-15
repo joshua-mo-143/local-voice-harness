@@ -185,6 +185,11 @@ def _pr_creation_awaiting(store: JobStore) -> CursorJob:
                 "github_pr_create_title": "Open the change",
                 "github_pr_create_body": "Detailed body",
                 "github_pr_create_marker": "a" * 32,
+                "github_pr_create_base": "main",
+                "github_pr_create_head_oid": "b" * 40,
+                "github_pr_create_head_repository": "example/project",
+                "github_pr_create_checkout_origin": "github.com/example/project",
+                "github_pr_create_status_digest": "d" * 64,
                 "github_pr_create_operation_state": "planned",
             }
         )

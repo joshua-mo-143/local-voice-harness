@@ -274,6 +274,9 @@ class GitHubPullRequestCreationPlan:
     title: str
     body: str
     head: str
+    base: str
+    head_oid: str
+    head_repository: str
     correlation_marker: str
 
 
@@ -565,12 +568,21 @@ class GitHubClient:
             )
         if not isinstance(plan.head, str) or not plan.head.strip():
             raise GitHubError("GitHub pull request head must not be empty")
-        if any(character.isspace() for character in plan.head) or plan.head in {
-            ".",
-            "..",
-            "HEAD",
-        }:
+        if any(character.isspace() for character in plan.head):
             raise GitHubError("GitHub pull request head is invalid")
+        if not isinstance(plan.base, str) or not plan.base.strip():
+            raise GitHubError("GitHub pull request base must not be empty")
+        if any(character.isspace() for character in plan.base):
+            raise GitHubError("GitHub pull request base is invalid")
+        if re.fullmatch(r"[0-9a-f]{40}", plan.head_oid) is None:
+            raise GitHubError("GitHub pull request head OID is invalid")
+        head_repository = GitHubClient.validate_repository(plan.head_repository)
+        if head_repository != plan.head_repository:
+            raise GitHubError("GitHub pull request head repository is not normalized")
+        head_owner, _name = head_repository.split("/", 1)
+        prefix = f"{head_owner}:"
+        if not plan.head.startswith(prefix) or plan.head == prefix:
+            raise GitHubError("GitHub pull request head must be owner-qualified")
         if (
             not isinstance(plan.correlation_marker, str)
             or ISSUE_CORRELATION_MARKER.fullmatch(plan.correlation_marker) is None
@@ -625,6 +637,8 @@ class GitHubClient:
                 plan.title,
                 "--head",
                 plan.head,
+                "--base",
+                plan.base,
                 "--body-file",
                 "-",
             ],
@@ -633,7 +647,14 @@ class GitHubClient:
             stdin=submitted_body,
         )
         try:
-            return self._pull_request_creation_result(plan, process.stdout)
+            submitted = self._pull_request_creation_result(plan, process.stdout)
+            observed = self.observe_pull_request_creation(plan)
+            if (
+                observed is None
+                or observed.pull_request.number != submitted.pull_request.number
+            ):
+                raise GitHubError("created pull request snapshot could not be verified")
+            return observed
         except GitHubError as exc:
             raise GitHubOperationAmbiguous(
                 "GitHub write completed without a provable pull request result; "
@@ -656,7 +677,7 @@ class GitHubClient:
                 "--limit",
                 str(ISSUE_OBSERVATION_LIMIT),
                 "--json",
-                "number,url,body",
+                "number,url,body,baseRefName,headRefName,headRefOid,headRepository",
             ],
             timeout=15,
         )
@@ -673,6 +694,20 @@ class GitHubClient:
         for value in values:
             if not isinstance(value, dict) or marker not in str(
                 value.get("body") or ""
+            ):
+                continue
+            head_repository = value.get("headRepository")
+            head_repository_name = (
+                str(head_repository.get("nameWithOwner") or "")
+                if isinstance(head_repository, dict)
+                else ""
+            )
+            expected_branch = plan.head.split(":", 1)[1]
+            if (
+                str(value.get("baseRefName") or "") != plan.base
+                or str(value.get("headRefName") or "") != expected_branch
+                or str(value.get("headRefOid") or "").lower() != plan.head_oid
+                or head_repository_name.casefold() != plan.head_repository.casefold()
             ):
                 continue
             result = self._pull_request_creation_result(plan, value.get("url"))
@@ -1592,6 +1627,12 @@ _GITHUB_STATE_SECTIONS: dict[str, dict[str, str]] = {
         "body": "github_pr_create_body",
         "marker": "github_pr_create_marker",
         "commit_subject": "github_pr_create_commit_subject",
+        "base": "github_pr_create_base",
+        "head_oid": "github_pr_create_head_oid",
+        "published_head_oid": "github_pr_create_published_head_oid",
+        "head_repository": "github_pr_create_head_repository",
+        "checkout_origin": "github_pr_create_checkout_origin",
+        "status_digest": "github_pr_create_status_digest",
         "operation_state": "github_pr_create_operation_state",
         "created_number": "github_pr_created_number",
         "created_url": "github_pr_created_url",
@@ -1826,6 +1867,9 @@ class GitHubProvider:
         title: str,
         body: str,
         head: str,
+        base: str,
+        head_oid: str,
+        head_repository: str,
         *,
         correlation_marker: str | None = None,
     ) -> GitHubPullRequestCreationPlan:
@@ -1842,6 +1886,9 @@ class GitHubProvider:
             title=title.strip(),
             body=body.strip(),
             head=head.strip(),
+            base=base.strip(),
+            head_oid=head_oid.strip().lower(),
+            head_repository=GitHubClient.validate_repository(head_repository),
             correlation_marker=correlation_marker or secrets.token_hex(16),
         )
         self.validate_pull_request_creation_plan(plan)

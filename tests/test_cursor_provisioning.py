@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import signal
@@ -65,7 +66,7 @@ from local_voice_harness.integrations.linear import (
     LinearTicketCreationResult,
 )
 from local_voice_harness.linear_ticket_creation import LinearTicketDraft
-from local_voice_harness.local_git import LocalGitRefChanged
+from local_voice_harness.local_git import GitPublicationSnapshot, LocalGitRefChanged
 from tests.support import join_threads
 
 WORKER = WorkerOwnership("worker", 42, "boot", "start", "test", 1)
@@ -3475,10 +3476,15 @@ class CursorJobStateTests(unittest.TestCase):
         )
         github = mock.Mock()
         github.inspect_repository.return_value = source
+        github.repository_for_checkout.return_value = "source/project"
         github.local_git = mock.Mock()
-        github.local_git.verify_checkout.return_value = None
-        github.local_git.current_branch.return_value = "voice/job"
-        github.local_git.has_unpublished_changes.return_value = True
+        github.local_git.publication_snapshot.return_value = GitPublicationSnapshot(
+            "github.com/source/project",
+            "voice/job",
+            "b" * 40,
+            "d" * 64,
+            True,
+        )
         with mock.patch.object(jobs, "GitHubClient", return_value=github):
             service.run_worker("123456789abc")
 
@@ -3512,6 +3518,11 @@ class CursorJobStateTests(unittest.TestCase):
                 "github_pr_create_body": "open a pull request",
                 "github_pr_create_marker": "a" * 32,
                 "github_pr_create_commit_subject": "open a pull request",
+                "github_pr_create_base": "main",
+                "github_pr_create_head_oid": "b" * 40,
+                "github_pr_create_head_repository": "source/project",
+                "github_pr_create_checkout_origin": "github.com/source/project",
+                "github_pr_create_status_digest": "d" * 64,
                 "github_pr_create_operation_state": "planned",
                 "worktree_path": str(checkout),
                 "worktree_branch": "voice/job",
@@ -3534,9 +3545,24 @@ class CursorJobStateTests(unittest.TestCase):
         )
         github = mock.Mock()
         github.inspect_repository.return_value = source
+        github.repository_for_checkout.return_value = "source/project"
         github.local_git = mock.Mock()
-        github.local_git.verify_checkout.return_value = None
-        github.local_git.current_branch.return_value = "voice/job"
+        github.local_git.publication_snapshot.side_effect = [
+            GitPublicationSnapshot(
+                "github.com/source/project",
+                "voice/job",
+                "b" * 40,
+                "d" * 64,
+                True,
+            ),
+            GitPublicationSnapshot(
+                "github.com/source/project",
+                "voice/job",
+                "c" * 40,
+                hashlib.sha256(b"").hexdigest(),
+                False,
+            ),
+        ]
         github.submit_pull_request_creation.return_value = result
         herdr = mock.Mock()
         with (
@@ -3560,6 +3586,95 @@ class CursorJobStateTests(unittest.TestCase):
         github.local_git.push_current_branch.assert_called_once()
         github.submit_pull_request_creation.assert_called_once()
         herdr.assert_not_called()
+
+    def test_pull_request_creation_fails_closed_for_mixed_repository_state(
+        self,
+    ) -> None:
+        checkout = self._pr_checkout()
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "open a pull request",
+                "github_pr_create_requested": True,
+                "worktree_path": str(checkout),
+                "worktree_branch": "voice/job",
+                "github_repository": "source/project",
+                "status": "queued",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        github = mock.Mock()
+        github.repository_for_checkout.return_value = "other/project"
+        github.local_git = mock.Mock()
+
+        with mock.patch.object(jobs, "GitHubClient", return_value=github):
+            service.run_worker("123456789abc")
+
+        updated = jobs.read_job("123456789abc")
+        self.assertEqual(updated["status"], "completed")
+        self.assertIn("couldn't verify", str(updated["result"]))
+        github.submit_pull_request_creation.assert_not_called()
+        github.local_git.commit_unpublished_changes.assert_not_called()
+        github.local_git.push_current_branch.assert_not_called()
+
+    def test_stale_pull_request_snapshot_requires_reconfirmation(self) -> None:
+        checkout = self._pr_checkout()
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "open a pull request",
+                "trusted_utterance": "open a pull request",
+                "github_pr_create_requested": True,
+                "github_pr_create_confirmed": True,
+                "github_pr_create_title": "Open the change",
+                "github_pr_create_body": "Detailed body",
+                "github_pr_create_marker": "a" * 32,
+                "github_pr_create_base": "main",
+                "github_pr_create_head_oid": "b" * 40,
+                "github_pr_create_head_repository": "source/project",
+                "github_pr_create_checkout_origin": "github.com/source/project",
+                "github_pr_create_status_digest": "d" * 64,
+                "github_pr_create_operation_state": "planned",
+                "worktree_path": str(checkout),
+                "worktree_branch": "voice/job",
+                "github_repository": "source/project",
+                "status": "queued",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        source = GitHubRepository(
+            "source/project",
+            "https://github.com/source/project",
+            False,
+            "main",
+        )
+        changed = GitPublicationSnapshot(
+            "github.com/source/project",
+            "voice/job",
+            "e" * 40,
+            "f" * 64,
+            True,
+        )
+        github = mock.Mock()
+        github.repository_for_checkout.return_value = "source/project"
+        github.inspect_repository.return_value = source
+        github.local_git = mock.Mock()
+        github.local_git.publication_snapshot.return_value = changed
+
+        with mock.patch.object(jobs, "GitHubClient", return_value=github):
+            service.run_worker("123456789abc")
+
+        updated = jobs.read_job("123456789abc")
+        self.assertEqual(updated["status"], "awaiting_user")
+        self.assertFalse(updated["github_pr_create_confirmed"])
+        self.assertEqual(updated["github_pr_create_head_oid"], "e" * 40)
+        self.assertEqual(updated["github_pr_create_status_digest"], "f" * 64)
+        self.assertIn("Confirmed HEAD", str(updated["question"]))
+        github.local_git.commit_unpublished_changes.assert_not_called()
+        github.local_git.push_current_branch.assert_not_called()
+        github.submit_pull_request_creation.assert_not_called()
 
     def test_missing_checkout_completes_pull_request_without_write(self) -> None:
         jobs.write_job(
@@ -3601,6 +3716,11 @@ class CursorJobStateTests(unittest.TestCase):
                 "github_pr_create_title": "open a pull request",
                 "github_pr_create_body": "open a pull request",
                 "github_pr_create_marker": "a" * 32,
+                "github_pr_create_base": "main",
+                "github_pr_create_head_oid": "b" * 40,
+                "github_pr_create_head_repository": "source/project",
+                "github_pr_create_checkout_origin": "github.com/source/project",
+                "github_pr_create_status_digest": hashlib.sha256(b"").hexdigest(),
                 "github_pr_create_operation_state": "planned",
                 "worktree_path": str(checkout),
                 "worktree_branch": "voice/job",
@@ -3618,9 +3738,19 @@ class CursorJobStateTests(unittest.TestCase):
         )
         github = mock.Mock()
         github.inspect_repository.return_value = source
+        github.repository_for_checkout.return_value = "source/project"
         github.local_git = mock.Mock()
-        github.local_git.verify_checkout.return_value = None
-        github.local_git.current_branch.return_value = "voice/job"
+        clean_snapshot = GitPublicationSnapshot(
+            "github.com/source/project",
+            "voice/job",
+            "b" * 40,
+            hashlib.sha256(b"").hexdigest(),
+            False,
+        )
+        github.local_git.publication_snapshot.side_effect = [
+            clean_snapshot,
+            clean_snapshot,
+        ]
         github.submit_pull_request_creation.side_effect = GitHubOperationAmbiguous(
             "timed out"
         )
@@ -5017,7 +5147,9 @@ class CursorJobStateTests(unittest.TestCase):
             service.run_worker("123456789abc")
 
         updated = jobs.read_job("123456789abc")
-        self.assertEqual(updated["github_repo_create_operation_state"], "created")
+        self.assertEqual(
+            updated["github_repo_create_operation_state"], "clone_verified"
+        )
         self.assertEqual(updated["repository"], str(checkout))
         self.assertEqual(updated["status"], "awaiting_user")
         self.assertEqual(updated["clarification_kind"], "github_issue_file_as_one")
@@ -5046,7 +5178,7 @@ class CursorJobStateTests(unittest.TestCase):
                 "github_repository": "alice/widgets",
                 "github_repo_create_requested": True,
                 "github_repo_create_continue_workflow": True,
-                "github_repo_create_operation_state": "created",
+                "github_repo_create_operation_state": "clone_verified",
                 "github_repo_create_visibility": "private",
                 "github_repo_create_marker": "a" * 32,
                 "github_repo_created_url": "https://github.com/alice/widgets",
@@ -5123,7 +5255,7 @@ class CursorJobStateTests(unittest.TestCase):
                 "github_repository": "alice/widgets",
                 "github_repo_create_requested": True,
                 "github_repo_create_continue_workflow": True,
-                "github_repo_create_operation_state": "created",
+                "github_repo_create_operation_state": "clone_verified",
                 "github_repo_create_visibility": "private",
                 "github_repo_create_marker": "a" * 32,
                 "github_repo_created_url": "https://github.com/alice/widgets",

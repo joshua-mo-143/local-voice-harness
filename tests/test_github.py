@@ -415,7 +415,10 @@ class GitHubClientTests(unittest.TestCase):
             "example/project",
             "Open the change",
             "Detailed body",
-            "voice/job",
+            "example:voice/job",
+            "main",
+            "b" * 40,
+            "example/project",
             "a" * 32,
         )
         with (
@@ -433,13 +436,33 @@ class GitHubClientTests(unittest.TestCase):
             "example/project",
             "Open the change",
             "Detailed body",
-            "voice/job",
+            "example:voice/job",
+            "main",
+            "b" * 40,
+            "example/project",
             "a" * 32,
         )
+        observed = [
+            {
+                "number": 7,
+                "url": "https://github.com/example/project/pull/7",
+                "body": (
+                    f"Detailed body\n\n"
+                    f"<!-- local-voice-harness-correlation:{'a' * 32} -->"
+                ),
+                "baseRefName": "main",
+                "headRefName": "voice/job",
+                "headRefOid": "b" * 40,
+                "headRepository": {"nameWithOwner": "example/project"},
+            }
+        ]
         with mock.patch.object(
             client,
             "_run",
-            return_value=_completed("https://github.com/example/project/pull/7\n"),
+            side_effect=[
+                _completed("https://github.com/example/project/pull/7\n"),
+                _completed(json.dumps(observed)),
+            ],
         ) as run:
             result = client.submit_pull_request_creation(plan, confirmed=True)
 
@@ -452,7 +475,7 @@ class GitHubClientTests(unittest.TestCase):
             ),
         )
         self.assertEqual(
-            run.call_args.args[0],
+            run.call_args_list[0].args[0],
             [
                 "gh",
                 "pr",
@@ -462,13 +485,15 @@ class GitHubClientTests(unittest.TestCase):
                 "--title",
                 "Open the change",
                 "--head",
-                "voice/job",
+                "example:voice/job",
+                "--base",
+                "main",
                 "--body-file",
                 "-",
             ],
         )
         self.assertEqual(
-            run.call_args.kwargs["stdin"],
+            run.call_args_list[0].kwargs["stdin"],
             f"Detailed body\n\n<!-- local-voice-harness-correlation:{'a' * 32} -->\n",
         )
 
@@ -478,7 +503,10 @@ class GitHubClientTests(unittest.TestCase):
             "example/project",
             "Title",
             "Body",
-            "voice/job",
+            "example:voice/job",
+            "main",
+            "b" * 40,
+            "example/project",
             "a" * 32,
         )
         payload = [
@@ -493,6 +521,10 @@ class GitHubClientTests(unittest.TestCase):
                 "body": (
                     f"Body\n\n<!-- local-voice-harness-correlation:{'a' * 32} -->"
                 ),
+                "baseRefName": "main",
+                "headRefName": "voice/job",
+                "headRefOid": "b" * 40,
+                "headRepository": {"nameWithOwner": "example/project"},
             },
         ]
         with mock.patch.object(
@@ -523,7 +555,10 @@ class GitHubClientTests(unittest.TestCase):
             "example/project",
             "Title",
             "Body",
-            "voice/job",
+            "example:voice/job",
+            "main",
+            "b" * 40,
+            "example/project",
             "a" * 32,
         )
         with (

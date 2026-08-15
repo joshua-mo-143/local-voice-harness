@@ -126,6 +126,19 @@ class CursorRecoveryTests(unittest.TestCase):
                 "participant_creation_checkout",
                 values.get("worktree_path") or values.get("repository") or "/worktree",
             )
+        if values.get("github_pr_create_operation_state") is not None:
+            values.setdefault("github_pr_create_base", "main")
+            values.setdefault("github_pr_create_head_oid", "b" * 40)
+            values.setdefault("github_pr_create_published_head_oid", "c" * 40)
+            values.setdefault(
+                "github_pr_create_head_repository",
+                values.get("github_repository") or "example/project",
+            )
+            values.setdefault(
+                "github_pr_create_checkout_origin",
+                "github.com/example/project",
+            )
+            values.setdefault("github_pr_create_status_digest", "d" * 64)
         return self.store.create(CursorJob.from_dict(values))
 
     def test_ambiguous_clone_recovery_only_observes_expected_destination(self) -> None:
@@ -708,6 +721,7 @@ class CursorRecoveryTests(unittest.TestCase):
             "https://github.com/alice/widgets",
             "a" * 32,
         )
+        client.ensure_repository_clone.return_value = Path("/home/test/src/widgets")
 
         reconcile_uncertain_repo_creation(
             self.store,
@@ -720,10 +734,11 @@ class CursorRecoveryTests(unittest.TestCase):
         self.assertEqual(updated.status, JobStatus.QUEUED)
         self.assertEqual(
             updated.github_repo_create_operation_state,
-            "created",
+            "clone_verified",
         )
         self.assertTrue(updated.github_repo_create_continue_workflow)
         client.submit_repository_creation.assert_not_called()
+        client.ensure_repository_clone.assert_called_once()
 
     def test_unobserved_repo_creation_requires_manual_check(self) -> None:
         job = self.create(

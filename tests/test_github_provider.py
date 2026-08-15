@@ -248,7 +248,10 @@ class GitHubProviderTests(unittest.TestCase):
             " example/project.git ",
             " Open the change ",
             " Detailed body ",
-            " voice/job ",
+            " example:voice/job ",
+            " main ",
+            "b" * 40,
+            "example/project",
             correlation_marker="a" * 32,
         )
 
@@ -258,7 +261,10 @@ class GitHubProviderTests(unittest.TestCase):
                 "example/project",
                 "Open the change",
                 "Detailed body",
-                "voice/job",
+                "example:voice/job",
+                "main",
+                "b" * 40,
+                "example/project",
                 "a" * 32,
             ),
         )
