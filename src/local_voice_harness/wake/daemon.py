@@ -1391,14 +1391,17 @@ class WakeConversationDaemon:
         )
 
     def _capture_request_context(self, text: str) -> RequestContext:
-        if self.omit_focused_context:
-            return RequestContext(text)
         context = request_context(
             text,
             platform=self.platform,
             integrations=self.integrations,
+            include_focused_context=not self.omit_focused_context,
         )
-        self.last_focused_identity = self._focused_identity_from_context(context)
+        self.last_focused_identity = (
+            None
+            if self.omit_focused_context
+            else self._focused_identity_from_context(context)
+        )
         return context
 
     def _speak_control_notice(self, spoken: str) -> BargeIn | None:
@@ -2270,11 +2273,9 @@ class WakeConversationDaemon:
                 terminalize_non_side_effect()
                 if self.omit_focused_context:
                     return self._speak_control_notice(NO_FOCUSED_CONTEXT_RESPONSE)
-                identity = self.last_focused_identity
-                if identity is None:
-                    captured = self._capture_request_context(text)
-                    identity = self._focused_identity_from_context(captured)
-                    self.last_focused_identity = identity
+                captured = self._capture_request_context(text)
+                identity = self._focused_identity_from_context(captured)
+                self.last_focused_identity = identity
                 return self._speak_control_notice(identity.spoken())
             if OMIT_CONTEXT_PATTERN.search(text):
                 terminalize_non_side_effect()

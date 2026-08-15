@@ -8043,17 +8043,17 @@ class FocusedContextInspectTests(unittest.TestCase):
     def test_inspect_speaks_identity_without_bodies(self) -> None:
         daemon = _bare_daemon()
         daemon.last_focused_identity = wake_daemon.FocusedIdentity(
-            repository="example/payments",
-            issue="example/payments#42",
-            pull_request="example/payments#7",
-            app_class="Code",
-            source_kinds=("selection", "git_diff"),
+            repository="stale/project",
+            issue="stale/project#1",
+            app_class="Terminal",
         )
         daemon.conversation_deadline = time.monotonic() + 30
         captured = RequestContext(
             "secret page body and selected code",
             focused_repository="example/payments",
             focused_issue="example/payments#42",
+            github_repository="example/payments",
+            github_pull_request=7,
             github_issue_context="untrusted issue body",
             focused_app_class="Code",
             focused_app_context="def secret():\n    pass",
@@ -8064,7 +8064,9 @@ class FocusedContextInspectTests(unittest.TestCase):
                 wake_daemon, "transcribe", return_value="What are you looking at?"
             ),
             mock.patch.object(wake_daemon, "start_components"),
-            mock.patch.object(wake_daemon, "request_context", return_value=captured),
+            mock.patch.object(
+                wake_daemon, "request_context", return_value=captured
+            ) as capture,
             mock.patch.object(wake_daemon, "cursor_turn") as cursor_turn,
             mock.patch.object(wake_daemon, "qwen_turn") as qwen_turn,
             mock.patch.object(wake_daemon, "apply_config_values") as apply_config,
@@ -8087,6 +8089,13 @@ class FocusedContextInspectTests(unittest.TestCase):
         self.assertNotIn("secret page body", spoken)
         self.assertNotIn("untrusted issue body", spoken)
         self.assertNotIn("def secret", spoken)
+        self.assertNotIn("stale/project", spoken)
+        capture.assert_called_once_with(
+            "What are you looking at?",
+            platform=daemon.platform,
+            integrations=daemon.integrations,
+            include_focused_context=True,
+        )
         cursor_turn.assert_not_called()
         qwen_turn.assert_not_called()
         apply_config.assert_not_called()
@@ -8159,7 +8168,16 @@ class FocusedContextInspectTests(unittest.TestCase):
                 wake_daemon, "transcribe", return_value="fix the failing tests"
             ),
             mock.patch.object(wake_daemon, "start_components"),
-            mock.patch.object(wake_daemon, "request_context") as capture,
+            mock.patch.object(
+                wake_daemon,
+                "request_context",
+                return_value=RequestContext(
+                    "fix the failing tests",
+                    github_repository="example/payments",
+                    github_issue=42,
+                    github_pull_request=7,
+                ),
+            ) as capture,
             mock.patch.object(
                 wake_daemon,
                 "route_intent",
@@ -8167,7 +8185,7 @@ class FocusedContextInspectTests(unittest.TestCase):
             ),
             mock.patch.object(
                 wake_daemon, "cursor_turn", return_value=("started", None)
-            ),
+            ) as cursor_turn,
             mock.patch.object(
                 daemon,
                 "play_response",
@@ -8177,7 +8195,16 @@ class FocusedContextInspectTests(unittest.TestCase):
         ):
             daemon.process_utterance(AUDIO_GENERATION, woke=False)
 
-        capture.assert_not_called()
+        capture.assert_called_once_with(
+            "fix the failing tests",
+            platform=daemon.platform,
+            integrations=daemon.integrations,
+            include_focused_context=False,
+        )
+        request = cursor_turn.call_args.args[0]
+        self.assertEqual(request.github_repository, "example/payments")
+        self.assertEqual(request.github_issue, 42)
+        self.assertEqual(request.github_pull_request, 7)
         self.assertTrue(daemon.omit_focused_context)
 
     def test_omit_inspect_does_not_invent_a_source(self) -> None:
