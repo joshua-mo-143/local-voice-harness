@@ -11,6 +11,7 @@ import uuid
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
+from enum import StrEnum
 from pathlib import Path
 from typing import Any, Protocol
 from urllib.parse import SplitResult, urlsplit
@@ -90,6 +91,64 @@ class LinearError(HarnessError):
 
 class LinearOperationAmbiguous(LinearError):
     """A Linear write may have completed despite a local failure."""
+
+
+class LinearIssueLookupReason(StrEnum):
+    NOT_FOUND_OR_INACCESSIBLE = "not_found_or_inaccessible"
+    UNAUTHORIZED = "unauthorized"
+    TRANSIENT = "transient"
+    MALFORMED = "malformed"
+    NONPOSITIVE = "nonpositive"
+    UNKNOWN = "unknown"
+
+
+class LinearIssueLookupError(LinearError):
+    """A classified Linear issue lookup failure with a safe spoken message."""
+
+    def __init__(
+        self,
+        reason: LinearIssueLookupReason,
+        diagnostic: str,
+    ) -> None:
+        self.reason = reason
+        self.diagnostic = diagnostic
+        super().__init__(self.voice_message)
+
+    @property
+    def voice_message(self) -> str:
+        if self.reason == LinearIssueLookupReason.NOT_FOUND_OR_INACCESSIBLE:
+            return "I couldn't find or access that Linear issue."
+        if self.reason == LinearIssueLookupReason.UNAUTHORIZED:
+            return (
+                "I couldn't access that Linear issue because Linear "
+                "authorization is required."
+            )
+        if self.reason == LinearIssueLookupReason.TRANSIENT:
+            return "Linear is temporarily unavailable while checking that issue."
+        if self.reason == LinearIssueLookupReason.MALFORMED:
+            return "I couldn't verify that Linear issue: the issue key is malformed."
+        if self.reason == LinearIssueLookupReason.NONPOSITIVE:
+            return "I couldn't verify that Linear issue: the issue number must be positive."
+        return "I couldn't verify that Linear issue."
+
+
+def parse_linear_issue_reference(reference: str) -> LinearIssue:
+    """Parse a Linear identifier without contacting the provider."""
+
+    text = reference.strip()
+    if LINEAR_IDENTIFIER.fullmatch(text) is None:
+        raise LinearIssueLookupError(
+            LinearIssueLookupReason.MALFORMED,
+            f"malformed Linear issue key: {text}",
+        )
+    team, _separator, number_text = text.upper().rpartition("-")
+    number = int(number_text)
+    if number < 1:
+        raise LinearIssueLookupError(
+            LinearIssueLookupReason.NONPOSITIVE,
+            f"Linear issue number must be positive: {text}",
+        )
+    return LinearIssue(f"{team}-{number}")
 
 
 @dataclass(frozen=True)
@@ -419,6 +478,94 @@ class LinearIntegration:
             )
         )
         return LinearTeam(validated.team_id, team_key, name.strip())
+
+    def resolve_issue(
+        self,
+        client: CreationClient,
+        reference: str,
+        *,
+        checkpoint: Any = None,
+    ) -> LinearIssue:
+        issue = parse_linear_issue_reference(reference)
+        self.require_capabilities()
+        token = f"linear-issue-{uuid.uuid4().hex[:12]}"
+        with _router_owner(checkpoint):
+            try:
+                router = client.ensure_router(set(), checkpoint=checkpoint)
+                outcome = client.prompt_and_wait(
+                    router.target,
+                    (
+                        "Use configured Linear MCP tools read-only. Resolve exactly one "
+                        f"issue whose identifier is {issue.identifier}. Do not create or "
+                        "modify anything. Return exactly one status. If the issue exists "
+                        "and is accessible:\n"
+                        f"VOICE_LINEAR_STATUS[{token}]: found\n"
+                        f"VOICE_LINEAR_IDENTIFIER[{token}]: <identifier>\n"
+                        f"VOICE_LINEAR_URL[{token}]: <https URL>\n"
+                        "If it does not exist:\n"
+                        f"VOICE_LINEAR_STATUS[{token}]: not_found\n"
+                        "If it exists but is not accessible:\n"
+                        f"VOICE_LINEAR_STATUS[{token}]: inaccessible\n"
+                        "If authentication is required:\n"
+                        f"VOICE_LINEAR_STATUS[{token}]: unauthorized\n"
+                        "If resolution is incomplete:\n"
+                        f"VOICE_LINEAR_STATUS[{token}]: unknown"
+                    ),
+                    token=token,
+                    timeout=180,
+                    checkpoint=checkpoint,
+                )
+            except HerdrError as exc:
+                raise LinearIssueLookupError(
+                    LinearIssueLookupReason.TRANSIENT,
+                    str(exc),
+                ) from exc
+        status = extract_marker(outcome.output, "VOICE_LINEAR_STATUS", token)
+        if status == "not_found":
+            raise LinearIssueLookupError(
+                LinearIssueLookupReason.NOT_FOUND_OR_INACCESSIBLE,
+                f"Linear issue {issue.identifier} was not found",
+            )
+        if status == "inaccessible":
+            raise LinearIssueLookupError(
+                LinearIssueLookupReason.NOT_FOUND_OR_INACCESSIBLE,
+                f"Linear issue {issue.identifier} is inaccessible",
+            )
+        if status == "unauthorized":
+            raise LinearIssueLookupError(
+                LinearIssueLookupReason.UNAUTHORIZED,
+                f"Linear authorization is required for {issue.identifier}",
+            )
+        if status != "found":
+            raise LinearIssueLookupError(
+                LinearIssueLookupReason.UNKNOWN,
+                f"Linear issue {issue.identifier} could not be verified",
+            )
+        identifier = extract_marker(outcome.output, "VOICE_LINEAR_IDENTIFIER", token)
+        url = extract_marker(outcome.output, "VOICE_LINEAR_URL", token)
+        if identifier is None or url is None:
+            raise LinearIssueLookupError(
+                LinearIssueLookupReason.UNKNOWN,
+                "Linear MCP returned an incomplete issue identity",
+            )
+        try:
+            returned = parse_linear_issue_reference(identifier)
+        except LinearIssueLookupError as exc:
+            raise LinearIssueLookupError(
+                LinearIssueLookupReason.UNKNOWN,
+                "Linear MCP returned an invalid issue identity",
+            ) from exc
+        from_url = linear_issue_from_url(url)
+        if (
+            returned.identifier != issue.identifier
+            or from_url is None
+            or from_url.identifier != issue.identifier
+        ):
+            raise LinearIssueLookupError(
+                LinearIssueLookupReason.UNKNOWN,
+                "Linear returned a different issue identity",
+            )
+        return returned
 
     @staticmethod
     def _ticket_marker(marker: str) -> str:
