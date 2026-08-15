@@ -1350,10 +1350,11 @@ class WakeConversationDaemon:
         slot = self.last_transcript
         if slot is None:
             return
+        default_deadline = time.monotonic() + CONVERSATION_TIMEOUT_SECONDS
         self.last_transcript = LastTranscript(
             utterance=slot.utterance,
             dispatched=slot.dispatched,
-            expires_at=time.monotonic() + CONVERSATION_TIMEOUT_SECONDS,
+            expires_at=max(slot.expires_at, default_deadline),
         )
 
     def _mark_last_transcript_dispatched(self) -> None:
@@ -1470,7 +1471,11 @@ class WakeConversationDaemon:
         if interruption is not None:
             return interruption
         self.awaiting_followup = True
-        self.conversation_deadline = time.monotonic() + CONVERSATION_TIMEOUT_SECONDS
+        default_deadline = time.monotonic() + CONVERSATION_TIMEOUT_SECONDS
+        self.conversation_deadline = max(
+            self.conversation_deadline,
+            default_deadline,
+        )
         self._refresh_last_transcript_deadline()
         notify("Listening for a follow-up…")
         return None
@@ -3164,7 +3169,11 @@ class WakeConversationDaemon:
             if self.cursor_session == cursor_session_before_playback:
                 self.cursor_session = next_cursor_session
             self.history = next_history
-            self.conversation_deadline = time.monotonic() + CONVERSATION_TIMEOUT_SECONDS
+            default_deadline = time.monotonic() + CONVERSATION_TIMEOUT_SECONDS
+            self.conversation_deadline = max(
+                self.conversation_deadline,
+                default_deadline,
+            )
             self._refresh_last_transcript_deadline()
             unresolved_target = getattr(self, "pending_target_resolution", None)
             if unresolved_target is not None:

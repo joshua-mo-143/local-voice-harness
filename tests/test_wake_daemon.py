@@ -8417,6 +8417,35 @@ class SpokenHoldTests(unittest.TestCase):
         self.assertEqual(daemon.hold_extensions, 0)
         self.assertEqual(daemon.conversation_deadline, 0.0)
 
+    def test_control_notice_preserves_active_hold_deadlines(self) -> None:
+        daemon = _bare_daemon()
+        daemon.awaiting_followup = True
+        held_until = time.monotonic() + wake_daemon.HOLD_EXTENSION_SECONDS + 30
+        daemon.conversation_deadline = held_until
+        daemon.hold_extensions = 1
+        daemon.last_transcript = wake_daemon.LastTranscript(
+            "what time is it",
+            dispatched=False,
+            expires_at=held_until,
+        )
+        with (
+            mock.patch.object(
+                wake_daemon, "transcribe", return_value="what did you hear?"
+            ),
+            mock.patch.object(wake_daemon, "start_components"),
+            mock.patch.object(
+                daemon,
+                "play_response",
+                return_value=({"played_text": "I heard: what time is it"}, None),
+            ),
+            mock.patch.object(wake_daemon, "notify"),
+        ):
+            daemon.process_utterance(AUDIO_GENERATION, woke=False)
+
+        self.assertGreaterEqual(daemon.conversation_deadline, held_until - 1)
+        assert daemon.last_transcript is not None
+        self.assertGreaterEqual(daemon.last_transcript.expires_at, held_until - 1)
+
 
 if __name__ == "__main__":
     unittest.main()
