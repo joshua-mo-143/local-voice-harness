@@ -1082,7 +1082,7 @@ def _ticket_start_spoken(
             GitHubIssueLookupReason.UNKNOWN: f"I couldn't verify {identity}.",
         }
         return messages.get(
-            outcomes[0].github_lookup_reason,
+            lookup_reason,
             f"I couldn't verify {identity}.",
         )
     if len(outcomes) == 1 and outcomes[0].linear_lookup_reason is not None:
