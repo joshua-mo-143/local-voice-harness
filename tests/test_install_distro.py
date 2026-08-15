@@ -32,7 +32,9 @@ OS_RELEASES = {
 }
 
 
-def _plan(family: DistroFamily, *, profile: str = "showcase", checkout: Path) -> DistroPlan:
+def _plan(
+    family: DistroFamily, *, profile: str = "showcase", checkout: Path
+) -> DistroPlan:
     return resolve_distro_plan(
         resolve_installation_plan(profile=profile),
         checkout=checkout,
@@ -136,7 +138,9 @@ class InstallPathDiscoveryTests(unittest.TestCase):
         self.assertEqual(paths.checkout, checkout)
         self.assertEqual(paths.user_bin, home / ".local" / "bin")
         self.assertEqual(paths.voice_harness, home / ".local" / "bin" / "voice-harness")
-        self.assertEqual(paths.systemd_user_dir, root / "xdg-config" / "systemd" / "user")
+        self.assertEqual(
+            paths.systemd_user_dir, root / "xdg-config" / "systemd" / "user"
+        )
         self.assertEqual(paths.chatterbox_dir, root / "tts")
         self.assertNotIn("local-voice-harness", str(paths.checkout))
 
@@ -153,7 +157,10 @@ class DistroServiceLifecycleTests(unittest.TestCase):
         supervisor.is_active.return_value = "inactive"
         supervisor.show.return_value = {}
         for family in DistroFamily:
-            with self.subTest(family=family.value), tempfile.TemporaryDirectory() as temporary:
+            with (
+                self.subTest(family=family.value),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
                 checkout = Path(temporary) / "checkout"
                 checkout.mkdir()
                 plan = _plan(family, checkout=checkout)
@@ -169,7 +176,9 @@ class DistroServiceLifecycleTests(unittest.TestCase):
                     installed = sorted(path.name for path in systemd.glob("*.service"))
                     self.assertIn("voice-harness-wake.service", installed)
                     diagnostics = checks.check_systemd_units()
-                    self.assertTrue(any(result.name.startswith("unit:") for result in diagnostics))
+                    self.assertTrue(
+                        any(result.name.startswith("unit:") for result in diagnostics)
+                    )
                     service_manager.uninstall_services(
                         include_herdr=False, snapshot=snapshot
                     )
