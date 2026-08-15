@@ -393,6 +393,72 @@ class LocalGitRepositoryTests(unittest.TestCase):
                 any("clone" in call.args[0] for call in run.call_args_list)
             )
 
+    def test_observe_materialized_binds_generic_remote_across_protocols(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            destination = root / "source" / "project"
+            (destination / ".git").mkdir(parents=True)
+            repository = LocalGitRepository(clone_root=root, allowed_root=root)
+            expected = ExpectedRemote.from_url("https://example.com/source/project")
+
+            with mock.patch(
+                "local_voice_harness.local_git.run_command",
+                return_value=_completed("git@example.com:source/project.git\n"),
+            ) as run:
+                observed = repository.observe_materialized(
+                    Path("source/project"),
+                    expected=expected,
+                )
+
+            self.assertEqual(observed, destination.resolve())
+            self.assertEqual(run.call_count, 1)
+            self.assertNotIn("clone", run.call_args.args[0])
+
+    def test_observe_materialized_rejects_escaping_destination_symlink(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            allowed = Path(temporary)
+            root = allowed / "src"
+            outside = allowed / "outside"
+            (outside / ".git").mkdir(parents=True)
+            destination = root / "source" / "project"
+            destination.parent.mkdir(parents=True)
+            destination.symlink_to(outside, target_is_directory=True)
+            repository = LocalGitRepository(clone_root=root, allowed_root=allowed)
+            expected = ExpectedRemote.from_url("https://example.com/source/project")
+
+            with (
+                mock.patch("local_voice_harness.local_git.run_command") as run,
+                self.assertRaisesRegex(LocalGitError, "escapes its root"),
+            ):
+                repository.observe_materialized(
+                    Path("source/project"),
+                    expected=expected,
+                )
+
+            run.assert_not_called()
+
+    def test_observe_materialized_rejects_escaping_destination_parent(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            allowed = Path(temporary)
+            root = allowed / "src"
+            outside = allowed / "outside"
+            outside.mkdir()
+            root.mkdir()
+            (root / "source").symlink_to(outside, target_is_directory=True)
+            repository = LocalGitRepository(clone_root=root, allowed_root=allowed)
+            expected = ExpectedRemote.from_url("https://example.com/source/project")
+
+            with (
+                mock.patch("local_voice_harness.local_git.run_command") as run,
+                self.assertRaisesRegex(LocalGitError, "escapes its root"),
+            ):
+                repository.observe_materialized(
+                    Path("source/project"),
+                    expected=expected,
+                )
+
+            run.assert_not_called()
+
     def test_materialize_accepts_adapter_clone_command(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
