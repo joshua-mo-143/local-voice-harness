@@ -82,6 +82,7 @@ class HerdrOperations(Protocol):
         *,
         name: str | None = None,
         mode: str | None = None,
+        kind: str | None = None,
         checkpoint: Checkpoint | None = None,
     ) -> AgentSelection: ...
 

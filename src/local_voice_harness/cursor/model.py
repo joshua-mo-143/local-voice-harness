@@ -161,6 +161,7 @@ class HarnessKind(StrEnum):
     """Coding-agent harness responsible for a durable job."""
 
     CURSOR = "cursor"
+    OPENCODE = "opencode"
 
 
 ACTIVE_STATUSES = frozenset(

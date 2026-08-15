@@ -11,7 +11,7 @@ from ...agents.harness import (
     SessionRequest,
 )
 from .repository import HerdrRepository
-from .session import HerdrSession
+from .session import HerdrSession, OpenCodeSession, herdr_provider
 from .transport import HerdrTransport
 from .types import (
     AGENT_COMPLETION_QUIET_SECONDS,
@@ -61,6 +61,7 @@ class HerdrClient:
         self.agent_max_runtime = agent_max_runtime
         self.session = HerdrSession(self)
         self.harness = self.session
+        self._opencode_session = OpenCodeSession(self)
         self.repository = HerdrRepository(self, root)
         self.workspace = HerdrWorkspace(
             self,
@@ -69,6 +70,20 @@ class HerdrClient:
             cursor_mcp_auth_source=cursor_mcp_auth_source,
             cursor_projects_root=cursor_projects_root,
         )
+
+    def bind_harness_kind(self, kind: str) -> None:
+        """Select the Cursor or OpenCode Herdr transport for this client."""
+
+        self.workspace.bind_kind(kind)
+        if kind == "opencode":
+            current = self.harness
+            if isinstance(current, HerdrSession) and current.kind != "opencode":
+                self.session = self._opencode_session
+                self.harness = self.session
+            return
+        if isinstance(self.harness, OpenCodeSession):
+            self.session = HerdrSession(self)
+            self.harness = self.session
 
     def command(self, *args: str) -> list[str]:
         return self.transport.command(*args)
@@ -103,7 +118,13 @@ class HerdrClient:
         checkpoint: Checkpoint | None = None,
         before_submit: BeforeDispatch | None = None,
     ) -> HarnessSession:
-        return self.harness.create_session(
+        harness = self.harness
+        if request.provider == herdr_provider("opencode") and isinstance(
+            harness, HerdrSession
+        ):
+            if harness.kind != "opencode":
+                harness = self._opencode_session
+        return harness.create_session(
             request, checkpoint=checkpoint, before_submit=before_submit
         )
 
@@ -159,8 +180,8 @@ class HerdrClient:
     def target(agent: dict[str, Any]) -> str:
         return HerdrWorkspace.target(agent)
 
-    def live_agents(self) -> list[dict[str, Any]]:
-        return HerdrWorkspace.live_agents(self.workspace)
+    def live_agents(self, kind: str | None = None) -> list[dict[str, Any]]:
+        return self.workspace.live_agents(kind)
 
     def selection(
         self, agent: dict[str, Any], worktree: str | None = None
@@ -218,6 +239,7 @@ class HerdrClient:
         *,
         name: str | None = None,
         mode: str | None = None,
+        kind: str | None = None,
         checkpoint: Checkpoint | None = None,
     ) -> AgentSelection:
         return HerdrWorkspace.start_agent(
@@ -228,6 +250,7 @@ class HerdrClient:
             workspace,
             name=name,
             mode=mode,
+            kind=kind,
             checkpoint=checkpoint,
         )
 

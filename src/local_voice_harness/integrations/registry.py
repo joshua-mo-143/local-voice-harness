@@ -8,6 +8,8 @@ from functools import partial
 from pathlib import Path
 from typing import Any
 
+from ..agents.harness import HarnessCapability, UnsupportedCapabilityError
+from ..agents.model import HarnessKind
 from ..context_fragment import ContextFragment, ContextProvider
 from ..errors import HarnessError
 from ..user_config import (
@@ -286,6 +288,33 @@ def require_issue_capabilities(
     require = getattr(integration, "require_capabilities", None)
     if require is not None:
         require()
+
+
+def require_harness_capabilities(
+    kind: HarnessKind,
+    *,
+    provider: str | None = None,
+    linear_ticket_create_requested: bool = False,
+    integrations: RegistryInput = None,
+) -> None:
+    """Fail closed before OpenCode session creation for cursor-mcp-only work."""
+
+    if kind != HarnessKind.OPENCODE:
+        return
+    needs_cursor_mcp = bool(linear_ticket_create_requested)
+    if provider == "linear":
+        needs_cursor_mcp = True
+    elif provider:
+        integration = issue_provider(provider, integrations)
+        required = getattr(integration, "required_capabilities", frozenset()) or (
+            frozenset()
+        )
+        needs_cursor_mcp = "cursor-mcp" in {str(item) for item in required}
+    if needs_cursor_mcp:
+        raise UnsupportedCapabilityError(
+            "opencode/herdr",
+            HarnessCapability.MCP_CONNECTORS,
+        )
 
 
 def prompt_instructions(

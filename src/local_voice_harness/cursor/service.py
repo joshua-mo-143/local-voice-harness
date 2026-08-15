@@ -37,6 +37,7 @@ from ..integrations.registry import (
     integration_enabled,
     issue_provider,
     issue_provider_identity,
+    require_harness_capabilities,
     require_issue_capabilities,
     require_issue_provider,
     resolve_issue_reference,
@@ -82,6 +83,7 @@ from .model import (
     TERMINAL_STATUSES,
     WORKER_STATUSES,
     CursorJob,
+    HarnessKind,
     JobStatus,
     JobValidationError,
     NewCursorJob,
@@ -130,6 +132,7 @@ class StartJobRequest:
     context_repository: str | None = None
     issue_key: str | None = None
     foreground: bool = True
+    harness_kind: HarnessKind | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -370,6 +373,13 @@ def _build_start_job(
             )
         )
     )
+    harness_kind = request.harness_kind or HarnessKind.CURSOR
+    require_harness_capabilities(
+        harness_kind,
+        provider=issue_provider,
+        linear_ticket_create_requested=request.linear_ticket_create_requested,
+        integrations=registry,
+    )
     if resolved_issue_key:
         assert issue_provider is not None
         require_issue_capabilities(
@@ -440,6 +450,7 @@ def _build_start_job(
                 "pending" if request.github_pull_request else None
             ),
             agent_hint=request.agent,
+            harness_kind=harness_kind,
             issue_key=resolved_issue_key,
             issue_provider=issue_provider,
             speakable_label=inbox.build_speakable_label(
@@ -470,6 +481,7 @@ def start_job(
     context_repository: str | None = None,
     issue_key: str | None = None,
     foreground: bool = True,
+    harness_kind: HarnessKind | None = None,
     foreground_seconds: float = 5.0,
     integrations: IntegrationRegistry | None = None,
 ) -> str:
@@ -492,6 +504,7 @@ def start_job(
             context_repository=context_repository,
             issue_key=issue_key,
             foreground=foreground,
+            harness_kind=harness_kind,
         )
     )
     job_id = uuid.uuid4().hex[:12]
@@ -677,6 +690,7 @@ def _github_target(
             utterance=f"Work only on GitHub issue {target}.",
             context_repository=issue.name_with_owner,
             foreground=foreground,
+            harness_kind=base.harness_kind,
         ),
     )
 
@@ -727,6 +741,7 @@ def _linear_target(
             context_repository=base.context_repository,
             issue_key=identity,
             foreground=foreground,
+            harness_kind=base.harness_kind,
         ),
     )
 
@@ -818,6 +833,9 @@ def _serialize_start_request(request: StartJobRequest) -> dict[str, object]:
         "context_repository": request.context_repository,
         "issue_key": request.issue_key,
         "foreground": request.foreground,
+        "harness_kind": (
+            request.harness_kind.value if request.harness_kind is not None else None
+        ),
     }
 
 
@@ -849,6 +867,17 @@ def _deserialize_start_request(raw: object) -> StartJobRequest | None:
         raw.get("foreground", False), bool
     ):
         return None
+    raw_kind = raw.get("harness_kind")
+    harness_kind: HarnessKind | None
+    if raw_kind is None:
+        harness_kind = None
+    elif isinstance(raw_kind, str):
+        try:
+            harness_kind = HarnessKind(raw_kind)
+        except ValueError:
+            return None
+    else:
+        return None
     return StartJobRequest(
         text=str(raw["text"]),
         repository=raw.get("repository"),
@@ -862,6 +891,7 @@ def _deserialize_start_request(raw: object) -> StartJobRequest | None:
         context_repository=raw.get("context_repository"),
         issue_key=raw.get("issue_key"),
         foreground=bool(raw.get("foreground", False)),
+        harness_kind=harness_kind,
     )
 
 
