@@ -6054,7 +6054,9 @@ class CursorJobStateTests(unittest.TestCase):
         self.assertEqual(updated["status"], "awaiting_user")
         self.assertEqual(updated["clarification_kind"], "github_repo_create_slug")
         self.assertIn("already exists", str(updated["question"]))
-        self.assertNotEqual(updated.get("github_repo_create_operation_state"), "created")
+        self.assertNotEqual(
+            updated.get("github_repo_create_operation_state"), "created"
+        )
         self.assertIsNone(updated.get("github_repo_created_url"))
         github.ensure_repository_clone.assert_not_called()
 

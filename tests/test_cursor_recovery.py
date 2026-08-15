@@ -48,7 +48,6 @@ from local_voice_harness.cursor.recovery import (
     reconcile_uncertain_linear_ticket_creation,
     reconcile_uncertain_pr_creation,
     reconcile_uncertain_pr_merge,
-    reconcile_uncertain_clone,
     reconcile_uncertain_repo_creation,
     recover_jobs,
     resolve_manual_reconciliation,
