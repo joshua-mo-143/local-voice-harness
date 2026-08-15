@@ -181,6 +181,8 @@ def _bare_daemon() -> WakeConversationDaemon:
     instance.awaiting_followup = False
     instance.last_ordinary_reply = None
     instance.last_transcript = None
+    instance.omit_focused_context = False
+    instance.last_focused_identity = None
     instance.last_wake = 0.0
     instance.force_listen = threading.Event()
     instance.running = True
@@ -8035,6 +8037,206 @@ class LastTranscriptReplayTests(unittest.TestCase):
         ):
             daemon.close_conversation("inactivity")
         self.assertIsNone(daemon.last_transcript)
+
+
+class FocusedContextInspectTests(unittest.TestCase):
+    def test_inspect_speaks_identity_without_bodies(self) -> None:
+        daemon = _bare_daemon()
+        daemon.last_focused_identity = wake_daemon.FocusedIdentity(
+            repository="example/payments",
+            issue="example/payments#42",
+            pull_request="example/payments#7",
+            app_class="Code",
+            source_kinds=("selection", "git_diff"),
+        )
+        daemon.conversation_deadline = time.monotonic() + 30
+        captured = RequestContext(
+            "secret page body and selected code",
+            focused_repository="example/payments",
+            focused_issue="example/payments#42",
+            github_issue_context="untrusted issue body",
+            focused_app_class="Code",
+            focused_app_context="def secret():\n    pass",
+            focused_app_sources=("selection", "git_diff"),
+        )
+        with (
+            mock.patch.object(
+                wake_daemon, "transcribe", return_value="What are you looking at?"
+            ),
+            mock.patch.object(wake_daemon, "start_components"),
+            mock.patch.object(wake_daemon, "request_context", return_value=captured),
+            mock.patch.object(wake_daemon, "cursor_turn") as cursor_turn,
+            mock.patch.object(wake_daemon, "qwen_turn") as qwen_turn,
+            mock.patch.object(wake_daemon, "apply_config_values") as apply_config,
+            mock.patch.object(
+                daemon,
+                "play_response",
+                return_value=({"played_text": "identity"}, None),
+            ) as play,
+            mock.patch.object(wake_daemon, "notify"),
+        ):
+            daemon.process_utterance(AUDIO_GENERATION, woke=False)
+
+        spoken = play.call_args.args[0].spoken_text
+        self.assertIn("repository example/payments", spoken)
+        self.assertIn("issue example/payments#42", spoken)
+        self.assertIn("pull request example/payments#7", spoken)
+        self.assertIn("app Code", spoken)
+        self.assertIn("selection", spoken)
+        self.assertIn("git_diff", spoken)
+        self.assertNotIn("secret page body", spoken)
+        self.assertNotIn("untrusted issue body", spoken)
+        self.assertNotIn("def secret", spoken)
+        cursor_turn.assert_not_called()
+        qwen_turn.assert_not_called()
+        apply_config.assert_not_called()
+
+    def test_inspect_says_so_when_nothing_was_captured(self) -> None:
+        daemon = _bare_daemon()
+        with (
+            mock.patch.object(
+                wake_daemon, "transcribe", return_value="What are you looking at?"
+            ),
+            mock.patch.object(wake_daemon, "start_components"),
+            mock.patch.object(
+                wake_daemon,
+                "request_context",
+                return_value=RequestContext("What are you looking at?"),
+            ),
+            mock.patch.object(wake_daemon, "cursor_turn") as cursor_turn,
+            mock.patch.object(
+                daemon,
+                "play_response",
+                return_value=(
+                    {"played_text": wake_daemon.NO_FOCUSED_CONTEXT_RESPONSE},
+                    None,
+                ),
+            ) as play,
+            mock.patch.object(wake_daemon, "notify"),
+        ):
+            daemon.process_utterance(AUDIO_GENERATION, woke=False)
+
+        play.assert_called_once_with(
+            AssistantResponse.from_text(wake_daemon.NO_FOCUSED_CONTEXT_RESPONSE)
+        )
+        cursor_turn.assert_not_called()
+
+    def test_omit_skips_later_capture_without_writing_config(self) -> None:
+        daemon = _bare_daemon()
+        daemon.conversation_deadline = time.monotonic() + 30
+        with (
+            mock.patch.object(wake_daemon, "transcribe", return_value="Don't use that"),
+            mock.patch.object(wake_daemon, "start_components"),
+            mock.patch.object(wake_daemon, "request_context") as capture,
+            mock.patch.object(wake_daemon, "apply_config_values") as apply_config,
+            mock.patch.object(wake_daemon, "prepare_config_change") as prepare,
+            mock.patch.object(
+                daemon,
+                "play_response",
+                return_value=(
+                    {"played_text": wake_daemon.OMIT_FOCUSED_CONTEXT_RESPONSE},
+                    None,
+                ),
+            ) as play,
+            mock.patch.object(wake_daemon, "notify"),
+        ):
+            daemon.process_utterance(AUDIO_GENERATION, woke=False)
+
+        play.assert_called_once_with(
+            AssistantResponse.from_text(wake_daemon.OMIT_FOCUSED_CONTEXT_RESPONSE)
+        )
+        self.assertTrue(daemon.omit_focused_context)
+        capture.assert_not_called()
+        apply_config.assert_not_called()
+        prepare.assert_not_called()
+        self.assertNotIn(
+            "focused_app_context",
+            {key.value for key in SettingKey},
+        )
+
+        with (
+            mock.patch.object(
+                wake_daemon, "transcribe", return_value="fix the failing tests"
+            ),
+            mock.patch.object(wake_daemon, "start_components"),
+            mock.patch.object(wake_daemon, "request_context") as capture,
+            mock.patch.object(
+                wake_daemon,
+                "route_intent",
+                return_value=IntentRoute(Intent.AGENT_SUBMIT, "high"),
+            ),
+            mock.patch.object(
+                wake_daemon, "cursor_turn", return_value=("started", None)
+            ),
+            mock.patch.object(
+                daemon,
+                "play_response",
+                return_value=({"played_text": "started"}, None),
+            ),
+            mock.patch.object(wake_daemon, "notify"),
+        ):
+            daemon.process_utterance(AUDIO_GENERATION, woke=False)
+
+        capture.assert_not_called()
+        self.assertTrue(daemon.omit_focused_context)
+
+    def test_omit_inspect_does_not_invent_a_source(self) -> None:
+        daemon = _bare_daemon()
+        daemon.omit_focused_context = True
+        daemon.last_focused_identity = wake_daemon.FocusedIdentity(
+            repository="example/payments",
+            issue="example/payments#42",
+        )
+        with (
+            mock.patch.object(
+                wake_daemon, "transcribe", return_value="ignore the focused tab"
+            ),
+            mock.patch.object(wake_daemon, "start_components"),
+            mock.patch.object(
+                daemon,
+                "play_response",
+                return_value=({"played_text": "ok"}, None),
+            ),
+            mock.patch.object(wake_daemon, "notify"),
+        ):
+            daemon.process_utterance(AUDIO_GENERATION, woke=False)
+
+        with (
+            mock.patch.object(
+                wake_daemon, "transcribe", return_value="What are you looking at?"
+            ),
+            mock.patch.object(wake_daemon, "start_components"),
+            mock.patch.object(wake_daemon, "request_context") as capture,
+            mock.patch.object(
+                daemon,
+                "play_response",
+                return_value=(
+                    {"played_text": wake_daemon.NO_FOCUSED_CONTEXT_RESPONSE},
+                    None,
+                ),
+            ) as play,
+            mock.patch.object(wake_daemon, "notify"),
+        ):
+            daemon.process_utterance(AUDIO_GENERATION, woke=False)
+
+        play.assert_called_once_with(
+            AssistantResponse.from_text(wake_daemon.NO_FOCUSED_CONTEXT_RESPONSE)
+        )
+        capture.assert_not_called()
+
+    def test_close_conversation_clears_omit(self) -> None:
+        daemon = _bare_daemon()
+        daemon.omit_focused_context = True
+        daemon.last_focused_identity = wake_daemon.FocusedIdentity(
+            repository="example/payments"
+        )
+        with (
+            mock.patch.object(wake_daemon, "stop_components"),
+            mock.patch.object(wake_daemon, "notify"),
+        ):
+            daemon.close_conversation("inactivity")
+        self.assertFalse(daemon.omit_focused_context)
+        self.assertIsNone(daemon.last_focused_identity)
 
 
 if __name__ == "__main__":

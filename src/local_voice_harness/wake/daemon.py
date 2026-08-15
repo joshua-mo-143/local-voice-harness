@@ -443,6 +443,22 @@ TRANSCRIPT_CORRECTION_BARE_PATTERN = re.compile(
     r"^\s*that(?:'s|\s+is)\s+not\s+what\s+i\s+said\s*[!.]?\s*$",
     re.IGNORECASE,
 )
+INSPECT_CONTEXT_PATTERN = re.compile(
+    r"^\s*(?:"
+    r"what\s+are\s+you\s+looking\s+at|"
+    r"what(?:'s|\s+is)\s+(?:the\s+)?focused\s+(?:tab|context|source|app)|"
+    r"what\s+context\s+are\s+you\s+using"
+    r")\s*[?.!]?\s*$",
+    re.IGNORECASE,
+)
+OMIT_CONTEXT_PATTERN = re.compile(
+    r"^\s*(?:"
+    r"don['’]?t\s+use\s+that|"
+    r"ignore\s+(?:the\s+)?focused\s+(?:tab|app|context|window|source)|"
+    r"stop\s+using\s+(?:the\s+)?focused\s+(?:tab|context|app)"
+    r")\s*[?.!]?\s*$",
+    re.IGNORECASE,
+)
 PENDING_SUBMIT_PATTERN = re.compile(
     r"\b(?:work\s+on|fix|change|update|implement|add|remove|run|review|inspect|"
     r"start|create|build|refactor|test)\b",
@@ -484,6 +500,10 @@ DISPATCHED_TRANSCRIPT_RESPONSE = (
 BARE_TRANSCRIPT_CORRECTION_RESPONSE = (
     "I heard a correction but no replacement. Say I said, then the request."
 )
+NO_FOCUSED_CONTEXT_RESPONSE = "I'm not looking at a focused source."
+OMIT_FOCUSED_CONTEXT_RESPONSE = (
+    "Okay, I won't use the focused tab or app for the rest of this conversation."
+)
 
 
 @dataclass
@@ -505,6 +525,33 @@ class CompletedFollowup:
     completed_at: float | None
     expires_at: float
     display_fingerprint: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class FocusedIdentity:
+    """Speakable identity from RequestContext, excluding untrusted bodies."""
+
+    repository: str | None = None
+    issue: str | None = None
+    pull_request: str | None = None
+    app_class: str | None = None
+    source_kinds: tuple[str, ...] = ()
+
+    def spoken(self) -> str:
+        parts: list[str] = []
+        if self.repository:
+            parts.append(f"repository {self.repository}")
+        if self.issue:
+            parts.append(f"issue {self.issue}")
+        if self.pull_request:
+            parts.append(f"pull request {self.pull_request}")
+        if self.app_class:
+            parts.append(f"app {self.app_class}")
+        if self.source_kinds:
+            parts.append("source kinds " + ", ".join(self.source_kinds))
+        if not parts:
+            return NO_FOCUSED_CONTEXT_RESPONSE
+        return "I'm looking at " + "; ".join(parts) + "."
 
 
 @dataclass(frozen=True, slots=True)
@@ -630,6 +677,8 @@ class WakeConversationDaemon:
         self.awaiting_followup = False
         self.last_ordinary_reply: str | None = None
         self.last_transcript: LastTranscript | None = None
+        self.omit_focused_context = False
+        self.last_focused_identity: FocusedIdentity | None = None
         self.last_wake = 0.0
         self.force_listen = threading.Event()
         self.running = True
@@ -836,6 +885,8 @@ class WakeConversationDaemon:
         self.awaiting_followup = False
         self.last_ordinary_reply = None
         self.last_transcript = None
+        self.omit_focused_context = False
+        self.last_focused_identity = None
         self.pause_microphone()
         try:
             self.stop_components_when_idle()
@@ -1311,6 +1362,44 @@ class WakeConversationDaemon:
             # These synchronous operations return only after their durable update.
             self._mark_last_transcript_dispatched()
         return response, session
+
+    def _focused_identity_from_context(
+        self, context: RequestContext
+    ) -> FocusedIdentity:
+        issue = context.focused_issue or context.external_issue_reference
+        if issue is None and context.github_issue is not None:
+            repository = context.github_repository or context.focused_repository
+            issue = (
+                f"{repository}#{context.github_issue}"
+                if repository
+                else str(context.github_issue)
+            )
+        pull_request = None
+        if context.github_pull_request is not None:
+            repository = context.github_repository or context.focused_repository
+            pull_request = (
+                f"{repository}#{context.github_pull_request}"
+                if repository
+                else str(context.github_pull_request)
+            )
+        return FocusedIdentity(
+            repository=context.focused_repository or context.github_repository,
+            issue=issue,
+            pull_request=pull_request,
+            app_class=context.focused_app_class,
+            source_kinds=context.focused_app_sources,
+        )
+
+    def _capture_request_context(self, text: str) -> RequestContext:
+        if self.omit_focused_context:
+            return RequestContext(text)
+        context = request_context(
+            text,
+            platform=self.platform,
+            integrations=self.integrations,
+        )
+        self.last_focused_identity = self._focused_identity_from_context(context)
+        return context
 
     def _speak_control_notice(self, spoken: str) -> BargeIn | None:
         self.ensure_components()
@@ -2177,6 +2266,21 @@ class WakeConversationDaemon:
                 self.pending_target_resolution = None
                 self.pending_config_change = None
                 text = replacement
+            if INSPECT_CONTEXT_PATTERN.search(text):
+                terminalize_non_side_effect()
+                if self.omit_focused_context:
+                    return self._speak_control_notice(NO_FOCUSED_CONTEXT_RESPONSE)
+                identity = self.last_focused_identity
+                if identity is None:
+                    captured = self._capture_request_context(text)
+                    identity = self._focused_identity_from_context(captured)
+                    self.last_focused_identity = identity
+                return self._speak_control_notice(identity.spoken())
+            if OMIT_CONTEXT_PATTERN.search(text):
+                terminalize_non_side_effect()
+                self.omit_focused_context = True
+                self.last_focused_identity = None
+                return self._speak_control_notice(OMIT_FOCUSED_CONTEXT_RESPONSE)
             pending_resolution = getattr(self, "pending_target_resolution", None)
             resolution_active = (
                 pending_resolution is not None
@@ -2246,11 +2350,7 @@ class WakeConversationDaemon:
             pending_readback = getattr(self, "pending_target_readback", None)
             routing_context = RequestContext(text)
             context = (
-                request_context(
-                    text,
-                    platform=self.platform,
-                    integrations=self.integrations,
-                )
+                self._capture_request_context(text)
                 if pending_readback is not None or resuming_target_resolution
                 else routing_context
             )
@@ -2462,11 +2562,7 @@ class WakeConversationDaemon:
                     )
                 )
             ):
-                context = request_context(
-                    text,
-                    platform=self.platform,
-                    integrations=self.integrations,
-                )
+                context = self._capture_request_context(text)
             if route.actionable and route.intent == Intent.END_CONVERSATION:
                 return self.end_conversation()
             fork_requested = decide_fork_intent(text) == ForkIntent.AFFIRMATIVE
