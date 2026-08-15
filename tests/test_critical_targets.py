@@ -5,12 +5,14 @@ from local_voice_harness.critical_targets import (
     READBACK_TIMEOUT_SECONDS,
     ReadbackReply,
     TargetSelection,
+    identified_target_response,
     new_candidate,
     parse_target,
     readback_response,
     resolve_readback,
     select_submit_target,
 )
+from local_voice_harness.responses import AssistantResponse
 from local_voice_harness.ticket_targets import extract_ticket_targets
 
 
@@ -29,6 +31,8 @@ def test_single_ticket_submit_requires_concise_exact_readback() -> None:
     assert candidate.question.origin.turn_token == "turn-1"
     assert response.spoken_text == "Work on issue 42 in payments?"
     assert "example/payments#42" in response.display_text
+    assert "for “" not in response.spoken_text
+    assert "work on example/payments#42" not in response.spoken_text
 
 
 def test_affirmation_is_bound_to_current_focused_identity() -> None:
@@ -206,6 +210,28 @@ def test_explicit_batch_is_not_read_back() -> None:
         )
         is None
     )
+
+
+def test_identified_target_response_does_not_echo_utterance_ack() -> None:
+    target = parse_target("example/payments#42")
+    accept = AssistantResponse(
+        spoken_text=(
+            "Cursor accepted the login change and queued it for "
+            "“revert the login change.”"
+        ),
+        display_text=(
+            "Cursor job 123456789abc was accepted and queued. "
+            "Request: revert the login change"
+        ),
+    )
+
+    wrapped = identified_target_response(target, accept)
+
+    assert wrapped.spoken_text == (
+        "For example/payments issue 42: Cursor accepted the login change and queued it."
+    )
+    assert "revert the login change" not in wrapped.spoken_text
+    assert "revert the login change" in wrapped.display_text
 
 
 def test_unrelated_or_read_only_routing_has_no_target_policy_side_effect() -> None:

@@ -279,6 +279,8 @@ class ConfigChangeTests(unittest.TestCase):
                 self.assertIn(old_value, response.spoken_text)
                 self.assertIn(new_value, response.spoken_text)
                 self.assertIn("Say yes to confirm", response.spoken_text)
+                self.assertNotIn("for “", response.spoken_text)
+                self.assertNotIn(utterance, response.spoken_text)
 
     def test_malformed_unsupported_ambiguous_and_unsafe_changes_fail_closed(
         self,

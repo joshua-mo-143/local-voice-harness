@@ -833,7 +833,14 @@ class AppConsultationTests(unittest.TestCase):
         ) -> str:
             self.assertEqual(
                 events,
-                [("play", consultation.ACKNOWLEDGEMENT)],
+                [
+                    (
+                        "play",
+                        consultation.acknowledgement(
+                            "What do you think about this approach?"
+                        ).spoken_text,
+                    )
+                ],
             )
             events.append(("consult", _text))
             return "Use the simpler boundary."
@@ -875,7 +882,12 @@ class AppConsultationTests(unittest.TestCase):
         qwen.assert_not_called()
         self.assertEqual(
             [call.args[0] for call in play.call_args_list],
-            [consultation.ACKNOWLEDGEMENT, "Use the simpler boundary."],
+            [
+                consultation.acknowledgement(
+                    "What do you think about this approach?"
+                ).spoken_text,
+                "Use the simpler boundary.",
+            ],
         )
 
     def test_pending_consultation_supplies_router_context_without_replying(
@@ -899,7 +911,14 @@ class AppConsultationTests(unittest.TestCase):
         ) -> str:
             self.assertEqual(
                 events,
-                [("play", consultation.ACKNOWLEDGEMENT)],
+                [
+                    (
+                        "play",
+                        consultation.acknowledgement(
+                            "Which option do you recommend?"
+                        ).spoken_text,
+                    )
+                ],
             )
             events.append(("consult", text))
             return "Choose the safe design."
@@ -954,7 +973,12 @@ class AppConsultationTests(unittest.TestCase):
         qwen.assert_not_called()
         self.assertEqual(
             [call.args[0] for call in play.call_args_list],
-            [consultation.ACKNOWLEDGEMENT, "Choose the safe design."],
+            [
+                consultation.acknowledgement(
+                    "Which option do you recommend?"
+                ).spoken_text,
+                "Choose the safe design.",
+            ],
         )
 
     def test_ambiguous_pending_consultation_fails_without_fallback(self) -> None:
@@ -1070,7 +1094,7 @@ class AppConsultationTests(unittest.TestCase):
         self.assertEqual(
             [call.args[0] for call in play.call_args_list],
             [
-                consultation.ACKNOWLEDGEMENT,
+                consultation.acknowledgement("Inspect this checkout").spoken_text,
                 "I couldn't complete the read only consultation.",
             ],
         )

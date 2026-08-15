@@ -138,8 +138,9 @@ def release_deliveries(claims: DeliveryClaims) -> None:
 def _acknowledge_consultation(
     speech_renderer: SpeechRenderer,
     settings: UserConfig,
+    utterance: str,
 ) -> None:
-    acknowledgement = as_assistant_response(cursor_consultation.ACKNOWLEDGEMENT)
+    acknowledgement = cursor_consultation.acknowledgement(utterance)
     print(f"Assistant: {acknowledgement.display_text}")
     stream_and_play(
         speech_renderer.render(acknowledgement.spoken_text),
@@ -316,7 +317,7 @@ def respond(text: str, *, user_config: UserConfig | None = None) -> None:
                 else:
                     try:
                         client = integrations.herdr_client()
-                        _acknowledge_consultation(speech_renderer, settings)
+                        _acknowledge_consultation(speech_renderer, settings, text)
                         response = cursor_consultation.consult_pending_question(
                             client,
                             CURSOR_STORE,
@@ -342,7 +343,7 @@ def respond(text: str, *, user_config: UserConfig | None = None) -> None:
                     if target is None:
                         response = cursor_consultation.NO_WORKSPACE
                     else:
-                        _acknowledge_consultation(speech_renderer, settings)
+                        _acknowledge_consultation(speech_renderer, settings, text)
                         response = cursor_consultation.consult(
                             client, target, context.text
                         )

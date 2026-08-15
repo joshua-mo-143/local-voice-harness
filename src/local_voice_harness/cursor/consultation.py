@@ -16,6 +16,7 @@ from ..errors import HarnessError
 from ..integrations.herdr import HerdrClient
 from ..process import boot_identity, process_identity
 from ..questions import Choice, Question, QuestionSensitivity, QuestionState
+from ..responses import AssistantResponse, spoken_utterance_slice
 from . import questions
 from .model import CursorJob, JobStatus, JobValidationError
 from .operations import checkout_is_usable
@@ -26,6 +27,22 @@ NO_PENDING_QUESTION = (
     "I couldn't identify one current pending question for that consultation."
 )
 ACKNOWLEDGEMENT = "Let me take a look. I'll get back to you."
+
+
+def acknowledgement(utterance: str) -> AssistantResponse:
+    """Acknowledge consultation start with a bounded trusted-utterance slice."""
+
+    spoken_slice = spoken_utterance_slice(utterance)
+    if not spoken_slice:
+        return AssistantResponse.from_text(ACKNOWLEDGEMENT)
+    spoken = f"Let me look at “{spoken_slice}.” I'll get back to you."
+    display_source = " ".join(utterance.split())
+    return AssistantResponse(
+        spoken_text=spoken,
+        display_text=f"Let me look at “{display_source}.” I'll get back to you.",
+    )
+
+
 STALE_PENDING_QUESTION = (
     "That question changed before consultation started, so I did not consult it."
 )

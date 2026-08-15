@@ -2143,7 +2143,14 @@ class ProcessUtteranceTests(unittest.TestCase):
         ) -> str:
             self.assertEqual(
                 events,
-                [("play", wake_daemon.cursor_consultation.ACKNOWLEDGEMENT)],
+                [
+                    (
+                        "play",
+                        wake_daemon.cursor_consultation.acknowledgement(
+                            "which option would you recommend"
+                        ).spoken_text,
+                    )
+                ],
             )
             events.append(("consult", text))
             return "SQLite is simpler for a local tool."
@@ -2200,7 +2207,12 @@ class ProcessUtteranceTests(unittest.TestCase):
         self.assertEqual(
             events,
             [
-                ("play", wake_daemon.cursor_consultation.ACKNOWLEDGEMENT),
+                (
+                    "play",
+                    wake_daemon.cursor_consultation.acknowledgement(
+                        "which option would you recommend"
+                    ).spoken_text,
+                ),
                 ("consult", "which option would you recommend"),
                 ("play", "SQLite is simpler for a local tool."),
             ],

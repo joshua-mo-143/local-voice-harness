@@ -51,7 +51,12 @@ from ..questions import (
     resolve_answer,
     validate_question_identity,
 )
-from ..responses import AssistantResponse, ResponseLike
+from ..responses import (
+    AssistantResponse,
+    ResponseLike,
+    spoken_utterance_slice,
+    with_spoken_utterance_ack,
+)
 from ..ticket_targets import TicketExtraction, TicketReference, extract_ticket_targets
 from ..user_config import PlatformSettings, default_user_config
 from . import (
@@ -985,7 +990,10 @@ def _counted(count: int, singular: str, plural: str | None = None) -> str:
     return f"{quantity} {singular if count == 1 else plural or singular + 's'}"
 
 
-def _ticket_start_spoken(outcomes: tuple[TicketStartOutcome, ...]) -> str:
+def _ticket_start_spoken(
+    outcomes: tuple[TicketStartOutcome, ...],
+    utterance: str | None = None,
+) -> str:
     lookup_reason = outcomes[0].github_lookup_reason if len(outcomes) == 1 else None
     if lookup_reason is not None:
         outcome = outcomes[0]
@@ -1039,7 +1047,10 @@ def _ticket_start_spoken(outcomes: tuple[TicketStartOutcome, ...]) -> str:
     if not parts:
         return "No ticket jobs were started."
     sentence = "; ".join(parts) + "."
-    return sentence[0].upper() + sentence[1:]
+    sentence = sentence[0].upper() + sentence[1:]
+    if accepted or queued:
+        return with_spoken_utterance_ack(sentence, utterance or "")
+    return sentence
 
 
 def _ticket_display_detail(outcome: TicketStartOutcome) -> str | None:
@@ -1070,6 +1081,7 @@ def _ticket_display_detail(outcome: TicketStartOutcome) -> str | None:
 
 def _ticket_start_summary(
     outcomes: tuple[TicketStartOutcome, ...],
+    utterance: str | None = None,
 ) -> AssistantResponse:
     parts: list[str] = []
     for outcome in outcomes:
@@ -1082,9 +1094,32 @@ def _ticket_start_summary(
             display_detail = _ticket_display_detail(outcome)
             detail = f" ({display_detail})" if display_detail else ""
             parts.append(f"{outcome.target}: {outcome.status}{detail}")
+    display = "Ticket starts: " + "; ".join(parts) + "."
+    full = " ".join((utterance or "").split())
+    spoken_slice = spoken_utterance_slice(utterance or "")
+    if full and full != spoken_slice:
+        display = f"{display} Request: {full}"
     return AssistantResponse(
-        spoken_text=_ticket_start_spoken(outcomes),
-        display_text="Ticket starts: " + "; ".join(parts) + ".",
+        spoken_text=_ticket_start_spoken(outcomes, utterance),
+        display_text=display,
+    )
+
+
+def _queued_accept_response(
+    label: str,
+    job_id: str,
+    utterance: str,
+) -> AssistantResponse:
+    display = f"Cursor job {job_id} was accepted and queued."
+    full = " ".join(utterance.split())
+    if full:
+        display = f"{display} Request: {full}"
+    return AssistantResponse(
+        spoken_text=with_spoken_utterance_ack(
+            f"Cursor accepted {label} and queued it.",
+            utterance,
+        ),
+        display_text=display,
     )
 
 
@@ -1431,7 +1466,7 @@ def _reply_grouped_repository(
         and on_started
     ):
         on_started()
-    message = _ticket_start_spoken(outcomes)
+    message = _ticket_start_spoken(outcomes, trusted_utterance or text)
     if remaining:
         message += (
             f" {_counted(len(remaining), 'ticket')} still needs a repository in "
@@ -2648,7 +2683,10 @@ def cursor_turn(
                 or not accepted
                 or accepted[0].status == "queued"
             ):
-                return CursorTurnResult(_ticket_start_summary(outcomes), None)
+                return CursorTurnResult(
+                    _ticket_start_summary(outcomes, utterance or text),
+                    None,
+                )
             assert len(accepted) == 1 and accepted[0].job_id is not None
             return _await_foreground(
                 accepted[0].job_id,
@@ -2689,10 +2727,7 @@ def cursor_turn(
         if queued.participant_admission_state == "waiting":
             label = inbox.speakable_label_for(queued)
             return CursorTurnResult(
-                AssistantResponse(
-                    spoken_text=f"Cursor accepted {label} and queued it.",
-                    display_text=f"Cursor job {job_id} was accepted and queued.",
-                ),
+                _queued_accept_response(label, job_id, utterance or text),
                 None,
             )
     return _await_foreground(

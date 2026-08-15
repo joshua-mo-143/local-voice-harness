@@ -797,8 +797,8 @@ class WakeConversationDaemon:
         self.close_conversation("assistant ended the conversation")
         return None
 
-    def _acknowledge_consultation(self) -> BargeIn | None:
-        response = as_assistant_response(cursor_consultation.ACKNOWLEDGEMENT)
+    def _acknowledge_consultation(self, utterance: str) -> BargeIn | None:
+        response = cursor_consultation.acknowledgement(utterance)
         print(f"Assistant: {response.display_text}", flush=True)
         _playback, interruption = self.play_response(response)
         return interruption
@@ -2265,7 +2265,7 @@ class WakeConversationDaemon:
                 else:
                     try:
                         client = self.integrations.herdr_client()
-                        interruption = self._acknowledge_consultation()
+                        interruption = self._acknowledge_consultation(text)
                         if interruption is not None:
                             return interruption
                         response = cursor_consultation.consult_pending_question(
@@ -2301,7 +2301,7 @@ class WakeConversationDaemon:
                     if target is None:
                         response = cursor_consultation.NO_WORKSPACE
                     else:
-                        interruption = self._acknowledge_consultation()
+                        interruption = self._acknowledge_consultation(text)
                         if interruption is not None:
                             return interruption
                         response = cursor_consultation.consult(
