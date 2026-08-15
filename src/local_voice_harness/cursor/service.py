@@ -8,7 +8,7 @@ import uuid
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Literal, NamedTuple
+from typing import Literal, overload
 
 from ..config import JOB_LOGS_DIR, JOBS_DIR, LEGACY_JOBS_DIR
 from ..diagnostic_safety import redact_diagnostic
@@ -167,9 +167,34 @@ class CursorTurnRequest:
     on_job_started: Callable[[], None] | None = None
 
 
-class CursorTurnResult(NamedTuple):
+@dataclass(frozen=True, slots=True)
+class CursorTurnResult:
     text: ResponseLike
     session_id: str | None
+    mutated: bool = False
+
+    def __iter__(self):
+        # Keep the long-standing ``response, session = cursor_turn(...)`` contract.
+        yield self.text
+        yield self.session_id
+
+    def __len__(self) -> int:
+        return 2
+
+    @overload
+    def __getitem__(self, index: Literal[0]) -> ResponseLike: ...
+
+    @overload
+    def __getitem__(self, index: Literal[1]) -> str | None: ...
+
+    @overload
+    def __getitem__(self, index: slice) -> tuple[ResponseLike | str | None, ...]: ...
+
+    @overload
+    def __getitem__(self, index: int) -> ResponseLike | str | None: ...
+
+    def __getitem__(self, index: int | slice):
+        return (self.text, self.session_id)[index]
 
 
 TicketStartStatus = Literal[
@@ -2700,6 +2725,7 @@ def cursor_turn(
                 display_text=result,
             ),
             None,
+            mutated=True,
         )
     if action in {"dismiss", "repeat"}:
         resolved = _resolve_reference(
@@ -2718,7 +2744,7 @@ def cursor_turn(
             if action == "dismiss"
             else repeat_announcement(resolved.job_id)
         )
-        return CursorTurnResult(message, session_id)
+        return CursorTurnResult(message, session_id, mutated=True)
     if action == "reply":
         reply_id = job_id or session_id
         if not reply_id:
@@ -2732,6 +2758,7 @@ def cursor_turn(
                 return CursorTurnResult(resolved.clarification, session_id)
             reply_id = resolved.job_id
         assert reply_id is not None
+        before_reply = read_job(reply_id)
         immediate = reply_job(
             reply_id,
             text,
@@ -2745,13 +2772,15 @@ def cursor_turn(
             integrations=registry,
         )
         if immediate is not None:
-            pending = questions.current(read_job(reply_id))
+            current = read_job(reply_id)
+            pending = questions.current(current)
             next_session = (
                 None
                 if pending is not None and pending.state == QuestionState.DEFERRED
                 else reply_id
             )
-            return CursorTurnResult(immediate, next_session)
+            mutated = current.revision != before_reply.revision
+            return CursorTurnResult(immediate, next_session, mutated=mutated)
         job_id = reply_id
         return _await_foreground(
             job_id,
@@ -2843,6 +2872,7 @@ def cursor_turn(
                 return CursorTurnResult(
                     _ticket_start_summary(outcomes, utterance),
                     None,
+                    mutated=bool(accepted),
                 )
             assert len(accepted) == 1 and accepted[0].job_id is not None
             return _await_foreground(
@@ -2887,6 +2917,7 @@ def cursor_turn(
             return CursorTurnResult(
                 _queued_accept_response(label, job_id, utterance),
                 None,
+                mutated=True,
             )
     return _await_foreground(
         job_id,
@@ -3070,6 +3101,7 @@ def _await_foreground(
                 ),
             ),
             None,
+            mutated=True,
         )
     label = inbox.speakable_label_for(job)
     return CursorTurnResult(
@@ -3083,6 +3115,7 @@ def _await_foreground(
             ),
         ),
         None,
+        mutated=True,
     )
 
 
@@ -3098,9 +3131,11 @@ def _foreground_delivery_result(
             completed.github_issue_create_requested
             or completed.linear_ticket_create_requested
         ):
-            return CursorTurnResult(render_job_announcement(completed), None)
+            return CursorTurnResult(
+                render_job_announcement(completed), None, mutated=True
+            )
         result = completed.result
-        return CursorTurnResult(str(result or "").strip(), None)
+        return CursorTurnResult(str(result or "").strip(), None, mutated=True)
     if job.status == JobStatus.AWAITING_USER:
         claimed = _defer_or_acknowledge(job_id, delivery_claims)
         awaiting = claimed if claimed is not None else job
@@ -3120,6 +3155,7 @@ def _foreground_delivery_result(
                     display_text=rendered_question,
                 ),
                 job_id,
+                mutated=True,
             )
         if awaiting.clarification_kind == "linear_ticket_create_confirmation":
             return CursorTurnResult(
@@ -3132,20 +3168,23 @@ def _foreground_delivery_result(
                     display_text=rendered_question,
                 ),
                 job_id,
+                mutated=True,
             )
-        return CursorTurnResult(rendered_question, job_id)
+        return CursorTurnResult(rendered_question, job_id, mutated=True)
     if job.status == JobStatus.BLOCKED:
         claimed = _defer_or_acknowledge(job_id, delivery_claims)
         blocked = claimed if claimed is not None else job
-        return CursorTurnResult(render_job_announcement(blocked), None)
+        return CursorTurnResult(render_job_announcement(blocked), None, mutated=True)
     if job.status == JobStatus.FAILED:
         claimed = _defer_or_acknowledge(job_id, delivery_claims)
         failed = claimed if claimed is not None else job
-        return CursorTurnResult(_foreground_failure_response(failed), None)
+        return CursorTurnResult(
+            _foreground_failure_response(failed), None, mutated=True
+        )
     if job.status == JobStatus.CANCELLED:
         claimed = _defer_or_acknowledge(job_id, delivery_claims)
         cancelled = claimed if claimed is not None else job
-        return CursorTurnResult(render_job_announcement(cancelled), None)
+        return CursorTurnResult(render_job_announcement(cancelled), None, mutated=True)
     return None
 
 

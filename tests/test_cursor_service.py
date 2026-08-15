@@ -55,7 +55,38 @@ def test_service_request_and_result_types_are_explicit() -> None:
 
     assert start.repository == "project"
     assert turn.session_id == "123456789abc"
+    response, session = result
+    assert (response, session) == ("done", None)
     assert tuple(result) == ("done", None)
+    assert result.mutated is False
+
+
+def test_reply_mutation_uses_revision_when_another_question_remains() -> None:
+    before = mock.Mock(revision=7)
+    after = mock.Mock(
+        revision=8,
+        status=JobStatus.AWAITING_USER,
+    )
+    pending = mock.Mock(state="pending")
+    with (
+        mock.patch.object(service, "read_job", side_effect=(before, after)),
+        mock.patch.object(
+            service,
+            "reply_job",
+            return_value="Which environment should I use?",
+        ),
+        mock.patch.object(service.questions, "current", return_value=pending),
+    ):
+        result = service.cursor_turn(
+            CursorTurnRequest(
+                "PostgreSQL",
+                action="reply",
+                job_id="123456789abc",
+            )
+        )
+
+    assert result.mutated is True
+    assert result.session_id == "123456789abc"
 
 
 def test_waiting_job_cancellation_releases_without_worker_launch(
@@ -1401,7 +1432,9 @@ def test_immediate_next_question_suppresses_continuation_ack_and_retries_deliver
         continuation=True,
     )
 
-    assert result == CursorTurnResult("Which database should I use?", job.id)
+    assert result == CursorTurnResult(
+        "Which database should I use?", job.id, mutated=True
+    )
     assert len(claims) == 1
     assert not store.get(job.id).delivered
 

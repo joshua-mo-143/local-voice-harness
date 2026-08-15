@@ -91,6 +91,7 @@ def test_ambiguous_cancel_clarifies_without_cancelling(store: JobStore) -> None:
     result = cursor_turn(CursorTurnRequest("cancel the issue job", action="cancel"))
     response = as_assistant_response(result.text)
 
+    assert result.mutated is False
     assert "Which one" in response.display_text
     assert "issue 42" in response.spoken_text
     assert "issue 43" in response.spoken_text
@@ -110,6 +111,7 @@ def test_reference_cancel_targets_intended_job(store: JobStore) -> None:
         )
 
     response = as_assistant_response(result.text)
+    assert result.mutated is True
     assert response.spoken_text == "Cursor cancelled venice fix."
     assert "bbbbbbbbbbbb" not in response.spoken_text
     assert "bbbbbbbbbbbb" in response.display_text

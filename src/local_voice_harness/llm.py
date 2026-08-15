@@ -311,7 +311,7 @@ def qwen_turn(
                             or fork_requested
                             or github_pull_request
                         ):
-                            turn_response, cursor_session = cursor_turn(
+                            turn_result = cursor_turn(
                                 CursorTurnRequest(
                                     task,
                                     job_id if action == "reply" else None,
@@ -335,7 +335,7 @@ def qwen_turn(
                                 delivery_claims=delivery_claims,
                             )
                         else:
-                            turn_response, cursor_session = cursor_turn(
+                            turn_result = cursor_turn(
                                 CursorTurnRequest(
                                     task,
                                     job_id if action == "reply" else None,
@@ -353,6 +353,7 @@ def qwen_turn(
                                 ),
                                 delivery_claims=delivery_claims,
                             )
+                        turn_response, cursor_session = turn_result[0], turn_result[1]
                         tool_result = _cursor_tool_result(turn_response)
                     except Exception as exc:
                         _log_llm_event(

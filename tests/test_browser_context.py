@@ -339,6 +339,34 @@ class BrowserDispatchTests(unittest.TestCase):
         self.assertEqual(context.github_issue, 7)
         focused_url.assert_not_called()
 
+    def test_omit_focus_preserves_explicit_pull_request_context(self) -> None:
+        fragment = ContextFragment(
+            source="github",
+            text="Explicit PR context",
+            repository_reference="spoken/project",
+            pull_request_number=9,
+        )
+        with (
+            mock.patch.object(
+                browser_context, "capture_text_context", return_value=fragment
+            ) as text_context,
+            mock.patch.object(browser_context, "focused_browser_url") as focused_url,
+            mock.patch.object(browser_context, "focused_app_context") as focused_app,
+        ):
+            context = browser_context.request_context(
+                "review https://github.com/spoken/project/pull/9",
+                platform=USER_CONFIG.platform,
+                integrations=USER_CONFIG.integrations,
+                include_focused_context=False,
+            )
+
+        text_context.assert_called_once()
+        focused_url.assert_not_called()
+        focused_app.assert_not_called()
+        self.assertEqual(context.github_repository, "spoken/project")
+        self.assertEqual(context.github_pull_request, 9)
+        self.assertIn("Explicit PR context", context.text)
+
     def test_generic_issue_fragment_retains_external_metadata(self) -> None:
         fragment = ContextFragment(
             source="linear",

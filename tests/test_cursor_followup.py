@@ -474,6 +474,7 @@ def test_cursor_turn_follow_up_reports_busy(store: JobStore, tmp_path: Path) -> 
     )
 
     assert result.session_id is None
+    assert result.mutated is False
     assert "busy" in as_assistant_response(result.text).display_text.lower()
 
 

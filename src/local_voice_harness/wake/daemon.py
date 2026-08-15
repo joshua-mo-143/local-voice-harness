@@ -15,7 +15,7 @@ import time
 import uuid
 import wave
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -74,6 +74,7 @@ from ..critical_targets import (
 )
 from ..cursor import announcements as announcement_policy
 from ..cursor import consultation as cursor_consultation
+from ..cursor import inbox as cursor_inbox
 from ..cursor import provisioning as cursor_provisioning
 from ..cursor import questions as cursor_questions
 from ..cursor import service as cursor_service
@@ -195,6 +196,8 @@ CURSOR_STORE = JobStore(JOBS_DIR, LEGACY_JOBS_DIR)
 END_SILENCE_MS = 720
 MAX_UTTERANCE_SECONDS = 120
 CONVERSATION_TIMEOUT_SECONDS = 60
+HOLD_EXTENSION_SECONDS = 120
+MAX_HOLD_EXTENSIONS = 2
 PRE_ROLL_FRAMES = 25
 MICROPHONE_START_ATTEMPTS = 30
 MICROPHONE_RETRY_SECONDS = 1
@@ -240,6 +243,16 @@ class PendingTargetReadback:
 class PendingTargetResolution:
     trusted_utterance: str
     route: IntentRoute
+    created_at: float
+
+    @property
+    def expires_at(self) -> float:
+        return self.created_at + CONVERSATION_TIMEOUT_SECONDS
+
+
+@dataclass(frozen=True, slots=True)
+class PendingQuestionRetarget:
+    candidate_ids: tuple[str, ...]
     created_at: float
 
     @property
@@ -315,12 +328,14 @@ def drain_pending_announcements(
     settings: AnnouncementSettings,
     *,
     integrations: IntegrationRegistry | None = None,
+    snooze: announcement_policy.AnnouncementSnooze | None = None,
 ) -> announcement_policy.DrainResult:
     recover_jobs(integrations=integrations)
     try:
         result = announcement_policy.drain_background_announcements(
             CURSOR_STORE,
             settings,
+            snooze=snooze,
         )
     except Exception as exc:  # noqa: BLE001 - notification failures cannot stop wake
         log(f"announcement drain failed: {type(exc).__name__}: {exc}")
@@ -422,6 +437,88 @@ CLOSE_PATTERN = re.compile(
     r"\b(?:goodbye|stop listening|go to sleep|end conversation)\b", re.IGNORECASE
 )
 STOP_TALKING_PATTERN = re.compile(r"\b(?:stop talking|shut up)\b", re.IGNORECASE)
+TRANSCRIPT_REPLAY_PATTERN = re.compile(
+    r"^\s*(?:"
+    r"what\s+did\s+you\s+hear|"
+    r"what\s+did\s+i\s+(?:just\s+)?say|"
+    r"(?:please\s+)?(?:repeat|replay|read\s+back)\s+(?:the\s+)?"
+    r"(?:last\s+)?(?:transcript|utterance)|"
+    r"play\s+(?:that|it|what\s+i\s+said)\s+back"
+    r")\s*[?.!]?\s*$",
+    re.IGNORECASE,
+)
+TRANSCRIPT_CORRECTION_PATTERN = re.compile(
+    r"^\s*(?:"
+    r"i\s+said\s+|"
+    r"that(?:'s|\s+is)\s+not\s+what\s+i\s+said(?:[,.]?\s*(?:i\s+said\s+))?"
+    r")(.+?)\s*$",
+    re.IGNORECASE,
+)
+TRANSCRIPT_CORRECTION_BARE_PATTERN = re.compile(
+    r"^\s*that(?:'s|\s+is)\s+not\s+what\s+i\s+said\s*[!.]?\s*$",
+    re.IGNORECASE,
+)
+INSPECT_CONTEXT_PATTERN = re.compile(
+    r"^\s*(?:"
+    r"what\s+are\s+you\s+looking\s+at|"
+    r"what(?:'s|\s+is)\s+(?:the\s+)?focused\s+(?:tab|context|source|app)|"
+    r"what\s+context\s+are\s+you\s+using"
+    r")\s*[?.!]?\s*$",
+    re.IGNORECASE,
+)
+OMIT_CONTEXT_PATTERN = re.compile(
+    r"^\s*(?:"
+    r"don['’]?t\s+use\s+that|"
+    r"ignore\s+(?:the\s+)?focused\s+(?:tab|app|context|window|source)|"
+    r"stop\s+using\s+(?:the\s+)?focused\s+(?:tab|context|app)"
+    r")\s*[?.!]?\s*$",
+    re.IGNORECASE,
+)
+HOLD_PATTERN = re.compile(
+    r"^\s*(?:"
+    r"hold\s+on|"
+    r"give\s+me\s+a\s+(?:minute|moment|sec(?:ond)?s?)|"
+    r"wait\s+(?:a\s+(?:minute|moment|second)|please)|"
+    r"hang\s+on"
+    r")\s*[!.]?\s*$",
+    re.IGNORECASE,
+)
+SNOOZE_PATTERN = re.compile(
+    r"^\s*(?:"
+    r"(?:please\s+)?(?:snooze|mute)"
+    r"(?:\s+(?P<target>announcements|background(?:\s+announcements)?|everything))?"
+    r"(?:\s+for\s+(?P<minutes>\d+)\s*(?:minute|minutes|min))?"
+    r"|be\s+quiet\s+for\s+a\s+(?:bit|while|minute)"
+    r"|don['’]?t\s+talk\s+at\s+all"
+    r")\s*[!.]?\s*$",
+    re.IGNORECASE,
+)
+CLEAR_SNOOZE_PATTERN = re.compile(
+    r"^\s*(?:"
+    r"you\s+can\s+talk\s+again|"
+    r"stop\s+snooz(?:e|ing)|"
+    r"unmute(?:\s+announcements)?"
+    r")\s*[!.]?\s*$",
+    re.IGNORECASE,
+)
+RETARGET_PATTERN = re.compile(
+    r"^\s*(?:"
+    r"(?:let(?:'s| us)\s+)?(?:talk|switch)\s+(?:to|about)\s+(?:the\s+)?(?P<ref>.+?)|"
+    r"what\s+was\s+the\s+(?P<qref>.+?)\s+question"
+    r")\s*[?.!]?\s*$",
+    re.IGNORECASE,
+)
+RESUME_PATTERN = re.compile(
+    r"^\s*(?:"
+    r"(?:please\s+)?(?:resume|continue)"
+    r"(?P<with>\s+with)?"
+    r"(?:\s+(?:the\s+)?(?P<ref>.+?))?|"
+    r"pick\s+(?:this|it|(?:the\s+)?(?P<pickref>.+?))\s+back\s+up|"
+    r"where\s+were\s+we(?:\s+(?:on|with|about)\s+(?:the\s+)?(?P<whereref>.+?))?|"
+    r"where\s+was\s+I"
+    r")\s*[?.!]?\s*$",
+    re.IGNORECASE,
+)
 PENDING_SUBMIT_PATTERN = re.compile(
     r"\b(?:work\s+on|fix|change|update|implement|add|remove|run|review|inspect|"
     r"start|create|build|refactor|test)\b",
@@ -454,6 +551,47 @@ RECENT_DETAILS_UNAVAILABLE = (
     "I no longer have details for that recent announcement. "
     "Ask for the job by name or ID."
 )
+MISSING_TRANSCRIPT_RESPONSE = (
+    "I don't have a recent transcript to replay, so I won't invent one."
+)
+DISPATCHED_TRANSCRIPT_RESPONSE = (
+    "I already started that request, so I can't replace what I heard."
+)
+BARE_TRANSCRIPT_CORRECTION_RESPONSE = (
+    "I heard a correction but no replacement. Say I said, then the request."
+)
+NO_FOCUSED_CONTEXT_RESPONSE = "I'm not looking at a focused source."
+OMIT_FOCUSED_CONTEXT_RESPONSE = (
+    "Okay, I won't use the focused tab or app for the rest of this conversation."
+)
+HOLD_ACCEPTED_RESPONSE = "Okay, I'll keep listening."
+HOLD_EXHAUSTED_RESPONSE = (
+    "I'm already holding. I'll keep listening until this window ends."
+)
+HOLD_INACTIVE_RESPONSE = "I can only hold while I'm already listening for a follow-up."
+DEFAULT_SNOOZE_SECONDS = 30 * 60
+SNOOZE_STARTED_RESPONSE = (
+    "Okay, I'll hold ordinary background announcements for 30 minutes."
+)
+
+
+def snooze_started_response(minutes: int | None) -> str:
+    if minutes is None:
+        return SNOOZE_STARTED_RESPONSE
+    label = "1 minute" if minutes == 1 else f"{minutes} minutes"
+    return f"Okay, I'll hold ordinary background announcements for {label}."
+
+
+SNOOZE_MUTE_ALL_RESPONSE = (
+    "Okay, I'll mute background announcements, including questions and failures."
+)
+SNOOZE_CLEARED_RESPONSE = "Okay, I can announce background updates again."
+SNOOZE_INACTIVE_RESPONSE = "I wasn't snoozing background announcements."
+RETARGET_NOT_FOUND_RESPONSE = "I couldn't find a job matching that."
+RETARGET_INACTIVE_RESPONSE = (
+    "I can only switch questions while this conversation has a live pending question."
+)
+RESUME_NONE_RESPONSE = "There's no Cursor job waiting for a reply."
 
 
 @dataclass
@@ -475,6 +613,47 @@ class CompletedFollowup:
     completed_at: float | None
     expires_at: float
     display_fingerprint: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class FocusedIdentity:
+    """Speakable identity from RequestContext, excluding untrusted bodies."""
+
+    repository: str | None = None
+    issue: str | None = None
+    pull_request: str | None = None
+    app_class: str | None = None
+    source_kinds: tuple[str, ...] = ()
+
+    def spoken(self) -> str:
+        parts: list[str] = []
+        if self.repository:
+            parts.append(f"repository {self.repository}")
+        if self.issue:
+            parts.append(f"issue {self.issue}")
+        if self.pull_request:
+            parts.append(f"pull request {self.pull_request}")
+        if self.app_class:
+            parts.append(f"app {self.app_class}")
+        if self.source_kinds:
+            parts.append("source kinds " + ", ".join(self.source_kinds))
+        if not parts:
+            return NO_FOCUSED_CONTEXT_RESPONSE
+        return "I'm looking at " + "; ".join(parts) + "."
+
+
+@dataclass(frozen=True, slots=True)
+class LastTranscript:
+    """Volatile trusted utterance for the current wake conversation.
+
+    ``expires_at`` is a ``time.monotonic()`` deadline, so the slot cannot
+    survive a restart. ``dispatched`` becomes true only after a job or write
+    has started for this utterance.
+    """
+
+    utterance: str
+    dispatched: bool
+    expires_at: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -574,6 +753,7 @@ class WakeConversationDaemon:
         )
         self.pending_target_readback: PendingTargetReadback | None = None
         self.pending_target_resolution: PendingTargetResolution | None = None
+        self.pending_question_retarget: PendingQuestionRetarget | None = None
         self.pending_config_change: PendingConfigChange | None = None
         self.pending_spoken_alias: PendingSpokenAlias | None = None
         self.config_activation_store = config_activation_store or ActivationStore()
@@ -585,6 +765,11 @@ class WakeConversationDaemon:
         self.conversation_deadline = 0.0
         self.awaiting_followup = False
         self.last_ordinary_reply: str | None = None
+        self.last_transcript: LastTranscript | None = None
+        self.omit_focused_context = False
+        self.last_focused_identity: FocusedIdentity | None = None
+        self.hold_extensions = 0
+        self.announcement_snooze: announcement_policy.AnnouncementSnooze | None = None
         self.last_wake = 0.0
         self.force_listen = threading.Event()
         self.running = True
@@ -785,11 +970,16 @@ class WakeConversationDaemon:
         self.recent_playback.clear()
         self.pending_target_readback = None
         self.pending_target_resolution = None
+        self.pending_question_retarget = None
         self.pending_config_change = None
         self.pending_spoken_alias = None
         self.conversation_deadline = 0.0
         self.awaiting_followup = False
         self.last_ordinary_reply = None
+        self.last_transcript = None
+        self.omit_focused_context = False
+        self.last_focused_identity = None
+        self.hold_extensions = 0
         self.pause_microphone()
         try:
             self.stop_components_when_idle()
@@ -802,10 +992,12 @@ class WakeConversationDaemon:
         log(f"pending-question capture closed: {reason}")
         self.history.clear()
         self.completed_followup = None
+        self.pending_question_retarget = None
         self.pending_config_change = None
         self.pending_spoken_alias = None
         self.conversation_deadline = 0.0
         self.awaiting_followup = False
+        self.hold_extensions = 0
         self.pause_microphone()
         try:
             self.stop_components_when_idle()
@@ -1211,6 +1403,298 @@ class WakeConversationDaemon:
             return None
         return followup
 
+    def _active_last_transcript(self) -> LastTranscript | None:
+        """Return the live last-transcript slot, clearing it once it has expired."""
+        slot = self.last_transcript
+        if slot is None:
+            return None
+        if time.monotonic() >= slot.expires_at:
+            self.last_transcript = None
+            return None
+        return slot
+
+    def _remember_last_transcript(self, utterance: str) -> None:
+        text = utterance.strip()
+        if not text:
+            return
+        self.last_transcript = LastTranscript(
+            utterance=text,
+            dispatched=False,
+            expires_at=time.monotonic() + CONVERSATION_TIMEOUT_SECONDS,
+        )
+
+    def _refresh_last_transcript_deadline(self) -> None:
+        slot = self.last_transcript
+        if slot is None:
+            return
+        default_deadline = time.monotonic() + CONVERSATION_TIMEOUT_SECONDS
+        self.last_transcript = LastTranscript(
+            utterance=slot.utterance,
+            dispatched=slot.dispatched,
+            expires_at=max(slot.expires_at, default_deadline),
+        )
+
+    def _mark_last_transcript_dispatched(self) -> None:
+        slot = self._active_last_transcript()
+        if slot is None:
+            return
+        self.last_transcript = LastTranscript(
+            utterance=slot.utterance,
+            dispatched=True,
+            expires_at=slot.expires_at,
+        )
+
+    def _dispatch_cursor_turn(self, request: CursorTurnRequest, **kwargs):
+        existing_on_started = request.on_job_started
+
+        def mutation_started() -> None:
+            if existing_on_started is not None:
+                existing_on_started()
+            self._mark_last_transcript_dispatched()
+
+        guarded_request = replace(request, on_job_started=mutation_started)
+        result = cursor_turn(guarded_request, **kwargs)
+        response, session = result[0], result[1]
+        if getattr(result, "mutated", False) or request.action in {
+            "cancel",
+            "dismiss",
+            "repeat",
+        }:
+            # These synchronous operations return only after their durable update.
+            self._mark_last_transcript_dispatched()
+        return response, session
+
+    def _focused_identity_from_context(
+        self, context: RequestContext
+    ) -> FocusedIdentity:
+        issue = context.focused_issue or context.external_issue_reference
+        if issue is None and context.github_issue is not None:
+            repository = context.github_repository or context.focused_repository
+            issue = (
+                f"{repository}#{context.github_issue}"
+                if repository
+                else str(context.github_issue)
+            )
+        pull_request = None
+        if context.github_pull_request is not None:
+            repository = context.github_repository or context.focused_repository
+            pull_request = (
+                f"{repository}#{context.github_pull_request}"
+                if repository
+                else str(context.github_pull_request)
+            )
+        return FocusedIdentity(
+            repository=context.focused_repository or context.github_repository,
+            issue=issue,
+            pull_request=pull_request,
+            app_class=context.focused_app_class,
+            source_kinds=context.focused_app_sources,
+        )
+
+    def _bind_awaiting_job(self, job_id: str, *, missing: str) -> str:
+        """Load a fresh snapshot and bind the session without answering."""
+        try:
+            job = CURSOR_STORE.get(job_id)
+        except Exception as exc:  # noqa: BLE001 - resume/retarget must fail closed
+            log(f"awaiting job unavailable for {job_id}: {type(exc).__name__}: {exc}")
+            return missing
+        if job.status != JobStatus.AWAITING_USER:
+            return cursor_service.job_status(job.id)
+        question = cursor_questions.current(job)
+        if question is None:
+            return cursor_service.job_status(job.id)
+        self.cursor_session = job.id
+        return question.text
+
+    def _retarget_named_question(self, reference: str) -> str:
+        """Switch the live session to a named awaiting job without answering."""
+        if (
+            not self.conversation_deadline
+            or time.monotonic() >= self.conversation_deadline
+            or self._pending_cursor_question() is None
+        ):
+            self.pending_question_retarget = None
+            return RETARGET_INACTIVE_RESPONSE
+        jobs = CURSOR_STORE.list()
+        resolution = cursor_inbox.resolve_reference(jobs, reference)
+        if resolution.ambiguous:
+            self.pending_question_retarget = PendingQuestionRetarget(
+                tuple(match.id for match in resolution.matches),
+                time.monotonic(),
+            )
+            return cursor_inbox.clarify(list(resolution.matches), "talk about")
+        if resolution.unique is None:
+            self.pending_question_retarget = None
+            return RETARGET_NOT_FOUND_RESPONSE
+        self.pending_question_retarget = None
+        return self._bind_awaiting_job(
+            resolution.unique.id, missing=RETARGET_NOT_FOUND_RESPONSE
+        )
+
+    def _resume_awaiting_question(self, reference: str | None) -> str:
+        """Replay a durable awaiting question without submitting an answer."""
+        if reference:
+            jobs = CURSOR_STORE.list()
+            resolution = cursor_inbox.resolve_reference(jobs, reference)
+            if resolution.ambiguous:
+                return cursor_inbox.clarify(list(resolution.matches), "resume")
+            if resolution.unique is None:
+                return RETARGET_NOT_FOUND_RESPONSE
+            return self._bind_awaiting_job(
+                resolution.unique.id, missing=RETARGET_NOT_FOUND_RESPONSE
+            )
+        awaiting = [
+            job
+            for job in CURSOR_STORE.list()
+            if job.status == JobStatus.AWAITING_USER
+            and cursor_questions.current(job) is not None
+        ]
+        if not awaiting:
+            return RESUME_NONE_RESPONSE
+        if len(awaiting) > 1:
+            return cursor_inbox.clarify(
+                [cursor_inbox.summarize(job) for job in awaiting],
+                "resume",
+            )
+        return self._bind_awaiting_job(
+            awaiting[0].id, missing=RETARGET_NOT_FOUND_RESPONSE
+        )
+
+    def _resolve_pending_question_retarget(self, reference: str) -> str | None:
+        pending = self.pending_question_retarget
+        if pending is None:
+            return None
+        if time.monotonic() >= pending.expires_at:
+            self.pending_question_retarget = None
+            return None
+        if (
+            not self.conversation_deadline
+            or time.monotonic() >= self.conversation_deadline
+            or self._pending_cursor_question() is None
+        ):
+            self.pending_question_retarget = None
+            return RETARGET_INACTIVE_RESPONSE
+
+        live_jobs = []
+        for job_id in pending.candidate_ids:
+            try:
+                job = CURSOR_STORE.get(job_id)
+            except Exception:  # noqa: BLE001 - stale candidates fail closed
+                continue
+            if (
+                job.status == JobStatus.AWAITING_USER
+                and cursor_questions.current(job) is not None
+            ):
+                live_jobs.append(job)
+        if not live_jobs:
+            self.pending_question_retarget = None
+            return RETARGET_NOT_FOUND_RESPONSE
+
+        resolution = cursor_inbox.resolve_reference(live_jobs, reference)
+        if resolution.unique is not None:
+            self.pending_question_retarget = None
+            return self._retarget_named_question(resolution.unique.id)
+
+        summaries = (
+            list(resolution.matches)
+            if resolution.ambiguous
+            else [cursor_inbox.summarize(job) for job in live_jobs]
+        )
+        self.pending_question_retarget = PendingQuestionRetarget(
+            tuple(summary.id for summary in summaries),
+            time.monotonic(),
+        )
+        return cursor_inbox.clarify(summaries, "talk about")
+
+    def _active_announcement_snooze(
+        self, now: float | None = None
+    ) -> announcement_policy.AnnouncementSnooze | None:
+        snooze = self.announcement_snooze
+        if snooze is None:
+            return None
+        current = time.time() if now is None else now
+        if not snooze.active(current):
+            self.announcement_snooze = None
+            return None
+        return snooze
+
+    def _followup_listening_armed(self) -> bool:
+        return bool(
+            self.awaiting_followup
+            or (
+                self.conversation_deadline
+                and time.monotonic() < self.conversation_deadline
+            )
+        )
+
+    def _extend_conversation_hold(self) -> bool:
+        if self.hold_extensions >= MAX_HOLD_EXTENSIONS:
+            return False
+        self.hold_extensions += 1
+        now = time.monotonic()
+        base = self.conversation_deadline if self.conversation_deadline > now else now
+        self.conversation_deadline = base + HOLD_EXTENSION_SECONDS
+        pending = self.pending_target_readback
+        if pending is not None:
+            self.pending_target_readback = PendingTargetReadback(
+                replace(
+                    pending.candidate,
+                    created_at=pending.candidate.created_at + HOLD_EXTENSION_SECONDS,
+                ),
+                pending.request,
+            )
+        resolution = self.pending_target_resolution
+        if resolution is not None:
+            self.pending_target_resolution = replace(
+                resolution,
+                created_at=resolution.created_at + HOLD_EXTENSION_SECONDS,
+            )
+        retarget = self.pending_question_retarget
+        if retarget is not None:
+            self.pending_question_retarget = replace(
+                retarget,
+                created_at=retarget.created_at + HOLD_EXTENSION_SECONDS,
+            )
+        slot = self.last_transcript
+        if slot is not None:
+            self.last_transcript = LastTranscript(
+                utterance=slot.utterance,
+                dispatched=slot.dispatched,
+                expires_at=slot.expires_at + HOLD_EXTENSION_SECONDS,
+            )
+        return True
+
+    def _capture_request_context(self, text: str) -> RequestContext:
+        context = request_context(
+            text,
+            platform=self.platform,
+            integrations=self.integrations,
+            include_focused_context=not self.omit_focused_context,
+        )
+        self.last_focused_identity = (
+            None
+            if self.omit_focused_context
+            else self._focused_identity_from_context(context)
+        )
+        return context
+
+    def _speak_control_notice(self, spoken: str) -> BargeIn | None:
+        self.ensure_components()
+        response = AssistantResponse.from_text(spoken)
+        print(f"Assistant: {response.display_text}", flush=True)
+        _playback, interruption = self.play_response(response)
+        if interruption is not None:
+            return interruption
+        self.awaiting_followup = True
+        default_deadline = time.monotonic() + CONVERSATION_TIMEOUT_SECONDS
+        self.conversation_deadline = max(
+            self.conversation_deadline,
+            default_deadline,
+        )
+        self._refresh_last_transcript_deadline()
+        notify("Listening for a follow-up…")
+        return None
+
     def _recent_completion_details(
         self,
         followup: CompletedFollowup,
@@ -1435,6 +1919,7 @@ class WakeConversationDaemon:
             if before_mutation is not None:
                 before_mutation()
             result = commit_pending_change(pending)
+            self._mark_last_transcript_dispatched()
         except StaleConfigChangeError:
             if after_mutation is not None:
                 after_mutation()
@@ -2034,6 +2519,153 @@ class WakeConversationDaemon:
                 )
                 notify("Listening for a follow-up…")
                 return None
+            if TRANSCRIPT_REPLAY_PATTERN.search(text):
+                terminalize_non_side_effect()
+                slot = self._active_last_transcript()
+                if slot is None:
+                    return self._speak_control_notice(MISSING_TRANSCRIPT_RESPONSE)
+                return self._speak_control_notice(f"I heard: {slot.utterance}")
+            if TRANSCRIPT_CORRECTION_BARE_PATTERN.search(text):
+                terminalize_non_side_effect()
+                if self._active_last_transcript() is None:
+                    return self._speak_control_notice(MISSING_TRANSCRIPT_RESPONSE)
+                return self._speak_control_notice(BARE_TRANSCRIPT_CORRECTION_RESPONSE)
+            correction = TRANSCRIPT_CORRECTION_PATTERN.search(text)
+            if correction is not None:
+                replacement = correction.group(1).strip()
+                slot = self._active_last_transcript()
+                if slot is None or not replacement:
+                    terminalize_non_side_effect()
+                    return self._speak_control_notice(MISSING_TRANSCRIPT_RESPONSE)
+                if slot.dispatched:
+                    terminalize_non_side_effect()
+                    return self._speak_control_notice(DISPATCHED_TRANSCRIPT_RESPONSE)
+                # Abandon confirmations that belonged to the replaced utterance.
+                # The replacement re-enters the same routing path and must still
+                # satisfy ticket readback, create, fork, clone, and config checks.
+                self.pending_target_readback = None
+                self.pending_target_resolution = None
+                self.pending_config_change = None
+                text = replacement
+            if INSPECT_CONTEXT_PATTERN.search(text):
+                terminalize_non_side_effect()
+                if self.omit_focused_context:
+                    return self._speak_control_notice(NO_FOCUSED_CONTEXT_RESPONSE)
+                captured = self._capture_request_context(text)
+                identity = self._focused_identity_from_context(captured)
+                self.last_focused_identity = identity
+                return self._speak_control_notice(identity.spoken())
+            if OMIT_CONTEXT_PATTERN.search(text):
+                terminalize_non_side_effect()
+                self.omit_focused_context = True
+                self.last_focused_identity = None
+                return self._speak_control_notice(OMIT_FOCUSED_CONTEXT_RESPONSE)
+            if HOLD_PATTERN.search(text):
+                terminalize_non_side_effect()
+                if not self._followup_listening_armed():
+                    return self._speak_control_notice(HOLD_INACTIVE_RESPONSE)
+                spoken = (
+                    HOLD_ACCEPTED_RESPONSE
+                    if self._extend_conversation_hold()
+                    else HOLD_EXHAUSTED_RESPONSE
+                )
+                self.ensure_components()
+                response = AssistantResponse.from_text(spoken)
+                print(f"Assistant: {response.display_text}", flush=True)
+                _playback, interruption = self.play_response(response)
+                if interruption is not None:
+                    return interruption
+                self.awaiting_followup = True
+                notify("Listening for a follow-up…")
+                return None
+            if CLEAR_SNOOZE_PATTERN.search(text):
+                terminalize_non_side_effect()
+                had_snooze = self._active_announcement_snooze() is not None
+                self.announcement_snooze = None
+                return self._speak_control_notice(
+                    SNOOZE_CLEARED_RESPONSE if had_snooze else SNOOZE_INACTIVE_RESPONSE
+                )
+            snooze_match = SNOOZE_PATTERN.search(text)
+            if snooze_match is not None:
+                terminalize_non_side_effect()
+                minutes = snooze_match.group("minutes")
+                parsed_minutes = int(minutes) if minutes else None
+                duration = (
+                    parsed_minutes * 60
+                    if parsed_minutes is not None
+                    else DEFAULT_SNOOZE_SECONDS
+                )
+                target = (snooze_match.group("target") or "").casefold()
+                mute_everything = (
+                    target == "everything"
+                    or "don" in text.casefold()
+                    and "talk" in text.casefold()
+                )
+                self.announcement_snooze = announcement_policy.AnnouncementSnooze(
+                    until=time.time() + duration,
+                    mute_everything=mute_everything,
+                )
+                return self._speak_control_notice(
+                    SNOOZE_MUTE_ALL_RESPONSE
+                    if mute_everything
+                    else snooze_started_response(parsed_minutes)
+                )
+            pending_retarget_response = self._resolve_pending_question_retarget(text)
+            if pending_retarget_response is not None:
+                terminalize_non_side_effect()
+                return self._speak_control_notice(pending_retarget_response)
+            retarget = RETARGET_PATTERN.search(text)
+            if retarget is not None:
+                reference = (
+                    retarget.group("ref") or retarget.group("qref") or ""
+                ).strip()
+                if reference:
+                    terminalize_non_side_effect()
+                    self.pending_target_readback = None
+                    self.pending_target_resolution = None
+                    self.pending_config_change = None
+                    return self._speak_control_notice(
+                        self._retarget_named_question(reference)
+                    )
+            resume = RESUME_PATTERN.search(text)
+            if resume is not None:
+                reference = (
+                    resume.group("ref")
+                    or resume.group("pickref")
+                    or resume.group("whereref")
+                    or ""
+                ).strip()
+                with_prefix = bool(resume.group("with"))
+                handle_resume = True
+                if reference and re.search(
+                    r"\b(?:work\s+on|fix|change|update|implement|add|remove|"
+                    r"run|review|inspect|start|create|build|refactor|test)",
+                    reference,
+                    re.IGNORECASE,
+                ):
+                    handle_resume = False
+                elif (
+                    with_prefix
+                    and reference
+                    and self._pending_cursor_question() is not None
+                ):
+                    # "Continue with X" while a question is live is an answer,
+                    # even when X also matches another awaiting job.
+                    handle_resume = False
+                elif with_prefix and reference:
+                    resolution = cursor_inbox.resolve_reference(
+                        CURSOR_STORE.list(), reference
+                    )
+                    if resolution.unique is None and not resolution.ambiguous:
+                        handle_resume = False
+                if handle_resume:
+                    terminalize_non_side_effect()
+                    self.pending_target_readback = None
+                    self.pending_target_resolution = None
+                    self.pending_config_change = None
+                    return self._speak_control_notice(
+                        self._resume_awaiting_question(reference or None)
+                    )
             pending_resolution = getattr(self, "pending_target_resolution", None)
             resolution_active = (
                 pending_resolution is not None
@@ -2102,11 +2734,7 @@ class WakeConversationDaemon:
             pending_readback = getattr(self, "pending_target_readback", None)
             routing_context = RequestContext(text)
             context = (
-                request_context(
-                    text,
-                    platform=self.platform,
-                    integrations=self.integrations,
-                )
+                self._capture_request_context(text)
                 if pending_readback is not None or resuming_target_resolution
                 else routing_context
             )
@@ -2256,6 +2884,15 @@ class WakeConversationDaemon:
                         terminalize_non_side_effect()
                         self.close_pending_capture("non-actionable speech")
                         return None
+            answering_existing = (
+                readback_result is not None
+                or confirmed_request is not None
+                or config_response is not None
+                or activation_response is not None
+                or (pending is not None and route.intent == Intent.AGENT_REPLY)
+            )
+            if not answering_existing:
+                self._remember_last_transcript(text)
             if confirmed_request is not None or (
                 route.actionable and route.intent in SIDE_EFFECTING_INTENTS
             ):
@@ -2318,11 +2955,7 @@ class WakeConversationDaemon:
                     )
                 )
             ):
-                context = request_context(
-                    text,
-                    platform=self.platform,
-                    integrations=self.integrations,
-                )
+                context = self._capture_request_context(text)
             if route.actionable and route.intent == Intent.END_CONVERSATION:
                 return self.end_conversation()
             fork_requested = decide_fork_intent(text) == ForkIntent.AFFIRMATIVE
@@ -2363,14 +2996,14 @@ class WakeConversationDaemon:
                 response = readback_result
             elif confirmed_request is not None:
                 self.completed_followup = None
-                response, next_cursor_session = cursor_turn(
+                response, next_cursor_session = self._dispatch_cursor_turn(
                     confirmed_request,
                     delivery_claims=delivery_claims,
                     integrations=self.integrations,
                 )
             elif route.actionable and route.intent == Intent.GITHUB_ISSUE_CREATE:
                 self.completed_followup = None
-                response, next_cursor_session = cursor_turn(
+                response, next_cursor_session = self._dispatch_cursor_turn(
                     CursorTurnRequest(
                         context.text,
                         utterance=text,
@@ -2384,7 +3017,7 @@ class WakeConversationDaemon:
                 )
             elif route.actionable and route.intent == Intent.LINEAR_TICKET_CREATE:
                 self.completed_followup = None
-                response, next_cursor_session = cursor_turn(
+                response, next_cursor_session = self._dispatch_cursor_turn(
                     CursorTurnRequest(
                         context.text,
                         utterance=text,
@@ -2476,7 +3109,7 @@ class WakeConversationDaemon:
                 if snapshot is None or choice_id is None:
                     response = cursor_consultation.RECOMMENDATION_UNAVAILABLE
                 else:
-                    response, next_cursor_session = cursor_turn(
+                    response, next_cursor_session = self._dispatch_cursor_turn(
                         CursorTurnRequest(
                             choice_id,
                             snapshot.job_id,
@@ -2548,7 +3181,7 @@ class WakeConversationDaemon:
                     response = cursor_consultation.CONSULTATION_FAILED
                     ordinary_reply = True
             elif route.actionable and route.intent == Intent.AGENT_LIST:
-                response, next_cursor_session = cursor_turn(
+                listed = cursor_turn(
                     CursorTurnRequest(
                         "",
                         self.cursor_session,
@@ -2557,8 +3190,9 @@ class WakeConversationDaemon:
                     delivery_claims=delivery_claims,
                     integrations=self.integrations,
                 )
+                response, next_cursor_session = listed[0], listed[1]
             elif route.actionable and route.intent == Intent.ANNOUNCEMENT_DIGEST:
-                response, next_cursor_session = cursor_turn(
+                missed = cursor_turn(
                     CursorTurnRequest(
                         "",
                         self.cursor_session,
@@ -2567,8 +3201,9 @@ class WakeConversationDaemon:
                     delivery_claims=delivery_claims,
                     integrations=self.integrations,
                 )
+                response, next_cursor_session = missed[0], missed[1]
             elif route.actionable and route.intent == Intent.AGENT_CANCEL:
-                response, next_cursor_session = cursor_turn(
+                response, next_cursor_session = self._dispatch_cursor_turn(
                     CursorTurnRequest(
                         text,
                         self.cursor_session,
@@ -2580,7 +3215,7 @@ class WakeConversationDaemon:
                     integrations=self.integrations,
                 )
             elif route.actionable and route.intent == Intent.AGENT_STATUS:
-                response, next_cursor_session = cursor_turn(
+                statused = cursor_turn(
                     CursorTurnRequest(
                         text,
                         self.cursor_session,
@@ -2591,6 +3226,7 @@ class WakeConversationDaemon:
                     delivery_claims=delivery_claims,
                     integrations=self.integrations,
                 )
+                response, next_cursor_session = statused[0], statused[1]
             elif route.actionable and route.intent in {
                 Intent.AGENT_DISMISS,
                 Intent.AGENT_REPEAT,
@@ -2602,7 +3238,7 @@ class WakeConversationDaemon:
                         "dismiss" if route.intent == Intent.AGENT_DISMISS else "repeat"
                     )
                 )
-                response, next_cursor_session = cursor_turn(
+                response, next_cursor_session = self._dispatch_cursor_turn(
                     CursorTurnRequest(
                         text,
                         self.cursor_session,
@@ -2634,7 +3270,7 @@ class WakeConversationDaemon:
                 and route.intent == Intent.AGENT_REPLY
                 and pending is not None
             ):
-                response, next_cursor_session = cursor_turn(
+                response, next_cursor_session = self._dispatch_cursor_turn(
                     CursorTurnRequest(
                         context.text,
                         pending.job_id,
@@ -2673,7 +3309,7 @@ class WakeConversationDaemon:
                         self.pending_target_resolution = None
                     response = readback_response(candidate)
                 else:
-                    response, next_cursor_session = cursor_turn(
+                    response, next_cursor_session = self._dispatch_cursor_turn(
                         CursorTurnRequest(
                             context.text,
                             utterance=text,
@@ -2746,7 +3382,7 @@ class WakeConversationDaemon:
                         if self.completed_followup is current_completed:
                             self.completed_followup = None
 
-                    response, next_cursor_session = cursor_turn(
+                    response, next_cursor_session = self._dispatch_cursor_turn(
                         CursorTurnRequest(
                             context.text,
                             utterance=text,
@@ -2847,7 +3483,12 @@ class WakeConversationDaemon:
             if self.cursor_session == cursor_session_before_playback:
                 self.cursor_session = next_cursor_session
             self.history = next_history
-            self.conversation_deadline = time.monotonic() + CONVERSATION_TIMEOUT_SECONDS
+            default_deadline = time.monotonic() + CONVERSATION_TIMEOUT_SECONDS
+            self.conversation_deadline = max(
+                self.conversation_deadline,
+                default_deadline,
+            )
+            self._refresh_last_transcript_deadline()
             unresolved_target = getattr(self, "pending_target_resolution", None)
             if unresolved_target is not None:
                 self.conversation_deadline = min(
@@ -2869,7 +3510,24 @@ class WakeConversationDaemon:
         except NoSpeechError as exc:
             turn_failed = True
             release_deliveries(delivery_claims)
-            if had_active_conversation:
+            pending_confirmation = (
+                getattr(self, "pending_target_readback", None) is not None
+                or getattr(self, "pending_target_resolution", None) is not None
+                or getattr(self, "pending_config_change", None) is not None
+            )
+            if (
+                had_active_conversation
+                and not pending_confirmation
+                and self._pending_cursor_question() is not None
+            ):
+                log(
+                    "no recognizable speech after announced question; "
+                    "closing ambient capture"
+                )
+                self.close_pending_capture(
+                    "no recognizable speech after announced question"
+                )
+            elif had_active_conversation:
                 log(
                     "follow-up contained no recognizable speech; listening remains armed"
                 )
@@ -3014,6 +3672,7 @@ class WakeConversationDaemon:
                 batch = drain_pending_announcements(
                     self.announcements,
                     integrations=self.integrations,
+                    snooze=self._active_announcement_snooze(),
                 )
                 if batch.speak:
                     self._enqueue_announcement_batch(batch.speak)
@@ -3101,6 +3760,7 @@ class WakeConversationDaemon:
     def stop(self) -> None:
         self.running = False
         self.pending_target_resolution = None
+        self.pending_question_retarget = None
         self.pending_config_change = None
         self.pending_spoken_alias = None
         if self.microphone is not None and self.microphone.poll() is None:
