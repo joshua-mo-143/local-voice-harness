@@ -8,6 +8,7 @@ from pathlib import Path
 from unittest import mock
 
 from local_voice_harness import cli
+from local_voice_harness.agents.model import HarnessKind
 from local_voice_harness.browser_context import RequestContext
 from local_voice_harness.cursor.service import CursorTurnRequest, CursorTurnResult
 from local_voice_harness.cursor.store import QuarantineEvidence
@@ -35,6 +36,24 @@ class JobsCliTests(unittest.TestCase):
         cursor_turn = self._dispatch(["jobs", "list"])
         cursor_turn.assert_called_once_with(
             CursorTurnRequest("", action="list"),
+        )
+
+    def test_submit_maps_explicit_harness_to_one_request(self) -> None:
+        cursor_turn = self._dispatch(
+            ["jobs", "submit", "--harness", "opencode", "fix", "the", "bug"]
+        )
+        cursor_turn.assert_called_once_with(
+            CursorTurnRequest(
+                "fix the bug",
+                action="submit",
+                harness_kind=HarnessKind.OPENCODE,
+            )
+        )
+
+    def test_submit_without_override_preserves_configured_default(self) -> None:
+        cursor_turn = self._dispatch(["jobs", "submit", "fix", "the", "bug"])
+        cursor_turn.assert_called_once_with(
+            CursorTurnRequest("fix the bug", action="submit", harness_kind=None)
         )
 
     def test_missed_maps_to_missed_action(self) -> None:

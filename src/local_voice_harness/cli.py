@@ -5,6 +5,7 @@ import getpass
 import json
 from pathlib import Path
 
+from .agents.model import HarnessKind
 from .agents.service import AgentTurnRequest as CursorTurnRequest
 from .agents.service import (
     acknowledge_quarantine_reservations,
@@ -211,6 +212,16 @@ def parser() -> argparse.ArgumentParser:
 
     jobs = commands.add_parser("jobs", help="manage background Cursor jobs")
     job_commands = jobs.add_subparsers(dest="jobs_command", required=True)
+    job_submit = job_commands.add_parser(
+        "submit",
+        help="submit a coding job without speech playback",
+    )
+    job_submit.add_argument(
+        "--harness",
+        choices=tuple(kind.value for kind in HarnessKind),
+        help="override the configured coding harness for this request",
+    )
+    job_submit.add_argument("message", nargs="+")
     job_commands.add_parser("list", help="summarize the Cursor job inbox")
     job_commands.add_parser(
         "missed",
@@ -341,6 +352,15 @@ def run_job_command(args: argparse.Namespace) -> None:
         return
     if args.jobs_command == "list":
         request = CursorTurnRequest("", action="list")
+    elif args.jobs_command == "submit":
+        message = " ".join(args.message)
+        request = CursorTurnRequest(
+            message,
+            action="submit",
+            harness_kind=(
+                HarnessKind(args.harness) if args.harness is not None else None
+            ),
+        )
     elif args.jobs_command == "missed":
         request = CursorTurnRequest("", action="missed")
     elif args.jobs_command == "reply":

@@ -710,3 +710,36 @@ def test_cursor_turn_override_selects_opencode_without_changing_default(
     jobs = store.list()
     assert any(job.harness_kind == HarnessKind.OPENCODE for job in jobs)
     assert store.get(later).harness_kind == HarnessKind.CURSOR
+
+
+def test_non_spoken_cli_override_persists_one_opencode_job(tmp_path: Path) -> None:
+    from local_voice_harness import cli
+
+    store = JobStore(tmp_path / "jobs", tmp_path / "legacy")
+    registry = _registry_with_default(tmp_path, "cursor")
+    args = cli.parser().parse_args(
+        ["jobs", "submit", "--harness", "opencode", "fix", "a", "local", "bug"]
+    )
+
+    with (
+        mock.patch("local_voice_harness.cursor.service._job_store", return_value=store),
+        mock.patch("local_voice_harness.cursor.service.launch_worker"),
+        mock.patch(
+            "local_voice_harness.cursor.service._await_foreground",
+            return_value=CursorTurnResult("started", None),
+        ),
+        mock.patch.object(
+            cli,
+            "cursor_turn",
+            side_effect=lambda request: cursor_turn(request, integrations=registry),
+        ),
+        mock.patch.object(cli, "respond") as spoken,
+        mock.patch("builtins.print"),
+    ):
+        cli.dispatch(args)
+
+    jobs = store.list()
+    assert len(jobs) == 1
+    assert jobs[0].request == "fix a local bug"
+    assert jobs[0].harness_kind == HarnessKind.OPENCODE
+    spoken.assert_not_called()
