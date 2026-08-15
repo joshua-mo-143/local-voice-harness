@@ -1738,13 +1738,25 @@ def resolve_manual_reconciliation(
             != ("ambiguous" if operation == "prompt" else "manual_required")
         ):
             return None
-        return job.resolve_manual_operation(
+        resolved = job.resolve_manual_operation(
             operation,
             outcome,
             resolved_at=resolved_at,
             pane_id=pane_id,
             workspace_id=workspace_id,
         )
+        if (
+            resolved is not None
+            and operation == "prompt"
+            and resolved.session_control == SessionControlMode.USER_OWNED.value
+            and resolved.agent_dispatch_state
+            in {"dispatching", "ambiguous", "failed_observing"}
+        ):
+            return _require_agent_manual_reconciliation(
+                resolved,
+                required_at=resolved_at,
+            )
+        return resolved
 
     resolved = store.update(job_id, resolve)
     if resolved is None:
@@ -1752,9 +1764,7 @@ def resolve_manual_reconciliation(
     return resolved
 
 
-_IN_FLIGHT_PROMPT_STATES = frozenset(
-    {"submitting", "submitted", "observed", "ambiguous"}
-)
+_IN_FLIGHT_PROMPT_STATES = frozenset({"submitting", "observed", "ambiguous"})
 _UNRESOLVED_SESSION_STATES = frozenset(
     {"dispatching", "ambiguous", "failed_observing", "manual_required"}
 )
@@ -1770,6 +1780,26 @@ def _confusable_harness_operation(job: CursorJob) -> bool:
         or job.agent_dispatch_state in _UNRESOLVED_SESSION_STATES
         or job.manual_reconcile_operation is not None
     )
+
+
+def _require_agent_manual_reconciliation(
+    job: CursorJob,
+    *,
+    required_at: float,
+) -> CursorJob:
+    agent_operation = job.agent_session_operation
+    changes: dict[str, Any] = {
+        "manual_reconcile_operation": "agent",
+        "manual_reconcile_token": uuid.uuid4().hex,
+        "manual_reconcile_required_at": required_at,
+    }
+    if agent_operation is not None:
+        changes["agent_session_operation"] = agent_operation.transition(
+            AgentSessionState.MANUAL_REQUIRED
+        )
+    else:
+        changes["agent_dispatch_state"] = "manual_required"
+    return job.evolve(**changes)
 
 
 def relinquish_session_control(
@@ -1801,6 +1831,11 @@ def relinquish_session_control(
         changes: dict[str, Any] = {
             "session_control": next_control.mode.value,
             "session_control_generation": next_control.generation,
+            "worker_operation": None,
+            "worker_pid": None,
+            "worker_boot_id": None,
+            "worker_process_start": None,
+            "worker_token": None,
         }
         try:
             operation = job.prompt_operation
@@ -1825,21 +1860,14 @@ def relinquish_session_control(
             changes["manual_reconcile_token"] = uuid.uuid4().hex
             changes["manual_reconcile_required_at"] = relinquished_at
         if (
-            job.agent_dispatch_state
-            in {"dispatching", "ambiguous", "failed_observing"}
+            job.agent_dispatch_state in {"dispatching", "ambiguous", "failed_observing"}
             and job.manual_reconcile_operation is None
             and "manual_reconcile_operation" not in changes
         ):
-            agent_operation = job.agent_session_operation
-            if agent_operation is not None:
-                changes["agent_session_operation"] = agent_operation.transition(
-                    AgentSessionState.MANUAL_REQUIRED
-                )
-            else:
-                changes["agent_dispatch_state"] = "manual_required"
-            changes["manual_reconcile_operation"] = "agent"
-            changes["manual_reconcile_token"] = uuid.uuid4().hex
-            changes["manual_reconcile_required_at"] = relinquished_at
+            return _require_agent_manual_reconciliation(
+                job.evolve(**changes),
+                required_at=relinquished_at,
+            )
         return job.evolve(**changes)
 
     updated = store.update(job_id, relinquish)
@@ -1932,8 +1960,8 @@ def resume_session_control(
                 prompt = current.prompt_operation
             except (PromptOperationError, JobValidationError):
                 prompt = None
-            if isinstance(prompt, PlannedPrompt):
-                changes["prompt_operation"] = PlannedPrompt(
+            if isinstance(prompt, PlannedPrompt | SubmittedPrompt):
+                changes["prompt_operation"] = type(prompt)(
                     replace(prompt.identity, baseline_sequence=observed_sequence)
                 )
         return current.evolve(**changes)

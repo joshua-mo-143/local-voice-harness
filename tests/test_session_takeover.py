@@ -198,6 +198,104 @@ class SessionTakeoverTests(unittest.TestCase):
                 self.assertEqual(resolved.agent_dispatch_state, "retained")
                 self.assertIsNone(resolved.manual_reconcile_operation)
 
+    def test_prompt_reconciliation_chains_uncertain_agent_reconciliation(
+        self,
+    ) -> None:
+        identity = PromptIdentity(
+            job_id="123456789abc",
+            phase="implementing",
+            turn=1,
+            turn_token="123456789abc-1",
+            target="agent",
+            agent_session="session",
+            baseline_sequence=7,
+        )
+        job = self.create(
+            prompt_operation=SubmittingPrompt(identity),
+            agent_dispatch_state="ambiguous",
+            turn=1,
+            turn_token="123456789abc-1",
+        )
+        taken = relinquish_session_control(self.store, job.id, now=10)
+        self.assertEqual(taken.manual_reconcile_operation, "prompt")
+
+        resolved = resolve_manual_reconciliation(
+            self.store,
+            job.id,
+            "prompt",
+            taken.manual_reconcile_token or "",
+            "materialized",
+            now=11,
+        )
+
+        self.assertEqual(resolved.prompt_operation_state, "submitted")
+        self.assertEqual(resolved.agent_dispatch_state, "manual_required")
+        self.assertEqual(resolved.manual_reconcile_operation, "agent")
+        self.assertIsNotNone(resolved.manual_reconcile_token)
+
+    def test_materialized_prompt_rebases_at_hand_back(self) -> None:
+        identity = PromptIdentity(
+            job_id="123456789abc",
+            phase="implementing",
+            turn=1,
+            turn_token="123456789abc-1",
+            target="agent",
+            agent_session="session",
+            baseline_sequence=7,
+        )
+        job = self.create(
+            prompt_operation=SubmittingPrompt(identity),
+            turn=1,
+            turn_token="123456789abc-1",
+        )
+        taken = relinquish_session_control(self.store, job.id, now=10)
+        resolved = resolve_manual_reconciliation(
+            self.store,
+            job.id,
+            "prompt",
+            taken.manual_reconcile_token or "",
+            "materialized",
+            now=11,
+        )
+        self.assertEqual(resolved.prompt_operation_state, "submitted")
+        client = mock.Mock()
+        client.harness.reconcile.return_value = SessionReconciliation(
+            ReconciliationState.ACTIVE,
+            HarnessSession("cursor/herdr", "session", "agent", 12),
+            "active",
+            True,
+        )
+
+        resumed = resume_session_control(
+            self.store,
+            job.id,
+            now=20,
+            herdr_factory=lambda: client,
+        )
+
+        self.assertEqual(resumed.session_control, SessionControlMode.AUTOMATED.value)
+        self.assertEqual(resumed.prompt_operation_state, "submitted")
+        self.assertEqual(resumed.prompt_baseline_sequence, 12)
+
+    def test_takeover_fences_live_worker_ownership(self) -> None:
+        job = self.create(
+            status="running",
+            worker_token="worker",
+            worker_pid=42,
+            worker_boot_id="boot",
+            worker_process_start="start",
+            worker_claim_operation="test",
+            worker_claimed_at=1,
+        )
+
+        updated = relinquish_session_control(self.store, job.id, now=10)
+
+        self.assertIsNone(updated.worker_token)
+        self.assertIsNone(updated.worker_pid)
+        self.assertIsNone(updated.worker_boot_id)
+        self.assertIsNone(updated.worker_process_start)
+        self.assertIsNone(updated.worker_operation)
+
     def test_session_replacement_blocks_hand_back(self) -> None:
         job = self.create()
         relinquish_session_control(self.store, job.id, now=10)
