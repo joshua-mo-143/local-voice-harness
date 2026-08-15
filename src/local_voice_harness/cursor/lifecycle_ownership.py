@@ -1396,10 +1396,10 @@ def measured_baseline_counts() -> dict[str, int]:
 # Measured on the #357 baseline checkout. Tests fail if these drift without an
 # intentional inventory update. They are evidence, not an optimization target.
 BASELINE_COUNTS: dict[str, int] = {
-    "persisted_field_names": 216,
-    "named_table_fields": 211,
+    "persisted_field_names": 218,
+    "named_table_fields": 213,
     "import_only_fields": 4,
-    "cursor_job_public_properties": 155,
+    "cursor_job_public_properties": 157,
     "compatibility_adapters": 38,
     "transition_entry_points": 75,
     "duplicate_authorities": 0,
