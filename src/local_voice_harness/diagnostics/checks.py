@@ -730,6 +730,7 @@ def check_pipewire_devices(
         ]
     sources = pipewire_section_devices(process.stdout, "Sources")
     sinks = pipewire_section_devices(process.stdout, "Sinks")
+    filters = pipewire_section_devices(process.stdout, "Filters")
     if not sources or not sinks:
         return [
             CheckResult(
@@ -743,7 +744,7 @@ def check_pipewire_devices(
                 suggestion="wpctl status  # confirm a source and sink are available",
             )
         ]
-    if source and source not in sources:
+    if source and source not in {*sources, *filters}:
         return [
             CheckResult(
                 name="audio:pipewire",
@@ -756,7 +757,7 @@ def check_pipewire_devices(
                 suggestion="voice-harness config set audio.source '<PIPEWIRE_SOURCE_NAME>'",
             )
         ]
-    if sink and sink not in sinks:
+    if sink and sink not in {*sinks, *filters}:
         return [
             CheckResult(
                 name="audio:pipewire",

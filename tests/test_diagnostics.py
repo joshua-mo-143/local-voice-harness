@@ -487,6 +487,13 @@ Audio
  ├─ Filters:
 """
 
+_WPCTL_FILTER_STATUS = _WPCTL_STATUS.replace(
+    " ├─ Filters:\n",
+    " ├─ Filters:\n"
+    " │      72. voice_harness_aec_sink\n"
+    " │  *   73. voice_harness_aec\n",
+)
+
 
 class PipewireTests(unittest.TestCase):
     def test_missing_wpctl_is_fatal(self) -> None:
@@ -526,6 +533,25 @@ class PipewireTests(unittest.TestCase):
             mock.patch.object(checks, "_which", return_value="/usr/bin/wpctl"),
             mock.patch.object(
                 checks, "_run", return_value=_completed(0, _WPCTL_STATUS)
+            ),
+        ):
+            results = checks.check_pipewire_devices(snapshot)
+        self.assertIs(results[0].severity, Severity.OK)
+
+    def test_configured_filter_node_matches_virtual_capture_target(self) -> None:
+        snapshot = _snapshot()
+        assert snapshot.config is not None
+        snapshot = checks.DiagnosticSnapshot(
+            config=replace(
+                snapshot.config,
+                audio=replace(snapshot.config.audio, source="voice_harness_aec"),
+            ),
+            registry=snapshot.registry,
+        )
+        with (
+            mock.patch.object(checks, "_which", return_value="/usr/bin/wpctl"),
+            mock.patch.object(
+                checks, "_run", return_value=_completed(0, _WPCTL_FILTER_STATUS)
             ),
         ):
             results = checks.check_pipewire_devices(snapshot)
