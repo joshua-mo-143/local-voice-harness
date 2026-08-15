@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import shutil
 import subprocess
+from typing import Protocol
 
 from .errors import HarnessError
 
@@ -13,6 +14,22 @@ MAX_API_KEY_CHARS = 4096
 
 class CredentialError(HarnessError):
     """A desktop Secret Service operation failed."""
+
+
+class CredentialStore(Protocol):
+    """Desktop credential storage used by core orchestration."""
+
+    def available(self) -> bool: ...
+
+    def get_venice_api_key(self) -> str: ...
+
+    def store_venice_api_key(self, value: str) -> None: ...
+
+    def delete_venice_api_key(self) -> None: ...
+
+
+def secret_service_available() -> bool:
+    return shutil.which(SECRET_TOOL) is not None
 
 
 def _secret_tool() -> str:
@@ -50,6 +67,22 @@ def _missing_credential_error() -> CredentialError:
     return CredentialError(
         "Venice API key is not stored; run `voice-harness credentials set`"
     )
+
+
+class SecretServiceStore:
+    """Linux Secret Service implementation that invokes secret-tool."""
+
+    def available(self) -> bool:
+        return secret_service_available()
+
+    def get_venice_api_key(self) -> str:
+        return get_venice_api_key()
+
+    def store_venice_api_key(self, value: str) -> None:
+        store_venice_api_key(value)
+
+    def delete_venice_api_key(self) -> None:
+        delete_venice_api_key()
 
 
 def get_venice_api_key() -> str:

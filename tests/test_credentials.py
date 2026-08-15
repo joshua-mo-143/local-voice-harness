@@ -52,6 +52,15 @@ class VeniceCredentialTests(unittest.TestCase):
             ["/usr/bin/secret-tool", "lookup", *credentials.SECRET_ATTRIBUTES],
         )
 
+    def test_secret_service_availability_is_capability_not_invocation(self) -> None:
+        with mock.patch.object(credentials.shutil, "which", return_value=None):
+            self.assertFalse(credentials.secret_service_available())
+            self.assertFalse(credentials.SecretServiceStore().available())
+        with mock.patch.object(
+            credentials.shutil, "which", return_value="/usr/bin/secret-tool"
+        ):
+            self.assertTrue(credentials.secret_service_available())
+
     def test_missing_tool_and_missing_key_are_clear_errors(self) -> None:
         with (
             mock.patch.object(credentials.shutil, "which", return_value=None),

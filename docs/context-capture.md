@@ -84,9 +84,12 @@ bounded pulls.
 
 Native Wayland automation is supported on Hyprland and Sway. It uses `hyprctl` or
 `swaymsg` to identify the focused window, `wl-copy`/`wl-paste` for the clipboard,
-and `wtype` for keyboard input. GNOME, KDE Plasma, and other compositors are not
-currently supported; set `DICTATION_INJECT=stdout` if focused-window insertion is
-not required there.
+and `wtype` for keyboard input. GNOME and KDE Plasma Wayland are detected and
+degrade safely: clipboard access remains available when `wl-clipboard` is
+installed, but focused-window identity, keyboard injection, and session overlays
+are reported as unavailable. Set `DICTATION_INJECT=stdout` if focused-window
+insertion is not required there. Diagnostics report those capabilities instead of
+failing because a compositor API is missing.
 
 Automatic dictation injection routes by focused application: native Herdr delivery
 for Cursor panes, simulated typing for terminals, and clipboard paste for other

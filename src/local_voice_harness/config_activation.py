@@ -21,6 +21,7 @@ from typing import Protocol
 from .config import SERVICE_FILES, durable_state_dir
 from .config_management import ConfigChangeResult, commit_config_change
 from .errors import HarnessError
+from .platform_services import user_services
 from .responses import AssistantResponse
 from .self_management import PendingConfigChange
 from .tts.client import VoiceValidationResult, validate_voice
@@ -726,28 +727,16 @@ class SystemdUserServiceController:
     def snapshot(self, service: str) -> ServiceSnapshot:
         if service not in SERVICE_FILES:
             raise ActivationStateError(f"unsupported user service {service!r}")
-        process = subprocess.run(
-            [
-                "systemctl",
-                "--user",
-                "show",
-                service,
-                "--property=LoadState",
-                "--property=ActiveState",
-                "--property=SubState",
-                "--property=InvocationID",
-                "--property=MainPID",
-                "--no-pager",
-            ],
-            capture_output=True,
-            text=True,
-            check=False,
+        properties = user_services().show(
+            service,
+            (
+                "LoadState",
+                "ActiveState",
+                "SubState",
+                "InvocationID",
+                "MainPID",
+            ),
         )
-        properties = {}
-        for line in process.stdout.splitlines():
-            key, separator, value = line.partition("=")
-            if separator:
-                properties[key] = value
         process_start = ""
         digest = ""
         voice = ""
@@ -777,12 +766,7 @@ class SystemdUserServiceController:
     def restart(self, service: str) -> subprocess.CompletedProcess[str]:
         if service not in SERVICE_FILES:
             raise ActivationStateError(f"unsupported user service {service!r}")
-        return subprocess.run(
-            ["systemctl", "--user", "try-restart", service],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
+        return user_services().try_restart(service)
 
 
 def _matches_expected_snapshot(

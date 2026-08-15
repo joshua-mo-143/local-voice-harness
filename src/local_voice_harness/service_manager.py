@@ -14,6 +14,7 @@ from .config import (
 from .errors import HarnessError
 from .integrations.herdr import HerdrError
 from .integrations.registry import IntegrationRegistry, build_integration_registry
+from .platform_services import user_services
 from .service_units import audit_installed
 from .user_config import UserConfig, load_user_config
 
@@ -38,12 +39,9 @@ def _resolved(
 
 
 def systemctl(*arguments: str, check: bool = True) -> subprocess.CompletedProcess[str]:
-    return subprocess.run(
-        ["systemctl", "--user", *arguments],
-        capture_output=True,
-        text=True,
-        check=check,
-    )
+    """Delegate user-service commands through the platform supervisor."""
+
+    return user_services().run(*arguments, check=check)
 
 
 def unit_text(name: str) -> str:

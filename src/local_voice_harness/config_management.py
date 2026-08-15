@@ -15,8 +15,9 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 
 from .config import PROJECT_ROOT, SERVICE_FILES, backend_config_path, xdg_config_home
-from .credentials import CredentialError, get_venice_api_key
+from .credentials import CredentialError, get_venice_api_key, secret_service_available
 from .integrations.registry import capability_statuses
+from .platform_services import user_services
 from .user_config import (
     AnnouncementMode,
     IntegrationSettings,
@@ -658,13 +659,7 @@ def active_services(services: Sequence[str]) -> tuple[str, ...]:
     for name in services:
         if name not in SERVICE_FILES:
             continue
-        process = subprocess.run(
-            ["systemctl", "--user", "is-active", name],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        if process.stdout.strip() == "active":
+        if user_services().is_active(name) == "active":
             active.append(name)
     return tuple(active)
 
@@ -892,7 +887,7 @@ def _venice_available() -> bool:
         get_venice_api_key()
         return True
     except CredentialError:
-        return shutil.which("secret-tool") is not None
+        return secret_service_available()
 
 
 def _available_dictation_backends() -> tuple[str, ...]:

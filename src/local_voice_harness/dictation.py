@@ -256,6 +256,9 @@ def inject(text: str, settings: DictationSettings | None = None) -> None:
             "focused-window automation supports X11, Hyprland, and Sway only"
         )
     if window is None:
+        capabilities = desktop.capabilities()
+        if not capabilities.active_window:
+            raise HarnessError(capabilities.detail)
         raise HarnessError("could not determine the focused window for dictation")
 
     if mode == "auto":

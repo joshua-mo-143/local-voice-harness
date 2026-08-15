@@ -5,6 +5,7 @@ import subprocess
 import time
 from typing import Any
 
+from ...platform_services import user_services
 from .types import HERDR_UNIT, HerdrError
 
 
@@ -77,25 +78,12 @@ class HerdrTransport:
         timeout = self.timeout if timeout is None else timeout
         if self.is_running():
             return
-        subprocess.run(
-            ["systemctl", "--user", "start", HERDR_UNIT],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=False,
-        )
+        services = user_services()
+        services.start(HERDR_UNIT, check=False)
         if not self.is_running():
-            process = subprocess.run(
-                [
-                    "systemd-run",
-                    "--user",
-                    "--unit=voice-harness-herdr",
-                    "--collect",
-                    self.executable,
-                    "server",
-                ],
-                capture_output=True,
-                text=True,
-                check=False,
+            process = services.start_transient(
+                "voice-harness-herdr",
+                (self.executable, "server"),
             )
             if (
                 process.returncode

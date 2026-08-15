@@ -23,8 +23,13 @@ from ..config import (
     SYSTEMD_USER_DIR,
     TTS_SOCKET,
 )
-from ..credentials import CredentialError, get_venice_api_key
+from ..credentials import (
+    CredentialError,
+    get_venice_api_key,
+    secret_service_available,
+)
 from ..cursor.sqlite_store import SQLiteJobDatabase
+from ..desktop import get_desktop
 from ..diagnostic_safety import redact_diagnostic
 from ..errors import HarnessError
 from ..integrations.herdr import HerdrError
@@ -34,6 +39,8 @@ from ..integrations.registry import (
     capability_statuses,
 )
 from ..ipc import socket_ready
+from ..notifications import notification_service_available
+from ..platform_services import user_services
 from ..process import capability_diagnostics
 from ..user_config import (
     ComputeDevice,
@@ -150,17 +157,7 @@ def _run(
 
 
 def _systemctl_show(name: str, properties: Sequence[str]) -> dict[str, str]:
-    command = ["systemctl", "--user", "show", name]
-    command.extend(f"--property={prop}" for prop in properties)
-    process = _run(command)
-    values: dict[str, str] = {}
-    if process is None or process.returncode:
-        return values
-    for line in process.stdout.splitlines():
-        key, separator, value = line.partition("=")
-        if separator:
-            values[key] = value
-    return values
+    return user_services().show(name, properties)
 
 
 def _service_active_state(name: str) -> str:
@@ -169,13 +166,12 @@ def _service_active_state(name: str) -> str:
 
 def _restart_service_repair(name: str) -> Repair:
     def action() -> str:
-        process = _run(["systemctl", "--user", "restart", name], timeout=30)
-        if process is None:
-            raise HarnessError(f"could not run systemctl --user restart {name}")
+        try:
+            process = user_services().restart(name)
+        except OSError as exc:
+            raise HarnessError(f"could not restart {name}") from exc
         if process.returncode:
-            raise HarnessError(
-                process.stderr.strip() or f"systemctl --user restart {name} failed"
-            )
+            raise HarnessError(process.stderr.strip() or f"could not restart {name}")
         return f"restarted {name}"
 
     return Repair(summary=f"restart {name}", action=action)
@@ -311,43 +307,40 @@ def check_optional_executables(
 def check_focus_automation(
     _snapshot: DiagnosticSnapshot | None = None,
 ) -> list[CheckResult]:
-    """One complete X11 or Wayland stack enables focused-window dictation."""
+    """Report detected desktop capabilities without requiring unavailable APIs."""
 
-    x11 = {tool: _which(tool) is not None for tool in ("xdotool", "xclip")}
-    wayland = {
-        tool: _which(tool) is not None for tool in ("wtype", "wl-copy", "wl-paste")
-    }
-    x11_ready = all(x11.values())
-    wayland_ready = all(wayland.values())
-    if x11_ready or wayland_ready:
-        stacks = []
-        if x11_ready:
-            stacks.append("X11 (xdotool, xclip)")
-        if wayland_ready:
-            stacks.append("Wayland (wtype, wl-clipboard)")
+    desktop = get_desktop()
+    if desktop is None:
         return [
             CheckResult(
                 name="focus-automation",
-                category="executables",
-                severity=Severity.OK,
-                detail=f"focused-window automation available: {', '.join(stacks)}",
+                category="desktop",
+                severity=Severity.WARNING,
+                detail=(
+                    "no desktop session was detected; dictation insertion "
+                    "will fall back to stdout"
+                ),
             )
         ]
-    missing_x11 = sorted(tool for tool, present in x11.items() if not present)
-    missing_wayland = sorted(tool for tool, present in wayland.items() if not present)
+    capabilities = desktop.capabilities()
+    if capabilities.active_window and capabilities.type_text and capabilities.send_key:
+        return [
+            CheckResult(
+                name="focus-automation",
+                category="desktop",
+                severity=Severity.OK,
+                detail=capabilities.detail,
+            )
+        ]
     return [
         CheckResult(
             name="focus-automation",
-            category="executables",
+            category="desktop",
             severity=Severity.WARNING,
-            detail=(
-                "no complete focused-window automation stack; dictation insertion "
-                f"will fall back to stdout. Missing X11 tools: {missing_x11}; "
-                f"missing Wayland tools: {missing_wayland}"
-            ),
+            detail=capabilities.detail,
             suggestion=(
-                "paru -S --needed xdotool xclip  # X11, or: "
-                "paru -S --needed wtype wl-clipboard  # Wayland"
+                "set DICTATION_INJECT=stdout if focused-window insertion is "
+                "not required"
             ),
         )
     ]
@@ -808,9 +801,119 @@ def check_pipewire_devices(
     ]
 
 
+def check_platform_capabilities(
+    _snapshot: DiagnosticSnapshot | None = None,
+) -> list[CheckResult]:
+    """Report service, credential, notification, and desktop capabilities."""
+
+    results: list[CheckResult] = []
+    services = user_services()
+    if services.available():
+        results.append(
+            CheckResult(
+                name="platform:services",
+                category="platform",
+                severity=Severity.OK,
+                detail="user service supervision is available",
+            )
+        )
+    else:
+        results.append(
+            CheckResult(
+                name="platform:services",
+                category="platform",
+                severity=Severity.WARNING,
+                detail=(
+                    "user service supervision is unavailable; systemd unit "
+                    "state will not be required"
+                ),
+            )
+        )
+    if secret_service_available():
+        results.append(
+            CheckResult(
+                name="platform:credentials",
+                category="platform",
+                severity=Severity.OK,
+                detail="desktop Secret Service lookup is available",
+            )
+        )
+    else:
+        results.append(
+            CheckResult(
+                name="platform:credentials",
+                category="platform",
+                severity=Severity.WARNING,
+                detail=(
+                    "desktop Secret Service is unavailable; Venice credentials "
+                    "cannot be stored or read"
+                ),
+                suggestion="install libsecret and a Secret Service provider",
+            )
+        )
+    if notification_service_available():
+        results.append(
+            CheckResult(
+                name="platform:notifications",
+                category="platform",
+                severity=Severity.OK,
+                detail="desktop notifications are available",
+            )
+        )
+    else:
+        results.append(
+            CheckResult(
+                name="platform:notifications",
+                category="platform",
+                severity=Severity.WARNING,
+                detail=(
+                    "desktop notifications are unavailable; voice operation "
+                    "continues without notify-send"
+                ),
+            )
+        )
+    desktop = get_desktop()
+    if desktop is None:
+        results.append(
+            CheckResult(
+                name="platform:desktop",
+                category="platform",
+                severity=Severity.WARNING,
+                detail="no desktop session was detected",
+            )
+        )
+        return results
+    capabilities = desktop.capabilities()
+    results.append(
+        CheckResult(
+            name="platform:desktop",
+            category="platform",
+            severity=(
+                Severity.OK
+                if capabilities.active_window and capabilities.type_text
+                else Severity.WARNING
+            ),
+            detail=capabilities.detail,
+        )
+    )
+    return results
+
+
 def check_systemd_units(
     _snapshot: DiagnosticSnapshot | None = None,
 ) -> list[CheckResult]:
+    if not user_services().available():
+        return [
+            CheckResult(
+                name="platform:services",
+                category="platform",
+                severity=Severity.WARNING,
+                detail=(
+                    "user service supervision is unavailable; installed unit "
+                    "state was not queried"
+                ),
+            )
+        ]
     results: list[CheckResult] = []
     for name in SERVICE_FILES:
         always_on = name in START_SERVICES
@@ -1442,6 +1545,7 @@ ALL_CHECKS: tuple[Check, ...] = (
     check_runtime_sockets,
     check_runtime_directories,
     check_process_capabilities,
+    check_platform_capabilities,
     check_cursor_jobs,
     check_herdr,
     check_cursor_cli,

@@ -353,24 +353,40 @@ class ExecutableCheckTests(unittest.TestCase):
         self.assertTrue(all(r.severity is Severity.WARNING for r in results))
 
     def test_focus_automation_ok_when_x11_stack_present(self) -> None:
-        def which(name: str) -> str | None:
-            return "/usr/bin/tool" if name in {"xdotool", "xclip"} else None
+        from local_voice_harness.desktop import X11Desktop
 
-        with mock.patch.object(checks, "_which", side_effect=which):
+        with (
+            mock.patch.object(checks, "get_desktop", return_value=X11Desktop()),
+            mock.patch(
+                "local_voice_harness.desktop.shutil.which",
+                return_value="/usr/bin/tool",
+            ),
+        ):
             results = checks.check_focus_automation()
         self.assertIs(results[0].severity, Severity.OK)
         self.assertIn("X11", results[0].detail)
 
     def test_focus_automation_ok_when_wayland_stack_present(self) -> None:
-        def which(name: str) -> str | None:
-            return "/usr/bin/tool" if name in {"wtype", "wl-copy", "wl-paste"} else None
+        from local_voice_harness.desktop import HyprlandDesktop
 
-        with mock.patch.object(checks, "_which", side_effect=which):
+        with (
+            mock.patch.object(checks, "get_desktop", return_value=HyprlandDesktop()),
+            mock.patch(
+                "local_voice_harness.desktop.shutil.which",
+                return_value="/usr/bin/tool",
+            ),
+        ):
             results = checks.check_focus_automation()
         self.assertIs(results[0].severity, Severity.OK)
+        self.assertIn("hyprland", results[0].detail)
 
     def test_focus_automation_warns_without_any_stack(self) -> None:
-        with mock.patch.object(checks, "_which", return_value=None):
+        from local_voice_harness.desktop import X11Desktop
+
+        with (
+            mock.patch.object(checks, "get_desktop", return_value=X11Desktop()),
+            mock.patch("local_voice_harness.desktop.shutil.which", return_value=None),
+        ):
             results = checks.check_focus_automation()
         self.assertIs(results[0].severity, Severity.WARNING)
 
@@ -631,9 +647,12 @@ class SystemdUnitTests(unittest.TestCase):
         def show(name: str, _properties: object) -> dict[str, str]:
             return props.get(name, {})
 
+        supervisor = mock.Mock()
+        supervisor.available.return_value = True
         with (
             mock.patch.object(checks, "SYSTEMD_USER_DIR", tmp),
             mock.patch.object(checks, "_systemctl_show", side_effect=show),
+            mock.patch.object(checks, "user_services", return_value=supervisor),
         ):
             return checks.check_systemd_units()
 
@@ -833,20 +852,26 @@ class SocketCheckTests(unittest.TestCase):
 
 class RepairActionTests(unittest.TestCase):
     def test_restart_service_repair_success(self) -> None:
-        with mock.patch.object(checks, "_run", return_value=_completed(0)):
+        supervisor = mock.Mock()
+        supervisor.restart.return_value = _completed(0)
+        with mock.patch.object(checks, "user_services", return_value=supervisor):
             repair = checks._restart_service_repair("dictation.service")
             message = repair.action()
         self.assertIn("restarted dictation.service", message)
 
     def test_restart_service_repair_failure_raises(self) -> None:
-        with mock.patch.object(checks, "_run", return_value=_completed(1, "", "boom")):
+        supervisor = mock.Mock()
+        supervisor.restart.return_value = _completed(1, "", "boom")
+        with mock.patch.object(checks, "user_services", return_value=supervisor):
             repair = checks._restart_service_repair("dictation.service")
             with self.assertRaises(checks.HarnessError) as caught:
                 repair.action()
         self.assertIn("boom", str(caught.exception))
 
     def test_restart_service_repair_spawn_failure_raises(self) -> None:
-        with mock.patch.object(checks, "_run", return_value=None):
+        supervisor = mock.Mock()
+        supervisor.restart.side_effect = OSError("gone")
+        with mock.patch.object(checks, "user_services", return_value=supervisor):
             repair = checks._restart_service_repair("dictation.service")
             with self.assertRaises(checks.HarnessError):
                 repair.action()
