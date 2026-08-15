@@ -131,6 +131,9 @@ class InstallationProfileDecisionTests(unittest.TestCase):
         self.assertIn("PROFILE=showcase", readme)
         self.assertIn("showcase", installation.casefold())
         self.assertIn("local-cuda", installer)
+        self.assertIn('requested = os.environ["TTS_CACHE_DEVICE"]', installer)
+        self.assertIn('requested == "auto" and torch.cuda.is_available()', installer)
+        self.assertIn('else "cpu" if requested == "auto"', installer)
 
 
 if __name__ == "__main__":

@@ -228,14 +228,18 @@ else
   if [[ "$INSTALL_DOWNLOAD_CHATTERBOX" == 1 ]]; then
     step "Caching Chatterbox Turbo weights"
     TTS_CACHE_DEVICE="$INSTALL_TTS_DEVICE"
-    if [[ "$TTS_CACHE_DEVICE" == "auto" ]]; then
-      TTS_CACHE_DEVICE="cuda"
-    fi
     HF_HUB_OFFLINE=0 TTS_CACHE_DEVICE="$TTS_CACHE_DEVICE" \
       "$CHATTERBOX_DIR/.venv/bin/python" - <<'PY'
 import os
+import torch
 from chatterbox.tts_turbo import ChatterboxTurboTTS
-ChatterboxTurboTTS.from_pretrained(device=os.environ["TTS_CACHE_DEVICE"])
+requested = os.environ["TTS_CACHE_DEVICE"]
+device = (
+    "cuda" if requested == "auto" and torch.cuda.is_available()
+    else "cpu" if requested == "auto"
+    else requested
+)
+ChatterboxTurboTTS.from_pretrained(device=device)
 print("Chatterbox Turbo cached")
 PY
   else
