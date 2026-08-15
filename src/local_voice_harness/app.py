@@ -599,6 +599,12 @@ def respond(text: str, *, user_config: UserConfig | None = None) -> None:
                     "back the exact change and receive confirmation. I didn't write "
                     "anything."
                 )
+            elif route.intent == Intent.WAKE_MODE_DISABLE:
+                response = AssistantResponse.from_text(
+                    "Turning wake mode off requires a wake conversation so I can "
+                    "receive confirmation before stopping the listener. I am still "
+                    "listening."
+                )
             elif route.intent == Intent.VOCABULARY_ALIAS_ADD:
                 response = AssistantResponse.from_text(
                     "Adding a spoken alias requires a wake conversation so I can read "

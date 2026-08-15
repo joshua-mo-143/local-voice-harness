@@ -25,6 +25,13 @@ voice-harness services uninstall
 on-demand. `stop` shuts down the wake listener, model servers, and dictation in a
 safe order but leaves Herdr and active Cursor agents running.
 
+The same temporary shutdown is available by voice: say “turn wake mode off” or
+“stop listening,” then explicitly confirm. Jarvis delivers its shutdown response
+before stopping the services. The isolated shutdown action verifies that every
+target service is inactive and raises a critical desktop alert if it cannot prove
+that result. This does not disable the units at login; run `voice-harness services
+start` to restore listening.
+
 Each management command resolves one validated `UserConfig` snapshot. Configured
 Herdr paths and timeouts are used by status and shutdown, while audits validate the
 effective units against the same snapshot. `restart` reuses one snapshot for its

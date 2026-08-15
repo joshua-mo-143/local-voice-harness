@@ -173,6 +173,8 @@ def _bare_daemon() -> WakeConversationDaemon:
     instance.pending_question_retarget = None
     instance.pending_config_change = None
     instance.pending_spoken_alias = None
+    instance.pending_wake_mode_disable = False
+    instance.wake_mode_stop_after_delivery = False
     instance.config_activation_store = mock.Mock(spec=wake_daemon.ActivationStore)
     instance.config_activation_store.current.return_value = None
     instance.config_activation_store.create_offer.return_value = None
@@ -819,7 +821,7 @@ class ProcessUtteranceTests(unittest.TestCase):
                 notify.assert_called_with("Listening for a follow-up…")
 
     def test_hang_up_phrases_still_close_after_stop_talking(self) -> None:
-        for phrase in ("goodbye", "stop listening", "go to sleep", "end conversation"):
+        for phrase in ("goodbye", "end conversation"):
             with self.subTest(phrase=phrase):
                 daemon = _bare_daemon()
                 daemon.awaiting_followup = True
@@ -847,9 +849,13 @@ class ProcessUtteranceTests(unittest.TestCase):
             with self.subTest(phrase=phrase):
                 self.assertIsNone(wake_daemon.CLOSE_PATTERN.search(phrase))
                 self.assertIsNotNone(wake_daemon.STOP_TALKING_PATTERN.search(phrase))
-        for phrase in ("goodbye", "stop listening", "go to sleep", "end conversation"):
+        for phrase in ("goodbye", "end conversation"):
             with self.subTest(phrase=phrase):
                 self.assertIsNotNone(wake_daemon.CLOSE_PATTERN.search(phrase))
+                self.assertIsNone(wake_daemon.STOP_TALKING_PATTERN.search(phrase))
+        for phrase in ("stop listening", "go to sleep"):
+            with self.subTest(phrase=phrase):
+                self.assertIsNone(wake_daemon.CLOSE_PATTERN.search(phrase))
                 self.assertIsNone(wake_daemon.STOP_TALKING_PATTERN.search(phrase))
 
     def test_stop_talking_clears_expired_target_resolution(self) -> None:
@@ -4523,6 +4529,263 @@ class InboxIntentRoutingTests(unittest.TestCase):
             integrations=mock.ANY,
         )
         qwen_turn.assert_not_called()
+
+
+class WakeModeDisableConversationTests(unittest.TestCase):
+    def _turn(
+        self,
+        daemon: WakeConversationDaemon,
+        text: str,
+        *,
+        route: IntentRoute | None = None,
+        launch_effect: object = None,
+        playback: tuple[dict[str, object], wake_daemon.BargeIn | None] | None = None,
+    ) -> tuple[mock.Mock, mock.Mock, mock.Mock]:
+        stop_process = mock.Mock()
+        stop_process.wait.return_value = 0
+        launch_patch = (
+            mock.patch.object(
+                wake_daemon,
+                "launch_wake_mode_stop_worker",
+                side_effect=launch_effect,
+            )
+            if launch_effect is not None
+            else mock.patch.object(
+                wake_daemon,
+                "launch_wake_mode_stop_worker",
+                return_value=stop_process,
+            )
+        )
+        with (
+            mock.patch.object(wake_daemon, "transcribe", return_value=text),
+            mock.patch.object(wake_daemon, "start_components"),
+            mock.patch.object(
+                wake_daemon,
+                "route_intent",
+                return_value=route or IntentRoute(Intent.CONVERSATION, "high"),
+            ) as router,
+            launch_patch as launch,
+            mock.patch.object(
+                daemon,
+                "play_response",
+                return_value=playback or ({"played_text": "ok"}, None),
+            ) as play,
+            mock.patch.object(wake_daemon, "notify"),
+            mock.patch.object(wake_daemon, "cursor_turn"),
+            mock.patch.object(wake_daemon, "qwen_turn"),
+        ):
+            daemon.process_utterance(AUDIO_GENERATION, woke=False)
+        return router, launch, play
+
+    def test_wake_mode_request_supersedes_pending_target_readback(self) -> None:
+        daemon = _bare_daemon()
+        target = wake_daemon.CriticalTarget(
+            "github", "example/payments", "42", "submit"
+        )
+        candidate = wake_daemon.new_candidate(
+            wake_daemon.TargetSelection(target, (None,) * 5),
+            origin_turn="readback-turn",
+        )
+        daemon.pending_target_readback = wake_daemon.PendingTargetReadback(
+            candidate,
+            wake_daemon._critical_target_request(target),
+        )
+
+        _router, launch, play = self._turn(
+            daemon,
+            "Turn wake mode off",
+            route=IntentRoute(Intent.WAKE_MODE_DISABLE, "high"),
+        )
+
+        self.assertTrue(daemon.pending_wake_mode_disable)
+        self.assertIsNone(daemon.pending_target_readback)
+        launch.assert_not_called()
+        self.assertIn("Say yes to confirm", play.call_args.args[0].spoken_text)
+
+        router, launch, _play = self._turn(daemon, "yes")
+
+        router.assert_not_called()
+        launch.assert_called_once_with()
+        self.assertFalse(daemon.pending_wake_mode_disable)
+
+    def test_explicit_request_requires_confirmation_without_stopping(self) -> None:
+        for phrase in ("Turn wake mode off", "Stop listening", "Go to sleep"):
+            with self.subTest(phrase=phrase):
+                daemon = _bare_daemon()
+
+                router, launch, play = self._turn(
+                    daemon,
+                    phrase,
+                    route=IntentRoute(Intent.WAKE_MODE_DISABLE, "high"),
+                )
+
+                router.assert_called_once()
+                self.assertTrue(daemon.pending_wake_mode_disable)
+                launch.assert_not_called()
+                response = play.call_args.args[0]
+                self.assertIn("Say yes to confirm", response.spoken_text)
+
+    def test_empty_confirmation_reply_keeps_wake_mode_pending(self) -> None:
+        daemon = _bare_daemon()
+        daemon.pending_wake_mode_disable = True
+        daemon.awaiting_followup = True
+        daemon.conversation_deadline = time.monotonic() + 30
+
+        with (
+            mock.patch.object(wake_daemon, "transcribe", return_value=""),
+            mock.patch.object(wake_daemon, "start_components"),
+            mock.patch.object(wake_daemon, "launch_wake_mode_stop_worker") as launch,
+            mock.patch.object(wake_daemon, "notify") as notify,
+            mock.patch.object(wake_daemon, "stop_components"),
+        ):
+            daemon.process_utterance(AUDIO_GENERATION, woke=False)
+
+        launch.assert_not_called()
+        self.assertTrue(daemon.pending_wake_mode_disable)
+        self.assertTrue(daemon.awaiting_followup)
+        notify.assert_called_with("I didn't catch that. Please repeat yes or no.")
+
+    def test_cancellation_and_ambiguous_reply_do_not_launch_stop(self) -> None:
+        daemon = _bare_daemon()
+        daemon.pending_wake_mode_disable = True
+
+        router, launch, play = self._turn(daemon, "maybe")
+
+        router.assert_called_once()
+        launch.assert_not_called()
+        self.assertTrue(daemon.pending_wake_mode_disable)
+        self.assertIn("say yes", play.call_args.args[0].spoken_text)
+
+        router, launch, play = self._turn(daemon, "no")
+
+        router.assert_not_called()
+        launch.assert_not_called()
+        self.assertFalse(daemon.pending_wake_mode_disable)
+        self.assertIn("still on", play.call_args.args[0].spoken_text)
+
+    def test_complete_shutdown_response_precedes_isolated_stop_launch(self) -> None:
+        daemon = _bare_daemon()
+        daemon.pending_wake_mode_disable = True
+        events: list[str] = []
+        stop_process = mock.Mock()
+        stop_process.wait.return_value = 0
+
+        with (
+            mock.patch.object(wake_daemon, "transcribe", return_value="yes"),
+            mock.patch.object(wake_daemon, "start_components"),
+            mock.patch.object(wake_daemon, "route_intent") as router,
+            mock.patch.object(
+                daemon,
+                "play_response",
+                side_effect=lambda _response: (
+                    events.append("play") or {"played_text": "ok"},
+                    None,
+                ),
+            ),
+            mock.patch.object(
+                wake_daemon,
+                "launch_wake_mode_stop_worker",
+                side_effect=lambda: events.append("launch") or stop_process,
+            ) as launch,
+            mock.patch.object(wake_daemon, "notify") as notify,
+        ):
+            daemon.process_utterance(AUDIO_GENERATION, woke=False)
+
+        self.assertEqual(events, ["play", "launch"])
+        router.assert_not_called()
+        launch.assert_called_once_with()
+        self.assertFalse(daemon.pending_wake_mode_disable)
+        self.assertFalse(daemon.wake_mode_stop_after_delivery)
+        self.assertFalse(daemon.awaiting_followup)
+        self.assertEqual(daemon.conversation_deadline, 0.0)
+        notify.assert_not_called()
+
+    def test_interrupted_shutdown_response_does_not_stop_services(self) -> None:
+        daemon = _bare_daemon()
+        daemon.pending_wake_mode_disable = True
+        interruption = wake_daemon.BargeIn([b"speech"], woke=False)
+
+        router, launch, _play = self._turn(
+            daemon,
+            "yes",
+            playback=({"played_text": "Okay"}, interruption),
+        )
+
+        router.assert_not_called()
+        launch.assert_not_called()
+        self.assertTrue(daemon.pending_wake_mode_disable)
+        self.assertFalse(daemon.wake_mode_stop_after_delivery)
+
+    def test_failed_shutdown_delivery_can_still_be_cancelled(self) -> None:
+        daemon = _bare_daemon()
+        daemon.pending_wake_mode_disable = True
+
+        with (
+            mock.patch.object(wake_daemon, "transcribe", return_value="yes"),
+            mock.patch.object(wake_daemon, "start_components"),
+            mock.patch.object(wake_daemon, "route_intent") as router,
+            mock.patch.object(
+                daemon,
+                "play_response",
+                side_effect=RuntimeError("tts failed"),
+            ),
+            mock.patch.object(wake_daemon, "launch_wake_mode_stop_worker") as launch,
+            mock.patch.object(wake_daemon, "notify"),
+            mock.patch.object(wake_daemon, "stop_components"),
+        ):
+            daemon.process_utterance(AUDIO_GENERATION, woke=False)
+
+        router.assert_not_called()
+        launch.assert_not_called()
+        self.assertTrue(daemon.pending_wake_mode_disable)
+        self.assertFalse(daemon.wake_mode_stop_after_delivery)
+
+        router, launch, play = self._turn(daemon, "no")
+
+        router.assert_not_called()
+        launch.assert_not_called()
+        self.assertFalse(daemon.pending_wake_mode_disable)
+        self.assertIn("still on", play.call_args.args[0].spoken_text)
+
+    def test_stop_worker_launch_failure_reports_that_listener_remains_on(self) -> None:
+        daemon = _bare_daemon()
+        daemon.pending_wake_mode_disable = True
+
+        _router, launch, play = self._turn(
+            daemon,
+            "yes",
+            launch_effect=OSError("systemd unavailable"),
+        )
+
+        launch.assert_called_once_with()
+        self.assertEqual(play.call_count, 2)
+        failure = play.call_args.args[0]
+        self.assertIn("still listening", failure.spoken_text)
+        self.assertTrue(daemon.pending_wake_mode_disable)
+        self.assertFalse(daemon.wake_mode_stop_after_delivery)
+
+        router, launch, _play = self._turn(daemon, "yes")
+
+        router.assert_not_called()
+        launch.assert_called_once_with()
+        self.assertFalse(daemon.pending_wake_mode_disable)
+
+    def test_post_launch_worker_failure_emits_critical_notification(self) -> None:
+        daemon = _bare_daemon()
+        process = mock.Mock()
+        process.wait.return_value = 17
+
+        with (
+            mock.patch.object(wake_daemon, "log") as log,
+            mock.patch.object(wake_daemon, "notify") as notify,
+        ):
+            daemon._observe_wake_mode_stop_worker(process)
+
+        log.assert_called_once()
+        notify.assert_called_once_with(
+            "Wake-mode shutdown failed after launch; the listener may still be active.",
+            error=True,
+        )
 
 
 class ConfigChangeConversationTests(unittest.TestCase):

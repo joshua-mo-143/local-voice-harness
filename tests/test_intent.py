@@ -684,6 +684,32 @@ class HarnessConfigChangeIntentTests(LocalRouterTestCase):
         self.assertEqual(route, intent.FALLBACK_ROUTE)
 
 
+class WakeModeDisableIntentTests(LocalRouterTestCase):
+    def test_route_tool_exposes_distinct_wake_mode_disable_intent(self) -> None:
+        properties = intent.ROUTE_TOOL["function"]["parameters"]["properties"]
+
+        self.assertIn("wake_mode_disable", properties["intent"]["enum"])
+        self.assertIn(
+            "distinct from setting barge-in mode", intent.ROUTER_SYSTEM_PROMPT
+        )
+
+    def test_explicit_wake_mode_request_routes_as_confirmed_first_party_action(
+        self,
+    ) -> None:
+        with mock.patch.object(
+            llm_transport.urllib.request,
+            "urlopen",
+            return_value=_response("wake_mode_disable", "high"),
+        ):
+            route = intent.route_intent(
+                "Turn wake mode off",
+                RequestContext("Turn wake mode off"),
+            )
+
+        self.assertEqual(route.intent, intent.Intent.WAKE_MODE_DISABLE)
+        self.assertTrue(route.actionable)
+
+
 class VocabularyAliasIntentTests(LocalRouterTestCase):
     def test_route_tool_exposes_spoken_alias_intent(self) -> None:
         properties = intent.ROUTE_TOOL["function"]["parameters"]["properties"]

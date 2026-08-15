@@ -7,7 +7,7 @@ HARNESS_HELP_RECAP = (
     "dismiss, or repeat a job, hear more details or a digest of what you "
     "missed, consult the workspace or a pending job question, file a GitHub "
     "issue or a Linear ticket, inspect or change my settings, check whether "
-    "I'm healthy, and hang up when you're done."
+    "I'm healthy, turn wake mode off, and hang up when you're done."
 )
 
 
