@@ -186,7 +186,7 @@ class Intent(StrEnum):
     AGENT_REPLY = "cursor_reply"
     AGENT_FOLLOWUP = "cursor_followup"
     GITHUB_PR_CREATE = "github_pr_create"
-    AGENT_STATUS = ("cursor_status",)
+    AGENT_STATUS = "cursor_status"
     AGENT_CANCEL = "cursor_cancel"
     AGENT_LIST = "cursor_list"
     AGENT_DISMISS = "cursor_dismiss"
