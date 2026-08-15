@@ -74,6 +74,7 @@ from ..critical_targets import (
 )
 from ..cursor import announcements as announcement_policy
 from ..cursor import consultation as cursor_consultation
+from ..cursor import inbox as cursor_inbox
 from ..cursor import provisioning as cursor_provisioning
 from ..cursor import questions as cursor_questions
 from ..cursor import service as cursor_service
@@ -490,6 +491,13 @@ CLEAR_SNOOZE_PATTERN = re.compile(
     r")\s*[!.]?\s*$",
     re.IGNORECASE,
 )
+RETARGET_PATTERN = re.compile(
+    r"^\s*(?:"
+    r"(?:let(?:'s| us)\s+)?(?:talk|switch)\s+(?:to|about)\s+(?:the\s+)?(?P<ref>.+?)|"
+    r"what\s+was\s+the\s+(?P<qref>.+?)\s+question"
+    r")\s*[?.!]?\s*$",
+    re.IGNORECASE,
+)
 PENDING_SUBMIT_PATTERN = re.compile(
     r"\b(?:work\s+on|fix|change|update|implement|add|remove|run|review|inspect|"
     r"start|create|build|refactor|test)\b",
@@ -558,6 +566,7 @@ SNOOZE_MUTE_ALL_RESPONSE = (
 )
 SNOOZE_CLEARED_RESPONSE = "Okay, I can announce background updates again."
 SNOOZE_INACTIVE_RESPONSE = "I wasn't snoozing background announcements."
+RETARGET_NOT_FOUND_RESPONSE = "I couldn't find a job matching that."
 
 
 @dataclass
@@ -1447,6 +1456,30 @@ class WakeConversationDaemon:
             app_class=context.focused_app_class,
             source_kinds=context.focused_app_sources,
         )
+
+    def _retarget_named_question(self, reference: str) -> str:
+        """Switch the live session to a named awaiting job without answering."""
+        jobs = CURSOR_STORE.list()
+        resolution = cursor_inbox.resolve_reference(jobs, reference)
+        if resolution.ambiguous:
+            return cursor_inbox.clarify(list(resolution.matches), "talk about")
+        if resolution.unique is None:
+            return RETARGET_NOT_FOUND_RESPONSE
+        try:
+            job = CURSOR_STORE.get(resolution.unique.id)
+        except Exception as exc:  # noqa: BLE001 - retarget must fail closed
+            log(
+                "retarget job unavailable for "
+                f"{resolution.unique.id}: {type(exc).__name__}: {exc}"
+            )
+            return RETARGET_NOT_FOUND_RESPONSE
+        if job.status != JobStatus.AWAITING_USER:
+            return cursor_service.job_status(job.id)
+        question = cursor_questions.current(job)
+        if question is None:
+            return cursor_service.job_status(job.id)
+        self.cursor_session = job.id
+        return question.text
 
     def _active_announcement_snooze(
         self, now: float | None = None
@@ -2446,6 +2479,16 @@ class WakeConversationDaemon:
                     if mute_everything
                     else snooze_started_response(parsed_minutes)
                 )
+            retarget = RETARGET_PATTERN.search(text)
+            if retarget is not None:
+                reference = (
+                    retarget.group("ref") or retarget.group("qref") or ""
+                ).strip()
+                if reference:
+                    terminalize_non_side_effect()
+                    return self._speak_control_notice(
+                        self._retarget_named_question(reference)
+                    )
             pending_resolution = getattr(self, "pending_target_resolution", None)
             resolution_active = (
                 pending_resolution is not None

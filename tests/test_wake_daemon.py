@@ -8600,5 +8600,200 @@ class AnnouncementSnoozeTests(unittest.TestCase):
         self.assertIs(drain.call_args.kwargs["snooze"], daemon.announcement_snooze)
 
 
+def _named_job(
+    job_id: str,
+    status: str,
+    *,
+    label: str,
+    question: str | None = None,
+) -> CursorJob:
+    values: dict[str, object] = {
+        "id": job_id,
+        "status": status,
+        "request": label,
+        "speakable_label": label,
+        "created_at": 1,
+        "delivered": True,
+    }
+    if status == "awaiting_user":
+        values["question"] = question or "Which option?"
+        values["result"] = question or "Which option?"
+    elif status == "running":
+        values.update(
+            {
+                "delivered": False,
+                "worker_token": "claim",
+                "worker_pid": 42,
+                "worker_boot_id": "boot",
+                "worker_process_start": "start",
+            }
+        )
+    else:
+        values["completed_at"] = 2
+        values["result"] = "done"
+        if status == "failed":
+            values["error"] = "boom"
+    return CursorJob.from_dict(values)
+
+
+class RetargetPendingQuestionTests(unittest.TestCase):
+    def _store(self, *jobs: CursorJob) -> mock.Mock:
+        store = mock.Mock()
+        store.list.return_value = list(jobs)
+        by_id = {job.id: job for job in jobs}
+        store.get.side_effect = lambda job_id: by_id[job_id]
+        return store
+
+    def test_unique_named_retarget_sets_session_and_does_not_answer(self) -> None:
+        daemon = _bare_daemon()
+        daemon.cursor_session = "aaaaaaaaaaaa"
+        payments = _named_job(
+            "bbbbbbbbbbbb",
+            "awaiting_user",
+            label="payments",
+            question="Which payments table?",
+        )
+        current = _named_job(
+            "aaaaaaaaaaaa",
+            "awaiting_user",
+            label="login",
+            question="Which login page?",
+        )
+        store = self._store(current, payments)
+        with (
+            mock.patch.object(wake_daemon, "CURSOR_STORE", store),
+            mock.patch.object(
+                wake_daemon, "transcribe", return_value="talk about the payments issue"
+            ),
+            mock.patch.object(wake_daemon, "start_components"),
+            mock.patch.object(wake_daemon, "cursor_turn") as cursor_turn,
+            mock.patch.object(
+                daemon,
+                "play_response",
+                return_value=({"played_text": "Which payments table?"}, None),
+            ) as play,
+            mock.patch.object(wake_daemon, "notify"),
+        ):
+            daemon.process_utterance(AUDIO_GENERATION, woke=False)
+
+        play.assert_called_once_with(
+            AssistantResponse.from_text("Which payments table?")
+        )
+        cursor_turn.assert_not_called()
+        self.assertEqual(daemon.cursor_session, "bbbbbbbbbbbb")
+
+    def test_ambiguous_retarget_does_not_switch_or_answer(self) -> None:
+        daemon = _bare_daemon()
+        daemon.cursor_session = "aaaaaaaaaaaa"
+        jobs = (
+            _named_job(
+                "aaaaaaaaaaaa",
+                "awaiting_user",
+                label="payments issue",
+                question="First question?",
+            ),
+            _named_job(
+                "bbbbbbbbbbbb",
+                "awaiting_user",
+                label="payments issue",
+                question="Second question?",
+            ),
+        )
+        store = self._store(*jobs)
+        with (
+            mock.patch.object(wake_daemon, "CURSOR_STORE", store),
+            mock.patch.object(
+                wake_daemon,
+                "transcribe",
+                return_value="what was the payments question?",
+            ),
+            mock.patch.object(wake_daemon, "start_components"),
+            mock.patch.object(wake_daemon, "cursor_turn") as cursor_turn,
+            mock.patch.object(
+                daemon,
+                "play_response",
+                return_value=({"played_text": "clarify"}, None),
+            ) as play,
+            mock.patch.object(wake_daemon, "notify"),
+        ):
+            daemon.process_utterance(AUDIO_GENERATION, woke=False)
+
+        spoken = play.call_args.args[0].spoken_text
+        self.assertIn("several jobs", spoken)
+        cursor_turn.assert_not_called()
+        self.assertEqual(daemon.cursor_session, "aaaaaaaaaaaa")
+
+    def test_unnamed_yes_still_answers_current_session(self) -> None:
+        daemon = _bare_daemon()
+        daemon.cursor_session = "aaaaaaaaaaaa"
+        pending = _pending_choice_snapshot()
+        pending = replace(pending, job_id="aaaaaaaaaaaa")
+        with (
+            mock.patch.object(wake_daemon, "transcribe", return_value="sqlite"),
+            mock.patch.object(wake_daemon, "start_components"),
+            mock.patch.object(
+                wake_daemon,
+                "route_intent",
+                return_value=IntentRoute(Intent.AGENT_REPLY, "high"),
+            ),
+            mock.patch.object(daemon, "_pending_cursor_question", return_value=pending),
+            mock.patch.object(
+                wake_daemon, "cursor_turn", return_value=("answered", None)
+            ) as cursor_turn,
+            mock.patch.object(
+                daemon,
+                "play_response",
+                return_value=({"played_text": "answered"}, None),
+            ),
+            mock.patch.object(wake_daemon, "notify"),
+        ):
+            daemon.process_utterance(AUDIO_GENERATION, woke=False)
+
+        cursor_turn.assert_called_once()
+        request = cursor_turn.call_args.args[0]
+        self.assertEqual(request.action, "reply")
+        self.assertEqual(request.job_id, "aaaaaaaaaaaa")
+        self.assertEqual(request.utterance, "sqlite")
+
+    def test_non_awaiting_job_gets_status_refusal(self) -> None:
+        daemon = _bare_daemon()
+        daemon.cursor_session = "aaaaaaaaaaaa"
+        running = _named_job("cccccccccccc", "running", label="payments")
+        awaiting = _named_job(
+            "aaaaaaaaaaaa",
+            "awaiting_user",
+            label="login",
+            question="Which login page?",
+        )
+        store = self._store(awaiting, running)
+        with (
+            mock.patch.object(wake_daemon, "CURSOR_STORE", store),
+            mock.patch.object(
+                cursor_service,
+                "job_status",
+                return_value="payments issue is running, in implementing.",
+            ) as status,
+            mock.patch.object(
+                wake_daemon, "transcribe", return_value="talk about the payments issue"
+            ),
+            mock.patch.object(wake_daemon, "start_components"),
+            mock.patch.object(wake_daemon, "cursor_turn") as cursor_turn,
+            mock.patch.object(
+                daemon,
+                "play_response",
+                return_value=({"played_text": "status"}, None),
+            ) as play,
+            mock.patch.object(wake_daemon, "notify"),
+        ):
+            daemon.process_utterance(AUDIO_GENERATION, woke=False)
+
+        status.assert_called_once_with("cccccccccccc")
+        play.assert_called_once_with(
+            AssistantResponse.from_text("payments issue is running, in implementing.")
+        )
+        cursor_turn.assert_not_called()
+        self.assertEqual(daemon.cursor_session, "aaaaaaaaaaaa")
+
+
 if __name__ == "__main__":
     unittest.main()
