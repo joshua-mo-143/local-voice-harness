@@ -1865,6 +1865,171 @@ class CursorJobStateTests(unittest.TestCase):
         self.assertEqual(awaiting.plan_approval_state, "awaiting")
         self.assertTrue(awaiting.review_approved)
         self.assertIsNotNone(awaiting.review_artifact)
+        self.assertEqual(
+            awaiting.question,
+            "The reviewed implementation plan is ready. "
+            "Update behavior with compatibility tests. "
+            "Should I approve it and start implementation in a fresh "
+            "Agent-mode session? "
+            "Say yes to implement it, or no to cancel this job.",
+        )
+        self.assertIn(
+            "Say yes to implement it, or no to cancel this job.",
+            awaiting.question,
+        )
+
+    def test_plan_approval_question_omits_plan_after_first_sentence(self) -> None:
+        remainder = "Do not speak this remainder about secret recovery ownership."
+        plan = (
+            "Update the label copy in the settings panel. "
+            f"{remainder} Then add compatibility tests for every screen."
+        )
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "update ordinary application behavior",
+                "status": "running",
+                "worker_token": "worker",
+                "worker_pid": 42,
+                "worker_process_start": "start",
+                "worker_claim_operation": "test",
+                "worker_claimed_at": 1,
+                "workflow_tier": "medium",
+                "workflow_classification_reason": "cross-component",
+                "workflow_phase": "reviewing",
+                "planner_target": "planner",
+                "reviewer_target": "reviewer",
+                "active_participant": "reviewer",
+                "herdr_target": "reviewer",
+                "turn_token": "turn",
+                "plan_approval_state": "boundary",
+                "plan_approval_id": "gate-id",
+                "plan_approval_agent_session": "planner-session",
+                "plan_approval_state_change_sequence": 7,
+                "plan_approval_revision": 3,
+            }
+        )
+        store = jobs._store()
+        plan_reference = store.write_artifact("123456789abc", "plan", 0, plan)
+        store.update(
+            "123456789abc",
+            lambda job: job.evolve(plan_artifact=plan_reference),
+        )
+
+        with mock.patch.object(
+            production_jobs,
+            "load_plan_approval_preferences",
+            return_value=user_config.PlanApprovalPreferences(),
+        ):
+            production_jobs._advance_workflow_output(
+                store,
+                store.get("123456789abc"),
+                LEGACY_WORKER,
+                "WORKFLOW_REVIEW_DECISION[turn]: approve\n"
+                "WORKFLOW_REVIEW[turn]: plan is safe",
+                "idle",
+            )
+
+        awaiting = store.get("123456789abc")
+        self.assertEqual(awaiting.clarification_kind, "workflow_plan_approval")
+        self.assertIn("Update the label copy in the settings panel.", awaiting.question)
+        self.assertIn(
+            "Say yes to implement it, or no to cancel this job.",
+            awaiting.question,
+        )
+        self.assertNotIn(remainder, awaiting.question)
+        self.assertNotIn("compatibility tests for every screen", awaiting.question)
+
+    def test_plan_approval_question_stays_generic_when_artifact_is_unreadable(
+        self,
+    ) -> None:
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "update ordinary application behavior",
+                "status": "running",
+                "worker_token": "worker",
+                "worker_pid": 42,
+                "worker_process_start": "start",
+                "worker_claim_operation": "test",
+                "worker_claimed_at": 1,
+                "workflow_tier": "medium",
+                "workflow_classification_reason": "cross-component",
+                "workflow_phase": "reviewing",
+                "planner_target": "planner",
+                "reviewer_target": "reviewer",
+                "active_participant": "reviewer",
+                "herdr_target": "reviewer",
+                "turn_token": "turn",
+                "plan_approval_state": "boundary",
+                "plan_approval_id": "gate-id",
+                "plan_approval_agent_session": "planner-session",
+                "plan_approval_state_change_sequence": 7,
+                "plan_approval_revision": 3,
+            }
+        )
+        store = jobs._store()
+        plan = "Invented gist must not appear when the artifact is unreadable."
+        plan_reference = store.write_artifact("123456789abc", "plan", 0, plan)
+        store.update(
+            "123456789abc",
+            lambda job: job.evolve(plan_artifact=plan_reference),
+        )
+
+        with (
+            mock.patch.object(
+                production_jobs,
+                "load_plan_approval_preferences",
+                return_value=user_config.PlanApprovalPreferences(),
+            ),
+            mock.patch.object(
+                store,
+                "read_artifact",
+                side_effect=production_jobs.JobValidationError(
+                    "workflow artifact is unreadable"
+                ),
+            ),
+        ):
+            production_jobs._advance_workflow_output(
+                store,
+                store.get("123456789abc"),
+                LEGACY_WORKER,
+                "WORKFLOW_REVIEW_DECISION[turn]: approve\n"
+                "WORKFLOW_REVIEW[turn]: plan is safe",
+                "idle",
+            )
+
+        awaiting = store.get("123456789abc")
+        self.assertEqual(awaiting.clarification_kind, "workflow_plan_approval")
+        self.assertEqual(awaiting.question, production_jobs._PLAN_APPROVAL_QUESTION)
+        self.assertNotIn("Invented gist", awaiting.question)
+        self.assertNotIn("must not appear", awaiting.question)
+
+    def test_plan_approval_question_helper_bounds_and_rejects_unreadable_plans(
+        self,
+    ) -> None:
+        yes_no = "Say yes to implement it, or no to cancel this job."
+        self.assertEqual(
+            production_jobs._plan_approval_question(""),
+            production_jobs._PLAN_APPROVAL_QUESTION,
+        )
+        self.assertEqual(
+            production_jobs._plan_approval_question(" \n\t "),
+            production_jobs._PLAN_APPROVAL_QUESTION,
+        )
+        words = [f"word{index}" for index in range(50)]
+        long_sentence = " ".join(words)
+        question = production_jobs._plan_approval_question(
+            f"{long_sentence} leftover secret remainder."
+        )
+        self.assertIn(" ".join(words[:40]), question)
+        self.assertNotIn("word40", question)
+        self.assertNotIn("leftover secret remainder", question)
+        self.assertIn(yes_no, question)
+        self.assertEqual(
+            production_jobs._plan_approval_gist(long_sentence).split(),
+            words[:40],
+        )
 
     def test_auto_mode_does_not_bypass_destructive_confirmation(self) -> None:
         job = CursorJob.from_dict(

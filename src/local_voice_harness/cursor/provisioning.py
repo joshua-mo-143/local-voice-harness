@@ -2827,6 +2827,39 @@ def _classified_tier(
     return tier
 
 
+_MAX_PLAN_APPROVAL_GIST_WORDS = 40
+_PLAN_APPROVAL_YES_NO = (
+    "Should I approve it and start implementation in a fresh Agent-mode "
+    "session? "
+    "Say yes to implement it, or no to cancel this job."
+)
+_PLAN_APPROVAL_QUESTION = (
+    f"The reviewed implementation plan is ready. {_PLAN_APPROVAL_YES_NO}"
+)
+_PLAN_GIST_SENTENCE_END = re.compile(r"[.!?]")
+
+
+def _plan_approval_gist(plan: str) -> str:
+    """Return a first-sentence or ~40-word slice, or empty if unreadable."""
+    normalized = re.sub(r"\s+", " ", plan).strip()
+    if not normalized:
+        return ""
+    match = _PLAN_GIST_SENTENCE_END.search(normalized)
+    gist = normalized[: match.end()].strip() if match else normalized
+    words = gist.split()
+    if len(words) > _MAX_PLAN_APPROVAL_GIST_WORDS:
+        return " ".join(words[:_MAX_PLAN_APPROVAL_GIST_WORDS])
+    return gist
+
+
+def _plan_approval_question(plan: str) -> str:
+    """Name a bounded plan gist in the existing yes/no approval question."""
+    gist = _plan_approval_gist(plan)
+    if not gist:
+        return _PLAN_APPROVAL_QUESTION
+    return f"The reviewed implementation plan is ready. {gist} {_PLAN_APPROVAL_YES_NO}"
+
+
 def _auto_plan_approval_allowed(
     job: CursorJob,
     *,
@@ -3181,8 +3214,11 @@ def _advance_workflow_output(
             )
             return None
         if decision == "approve":
-            plan = store.read_artifact(job.id, job.plan_artifact, kind="plan")
-            auto_approval = _auto_plan_approval_allowed(
+            try:
+                plan = store.read_artifact(job.id, job.plan_artifact, kind="plan")
+            except JobValidationError:
+                plan = ""
+            auto_approval = bool(plan) and _auto_plan_approval_allowed(
                 job,
                 plan=plan,
                 review=review,
@@ -3221,10 +3257,7 @@ def _advance_workflow_output(
                 return question_adapter.ask(
                     current,
                     QuestionSpec(
-                        "The reviewed implementation plan is ready. Should I "
-                        "approve it and start implementation in a fresh Agent-mode "
-                        "session? "
-                        "Say yes to implement it, or no to cancel this job.",
+                        _plan_approval_question(plan),
                         sensitivity=QuestionSensitivity.ARCHITECTURE,
                     ),
                     owner="workflow_plan_approval",
