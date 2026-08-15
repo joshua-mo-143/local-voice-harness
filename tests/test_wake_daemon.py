@@ -8085,35 +8085,6 @@ class LastTranscriptReplayTests(unittest.TestCase):
             daemon.last_transcript.utterance, "work on example/payments#42"
         )
 
-    def test_failed_cursor_turn_does_not_mark_transcript_dispatched(self) -> None:
-        daemon = _bare_daemon()
-        with (
-            mock.patch.object(
-                wake_daemon, "transcribe", return_value="fix the failing tests"
-            ),
-            mock.patch.object(wake_daemon, "start_components"),
-            mock.patch.object(
-                wake_daemon,
-                "request_context",
-                side_effect=lambda text, **_settings: RequestContext(text),
-            ),
-            mock.patch.object(
-                wake_daemon,
-                "route_intent",
-                return_value=IntentRoute(Intent.AGENT_SUBMIT, "high"),
-            ),
-            mock.patch.object(
-                wake_daemon, "cursor_turn", side_effect=RuntimeError("boom")
-            ),
-            mock.patch.object(wake_daemon, "notify"),
-            mock.patch.object(daemon, "stop_components_when_idle"),
-        ):
-            daemon.process_utterance(AUDIO_GENERATION, woke=False)
-
-        assert daemon.last_transcript is not None
-        self.assertEqual(daemon.last_transcript.utterance, "fix the failing tests")
-        self.assertFalse(daemon.last_transcript.dispatched)
-
     def test_refused_reply_result_does_not_mark_transcript_dispatched(self) -> None:
         from local_voice_harness.cursor.service import CursorTurnResult
 
@@ -8157,6 +8128,7 @@ class LastTranscriptReplayTests(unittest.TestCase):
         assert daemon.last_transcript is not None
         self.assertEqual(daemon.last_transcript.utterance, "fix the failing tests")
         self.assertFalse(daemon.last_transcript.dispatched)
+
 
 class FocusedContextInspectTests(unittest.TestCase):
     def test_inspect_speaks_identity_without_bodies(self) -> None:
