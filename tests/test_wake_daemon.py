@@ -8994,6 +8994,7 @@ class RetargetPendingQuestionTests(unittest.TestCase):
     def test_retarget_clears_stale_readback(self) -> None:
         daemon = _bare_daemon()
         daemon.cursor_session = "aaaaaaaaaaaa"
+        daemon.conversation_deadline = time.monotonic() + 30
         target = wake_daemon.CriticalTarget(
             "github", "example/payments", "42", "submit"
         )
@@ -9011,7 +9012,13 @@ class RetargetPendingQuestionTests(unittest.TestCase):
             label="payments",
             question="Which payments table?",
         )
-        store = self._store(payments)
+        current = _named_job(
+            "aaaaaaaaaaaa",
+            "awaiting_user",
+            label="login",
+            question="Which login page?",
+        )
+        store = self._store(current, payments)
         with (
             mock.patch.object(wake_daemon, "CURSOR_STORE", store),
             mock.patch.object(

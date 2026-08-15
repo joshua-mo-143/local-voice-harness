@@ -8,7 +8,7 @@ import uuid
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Literal, NamedTuple
+from typing import Literal
 
 from ..config import JOB_LOGS_DIR, JOBS_DIR, LEGACY_JOBS_DIR
 from ..diagnostic_safety import redact_diagnostic
@@ -167,10 +167,22 @@ class CursorTurnRequest:
     on_job_started: Callable[[], None] | None = None
 
 
-class CursorTurnResult(NamedTuple):
+@dataclass(frozen=True, slots=True)
+class CursorTurnResult:
     text: ResponseLike
     session_id: str | None
     mutated: bool = False
+
+    def __iter__(self):
+        # Keep the long-standing ``response, session = cursor_turn(...)`` contract.
+        yield self.text
+        yield self.session_id
+
+    def __len__(self) -> int:
+        return 2
+
+    def __getitem__(self, index: int | slice):
+        return (self.text, self.session_id)[index]
 
 
 TicketStartStatus = Literal[
@@ -2734,6 +2746,7 @@ def cursor_turn(
                 return CursorTurnResult(resolved.clarification, session_id)
             reply_id = resolved.job_id
         assert reply_id is not None
+        before_reply = read_job(reply_id)
         immediate = reply_job(
             reply_id,
             text,
@@ -2754,9 +2767,7 @@ def cursor_turn(
                 if pending is not None and pending.state == QuestionState.DEFERRED
                 else reply_id
             )
-            mutated = current.status != JobStatus.AWAITING_USER or (
-                pending is not None and pending.state == QuestionState.DEFERRED
-            )
+            mutated = current.revision != before_reply.revision
             return CursorTurnResult(immediate, next_session, mutated=mutated)
         job_id = reply_id
         return _await_foreground(
