@@ -50,6 +50,7 @@ from local_voice_harness.cursor.recovery import (
     reconcile_uncertain_linear_ticket_close,
     reconcile_uncertain_linear_ticket_creation,
     reconcile_uncertain_linear_ticket_update,
+    reconcile_uncertain_operations,
     reconcile_uncertain_pr_creation,
     reconcile_uncertain_pr_merge,
     reconcile_uncertain_repo_creation,
@@ -1551,6 +1552,62 @@ class CursorRecoveryTests(unittest.TestCase):
         self.assertEqual(updated.ticket_merge_operation_state, "manual_required")
         self.assertIn("Updated example/project#12", str(updated.result))
         self.assertIn("was not closed", str(updated.result))
+        client.submit_issue_close.assert_not_called()
+
+    def test_uncertain_operations_reconcile_ambiguous_issue_merge(self) -> None:
+        closing = encode_merge_closing(
+            (
+                MergeClosingTicket(
+                    "example/project#13",
+                    "b" * 32,
+                    state="ambiguous",
+                    repository="example/project",
+                    number=13,
+                ),
+            )
+        )
+        job = self.create(
+            {
+                "id": "123456789abc",
+                "status": "queued",
+                "request": "merge the issues",
+                "created_at": 1,
+                "queued_at": 1,
+                "delivered": False,
+                "issue_provider": "github",
+                "github_repository": "example/project",
+                "github_issue": 12,
+                "github_issue_merge_requested": True,
+                "ticket_merge_confirmed": True,
+                "ticket_merge_survivor": "example/project#12",
+                "ticket_merge_survivor_title": "Combined auth",
+                "ticket_merge_survivor_body": "Handle login and invoices.",
+                "ticket_merge_survivor_marker": "a" * 32,
+                "ticket_merge_survivor_operation_state": "created",
+                "ticket_merge_closing": closing,
+                "ticket_merge_operation_state": "ambiguous",
+                "reconcile": True,
+            }
+        )
+        client = mock.Mock(spec=GitHubClient)
+        client.observe_issue_close.return_value = GitHubIssueCloseResult(
+            GitHubIssue("example", "project", 13),
+            "https://github.com/example/project/issues/13",
+            "b" * 32,
+        )
+
+        reconcile_uncertain_operations(
+            self.store,
+            job,
+            now=100,
+            github_factory=lambda: client,
+        )
+
+        updated = self.store.get(job.id)
+        self.assertEqual(updated.status, JobStatus.COMPLETED)
+        self.assertEqual(updated.ticket_merge_operation_state, "created")
+        self.assertFalse(updated.reconcile)
+        client.submit_issue_update.assert_not_called()
         client.submit_issue_close.assert_not_called()
 
     def test_migration_and_pruning_precede_recovery_scans(self) -> None:
