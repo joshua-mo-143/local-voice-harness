@@ -2628,15 +2628,19 @@ class WakeConversationDaemon:
                 ).strip()
                 with_prefix = bool(resume.group("with"))
                 handle_resume = True
-                if with_prefix and reference:
+                if (
+                    with_prefix
+                    and reference
+                    and self._pending_cursor_question() is not None
+                ):
+                    # "Continue with X" while a question is live is an answer,
+                    # even when X also matches another awaiting job.
+                    handle_resume = False
+                elif with_prefix and reference:
                     resolution = cursor_inbox.resolve_reference(
                         CURSOR_STORE.list(), reference
                     )
-                    if (
-                        resolution.unique is None
-                        and not resolution.ambiguous
-                        and self._pending_cursor_question() is not None
-                    ):
+                    if resolution.unique is None and not resolution.ambiguous:
                         handle_resume = False
                 if handle_resume:
                     terminalize_non_side_effect()
@@ -2698,7 +2702,6 @@ class WakeConversationDaemon:
             if resuming_target_resolution:
                 assert pending_target_resolution is not None
                 text = pending_target_resolution.trusted_utterance
-            self._remember_last_transcript(text)
             next_cursor_session = self.cursor_session
             next_history = list(self.history)
             remember_response = False
@@ -2862,6 +2865,15 @@ class WakeConversationDaemon:
                         terminalize_non_side_effect()
                         self.close_pending_capture("non-actionable speech")
                         return None
+            answering_existing = (
+                readback_result is not None
+                or confirmed_request is not None
+                or config_response is not None
+                or activation_response is not None
+                or (pending is not None and route.intent == Intent.AGENT_REPLY)
+            )
+            if not answering_existing:
+                self._remember_last_transcript(text)
             if confirmed_request is not None or (
                 route.actionable and route.intent in SIDE_EFFECTING_INTENTS
             ):
