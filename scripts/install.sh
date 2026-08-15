@@ -82,13 +82,73 @@ require() {
   return "$missing"
 }
 
-installer_python() {
-  if have python3; then
-    printf '%s\n' python3
-  elif have python; then
-    printf '%s\n' python
+python_planner_available() {
+  have python3 &&
+    python3 -c 'import sys; raise SystemExit(sys.version_info < (3, 11))' \
+      >/dev/null 2>&1
+}
+
+as_root() {
+  if [[ "$EUID" -eq 0 ]]; then
+    "$@"
+  elif have sudo; then
+    sudo "$@"
   else
-    warn "python3 is required to resolve installation profiles."
+    warn "sudo is required to install the Python planning prerequisite."
+    return 1
+  fi
+}
+
+bootstrap_installer_python() {
+  if python_planner_available; then
+    return 0
+  fi
+  local release="${OS_RELEASE_PATH:-/etc/os-release}" identity="" key value
+  if [[ ! -r "$release" ]]; then
+    warn "Cannot read $release to install the Python planning prerequisite."
+    return 1
+  fi
+  while IFS="=" read -r key value; do
+    case "$key" in
+      ID|ID_LIKE)
+        value="${value#\"}"
+        value="${value%\"}"
+        identity+=" ${value,,}"
+        ;;
+    esac
+  done <"$release"
+  step "Installing Python planning prerequisite"
+  case "$identity" in
+    *arch*|*cachyos*|*manjaro*|*endeavouros*)
+      if ! have paru; then
+        warn "paru is required to install Python on Arch-family systems."
+        return 1
+      fi
+      paru -S --needed --noconfirm python
+      ;;
+    *ubuntu*|*debian*|*pop*|*linuxmint*|*elementary*)
+      as_root apt-get update
+      as_root apt-get install -y --no-install-recommends python3
+      ;;
+    *fedora*|*rhel*|*centos*|*nobara*)
+      as_root dnf install -y python3
+      ;;
+    *)
+      warn "Unsupported distribution; install Python 3.11 or newer manually."
+      return 1
+      ;;
+  esac
+  if ! python_planner_available; then
+    warn "Python 3.11 or newer is required to resolve the installation plan."
+    return 1
+  fi
+}
+
+installer_python() {
+  if python_planner_available; then
+    printf '%s\n' python3
+  else
+    warn "Python 3.11 or newer is required to resolve installation profiles."
     return 1
   fi
 }
@@ -136,6 +196,7 @@ cd "$PROJECT_DIR"
 
 bold "Local Voice Agent Harness installer"
 info "Project directory: $PROJECT_DIR"
+bootstrap_installer_python
 
 step "Selecting AI providers"
 if [[ "${PROFILE,,}" == "showcase" ]]; then
@@ -216,7 +277,7 @@ else
     info "Skipping CUDA and NVIDIA packages ($INSTALL_PROFILE profile)"
   fi
   if [[ -n "${INSTALL_SKIPPED_PACKAGES}" ]]; then
-    info "Distro packages not mapped and left for manual install: $INSTALL_SKIPPED_PACKAGES"
+    info "Packages handled outside the distro package manager: $INSTALL_SKIPPED_PACKAGES"
   fi
   if [[ "$INSTALL_UV_BOOTSTRAP" == 1 ]] && ! have uv; then
     step "Installing uv"

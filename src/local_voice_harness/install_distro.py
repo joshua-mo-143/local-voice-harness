@@ -251,6 +251,13 @@ def resolve_distro_plan(
     packages, skipped_system = _map_packages(family, install_plan.system_packages)
     cuda_packages, skipped_cuda = _map_packages(family, install_plan.cuda_packages)
     skipped = tuple(dict.fromkeys((*skipped_system, *skipped_cuda)))
+    required_unmapped = tuple(name for name in skipped if name != "uv")
+    if required_unmapped:
+        raise DistroError(
+            f"{family.value} has no supported package adapter for required "
+            f"packages: {', '.join(required_unmapped)}; use the supported Arch "
+            "adapter or select an install profile this distro can satisfy"
+        )
     return DistroPlan(
         family=family,
         distro_id=(os_release or {}).get("ID", family),
@@ -313,6 +320,11 @@ def main(arguments: list[str] | None = None) -> int:
     parser.add_argument("--llm-device", dest="llm_device", default="")
     parser.add_argument("--tts-device", dest="tts_device", default="")
     parser.add_argument("--dictation-device", dest="dictation_device", default="")
+    parser.add_argument(
+        "--cuda-available",
+        action="store_true",
+        help="a bounded runtime probe confirmed usable CUDA on this host",
+    )
     parser.add_argument("--chatterbox-dir", default="")
     parser.add_argument("--format", choices=("env", "json"), default="env")
     options = parser.parse_args(arguments)
@@ -324,6 +336,7 @@ def main(arguments: list[str] | None = None) -> int:
             llm_device=options.llm_device or None,
             tts_device=options.tts_device or None,
             dictation_device=options.dictation_device or None,
+            cuda_available=options.cuda_available,
         )
         distro_plan = resolve_distro_plan(
             install_plan,

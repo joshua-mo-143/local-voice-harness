@@ -119,17 +119,25 @@ class DistroPackageAdapterTests(unittest.TestCase):
                     plan = _plan(family, checkout=checkout)
                     self.assertTrue(packages.issubset(plan.packages))
 
-    def test_local_cuda_cuda_packages_stay_arch_specific(self) -> None:
+    def test_required_unmapped_cuda_packages_fail_closed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             checkout = Path(temporary) / "checkout"
             checkout.mkdir()
             arch = _plan(DistroFamily.ARCH, profile="local-cuda", checkout=checkout)
-            debian = _plan(DistroFamily.DEBIAN, profile="local-cuda", checkout=checkout)
 
         self.assertIn("cuda", arch.cuda_packages)
-        self.assertEqual(debian.cuda_packages, ())
-        self.assertIn("cuda", debian.skipped_packages)
-        self.assertIn("llama.cpp-cuda", debian.skipped_packages)
+        for family in (DistroFamily.DEBIAN, DistroFamily.FEDORA):
+            with (
+                self.subTest(family=family.value),
+                tempfile.TemporaryDirectory() as temporary,
+            ):
+                checkout = Path(temporary) / "checkout"
+                checkout.mkdir()
+                with self.assertRaisesRegex(
+                    DistroError,
+                    "no supported package adapter.*cuda, llama.cpp-cuda",
+                ):
+                    _plan(family, profile="local-cuda", checkout=checkout)
 
     def test_resolving_the_same_inputs_is_idempotent(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -180,6 +188,23 @@ class InstallPathDiscoveryTests(unittest.TestCase):
         self.assertIn("exit 1", installer)
         self.assertIn("paru is required on Arch", installer)
         self.assertNotIn('PACKAGE_COMMAND="sudo pacman', installer)
+
+    def test_installer_bootstraps_and_enforces_python_planner_prerequisite(
+        self,
+    ) -> None:
+        installer = (
+            Path(__file__).resolve().parents[1] / "scripts" / "install.sh"
+        ).read_text()
+
+        self.assertIn("bootstrap_installer_python", installer)
+        self.assertIn("sys.version_info < (3, 11)", installer)
+        self.assertIn("apt-get install -y --no-install-recommends python3", installer)
+        self.assertIn("dnf install -y python3", installer)
+        self.assertIn("paru -S --needed --noconfirm python", installer)
+        self.assertLess(
+            installer.index("bootstrap_installer_python\n\nstep"),
+            installer.index('eval "$(resolve_install_plan'),
+        )
 
     def test_runtime_systemd_path_matches_discovered_xdg_path(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

@@ -10,6 +10,10 @@ installer is idempotent.
 The installer discovers the checkout, `~/.local/bin`, and the systemd user
 directory from its own path and XDG locations. If the checkout is not
 `$HOME/local-voice-harness`, it creates that symlink so shipped user units resolve.
+The standard-library plan resolver requires Python 3.11 or newer. Before resolving
+packages, the installer installs the distro `python3` package with `paru`, `apt-get`,
+or `dnf` when necessary, verifies its version, and stops with manual guidance if the
+distro package is still too old.
 
 ## Compute requirements
 
@@ -55,9 +59,10 @@ PROFILE=showcase ./scripts/install.sh
 
 It installs no CUDA or NVIDIA packages, uses the CPU `dictation` extra, and
 omits local LLM/TTS extras, Qwen/Chatterbox downloads, and the local LLM
-service. The default one-shot path still provisions the local CUDA profile when
-a local provider is selected. Use the manual CPU instructions below for a
-partial GPU-free setup without the installer.
+service. With local providers, the default `auto` compute mode installs CUDA
+artifacts only when a bounded `nvidia-smi` probe confirms usable CUDA; otherwise it
+installs the CPU dictation and llama.cpp artifacts. Setting a device or the
+`local-cuda` profile explicitly is a strict CUDA requirement.
 
 ## External prerequisites
 
@@ -90,8 +95,9 @@ On Ubuntu/Debian, the installer maps those names to `apt-get` packages such as
 `uv` when the distro does not package it. On Fedora it uses `dnf` with the
 same mapping (`gh`, `libsecret`, `gnome-keyring`). Hosted-only installs do not
 install CUDA packages on any family. Local CUDA llama.cpp packages remain
-Arch-specific; Ubuntu and Fedora leave `cuda` and `llama.cpp-cuda` for a
-manual llama-server install.
+Arch-specific. An explicit CUDA plan on Ubuntu/Debian or Fedora fails before
+package installation because those adapters cannot currently satisfy `cuda` and
+`llama.cpp-cuda`; use the supported Arch adapter or select CPU/hosted compute.
 
 On Arch/CachyOS, install the CUDA-enabled llama.cpp AUR package (it conflicts with
 `llama.cpp-vulkan` and other non-CUDA variants):
