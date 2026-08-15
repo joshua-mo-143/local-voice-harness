@@ -12,6 +12,7 @@ from local_voice_harness.agents.model import JobStatus
 from local_voice_harness.browser_context import RequestContext
 from local_voice_harness.cursor import consultation
 from local_voice_harness.cursor.service import CursorTurnRequest
+from local_voice_harness.diagnostics.help import harness_help_response
 from local_voice_harness.errors import SpeechDeliveryError
 from local_voice_harness.intent import Intent, IntentRoute
 from local_voice_harness.questions import AnswerProvenance
@@ -165,6 +166,38 @@ class SelfHealthRoutingTests(unittest.TestCase):
         cursor_turn.assert_not_called()
         qwen_response.assert_not_called()
         play.assert_called_once_with(response.spoken_text, settings=mock.ANY)
+
+
+class HarnessHelpRoutingTests(unittest.TestCase):
+    def test_help_route_is_isolated_from_context_cursor_and_conversation(
+        self,
+    ) -> None:
+        response = harness_help_response()
+        with (
+            mock.patch.object(app, "start_components"),
+            mock.patch.object(
+                app,
+                "route_intent",
+                return_value=IntentRoute(Intent.HARNESS_HELP, "high"),
+            ),
+            mock.patch.object(app, "request_context") as request_context,
+            mock.patch.object(
+                app, "harness_help_response", return_value=response
+            ) as help_response,
+            mock.patch.object(app, "cursor_turn") as cursor_turn,
+            mock.patch.object(app, "qwen_response") as qwen_response,
+            mock.patch.object(app, "stream_and_play") as play,
+        ):
+            app.respond("What can you do?")
+
+        help_response.assert_called_once_with()
+        request_context.assert_not_called()
+        cursor_turn.assert_not_called()
+        qwen_response.assert_not_called()
+        play.assert_called_once()
+        played = play.call_args.args[0]
+        self.assertIn("talk with you", played)
+        self.assertIn("hang up when you're done", played)
 
 
 class AppContextTests(unittest.TestCase):

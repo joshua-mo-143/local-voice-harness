@@ -10,6 +10,7 @@ from local_voice_harness import intent, llm_transport
 from local_voice_harness.browser_context import RequestContext
 from local_voice_harness.config import CURSOR_PATTERN, load_backend_settings
 from local_voice_harness.credentials import CredentialError
+from local_voice_harness.diagnostics.help import HARNESS_HELP_RECAP
 
 LOCAL_SETTINGS = load_backend_settings(
     {"VOICE_HARNESS_LLM_PROVIDER": "local"},
@@ -520,6 +521,69 @@ class SelfHealthIntentTests(LocalRouterTestCase):
 
             self.assertEqual(route.intent, intent.Intent.SELF_HEALTH)
             self.assertEqual(route.actionable, actionable)
+
+
+class HarnessHelpIntentTests(LocalRouterTestCase):
+    def test_route_tool_exposes_explicit_harness_help_intent(self) -> None:
+        enum = intent.ROUTE_TOOL["function"]["parameters"]["properties"]["intent"][
+            "enum"
+        ]
+
+        self.assertIn("harness_help", enum)
+        self.assertIn("what the voice harness can do", intent.ROUTER_SYSTEM_PROMPT)
+        self.assertIn("what can you do?", intent.ROUTER_SYSTEM_PROMPT)
+        self.assertIn("what can I say?", intent.ROUTER_SYSTEM_PROMPT)
+        self.assertIn("Prefer harness_help", intent.ROUTER_SYSTEM_PROMPT)
+
+    def test_harness_help_is_actionable_only_at_high_confidence(self) -> None:
+        for confidence, actionable in (("high", True), ("medium", False)):
+            with (
+                self.subTest(confidence=confidence),
+                mock.patch.object(
+                    llm_transport.urllib.request,
+                    "urlopen",
+                    return_value=_response("harness_help", confidence),
+                ),
+            ):
+                route = intent.route_intent(
+                    "What can you do?",
+                    RequestContext("What can you do?"),
+                )
+
+            self.assertEqual(route.intent, intent.Intent.HARNESS_HELP)
+            self.assertEqual(route.actionable, actionable)
+
+    def test_recap_names_only_shipped_router_capabilities(self) -> None:
+        recap = HARNESS_HELP_RECAP.casefold()
+        for phrase in (
+            "talk with you",
+            "start a coding job",
+            "check status",
+            "cancel",
+            "list",
+            "dismiss",
+            "repeat",
+            "more details",
+            "digest",
+            "consult the workspace",
+            "pending job question",
+            "github issue",
+            "linear ticket",
+            "inspect or change my settings",
+            "healthy",
+            "hang up",
+        ):
+            with self.subTest(phrase=phrase):
+                self.assertIn(phrase, recap)
+        for unshipped in (
+            "pull request",
+            "opencode",
+            "overlay",
+            "snooze",
+            "transcript",
+        ):
+            with self.subTest(unshipped=unshipped):
+                self.assertNotIn(unshipped, recap)
 
 
 class ForkIntentTests(unittest.TestCase):

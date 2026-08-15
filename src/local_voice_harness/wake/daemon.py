@@ -103,6 +103,7 @@ from ..diagnostic_safety import (
     redact_diagnostic,
 )
 from ..diagnostics.health import self_health_response
+from ..diagnostics.help import harness_help_response
 from ..errors import HarnessError, NoSpeechError, SpeechDeliveryError
 from ..github_issue_creation import repository_from_utterance
 from ..integrations.registry import IntegrationRegistry, build_integration_registry
@@ -1998,7 +1999,7 @@ class WakeConversationDaemon:
                     pending_config is None
                     and cursor_consultation.is_apply_recommendation_request(text)
                 )
-                if apply_recommendation:
+                if apply_recommendation and route.intent != Intent.HARNESS_HELP:
                     route = IntentRoute(Intent.AGENT_REPLY, "high")
                 if pending is not None and pending_config is None:
                     deterministic_answer = (
@@ -2026,7 +2027,7 @@ class WakeConversationDaemon:
                         pending.owner == "repository"
                         and cursor_provisioning.is_repository_list_request(text)
                     )
-                    if (
+                    if route.intent != Intent.HARNESS_HELP and (
                         resolved_as_answer
                         or apply_recommendation
                         or grouped_repository_answer
@@ -2205,6 +2206,9 @@ class WakeConversationDaemon:
                     )
             elif route.actionable and route.intent == Intent.SELF_HEALTH:
                 response = self_health_response()
+                ordinary_reply = True
+            elif route.actionable and route.intent == Intent.HARNESS_HELP:
+                response = harness_help_response()
                 ordinary_reply = True
             elif invalid_target_resolution:
                 response = TARGET_RESOLUTION_CONTEXT_RESPONSE
