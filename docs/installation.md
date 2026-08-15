@@ -43,8 +43,18 @@ The tested configuration uses CUDA for Parakeet and Chatterbox, but dictation ca
 run independently on CPU. CPU dictation has substantially higher latency. The
 optional faster-whisper backend supports the same `auto`, `cpu`, and `cuda` device
 selection. Hosted LLM/TTS with CPU dictation can avoid local model inference on the
-GPU, but the current one-shot installer still provisions CUDA dictation and NVIDIA
-packages; use the manual CPU instructions below for a GPU-free profile.
+GPU. The showcase installer profile is that GPU-free path:
+
+```bash
+PROFILE=showcase ./scripts/install.sh
+./scripts/install.sh --profile showcase
+```
+
+It installs no CUDA or NVIDIA packages, uses the CPU `dictation` extra, and
+omits local LLM/TTS extras, Qwen/Chatterbox downloads, and the local LLM
+service. The default one-shot path still provisions the local CUDA profile when
+a local provider is selected. Use the manual CPU instructions below for a
+partial GPU-free setup without the installer.
 
 ## External prerequisites
 
@@ -198,6 +208,7 @@ Venice is selected. Its choices can also be supplied non-interactively:
 
 ```bash
 env LLM_PROVIDER=venice TTS_PROVIDER=venice ./scripts/install.sh
+PROFILE=showcase ./scripts/install.sh
 ```
 
 Venice credentials are stored through libsecret in the desktop Secret Service, not

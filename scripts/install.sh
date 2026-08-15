@@ -8,17 +8,24 @@
 # Overridable via environment:
 #   PYTHON_VERSION      Python for the harness envs (default 3.11)
 #   CHATTERBOX_DIR      TTS env location (default $HOME/chatterbox-audition)
+#   PROFILE             Installation profile: showcase or local-cuda
 #   LLM_PROVIDER        LLM backend: local or venice (prompts when unset)
 #   TTS_PROVIDER        TTS backend: local or venice (prompts when unset)
 #   SKIP_SYSTEM_PACKAGES=1   Skip the paru package steps
 #   SKIP_MODELS=1            Skip Qwen/Chatterbox downloads
 #   SKIP_AUTH=1              Skip the interactive gh/cursor/linear logins
+#
+# Showcase (Venice LLM/TTS + CPU dictation) installs no CUDA or NVIDIA
+# packages and omits local LLM/TTS extras, models, and the local LLM service:
+#   PROFILE=showcase ./scripts/install.sh
+#   ./scripts/install.sh --profile showcase
 set -euo pipefail
 
 PYTHON_VERSION="${PYTHON_VERSION:-3.11}"
 CHATTERBOX_DIR="${CHATTERBOX_DIR:-$HOME/chatterbox-audition}"
 QWEN_REPO="unsloth/Qwen3.5-4B-GGUF"
 QWEN_FILE="Qwen3.5-4B-Q4_K_M.gguf"
+PROFILE="${PROFILE:-}"
 
 # The script lives in the checkout, so derive the project root from its path
 # rather than cloning again.
@@ -72,6 +79,40 @@ require() {
   return "$missing"
 }
 
+resolve_install_plan() {
+  local python
+  if have python3; then
+    python=python3
+  elif have python; then
+    python=python
+  else
+    warn "python3 is required to resolve installation profiles."
+    return 1
+  fi
+  PYTHONPATH="$PROJECT_DIR/src" "$python" -m local_voice_harness.install_profile "$@"
+}
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --profile)
+      if [[ $# -lt 2 ]]; then
+        warn "--profile requires showcase or local-cuda."
+        exit 1
+      fi
+      PROFILE="$2"
+      shift 2
+      ;;
+    --profile=*)
+      PROFILE="${1#*=}"
+      shift
+      ;;
+    *)
+      warn "unknown installer argument: $1"
+      exit 1
+      ;;
+  esac
+done
+
 cd "$PROJECT_DIR"
 
 bold "Local Voice Agent Harness installer"
@@ -82,25 +123,36 @@ if [[ "$PROJECT_DIR" != "$HOME/local-voice-harness" ]]; then
 fi
 
 step "Selecting AI providers"
-LLM_PROVIDER="$(select_provider "LLM" "${LLM_PROVIDER:-}")"
-TTS_PROVIDER="$(select_provider "TTS" "${TTS_PROVIDER:-}")"
+if [[ "${PROFILE,,}" == "showcase" ]]; then
+  LLM_PROVIDER="venice"
+  TTS_PROVIDER="venice"
+  info "Showcase profile selected: Venice LLM/TTS with CPU dictation"
+else
+  LLM_PROVIDER="$(select_provider "LLM" "${LLM_PROVIDER:-}")"
+  TTS_PROVIDER="$(select_provider "TTS" "${TTS_PROVIDER:-}")"
+fi
+eval "$(resolve_install_plan --format env --profile "$PROFILE" --llm "$LLM_PROVIDER" --tts "$TTS_PROVIDER")"
+LLM_PROVIDER="$INSTALL_LLM_PROVIDER"
+TTS_PROVIDER="$INSTALL_TTS_PROVIDER"
+info "Installation profile: $INSTALL_PROFILE"
 info "LLM provider: $LLM_PROVIDER"
 info "TTS provider: $TTS_PROVIDER"
+info "Dictation extra: $INSTALL_DICTATION_EXTRA ($INSTALL_DICTATION_DEVICE)"
 
 # --- 1. System packages -----------------------------------------------------
 if [[ "${SKIP_SYSTEM_PACKAGES:-0}" == 1 ]]; then
   step "Skipping system packages (SKIP_SYSTEM_PACKAGES=1)"
 elif have paru; then
   step "Installing base system packages"
-  paru -S --needed pipewire libnotify git curl github-cli xdotool xclip \
-    wl-clipboard wtype uv libsndfile ffmpeg
-  if [[ "$LLM_PROVIDER" == venice || "$TTS_PROVIDER" == venice ]]; then
-    step "Installing Venice credential support"
-    paru -S --needed libsecret oo7
+  # shellcheck disable=SC2086
+  paru -S --needed $INSTALL_SYSTEM_PACKAGES
+  if [[ -n "${INSTALL_CUDA_PACKAGES}" ]]; then
+    step "Installing CUDA and CUDA-enabled llama.cpp"
+    # shellcheck disable=SC2086
+    paru -S --needed $INSTALL_CUDA_PACKAGES
+  else
+    info "Skipping CUDA and NVIDIA packages ($INSTALL_PROFILE profile)"
   fi
-
-  step "Installing CUDA and CUDA-enabled llama.cpp"
-  paru -S --needed cuda llama.cpp-cuda
 else
   warn "paru not found; skipping system packages."
   warn "Install prerequisites manually (see README) or set SKIP_SYSTEM_PACKAGES=1."
@@ -123,14 +175,21 @@ case ":$PATH:" in
 esac
 
 step "Writing backend configuration"
-mkdir -p "$HOME/.config/voice-harness"
-cat >"$HOME/.config/voice-harness/backends.toml" <<EOF
+if [[ "$INSTALL_PROFILE" == "showcase" ]]; then
+  voice-harness setup --profile showcase
+else
+  mkdir -p "$HOME/.config/voice-harness"
+  cat >"$HOME/.config/voice-harness/backends.toml" <<EOF
 [llm]
 provider = "$LLM_PROVIDER"
 
 [tts]
 provider = "$TTS_PROVIDER"
 EOF
+  if [[ "$INSTALL_DICTATION_DEVICE" == "cpu" ]]; then
+    voice-harness config set compute.dictation_device cpu
+  fi
+fi
 
 if [[ "$LLM_PROVIDER" == venice || "$TTS_PROVIDER" == venice ]]; then
   step "Configuring Venice credentials"
@@ -144,15 +203,17 @@ fi
 # --- 3. Dictation environment (Parakeet by default) -------------------------
 step "Syncing bundled dictation environment (.venv-dictation)"
 UV_PROJECT_ENVIRONMENT=.venv-dictation \
-  uv sync --python "$PYTHON_VERSION" --extra dictation-cuda --no-dev
+  uv sync --python "$PYTHON_VERSION" --extra "$INSTALL_DICTATION_EXTRA" --no-dev
 
 # --- 4. TTS environment ------------------------------------------------------
-step "Syncing TTS environment"
-mkdir -p "$CHATTERBOX_DIR"
-if [[ "$TTS_PROVIDER" == local ]]; then
+if [[ "$INSTALL_TTS_EXTRA" == 1 ]]; then
+  step "Syncing local TTS environment"
+  mkdir -p "$CHATTERBOX_DIR"
   UV_PROJECT_ENVIRONMENT="$CHATTERBOX_DIR/.venv" \
     uv sync --python "$PYTHON_VERSION" --extra tts --no-dev
 else
+  step "Skipping local TTS extra and Chatterbox environment ($INSTALL_PROFILE profile)"
+  mkdir -p "$CHATTERBOX_DIR"
   UV_PROJECT_ENVIRONMENT="$CHATTERBOX_DIR/.venv" \
     uv sync --python "$PYTHON_VERSION" --no-dev
 fi
@@ -161,7 +222,7 @@ fi
 if [[ "${SKIP_MODELS:-0}" == 1 ]]; then
   step "Skipping model downloads (SKIP_MODELS=1)"
 else
-  if [[ "$TTS_PROVIDER" == local ]]; then
+  if [[ "$INSTALL_DOWNLOAD_CHATTERBOX" == 1 ]]; then
     step "Caching Chatterbox Turbo weights"
     HF_HUB_OFFLINE=0 "$CHATTERBOX_DIR/.venv/bin/python" - <<'PY'
 from chatterbox.tts_turbo import ChatterboxTurboTTS
@@ -169,10 +230,10 @@ ChatterboxTurboTTS.from_pretrained(device="cuda")
 print("Chatterbox Turbo cached")
 PY
   else
-    info "Skipping Chatterbox weights (Venice TTS selected)"
+    info "Skipping Chatterbox weights (local TTS extra omitted)"
   fi
 
-  if [[ "$LLM_PROVIDER" == local ]]; then
+  if [[ "$INSTALL_DOWNLOAD_QWEN" == 1 ]]; then
     step "Downloading Qwen GGUF"
     mkdir -p "$PROJECT_DIR/models"
     if [[ -f "$PROJECT_DIR/models/$QWEN_FILE" ]]; then
@@ -184,7 +245,7 @@ PY
       hf download "$QWEN_REPO" "$QWEN_FILE" --local-dir "$PROJECT_DIR/models"
     fi
   else
-    info "Skipping Qwen download (Venice LLM selected)"
+    info "Skipping Qwen download (local LLM omitted)"
   fi
 fi
 
@@ -262,8 +323,12 @@ fi
 step "Install complete"
 bold "Remaining hardware-specific steps (see README):"
 info "1. Set your PipeWire mic source:"
-info "     systemctl --user edit voice-harness-wake.service"
-info "     [Service]"
-info "     Environment=VOICE_HARNESS_SOURCE=<PIPEWIRE_SOURCE_NAME>   # find with: wpctl status"
-info "2. If your NVIDIA device is not CUDA0, edit systemd/user/voice-harness-llm.service."
-info "3. Verify: voice-harness status && voice-harness services audit"
+info "     voice-harness config set audio.source <PIPEWIRE_SOURCE_NAME>  # find with: wpctl status"
+if [[ "$INSTALL_LLM_SERVICE" == 1 ]]; then
+  info "2. If your NVIDIA device is not CUDA0:"
+  info "     voice-harness config set compute.cuda_device <LLAMA_CPP_DEVICE>"
+  info "3. Verify: voice-harness doctor && voice-harness services audit"
+else
+  info "2. Store a Venice API key if needed: voice-harness credentials set"
+  info "3. Verify: voice-harness doctor && voice-harness services audit"
+fi

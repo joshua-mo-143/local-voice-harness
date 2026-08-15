@@ -912,6 +912,7 @@ def run_setup(
         llm_provider = "venice"
         tts_provider = "venice"
         dictation_backend = "parakeet"
+        dictation_device = "cpu" if profile == "showcase" else None
         github_enabled = True
         zendesk_enabled = False
         linear_enabled = False
@@ -967,6 +968,7 @@ def run_setup(
             == "true"
         )
         wake_threshold = input_fn("Wake threshold (0.0-1.0) [0.55]: ").strip() or "0.55"
+        dictation_device = None
 
     assignments = {
         "providers.llm.provider": llm_provider,
@@ -977,6 +979,8 @@ def run_setup(
         "integrations.linear": "true" if linear_enabled else "false",
         "audio.wake_threshold": wake_threshold,
     }
+    if dictation_device is not None:
+        assignments["compute.dictation_device"] = dictation_device
     result = commit_config_change(
         assignments,
         paths=resolved_paths,

@@ -224,7 +224,9 @@ supported on the current machine. Use `--defaults` for a non-interactive first
 write with Venice LLM/TTS and local Parakeet dictation. The equivalent
 `--profile showcase` also migrates an existing `backends.toml` into the unified
 configuration and retains the original as `backends.toml.migrated` so legacy
-provider values cannot override the selected profile. `config set` accepts dotted keys such as
+provider values cannot override the selected profile. The showcase profile
+selects Venice LLM/TTS and CPU dictation. The matching installer path is
+`PROFILE=showcase ./scripts/install.sh`. `config set` accepts dotted keys such as
 `audio.wake_threshold`, `compute.dictation_backend`, and
 `platform.cursor_followup`. After a change, the CLI reports which installed
 services are currently running and need a restart, for example
