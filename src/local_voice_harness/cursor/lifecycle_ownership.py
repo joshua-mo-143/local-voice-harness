@@ -563,6 +563,8 @@ def _build_field_ownership() -> tuple[FieldOwnership, ...]:
                 "ticket_split_parent_marker": CrashKind.TOKEN,
                 "ticket_split_parent_operation_state": CrashKind.UNCERTAINTY,
                 "ticket_split_parent_issue_id": CrashKind.IDENTITY,
+                "ticket_split_parent_terminal_state_id": CrashKind.IDENTITY,
+                "ticket_split_parent_terminal_state_name": CrashKind.CONTENT,
                 "ticket_split_children": CrashKind.CONTENT,
                 "ticket_split_operation_state": CrashKind.UNCERTAINTY,
                 "ticket_split_team": CrashKind.IDENTITY,

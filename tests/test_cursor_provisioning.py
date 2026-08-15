@@ -5207,6 +5207,7 @@ class CursorJobStateTests(unittest.TestCase):
         )
         github = mock.Mock()
         github.inspect_repository.return_value = source
+        github.issue_details.return_value = _github_update_details()
         with (
             mock.patch.object(jobs, "GitHubClient", return_value=github),
             mock.patch.object(
@@ -5475,6 +5476,16 @@ class CursorJobStateTests(unittest.TestCase):
                 return_value=LinearTeam("team-api", "API", "API"),
             ),
             mock.patch.object(
+                provider,
+                "ticket_snapshot",
+                return_value=_linear_update_snapshot(),
+            ),
+            mock.patch.object(
+                provider,
+                "resolve_terminal_state",
+                return_value=LinearWorkflowState("state-done", "Done", "completed"),
+            ),
+            mock.patch.object(
                 production_jobs,
                 "draft_ticket_split",
                 return_value=TicketSplitDraft(
@@ -5495,7 +5506,11 @@ class CursorJobStateTests(unittest.TestCase):
             "linear_ticket_split_confirmation",
         )
         self.assertEqual(updated["ticket_split_parent_action"], "close")
-        self.assertIn("Create 2 issues and close API-79?", str(updated["question"]))
+        self.assertEqual(updated["ticket_split_parent_terminal_state_name"], "Done")
+        self.assertIn(
+            "Create 2 issues and close API-79 by moving it to Done?",
+            str(updated["question"]),
+        )
         herdr.ensure_router.assert_not_called()
 
     def test_confirmed_linear_ticket_split_creates_children_and_closes_parent(
@@ -5520,6 +5535,8 @@ class CursorJobStateTests(unittest.TestCase):
                 "ticket_split_parent_action": "close",
                 "ticket_split_parent_marker": "c" * 32,
                 "ticket_split_parent_issue_id": "issue-id-api-79",
+                "ticket_split_parent_terminal_state_id": "state-done",
+                "ticket_split_parent_terminal_state_name": "Done",
                 "ticket_split_parent_operation_state": "planned",
                 "ticket_split_team": "API",
                 "ticket_split_team_id": "team-api",

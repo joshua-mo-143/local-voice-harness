@@ -403,6 +403,8 @@ _STRING_FIELDS = frozenset(
         "ticket_split_parent_marker",
         "ticket_split_parent_operation_state",
         "ticket_split_parent_issue_id",
+        "ticket_split_parent_terminal_state_id",
+        "ticket_split_parent_terminal_state_name",
         "ticket_split_children",
         "ticket_split_operation_state",
         "ticket_split_team",
@@ -812,6 +814,8 @@ _LINEAR_STATE_FIELDS = frozenset(
         "ticket_split_parent_marker",
         "ticket_split_parent_operation_state",
         "ticket_split_parent_issue_id",
+        "ticket_split_parent_terminal_state_id",
+        "ticket_split_parent_terminal_state_name",
         "ticket_split_children",
         "ticket_split_operation_state",
         "ticket_split_team",
@@ -3109,6 +3113,14 @@ class AgentJob:
     @property
     def ticket_split_parent_issue_id(self) -> str | None:
         return self._optional_string("ticket_split_parent_issue_id")
+
+    @property
+    def ticket_split_parent_terminal_state_id(self) -> str | None:
+        return self._optional_string("ticket_split_parent_terminal_state_id")
+
+    @property
+    def ticket_split_parent_terminal_state_name(self) -> str | None:
+        return self._optional_string("ticket_split_parent_terminal_state_name")
 
     @property
     def ticket_split_children(self) -> str | None:

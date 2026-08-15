@@ -279,6 +279,8 @@ _NAMED_TABLE_FIELDS: dict[str, tuple[str, ...]] = {
         "ticket_split_parent_issue_id",
         "ticket_split_parent_marker",
         "ticket_split_parent_operation_state",
+        "ticket_split_parent_terminal_state_id",
+        "ticket_split_parent_terminal_state_name",
         "ticket_split_parent_title",
         "ticket_split_prompt_session",
         "ticket_split_prompt_target",

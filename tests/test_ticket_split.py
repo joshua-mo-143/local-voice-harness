@@ -4,6 +4,8 @@ import json
 import unittest
 from unittest import mock
 
+from local_voice_harness.errors import HarnessError
+from local_voice_harness.ticket_snapshot import TicketSnapshot
 from local_voice_harness.ticket_split import (
     MISSING_TICKET_IDENTITY,
     SplitChild,
@@ -132,6 +134,17 @@ class TicketSplitAdmissionTests(unittest.TestCase):
 
 
 class TicketSplitDraftTests(unittest.TestCase):
+    snapshot = TicketSnapshot(
+        "linear",
+        "API-79",
+        "linear-issue-id",
+        "Current parent",
+        "Current parent body",
+        "revision-1",
+        "https://linear.app/acme/issue/API-79/current-parent",
+        "In Progress",
+    )
+
     def test_spoken_confirmation_names_count_and_parent(self) -> None:
         self.assertEqual(
             spoken_split_confirmation("API-79", 3, "close"),
@@ -183,7 +196,8 @@ class TicketSplitDraftTests(unittest.TestCase):
                 parent_action="close",
                 parent_state="planned",
             ),
-            "Created child tickets owner/repo#21. owner/repo#12 was not closed.",
+            "Created child tickets owner/repo#21. Creation outcome requires manual "
+            "verification for: Billing. owner/repo#12 was not closed.",
         )
 
     def test_assign_split_markers_replaces_placeholders(self) -> None:
@@ -231,11 +245,42 @@ class TicketSplitDraftTests(unittest.TestCase):
             "local_voice_harness.ticket_split.LlmTransport.from_settings",
             return_value=transport,
         ):
-            draft = draft_ticket_split("split API-79", "API-79")
+            draft = draft_ticket_split("split API-79", self.snapshot)
 
         self.assertEqual(draft.parent_action, "close")
         self.assertEqual(draft.children[0].title, "Auth")
         self.assertEqual(draft.children[0].body, "Handle login.")
+        request = transport.chat_completion.call_args.args[0]
+        self.assertIn("Current parent body", request.messages[1]["content"])
+
+    def test_rejects_duplicate_normalized_child_titles(self) -> None:
+        transport = mock.Mock()
+        transport.chat_completion.return_value = {
+            "tool_calls": [
+                {
+                    "function": {
+                        "name": "draft_ticket_split",
+                        "arguments": json.dumps(
+                            {
+                                "children": [
+                                    {"title": "Auth flow", "body": "First."},
+                                    {"title": "  AUTH   FLOW ", "body": "Second."},
+                                ],
+                                "parent_action": "none",
+                            }
+                        ),
+                    }
+                }
+            ]
+        }
+        with (
+            mock.patch(
+                "local_voice_harness.ticket_split.LlmTransport.from_settings",
+                return_value=transport,
+            ),
+            self.assertRaisesRegex(HarnessError, "duplicate child titles"),
+        ):
+            draft_ticket_split("split API-79", self.snapshot)
 
 
 if __name__ == "__main__":

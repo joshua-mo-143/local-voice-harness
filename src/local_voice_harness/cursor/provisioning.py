@@ -4292,7 +4292,13 @@ def _ask_split_confirmation(
     github: bool,
 ) -> None:
     parent = _split_parent_label(job)
-    preview = split_preview(parent, draft)
+    preview = split_preview(
+        parent,
+        draft,
+        terminal_state_name=(
+            None if github else job.ticket_split_parent_terminal_state_name
+        ),
+    )
     _worker_question(
         store,
         job.id,
@@ -4325,11 +4331,12 @@ def _run_github_issue_split(
     repository = source.name_with_owner
     checkpoint()
     if not job.ticket_split_children:
+        snapshot = github.ticket_snapshot(f"{repository}#{number}")
         config = default_user_config()
         draft = assign_split_markers(
             draft_ticket_split(
                 job.trusted_utterance or job.request,
-                f"{repository}#{number}",
+                snapshot,
                 settings=config.providers,
             )
         )
@@ -4654,13 +4661,29 @@ def _run_linear_ticket_split(
             return
         job = updated
     if not job.ticket_split_children:
+        snapshot = provider.ticket_snapshot(
+            client,
+            identifier,
+            checkpoint=checkpoint,
+        )
+        if snapshot.provider_id != job.ticket_split_parent_issue_id:
+            raise HarnessError("Linear split parent identity changed during resolution")
         config = default_user_config()
         draft = assign_split_markers(
             draft_ticket_split(
                 job.trusted_utterance or job.request,
-                identifier,
+                snapshot,
                 settings=config.providers,
             )
+        )
+        terminal_state = (
+            provider.resolve_terminal_state(
+                client,
+                identifier,
+                checkpoint=checkpoint,
+            )
+            if draft.parent_action == "close"
+            else None
         )
         parent_marker = (
             uuid.uuid4().hex if draft.parent_action in {"close", "update"} else None
@@ -4673,6 +4696,12 @@ def _run_linear_ticket_split(
                 ticket_split_parent_title=draft.parent_title,
                 ticket_split_parent_body=draft.parent_body,
                 ticket_split_parent_marker=parent_marker,
+                ticket_split_parent_terminal_state_id=(
+                    terminal_state.id if terminal_state is not None else None
+                ),
+                ticket_split_parent_terminal_state_name=(
+                    terminal_state.name if terminal_state is not None else None
+                ),
                 ticket_split_parent_operation_state=(
                     "planned" if draft.parent_action in {"close", "update"} else None
                 ),
@@ -4912,6 +4941,8 @@ def _run_linear_ticket_split(
             plan = provider.plan_ticket_close(
                 job.ticket_split_parent_issue_id or "",
                 job.issue_key or identifier,
+                job.ticket_split_parent_terminal_state_id or "",
+                job.ticket_split_parent_terminal_state_name or "",
                 correlation_marker=job.ticket_split_parent_marker,
             )
             try:
@@ -4963,6 +4994,8 @@ def _run_linear_ticket_split(
             plan = provider.plan_ticket_close(
                 job.ticket_split_parent_issue_id or "",
                 job.issue_key or identifier,
+                job.ticket_split_parent_terminal_state_id or "",
+                job.ticket_split_parent_terminal_state_name or "",
                 correlation_marker=job.ticket_split_parent_marker,
             )
             provider.submit_ticket_close(
@@ -4999,6 +5032,8 @@ def _run_linear_ticket_split(
                         provider.plan_ticket_close(
                             job.ticket_split_parent_issue_id or "",
                             job.issue_key or identifier,
+                            job.ticket_split_parent_terminal_state_id or "",
+                            job.ticket_split_parent_terminal_state_name or "",
                             correlation_marker=job.ticket_split_parent_marker,
                         ),
                         checkpoint=checkpoint,
@@ -5039,6 +5074,8 @@ def _run_linear_ticket_split(
                 provider.plan_ticket_close(
                     job.ticket_split_parent_issue_id or "",
                     job.issue_key or identifier,
+                    job.ticket_split_parent_terminal_state_id or "",
+                    job.ticket_split_parent_terminal_state_name or "",
                     correlation_marker=job.ticket_split_parent_marker,
                 ),
                 checkpoint=checkpoint,

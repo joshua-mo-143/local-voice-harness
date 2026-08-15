@@ -1436,7 +1436,12 @@ class CursorRecoveryTests(unittest.TestCase):
         updated = self.store.get(job.id)
         self.assertEqual(updated.status, JobStatus.BLOCKED)
         self.assertEqual(updated.ticket_split_operation_state, "manual_required")
+        decoded = json.loads(updated.ticket_split_children or "[]")
+        self.assertEqual(decoded[0]["state"], "created")
+        self.assertEqual(decoded[0]["created_ref"], "example/project#21")
+        self.assertEqual(decoded[1]["state"], "manual_required")
         self.assertIn("example/project#21", str(updated.result))
+        self.assertIn("manual verification for: Billing", str(updated.result))
         self.assertIn("was not closed", str(updated.result))
         client.submit_issue.assert_not_called()
 

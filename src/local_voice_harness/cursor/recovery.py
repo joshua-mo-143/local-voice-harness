@@ -1437,6 +1437,8 @@ def reconcile_uncertain_ticket_split(
                     plan = provider.plan_ticket_close(
                         job.ticket_split_parent_issue_id or "",
                         job.issue_key or "",
+                        job.ticket_split_parent_terminal_state_id or "",
+                        job.ticket_split_parent_terminal_state_name or "",
                         correlation_marker=job.ticket_split_parent_marker,
                     )
                     parent_observed = (
