@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import subprocess
+import tomllib
 import unittest
 from pathlib import Path
 
@@ -46,6 +47,19 @@ class DictationDependencyProfileTests(unittest.TestCase):
         resolved = _resolved_profile("dictation-cuda")
 
         self.assertIn("onnxruntime-gpu==", resolved)
+
+    def test_wake_uses_onnx_and_limits_tflite_to_supported_python(self) -> None:
+        metadata = tomllib.loads((PROJECT_ROOT / "pyproject.toml").read_text())
+        overrides = metadata["tool"]["uv"]["override-dependencies"]
+        daemon = (
+            PROJECT_ROOT / "src" / "local_voice_harness" / "wake" / "daemon.py"
+        ).read_text()
+
+        self.assertIn(
+            "tflite-runtime==2.14.0; python_version < '3.12'",
+            overrides,
+        )
+        self.assertIn('inference_framework="onnx"', daemon)
 
 
 if __name__ == "__main__":

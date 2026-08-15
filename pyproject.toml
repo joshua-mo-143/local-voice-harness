@@ -45,6 +45,9 @@ packages = ["src/local_voice_harness"]
 
 [tool.uv]
 override-dependencies = [
+  # OpenWakeWord declares TFLite on Linux, but production selects its ONNX backend.
+  # TFLite 2.14 has no CPython 3.12 wheel, so retain it only where installable.
+  "tflite-runtime==2.14.0; python_version < '3.12'",
   "torch==2.10.0",
   "torchaudio==2.10.0",
 ]
