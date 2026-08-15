@@ -1113,6 +1113,123 @@ class CursorJobModelTests(unittest.TestCase):
         self.assertEqual(job.schema_version, CURRENT_SCHEMA_VERSION)
         self.assertFalse(job.plan_approval_completion_pending)
 
+    def _github_issue_create_job(self, **fields: object) -> CursorJob:
+        values: dict[str, object] = {
+            "schema_version": CURRENT_SCHEMA_VERSION,
+            "id": "123456789abc",
+            "revision": 0,
+            "request": "create an issue",
+            "status": "completed",
+            "created_at": 1,
+            "completed_at": 2,
+            "result": "Created GitHub issue example/project#42.",
+            "delivered": False,
+            "issue_provider": "github",
+            "github_repository": "example/project",
+            "github_issue_create_requested": True,
+            "github_issue_create_confirmed": True,
+            "github_issue_create_title": "Fix startup",
+            "github_issue_create_marker": "a" * 32,
+            "github_issue_create_operation_state": "created",
+            "github_issue": 42,
+            "github_issue_url": "https://github.com/example/project/issues/42",
+        }
+        values.update(fields)
+        return CursorJob.from_dict(values)
+
+    def test_legacy_created_issue_identity_imports_to_canonical_fields(self) -> None:
+        job = self._github_issue_create_job(
+            github_issue=None,
+            github_issue_url=None,
+            github_issue_created_number=42,
+            github_issue_created_url="https://github.com/example/project/issues/42",
+        )
+
+        self.assertEqual(job.github_issue, 42)
+        self.assertEqual(
+            job.github_issue_url,
+            "https://github.com/example/project/issues/42",
+        )
+        self.assertEqual(job.github_issue_created_number, 42)
+        self.assertEqual(
+            job.github_issue_created_url,
+            "https://github.com/example/project/issues/42",
+        )
+        self.assertNotIn("github_issue_created_number", job.to_dict())
+        self.assertNotIn("github_issue_created_url", job.to_dict())
+
+    def test_native_created_issue_identity_cannot_disagree_with_canonical(
+        self,
+    ) -> None:
+        with self.assertRaisesRegex(JobValidationError, "must match"):
+            self._github_issue_create_job(github_issue_created_number=99)
+        with self.assertRaisesRegex(JobValidationError, "must match"):
+            self._github_issue_create_job(
+                github_issue_created_url="https://github.com/example/project/issues/99",
+            )
+
+    def test_successful_create_records_canonical_identity_once(self) -> None:
+        job = self._github_issue_create_job()
+
+        self.assertEqual(job.github_issue, 42)
+        self.assertEqual(job.github_issue_created_number, 42)
+        self.assertEqual(
+            job.github_issue_created_url,
+            "https://github.com/example/project/issues/42",
+        )
+        self.assertNotIn("github_issue_created_number", job.to_dict())
+        self.assertNotIn("github_issue_created_url", job.to_dict())
+        reloaded = CursorJob.from_dict(job.to_dict())
+        self.assertEqual(reloaded.github_issue, 42)
+        self.assertEqual(reloaded.github_issue_created_number, 42)
+        self.assertNotIn("github_issue_created_number", reloaded.to_dict())
+
+    def test_targeted_issue_job_is_distinct_from_create_job(self) -> None:
+        targeted = CursorJob.from_dict(
+            {
+                "schema_version": CURRENT_SCHEMA_VERSION,
+                "id": "bbbbbbbbbbbb",
+                "revision": 0,
+                "request": "work on issue 42",
+                "status": "queued",
+                "created_at": 1,
+                "queued_at": 1,
+                "delivered": False,
+                "issue_provider": "github",
+                "github_repository": "example/project",
+                "github_issue": 42,
+                "github_issue_url": "https://github.com/example/project/issues/42",
+            }
+        )
+
+        self.assertFalse(targeted.github_issue_create_requested)
+        self.assertIsNone(targeted.github_issue_create_operation_state)
+        self.assertEqual(targeted.github_issue, 42)
+        self.assertIsNone(targeted.github_issue_created_number)
+        self.assertIsNone(targeted.github_issue_created_url)
+        self.assertNotIn("github_issue_created_number", targeted.to_dict())
+
+    def test_unfinished_create_states_keep_marker_without_created_identity(
+        self,
+    ) -> None:
+        for state in ("submitted", "ambiguous", "manual_required"):
+            with self.subTest(state=state):
+                job = self._github_issue_create_job(
+                    status="queued",
+                    queued_at=1,
+                    completed_at=None,
+                    result=None,
+                    github_issue=None,
+                    github_issue_url=None,
+                    github_issue_create_operation_state=state,
+                )
+                self.assertEqual(job.github_issue_create_operation_state, state)
+                self.assertEqual(job.github_issue_create_marker, "a" * 32)
+                self.assertIsNone(job.github_issue)
+                self.assertIsNone(job.github_issue_created_number)
+                self.assertIsNone(job.github_issue_created_url)
+                self.assertNotIn("github_issue_created_number", job.to_dict())
+
     def test_deferred_plan_completion_requires_durable_finished_output(self) -> None:
         with self.assertRaisesRegex(
             JobValidationError,

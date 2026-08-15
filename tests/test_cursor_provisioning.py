@@ -3218,8 +3218,14 @@ class CursorJobStateTests(unittest.TestCase):
 
         updated = jobs.read_job("123456789abc")
         self.assertEqual(updated["status"], "completed")
-        self.assertEqual(updated["github_issue_created_number"], 42)
+        self.assertEqual(updated["github_issue"], 42)
+        self.assertEqual(
+            updated["github_issue_url"],
+            "https://github.com/source/project/issues/42",
+        )
         self.assertEqual(updated["github_issue_create_operation_state"], "created")
+        self.assertNotIn("github_issue_created_number", updated)
+        self.assertNotIn("github_issue_created_url", updated)
         herdr.assert_not_called()
 
     def test_stale_same_owner_issue_submission_result_is_rejected(self) -> None:
@@ -3370,7 +3376,8 @@ class CursorJobStateTests(unittest.TestCase):
         retried = jobs.read_job("123456789abc")
         self.assertEqual(retried["status"], "completed")
         self.assertEqual(retried["github_issue_create_operation_state"], "created")
-        self.assertEqual(retried["github_issue_created_number"], 42)
+        self.assertEqual(retried["github_issue"], 42)
+        self.assertNotIn("github_issue_created_number", retried)
         self.assertEqual(github.submit_issue.call_count, 2)
         self.assertEqual(github.observe_issue.call_count, 1)
 

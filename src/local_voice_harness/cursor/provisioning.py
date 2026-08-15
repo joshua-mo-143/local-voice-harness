@@ -639,8 +639,6 @@ def _finish_github_issue_creation(
             completed_at=now,
             github_issue=issue.number,
             github_issue_url=url,
-            github_issue_created_number=issue.number,
-            github_issue_created_url=url,
             github_issue_create_operation_state="created",
             worker_pid=None,
             worker_boot_id=None,

@@ -1807,6 +1807,56 @@ def test_background_job_renderings_cover_each_deliverable_status() -> None:
         assert "123456789abc" in response.display_text
 
 
+def test_completed_github_issue_creation_names_the_created_issue() -> None:
+    created = CursorJob.from_dict(
+        {
+            "id": "123456789abc",
+            "request": "create an issue about startup",
+            "status": JobStatus.COMPLETED.value,
+            "created_at": 1,
+            "completed_at": 2,
+            "delivered": False,
+            "result": "Created GitHub issue example/project#42: https://github.com/example/project/issues/42",
+            "issue_provider": "github",
+            "github_repository": "example/project",
+            "github_issue_create_requested": True,
+            "github_issue_create_confirmed": True,
+            "github_issue_create_title": "Fix startup",
+            "github_issue_create_marker": "a" * 32,
+            "github_issue_create_operation_state": "created",
+            "github_issue": 42,
+            "github_issue_url": "https://github.com/example/project/issues/42",
+            "speakable_label": "create issue",
+        }
+    )
+    targeted = CursorJob.from_dict(
+        {
+            "id": "bbbbbbbbbbbb",
+            "request": "work on issue 42",
+            "status": JobStatus.COMPLETED.value,
+            "created_at": 1,
+            "completed_at": 2,
+            "delivered": False,
+            "result": "Changed the startup path.",
+            "issue_provider": "github",
+            "github_repository": "example/project",
+            "github_issue": 42,
+            "github_issue_url": "https://github.com/example/project/issues/42",
+            "speakable_label": "issue 42",
+        }
+    )
+
+    created_response = service.render_job_announcement(created)
+    targeted_response = service.render_job_announcement(targeted)
+
+    assert created_response.spoken_text == "Created GitHub issue 42."
+    assert created.github_issue_create_requested
+    assert created.github_issue_created_number == 42
+    assert targeted_response.spoken_text == "Cursor finished issue 42."
+    assert not targeted.github_issue_create_requested
+    assert targeted.github_issue_created_number is None
+
+
 def test_missing_linear_team_is_spoken_directly() -> None:
     job = CursorJob.from_dict(
         {

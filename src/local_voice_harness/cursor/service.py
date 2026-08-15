@@ -2960,11 +2960,9 @@ def render_job_announcement(job: CursorJob) -> AssistantResponse:
     identity = f"Cursor job {job.id} ({label})"
     if job.status == JobStatus.COMPLETED:
         detail = str(job.result or "").strip()
-        if job.github_issue_create_requested and job.github_issue_created_number:
+        if job.github_issue_create_requested and job.github_issue:
             return AssistantResponse(
-                spoken_text=(
-                    f"Created GitHub issue {job.github_issue_created_number}."
-                ),
+                spoken_text=f"Created GitHub issue {job.github_issue}.",
                 display_text=detail,
             )
         if job.linear_ticket_create_requested and job.linear_ticket_created_identifier:

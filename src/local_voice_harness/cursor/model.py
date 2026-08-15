@@ -1014,9 +1014,39 @@ def _infer_legacy_issue_provider(values: Mapping[str, object]) -> str | None:
         # Historically issue_key was exclusively owned by the Linear
         # integration. GitHub fields could also be present as captured context.
         return "linear"
-    if values.get("github_issue") is not None:
+    if (
+        values.get("github_issue") is not None
+        or values.get("github_issue_created_number") is not None
+    ):
         return "github"
     return None
+
+
+def _canonicalize_github_issue_creation_identity(values: dict[str, object]) -> None:
+    """Translate legacy created identity, fail closed on conflict, then drop it."""
+
+    created_number = values.get("github_issue_created_number")
+    created_url = values.get("github_issue_created_url")
+    issue = values.get("github_issue")
+    url = values.get("github_issue_url")
+    if created_number is not None:
+        created_number = _integer(created_number, "github_issue_created_number")
+    if issue is not None:
+        issue = _integer(issue, "github_issue")
+    if created_number is not None and issue is not None and created_number != issue:
+        raise JobValidationError(
+            "created GitHub issue identity must match canonical issue identity"
+        )
+    if created_url is not None and url is not None and str(created_url) != str(url):
+        raise JobValidationError(
+            "created GitHub issue identity must match canonical issue identity"
+        )
+    if created_number is not None and issue is None:
+        values["github_issue"] = created_number
+    if created_url is not None and url is None:
+        values["github_issue_url"] = str(created_url)
+    values.pop("github_issue_created_number", None)
+    values.pop("github_issue_created_url", None)
 
 
 def _default_participant_admission_state(values: Mapping[str, object]) -> str:
@@ -1103,6 +1133,7 @@ def migrate_job_record(raw: Mapping[str, object]) -> tuple[dict[str, object], in
         values,
         legacy_record=loaded_version < CURRENT_SCHEMA_VERSION,
     )
+    _canonicalize_github_issue_creation_identity(values)
     values["schema_version"] = CURRENT_SCHEMA_VERSION
     return values, loaded_version
 
@@ -2478,11 +2509,15 @@ class AgentJob:
 
     @property
     def github_issue_created_number(self) -> int | None:
-        return self._optional_int("github_issue_created_number")
+        if not self.github_issue_create_requested:
+            return None
+        return self.github_issue
 
     @property
     def github_issue_created_url(self) -> str | None:
-        return self._optional_string("github_issue_created_url")
+        if not self.github_issue_create_requested:
+            return None
+        return self.github_issue_url
 
     @property
     def linear_ticket_create_requested(self) -> bool:

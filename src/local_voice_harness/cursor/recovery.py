@@ -656,8 +656,6 @@ def reconcile_uncertain_issue_creation(
             status=JobStatus.COMPLETED,
             github_issue=result.issue.number,
             github_issue_url=result.url,
-            github_issue_created_number=result.issue.number,
-            github_issue_created_url=result.url,
             github_issue_create_operation_state="created",
             result=f"Created GitHub issue {result.issue.reference}: {result.url}",
             completed_at=now,
