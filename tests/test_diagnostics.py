@@ -489,9 +489,7 @@ Audio
 
 _WPCTL_FILTER_STATUS = _WPCTL_STATUS.replace(
     " ├─ Filters:\n",
-    " ├─ Filters:\n"
-    " │      72. voice_harness_aec_sink\n"
-    " │  *   73. voice_harness_aec\n",
+    " ├─ Filters:\n │      72. voice_harness_aec_sink\n │  *   73. voice_harness_aec\n",
 )
 
 
