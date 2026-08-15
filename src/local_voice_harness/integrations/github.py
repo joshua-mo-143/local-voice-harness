@@ -2530,6 +2530,9 @@ _GITHUB_STATE_SECTIONS: dict[str, dict[str, str]] = {
         "marker": "github_issue_close_marker",
         "operation_state": "github_issue_close_operation_state",
     },
+    "issue_split": {
+        "requested": "github_issue_split_requested",
+    },
     "pull_request": {
         "number": "github_pull_request",
         "worktree_state": "pull_request_worktree_state",

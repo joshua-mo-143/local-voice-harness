@@ -63,6 +63,11 @@ from .ticket_close import (
     close_turn_arguments,
     wants_ticket_close_context,
 )
+from .ticket_split import (
+    admit_ticket_split,
+    split_turn_arguments,
+    wants_ticket_split_context,
+)
 from .ticket_targets import MISSING_ISSUE_SCOPE_RESPONSE, extract_ticket_targets
 from .ticket_update import (
     admit_ticket_update,
@@ -109,12 +114,15 @@ def _context_for_route(
                 Intent.LINEAR_TICKET_UPDATE,
                 Intent.GITHUB_ISSUE_CLOSE,
                 Intent.LINEAR_TICKET_CLOSE,
+                Intent.GITHUB_ISSUE_SPLIT,
+                Intent.LINEAR_TICKET_SPLIT,
                 Intent.WORKSPACE_CONSULTATION,
             }
         )
         or cursor_consultation.wants_ticket_consultation_context(text)
         or wants_ticket_update_context(text)
         or wants_ticket_close_context(text)
+        or wants_ticket_split_context(text)
     ):
         return request_context(
             text,
@@ -299,6 +307,11 @@ def respond(text: str, *, user_config: UserConfig | None = None) -> None:
                 extraction,
                 focused_issue=context.focused_issue,
             )
+            split_admission = admit_ticket_split(
+                text,
+                extraction,
+                focused_issue=context.focused_issue,
+            )
             if cursor_consultation.is_apply_recommendation_request(text):
                 choice_id = (
                     cursor_consultation.applicable_choice_id(
@@ -405,6 +418,33 @@ def respond(text: str, *, user_config: UserConfig | None = None) -> None:
                             issue_key=dispatch.issue_key,
                             linear_ticket_close_requested=(
                                 dispatch.linear_ticket_close_requested
+                            ),
+                        ),
+                        delivery_claims=delivery_claims,
+                        integrations=integrations,
+                    )[0]
+            elif split_admission is not None:
+                if split_admission.ticket is None:
+                    response = split_admission.missing_identity_response
+                elif not route.actionable:
+                    response = (
+                        "I did not split a ticket because the request was unclear. "
+                        "Please name the ticket to split."
+                    )
+                else:
+                    dispatch = split_turn_arguments(split_admission.ticket)
+                    response = cursor_turn(
+                        CursorTurnRequest(
+                            context.text,
+                            utterance=text,
+                            github_repository=dispatch.github_repository,
+                            github_issue=dispatch.github_issue,
+                            github_issue_split_requested=(
+                                dispatch.github_issue_split_requested
+                            ),
+                            issue_key=dispatch.issue_key,
+                            linear_ticket_split_requested=(
+                                dispatch.linear_ticket_split_requested
                             ),
                         ),
                         delivery_claims=delivery_claims,

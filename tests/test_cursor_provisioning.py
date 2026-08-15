@@ -79,6 +79,11 @@ from local_voice_harness.local_git import (
     LocalGitRefChanged,
 )
 from local_voice_harness.ticket_snapshot import TicketSnapshot
+from local_voice_harness.ticket_split import (
+    SplitChild,
+    TicketSplitDraft,
+    encode_split_children,
+)
 from local_voice_harness.ticket_update import TicketUpdateDraft
 from tests.support import join_threads
 
@@ -5179,6 +5184,428 @@ class CursorJobStateTests(unittest.TestCase):
         )
         submit.assert_called_once()
 
+    def test_worker_drafts_issue_split_before_requesting_confirmation(self) -> None:
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "split source/project#12 into two issues",
+                "trusted_utterance": "split source/project#12 into two issues",
+                "issue_provider": "github",
+                "github_repository": "source/project",
+                "github_issue": 12,
+                "github_issue_split_requested": True,
+                "status": "queued",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        source = GitHubRepository(
+            "source/project",
+            "https://github.com/source/project",
+            False,
+            "main",
+        )
+        github = mock.Mock()
+        github.inspect_repository.return_value = source
+        with (
+            mock.patch.object(jobs, "GitHubClient", return_value=github),
+            mock.patch.object(
+                production_jobs,
+                "draft_ticket_split",
+                return_value=TicketSplitDraft(
+                    (
+                        SplitChild("Auth", "Handle login.", "0" * 32),
+                        SplitChild("Billing", "Handle invoices.", "0" * 32),
+                    ),
+                    "close",
+                ),
+            ),
+        ):
+            service.run_worker("123456789abc")
+
+        updated = jobs.read_job("123456789abc")
+        self.assertEqual(updated["status"], "awaiting_user")
+        self.assertEqual(
+            updated["clarification_kind"],
+            "github_issue_split_confirmation",
+        )
+        self.assertEqual(updated["ticket_split_parent_action"], "close")
+        self.assertEqual(updated["ticket_split_operation_state"], "planned")
+        self.assertIn(
+            "Create 2 issues and close source/project#12?", str(updated["question"])
+        )
+        self.assertIn("Auth", str(updated["question"]))
+        github.submit_issue.assert_not_called()
+        github.submit_issue_close.assert_not_called()
+
+    def test_confirmed_issue_split_creates_children_and_closes_parent(self) -> None:
+        children = encode_split_children(
+            (
+                SplitChild("Auth", "Handle login.", "a" * 32),
+                SplitChild("Billing", "Handle invoices.", "b" * 32),
+            )
+        )
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "split source/project#12 into two issues",
+                "trusted_utterance": "split source/project#12 into two issues",
+                "issue_provider": "github",
+                "github_repository": "source/project",
+                "github_issue": 12,
+                "github_issue_split_requested": True,
+                "ticket_split_confirmed": True,
+                "ticket_split_children": children,
+                "ticket_split_parent_action": "close",
+                "ticket_split_parent_marker": "c" * 32,
+                "ticket_split_parent_operation_state": "planned",
+                "ticket_split_operation_state": "planned",
+                "status": "queued",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        source = GitHubRepository(
+            "source/project",
+            "https://github.com/source/project",
+            False,
+            "main",
+        )
+        first = GitHubIssueCreationResult(
+            GitHubIssue("source", "project", 21),
+            "https://github.com/source/project/issues/21",
+            "a" * 32,
+        )
+        second = GitHubIssueCreationResult(
+            GitHubIssue("source", "project", 22),
+            "https://github.com/source/project/issues/22",
+            "b" * 32,
+        )
+        closed = GitHubIssueCloseResult(
+            GitHubIssue("source", "project", 12),
+            "https://github.com/source/project/issues/12",
+            "c" * 32,
+        )
+        github = mock.Mock()
+        github.inspect_repository.return_value = source
+        github.submit_issue.side_effect = [first, second]
+        github.submit_issue_close.return_value = closed
+        herdr = mock.Mock()
+        with (
+            mock.patch.object(jobs, "GitHubClient", return_value=github),
+            mock.patch.object(jobs, "HerdrClient", return_value=herdr),
+        ):
+            service.run_worker("123456789abc")
+
+        updated = jobs.read_job("123456789abc")
+        self.assertEqual(updated["status"], "completed")
+        self.assertIn("source/project#21", str(updated["result"]))
+        self.assertIn("source/project#22", str(updated["result"]))
+        self.assertIn("Closed source/project#12", str(updated["result"]))
+        self.assertEqual(github.submit_issue.call_count, 2)
+        github.submit_issue_close.assert_called_once()
+        herdr.assert_not_called()
+
+    def test_partial_split_failure_does_not_retry_landed_child(self) -> None:
+        children = encode_split_children(
+            (
+                SplitChild("Auth", "Handle login.", "a" * 32),
+                SplitChild("Billing", "Handle invoices.", "b" * 32),
+            )
+        )
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "split the issue",
+                "trusted_utterance": "split the issue",
+                "issue_provider": "github",
+                "github_repository": "source/project",
+                "github_issue": 12,
+                "github_issue_split_requested": True,
+                "ticket_split_confirmed": True,
+                "ticket_split_children": children,
+                "ticket_split_parent_action": "close",
+                "ticket_split_parent_marker": "c" * 32,
+                "ticket_split_parent_operation_state": "planned",
+                "ticket_split_operation_state": "planned",
+                "status": "queued",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        github = mock.Mock()
+        github.inspect_repository.return_value = GitHubRepository(
+            "source/project",
+            "https://github.com/source/project",
+            False,
+            "main",
+        )
+        first = GitHubIssueCreationResult(
+            GitHubIssue("source", "project", 21),
+            "https://github.com/source/project/issues/21",
+            "a" * 32,
+        )
+        github.submit_issue.side_effect = [first, GitHubOperationAmbiguous("timed out")]
+        github.observe_issue.return_value = None
+        with mock.patch.object(jobs, "GitHubClient", return_value=github):
+            service.run_worker("123456789abc")
+
+        updated = jobs.read_job("123456789abc")
+        self.assertEqual(updated["status"], "queued")
+        self.assertEqual(updated["ticket_split_operation_state"], "ambiguous")
+        decoded = json.loads(str(updated["ticket_split_children"]))
+        self.assertEqual(decoded[0]["state"], "created")
+        self.assertEqual(decoded[0]["created_ref"], "source/project#21")
+        self.assertEqual(decoded[1]["state"], "ambiguous")
+        self.assertEqual(github.submit_issue.call_count, 2)
+        github.submit_issue_close.assert_not_called()
+
+        github.submit_issue.reset_mock()
+        github.observe_issue.return_value = None
+        with mock.patch.object(jobs, "GitHubClient", return_value=github):
+            service.run_worker("123456789abc")
+        github.submit_issue.assert_not_called()
+
+    def test_issue_split_start_failure_retries_only_unstarted_child(self) -> None:
+        children = encode_split_children(
+            (
+                SplitChild(
+                    "Auth",
+                    "Handle login.",
+                    "a" * 32,
+                    state="created",
+                    created_ref="source/project#21",
+                    created_url="https://github.com/source/project/issues/21",
+                ),
+                SplitChild("Billing", "Handle invoices.", "b" * 32),
+            )
+        )
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "split the issue",
+                "trusted_utterance": "split the issue",
+                "issue_provider": "github",
+                "github_repository": "source/project",
+                "github_issue": 12,
+                "github_issue_split_requested": True,
+                "ticket_split_confirmed": True,
+                "ticket_split_children": children,
+                "ticket_split_parent_action": "none",
+                "ticket_split_operation_state": "planned",
+                "status": "queued",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        github = mock.Mock()
+        github.inspect_repository.return_value = GitHubRepository(
+            "source/project",
+            "https://github.com/source/project",
+            False,
+            "main",
+        )
+        second = GitHubIssueCreationResult(
+            GitHubIssue("source", "project", 22),
+            "https://github.com/source/project/issues/22",
+            "b" * 32,
+        )
+        github.submit_issue.side_effect = [
+            GitHubCommandStartError("missing gh"),
+            second,
+        ]
+        github.observe_issue.side_effect = GitHubError("gh still missing")
+        with (
+            mock.patch.object(jobs, "GitHubClient", return_value=github),
+            mock.patch.object(service, "launch_worker") as launch,
+        ):
+            service.run_worker("123456789abc")
+
+        updated = jobs.read_job("123456789abc")
+        self.assertEqual(updated["status"], "queued")
+        self.assertEqual(updated["ticket_split_operation_state"], "planned")
+        decoded = json.loads(str(updated["ticket_split_children"]))
+        self.assertEqual(decoded[0]["state"], "created")
+        self.assertEqual(decoded[1]["state"], "planned")
+        self.assertEqual(github.submit_issue.call_count, 1)
+        launch.assert_called_once_with("123456789abc")
+
+        with mock.patch.object(jobs, "GitHubClient", return_value=github):
+            service.run_worker("123456789abc")
+
+        retried = jobs.read_job("123456789abc")
+        self.assertEqual(retried["status"], "completed")
+        self.assertIn("source/project#21", str(retried["result"]))
+        self.assertIn("source/project#22", str(retried["result"]))
+        self.assertEqual(github.submit_issue.call_count, 2)
+
+    def test_worker_drafts_linear_ticket_split_before_requesting_confirmation(
+        self,
+    ) -> None:
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "split API-79 into two tickets",
+                "trusted_utterance": "split API-79 into two tickets",
+                "issue_provider": "linear",
+                "issue_key": "API-79",
+                "linear_ticket_split_requested": True,
+                "status": "queued",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        provider = linear.LinearIntegration()
+        herdr = mock.Mock()
+        with (
+            mock.patch.object(jobs, "HerdrClient", return_value=herdr),
+            mock.patch.object(
+                production_jobs,
+                "issue_provider",
+                return_value=provider,
+            ),
+            mock.patch.object(
+                provider,
+                "resolve_issue",
+                return_value=("issue-id-api-79", LinearIssue("API-79")),
+            ),
+            mock.patch.object(
+                provider,
+                "resolve_team",
+                return_value=LinearTeam("team-api", "API", "API"),
+            ),
+            mock.patch.object(
+                production_jobs,
+                "draft_ticket_split",
+                return_value=TicketSplitDraft(
+                    (
+                        SplitChild("Auth", "Handle login.", "0" * 32),
+                        SplitChild("Billing", "Handle invoices.", "0" * 32),
+                    ),
+                    "close",
+                ),
+            ),
+        ):
+            service.run_worker("123456789abc")
+
+        updated = jobs.read_job("123456789abc")
+        self.assertEqual(updated["status"], "awaiting_user")
+        self.assertEqual(
+            updated["clarification_kind"],
+            "linear_ticket_split_confirmation",
+        )
+        self.assertEqual(updated["ticket_split_parent_action"], "close")
+        self.assertIn("Create 2 issues and close API-79?", str(updated["question"]))
+        herdr.ensure_router.assert_not_called()
+
+    def test_confirmed_linear_ticket_split_creates_children_and_closes_parent(
+        self,
+    ) -> None:
+        children = encode_split_children(
+            (
+                SplitChild("Auth", "Handle login.", "a" * 32),
+                SplitChild("Billing", "Handle invoices.", "b" * 32),
+            )
+        )
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "split API-79 into two tickets",
+                "trusted_utterance": "split API-79 into two tickets",
+                "issue_provider": "linear",
+                "issue_key": "API-79",
+                "linear_ticket_split_requested": True,
+                "ticket_split_confirmed": True,
+                "ticket_split_children": children,
+                "ticket_split_parent_action": "close",
+                "ticket_split_parent_marker": "c" * 32,
+                "ticket_split_parent_issue_id": "issue-id-api-79",
+                "ticket_split_parent_operation_state": "planned",
+                "ticket_split_team": "API",
+                "ticket_split_team_id": "team-api",
+                "ticket_split_operation_state": "planned",
+                "status": "queued",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        provider = linear.LinearIntegration()
+        first = LinearTicketCreationResult(
+            LinearIssue("API-80"),
+            "https://linear.app/acme/issue/API-80/auth",
+            "a" * 32,
+        )
+        second = LinearTicketCreationResult(
+            LinearIssue("API-81"),
+            "https://linear.app/acme/issue/API-81/billing",
+            "b" * 32,
+        )
+        closed = LinearTicketCloseResult(
+            LinearIssue("API-79"),
+            "https://linear.app/acme/issue/API-79/parent",
+            "c" * 32,
+        )
+        created = [first, second]
+
+        def submit_create(
+            *_args: object, **kwargs: object
+        ) -> LinearTicketCreationResult:
+            before_submit = kwargs["before_submit"]
+            accepted = kwargs["accepted"]
+            assert callable(before_submit)
+            assert callable(accepted)
+            before_submit("voice-router", "router-session", "prompt-token", 7)
+            accepted()
+            return created.pop(0)
+
+        def submit_close(*_args: object, **kwargs: object) -> LinearTicketCloseResult:
+            before_submit = kwargs["before_submit"]
+            accepted = kwargs["accepted"]
+            assert callable(before_submit)
+            assert callable(accepted)
+            before_submit("voice-router", "router-session", "prompt-token", 8)
+            accepted()
+            return closed
+
+        herdr = mock.Mock()
+        with (
+            mock.patch.object(jobs, "HerdrClient", return_value=herdr),
+            mock.patch.object(
+                production_jobs,
+                "issue_provider",
+                return_value=provider,
+            ),
+            mock.patch.object(
+                provider,
+                "submit_ticket_creation",
+                side_effect=submit_create,
+            ) as submit,
+            mock.patch.object(
+                provider,
+                "observe_ticket_creation",
+                side_effect=[first, second],
+            ),
+            mock.patch.object(
+                provider,
+                "submit_ticket_close",
+                side_effect=submit_close,
+            ) as close,
+            mock.patch.object(
+                provider,
+                "observe_ticket_close",
+                return_value=closed,
+            ),
+        ):
+            service.run_worker("123456789abc")
+
+        updated = jobs.read_job("123456789abc")
+        self.assertEqual(updated["status"], "completed")
+        self.assertIn("API-80", str(updated["result"]))
+        self.assertIn("API-81", str(updated["result"]))
+        self.assertIn("Closed API-79", str(updated["result"]))
+        self.assertEqual(submit.call_count, 2)
+        close.assert_called_once()
+
     def test_only_trusted_affirmative_reply_confirms_fork(self) -> None:
         job = {
             "id": "123456789abc",
@@ -5678,10 +6105,12 @@ class CursorJobStateTests(unittest.TestCase):
             github_repo_create_org_requested=False,
             github_issue_update_requested=False,
             github_issue_close_requested=False,
+            github_issue_split_requested=False,
             linear_team=None,
             linear_ticket_create_requested=False,
             linear_ticket_update_requested=False,
             linear_ticket_close_requested=False,
+            linear_ticket_split_requested=False,
             fork_requested=False,
             github_pull_request=None,
             agent=None,

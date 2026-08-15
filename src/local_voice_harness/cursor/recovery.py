@@ -51,6 +51,13 @@ from ..questions import (
     observe_question_prompt,
     replan_question_prompt,
 )
+from ..ticket_split import (
+    decode_split_children,
+    encode_split_children,
+    replace_split_child,
+    split_parent_identity,
+    split_result_message,
+)
 from ..user_config import default_user_config
 from . import questions as question_adapter
 from .agent_outbox import (
@@ -1337,6 +1344,252 @@ def reconcile_uncertain_linear_ticket_close(
     store.update(job.id, reconcile)
 
 
+def reconcile_uncertain_ticket_split(
+    store: JobStore,
+    job: CursorJob,
+    *,
+    now: float,
+    github_factory: GitHubFactory = GitHubClient,
+    herdr_factory: HerdrFactory = HerdrClient,
+    linear_factory: LinearFactory | None = None,
+) -> None:
+    states = frozenset({"submitting", "submitted", "ambiguous"})
+    if not (job.github_issue_split_requested or job.linear_ticket_split_requested) or (
+        job.ticket_split_operation_state not in states
+        and job.ticket_split_parent_operation_state not in states
+    ):
+        return
+    children = decode_split_children(job.ticket_split_children)
+    parent = split_parent_identity(
+        github_repository=job.github_repository,
+        github_issue=job.github_issue,
+        issue_key=job.issue_key,
+    )
+    in_flight_index = next(
+        (index for index, child in enumerate(children) if child.state in states),
+        None,
+    )
+    observed_ref: str | None = None
+    observed_url: str | None = None
+    parent_observed = False
+    try:
+        if in_flight_index is not None:
+            child = children[in_flight_index]
+            if job.github_issue_split_requested:
+                github = _github_provider(github_factory)
+                plan = github.plan_issue_creation(
+                    job.github_repository or "",
+                    child.title,
+                    child.body,
+                    correlation_marker=child.marker,
+                )
+                result = github.observe_issue_creation(plan)
+                if result is not None:
+                    observed_ref = result.issue.reference
+                    observed_url = result.url
+            else:
+                provider = _linear_provider(linear_factory)
+                plan = provider.plan_ticket_creation(
+                    job.ticket_split_team_id or "",
+                    job.ticket_split_team or "",
+                    child.title,
+                    child.body,
+                    correlation_marker=child.marker,
+                )
+                result = provider.observe_ticket_creation(herdr_factory(), plan)
+                if result is not None:
+                    observed_ref = result.issue.identifier
+                    observed_url = result.url
+        elif job.ticket_split_parent_operation_state in states:
+            if job.github_issue_split_requested:
+                github = _github_provider(github_factory)
+                if job.ticket_split_parent_action == "update":
+                    plan = github.plan_issue_update(
+                        job.github_repository or "",
+                        job.github_issue or 0,
+                        job.ticket_split_parent_title or "",
+                        job.ticket_split_parent_body or "",
+                        correlation_marker=job.ticket_split_parent_marker,
+                    )
+                    parent_observed = github.observe_issue_update(plan) is not None
+                else:
+                    plan = github.plan_issue_close(
+                        job.github_repository or "",
+                        job.github_issue or 0,
+                        correlation_marker=job.ticket_split_parent_marker,
+                    )
+                    parent_observed = github.observe_issue_close(plan) is not None
+            else:
+                provider = _linear_provider(linear_factory)
+                if job.ticket_split_parent_action == "update":
+                    plan = provider.plan_ticket_update(
+                        job.ticket_split_parent_issue_id or "",
+                        job.issue_key or "",
+                        job.ticket_split_parent_title or "",
+                        job.ticket_split_parent_body or "",
+                        correlation_marker=job.ticket_split_parent_marker,
+                    )
+                    parent_observed = (
+                        provider.observe_ticket_update(herdr_factory(), plan)
+                        is not None
+                    )
+                else:
+                    plan = provider.plan_ticket_close(
+                        job.ticket_split_parent_issue_id or "",
+                        job.issue_key or "",
+                        correlation_marker=job.ticket_split_parent_marker,
+                    )
+                    parent_observed = (
+                        provider.observe_ticket_close(herdr_factory(), plan) is not None
+                    )
+    except (GitHubError, HarnessError, LinearError):
+        return
+
+    def reconcile(current: CursorJob) -> CursorJob | None:
+        if not (
+            current.github_issue_split_requested
+            or current.linear_ticket_split_requested
+        ):
+            return None
+        current_children = decode_split_children(current.ticket_split_children)
+        current_index = next(
+            (
+                index
+                for index, child in enumerate(current_children)
+                if child.state in states
+            ),
+            None,
+        )
+        if in_flight_index is not None:
+            if current_index != in_flight_index:
+                return None
+            if observed_ref is None:
+                updated = replace_split_child(
+                    current_children,
+                    in_flight_index,
+                    state="manual_required",
+                )
+                message = split_result_message(
+                    parent,
+                    updated,
+                    parent_action=current.ticket_split_parent_action or "none",
+                    parent_state=current.ticket_split_parent_operation_state,
+                )
+                return current.evolve_recovery(
+                    now=now,
+                    status=JobStatus.BLOCKED,
+                    ticket_split_children=encode_split_children(updated),
+                    ticket_split_operation_state="manual_required",
+                    result=(
+                        f"{message} Ticket split could not be reconciled "
+                        "automatically. Check the created children before trying again."
+                    ),
+                    completed_at=now,
+                    reconcile=False,
+                    worker_operation=None,
+                    worker_pid=None,
+                    worker_boot_id=None,
+                    worker_process_start=None,
+                    worker_token=None,
+                    prepare_delivery=True,
+                )
+            updated = replace_split_child(
+                current_children,
+                in_flight_index,
+                state="created",
+                created_ref=observed_ref,
+                created_url=observed_url,
+            )
+            remaining = any(child.state == "planned" for child in updated)
+            parent_pending = (
+                current.ticket_split_parent_action or "none"
+            ) != "none" and current.ticket_split_parent_operation_state != "created"
+            if remaining or parent_pending:
+                return current.evolve(
+                    status=JobStatus.QUEUED,
+                    queued_at=now,
+                    ticket_split_children=encode_split_children(updated),
+                    ticket_split_operation_state="planned",
+                    reconcile=False,
+                    worker_operation=None,
+                    worker_pid=None,
+                    worker_boot_id=None,
+                    worker_process_start=None,
+                    worker_token=None,
+                )
+            message = split_result_message(
+                parent,
+                updated,
+                parent_action=current.ticket_split_parent_action or "none",
+                parent_state=current.ticket_split_parent_operation_state,
+            )
+            return current.evolve_recovery(
+                now=now,
+                status=JobStatus.COMPLETED,
+                ticket_split_children=encode_split_children(updated),
+                ticket_split_operation_state="created",
+                result=message,
+                completed_at=now,
+                reconcile=False,
+                worker_operation=None,
+                worker_pid=None,
+                worker_boot_id=None,
+                worker_process_start=None,
+                worker_token=None,
+                prepare_delivery=True,
+            )
+        if current.ticket_split_parent_operation_state not in states:
+            return None
+        if not parent_observed:
+            message = split_result_message(
+                parent,
+                current_children,
+                parent_action=current.ticket_split_parent_action or "none",
+                parent_state="manual_required",
+            )
+            return current.evolve_recovery(
+                now=now,
+                status=JobStatus.BLOCKED,
+                ticket_split_parent_operation_state="manual_required",
+                ticket_split_operation_state="manual_required",
+                result=(
+                    f"{message} Ticket split could not be reconciled "
+                    "automatically. Check the parent ticket before trying again."
+                ),
+                completed_at=now,
+                reconcile=False,
+                worker_operation=None,
+                worker_pid=None,
+                worker_boot_id=None,
+                worker_process_start=None,
+                worker_token=None,
+                prepare_delivery=True,
+            )
+        message = split_result_message(
+            parent,
+            current_children,
+            parent_action=current.ticket_split_parent_action or "none",
+            parent_state="created",
+        )
+        return current.evolve_recovery(
+            now=now,
+            status=JobStatus.COMPLETED,
+            ticket_split_parent_operation_state="created",
+            ticket_split_operation_state="created",
+            result=message,
+            completed_at=now,
+            reconcile=False,
+            worker_operation=None,
+            worker_pid=None,
+            worker_boot_id=None,
+            worker_process_start=None,
+            worker_token=None,
+            prepare_delivery=True,
+        )
+
+    store.update(job.id, reconcile)
+
+
 def reconcile_uncertain_worktree(
     store: JobStore,
     job: CursorJob,
@@ -1552,6 +1805,15 @@ def reconcile_uncertain_operations(
         store,
         current,
         now=now,
+        herdr_factory=herdr_factory,
+        linear_factory=linear_factory,
+    )
+    current = store.get(job.id)
+    reconcile_uncertain_ticket_split(
+        store,
+        current,
+        now=now,
+        github_factory=github_factory,
         herdr_factory=herdr_factory,
         linear_factory=linear_factory,
     )

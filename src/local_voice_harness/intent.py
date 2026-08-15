@@ -76,6 +76,12 @@ ROUTER_SYSTEM_PROMPT = (
     "issue. Do not use it for updating, implementing, or creating an issue. "
     "Use linear_ticket_close when the user asks to close or resolve an existing Linear "
     "ticket. Do not use it for updating, implementing, or creating a ticket. "
+    "Use github_issue_split when the user asks to split, divide, or break an existing "
+    "GitHub issue into child issues. Do not use it for implementing, merging, or "
+    "reviewing the issue. "
+    "Use linear_ticket_split when the user asks to split, divide, or break an existing "
+    "Linear ticket into child tickets. Do not use it for implementing, merging, or "
+    "reviewing the ticket. "
     "Use cursor_details when the user asks to see or hear more detail about the "
     "just-announced completed result, such as 'tell me more' or 'show me the details'; "
     "this is read-only and must not start more work. "
@@ -171,9 +177,11 @@ ROUTE_TOOL = {
                         "github_org_repo_create",
                         "github_issue_update",
                         "github_issue_close",
+                        "github_issue_split",
                         "linear_ticket_create",
                         "linear_ticket_update",
                         "linear_ticket_close",
+                        "linear_ticket_split",
                         "end_conversation",
                         "uncertain",
                     ],
@@ -228,9 +236,11 @@ class Intent(StrEnum):
     GITHUB_ORG_REPO_CREATE = "github_org_repo_create"
     GITHUB_ISSUE_UPDATE = "github_issue_update"
     GITHUB_ISSUE_CLOSE = "github_issue_close"
+    GITHUB_ISSUE_SPLIT = "github_issue_split"
     LINEAR_TICKET_CREATE = "linear_ticket_create"
     LINEAR_TICKET_UPDATE = "linear_ticket_update"
     LINEAR_TICKET_CLOSE = "linear_ticket_close"
+    LINEAR_TICKET_SPLIT = "linear_ticket_split"
     # Compatibility aliases for the original Cursor-specific intent names.
     CURSOR_SUBMIT = "cursor_submit"
     CURSOR_REPLY = "cursor_reply"

@@ -106,6 +106,19 @@ from ..questions import (
     submit_question_prompt,
 )
 from ..ticket_snapshot import TicketSnapshot
+from ..ticket_split import (
+    SplitChild,
+    TicketSplitDraft,
+    assign_split_markers,
+    decode_split_children,
+    draft_ticket_split,
+    encode_split_children,
+    linear_team_key,
+    replace_split_child,
+    split_parent_identity,
+    split_preview,
+    split_result_message,
+)
 from ..ticket_update import draft_ticket_update
 from ..user_config import (
     PlanApprovalMode,
@@ -4094,6 +4107,950 @@ def _run_linear_ticket_close(
     )
 
 
+def _run_ticket_split(
+    store: JobStore,
+    job: CursorJob,
+    token: WorkerClaim,
+    clients: ClientFactories,
+    checkpoint: Callable[[], None],
+) -> None:
+    if job.github_issue_split_requested:
+        _run_github_issue_split(store, job, token, clients, checkpoint)
+        return
+    _run_linear_ticket_split(store, job, token, clients, checkpoint)
+
+
+def _split_parent_label(job: CursorJob) -> str:
+    return split_parent_identity(
+        github_repository=job.github_repository,
+        github_issue=job.github_issue,
+        issue_key=job.issue_key,
+    )
+
+
+def _persist_split_job(
+    store: JobStore,
+    job: CursorJob,
+    token: WorkerClaim,
+    mutate: Callable[[CursorJob], CursorJob],
+    *,
+    statuses: set[JobStatus],
+) -> CursorJob | None:
+    return _worker_change(
+        store,
+        job.id,
+        token,
+        statuses,
+        mutate,
+        expected_revision=store.get(job.id).revision,
+    )
+
+
+def _persist_split_children(
+    store: JobStore,
+    job: CursorJob,
+    token: WorkerClaim,
+    children: tuple[SplitChild, ...],
+    *,
+    operation_state: str,
+) -> CursorJob | None:
+    payload = encode_split_children(children)
+
+    def persist(current: CursorJob) -> CursorJob:
+        return current.evolve(
+            ticket_split_children=payload,
+            ticket_split_operation_state=operation_state,
+        )
+
+    return _persist_split_job(store, job, token, persist, statuses={JobStatus.RUNNING})
+
+
+def _finish_ticket_split(
+    store: JobStore,
+    job: CursorJob,
+    token: WorkerClaim,
+    children: tuple[object, ...],
+    *,
+    parent_state: str | None,
+) -> None:
+    parent = _split_parent_label(job)
+    message = split_result_message(
+        parent,
+        children,  # type: ignore[arg-type]
+        parent_action=job.ticket_split_parent_action or "none",
+        parent_state=parent_state,
+    )
+
+    def finish(current: CursorJob) -> CursorJob:
+        now = time.time()
+        return current.evolve_for_delivery(
+            now=now,
+            status=JobStatus.COMPLETED,
+            result=message,
+            completed_at=now,
+            ticket_split_children=encode_split_children(children),  # type: ignore[arg-type]
+            ticket_split_parent_operation_state=parent_state,
+            ticket_split_operation_state="created",
+            worker_pid=None,
+            worker_boot_id=None,
+            worker_process_start=None,
+            worker_token=None,
+            worker_operation=None,
+        )
+
+    _worker_change(
+        store,
+        job.id,
+        token,
+        {JobStatus.ROUTING, JobStatus.RUNNING},
+        finish,
+        expected_revision=store.get(job.id).revision,
+    )
+
+
+def _queue_split_ambiguous(
+    store: JobStore,
+    job: CursorJob,
+    token: WorkerClaim,
+    children: tuple[object, ...],
+    *,
+    parent_state: str | None = None,
+) -> None:
+    def ambiguous(current: CursorJob) -> CursorJob:
+        return current.evolve(
+            status=JobStatus.QUEUED,
+            queued_at=time.time(),
+            ticket_split_children=encode_split_children(children),  # type: ignore[arg-type]
+            ticket_split_parent_operation_state=(
+                parent_state
+                if parent_state is not None
+                else current.ticket_split_parent_operation_state
+            ),
+            ticket_split_operation_state="ambiguous",
+            reconcile=True,
+            worker_pid=None,
+            worker_boot_id=None,
+            worker_process_start=None,
+            worker_token=None,
+            worker_operation=None,
+        )
+
+    _worker_change(
+        store,
+        job.id,
+        token,
+        {JobStatus.RUNNING, JobStatus.ROUTING},
+        ambiguous,
+        expected_revision=store.get(job.id).revision,
+    )
+
+
+def _queue_split_retry(
+    store: JobStore,
+    job: CursorJob,
+    token: WorkerClaim,
+    children: tuple[object, ...],
+    *,
+    parent_state: str | None = None,
+) -> None:
+    def retry(current: CursorJob) -> CursorJob:
+        return current.evolve(
+            status=JobStatus.QUEUED,
+            queued_at=time.time(),
+            ticket_split_children=encode_split_children(children),  # type: ignore[arg-type]
+            ticket_split_parent_operation_state=(
+                parent_state
+                if parent_state is not None
+                else current.ticket_split_parent_operation_state
+            ),
+            ticket_split_operation_state="planned",
+            worker_pid=None,
+            worker_boot_id=None,
+            worker_process_start=None,
+            worker_token=None,
+            worker_operation=None,
+            worker_claim_operation=None,
+            worker_claimed_at=None,
+        )
+
+    _worker_change(
+        store,
+        job.id,
+        token,
+        {JobStatus.RUNNING, JobStatus.ROUTING},
+        retry,
+        expected_revision=store.get(job.id).revision,
+    )
+
+
+def _ask_split_confirmation(
+    store: JobStore,
+    job: CursorJob,
+    token: WorkerClaim,
+    draft: TicketSplitDraft,
+    *,
+    github: bool,
+) -> None:
+    parent = _split_parent_label(job)
+    preview = split_preview(parent, draft)
+    _worker_question(
+        store,
+        job.id,
+        token,
+        preview,
+        expected_revision=job.revision,
+        clarification_kind=(
+            "github_issue_split_confirmation"
+            if github
+            else "linear_ticket_split_confirmation"
+        ),
+        sensitivity=QuestionSensitivity.DESTRUCTIVE,
+    )
+
+
+def _run_github_issue_split(
+    store: JobStore,
+    job: CursorJob,
+    token: WorkerClaim,
+    clients: ClientFactories,
+    checkpoint: Callable[[], None],
+) -> None:
+    repository = (job.github_repository or "").strip()
+    number = job.github_issue
+    if not repository or number is None:
+        raise HarnessError("GitHub issue split requires a trusted ticket identity")
+    github = _github_provider(clients.github)
+    checkpoint()
+    source = github.resolve_repository(repository)
+    repository = source.name_with_owner
+    checkpoint()
+    if not job.ticket_split_children:
+        config = default_user_config()
+        draft = assign_split_markers(
+            draft_ticket_split(
+                job.trusted_utterance or job.request,
+                f"{repository}#{number}",
+                settings=config.providers,
+            )
+        )
+        parent_marker = (
+            uuid.uuid4().hex if draft.parent_action in {"close", "update"} else None
+        )
+
+        def persist_draft(current: CursorJob) -> CursorJob:
+            return current.evolve(
+                github_repository=repository,
+                github_issue=number,
+                ticket_split_children=encode_split_children(draft.children),
+                ticket_split_parent_action=draft.parent_action,
+                ticket_split_parent_title=draft.parent_title,
+                ticket_split_parent_body=draft.parent_body,
+                ticket_split_parent_marker=parent_marker,
+                ticket_split_parent_operation_state=(
+                    "planned" if draft.parent_action in {"close", "update"} else None
+                ),
+                ticket_split_operation_state="planned",
+            )
+
+        updated = _persist_split_job(
+            store, job, token, persist_draft, statuses={JobStatus.ROUTING}
+        )
+        if updated is None:
+            return
+        job = updated
+    children = decode_split_children(job.ticket_split_children)
+    draft = TicketSplitDraft(
+        children,
+        job.ticket_split_parent_action or "none",
+        job.ticket_split_parent_title,
+        job.ticket_split_parent_body,
+    )
+    if not job.ticket_split_confirmed:
+        _ask_split_confirmation(store, job, token, draft, github=True)
+        return
+    if job.ticket_split_operation_state not in {None, "planned"}:
+        raise HarnessError("GitHub issue split requires reconciliation before retry")
+
+    def mark_running(current: CursorJob) -> CursorJob:
+        return current.evolve(
+            status=JobStatus.RUNNING,
+            worker_operation="github_issue_split",
+        )
+
+    running = _persist_split_job(
+        store, job, token, mark_running, statuses={JobStatus.ROUTING}
+    )
+    if running is None:
+        return
+    job = running
+    for index, child in enumerate(children):
+        if child.state == "created":
+            continue
+        if child.state in {"submitted", "ambiguous"}:
+            plan = github.plan_issue_creation(
+                repository,
+                child.title,
+                child.body,
+                correlation_marker=child.marker,
+            )
+            checkpoint()
+            try:
+                visible = github.observe_issue_creation(plan)
+            except GitHubError:
+                visible = None
+            if visible is None:
+                children = replace_split_child(children, index, state="ambiguous")
+                _queue_split_ambiguous(store, job, token, children)
+                return
+            children = replace_split_child(
+                children,
+                index,
+                state="created",
+                created_ref=visible.issue.reference,
+                created_url=visible.url,
+            )
+            persisted = _persist_split_children(
+                store, job, token, children, operation_state="planned"
+            )
+            if persisted is None:
+                return
+            job = persisted
+            continue
+        children = replace_split_child(children, index, state="submitted")
+        submitted = _persist_split_children(
+            store, job, token, children, operation_state="submitted"
+        )
+        if submitted is None:
+            return
+        job = submitted
+        plan = github.plan_issue_creation(
+            repository,
+            child.title,
+            child.body,
+            correlation_marker=child.marker,
+        )
+        try:
+            checkpoint()
+            result = github.submit_issue_creation(plan, confirmed=True)
+        except GitHubError as exc:
+            checkpoint()
+            try:
+                visible = github.observe_issue_creation(plan)
+            except GitHubError:
+                visible = None
+            if visible is not None:
+                children = replace_split_child(
+                    children,
+                    index,
+                    state="created",
+                    created_ref=visible.issue.reference,
+                    created_url=visible.url,
+                )
+                persisted = _persist_split_children(
+                    store, job, token, children, operation_state="planned"
+                )
+                if persisted is None:
+                    return
+                job = persisted
+                continue
+            if isinstance(exc, GitHubCommandStartError):
+                children = replace_split_child(children, index, state="planned")
+                _queue_split_retry(store, job, token, children)
+                return
+            children = replace_split_child(children, index, state="ambiguous")
+            _queue_split_ambiguous(store, job, token, children)
+            return
+        children = replace_split_child(
+            children,
+            index,
+            state="created",
+            created_ref=result.issue.reference,
+            created_url=result.url,
+        )
+        persisted = _persist_split_children(
+            store, job, token, children, operation_state="planned"
+        )
+        if persisted is None:
+            return
+        job = persisted
+    parent_action = job.ticket_split_parent_action or "none"
+    parent_state = job.ticket_split_parent_operation_state
+    if parent_action == "none":
+        _finish_ticket_split(store, job, token, children, parent_state=None)
+        return
+    if parent_state == "created":
+        _finish_ticket_split(store, job, token, children, parent_state="created")
+        return
+    if parent_state in {"submitted", "ambiguous"}:
+        if parent_action == "update":
+            plan = github.plan_issue_update(
+                repository,
+                number,
+                job.ticket_split_parent_title or "",
+                job.ticket_split_parent_body or "",
+                correlation_marker=job.ticket_split_parent_marker,
+            )
+            checkpoint()
+            try:
+                visible = github.observe_issue_update(plan)
+            except GitHubError:
+                visible = None
+        else:
+            plan = github.plan_issue_close(
+                repository,
+                number,
+                correlation_marker=job.ticket_split_parent_marker,
+            )
+            checkpoint()
+            try:
+                visible = github.observe_issue_close(plan)
+            except GitHubError:
+                visible = None
+        if visible is None:
+            _queue_split_ambiguous(
+                store, job, token, children, parent_state="ambiguous"
+            )
+            return
+        _finish_ticket_split(store, job, token, children, parent_state="created")
+        return
+    submitted = _persist_split_job(
+        store,
+        job,
+        token,
+        lambda current: current.evolve(
+            ticket_split_parent_operation_state="submitted",
+            ticket_split_operation_state="submitted",
+        ),
+        statuses={JobStatus.RUNNING},
+    )
+    if submitted is None:
+        return
+    job = submitted
+    try:
+        checkpoint()
+        if parent_action == "update":
+            plan = github.plan_issue_update(
+                repository,
+                number,
+                job.ticket_split_parent_title or "",
+                job.ticket_split_parent_body or "",
+                correlation_marker=job.ticket_split_parent_marker,
+            )
+            github.submit_issue_update(plan, confirmed=True)
+        else:
+            plan = github.plan_issue_close(
+                repository,
+                number,
+                correlation_marker=job.ticket_split_parent_marker,
+            )
+            github.submit_issue_close(plan, confirmed=True)
+    except GitHubError as exc:
+        checkpoint()
+        try:
+            if parent_action == "update":
+                visible = github.observe_issue_update(
+                    github.plan_issue_update(
+                        repository,
+                        number,
+                        job.ticket_split_parent_title or "",
+                        job.ticket_split_parent_body or "",
+                        correlation_marker=job.ticket_split_parent_marker,
+                    )
+                )
+            else:
+                visible = github.observe_issue_close(
+                    github.plan_issue_close(
+                        repository,
+                        number,
+                        correlation_marker=job.ticket_split_parent_marker,
+                    )
+                )
+        except GitHubError:
+            visible = None
+        if visible is not None:
+            _finish_ticket_split(store, job, token, children, parent_state="created")
+            return
+        if isinstance(exc, GitHubCommandStartError):
+            _queue_split_retry(store, job, token, children, parent_state="planned")
+            return
+        _queue_split_ambiguous(store, job, token, children, parent_state="ambiguous")
+        return
+    _finish_ticket_split(store, job, token, children, parent_state="created")
+
+
+def _run_linear_ticket_split(
+    store: JobStore,
+    job: CursorJob,
+    token: WorkerClaim,
+    clients: ClientFactories,
+    checkpoint: Callable[[], None],
+) -> None:
+    identifier = (job.issue_key or "").strip()
+    if not identifier:
+        raise HarnessError("Linear ticket split requires a trusted ticket identity")
+    registry = clients.integrations or build_integration_registry(default_user_config())
+    provider = issue_provider("linear", registry)
+    if not isinstance(provider, LinearIntegration):
+        raise HarnessError("selected Linear provider cannot split tickets")
+    client = clients.herdr()
+    checkpoint()
+    if not job.ticket_split_parent_issue_id:
+        try:
+            issue_id, issue = provider.resolve_issue(
+                client,
+                identifier,
+                checkpoint=checkpoint,
+            )
+        except LinearError:
+            message = f"I couldn't find Linear ticket {identifier}."
+
+            def finish_missing(current: CursorJob) -> CursorJob:
+                now = time.time()
+                return recovery.stage_terminal_intent(
+                    current,
+                    JobStatus.FAILED,
+                    now=now,
+                    result=message,
+                    error=message,
+                )
+
+            _worker_change(
+                store,
+                job.id,
+                token,
+                MODEL_WORKER_STATUSES,
+                finish_missing,
+                expected_revision=job.revision,
+            )
+            return
+
+        def persist_issue(current: CursorJob) -> CursorJob:
+            return current.evolve(
+                issue_key=issue.identifier,
+                ticket_split_parent_issue_id=issue_id,
+            )
+
+        updated = _persist_split_job(
+            store, job, token, persist_issue, statuses={JobStatus.ROUTING}
+        )
+        if updated is None:
+            return
+        job = updated
+        identifier = issue.identifier
+    if not job.ticket_split_team_id:
+        team_key = job.ticket_split_team or linear_team_key(identifier)
+        team = provider.resolve_team(client, team_key, checkpoint=checkpoint)
+
+        def persist_team(current: CursorJob) -> CursorJob:
+            return current.evolve(
+                ticket_split_team=team.key,
+                ticket_split_team_id=team.id,
+            )
+
+        updated = _persist_split_job(
+            store, job, token, persist_team, statuses={JobStatus.ROUTING}
+        )
+        if updated is None:
+            return
+        job = updated
+    if not job.ticket_split_children:
+        config = default_user_config()
+        draft = assign_split_markers(
+            draft_ticket_split(
+                job.trusted_utterance or job.request,
+                identifier,
+                settings=config.providers,
+            )
+        )
+        parent_marker = (
+            uuid.uuid4().hex if draft.parent_action in {"close", "update"} else None
+        )
+
+        def persist_draft(current: CursorJob) -> CursorJob:
+            return current.evolve(
+                ticket_split_children=encode_split_children(draft.children),
+                ticket_split_parent_action=draft.parent_action,
+                ticket_split_parent_title=draft.parent_title,
+                ticket_split_parent_body=draft.parent_body,
+                ticket_split_parent_marker=parent_marker,
+                ticket_split_parent_operation_state=(
+                    "planned" if draft.parent_action in {"close", "update"} else None
+                ),
+                ticket_split_operation_state="planned",
+            )
+
+        updated = _persist_split_job(
+            store, job, token, persist_draft, statuses={JobStatus.ROUTING}
+        )
+        if updated is None:
+            return
+        job = updated
+    children = decode_split_children(job.ticket_split_children)
+    draft = TicketSplitDraft(
+        children,
+        job.ticket_split_parent_action or "none",
+        job.ticket_split_parent_title,
+        job.ticket_split_parent_body,
+    )
+    if not job.ticket_split_confirmed:
+        _ask_split_confirmation(store, job, token, draft, github=False)
+        return
+    if job.ticket_split_operation_state not in {None, "planned"}:
+        raise HarnessError("Linear ticket split requires reconciliation before retry")
+
+    def mark_running(current: CursorJob) -> CursorJob:
+        return current.evolve(
+            status=JobStatus.RUNNING,
+            worker_operation="linear_ticket_split",
+        )
+
+    running = _persist_split_job(
+        store, job, token, mark_running, statuses={JobStatus.ROUTING}
+    )
+    if running is None:
+        return
+    job = running
+    callback_revision = job.revision
+
+    def persist_submit_fence(
+        target: str,
+        session: str,
+        prompt_token: str,
+        baseline: int,
+    ) -> None:
+        nonlocal callback_revision
+
+        def fence(current: CursorJob) -> CursorJob:
+            return current.evolve(
+                ticket_split_operation_state="submitting",
+                ticket_split_prompt_target=target,
+                ticket_split_prompt_session=session,
+                ticket_split_prompt_token=prompt_token,
+                ticket_split_baseline_sequence=baseline,
+            )
+
+        if (
+            _worker_change(
+                store,
+                job.id,
+                token,
+                {JobStatus.RUNNING},
+                fence,
+                expected_revision=callback_revision,
+            )
+            is None
+        ):
+            raise WorkerCancelled
+        callback_revision += 1
+
+    def persist_prompt_acceptance() -> None:
+        nonlocal callback_revision
+
+        def accepted(current: CursorJob) -> CursorJob:
+            return current.evolve(ticket_split_operation_state="submitted")
+
+        if (
+            _worker_change(
+                store,
+                job.id,
+                token,
+                {JobStatus.RUNNING},
+                accepted,
+                expected_revision=callback_revision,
+            )
+            is None
+        ):
+            raise WorkerCancelled
+        callback_revision += 1
+
+    for index, child in enumerate(children):
+        if child.state == "created":
+            continue
+        plan = provider.plan_ticket_creation(
+            job.ticket_split_team_id or "",
+            job.ticket_split_team or "",
+            child.title,
+            child.body,
+            correlation_marker=child.marker,
+        )
+        if child.state in {"submitted", "ambiguous"}:
+            checkpoint()
+            try:
+                visible = provider.observe_ticket_creation(
+                    client, plan, checkpoint=checkpoint
+                )
+            except LinearError:
+                visible = None
+            if visible is None:
+                children = replace_split_child(children, index, state="ambiguous")
+                _queue_split_ambiguous(store, job, token, children)
+                return
+            children = replace_split_child(
+                children,
+                index,
+                state="created",
+                created_ref=visible.issue.identifier,
+                created_url=visible.url,
+            )
+            persisted = _persist_split_children(
+                store, job, token, children, operation_state="planned"
+            )
+            if persisted is None:
+                return
+            job = persisted
+            callback_revision = job.revision
+            continue
+        children = replace_split_child(children, index, state="submitted")
+        submitted = _persist_split_children(
+            store, job, token, children, operation_state="planned"
+        )
+        if submitted is None:
+            return
+        job = submitted
+        callback_revision = job.revision
+        try:
+            checkpoint()
+            provider.submit_ticket_creation(
+                client,
+                plan,
+                confirmed=True,
+                checkpoint=checkpoint,
+                before_submit=persist_submit_fence,
+                accepted=persist_prompt_acceptance,
+            )
+        except LinearError as exc:
+            checkpoint()
+            current = store.get(job.id)
+            uncertain = isinstance(exc, LinearOperationAmbiguous) or (
+                current.ticket_split_operation_state in {"submitting", "submitted"}
+            )
+            if uncertain:
+                try:
+                    visible = provider.observe_ticket_creation(
+                        client, plan, checkpoint=checkpoint
+                    )
+                except LinearError:
+                    visible = None
+                if visible is not None:
+                    children = replace_split_child(
+                        children,
+                        index,
+                        state="created",
+                        created_ref=visible.issue.identifier,
+                        created_url=visible.url,
+                    )
+                    persisted = _persist_split_children(
+                        store, job, token, children, operation_state="planned"
+                    )
+                    if persisted is None:
+                        return
+                    job = persisted
+                    callback_revision = job.revision
+                    continue
+                children = replace_split_child(children, index, state="ambiguous")
+                _queue_split_ambiguous(store, job, token, children)
+                return
+            children = replace_split_child(children, index, state="planned")
+            _queue_split_retry(store, job, token, children)
+            return
+        current = store.get(job.id)
+        if current.ticket_split_operation_state != "submitted":
+            children = replace_split_child(children, index, state="ambiguous")
+            _queue_split_ambiguous(store, job, token, children)
+            return
+        try:
+            visible = provider.observe_ticket_creation(
+                client, plan, checkpoint=checkpoint
+            )
+        except LinearError:
+            visible = None
+        if visible is None:
+            children = replace_split_child(children, index, state="ambiguous")
+            _queue_split_ambiguous(store, job, token, children)
+            return
+        children = replace_split_child(
+            children,
+            index,
+            state="created",
+            created_ref=visible.issue.identifier,
+            created_url=visible.url,
+        )
+        persisted = _persist_split_children(
+            store, job, token, children, operation_state="planned"
+        )
+        if persisted is None:
+            return
+        job = persisted
+        callback_revision = job.revision
+    parent_action = job.ticket_split_parent_action or "none"
+    parent_state = job.ticket_split_parent_operation_state
+    if parent_action == "none" or parent_state == "created":
+        _finish_ticket_split(
+            store,
+            job,
+            token,
+            children,
+            parent_state=None if parent_action == "none" else "created",
+        )
+        return
+    if parent_state in {"submitted", "ambiguous"}:
+        if parent_action == "update":
+            plan = provider.plan_ticket_update(
+                job.ticket_split_parent_issue_id or "",
+                job.issue_key or identifier,
+                job.ticket_split_parent_title or "",
+                job.ticket_split_parent_body or "",
+                correlation_marker=job.ticket_split_parent_marker,
+            )
+            try:
+                visible = provider.observe_ticket_update(
+                    client, plan, checkpoint=checkpoint
+                )
+            except LinearError:
+                visible = None
+        else:
+            plan = provider.plan_ticket_close(
+                job.ticket_split_parent_issue_id or "",
+                job.issue_key or identifier,
+                correlation_marker=job.ticket_split_parent_marker,
+            )
+            try:
+                visible = provider.observe_ticket_close(
+                    client, plan, checkpoint=checkpoint
+                )
+            except LinearError:
+                visible = None
+        if visible is None:
+            _queue_split_ambiguous(
+                store, job, token, children, parent_state="ambiguous"
+            )
+            return
+        _finish_ticket_split(store, job, token, children, parent_state="created")
+        return
+    submitted = _persist_split_job(
+        store,
+        job,
+        token,
+        lambda current: current.evolve(
+            ticket_split_parent_operation_state="planned",
+            ticket_split_operation_state="planned",
+        ),
+        statuses={JobStatus.RUNNING},
+    )
+    if submitted is None:
+        return
+    job = submitted
+    callback_revision = job.revision
+    try:
+        checkpoint()
+        if parent_action == "update":
+            plan = provider.plan_ticket_update(
+                job.ticket_split_parent_issue_id or "",
+                job.issue_key or identifier,
+                job.ticket_split_parent_title or "",
+                job.ticket_split_parent_body or "",
+                correlation_marker=job.ticket_split_parent_marker,
+            )
+            provider.submit_ticket_update(
+                client,
+                plan,
+                confirmed=True,
+                checkpoint=checkpoint,
+                before_submit=persist_submit_fence,
+                accepted=persist_prompt_acceptance,
+            )
+        else:
+            plan = provider.plan_ticket_close(
+                job.ticket_split_parent_issue_id or "",
+                job.issue_key or identifier,
+                correlation_marker=job.ticket_split_parent_marker,
+            )
+            provider.submit_ticket_close(
+                client,
+                plan,
+                confirmed=True,
+                checkpoint=checkpoint,
+                before_submit=persist_submit_fence,
+                accepted=persist_prompt_acceptance,
+            )
+    except LinearError as exc:
+        checkpoint()
+        current = store.get(job.id)
+        uncertain = isinstance(exc, LinearOperationAmbiguous) or (
+            current.ticket_split_operation_state in {"submitting", "submitted"}
+        )
+        if uncertain:
+            try:
+                if parent_action == "update":
+                    visible = provider.observe_ticket_update(
+                        client,
+                        provider.plan_ticket_update(
+                            job.ticket_split_parent_issue_id or "",
+                            job.issue_key or identifier,
+                            job.ticket_split_parent_title or "",
+                            job.ticket_split_parent_body or "",
+                            correlation_marker=job.ticket_split_parent_marker,
+                        ),
+                        checkpoint=checkpoint,
+                    )
+                else:
+                    visible = provider.observe_ticket_close(
+                        client,
+                        provider.plan_ticket_close(
+                            job.ticket_split_parent_issue_id or "",
+                            job.issue_key or identifier,
+                            correlation_marker=job.ticket_split_parent_marker,
+                        ),
+                        checkpoint=checkpoint,
+                    )
+            except LinearError:
+                visible = None
+            if visible is not None:
+                _finish_ticket_split(
+                    store, job, token, children, parent_state="created"
+                )
+                return
+            _queue_split_ambiguous(
+                store, job, token, children, parent_state="ambiguous"
+            )
+            return
+        _queue_split_retry(store, job, token, children, parent_state="planned")
+        return
+    current = store.get(job.id)
+    if current.ticket_split_operation_state != "submitted":
+        _queue_split_ambiguous(store, job, token, children, parent_state="ambiguous")
+        return
+    try:
+        if parent_action == "update":
+            visible = provider.observe_ticket_update(
+                client,
+                provider.plan_ticket_update(
+                    job.ticket_split_parent_issue_id or "",
+                    job.issue_key or identifier,
+                    job.ticket_split_parent_title or "",
+                    job.ticket_split_parent_body or "",
+                    correlation_marker=job.ticket_split_parent_marker,
+                ),
+                checkpoint=checkpoint,
+            )
+        else:
+            visible = provider.observe_ticket_close(
+                client,
+                provider.plan_ticket_close(
+                    job.ticket_split_parent_issue_id or "",
+                    job.issue_key or identifier,
+                    correlation_marker=job.ticket_split_parent_marker,
+                ),
+                checkpoint=checkpoint,
+            )
+    except LinearError:
+        visible = None
+    if visible is None:
+        _queue_split_ambiguous(store, job, token, children, parent_state="ambiguous")
+        return
+    _finish_ticket_split(store, job, token, children, parent_state="created")
+
+
 def _completion_preferences(
     job: CursorJob,
 ) -> tuple[PlanApprovalPreferences | None, bool]:
@@ -7739,6 +8696,15 @@ def run_claimed_worker(  # pyright: ignore[reportGeneralTypeIssues]
             return
         if job.linear_ticket_close_requested:
             _run_linear_ticket_close(
+                store,
+                job,
+                worker_token,
+                clients,
+                checkpoint,
+            )
+            return
+        if job.github_issue_split_requested or job.linear_ticket_split_requested:
+            _run_ticket_split(
                 store,
                 job,
                 worker_token,

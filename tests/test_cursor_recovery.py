@@ -53,6 +53,7 @@ from local_voice_harness.cursor.recovery import (
     reconcile_uncertain_pr_creation,
     reconcile_uncertain_pr_merge,
     reconcile_uncertain_repo_creation,
+    reconcile_uncertain_ticket_split,
     recover_jobs,
     resolve_manual_reconciliation,
     stage_terminal_intent,
@@ -90,6 +91,7 @@ from local_voice_harness.prompt_operations import (
     PromptIdentity,
     SubmittingPrompt,
 )
+from local_voice_harness.ticket_split import SplitChild, encode_split_children
 
 WORKER = WorkerOwnership("worker", 42, "boot", "start", "test", 1)
 
@@ -1331,6 +1333,112 @@ class CursorRecoveryTests(unittest.TestCase):
             updated.linear_ticket_close_operation_state,
             "manual_required",
         )
+
+    def test_reconciles_ambiguous_issue_split_without_resubmitting(self) -> None:
+        children = encode_split_children(
+            (
+                SplitChild(
+                    "Auth",
+                    "Handle login.",
+                    "a" * 32,
+                    state="created",
+                    created_ref="example/project#21",
+                ),
+                SplitChild("Billing", "Handle invoices.", "b" * 32, state="ambiguous"),
+            )
+        )
+        job = self.create(
+            {
+                "id": "123456789abc",
+                "status": "reconciling",
+                "request": "split the issue",
+                "created_at": 1,
+                "delivered": False,
+                "issue_provider": "github",
+                "github_repository": "example/project",
+                "github_issue": 12,
+                "github_issue_split_requested": True,
+                "ticket_split_confirmed": True,
+                "ticket_split_children": children,
+                "ticket_split_parent_action": "close",
+                "ticket_split_parent_marker": "c" * 32,
+                "ticket_split_parent_operation_state": "planned",
+                "ticket_split_operation_state": "ambiguous",
+            }
+        )
+        client = mock.Mock(spec=GitHubClient)
+        client.observe_issue.return_value = GitHubIssueCreationResult(
+            GitHubIssue("example", "project", 22),
+            "https://github.com/example/project/issues/22",
+            "b" * 32,
+        )
+
+        reconcile_uncertain_ticket_split(
+            self.store,
+            job,
+            now=100,
+            github_factory=lambda: client,
+        )
+
+        updated = self.store.get(job.id)
+        self.assertEqual(updated.status, JobStatus.QUEUED)
+        self.assertEqual(updated.ticket_split_operation_state, "planned")
+        decoded = json.loads(updated.ticket_split_children or "[]")
+        self.assertEqual(decoded[0]["state"], "created")
+        self.assertEqual(decoded[1]["state"], "created")
+        self.assertEqual(decoded[1]["created_ref"], "example/project#22")
+        client.submit_issue.assert_not_called()
+        client.submit_issue_close.assert_not_called()
+
+    def test_unobserved_issue_split_requires_manual_check(self) -> None:
+        children = encode_split_children(
+            (
+                SplitChild(
+                    "Auth",
+                    "Handle login.",
+                    "a" * 32,
+                    state="created",
+                    created_ref="example/project#21",
+                ),
+                SplitChild("Billing", "Handle invoices.", "b" * 32, state="ambiguous"),
+            )
+        )
+        job = self.create(
+            {
+                "id": "123456789abc",
+                "status": "queued",
+                "request": "split the issue",
+                "created_at": 1,
+                "queued_at": 1,
+                "delivered": False,
+                "issue_provider": "github",
+                "github_repository": "example/project",
+                "github_issue": 12,
+                "github_issue_split_requested": True,
+                "ticket_split_confirmed": True,
+                "ticket_split_children": children,
+                "ticket_split_parent_action": "close",
+                "ticket_split_parent_marker": "c" * 32,
+                "ticket_split_parent_operation_state": "planned",
+                "ticket_split_operation_state": "ambiguous",
+            }
+        )
+        client = mock.Mock(spec=GitHubClient)
+        client.observe_issue.return_value = None
+
+        reconcile_uncertain_ticket_split(
+            self.store,
+            job,
+            now=100,
+            github_factory=lambda: client,
+        )
+
+        updated = self.store.get(job.id)
+        self.assertEqual(updated.status, JobStatus.BLOCKED)
+        self.assertEqual(updated.ticket_split_operation_state, "manual_required")
+        self.assertIn("example/project#21", str(updated.result))
+        self.assertIn("was not closed", str(updated.result))
+        client.submit_issue.assert_not_called()
 
     def test_migration_and_pruning_precede_recovery_scans(self) -> None:
         store = mock.Mock(spec=JobStore)
