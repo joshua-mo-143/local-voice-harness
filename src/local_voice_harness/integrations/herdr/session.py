@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import hashlib
+import re
+import shutil
 import subprocess
 import time
 from collections.abc import Iterator
@@ -54,6 +56,10 @@ class HerdrSessionClient(Protocol):
 CURSOR_PROVIDER = "cursor/herdr"
 OPENCODE_PROVIDER = "opencode/herdr"
 _SUPPORTED_KINDS = frozenset({"cursor", "opencode"})
+_OPENCODE_AUTH_COUNT = re.compile(
+    r"\b(\d+)\s+(?:credentials?|environment variables?)\b",
+    re.IGNORECASE,
+)
 
 
 def herdr_provider(kind: str) -> str:
@@ -108,7 +114,64 @@ class HerdrSession(AgentHarness):
             )
         return frozenset(HarnessCapability)
 
+    def require_ready(self) -> None:
+        """Prove OpenCode can start before any durable job or pane is created."""
+
+        if self._kind != "opencode":
+            return
+        executable = shutil.which("opencode")
+        if executable is None:
+            raise HerdrError(
+                "OpenCode is selected but the `opencode` executable is unavailable. "
+                "Install OpenCode and ensure `opencode` is on PATH before retrying.",
+                code="operation_spawn_failed",
+            )
+        try:
+            process = subprocess.run(
+                [executable, "auth", "list"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise HerdrError(
+                "OpenCode authentication readiness could not be checked. Run "
+                "`opencode auth list`, repair the reported problem, and retry.",
+                code="authentication_unavailable",
+            ) from exc
+        if process.returncode:
+            raise HerdrError(
+                "OpenCode authentication is unavailable. Run `opencode auth list`, "
+                "then `opencode auth login` if needed, and retry.",
+                code="authentication_unavailable",
+            )
+        counts = [
+            int(match.group(1))
+            for match in _OPENCODE_AUTH_COUNT.finditer(
+                f"{process.stdout}\n{process.stderr}"
+            )
+        ]
+        if not counts or not any(counts):
+            raise HerdrError(
+                "OpenCode has no authenticated provider. Run `opencode auth login` "
+                "or configure a supported provider credential in the service "
+                "environment, then retry.",
+                code="authentication_unavailable",
+            )
+
+    def validate_agent_kind(self, agent: dict[str, Any]) -> None:
+        observed = str(agent.get("agent") or "")
+        if not observed or observed == self._kind:
+            return
+        raise HerdrError(
+            f"Herdr reported agent kind {observed!r}; expected {self._kind!r}. "
+            "Refusing to operate on a different harness session.",
+            code="agent_kind_mismatch",
+        )
+
     def _session(self, agent: dict[str, Any], target: str) -> HarnessSession | None:
+        self.validate_agent_kind(agent)
         identity = agent_session_identity(agent.get("agent_session"))
         if identity is None:
             return None
@@ -815,6 +878,8 @@ class HerdrSession(AgentHarness):
         try:
             agent = self._client.get_agent(target)
         except HerdrError as exc:
+            if exc.code == "agent_kind_mismatch":
+                raise
             if exc.code in {"agent_not_found", "not_found"}:
                 return SessionReconciliation(
                     ReconciliationState.MISSING,

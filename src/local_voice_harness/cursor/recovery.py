@@ -51,14 +51,16 @@ from ..questions import (
 from ..user_config import default_user_config
 from . import questions as question_adapter
 from .agent_outbox import (
+    AGENT_EFFECT_KINDS,
     CLARIFICATION_REPLY,
     TASK_SUBMIT,
+    agent_effect_handlers,
     consume_agent_results,
-    lazy_agent_effect_handlers,
 )
 from .coordinator import (
     CoordinatorCommand,
     CoordinatorDecision,
+    OutboxLease,
 )
 from .lifecycle import (
     CleanupOwned,
@@ -118,6 +120,43 @@ GitHubFactory = Callable[[], GitHubClient | GitHubProvider]
 LinearFactory = Callable[[], LinearIntegration]
 LaunchWorker = Callable[[str], None]
 RequireIssueProvider = Callable[[str | None], None]
+
+
+def _herdr_client_for_job(herdr_factory: HerdrFactory, job: CursorJob) -> HerdrClient:
+    """Bind the persisted harness before any recovered session operation."""
+
+    client = herdr_factory()
+    client.bind_harness_kind(job.harness_kind.value)
+    return client
+
+
+def _recovery_agent_effect_handlers(
+    herdr_factory: HerdrFactory,
+    store: JobStore,
+) -> dict[str, EffectHandler]:
+    """Replay durable agent effects only through the persisted job harness."""
+
+    def harness_for(lease: OutboxLease):
+        return _herdr_client_for_job(
+            herdr_factory,
+            store.get(lease.job_id),
+        ).harness
+
+    handlers: dict[str, EffectHandler] = {}
+    for kind in AGENT_EFFECT_KINDS:
+
+        def handle(
+            lease: OutboxLease,
+            mark_dispatched: Callable[[], None],
+            effect_kind: str = kind,
+        ):
+            return agent_effect_handlers(harness_for(lease))[effect_kind](
+                lease,
+                mark_dispatched,
+            )
+
+        handlers[kind] = handle
+    return handlers
 
 
 def _github_provider(factory: GitHubFactory) -> GitHubProvider:
@@ -253,7 +292,7 @@ def reconcile_uncertain_agent(
     if operation is None or operation.session is None:
         if job.status in TERMINAL_STATUSES or job.terminal_intent_status is not None:
             try:
-                client = herdr_factory()
+                client = _herdr_client_for_job(herdr_factory, job)
                 client.ensure_server()
                 observed_agent = client.get_agent(target)
             except HerdrError as exc:
@@ -313,7 +352,7 @@ def reconcile_uncertain_agent(
             return
     else:
         try:
-            client = herdr_factory()
+            client = _herdr_client_for_job(herdr_factory, job)
             client.ensure_server()
             observation = client.reconcile_session(
                 target,
@@ -1008,7 +1047,7 @@ def reconcile_prompt_and_pane_operations(
         if not isinstance(operation, SubmittingPrompt | AmbiguousPrompt):
             return
         try:
-            client = herdr_factory()
+            client = _herdr_client_for_job(herdr_factory, job)
             client.ensure_server()
         except HerdrError:
             return
@@ -1218,7 +1257,7 @@ def cancel_target_and_release(
     )
     if targets:
         try:
-            client = herdr_factory()
+            client = _herdr_client_for_job(herdr_factory, current)
             client.ensure_server()
             for participant_target in targets:
                 if (
@@ -2072,7 +2111,7 @@ def _reconcile_question_prompt(
         except PromptOperationError:
             return
         try:
-            client = herdr_factory()
+            client = _herdr_client_for_job(herdr_factory, job)
             client.ensure_server()
             agent = client.get_agent(job.herdr_target or "")
         except (HarnessError, HerdrError):
@@ -2195,7 +2234,7 @@ def _reconcile_interactive_questionnaire(
     ):
         return
     try:
-        client = herdr_factory()
+        client = _herdr_client_for_job(herdr_factory, job)
         client.ensure_server()
         agent = client.get_agent(job.herdr_target)
     except (HarnessError, HerdrError):
@@ -2263,7 +2302,7 @@ def recover_jobs(
     store.prune(now=now)
     recovered_at = time.time() if now is None else now
     if outbox_handlers is None:
-        outbox_handlers = lazy_agent_effect_handlers(lambda: herdr_factory().harness)
+        outbox_handlers = _recovery_agent_effect_handlers(herdr_factory, store)
     recover_outbox(store, handlers=outbox_handlers, now=recovered_at)
     from .provisioning import _reduce_agent_effect
 

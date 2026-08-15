@@ -391,6 +391,10 @@ def _build_start_job(
         raise HarnessError("selected issue provider is unavailable")
     if issue_provider == "github" or request.linear_ticket_create_requested:
         require_issue_provider(issue_provider, registry)
+    if harness_kind == HarnessKind.OPENCODE:
+        client = registry.herdr_client()
+        client.bind_harness_kind(harness_kind.value)
+        client.require_harness_ready()
     issue_repository = (request.github_repository or "").strip()
     github_issue_url = (
         f"https://github.com/{issue_repository}/issues/{request.github_issue}"

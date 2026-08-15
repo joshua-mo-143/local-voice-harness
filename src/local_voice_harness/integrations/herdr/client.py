@@ -85,6 +85,11 @@ class HerdrClient:
             self.session = HerdrSession(self)
             self.harness = self.session
 
+    def require_harness_ready(self) -> None:
+        """Validate the selected harness without creating durable Herdr state."""
+
+        self.harness.require_ready()
+
     def command(self, *args: str) -> list[str]:
         return self.transport.command(*args)
 
@@ -148,7 +153,9 @@ class HerdrClient:
         return self.workspace.focused_checkout()
 
     def get_agent(self, target: str) -> dict[str, Any]:
-        return dict(self.run_json("agent", "get", target).get("agent") or {})
+        agent = dict(self.run_json("agent", "get", target).get("agent") or {})
+        self.session.validate_agent_kind(agent)
+        return agent
 
     def allowed_repository(self, path: Path) -> bool:
         return self.repository.allowed_repository(path)

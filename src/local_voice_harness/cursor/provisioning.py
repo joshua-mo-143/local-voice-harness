@@ -4740,6 +4740,8 @@ def run_claimed_worker(  # pyright: ignore[reportGeneralTypeIssues]
         client = clients.herdr()
         client.bind_harness_kind(job.harness_kind.value)
         checkpoint()
+        client.require_harness_ready()
+        checkpoint()
         client.ensure_server()
         checkpoint()
         followup_checkout: Path | None = None
