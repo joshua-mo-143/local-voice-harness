@@ -3573,10 +3573,7 @@ class WakeConversationDaemon:
                     "I did not update a ticket because the request was unclear. "
                     "Please name the ticket and the title or body change."
                 )
-            elif route.intent in {
-                Intent.GITHUB_PR_CREATE,
-                Intent.AGENT_PR_UNSUPPORTED,
-            }:
+            elif route.intent == Intent.GITHUB_PR_CREATE:
                 response = (
                     "I did not open a pull request because the request was unclear."
                 )
