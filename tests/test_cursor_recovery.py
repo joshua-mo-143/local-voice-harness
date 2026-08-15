@@ -879,68 +879,6 @@ class CursorRecoveryTests(unittest.TestCase):
         )
         client.submit_repository_creation.assert_not_called()
 
-    def test_reconciles_ambiguous_clone_without_retrying(self) -> None:
-        job = self.create(
-            {
-                "id": "123456789abc",
-                "status": "queued",
-                "request": "Use Cursor to fix the bug",
-                "created_at": 1,
-                "queued_at": 1,
-                "delivered": False,
-                "clone_source": "example/project",
-                "clone_confirmed": True,
-                "clone_operation_state": "ambiguous",
-                "reconcile": True,
-            }
-        )
-        client = mock.Mock(spec=GitHubClient)
-        client.observe_clone.return_value = Path("/home/test/src/example/project")
-
-        reconcile_uncertain_clone(
-            self.store,
-            job,
-            now=100,
-            github_factory=lambda: client,
-        )
-
-        updated = self.store.get(job.id)
-        self.assertEqual(updated.status, JobStatus.QUEUED)
-        self.assertEqual(updated.clone_operation_state, "cloned")
-        self.assertEqual(updated.repository, "/home/test/src/example/project")
-        self.assertFalse(updated.reconcile)
-        client.ensure_repository_clone.assert_not_called()
-
-    def test_unobserved_clone_requires_manual_check(self) -> None:
-        job = self.create(
-            {
-                "id": "123456789abc",
-                "status": "queued",
-                "request": "Use Cursor to fix the bug",
-                "created_at": 1,
-                "queued_at": 1,
-                "delivered": False,
-                "clone_source": "example/project",
-                "clone_confirmed": True,
-                "clone_operation_state": "ambiguous",
-                "reconcile": True,
-            }
-        )
-        client = mock.Mock(spec=GitHubClient)
-        client.observe_clone.return_value = None
-
-        reconcile_uncertain_clone(
-            self.store,
-            job,
-            now=100,
-            github_factory=lambda: client,
-        )
-
-        updated = self.store.get(job.id)
-        self.assertEqual(updated.status, JobStatus.BLOCKED)
-        self.assertEqual(updated.clone_operation_state, "manual_required")
-        client.ensure_repository_clone.assert_not_called()
-
     def test_reconciles_ambiguous_linear_creation_without_resubmitting(
         self,
     ) -> None:

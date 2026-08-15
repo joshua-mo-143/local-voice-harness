@@ -7126,6 +7126,30 @@ def run_claimed_worker(  # pyright: ignore[reportGeneralTypeIssues]
                                 expected_revision=job.revision,
                             )
                             return
+                        except (GitHubError, HarnessError):
+
+                            def mark_clone_ambiguous(current: CursorJob) -> CursorJob:
+                                return current.evolve(
+                                    status=JobStatus.QUEUED,
+                                    queued_at=time.time(),
+                                    clone_operation_state="ambiguous",
+                                    reconcile=True,
+                                    worker_pid=None,
+                                    worker_boot_id=None,
+                                    worker_process_start=None,
+                                    worker_token=None,
+                                    worker_operation=None,
+                                )
+
+                            _worker_change(
+                                store,
+                                job_id,
+                                worker_token,
+                                {JobStatus.ROUTING},
+                                mark_clone_ambiguous,
+                                expected_revision=job.revision,
+                            )
+                            return
 
                     def record_clone(current: CursorJob) -> CursorJob:
                         return current.evolve(

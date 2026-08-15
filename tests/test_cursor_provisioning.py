@@ -3567,7 +3567,8 @@ class CursorJobStateTests(unittest.TestCase):
 
         updated = jobs.read_job("123456789abc")
         self.assertEqual(updated["status"], "completed")
-        self.assertIn("unpublished changes", str(updated["result"]))
+        self.assertIn("couldn't verify", str(updated["result"]))
+        self.assertIn("checkout snapshot", str(updated["result"]))
         self.assertIsNone(updated.get("github_pr_created_url"))
         github.submit_pull_request_creation.assert_not_called()
         github.local_git.commit_unpublished_changes.assert_not_called()
@@ -6077,13 +6078,16 @@ class CursorJobStateTests(unittest.TestCase):
             service.run_worker("123456789abc")
 
         updated = jobs.read_job("123456789abc")
-        self.assertEqual(updated["status"], "completed")
-        self.assertEqual(updated["github_repo_create_operation_state"], "created")
+        self.assertEqual(updated["status"], "queued")
+        self.assertEqual(
+            updated["github_repo_create_operation_state"], "remote_created"
+        )
         self.assertEqual(
             updated["github_repo_created_url"],
             "https://github.com/alice/payments",
         )
         self.assertIsNone(updated.get("repository"))
+        self.assertTrue(updated["reconcile"])
         github.submit_repository_creation.assert_called_once()
 
     def test_existing_same_name_repo_is_not_a_successful_create(self) -> None:
