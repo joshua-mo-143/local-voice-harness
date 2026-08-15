@@ -266,7 +266,8 @@ class ServerStreamingTests(unittest.TestCase):
             },
         )
         self.assertEqual(request.get_header("Authorization"), "Bearer venice-secret")
-        self.assertEqual(urlopen.call_args.kwargs["timeout"], 19)
+        self.assertGreater(urlopen.call_args.kwargs["timeout"], 0)
+        self.assertLessEqual(urlopen.call_args.kwargs["timeout"], 19)
 
     def test_venice_synthesis_uses_request_voice_as_provider_override(self) -> None:
         settings = replace(
@@ -304,6 +305,85 @@ class ServerStreamingTests(unittest.TestCase):
         )
         error = urllib.error.HTTPError(
             settings.tts_endpoint,
+            401,
+            "Unauthorized",
+            Message(),
+            io.BytesIO(b'{"error":"invalid key"}'),
+        )
+
+        with (
+            mock.patch.object(server, "SETTINGS", settings),
+            mock.patch.object(
+                server, "get_venice_api_key", return_value="venice-secret"
+            ),
+            mock.patch.object(server, "pooled_urlopen", side_effect=error) as urlopen,
+            mock.patch.object(server.time, "sleep") as sleep,
+            self.assertRaisesRegex(RuntimeError, "HTTP 401"),
+        ):
+            server._venice_audio("Hello.")
+
+        urlopen.assert_called_once()
+        sleep.assert_not_called()
+        assert error.fp is not None
+        self.assertTrue(error.fp.closed)
+
+    def test_venice_retries_transient_connection_closure_then_succeeds(self) -> None:
+        output = io.BytesIO()
+        with wave.open(output, "wb") as target:
+            target.setnchannels(1)
+            target.setsampwidth(2)
+            target.setframerate(24_000)
+            target.writeframes(b"\x00\x00" * 2_400)
+        headers = Message()
+        headers["Content-Type"] = "audio/wav"
+        response = mock.MagicMock()
+        response.__enter__.return_value = response
+        response.headers = headers
+        response.read.return_value = output.getvalue()
+        settings = replace(
+            load_backend_settings({}),
+            tts_provider="venice",
+            tts_endpoint="https://api.venice.ai/api/v1/audio/speech",
+        )
+        closed = urllib.error.URLError("Remote end closed connection without response")
+
+        with (
+            mock.patch.object(server, "SETTINGS", settings),
+            mock.patch.object(
+                server, "get_venice_api_key", return_value="venice-secret"
+            ),
+            mock.patch.object(
+                server, "pooled_urlopen", side_effect=[closed, response]
+            ) as urlopen,
+            mock.patch.object(server.time, "sleep") as sleep,
+        ):
+            audio, rate, duration, _elapsed = server._venice_audio("Hello.")
+
+        self.assertEqual(urlopen.call_count, 2)
+        sleep.assert_called_once_with(server.VENICE_RETRY_BACKOFF_SECONDS)
+        self.assertEqual(audio, output.getvalue())
+        self.assertEqual((rate, duration), (24_000, 0.1))
+
+    def test_venice_retries_retryable_http_then_succeeds(self) -> None:
+        output = io.BytesIO()
+        with wave.open(output, "wb") as target:
+            target.setnchannels(1)
+            target.setsampwidth(2)
+            target.setframerate(24_000)
+            target.writeframes(b"\x00\x00" * 2_400)
+        headers = Message()
+        headers["Content-Type"] = "audio/wav"
+        response = mock.MagicMock()
+        response.__enter__.return_value = response
+        response.headers = headers
+        response.read.return_value = output.getvalue()
+        settings = replace(
+            load_backend_settings({}),
+            tts_provider="venice",
+            tts_endpoint="https://api.venice.ai/api/v1/audio/speech",
+        )
+        busy = urllib.error.HTTPError(
+            settings.tts_endpoint,
             429,
             "Too Many Requests",
             Message(),
@@ -315,13 +395,143 @@ class ServerStreamingTests(unittest.TestCase):
             mock.patch.object(
                 server, "get_venice_api_key", return_value="venice-secret"
             ),
-            mock.patch.object(server, "pooled_urlopen", side_effect=error),
-            self.assertRaisesRegex(RuntimeError, "HTTP 429"),
+            mock.patch.object(
+                server, "pooled_urlopen", side_effect=[busy, response]
+            ) as urlopen,
+            mock.patch.object(server.time, "sleep") as sleep,
+        ):
+            audio, rate, duration, _elapsed = server._venice_audio("Hello.")
+
+        self.assertEqual(urlopen.call_count, 2)
+        sleep.assert_called_once_with(server.VENICE_RETRY_BACKOFF_SECONDS)
+        assert busy.fp is not None
+        self.assertTrue(busy.fp.closed)
+        self.assertEqual(audio, output.getvalue())
+        self.assertEqual((rate, duration), (24_000, 0.1))
+
+    def test_venice_does_not_retry_permanent_client_failures(self) -> None:
+        settings = replace(
+            load_backend_settings({}),
+            tts_provider="venice",
+            tts_endpoint="https://api.venice.ai/api/v1/audio/speech",
+        )
+        error = urllib.error.HTTPError(
+            settings.tts_endpoint,
+            401,
+            "Unauthorized",
+            Message(),
+            io.BytesIO(b'{"error":"invalid key"}'),
+        )
+
+        with (
+            mock.patch.object(server, "SETTINGS", settings),
+            mock.patch.object(
+                server, "get_venice_api_key", return_value="venice-secret"
+            ),
+            mock.patch.object(server, "pooled_urlopen", side_effect=error) as urlopen,
+            mock.patch.object(server.time, "sleep") as sleep,
+            self.assertRaisesRegex(RuntimeError, "HTTP 401"),
         ):
             server._venice_audio("Hello.")
 
-        assert error.fp is not None
-        self.assertTrue(error.fp.closed)
+        urlopen.assert_called_once()
+        sleep.assert_not_called()
+
+    def test_venice_exhausted_retries_remain_a_speech_request_failure(self) -> None:
+        settings = replace(
+            load_backend_settings({}),
+            tts_provider="venice",
+            tts_endpoint="https://api.venice.ai/api/v1/audio/speech",
+        )
+        closed = urllib.error.URLError("Remote end closed connection without response")
+
+        with (
+            mock.patch.object(server, "SETTINGS", settings),
+            mock.patch.object(
+                server, "get_venice_api_key", return_value="venice-secret"
+            ),
+            mock.patch.object(server, "pooled_urlopen", side_effect=closed) as urlopen,
+            mock.patch.object(server.time, "sleep") as sleep,
+            self.assertRaisesRegex(
+                RuntimeError,
+                "Venice TTS request failed: .*Remote end closed connection",
+            ),
+        ):
+            server._venice_audio("Hello.")
+
+        self.assertEqual(urlopen.call_count, server.VENICE_AUDIO_ATTEMPTS)
+        self.assertEqual(
+            [call.args[0] for call in sleep.call_args_list],
+            [
+                server.VENICE_RETRY_BACKOFF_SECONDS,
+                server.VENICE_RETRY_BACKOFF_SECONDS * 2,
+            ],
+        )
+
+    def test_venice_does_not_retry_after_speech_timeout_budget(self) -> None:
+        settings = replace(
+            load_backend_settings({}),
+            tts_provider="venice",
+            tts_endpoint="https://api.venice.ai/api/v1/audio/speech",
+            tts_timeout=19,
+        )
+        closed = urllib.error.URLError("Remote end closed connection without response")
+        clock = {"now": 0.0}
+
+        def fail_and_consume_budget(*_args: object, **_kwargs: object) -> object:
+            clock["now"] = settings.tts_timeout
+            raise closed
+
+        with (
+            mock.patch.object(server, "SETTINGS", settings),
+            mock.patch.object(
+                server, "get_venice_api_key", return_value="venice-secret"
+            ),
+            mock.patch.object(
+                server, "pooled_urlopen", side_effect=fail_and_consume_budget
+            ) as urlopen,
+            mock.patch.object(
+                server.time, "monotonic", side_effect=lambda: clock["now"]
+            ),
+            mock.patch.object(server.time, "sleep") as sleep,
+            self.assertRaisesRegex(
+                RuntimeError,
+                "Venice TTS request failed: .*Remote end closed connection",
+            ),
+        ):
+            server._venice_audio("Hello.")
+
+        urlopen.assert_called_once()
+        sleep.assert_not_called()
+
+    def test_venice_rejects_truncated_wav_before_returning_audio(self) -> None:
+        headers = Message()
+        headers["Content-Type"] = "audio/wav"
+        response = mock.MagicMock()
+        response.__enter__.return_value = response
+        response.headers = headers
+        response.read.return_value = b"RIFF\x00\x00"
+        settings = replace(
+            load_backend_settings({}),
+            tts_provider="venice",
+            tts_endpoint="https://api.venice.ai/api/v1/audio/speech",
+        )
+
+        with (
+            mock.patch.object(server, "SETTINGS", settings),
+            mock.patch.object(
+                server, "get_venice_api_key", return_value="venice-secret"
+            ),
+            mock.patch.object(
+                server, "pooled_urlopen", return_value=response
+            ) as urlopen,
+            mock.patch.object(server.time, "sleep") as sleep,
+            self.assertRaisesRegex(RuntimeError, "invalid WAV"),
+        ):
+            server._venice_audio("Hello.")
+
+        urlopen.assert_called_once()
+        sleep.assert_not_called()
 
     def test_venice_speed_is_applied_locally_without_changing_pitch(self) -> None:
         source = io.BytesIO()

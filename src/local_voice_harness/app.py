@@ -30,7 +30,7 @@ from .cursor import consultation as cursor_consultation
 from .cursor import provisioning as cursor_provisioning
 from .cursor import questions as cursor_questions
 from .diagnostics.health import self_health_response
-from .errors import HarnessError
+from .errors import HarnessError, SpeechDeliveryError
 from .github_issue_creation import repository_from_utterance
 from .integrations.registry import IntegrationRegistry, build_integration_registry
 from .intent import (
@@ -417,10 +417,13 @@ def respond(text: str, *, user_config: UserConfig | None = None) -> None:
                 )
             rendered_response = as_assistant_response(response)
             print(f"Assistant: {rendered_response.display_text}")
-            playback = stream_and_play(
-                speech_renderer.render(rendered_response.spoken_text),
-                settings=settings.audio,
-            )
+            try:
+                playback = stream_and_play(
+                    speech_renderer.render(rendered_response.spoken_text),
+                    settings=settings.audio,
+                )
+            except Exception as exc:
+                raise SpeechDeliveryError(f"speech delivery failed: {exc}") from exc
             if recommendation_playback:
                 interrupted = isinstance(playback, dict) and bool(
                     playback.get("interrupted")

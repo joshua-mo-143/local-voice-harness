@@ -32,9 +32,14 @@ from .credentials import (
     get_venice_api_key,
     store_venice_api_key,
 )
-from .diagnostic_safety import COMMAND_FAILURE, log_diagnostic
+from .diagnostic_safety import (
+    COMMAND_FAILURE,
+    SPEECH_DELIVERY_FAILURE,
+    log_diagnostic,
+)
 from .diagnostics import doctor
 from .dictation import run as run_dictation
+from .errors import SpeechDeliveryError
 from .integrations.registry import build_integration_registry
 from .intent import Intent, IntentRoute, route_intent
 from .notifications import notify
@@ -797,6 +802,14 @@ def dispatch(args: argparse.Namespace) -> None:
 def main() -> None:
     try:
         dispatch(parser().parse_args())
+    except SpeechDeliveryError as exc:
+        log_diagnostic("cli", "speech_delivery_failed", f"{type(exc).__name__}: {exc}")
+        print(
+            f"voice-harness: {SPEECH_DELIVERY_FAILURE}",
+            file=__import__("sys").stderr,
+        )
+        notify(SPEECH_DELIVERY_FAILURE, error=True)
+        raise SystemExit(1) from exc
     except Exception as exc:
         log_diagnostic("cli", "command_failed", f"{type(exc).__name__}: {exc}")
         print(f"voice-harness: {COMMAND_FAILURE}", file=__import__("sys").stderr)
