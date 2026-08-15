@@ -8607,6 +8607,11 @@ def _named_job(
     *,
     label: str,
     question: str | None = None,
+    issue_key: str | None = None,
+    issue_provider: str | None = None,
+    github_repository: str | None = None,
+    github_issue: int | None = None,
+    clarification_kind: str | None = None,
 ) -> CursorJob:
     values: dict[str, object] = {
         "id": job_id,
@@ -8616,6 +8621,16 @@ def _named_job(
         "created_at": 1,
         "delivered": True,
     }
+    if issue_key is not None:
+        values["issue_key"] = issue_key
+    if issue_provider is not None:
+        values["issue_provider"] = issue_provider
+    if github_repository is not None:
+        values["github_repository"] = github_repository
+    if github_issue is not None:
+        values["github_issue"] = github_issue
+    if clarification_kind is not None:
+        values["clarification_kind"] = clarification_kind
     if status == "awaiting_user":
         values["question"] = question or "Which option?"
         values["result"] = question or "Which option?"
@@ -8919,6 +8934,378 @@ class RetargetPendingQuestionTests(unittest.TestCase):
         )
         cursor_turn.assert_not_called()
         self.assertEqual(daemon.cursor_session, "aaaaaaaaaaaa")
+
+
+class ResumeAwaitingJobTests(unittest.TestCase):
+    def _store(self, *jobs: CursorJob) -> mock.Mock:
+        store = mock.Mock()
+        store.list.return_value = list(jobs)
+        by_id = {job.id: job for job in jobs}
+        store.get.side_effect = lambda job_id: by_id[job_id]
+        return store
+
+    def _process(
+        self,
+        daemon: WakeConversationDaemon,
+        store: mock.Mock,
+        utterance: str,
+        *,
+        spoken: str = "replayed",
+    ) -> tuple[mock.Mock, mock.Mock]:
+        play = mock.Mock(return_value=({"played_text": spoken}, None))
+        cursor_turn = mock.Mock()
+        with (
+            mock.patch.object(wake_daemon, "CURSOR_STORE", store),
+            mock.patch.object(wake_daemon, "transcribe", return_value=utterance),
+            mock.patch.object(wake_daemon, "start_components"),
+            mock.patch.object(wake_daemon, "cursor_turn", cursor_turn),
+            mock.patch.object(daemon, "play_response", play),
+            mock.patch.object(wake_daemon, "notify"),
+        ):
+            daemon.process_utterance(AUDIO_GENERATION, woke=True)
+        return play, cursor_turn
+
+    def test_unnamed_resume_after_close_replays_sole_question(self) -> None:
+        daemon = _bare_daemon()
+        with (
+            mock.patch.object(wake_daemon, "stop_components"),
+            mock.patch.object(wake_daemon, "notify"),
+        ):
+            daemon.close_conversation("inactivity")
+        self.assertIsNone(daemon.cursor_session)
+        job = _named_job(
+            "aaaaaaaaaaaa",
+            "awaiting_user",
+            label="payments",
+            question="Which payments table?",
+        )
+        store = self._store(job)
+        play, cursor_turn = self._process(daemon, store, "where were we?")
+        play.assert_called_once_with(
+            AssistantResponse.from_text("Which payments table?")
+        )
+        cursor_turn.assert_not_called()
+        self.assertEqual(daemon.cursor_session, "aaaaaaaaaaaa")
+        store.get.assert_called_with("aaaaaaaaaaaa")
+
+    def test_unnamed_resume_collision_asks_instead_of_guessing(self) -> None:
+        daemon = _bare_daemon()
+        jobs = (
+            _named_job(
+                "aaaaaaaaaaaa",
+                "awaiting_user",
+                label="payments",
+                question="First question?",
+            ),
+            _named_job(
+                "bbbbbbbbbbbb",
+                "awaiting_user",
+                label="login",
+                question="Second question?",
+            ),
+        )
+        store = self._store(*jobs)
+        play, cursor_turn = self._process(daemon, store, "resume")
+        spoken = play.call_args.args[0].spoken_text
+        self.assertIn("several jobs", spoken)
+        self.assertIn("payments", spoken)
+        self.assertIn("login", spoken)
+        cursor_turn.assert_not_called()
+        self.assertIsNone(daemon.cursor_session)
+
+    def test_unnamed_resume_with_no_awaiting_job_fails_closed(self) -> None:
+        daemon = _bare_daemon()
+        running = _named_job("cccccccccccc", "running", label="payments")
+        store = self._store(running)
+        play, cursor_turn = self._process(daemon, store, "continue")
+        play.assert_called_once_with(
+            AssistantResponse.from_text(wake_daemon.RESUME_NONE_RESPONSE)
+        )
+        cursor_turn.assert_not_called()
+        self.assertIsNone(daemon.cursor_session)
+
+    def test_named_linear_key_resumes_unique_job(self) -> None:
+        daemon = _bare_daemon()
+        job = _named_job(
+            "aaaaaaaaaaaa",
+            "awaiting_user",
+            label="APP-43",
+            question="Which Linear project?",
+            issue_key="APP-43",
+            issue_provider="linear",
+        )
+        other = _named_job(
+            "bbbbbbbbbbbb",
+            "awaiting_user",
+            label="login",
+            question="Which login page?",
+        )
+        store = self._store(job, other)
+        play, cursor_turn = self._process(daemon, store, "resume APP-43")
+        play.assert_called_once_with(
+            AssistantResponse.from_text("Which Linear project?")
+        )
+        cursor_turn.assert_not_called()
+        self.assertEqual(daemon.cursor_session, "aaaaaaaaaaaa")
+
+    def test_named_qualified_github_issue_resumes_unique_job(self) -> None:
+        daemon = _bare_daemon()
+        widgets = _named_job(
+            "aaaaaaaaaaaa",
+            "awaiting_user",
+            label="widgets issue 43",
+            question="Which widgets table?",
+            github_repository="acme/widgets",
+            github_issue=43,
+            issue_provider="github",
+        )
+        api = _named_job(
+            "bbbbbbbbbbbb",
+            "awaiting_user",
+            label="api issue 43",
+            question="Which API table?",
+            github_repository="acme/api",
+            github_issue=43,
+            issue_provider="github",
+        )
+        store = self._store(widgets, api)
+        play, cursor_turn = self._process(
+            daemon, store, "pick the acme/widgets issue 43 back up"
+        )
+        play.assert_called_once_with(
+            AssistantResponse.from_text("Which widgets table?")
+        )
+        cursor_turn.assert_not_called()
+        self.assertEqual(daemon.cursor_session, "aaaaaaaaaaaa")
+
+    def test_named_label_collision_asks_instead_of_guessing(self) -> None:
+        daemon = _bare_daemon()
+        jobs = (
+            _named_job(
+                "aaaaaaaaaaaa",
+                "awaiting_user",
+                label="payments issue",
+                question="First question?",
+            ),
+            _named_job(
+                "bbbbbbbbbbbb",
+                "awaiting_user",
+                label="payments issue",
+                question="Second question?",
+            ),
+        )
+        store = self._store(*jobs)
+        play, cursor_turn = self._process(
+            daemon, store, "where were we on the payments issue?"
+        )
+        spoken = play.call_args.args[0].spoken_text
+        self.assertIn("several jobs", spoken)
+        cursor_turn.assert_not_called()
+        self.assertIsNone(daemon.cursor_session)
+
+    def test_non_awaiting_named_resume_speaks_status_and_does_not_restart(
+        self,
+    ) -> None:
+        daemon = _bare_daemon()
+        running = _named_job("cccccccccccc", "running", label="payments")
+        store = self._store(running)
+        with (
+            mock.patch.object(wake_daemon, "CURSOR_STORE", store),
+            mock.patch.object(
+                cursor_service,
+                "job_status",
+                return_value="payments issue is running, in implementing.",
+            ) as status,
+            mock.patch.object(
+                wake_daemon, "transcribe", return_value="resume the payments issue"
+            ),
+            mock.patch.object(wake_daemon, "start_components"),
+            mock.patch.object(wake_daemon, "cursor_turn") as cursor_turn,
+            mock.patch.object(
+                daemon,
+                "play_response",
+                return_value=({"played_text": "status"}, None),
+            ) as play,
+            mock.patch.object(wake_daemon, "notify"),
+        ):
+            daemon.process_utterance(AUDIO_GENERATION, woke=True)
+
+        status.assert_called_once_with("cccccccccccc")
+        play.assert_called_once_with(
+            AssistantResponse.from_text("payments issue is running, in implementing.")
+        )
+        cursor_turn.assert_not_called()
+        self.assertIsNone(daemon.cursor_session)
+
+    def test_resume_is_not_submitted_as_an_answer(self) -> None:
+        daemon = _bare_daemon()
+        daemon.cursor_session = "aaaaaaaaaaaa"
+        daemon.conversation_deadline = time.monotonic() + 100
+        job = _named_job(
+            "aaaaaaaaaaaa",
+            "awaiting_user",
+            label="payments",
+            question="Which payments table?",
+        )
+        store = self._store(job)
+        play, cursor_turn = self._process(daemon, store, "pick this back up")
+        play.assert_called_once_with(
+            AssistantResponse.from_text("Which payments table?")
+        )
+        cursor_turn.assert_not_called()
+        self.assertEqual(daemon.cursor_session, "aaaaaaaaaaaa")
+
+    def test_continue_with_answer_falls_through_to_answer_contract(self) -> None:
+        daemon = _bare_daemon()
+        daemon.cursor_session = "aaaaaaaaaaaa"
+        daemon.conversation_deadline = time.monotonic() + 100
+        pending = replace(_pending_free_text_snapshot(), job_id="aaaaaaaaaaaa")
+        job = _named_job(
+            "aaaaaaaaaaaa",
+            "awaiting_user",
+            label="database",
+            question="Which repository?",
+        )
+        store = self._store(job)
+        with (
+            mock.patch.object(wake_daemon, "CURSOR_STORE", store),
+            mock.patch.object(
+                wake_daemon, "transcribe", return_value="continue with sqlite"
+            ),
+            mock.patch.object(wake_daemon, "start_components"),
+            mock.patch.object(
+                wake_daemon,
+                "route_intent",
+                return_value=IntentRoute(Intent.AGENT_REPLY, "high"),
+            ),
+            mock.patch.object(daemon, "_pending_cursor_question", return_value=pending),
+            mock.patch.object(
+                wake_daemon, "cursor_turn", return_value=("answered", None)
+            ) as cursor_turn,
+            mock.patch.object(
+                daemon,
+                "play_response",
+                return_value=({"played_text": "answered"}, None),
+            ),
+            mock.patch.object(wake_daemon, "notify"),
+        ):
+            daemon.process_utterance(AUDIO_GENERATION, woke=False)
+
+        cursor_turn.assert_called_once()
+        request = cursor_turn.call_args.args[0]
+        self.assertEqual(request.action, "reply")
+        self.assertEqual(request.utterance, "continue with sqlite")
+
+    def test_protected_confirmation_is_replayed_but_not_approved(self) -> None:
+        daemon = _bare_daemon()
+        job = _named_job(
+            "aaaaaaaaaaaa",
+            "awaiting_user",
+            label="plan approval",
+            question="Approve the implementation plan?",
+            clarification_kind="workflow_plan_approval",
+        )
+        store = self._store(job)
+        play, cursor_turn = self._process(daemon, store, "resume")
+        play.assert_called_once_with(
+            AssistantResponse.from_text("Approve the implementation plan?")
+        )
+        cursor_turn.assert_not_called()
+        self.assertEqual(daemon.cursor_session, "aaaaaaaaaaaa")
+
+    def test_no_speech_after_announced_question_closes_capture_only(self) -> None:
+        daemon = _bare_daemon()
+        daemon.cursor_session = "aaaaaaaaaaaa"
+        daemon.conversation_deadline = time.monotonic() + 100
+        daemon.awaiting_followup = True
+        job = _named_job(
+            "aaaaaaaaaaaa",
+            "awaiting_user",
+            label="payments",
+            question="Which payments table?",
+        )
+        store = self._store(job)
+        with (
+            mock.patch.object(wake_daemon, "CURSOR_STORE", store),
+            mock.patch.object(
+                wake_daemon,
+                "transcribe",
+                side_effect=NoSpeechError("STT did not recognize any speech"),
+            ),
+            mock.patch.object(wake_daemon, "release_deliveries"),
+            mock.patch.object(daemon, "stop_components_when_idle") as stop_components,
+            mock.patch.object(wake_daemon, "notify") as notify,
+            mock.patch.object(wake_daemon, "cursor_turn") as cursor_turn,
+        ):
+            result = daemon.process_utterance(AUDIO_GENERATION, woke=False)
+
+        self.assertIsNone(result)
+        self.assertFalse(daemon.awaiting_followup)
+        self.assertEqual(daemon.conversation_deadline, 0.0)
+        self.assertEqual(daemon.cursor_session, "aaaaaaaaaaaa")
+        stop_components.assert_called_once_with()
+        notify.assert_not_called()
+        cursor_turn.assert_not_called()
+        store.get.assert_called()
+
+    def test_stt_backend_failure_is_not_treated_as_user_absence(self) -> None:
+        daemon = _bare_daemon()
+        daemon.cursor_session = "aaaaaaaaaaaa"
+        deadline = time.monotonic() + 100
+        daemon.conversation_deadline = deadline
+        daemon.awaiting_followup = True
+        job = _named_job(
+            "aaaaaaaaaaaa",
+            "awaiting_user",
+            label="payments",
+            question="Which payments table?",
+        )
+        store = self._store(job)
+        with (
+            mock.patch.object(wake_daemon, "CURSOR_STORE", store),
+            mock.patch.object(
+                wake_daemon,
+                "transcribe",
+                side_effect=HarnessError("STT backend unavailable"),
+            ),
+            mock.patch.object(wake_daemon, "release_deliveries"),
+            mock.patch.object(daemon, "stop_components_when_idle") as stop_components,
+            mock.patch.object(wake_daemon, "notify") as notify,
+            mock.patch.object(wake_daemon, "cursor_turn") as cursor_turn,
+        ):
+            result = daemon.process_utterance(AUDIO_GENERATION, woke=False)
+
+        self.assertIsNone(result)
+        self.assertEqual(daemon.cursor_session, "aaaaaaaaaaaa")
+        self.assertEqual(daemon.conversation_deadline, deadline)
+        stop_components.assert_not_called()
+        cursor_turn.assert_not_called()
+        notify.assert_called_once_with(wake_daemon.VOICE_REQUEST_FAILURE, error=True)
+
+    def test_fresh_snapshot_preserves_question_identity_after_resume(self) -> None:
+        daemon = _bare_daemon()
+        listed = _named_job(
+            "aaaaaaaaaaaa",
+            "awaiting_user",
+            label="payments",
+            question="Stale listed question?",
+        )
+        fresh = _named_job(
+            "aaaaaaaaaaaa",
+            "awaiting_user",
+            label="payments",
+            question="Which payments table?",
+        )
+        store = mock.Mock()
+        store.list.return_value = [listed]
+        store.get.return_value = fresh
+        play, cursor_turn = self._process(daemon, store, "resume")
+        play.assert_called_once_with(
+            AssistantResponse.from_text("Which payments table?")
+        )
+        cursor_turn.assert_not_called()
+        self.assertEqual(daemon.cursor_session, "aaaaaaaaaaaa")
+        store.get.assert_called_with("aaaaaaaaaaaa")
 
 
 if __name__ == "__main__":

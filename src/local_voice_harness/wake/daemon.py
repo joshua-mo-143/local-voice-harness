@@ -508,6 +508,17 @@ RETARGET_PATTERN = re.compile(
     r")\s*[?.!]?\s*$",
     re.IGNORECASE,
 )
+RESUME_PATTERN = re.compile(
+    r"^\s*(?:"
+    r"(?:please\s+)?(?:resume|continue)"
+    r"(?P<with>\s+with)?"
+    r"(?:\s+(?:the\s+)?(?P<ref>.+?))?|"
+    r"pick\s+(?:this|it|(?:the\s+)?(?P<pickref>.+?))\s+back\s+up|"
+    r"where\s+were\s+we(?:\s+(?:on|with|about)\s+(?:the\s+)?(?P<whereref>.+?))?|"
+    r"where\s+was\s+I"
+    r")\s*[?.!]?\s*$",
+    re.IGNORECASE,
+)
 PENDING_SUBMIT_PATTERN = re.compile(
     r"\b(?:work\s+on|fix|change|update|implement|add|remove|run|review|inspect|"
     r"start|create|build|refactor|test)\b",
@@ -580,6 +591,7 @@ RETARGET_NOT_FOUND_RESPONSE = "I couldn't find a job matching that."
 RETARGET_INACTIVE_RESPONSE = (
     "I can only switch questions while this conversation has a live pending question."
 )
+RESUME_NONE_RESPONSE = "There's no Cursor job waiting for a reply."
 
 
 @dataclass
@@ -1473,6 +1485,21 @@ class WakeConversationDaemon:
             source_kinds=context.focused_app_sources,
         )
 
+    def _bind_awaiting_job(self, job_id: str, *, missing: str) -> str:
+        """Load a fresh snapshot and bind the session without answering."""
+        try:
+            job = CURSOR_STORE.get(job_id)
+        except Exception as exc:  # noqa: BLE001 - resume/retarget must fail closed
+            log(f"awaiting job unavailable for {job_id}: {type(exc).__name__}: {exc}")
+            return missing
+        if job.status != JobStatus.AWAITING_USER:
+            return cursor_service.job_status(job.id)
+        question = cursor_questions.current(job)
+        if question is None:
+            return cursor_service.job_status(job.id)
+        self.cursor_session = job.id
+        return question.text
+
     def _retarget_named_question(self, reference: str) -> str:
         """Switch the live session to a named awaiting job without answering."""
         if (
@@ -1494,21 +1521,38 @@ class WakeConversationDaemon:
             self.pending_question_retarget = None
             return RETARGET_NOT_FOUND_RESPONSE
         self.pending_question_retarget = None
-        try:
-            job = CURSOR_STORE.get(resolution.unique.id)
-        except Exception as exc:  # noqa: BLE001 - retarget must fail closed
-            log(
-                "retarget job unavailable for "
-                f"{resolution.unique.id}: {type(exc).__name__}: {exc}"
+        return self._bind_awaiting_job(
+            resolution.unique.id, missing=RETARGET_NOT_FOUND_RESPONSE
+        )
+
+    def _resume_awaiting_question(self, reference: str | None) -> str:
+        """Replay a durable awaiting question without submitting an answer."""
+        if reference:
+            jobs = CURSOR_STORE.list()
+            resolution = cursor_inbox.resolve_reference(jobs, reference)
+            if resolution.ambiguous:
+                return cursor_inbox.clarify(list(resolution.matches), "resume")
+            if resolution.unique is None:
+                return RETARGET_NOT_FOUND_RESPONSE
+            return self._bind_awaiting_job(
+                resolution.unique.id, missing=RETARGET_NOT_FOUND_RESPONSE
             )
-            return RETARGET_NOT_FOUND_RESPONSE
-        if job.status != JobStatus.AWAITING_USER:
-            return cursor_service.job_status(job.id)
-        question = cursor_questions.current(job)
-        if question is None:
-            return cursor_service.job_status(job.id)
-        self.cursor_session = job.id
-        return question.text
+        awaiting = [
+            job
+            for job in CURSOR_STORE.list()
+            if job.status == JobStatus.AWAITING_USER
+            and cursor_questions.current(job) is not None
+        ]
+        if not awaiting:
+            return RESUME_NONE_RESPONSE
+        if len(awaiting) > 1:
+            return cursor_inbox.clarify(
+                [cursor_inbox.summarize(job) for job in awaiting],
+                "resume",
+            )
+        return self._bind_awaiting_job(
+            awaiting[0].id, missing=RETARGET_NOT_FOUND_RESPONSE
+        )
 
     def _resolve_pending_question_retarget(self, reference: str) -> str | None:
         pending = self.pending_question_retarget
@@ -2574,6 +2618,31 @@ class WakeConversationDaemon:
                     return self._speak_control_notice(
                         self._retarget_named_question(reference)
                     )
+            resume = RESUME_PATTERN.search(text)
+            if resume is not None:
+                reference = (
+                    resume.group("ref")
+                    or resume.group("pickref")
+                    or resume.group("whereref")
+                    or ""
+                ).strip()
+                with_prefix = bool(resume.group("with"))
+                handle_resume = True
+                if with_prefix and reference:
+                    resolution = cursor_inbox.resolve_reference(
+                        CURSOR_STORE.list(), reference
+                    )
+                    if (
+                        resolution.unique is None
+                        and not resolution.ambiguous
+                        and self._pending_cursor_question() is not None
+                    ):
+                        handle_resume = False
+                if handle_resume:
+                    terminalize_non_side_effect()
+                    return self._speak_control_notice(
+                        self._resume_awaiting_question(reference or None)
+                    )
             pending_resolution = getattr(self, "pending_target_resolution", None)
             resolution_active = (
                 pending_resolution is not None
@@ -3407,7 +3476,24 @@ class WakeConversationDaemon:
         except NoSpeechError as exc:
             turn_failed = True
             release_deliveries(delivery_claims)
-            if had_active_conversation:
+            pending_confirmation = (
+                getattr(self, "pending_target_readback", None) is not None
+                or getattr(self, "pending_target_resolution", None) is not None
+                or getattr(self, "pending_config_change", None) is not None
+            )
+            if (
+                had_active_conversation
+                and not pending_confirmation
+                and self._pending_cursor_question() is not None
+            ):
+                log(
+                    "no recognizable speech after announced question; "
+                    "closing ambient capture"
+                )
+                self.close_pending_capture(
+                    "no recognizable speech after announced question"
+                )
+            elif had_active_conversation:
                 log(
                     "follow-up contained no recognizable speech; listening remains armed"
                 )
