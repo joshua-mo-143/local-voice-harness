@@ -15,7 +15,7 @@ import time
 import uuid
 import wave
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 
@@ -1297,6 +1297,21 @@ class WakeConversationDaemon:
             expires_at=slot.expires_at,
         )
 
+    def _dispatch_cursor_turn(self, request: CursorTurnRequest, **kwargs):
+        existing_on_started = request.on_job_started
+
+        def mutation_started() -> None:
+            if existing_on_started is not None:
+                existing_on_started()
+            self._mark_last_transcript_dispatched()
+
+        guarded_request = replace(request, on_job_started=mutation_started)
+        response, session = cursor_turn(guarded_request, **kwargs)
+        if request.action in {"cancel", "dismiss", "repeat"}:
+            # These synchronous operations return only after their durable update.
+            self._mark_last_transcript_dispatched()
+        return response, session
+
     def _speak_control_notice(self, spoken: str) -> BargeIn | None:
         self.ensure_components()
         response = AssistantResponse.from_text(spoken)
@@ -2492,16 +2507,14 @@ class WakeConversationDaemon:
                 response = readback_result
             elif confirmed_request is not None:
                 self.completed_followup = None
-                self._mark_last_transcript_dispatched()
-                response, next_cursor_session = cursor_turn(
+                response, next_cursor_session = self._dispatch_cursor_turn(
                     confirmed_request,
                     delivery_claims=delivery_claims,
                     integrations=self.integrations,
                 )
             elif route.actionable and route.intent == Intent.GITHUB_ISSUE_CREATE:
                 self.completed_followup = None
-                self._mark_last_transcript_dispatched()
-                response, next_cursor_session = cursor_turn(
+                response, next_cursor_session = self._dispatch_cursor_turn(
                     CursorTurnRequest(
                         context.text,
                         utterance=text,
@@ -2515,8 +2528,7 @@ class WakeConversationDaemon:
                 )
             elif route.actionable and route.intent == Intent.LINEAR_TICKET_CREATE:
                 self.completed_followup = None
-                self._mark_last_transcript_dispatched()
-                response, next_cursor_session = cursor_turn(
+                response, next_cursor_session = self._dispatch_cursor_turn(
                     CursorTurnRequest(
                         context.text,
                         utterance=text,
@@ -2608,8 +2620,7 @@ class WakeConversationDaemon:
                 if snapshot is None or choice_id is None:
                     response = cursor_consultation.RECOMMENDATION_UNAVAILABLE
                 else:
-                    self._mark_last_transcript_dispatched()
-                    response, next_cursor_session = cursor_turn(
+                    response, next_cursor_session = self._dispatch_cursor_turn(
                         CursorTurnRequest(
                             choice_id,
                             snapshot.job_id,
@@ -2701,8 +2712,7 @@ class WakeConversationDaemon:
                     integrations=self.integrations,
                 )
             elif route.actionable and route.intent == Intent.AGENT_CANCEL:
-                self._mark_last_transcript_dispatched()
-                response, next_cursor_session = cursor_turn(
+                response, next_cursor_session = self._dispatch_cursor_turn(
                     CursorTurnRequest(
                         text,
                         self.cursor_session,
@@ -2736,9 +2746,7 @@ class WakeConversationDaemon:
                         "dismiss" if route.intent == Intent.AGENT_DISMISS else "repeat"
                     )
                 )
-                if action == "reply":
-                    self._mark_last_transcript_dispatched()
-                response, next_cursor_session = cursor_turn(
+                response, next_cursor_session = self._dispatch_cursor_turn(
                     CursorTurnRequest(
                         text,
                         self.cursor_session,
@@ -2770,8 +2778,7 @@ class WakeConversationDaemon:
                 and route.intent == Intent.AGENT_REPLY
                 and pending is not None
             ):
-                self._mark_last_transcript_dispatched()
-                response, next_cursor_session = cursor_turn(
+                response, next_cursor_session = self._dispatch_cursor_turn(
                     CursorTurnRequest(
                         context.text,
                         pending.job_id,
@@ -2810,8 +2817,7 @@ class WakeConversationDaemon:
                         self.pending_target_resolution = None
                     response = readback_response(candidate)
                 else:
-                    self._mark_last_transcript_dispatched()
-                    response, next_cursor_session = cursor_turn(
+                    response, next_cursor_session = self._dispatch_cursor_turn(
                         CursorTurnRequest(
                             context.text,
                             utterance=text,
@@ -2884,8 +2890,7 @@ class WakeConversationDaemon:
                         if self.completed_followup is current_completed:
                             self.completed_followup = None
 
-                    self._mark_last_transcript_dispatched()
-                    response, next_cursor_session = cursor_turn(
+                    response, next_cursor_session = self._dispatch_cursor_turn(
                         CursorTurnRequest(
                             context.text,
                             utterance=text,

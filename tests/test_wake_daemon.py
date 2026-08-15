@@ -7689,7 +7689,12 @@ class LastTranscriptReplayTests(unittest.TestCase):
         route: IntentRoute | None = None,
         play_text: str = "ok",
     ) -> mock.Mock:
-        cursor_turn = mock.Mock(return_value=("started", None))
+        def durable_turn(request: CursorTurnRequest, **_kwargs):
+            if request.on_job_started is not None:
+                request.on_job_started()
+            return "started", None
+
+        cursor_turn = mock.Mock(side_effect=durable_turn)
         with (
             mock.patch.object(wake_daemon, "transcribe", return_value=transcript),
             mock.patch.object(wake_daemon, "start_components"),
@@ -7764,7 +7769,12 @@ class LastTranscriptReplayTests(unittest.TestCase):
         self._process(daemon, "what time is it")
         self.assertFalse(daemon.last_transcript.dispatched)  # type: ignore[union-attr]
 
-        cursor_turn = mock.Mock(return_value=("started", None))
+        def durable_turn(request: CursorTurnRequest, **_kwargs):
+            if request.on_job_started is not None:
+                request.on_job_started()
+            return "started", None
+
+        cursor_turn = mock.Mock(side_effect=durable_turn)
         with (
             mock.patch.object(
                 wake_daemon,
@@ -7801,6 +7811,39 @@ class LastTranscriptReplayTests(unittest.TestCase):
         assert daemon.last_transcript is not None
         self.assertEqual(daemon.last_transcript.utterance, "fix the failing tests")
         self.assertTrue(daemon.last_transcript.dispatched)
+
+    def test_failed_cursor_turn_does_not_mark_transcript_dispatched(self) -> None:
+        daemon = _bare_daemon()
+        daemon._remember_last_transcript("fix the failing tests")
+
+        with mock.patch.object(
+            wake_daemon,
+            "cursor_turn",
+            side_effect=HarnessError("store unavailable"),
+        ):
+            with self.assertRaisesRegex(HarnessError, "store unavailable"):
+                daemon._dispatch_cursor_turn(
+                    CursorTurnRequest("fix the failing tests")
+                )
+
+        assert daemon.last_transcript is not None
+        self.assertFalse(daemon.last_transcript.dispatched)
+
+    def test_success_response_without_mutation_callback_stays_correctable(
+        self,
+    ) -> None:
+        daemon = _bare_daemon()
+        daemon._remember_last_transcript("fix the failing tests")
+
+        with mock.patch.object(
+            wake_daemon,
+            "cursor_turn",
+            return_value=("That ticket is already in progress.", None),
+        ):
+            daemon._dispatch_cursor_turn(CursorTurnRequest("fix the failing tests"))
+
+        assert daemon.last_transcript is not None
+        self.assertFalse(daemon.last_transcript.dispatched)
 
     def test_correction_after_dispatch_does_not_mutate_inflight_request(self) -> None:
         daemon = _bare_daemon()
