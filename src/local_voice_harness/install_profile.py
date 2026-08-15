@@ -35,6 +35,7 @@ BASE_PACKAGES = (
 )
 VENICE_PACKAGES = ("libsecret", "oo7")
 CUDA_PACKAGES = ("cuda", "llama.cpp-cuda")
+LOCAL_CPU_LLM_PACKAGES = ("llama.cpp",)
 LOCAL_LLM_SERVICES = ("voice-harness-llm.service",)
 LOCAL_TTS_EXTRAS = ("tts",)
 
@@ -176,6 +177,9 @@ def resolve_installation_plan(
     dictation_extra = "dictation-cuda" if dictation_compute != "cpu" else "dictation"
     cuda_packages = CUDA_PACKAGES if needs_cuda else ()
     venice_packages = VENICE_PACKAGES if "venice" in {llm, tts} else ()
+    local_llm_packages = (
+        LOCAL_CPU_LLM_PACKAGES if llm == "local" and llm_compute == "cpu" else ()
+    )
     install_tts_extra = tts == "local"
     python_extras = ("wake", dictation_extra)
     if install_tts_extra:
@@ -188,7 +192,7 @@ def resolve_installation_plan(
         tts_device=tts_compute,
         dictation_extra=dictation_extra,
         dictation_device=dictation_compute,
-        system_packages=BASE_PACKAGES + venice_packages,
+        system_packages=BASE_PACKAGES + venice_packages + local_llm_packages,
         cuda_packages=cuda_packages,
         venice_packages=venice_packages,
         python_extras=python_extras,

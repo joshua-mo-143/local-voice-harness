@@ -127,6 +127,7 @@ class InstallAndDiagnosticComputeTests(unittest.TestCase):
         )
 
         self.assertEqual(plan.cuda_packages, ())
+        self.assertIn("llama.cpp", plan.system_packages)
         self.assertEqual(plan.dictation_extra, "dictation")
         self.assertEqual(plan.llm_device, "cpu")
         self.assertEqual(plan.tts_device, "cpu")
