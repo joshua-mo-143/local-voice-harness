@@ -193,12 +193,9 @@ if [[ "${SKIP_SYSTEM_PACKAGES:-0}" == 1 ]]; then
 else
   PACKAGE_COMMAND="$INSTALL_PACKAGE_COMMAND"
   if [[ "$INSTALL_DISTRO_FAMILY" == "arch" ]] && ! have paru; then
-    if have pacman; then
-      PACKAGE_COMMAND="sudo pacman -S --needed --noconfirm"
-    else
-      warn "paru or pacman is required on Arch."
-      exit 1
-    fi
+    warn "paru is required on Arch because the install plan includes AUR packages."
+    warn "Install paru, or rerun with SKIP_SYSTEM_PACKAGES=1 after installing dependencies."
+    exit 1
   fi
   if [[ "$INSTALL_DISTRO_FAMILY" == "debian" ]] && ! have apt-get; then
     warn "apt-get is required on Ubuntu/Debian."

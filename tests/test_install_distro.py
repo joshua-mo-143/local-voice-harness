@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import os
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -156,6 +158,32 @@ class InstallPathDiscoveryTests(unittest.TestCase):
         self.assertIn('elif [[ -e "$UNIT_CHECKOUT" ]]', installer)
         self.assertIn("refusing to replace it", installer)
         self.assertIn("exit 1", installer)
+        self.assertIn("paru is required on Arch", installer)
+        self.assertNotIn('PACKAGE_COMMAND="sudo pacman', installer)
+
+    def test_runtime_systemd_path_matches_discovered_xdg_path(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            xdg_config = root / "xdg-config"
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    "-c",
+                    (
+                        "from local_voice_harness.config import SYSTEMD_USER_DIR; "
+                        "print(SYSTEMD_USER_DIR)"
+                    ),
+                ],
+                check=True,
+                capture_output=True,
+                text=True,
+                env={**os.environ, "XDG_CONFIG_HOME": str(xdg_config)},
+            )
+
+        self.assertEqual(
+            result.stdout.strip(),
+            str(xdg_config / "systemd" / "user"),
+        )
 
 
 class DistroServiceLifecycleTests(unittest.TestCase):

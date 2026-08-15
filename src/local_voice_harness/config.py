@@ -347,7 +347,7 @@ DEFAULT_FOCUSED_APP_DENY_CLASSES = (
     "net-runelite-client-runelite",
 )
 
-SYSTEMD_USER_DIR = Path.home() / ".config" / "systemd" / "user"
+SYSTEMD_USER_DIR = xdg_config_home() / "systemd" / "user"
 SERVICE_FILES = (
     "dictation.service",
     "voice-harness-llm.service",
