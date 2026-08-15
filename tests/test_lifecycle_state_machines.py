@@ -87,7 +87,7 @@ def _pending_delivery() -> PendingDelivery:
         2,
         0,
         0,
-        AnnouncementState(AnnouncementAck.PENDING, False, False),
+        AnnouncementState(AnnouncementAck.PENDING, False),
     )
 
 
@@ -132,7 +132,6 @@ def test_flat_lifecycle_adapters_restore_typed_sum_states() -> None:
         attempts=1,
         delivered_at=None,
         acknowledgement="pending",
-        dismissed=False,
         repeated=False,
     ) == ClaimedDelivery(
         2,
@@ -140,7 +139,7 @@ def test_flat_lifecycle_adapters_restore_typed_sum_states() -> None:
         10,
         0,
         1,
-        AnnouncementState(AnnouncementAck.PENDING, False, False),
+        AnnouncementState(AnnouncementAck.PENDING, False),
     )
 
 
@@ -286,7 +285,7 @@ def test_suppressed_announcement_can_advance_to_visible_delivery(
         2,
         0,
         1,
-        AnnouncementState(current, False, False),
+        AnnouncementState(current, False),
     )
     claimed = claim_delivery(pending, "claim", 100, lease_seconds=300)
 
@@ -303,18 +302,52 @@ def test_suppressed_announcement_can_advance_to_visible_delivery(
     )
 
 
-def test_announcement_dismissal_flag_must_match_acknowledgement() -> None:
+def test_announcement_dismissal_is_derived_from_acknowledgement() -> None:
+    pending = AnnouncementState(AnnouncementAck.PENDING, False)
+    dismissed = AnnouncementState(AnnouncementAck.DISMISSED, False)
+
+    assert pending.dismissed is False
+    assert dismissed.dismissed is True
     with pytest.raises(LifecycleTransitionError, match="must match"):
-        AnnouncementState(AnnouncementAck.PENDING, True, False)
+        load_delivery_state(
+            delivered=False,
+            generation=1,
+            claim_token=None,
+            claimed_at=None,
+            retry_at=0,
+            attempts=0,
+            delivered_at=None,
+            acknowledgement="pending",
+            repeated=False,
+            dismissed=True,
+        )
+
+
+def test_delivery_fields_do_not_emit_independent_dismissal() -> None:
+    from local_voice_harness.cursor.lifecycle import delivery_fields
+
+    delivered = acknowledge_delivery(
+        claim_delivery(_pending_delivery(), "claim", 100, lease_seconds=300),
+        "claim",
+        101,
+        AnnouncementAck.DISMISSED,
+    )
+
+    fields = delivery_fields(delivered)
+    assert fields["announcement_ack"] == AnnouncementAck.DISMISSED.value
+    assert "announcement_dismissed" not in fields
+    assert delivered.announcement.dismissed is True
 
 
 def test_dismissal_and_repetition_are_explicit_transitions() -> None:
-    initial = AnnouncementState(AnnouncementAck.PENDING, False, False)
+    initial = AnnouncementState(AnnouncementAck.PENDING, False)
     dismissed = dismiss_announcement(initial)
     repeated = repeat_announcement(dismissed)
 
-    assert dismissed == AnnouncementState(AnnouncementAck.DISMISSED, True, False)
-    assert repeated == AnnouncementState(AnnouncementAck.PENDING, False, True)
+    assert dismissed == AnnouncementState(AnnouncementAck.DISMISSED, False)
+    assert dismissed.dismissed is True
+    assert repeated == AnnouncementState(AnnouncementAck.PENDING, True)
+    assert repeated.dismissed is False
     with pytest.raises(LifecycleTransitionError, match="already dismissed"):
         dismiss_announcement(dismissed)
 

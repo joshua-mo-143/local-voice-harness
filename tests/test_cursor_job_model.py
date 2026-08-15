@@ -344,10 +344,86 @@ class CursorJobModelTests(unittest.TestCase):
 
         self.assertEqual(job.speakable_label, "issue 42")
         self.assertTrue(job.announcement_dismissed)
+        self.assertEqual(job.announcement_ack, "dismissed")
         self.assertTrue(job.announcement_repeated)
+        self.assertNotIn("announcement_dismissed", job.to_dict())
         reloaded = CursorJob.from_dict(job.to_dict())
         self.assertEqual(reloaded.speakable_label, "issue 42")
         self.assertTrue(reloaded.announcement_dismissed)
+        self.assertEqual(reloaded.announcement_ack, "dismissed")
+        self.assertNotIn("announcement_dismissed", reloaded.to_dict())
+
+    def test_legacy_boolean_only_dismissal_imports_to_acknowledgement(self) -> None:
+        job = CursorJob.from_dict(
+            {
+                "schema_version": 14,
+                "id": "123456789abc",
+                "revision": 0,
+                "request": "do it",
+                "status": "completed",
+                "created_at": 1,
+                "completed_at": 2,
+                "result": "done",
+                "delivered": True,
+                "announcement_dismissed": True,
+            }
+        )
+
+        self.assertEqual(job.announcement_ack, "dismissed")
+        self.assertTrue(job.announcement_dismissed)
+        self.assertNotIn("announcement_dismissed", job.to_dict())
+
+    def test_native_dismissal_cannot_disagree_with_acknowledgement(self) -> None:
+        with self.assertRaisesRegex(JobValidationError, "must match"):
+            CursorJob.from_dict(
+                {
+                    "schema_version": CURRENT_SCHEMA_VERSION,
+                    "id": "123456789abc",
+                    "revision": 0,
+                    "request": "do it",
+                    "status": "completed",
+                    "created_at": 1,
+                    "completed_at": 2,
+                    "result": "done",
+                    "delivered": True,
+                    "announcement_ack": "spoken",
+                    "announcement_dismissed": True,
+                }
+            )
+        with self.assertRaisesRegex(JobValidationError, "must match"):
+            CursorJob.from_dict(
+                {
+                    "schema_version": CURRENT_SCHEMA_VERSION,
+                    "id": "bbbbbbbbbbbb",
+                    "revision": 0,
+                    "request": "do it",
+                    "status": "completed",
+                    "created_at": 1,
+                    "completed_at": 2,
+                    "result": "done",
+                    "delivered": True,
+                    "announcement_ack": "dismissed",
+                    "announcement_dismissed": False,
+                }
+            )
+
+    def test_native_dismiss_and_repeat_do_not_emit_dismissal_mirror(self) -> None:
+        job = self.job_for_status(JobStatus.COMPLETED)
+        dismissed = job.dismiss_announcement(delivered_at=3)
+        repeated = dismissed.repeat_announcement(now=4)
+
+        self.assertEqual(dismissed.announcement_ack, "dismissed")
+        self.assertTrue(dismissed.announcement_dismissed)
+        self.assertNotIn("announcement_dismissed", dismissed.to_dict())
+        self.assertEqual(repeated.announcement_ack, "pending")
+        self.assertFalse(repeated.announcement_dismissed)
+        self.assertNotIn("announcement_dismissed", repeated.to_dict())
+        reloaded = CursorJob.from_dict(dismissed.to_dict())
+        self.assertTrue(reloaded.announcement_dismissed)
+        self.assertEqual(
+            reloaded.announcement_ack,
+            reloaded.delivery_state.announcement.acknowledgement.value,
+        )
 
     def test_v8_job_migrates_to_finished_simple_workflow(self) -> None:
         job = CursorJob.from_dict(

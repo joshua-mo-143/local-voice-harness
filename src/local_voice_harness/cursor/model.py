@@ -926,24 +926,43 @@ def _pair_announcement_ack(values: dict[str, object]) -> None:
         values["announcement_ack"] = AnnouncementAck.PENDING.value
 
 
+def _legacy_announcement_ack_from_dismissal(values: dict[str, object]) -> str:
+    return (
+        AnnouncementAck.DISMISSED.value
+        if values.get("announcement_dismissed")
+        else AnnouncementAck.SPOKEN.value
+    )
+
+
 def _default_announcement_ack(values: dict[str, object]) -> None:
     ack = values.get("announcement_ack")
     if ack in ANNOUNCEMENT_ACK_STATES:
         if values.get("delivered") and ack == AnnouncementAck.PENDING.value:
-            values["announcement_ack"] = (
-                AnnouncementAck.DISMISSED.value
-                if values.get("announcement_dismissed")
-                else AnnouncementAck.SPOKEN.value
-            )
+            values["announcement_ack"] = _legacy_announcement_ack_from_dismissal(values)
         return
     if values.get("delivered"):
-        values["announcement_ack"] = (
-            AnnouncementAck.DISMISSED.value
-            if values.get("announcement_dismissed")
-            else AnnouncementAck.SPOKEN.value
-        )
+        values["announcement_ack"] = _legacy_announcement_ack_from_dismissal(values)
         return
     values["announcement_ack"] = AnnouncementAck.PENDING.value
+
+
+def _canonicalize_announcement_dismissal(values: dict[str, object]) -> None:
+    """Translate legacy dismissal, fail closed on conflict, then drop the mirror."""
+
+    raw_ack = values.get("announcement_ack")
+    dismissed_present = "announcement_dismissed" in values
+    dismissed = (
+        bool(values.get("announcement_dismissed")) if dismissed_present else None
+    )
+    if (
+        dismissed_present
+        and raw_ack in ANNOUNCEMENT_ACK_STATES
+        and dismissed != (raw_ack == AnnouncementAck.DISMISSED.value)
+        and not (values.get("delivered") and raw_ack == AnnouncementAck.PENDING.value)
+    ):
+        raise JobValidationError("dismissal state and acknowledgement must match")
+    _default_announcement_ack(values)
+    values.pop("announcement_dismissed", None)
 
 
 def _pair_worker_ownership(values: dict[str, object]) -> None:
@@ -1051,6 +1070,7 @@ def migrate_job_record(raw: Mapping[str, object]) -> tuple[dict[str, object], in
         _default_announcement_ack(values)
     values.setdefault("session_control", SessionControlMode.AUTOMATED.value)
     values.setdefault("session_control_generation", 0)
+    _canonicalize_announcement_dismissal(values)
     values["schema_version"] = CURRENT_SCHEMA_VERSION
     return values, loaded_version
 
@@ -2591,14 +2611,14 @@ class AgentJob:
         if self.delivered:
             return (
                 AnnouncementAck.DISMISSED.value
-                if self.announcement_dismissed
+                if self._values.get("announcement_dismissed")
                 else AnnouncementAck.SPOKEN.value
             )
         return AnnouncementAck.PENDING.value
 
     @property
     def announcement_dismissed(self) -> bool:
-        return self._boolean_field("announcement_dismissed")
+        return self.announcement_ack == AnnouncementAck.DISMISSED.value
 
     @property
     def announcement_repeated(self) -> bool:
@@ -3576,7 +3596,6 @@ class AgentJob:
                 attempts=self.delivery_attempts,
                 delivered_at=self.delivered_at,
                 acknowledgement=self.announcement_ack,
-                dismissed=self.announcement_dismissed,
                 repeated=self.announcement_repeated,
             )
         except LifecycleTransitionError as exc:
