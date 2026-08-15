@@ -250,6 +250,16 @@ class PendingTargetResolution:
         return self.created_at + CONVERSATION_TIMEOUT_SECONDS
 
 
+@dataclass(frozen=True, slots=True)
+class PendingQuestionRetarget:
+    candidate_ids: tuple[str, ...]
+    created_at: float
+
+    @property
+    def expires_at(self) -> float:
+        return self.created_at + CONVERSATION_TIMEOUT_SECONDS
+
+
 def _is_target_resolution_continuation(text: str) -> bool:
     return TARGET_RESOLUTION_CONTINUATION_PATTERN.fullmatch(text) is not None
 
@@ -567,6 +577,9 @@ SNOOZE_MUTE_ALL_RESPONSE = (
 SNOOZE_CLEARED_RESPONSE = "Okay, I can announce background updates again."
 SNOOZE_INACTIVE_RESPONSE = "I wasn't snoozing background announcements."
 RETARGET_NOT_FOUND_RESPONSE = "I couldn't find a job matching that."
+RETARGET_INACTIVE_RESPONSE = (
+    "I can only switch questions while this conversation has a live pending question."
+)
 
 
 @dataclass
@@ -728,6 +741,7 @@ class WakeConversationDaemon:
         )
         self.pending_target_readback: PendingTargetReadback | None = None
         self.pending_target_resolution: PendingTargetResolution | None = None
+        self.pending_question_retarget: PendingQuestionRetarget | None = None
         self.pending_config_change: PendingConfigChange | None = None
         self.pending_spoken_alias: PendingSpokenAlias | None = None
         self.config_activation_store = config_activation_store or ActivationStore()
@@ -944,6 +958,7 @@ class WakeConversationDaemon:
         self.recent_playback.clear()
         self.pending_target_readback = None
         self.pending_target_resolution = None
+        self.pending_question_retarget = None
         self.pending_config_change = None
         self.pending_spoken_alias = None
         self.conversation_deadline = 0.0
@@ -965,6 +980,7 @@ class WakeConversationDaemon:
         log(f"pending-question capture closed: {reason}")
         self.history.clear()
         self.completed_followup = None
+        self.pending_question_retarget = None
         self.pending_config_change = None
         self.pending_spoken_alias = None
         self.conversation_deadline = 0.0
@@ -1459,12 +1475,25 @@ class WakeConversationDaemon:
 
     def _retarget_named_question(self, reference: str) -> str:
         """Switch the live session to a named awaiting job without answering."""
+        if (
+            not self.conversation_deadline
+            or time.monotonic() >= self.conversation_deadline
+            or self._pending_cursor_question() is None
+        ):
+            self.pending_question_retarget = None
+            return RETARGET_INACTIVE_RESPONSE
         jobs = CURSOR_STORE.list()
         resolution = cursor_inbox.resolve_reference(jobs, reference)
         if resolution.ambiguous:
+            self.pending_question_retarget = PendingQuestionRetarget(
+                tuple(match.id for match in resolution.matches),
+                time.monotonic(),
+            )
             return cursor_inbox.clarify(list(resolution.matches), "talk about")
         if resolution.unique is None:
+            self.pending_question_retarget = None
             return RETARGET_NOT_FOUND_RESPONSE
+        self.pending_question_retarget = None
         try:
             job = CURSOR_STORE.get(resolution.unique.id)
         except Exception as exc:  # noqa: BLE001 - retarget must fail closed
@@ -1480,6 +1509,52 @@ class WakeConversationDaemon:
             return cursor_service.job_status(job.id)
         self.cursor_session = job.id
         return question.text
+
+    def _resolve_pending_question_retarget(self, reference: str) -> str | None:
+        pending = self.pending_question_retarget
+        if pending is None:
+            return None
+        if time.monotonic() >= pending.expires_at:
+            self.pending_question_retarget = None
+            return None
+        if (
+            not self.conversation_deadline
+            or time.monotonic() >= self.conversation_deadline
+            or self._pending_cursor_question() is None
+        ):
+            self.pending_question_retarget = None
+            return RETARGET_INACTIVE_RESPONSE
+
+        live_jobs = []
+        for job_id in pending.candidate_ids:
+            try:
+                job = CURSOR_STORE.get(job_id)
+            except Exception:  # noqa: BLE001 - stale candidates fail closed
+                continue
+            if (
+                job.status == JobStatus.AWAITING_USER
+                and cursor_questions.current(job) is not None
+            ):
+                live_jobs.append(job)
+        if not live_jobs:
+            self.pending_question_retarget = None
+            return RETARGET_NOT_FOUND_RESPONSE
+
+        resolution = cursor_inbox.resolve_reference(live_jobs, reference)
+        if resolution.unique is not None:
+            self.pending_question_retarget = None
+            return self._retarget_named_question(resolution.unique.id)
+
+        summaries = (
+            list(resolution.matches)
+            if resolution.ambiguous
+            else [cursor_inbox.summarize(job) for job in live_jobs]
+        )
+        self.pending_question_retarget = PendingQuestionRetarget(
+            tuple(summary.id for summary in summaries),
+            time.monotonic(),
+        )
+        return cursor_inbox.clarify(summaries, "talk about")
 
     def _active_announcement_snooze(
         self, now: float | None = None
@@ -1523,6 +1598,12 @@ class WakeConversationDaemon:
             self.pending_target_resolution = replace(
                 resolution,
                 created_at=resolution.created_at + HOLD_EXTENSION_SECONDS,
+            )
+        retarget = self.pending_question_retarget
+        if retarget is not None:
+            self.pending_question_retarget = replace(
+                retarget,
+                created_at=retarget.created_at + HOLD_EXTENSION_SECONDS,
             )
         slot = self.last_transcript
         if slot is not None:
@@ -2479,6 +2560,10 @@ class WakeConversationDaemon:
                     if mute_everything
                     else snooze_started_response(parsed_minutes)
                 )
+            pending_retarget_response = self._resolve_pending_question_retarget(text)
+            if pending_retarget_response is not None:
+                terminalize_non_side_effect()
+                return self._speak_control_notice(pending_retarget_response)
             retarget = RETARGET_PATTERN.search(text)
             if retarget is not None:
                 reference = (
@@ -3555,6 +3640,7 @@ class WakeConversationDaemon:
     def stop(self) -> None:
         self.running = False
         self.pending_target_resolution = None
+        self.pending_question_retarget = None
         self.pending_config_change = None
         self.pending_spoken_alias = None
         if self.microphone is not None and self.microphone.poll() is None:
