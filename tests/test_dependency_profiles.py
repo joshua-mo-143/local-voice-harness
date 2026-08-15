@@ -27,6 +27,14 @@ def _resolved_profile(extra: str) -> str:
 
 
 class DictationDependencyProfileTests(unittest.TestCase):
+    def test_every_declared_extra_resolves_from_the_lockfile(self) -> None:
+        from local_voice_harness.production_extras import declared_extras
+
+        for extra in declared_extras(PROJECT_ROOT / "pyproject.toml"):
+            with self.subTest(extra=extra):
+                resolved = _resolved_profile(extra)
+                self.assertTrue(resolved.strip())
+
     def test_cpu_profile_excludes_gpu_and_nvidia_packages(self) -> None:
         resolved = _resolved_profile("dictation")
 

@@ -35,6 +35,7 @@ from local_voice_harness.cursor.store import (
     read_unlocked,
     write_unlocked,
 )
+from tests.support import join_threads
 
 
 class CursorStoreIntegrationTests(unittest.TestCase):
@@ -443,8 +444,7 @@ class CursorStoreIntegrationTests(unittest.TestCase):
         for thread in threads:
             thread.start()
         barrier.wait()
-        for thread in threads:
-            thread.join()
+        join_threads(threads)
 
         self.assertEqual(sorted(claimed), ids[:2])
         self.assertEqual(

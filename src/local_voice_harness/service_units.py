@@ -253,6 +253,21 @@ AUDIT_SHOW_PROPERTIES = (
 )
 
 
+_USER_CONTEXT_UNSUPPORTED = re.compile(
+    r"Failed to initialize unit search paths.*Invalid argument"
+    r"|Failed to lookup RuntimeDirectory path"
+    r"|Failed to initialize manager"
+    r"|Failed to connect to bus",
+    re.DOTALL,
+)
+
+
+def user_context_unsupported(stderr: str) -> bool:
+    """Return whether systemd-analyze could not initialize rooted user context."""
+
+    return bool(_USER_CONTEXT_UNSUPPORTED.search(stderr))
+
+
 @dataclass(frozen=True)
 class StagedVerification:
     process: subprocess.CompletedProcess[str]
@@ -621,10 +636,7 @@ def systemd_analyze(
             text=True,
             check=False,
         )
-        if result.returncode and re.search(
-            r"Failed to initialize unit search paths.*Invalid argument",
-            result.stderr,
-        ):
+        if result.returncode and user_context_unsupported(result.stderr):
             user_error = result.stderr.strip()
             fallback = subprocess.run(
                 [command, *common_arguments],

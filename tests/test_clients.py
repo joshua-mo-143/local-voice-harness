@@ -18,6 +18,7 @@ from local_voice_harness.stt import client as stt_client
 from local_voice_harness.stt import server as stt_server
 from local_voice_harness.tts import client as tts_client
 from local_voice_harness.user_config import DictationDevice
+from tests.support import join_threads
 
 
 class SpeechToTextClientTests(unittest.TestCase):
@@ -686,8 +687,7 @@ class TextToSpeechClientTests(unittest.TestCase):
             ]
             for thread in threads:
                 thread.start()
-            for thread in threads:
-                thread.join()
+            join_threads(threads)
 
         self.assertEqual(maximum_active, 1)
 
