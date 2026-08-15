@@ -5795,6 +5795,45 @@ class CursorJobStateTests(unittest.TestCase):
         self.assertNotEqual(updated.get("clone_operation_state"), "cloned")
         self.assertIsNone(updated.get("repository"))
 
+    def test_clone_github_error_after_submit_is_ambiguous(self) -> None:
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "Use Cursor to fix the bug",
+                "repository_hint": "example/project",
+                "clone_source": "example/project",
+                "clone_confirmed": True,
+                "clone_operation_state": "planned",
+                "status": "queued",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        source = GitHubRepository(
+            "example/project",
+            "https://github.com/example/project",
+            False,
+            "main",
+        )
+        github = mock.Mock()
+        github.local_git.clone_root = Path("/home/test/src")
+        github.inspect_repository.return_value = source
+        github.ensure_repository_clone.side_effect = GitHubError("clone failed")
+        client = mock.Mock()
+        client.repository_roots.return_value = []
+        client.resolve_repository.return_value = (None, [])
+        with (
+            mock.patch.object(jobs, "HerdrClient", return_value=client),
+            mock.patch.object(jobs, "GitHubClient", return_value=github),
+        ):
+            service.run_worker("123456789abc")
+
+        updated = jobs.read_job("123456789abc")
+        self.assertEqual(updated["clone_operation_state"], "ambiguous")
+        self.assertTrue(updated["reconcile"])
+        self.assertIsNone(updated.get("repository"))
+        github.ensure_repository_clone.assert_called_once()
+
     def test_parse_repo_create_slug_and_visibility(self) -> None:
         self.assertEqual(production_jobs.parse_repo_create_slug("payments"), "payments")
         self.assertEqual(
@@ -5969,6 +6008,52 @@ class CursorJobStateTests(unittest.TestCase):
         self.assertTrue(github.submit_repository_creation.call_args.kwargs["confirmed"])
         github.ensure_repository_clone.assert_called_once()
         herdr.assert_not_called()
+
+    def test_repo_create_survives_materialize_failure(self) -> None:
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "create a GitHub repository called payments",
+                "trusted_utterance": "create a GitHub repository called payments",
+                "issue_provider": "github",
+                "github_repository": "alice/payments",
+                "github_repo_create_requested": True,
+                "github_repo_create_confirmed": True,
+                "github_repo_create_visibility": "private",
+                "github_repo_create_marker": "a" * 32,
+                "github_repo_create_operation_state": "planned",
+                "status": "queued",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        created = GitHubRepoCreationResult(
+            GitHubRepository(
+                "alice/payments",
+                "https://github.com/alice/payments",
+                True,
+                "main",
+            ),
+            "https://github.com/alice/payments",
+            "a" * 32,
+        )
+        github = mock.Mock()
+        github.authenticated_login.return_value = "alice"
+        github.lookup_repository.return_value = None
+        github.submit_repository_creation.return_value = created
+        github.ensure_repository_clone.side_effect = GitHubError("clone failed")
+        with mock.patch.object(jobs, "GitHubClient", return_value=github):
+            service.run_worker("123456789abc")
+
+        updated = jobs.read_job("123456789abc")
+        self.assertEqual(updated["status"], "completed")
+        self.assertEqual(updated["github_repo_create_operation_state"], "created")
+        self.assertEqual(
+            updated["github_repo_created_url"],
+            "https://github.com/alice/payments",
+        )
+        self.assertIsNone(updated.get("repository"))
+        github.submit_repository_creation.assert_called_once()
 
     def test_existing_same_name_repo_is_not_a_successful_create(self) -> None:
         jobs.write_job(

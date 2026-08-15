@@ -1952,6 +1952,17 @@ def _resolve_github_repo_create_owner(
         return None
 
 
+def _checkout_created_repository(
+    github: GitHubProvider,
+    result: GitHubRepoCreationResult,
+    checkpoint: Callable[[], None],
+) -> Path | None:
+    try:
+        return github.materialize_repository(result.repository, checkpoint=checkpoint)
+    except (GitHubError, LocalGitError):
+        return None
+
+
 def _finish_github_repo_creation(
     store: JobStore,
     job_id: str,
@@ -6210,10 +6221,15 @@ def run_claimed_worker(  # pyright: ignore[reportGeneralTypeIssues]
                 job = cloned
             if not job.repository:
                 return
+            already_offered_issue_one = any(
+                str(record.get("owner") or "") == "github_issue_file_as_one"
+                for record in (job.clarifications or ())
+            )
             if (
                 not job.github_issue_create_requested
                 and job.github_issue_created_number is None
                 and not job.github_issue_create_title
+                and not already_offered_issue_one
             ):
                 _offer_file_as_issue_one(
                     store,

@@ -131,6 +131,18 @@ def _single_pending_job() -> AgentJob | None:
     return pending[0] if len(pending) == 1 else None
 
 
+def _recent_completed_pr_parent() -> AgentJob | None:
+    matches = [
+        job
+        for job in CURSOR_STORE.list()
+        if job.status == JobStatus.COMPLETED
+        and bool(job.worktree_path or job.repository)
+    ]
+    if not matches:
+        return None
+    return max(matches, key=lambda job: float(job.completed_at or 0))
+
+
 def acknowledge_deliveries(claims: DeliveryClaims) -> None:
     acknowledge_claims(CURSOR_STORE, claims)
 
@@ -294,10 +306,26 @@ def respond(text: str, *, user_config: UserConfig | None = None) -> None:
                     integrations=integrations,
                 )[0]
             elif route.actionable and route.intent == Intent.GITHUB_PR_CREATE:
-                response = (
-                    "I don't have a recent completed job checkout to open a "
-                    "pull request from."
-                )
+                parent = _recent_completed_pr_parent()
+                if parent is None:
+                    response = (
+                        "I don't have a recent completed job checkout to open a "
+                        "pull request from."
+                    )
+                else:
+                    response = cursor_turn(
+                        CursorTurnRequest(
+                            context.text,
+                            utterance=text,
+                            action="follow_up",
+                            job_id=parent.id,
+                            expected_parent_revision=parent.revision,
+                            expected_completed_at=parent.completed_at,
+                            github_pr_create_requested=True,
+                        ),
+                        delivery_claims=delivery_claims,
+                        integrations=integrations,
+                    )[0]
             elif route.actionable and route.intent == Intent.GITHUB_ISSUE_CREATE:
                 response = cursor_turn(
                     CursorTurnRequest(

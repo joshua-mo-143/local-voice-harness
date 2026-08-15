@@ -1078,6 +1078,10 @@ def test_file_as_issue_one_no_does_not_create(store: JobStore) -> None:
     assert updated.status == JobStatus.QUEUED
     assert not updated.github_issue_create_requested
     assert not updated.github_issue_create_confirmed
+    assert updated.github_issue_create_title is None
+    assert updated.github_issue_create_body is None
+    assert updated.github_issue_create_marker is None
+    assert updated.github_issue_create_operation_state is None
     launch.assert_called_once_with(original.id)
 
 
@@ -1095,6 +1099,8 @@ def test_file_as_issue_one_cancel_does_not_create(store: JobStore) -> None:
     assert updated.status == JobStatus.QUEUED
     assert not updated.github_issue_create_requested
     assert not updated.github_issue_create_confirmed
+    assert updated.github_issue_create_title is None
+    assert updated.github_issue_create_operation_state is None
     launch.assert_called_once_with(original.id)
 
 
@@ -1125,6 +1131,23 @@ def test_file_as_issue_one_speaks_question_and_displays_brief(
         "Title: create me a SaaS called widgets\n\n"
         "Body:\ncreate me a SaaS called widgets"
     )
+
+
+def test_no_cancels_repository_or_create(store: JobStore) -> None:
+    original = _repository_or_create_awaiting(store)
+    with mock.patch.object(service, "launch_worker") as launch:
+        spoken = service.reply_job(
+            original.id,
+            "no",
+            trusted_utterance="no",
+            answer_provenance=AnswerProvenance.USER_VOICE,
+        )
+
+    updated = store.get(original.id)
+    assert updated.status == JobStatus.COMPLETED
+    assert "did not start" in str(updated.result)
+    assert spoken is None
+    launch.assert_not_called()
 
 
 def test_yes_does_not_resolve_repository_or_create(store: JobStore) -> None:

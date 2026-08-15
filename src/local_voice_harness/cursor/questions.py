@@ -314,6 +314,7 @@ def _queue_answer(
     linear_ticket_create_team: str | None = None,
     linear_ticket_create_confirmed: bool | None = None,
     clear_target: bool = False,
+    clear_issue_create_draft: bool = False,
 ) -> CursorJob:
     return job.mark_delivered(
         status=JobStatus.QUEUED,
@@ -406,6 +407,16 @@ def _queue_answer(
             _clarification_record(job, question, resolution, context),
         ],
         voice_question=_answered_envelope(job, question, resolution, context.now),
+        **(
+            {
+                "github_issue_create_title": None,
+                "github_issue_create_body": None,
+                "github_issue_create_marker": None,
+                "github_issue_create_operation_state": None,
+            }
+            if clear_issue_create_draft
+            else {}
+        ),
     )
 
 
@@ -495,24 +506,42 @@ def _repository_or_create_answer(
             message="Please say the checkout name, this one, new repo, or existing.",
         )
     normalized = _normalize_admission_answer(context.trusted_text)
-    if (
-        normalized
-        in {
-            "yes",
-            "yes please",
-            "ok",
-            "okay",
-            "ok then",
-            "okay then",
-            "sure",
-            "confirm",
-            "confirmed",
-            "lgtm",
-            "sounds good",
-        }
-        or _confirmation(normalized) is False
-    ):
+    if normalized in {
+        "yes",
+        "yes please",
+        "ok",
+        "okay",
+        "ok then",
+        "okay then",
+        "sure",
+        "confirm",
+        "confirmed",
+        "lgtm",
+        "sounds good",
+    }:
         return AnswerTransition(None, message=question.text)
+    if _confirmation(normalized) is False:
+        completed = job.evolve_for_delivery(
+            now=context.now,
+            status=JobStatus.COMPLETED,
+            question=None,
+            clarification_kind=None,
+            result="Okay, I did not start that work.",
+            completed_at=context.now,
+            worker_pid=None,
+            worker_boot_id=None,
+            worker_process_start=None,
+            worker_token=None,
+            voice_question=envelope(
+                question,
+                QuestionState.RESOLVED,
+                job=job,
+                answer="no",
+                trusted_answer=context.trusted_text,
+                answered_at=context.now,
+            ),
+        )
+        return AnswerTransition(completed)
     if normalized in _NEW_REPO_ANSWERS:
         return AnswerTransition(
             _queue_answer(
@@ -833,6 +862,9 @@ def _github_issue_file_as_one_answer(
             context,
             continuation=False,
             clear_target=True,
+            github_issue_create_requested=False,
+            github_issue_create_confirmed=False,
+            clear_issue_create_draft=True,
         ),
         launch=True,
     )

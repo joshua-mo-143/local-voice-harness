@@ -635,6 +635,55 @@ class AppContextTests(unittest.TestCase):
             play.call_args.args[0],
         )
 
+    def test_high_confidence_pull_request_follows_up_completed_checkout(self) -> None:
+        parent = mock.Mock()
+        parent.id = "123456789abc"
+        parent.status = JobStatus.COMPLETED
+        parent.worktree_path = "/home/test/src/project"
+        parent.repository = "/home/test/src/project"
+        parent.revision = 4
+        parent.completed_at = 20.0
+        captured: dict[str, object] = {}
+
+        def cursor_turn(
+            request: CursorTurnRequest,
+            *,
+            delivery_claims: list[tuple[str, str]],
+            integrations: object,
+        ) -> tuple[str, None]:
+            captured["request"] = request
+            return "Create private source/project?", None
+
+        with (
+            mock.patch.object(app, "start_components"),
+            mock.patch.object(
+                app,
+                "request_context",
+                side_effect=lambda text, **_settings: RequestContext(text),
+            ),
+            mock.patch.object(
+                app,
+                "route_intent",
+                return_value=IntentRoute(Intent.GITHUB_PR_CREATE, "high"),
+            ),
+            mock.patch.object(app.CURSOR_STORE, "list", return_value=[parent]),
+            mock.patch.object(app, "qwen_response") as qwen,
+            mock.patch.object(app, "cursor_turn", side_effect=cursor_turn) as cursor,
+            mock.patch.object(app, "stream_and_play") as play,
+        ):
+            app.respond("open a pull request")
+
+        qwen.assert_not_called()
+        cursor.assert_called_once()
+        request = captured["request"]
+        assert isinstance(request, CursorTurnRequest)
+        self.assertEqual(request.action, "follow_up")
+        self.assertEqual(request.job_id, "123456789abc")
+        self.assertEqual(request.expected_parent_revision, 4)
+        self.assertEqual(request.expected_completed_at, 20.0)
+        self.assertTrue(request.github_pr_create_requested)
+        self.assertIn("Create private source/project?", play.call_args.args[0])
+
     def test_medium_confidence_merge_does_not_write(self) -> None:
         with (
             mock.patch.object(app, "start_components"),
