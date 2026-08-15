@@ -4350,6 +4350,7 @@ class CursorJobStateTests(unittest.TestCase):
             github_issue=None,
             github_issue_context=None,
             github_issue_create_requested=False,
+            github_pr_create_requested=False,
             github_repo_create_requested=False,
             github_repo_create_org_requested=False,
             linear_team=None,
