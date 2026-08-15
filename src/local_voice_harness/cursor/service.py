@@ -8,7 +8,7 @@ import uuid
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Literal
+from typing import Literal, overload
 
 from ..config import JOB_LOGS_DIR, JOBS_DIR, LEGACY_JOBS_DIR
 from ..diagnostic_safety import redact_diagnostic
@@ -180,6 +180,18 @@ class CursorTurnResult:
 
     def __len__(self) -> int:
         return 2
+
+    @overload
+    def __getitem__(self, index: Literal[0]) -> ResponseLike: ...
+
+    @overload
+    def __getitem__(self, index: Literal[1]) -> str | None: ...
+
+    @overload
+    def __getitem__(self, index: slice) -> tuple[ResponseLike | str | None, ...]: ...
+
+    @overload
+    def __getitem__(self, index: int) -> ResponseLike | str | None: ...
 
     def __getitem__(self, index: int | slice):
         return (self.text, self.session_id)[index]
