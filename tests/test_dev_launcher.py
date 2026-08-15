@@ -44,20 +44,23 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, os.environ["FAKE_APPLICATION_SOURCE"])
-from local_voice_harness.config import JOBS_DB
+from local_voice_harness.config import JOB_LOGS_DIR, JOBS_DB
 
 record = {
     "arguments": sys.argv[1:],
     "jobs_database": str(JOBS_DB),
+    "job_logs_dir": str(JOB_LOGS_DIR),
     "environment": {
         name: os.environ.get(name)
         for name in (
             "GH_CONFIG_DIR",
             "STATE_DIRECTORY",
+            "TMPDIR",
             "XDG_CONFIG_HOME",
             "XDG_STATE_HOME",
             "XDG_RUNTIME_DIR",
             "UV_PROJECT_ENVIRONMENT",
+            "VOICE_HARNESS_BRANCH_RUNTIME",
             "VOICE_HARNESS_WAKE_THRESHOLD",
         )
     },
@@ -166,10 +169,12 @@ raise SystemExit(int(os.environ.get("FAKE_SYSTEMCTL_EXIT", "3")))
             {
                 "GH_CONFIG_DIR": str(self.test_root / "official-config" / "gh"),
                 "STATE_DIRECTORY": None,
+                "TMPDIR": str(PROJECT_ROOT / ".dev" / "runtime" / "tmp"),
                 "XDG_CONFIG_HOME": str(PROJECT_ROOT / ".dev" / "config"),
                 "XDG_STATE_HOME": str(PROJECT_ROOT / ".dev" / "state"),
                 "XDG_RUNTIME_DIR": str(self.test_root / "shared-runtime"),
                 "UV_PROJECT_ENVIRONMENT": str(PROJECT_ROOT / ".dev" / "venv"),
+                "VOICE_HARNESS_BRANCH_RUNTIME": str(PROJECT_ROOT / ".dev" / "runtime"),
                 "VOICE_HARNESS_WAKE_THRESHOLD": "0.73",
             },
         )
@@ -186,6 +191,11 @@ raise SystemExit(int(os.environ.get("FAKE_SYSTEMCTL_EXIT", "3")))
         )
         self.assertTrue((PROJECT_ROOT / ".dev" / "config").is_dir())
         self.assertTrue((PROJECT_ROOT / ".dev" / "state").is_dir())
+        self.assertTrue((PROJECT_ROOT / ".dev" / "runtime").is_dir())
+        self.assertEqual(
+            invocation["job_logs_dir"],
+            str(PROJECT_ROOT / ".dev" / "runtime" / "jobs"),
+        )
         self.assertFalse(self.systemctl_record.exists())
 
     def test_commands_cannot_inherit_production_durable_state(self) -> None:
@@ -259,6 +269,109 @@ raise SystemExit(int(os.environ.get("FAKE_SYSTEMCTL_EXIT", "3")))
             resolved_databases.append(cast(str, invocation["jobs_database"]))
 
         self.assertNotEqual(*resolved_databases)
+
+    def test_concurrent_worktree_launchers_isolate_branch_owned_files(self) -> None:
+        processes: list[subprocess.Popen[str]] = []
+        records: list[Path] = []
+        checkouts: list[Path] = []
+        shared_runtime = self.test_root / "shared-runtime"
+        shared_runtime.mkdir(parents=True, exist_ok=True)
+        (shared_runtime / "dictation.sock").write_text("shared-stt")
+        (shared_runtime / "voice-harness-tts.sock").write_text("shared-tts")
+
+        try:
+            for name in ("worktree-one", "worktree-two"):
+                checkout = self.test_root / name
+                scripts = checkout / "scripts"
+                scripts.mkdir(parents=True)
+                shutil.copy2(LAUNCHER, scripts / "dev.sh")
+                record = self.test_root / f"{name}-uv.json"
+                ready = self.test_root / f"{name}-ready"
+                checkouts.append(checkout)
+                records.append(record)
+                processes.append(
+                    subprocess.Popen(
+                        [str(scripts / "dev.sh"), "text", "request"],
+                        cwd=self.test_root,
+                        env=self._environment(
+                            FAKE_UV_RECORD=str(record),
+                            FAKE_UV_MODE="wait",
+                            FAKE_READY=str(ready),
+                        ),
+                        stdout=subprocess.PIPE,
+                        stderr=subprocess.PIPE,
+                        text=True,
+                    )
+                )
+
+            deadline = time.monotonic() + 5
+            while time.monotonic() < deadline and not all(
+                (self.test_root / f"{name}-ready").exists()
+                for name in ("worktree-one", "worktree-two")
+            ):
+                time.sleep(0.01)
+            self.assertTrue(
+                all(
+                    (self.test_root / f"{name}-ready").exists()
+                    for name in ("worktree-one", "worktree-two")
+                ),
+                "concurrent launchers did not start",
+            )
+
+            invocations = [json.loads(record.read_text()) for record in records]
+            environments = [
+                cast(dict[str, str | None], invocation["environment"])
+                for invocation in invocations
+            ]
+            owned_roots = [
+                {
+                    environments[index]["XDG_CONFIG_HOME"],
+                    environments[index]["XDG_STATE_HOME"],
+                    environments[index]["UV_PROJECT_ENVIRONMENT"],
+                    environments[index]["VOICE_HARNESS_BRANCH_RUNTIME"],
+                    environments[index]["TMPDIR"],
+                    invocations[index]["jobs_database"],
+                    invocations[index]["job_logs_dir"],
+                }
+                for index in range(2)
+            ]
+            for index, checkout in enumerate(checkouts):
+                self.assertEqual(
+                    environments[index]["XDG_RUNTIME_DIR"],
+                    str(shared_runtime),
+                )
+                self.assertEqual(
+                    environments[index]["VOICE_HARNESS_BRANCH_RUNTIME"],
+                    str(checkout / ".dev" / "runtime"),
+                )
+                self.assertEqual(
+                    invocations[index]["job_logs_dir"],
+                    str(checkout / ".dev" / "runtime" / "jobs"),
+                )
+                self.assertTrue((checkout / ".dev" / "config").is_dir())
+                self.assertTrue((checkout / ".dev" / "state").is_dir())
+                self.assertTrue((checkout / ".dev" / "runtime").is_dir())
+                other = checkouts[1 - index]
+                for path in owned_roots[index]:
+                    self.assertIsNotNone(path)
+                    assert path is not None
+                    self.assertTrue(
+                        path.startswith(str(checkout / ".dev")),
+                        path,
+                    )
+                    self.assertFalse(path.startswith(str(other / ".dev")), path)
+            self.assertTrue(owned_roots[0].isdisjoint(owned_roots[1]))
+            self.assertEqual(
+                (shared_runtime / "dictation.sock").read_text(), "shared-stt"
+            )
+            self.assertEqual(
+                (shared_runtime / "voice-harness-tts.sock").read_text(),
+                "shared-tts",
+            )
+        finally:
+            for process in processes:
+                process.send_signal(signal.SIGTERM)
+                process.wait(timeout=5)
 
     def test_primary_checkout_launcher_preserves_installed_wake_environment(
         self,

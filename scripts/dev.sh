@@ -48,8 +48,10 @@ fi
 export XDG_CONFIG_HOME="$PROJECT_DIR/.dev/config"
 export XDG_STATE_HOME="$PROJECT_DIR/.dev/state"
 export UV_PROJECT_ENVIRONMENT="$PROJECT_DIR/.dev/venv"
+export VOICE_HARNESS_BRANCH_RUNTIME="$PROJECT_DIR/.dev/runtime"
+export TMPDIR="$PROJECT_DIR/.dev/runtime/tmp"
 unset STATE_DIRECTORY
-mkdir -p -- "$XDG_CONFIG_HOME" "$XDG_STATE_HOME"
+mkdir -p -- "$XDG_CONFIG_HOME" "$XDG_STATE_HOME" "$VOICE_HARNESS_BRANCH_RUNTIME" "$TMPDIR"
 
 if [[ "$command" == "text" || "$command" == "pronounce" ]]; then
   exec uv run --project "$PROJECT_DIR" --python "$python_version" --extra wake voice-harness "$command" "$@"
