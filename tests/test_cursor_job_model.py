@@ -550,6 +550,29 @@ class CursorJobModelTests(unittest.TestCase):
         self.assertTrue(job.review_approved)
         self.assertNotIn("review_approved", job.to_dict())
 
+    def test_native_review_boolean_cannot_create_reviewer_provenance(self) -> None:
+        with self.assertRaisesRegex(JobValidationError, "explicit approval source"):
+            CursorJob.from_dict(
+                {
+                    "schema_version": CURRENT_SCHEMA_VERSION,
+                    "id": "123456789abc",
+                    "revision": 0,
+                    "request": "change recovery",
+                    "status": "queued",
+                    "created_at": 1,
+                    "queued_at": 1,
+                    "delivered": False,
+                    "workflow_tier": "medium",
+                    "workflow_classification_reason": "recovery",
+                    "workflow_phase": "reviewing",
+                    "review_round": 0,
+                    "plan_artifact": ".artifacts/123456789abc/plan-0.json",
+                    "review_artifact": ".artifacts/123456789abc/review-0.json",
+                    "review_decision": "approve",
+                    "review_approved": True,
+                }
+            )
+
     def test_native_review_approval_cannot_disagree_with_source(self) -> None:
         with self.assertRaisesRegex(JobValidationError, "must be paired"):
             CursorJob.from_dict(

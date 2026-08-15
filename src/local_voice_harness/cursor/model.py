@@ -971,7 +971,9 @@ def _canonicalize_announcement_dismissal(
     values.pop("announcement_dismissed", None)
 
 
-def _canonicalize_review_approval(values: dict[str, object]) -> None:
+def _canonicalize_review_approval(
+    values: dict[str, object], *, legacy_record: bool
+) -> None:
     """Translate legacy approval boolean, fail closed on conflict, then drop it."""
 
     approved_present = "review_approved" in values
@@ -981,6 +983,10 @@ def _canonicalize_review_approval(values: dict[str, object]) -> None:
     if approved_present and source_present and approved != (source is not None):
         raise JobValidationError("review approval and approval source must be paired")
     if approved_present and not source_present and approved:
+        if not legacy_record:
+            raise JobValidationError(
+                "current-schema review approval requires explicit approval source"
+            )
         values["review_approval_source"] = "reviewer"
     values.pop("review_approved", None)
 
@@ -1093,7 +1099,10 @@ def migrate_job_record(raw: Mapping[str, object]) -> tuple[dict[str, object], in
         values,
         legacy_record=loaded_version < CURRENT_SCHEMA_VERSION,
     )
-    _canonicalize_review_approval(values)
+    _canonicalize_review_approval(
+        values,
+        legacy_record=loaded_version < CURRENT_SCHEMA_VERSION,
+    )
     values["schema_version"] = CURRENT_SCHEMA_VERSION
     return values, loaded_version
 
