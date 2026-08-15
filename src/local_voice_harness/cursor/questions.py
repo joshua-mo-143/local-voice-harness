@@ -303,6 +303,7 @@ def _queue_answer(
     clone_confirmed: bool | None = None,
     github_issue_create_confirmed: bool | None = None,
     github_repo_create_confirmed: bool | None = None,
+    github_repo_create_owner: str | None = None,
     linear_ticket_create_team: str | None = None,
     linear_ticket_create_confirmed: bool | None = None,
     clear_target: bool = False,
@@ -339,6 +340,11 @@ def _queue_answer(
             job.github_repo_create_confirmed
             if github_repo_create_confirmed is None
             else github_repo_create_confirmed
+        ),
+        github_repo_create_owner=(
+            job.github_repo_create_owner
+            if github_repo_create_owner is None
+            else github_repo_create_owner
         ),
         linear_ticket_create_confirmed=(
             job.linear_ticket_create_confirmed
@@ -657,6 +663,46 @@ def _github_issue_create_confirmation_answer(
         ),
     )
     return AnswerTransition(completed)
+
+
+def _github_repo_create_org_answer(
+    job: CursorJob,
+    question: Question,
+    resolution: AnswerResolution,
+    context: AnswerContext,
+) -> AnswerTransition:
+    if context.trusted_text is None:
+        return AnswerTransition(
+            None,
+            message="Please name the organization directly.",
+        )
+    from .provisioning import parse_repo_create_org
+
+    organization = parse_repo_create_org(context.trusted_text)
+    if organization is None:
+        return AnswerTransition(
+            None,
+            message="Please say the organization name.",
+        )
+    repository = (job.github_repository or "").strip()
+    if "/" in repository:
+        _, slug = repository.split("/", 1)
+        github_repository = f"{organization}/{slug}" if slug else organization
+    else:
+        github_repository = organization
+    return AnswerTransition(
+        _queue_answer(
+            job,
+            question,
+            resolution,
+            context,
+            continuation=False,
+            github_repository=github_repository,
+            github_repo_create_owner=organization,
+            clear_target=True,
+        ),
+        launch=True,
+    )
 
 
 def _github_repo_create_slug_answer(
@@ -1155,6 +1201,7 @@ _ANSWER_HANDLERS: dict[str, AnswerHandler] = {
     "fork_confirmation": _fork_confirmation_answer,
     "clone_confirmation": _clone_confirmation_answer,
     "github_issue_create_confirmation": _github_issue_create_confirmation_answer,
+    "github_repo_create_org": _github_repo_create_org_answer,
     "github_repo_create_slug": _github_repo_create_slug_answer,
     "github_repo_create_confirmation": _github_repo_create_confirmation_answer,
     "linear_team": _linear_team_answer,

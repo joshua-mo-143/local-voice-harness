@@ -13,7 +13,7 @@ from pathlib import Path
 from ..agents.harness import HarnessCapability, HarnessSession, ReconciliationState
 from ..diagnostic_safety import redact_diagnostic
 from ..errors import HarnessError
-from ..github_issue_creation import draft_github_issue
+from ..github_issue_creation import draft_github_issue, repository_from_utterance
 from ..integrations.github import (
     GitHubClient,
     GitHubCommandStartError,
@@ -571,6 +571,77 @@ def parse_repo_create_visibility(value: str) -> str:
     return "private"
 
 
+_ORG_LOGIN = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$")
+_ORG_SUFFIX = re.compile(
+    r"\b(?:the\s+)?([A-Za-z0-9](?:[A-Za-z0-9-]{0,38}))\s+"
+    r"(?:org|organization|organisation)\b",
+    re.IGNORECASE,
+)
+_ORG_PREFIX = re.compile(
+    r"\b(?:org|organization|organisation)\s+"
+    r"([A-Za-z0-9](?:[A-Za-z0-9-]{0,38}))\b",
+    re.IGNORECASE,
+)
+_ORG_PREPOSITION = re.compile(
+    r"\b(?:in|under)\s+(?:the\s+)?"
+    r"([A-Za-z0-9](?:[A-Za-z0-9-]{0,38}))"
+    r"(?:\s+(?:org|organization|organisation))?\b",
+    re.IGNORECASE,
+)
+_ORG_RESERVED = frozenset(
+    {
+        "a",
+        "an",
+        "the",
+        "create",
+        "empty",
+        "github",
+        "new",
+        "please",
+        "private",
+        "public",
+        "repo",
+        "repository",
+        "org",
+        "organization",
+        "organisation",
+        "in",
+        "under",
+        "for",
+        "called",
+        "named",
+        "my",
+        "our",
+    }
+)
+_ORG_CREATE_DENIED = "I cannot create a GitHub repository in that organization."
+_WHICH_ORG_QUESTION = "Which org?"
+
+
+def parse_repo_create_org(value: str) -> str | None:
+    candidate = value.strip()
+    match = (
+        _ORG_SUFFIX.search(candidate)
+        or _ORG_PREFIX.search(candidate)
+        or _ORG_PREPOSITION.search(candidate)
+    )
+    if match is not None:
+        candidate = match.group(1)
+    else:
+        tokens = re.findall(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})", candidate)
+        leftover = [token for token in tokens if token.casefold() not in _ORG_RESERVED]
+        if len(leftover) != 1:
+            return None
+        if any(
+            token.casefold() in {"create", "repo", "repository"} for token in tokens
+        ):
+            return None
+        candidate = leftover[0]
+    if candidate.casefold() in _ORG_RESERVED or not _ORG_LOGIN.fullmatch(candidate):
+        return None
+    return candidate
+
+
 def complete_from_output(
     job: CursorJob,
     *,
@@ -991,6 +1062,119 @@ def _record_github_repo_remote_created(
     )
 
 
+def _complete_github_repo_creation_without_write(
+    store: JobStore,
+    job_id: str,
+    token: WorkerClaim,
+    message: str,
+    *,
+    expected_revision: int,
+) -> None:
+    revision = expected_revision
+    snapshot = store.get(job_id)
+    if snapshot.status == JobStatus.ROUTING:
+
+        def mark_running(job: CursorJob) -> CursorJob:
+            return job.evolve(status=JobStatus.RUNNING)
+
+        running = _worker_change(
+            store,
+            job_id,
+            token,
+            {JobStatus.ROUTING},
+            mark_running,
+            expected_revision=revision,
+        )
+        if running is None:
+            return
+        revision = running.revision
+
+    def finish(job: CursorJob) -> CursorJob:
+        now = time.time()
+        return job.evolve_for_delivery(
+            now=now,
+            status=JobStatus.COMPLETED,
+            result=message,
+            completed_at=now,
+            worker_pid=None,
+            worker_boot_id=None,
+            worker_process_start=None,
+            worker_token=None,
+            worker_operation=None,
+        )
+
+    _worker_change(
+        store,
+        job_id,
+        token,
+        {JobStatus.RUNNING},
+        finish,
+        expected_revision=revision,
+    )
+
+
+def _resolve_github_repo_create_owner(
+    store: JobStore,
+    job: CursorJob,
+    token: WorkerClaim,
+    github: GitHubProvider,
+    login: str,
+    trusted: str,
+) -> str | None:
+    if not job.github_repo_create_org_requested:
+        return login
+    named = (job.github_repo_create_owner or "").strip()
+    if not named:
+        named = parse_repo_create_org(trusted) or ""
+    if not named:
+        spoken_repository = repository_from_utterance(trusted)
+        if spoken_repository and "/" in spoken_repository:
+            named = spoken_repository.split("/", 1)[0].strip()
+    if not named:
+        try:
+            organizations = github.list_organizations()
+        except GitHubError:
+            _complete_github_repo_creation_without_write(
+                store,
+                job.id,
+                token,
+                _ORG_CREATE_DENIED,
+                expected_revision=job.revision,
+            )
+            return None
+        if len(organizations) > 1:
+            _worker_question(
+                store,
+                job.id,
+                token,
+                _WHICH_ORG_QUESTION,
+                expected_revision=job.revision,
+                clarification_kind="github_repo_create_org",
+            )
+            return None
+        if len(organizations) != 1:
+            _complete_github_repo_creation_without_write(
+                store,
+                job.id,
+                token,
+                _ORG_CREATE_DENIED,
+                expected_revision=job.revision,
+            )
+            return None
+        named = organizations[0]
+    try:
+        return github.require_organization_create_access(named)
+    except GitHubError:
+        _complete_github_repo_creation_without_write(
+            store,
+            job.id,
+            token,
+            _ORG_CREATE_DENIED,
+            expected_revision=job.revision,
+        )
+        return None
+
+
 def _finish_github_repo_creation(
     store: JobStore,
     job_id: str,
@@ -1112,16 +1296,21 @@ def _run_github_repo_creation(
     visibility = job.github_repo_create_visibility or parse_repo_create_visibility(
         trusted
     )
+    owner = _resolve_github_repo_create_owner(store, job, token, github, login, trusted)
+    if owner is None:
+        return
     repository = (job.github_repository or "").strip()
     slug = ""
     if repository and "/" in repository:
-        owner, slug = repository.split("/", 1)
-        if owner.casefold() != login.casefold():
-            repository = ""
+        stored_owner, slug = repository.split("/", 1)
+        if stored_owner.casefold() != owner.casefold():
             slug = ""
     if not slug:
         slug = parse_repo_create_slug(trusted) or ""
     if not slug:
+        slug_changes = {"github_repository": owner}
+        if job.github_repo_create_org_requested:
+            slug_changes["github_repo_create_owner"] = owner
         _worker_question(
             store,
             job.id,
@@ -1129,12 +1318,12 @@ def _run_github_repo_creation(
             "What should I name the repository?",
             expected_revision=job.revision,
             clarification_kind="github_repo_create_slug",
-            job_changes={"github_repository": login},
+            job_changes=slug_changes,
         )
         return
     if not job.github_repo_create_marker:
         plan = github.plan_repository_creation(
-            login,
+            owner,
             slug,
             visibility,
             correlation_marker=uuid.uuid4().hex,
@@ -1143,6 +1332,9 @@ def _run_github_repo_creation(
         def persist_plan(current: CursorJob) -> CursorJob:
             return current.evolve(
                 github_repository=plan.name_with_owner,
+                github_repo_create_owner=(
+                    plan.owner if current.github_repo_create_org_requested else None
+                ),
                 github_repo_create_visibility=plan.visibility,
                 github_repo_create_marker=plan.correlation_marker,
                 github_repo_create_operation_state="planned",
@@ -1160,7 +1352,7 @@ def _run_github_repo_creation(
             return
         job = updated
     plan = github.plan_repository_creation(
-        login,
+        owner,
         slug,
         job.github_repo_create_visibility or visibility,
         correlation_marker=job.github_repo_create_marker,
@@ -1192,10 +1384,15 @@ def _run_github_repo_creation(
                 expected_revision=job.revision,
                 clarification_kind="github_repo_create_slug",
                 job_changes={
-                    "github_repository": login,
+                    "github_repository": owner,
                     "github_repo_create_confirmed": False,
                     "github_repo_create_marker": None,
                     "github_repo_create_operation_state": None,
+                    **(
+                        {"github_repo_create_owner": owner}
+                        if job.github_repo_create_org_requested
+                        else {}
+                    ),
                 },
             )
             return

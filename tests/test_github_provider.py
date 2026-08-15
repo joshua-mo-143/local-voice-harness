@@ -268,6 +268,18 @@ class GitHubProviderTests(unittest.TestCase):
             plan, confirmed=True
         )
 
+    def test_provider_delegates_organization_create_access(self) -> None:
+        self.client.list_organizations.return_value = ("acme", "widgets")
+        self.client.require_organization_create_access.return_value = "acme"
+
+        self.assertEqual(self.provider.list_organizations(), ("acme", "widgets"))
+        self.assertEqual(
+            self.provider.require_organization_create_access("acme"),
+            "acme",
+        )
+        self.client.list_organizations.assert_called_once_with()
+        self.client.require_organization_create_access.assert_called_once_with("acme")
+
     def test_provider_requires_confirmation_before_repo_submission(self) -> None:
         plan = GitHubRepoCreationPlan("alice", "payments", "private", "a" * 32)
         with self.assertRaisesRegex(GitHubError, "confirmation"):

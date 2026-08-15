@@ -210,8 +210,31 @@ def test_admission_persists_github_repo_create_request(tmp_path: Path) -> None:
 
     job = store.get(job_id)
     assert job.github_repo_create_requested
+    assert not job.github_repo_create_org_requested
     assert job.issue_provider == "github"
     assert job.trusted_utterance == "create a GitHub repository called payments"
+
+
+def test_admission_persists_github_org_repo_create_request(tmp_path: Path) -> None:
+    store = JobStore(tmp_path / "jobs", tmp_path / "legacy")
+    registry = build_integration_registry(default_user_config(tmp_path))
+    with (
+        mock.patch.object(service, "_job_store", return_value=store),
+        mock.patch.object(service, "launch_worker"),
+    ):
+        job_id = service.start_job(
+            "create a GitHub repository in the acme org called payments",
+            utterance="create a GitHub repository in the acme org called payments",
+            github_repo_create_requested=True,
+            github_repo_create_org_requested=True,
+            foreground=False,
+            integrations=registry,
+        )
+
+    job = store.get(job_id)
+    assert job.github_repo_create_requested
+    assert job.github_repo_create_org_requested
+    assert job.issue_provider == "github"
 
 
 def test_github_target_with_linear_like_owner_reaches_github_classification(

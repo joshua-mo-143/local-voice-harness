@@ -207,6 +207,7 @@ _BOOL_FIELDS = frozenset(
         "github_issue_create_requested",
         "github_issue_create_confirmed",
         "github_repo_create_requested",
+        "github_repo_create_org_requested",
         "github_repo_create_confirmed",
         "linear_ticket_create_requested",
         "linear_ticket_create_confirmed",
@@ -314,6 +315,7 @@ _STRING_FIELDS = frozenset(
         "github_issue_create_marker",
         "github_issue_create_operation_state",
         "github_issue_created_url",
+        "github_repo_create_owner",
         "github_repo_create_visibility",
         "github_repo_create_marker",
         "github_repo_create_operation_state",
@@ -518,6 +520,7 @@ class NewAgentJob:
     github_issue_create_body: str | None = None
     github_issue_create_marker: str | None = None
     github_repo_create_requested: bool = False
+    github_repo_create_org_requested: bool = False
     linear_ticket_create_requested: bool = False
     linear_ticket_create_team: str | None = None
     linear_ticket_create_team_id: str | None = None
@@ -2025,6 +2028,9 @@ class AgentJob:
                 "github_issue_create_body": spec.github_issue_create_body,
                 "github_issue_create_marker": spec.github_issue_create_marker,
                 "github_repo_create_requested": spec.github_repo_create_requested,
+                "github_repo_create_org_requested": (
+                    spec.github_repo_create_org_requested
+                ),
                 "linear_ticket_create_requested": spec.linear_ticket_create_requested,
                 "linear_ticket_create_team": spec.linear_ticket_create_team,
                 "linear_ticket_create_team_id": spec.linear_ticket_create_team_id,
@@ -2586,6 +2592,14 @@ class AgentJob:
     @property
     def github_repo_create_requested(self) -> bool:
         return self._boolean_field("github_repo_create_requested")
+
+    @property
+    def github_repo_create_org_requested(self) -> bool:
+        return self._boolean_field("github_repo_create_org_requested")
+
+    @property
+    def github_repo_create_owner(self) -> str | None:
+        return self._optional_string("github_repo_create_owner")
 
     @property
     def github_repo_create_confirmed(self) -> bool:
@@ -3950,6 +3964,13 @@ class AgentJob:
         if self.github_repo_create_confirmed and not self.github_repo_create_requested:
             raise JobValidationError(
                 "GitHub repository creation confirmation requires a creation request"
+            )
+        if (
+            self.github_repo_create_org_requested
+            and not self.github_repo_create_requested
+        ):
+            raise JobValidationError(
+                "GitHub organization repository creation requires a creation request"
             )
         if self.github_repo_create_visibility is not None and (
             self.github_repo_create_visibility not in {"private", "public"}

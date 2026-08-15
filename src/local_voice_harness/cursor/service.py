@@ -124,6 +124,7 @@ class StartJobRequest:
     github_issue_context: str | None = None
     github_issue_create_requested: bool = False
     github_repo_create_requested: bool = False
+    github_repo_create_org_requested: bool = False
     linear_team: str | None = None
     linear_ticket_create_requested: bool = False
     fork_requested: bool = False
@@ -146,6 +147,7 @@ class CursorTurnRequest:
     github_issue_context: str | None = None
     github_issue_create_requested: bool = False
     github_repo_create_requested: bool = False
+    github_repo_create_org_requested: bool = False
     linear_team: str | None = None
     linear_ticket_create_requested: bool = False
     fork_requested: bool = False
@@ -456,6 +458,7 @@ def _build_start_job(
             github_issue_context=request.github_issue_context,
             github_issue_create_requested=request.github_issue_create_requested,
             github_repo_create_requested=request.github_repo_create_requested,
+            github_repo_create_org_requested=request.github_repo_create_org_requested,
             linear_ticket_create_requested=request.linear_ticket_create_requested,
             linear_ticket_create_team=request.linear_team,
             fork_requested=request.fork_requested,
@@ -513,6 +516,7 @@ def start_job(
     github_issue_context: str | None = None,
     github_issue_create_requested: bool = False,
     github_repo_create_requested: bool = False,
+    github_repo_create_org_requested: bool = False,
     linear_team: str | None = None,
     linear_ticket_create_requested: bool = False,
     fork_requested: bool = False,
@@ -537,6 +541,7 @@ def start_job(
             github_issue_context=github_issue_context,
             github_issue_create_requested=github_issue_create_requested,
             github_repo_create_requested=github_repo_create_requested,
+            github_repo_create_org_requested=github_repo_create_org_requested,
             linear_team=linear_team,
             linear_ticket_create_requested=linear_ticket_create_requested,
             fork_requested=fork_requested,
@@ -2634,6 +2639,7 @@ def cursor_turn(
     github_issue_context: str | None = None,
     github_issue_create_requested: bool = False,
     github_repo_create_requested: bool = False,
+    github_repo_create_org_requested: bool = False,
     linear_team: str | None = None,
     linear_ticket_create_requested: bool = False,
     fork_requested: bool = False,
@@ -2668,6 +2674,7 @@ def cursor_turn(
         github_issue_context = request.github_issue_context
         github_issue_create_requested = request.github_issue_create_requested
         github_repo_create_requested = request.github_repo_create_requested
+        github_repo_create_org_requested = request.github_repo_create_org_requested
         linear_team = request.linear_team
         linear_ticket_create_requested = request.linear_ticket_create_requested
         fork_requested = request.fork_requested
@@ -2848,6 +2855,7 @@ def cursor_turn(
                 github_issue_context=github_issue_context,
                 github_issue_create_requested=github_issue_create_requested,
                 github_repo_create_requested=github_repo_create_requested,
+                github_repo_create_org_requested=github_repo_create_org_requested,
                 linear_team=linear_team,
                 linear_ticket_create_requested=linear_ticket_create_requested,
                 fork_requested=fork_requested,
@@ -2899,6 +2907,7 @@ def cursor_turn(
                 github_issue_context=github_issue_context,
                 github_issue_create_requested=github_issue_create_requested,
                 github_repo_create_requested=github_repo_create_requested,
+                github_repo_create_org_requested=github_repo_create_org_requested,
                 linear_team=linear_team,
                 linear_ticket_create_requested=linear_ticket_create_requested,
                 fork_requested=fork_requested,

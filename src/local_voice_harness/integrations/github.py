@@ -819,6 +819,33 @@ class GitHubClient:
             raise GitHubError("GitHub CLI did not return an authenticated user")
         return login
 
+    def list_organizations(self) -> tuple[str, ...]:
+        process = self._run(
+            [self.gh_executable, "org", "list", "--limit", "100"],
+            timeout=15,
+        )
+        organizations: list[str] = []
+        for line in process.stdout.splitlines():
+            name = line.strip()
+            if not name:
+                continue
+            if not re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})", name):
+                raise GitHubError("GitHub CLI returned a malformed organization")
+            organizations.append(name)
+        return tuple(organizations)
+
+    def require_organization_create_access(self, organization: str) -> str:
+        candidate = organization.strip()
+        if not re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})", candidate):
+            raise GitHubError("GitHub organization must be a valid login")
+        organizations = self.list_organizations()
+        for name in organizations:
+            if name.casefold() == candidate.casefold():
+                return name
+        raise GitHubError(
+            f"authenticated user cannot create a repository in {candidate}"
+        )
+
     def prepare_public_fork(self, repository: str) -> tuple[GitHubRepository, str, str]:
         source = self.inspect_public_repository(repository)
         login = self.authenticated_login()
@@ -1394,6 +1421,8 @@ _GITHUB_STATE_SECTIONS: dict[str, dict[str, str]] = {
     },
     "repo_creation": {
         "requested": "github_repo_create_requested",
+        "org_requested": "github_repo_create_org_requested",
+        "owner": "github_repo_create_owner",
         "confirmed": "github_repo_create_confirmed",
         "visibility": "github_repo_create_visibility",
         "marker": "github_repo_create_marker",
@@ -1651,6 +1680,12 @@ class GitHubProvider:
             )
         GitHubClient.validate_repo_creation_plan(plan)
         return self._client.submit_repository_creation(plan, confirmed=True)
+
+    def list_organizations(self) -> tuple[str, ...]:
+        return self._client.list_organizations()
+
+    def require_organization_create_access(self, organization: str) -> str:
+        return self._client.require_organization_create_access(organization)
 
     def materialize_repository(
         self,

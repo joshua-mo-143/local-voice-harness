@@ -452,6 +452,26 @@ class GitHubClientTests(unittest.TestCase):
             ],
         )
 
+    def test_list_organizations_and_require_create_access(self) -> None:
+        client = GitHubClient()
+        with mock.patch.object(
+            client, "_run", return_value=_completed("acme\nwidgets\n")
+        ) as run:
+            self.assertEqual(client.list_organizations(), ("acme", "widgets"))
+        self.assertEqual(
+            run.call_args.args[0],
+            ["gh", "org", "list", "--limit", "100"],
+        )
+        with mock.patch.object(
+            client, "list_organizations", return_value=("acme", "widgets")
+        ):
+            self.assertEqual(client.require_organization_create_access("Acme"), "acme")
+        with (
+            mock.patch.object(client, "list_organizations", return_value=("widgets",)),
+            self.assertRaisesRegex(GitHubError, "cannot create"),
+        ):
+            client.require_organization_create_access("acme")
+
     def test_repo_creation_requires_confirmation_before_running(self) -> None:
         client = GitHubClient()
         plan = GitHubRepoCreationPlan("alice", "payments", "private", "a" * 32)

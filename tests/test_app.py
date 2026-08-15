@@ -1475,10 +1475,37 @@ class CursorFastPathTests(unittest.TestCase):
 
         request = cursor.call_args.args[0]
         self.assertTrue(request.github_repo_create_requested)
+        self.assertFalse(request.github_repo_create_org_requested)
         self.assertEqual(
             request.utterance,
             "create a GitHub repository called payments",
         )
+
+    def test_github_org_repo_creation_ignores_focused_page_repository(self) -> None:
+        context = RequestContext(
+            "create a GitHub repository in an organization",
+            github_repository="focused/page",
+            focused_repository="focused/page",
+        )
+        with (
+            mock.patch.object(app, "start_components"),
+            mock.patch.object(app, "request_context", return_value=context),
+            mock.patch.object(
+                app,
+                "route_intent",
+                return_value=IntentRoute(Intent.GITHUB_ORG_REPO_CREATE, "high"),
+            ),
+            mock.patch.object(
+                app, "cursor_turn", return_value=("drafted", "job")
+            ) as cursor,
+            mock.patch.object(app, "stream_and_play"),
+        ):
+            app.respond("create a GitHub repository in an organization")
+
+        request = cursor.call_args.args[0]
+        self.assertTrue(request.github_repo_create_requested)
+        self.assertTrue(request.github_repo_create_org_requested)
+        self.assertIsNone(request.github_repository)
 
     def test_linear_ticket_creation_dispatches_dedicated_durable_job(self) -> None:
         context = RequestContext(

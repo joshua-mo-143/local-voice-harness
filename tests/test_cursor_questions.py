@@ -218,6 +218,35 @@ def _repo_create_slug_awaiting(store: JobStore) -> CursorJob:
     )
 
 
+def _repo_create_org_awaiting(store: JobStore) -> CursorJob:
+    pending = replace(
+        _question(),
+        text="Which org?",
+        owner="github_repo_create_org",
+    )
+    return store.create(
+        CursorJob.from_dict(
+            {
+                "id": "aaaaaaaaaaaa",
+                "request": "create a GitHub repository in an organization",
+                "trusted_utterance": "create a GitHub repository in an organization",
+                "status": JobStatus.AWAITING_USER.value,
+                "created_at": 1,
+                "updated_at": 10,
+                "delivered": True,
+                "question": pending.text,
+                "result": pending.text,
+                "clarification_kind": pending.owner,
+                "turn": 1,
+                "turn_token": pending.origin.turn_token,
+                "voice_question": pending.to_dict(),
+                "github_repo_create_requested": True,
+                "github_repo_create_org_requested": True,
+            }
+        )
+    )
+
+
 def _linear_creation_awaiting(store: JobStore) -> CursorJob:
     pending = replace(
         _question(sensitivity=QuestionSensitivity.DESTRUCTIVE),
@@ -786,6 +815,30 @@ def test_only_direct_answer_names_github_repo_create_slug(store: JobStore) -> No
 
     updated = store.get(original.id)
     assert updated.github_repository == "alice/payments"
+    assert updated.status == JobStatus.QUEUED
+    launch.assert_called_once_with(original.id)
+
+
+def test_only_direct_answer_names_github_repo_create_org(store: JobStore) -> None:
+    original = _repo_create_org_awaiting(store)
+    with mock.patch.object(service, "launch_worker") as launch:
+        message = service.reply_job(
+            original.id,
+            "acme",
+            answer_provenance=AnswerProvenance.AUTOMATION,
+        )
+        assert message is not None
+        assert store.get(original.id).revision == original.revision
+        service.reply_job(
+            original.id,
+            "acme",
+            trusted_utterance="acme",
+            answer_provenance=AnswerProvenance.USER_VOICE,
+        )
+
+    updated = store.get(original.id)
+    assert updated.github_repo_create_owner == "acme"
+    assert updated.github_repository == "acme"
     assert updated.status == JobStatus.QUEUED
     launch.assert_called_once_with(original.id)
 

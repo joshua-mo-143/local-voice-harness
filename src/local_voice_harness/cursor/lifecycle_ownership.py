@@ -467,6 +467,8 @@ def _build_field_ownership() -> tuple[FieldOwnership, ...]:
                 "github_issue_created_number": CrashKind.IDENTITY,
                 "github_issue_created_url": CrashKind.IDENTITY,
                 "github_repo_create_requested": CrashKind.CONTENT,
+                "github_repo_create_org_requested": CrashKind.CONTENT,
+                "github_repo_create_owner": CrashKind.IDENTITY,
                 "github_repo_create_confirmed": CrashKind.UNCERTAINTY,
                 "github_repo_create_visibility": CrashKind.CONTENT,
                 "github_repo_create_marker": CrashKind.TOKEN,
@@ -1417,5 +1419,5 @@ BASELINE_COUNTS: dict[str, int] = {
     "compatibility_adapters": 38,
     "transition_entry_points": 76,
     "duplicate_authorities": 0,
-    "lifecycle_module_lines": 27421,
+    "lifecycle_module_lines": 27698,
 }

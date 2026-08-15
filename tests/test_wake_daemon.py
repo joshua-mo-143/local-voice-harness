@@ -7664,7 +7664,22 @@ class CompletedFollowupContextTests(unittest.TestCase):
 
         request = cursor_turn.call_args.args[0]
         self.assertTrue(request.github_repo_create_requested)
+        self.assertFalse(request.github_repo_create_org_requested)
         self.assertFalse(request.github_issue_create_requested)
+        self._last_qwen.assert_not_called()
+
+    def test_github_org_repo_creation_dispatches_without_focused_owner(self) -> None:
+        daemon = _bare_daemon()
+        cursor_turn = self._run_route(
+            daemon,
+            IntentRoute(Intent.GITHUB_ORG_REPO_CREATE, "high"),
+            transcript="create a GitHub repository in an organization",
+        )
+
+        request = cursor_turn.call_args.args[0]
+        self.assertTrue(request.github_repo_create_requested)
+        self.assertTrue(request.github_repo_create_org_requested)
+        self.assertIsNone(request.github_repository)
         self._last_qwen.assert_not_called()
 
     def test_linear_ticket_creation_dispatches_dedicated_job(self) -> None:

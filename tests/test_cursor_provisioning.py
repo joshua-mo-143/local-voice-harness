@@ -4159,6 +4159,7 @@ class CursorJobStateTests(unittest.TestCase):
             github_issue_context=None,
             github_issue_create_requested=False,
             github_repo_create_requested=False,
+            github_repo_create_org_requested=False,
             linear_team=None,
             linear_ticket_create_requested=False,
             fork_requested=False,
@@ -4814,6 +4815,16 @@ class CursorJobStateTests(unittest.TestCase):
             ),
             "private",
         )
+        self.assertEqual(
+            production_jobs.parse_repo_create_org("create a repo in the acme org"),
+            "acme",
+        )
+        self.assertEqual(
+            production_jobs.parse_repo_create_org("acme-corp"), "acme-corp"
+        )
+        self.assertIsNone(
+            production_jobs.parse_repo_create_org("create a GitHub repository")
+        )
 
     def test_worker_asks_repo_create_confirmation_naming_owner_slug_visibility(
         self,
@@ -5106,6 +5117,311 @@ class CursorJobStateTests(unittest.TestCase):
             retried["github_repo_create_operation_state"], "clone_verified"
         )
         self.assertEqual(github.submit_repository_creation.call_count, 2)
+
+    def test_org_repo_create_asks_which_org_without_listing_names(self) -> None:
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "create a GitHub repository in an organization called payments",
+                "trusted_utterance": (
+                    "create a GitHub repository in an organization called payments"
+                ),
+                "issue_provider": "github",
+                "github_repo_create_requested": True,
+                "github_repo_create_org_requested": True,
+                "status": "queued",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        github = mock.Mock()
+        github.authenticated_login.return_value = "alice"
+        github.list_organizations.return_value = ("acme", "widgets")
+        herdr = mock.Mock()
+        with (
+            mock.patch.object(jobs, "GitHubClient", return_value=github),
+            mock.patch.object(jobs, "HerdrClient", return_value=herdr),
+        ):
+            service.run_worker("123456789abc")
+
+        updated = jobs.read_job("123456789abc")
+        self.assertEqual(updated["status"], "awaiting_user")
+        self.assertEqual(updated["clarification_kind"], "github_repo_create_org")
+        self.assertEqual(updated["question"], "Which org?")
+        self.assertNotIn("acme", str(updated["question"]))
+        self.assertNotIn("widgets", str(updated["question"]))
+        github.submit_repository_creation.assert_not_called()
+        github.require_organization_create_access.assert_not_called()
+        herdr.assert_not_called()
+
+    def test_org_repo_create_uses_sole_organization_when_none_named(self) -> None:
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "create a GitHub repository in an organization called payments",
+                "trusted_utterance": (
+                    "create a GitHub repository in an organization called payments"
+                ),
+                "issue_provider": "github",
+                "github_repo_create_requested": True,
+                "github_repo_create_org_requested": True,
+                "status": "queued",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        github = mock.Mock()
+        github.authenticated_login.return_value = "alice"
+        github.list_organizations.return_value = ("acme",)
+        github.require_organization_create_access.return_value = "acme"
+        with mock.patch.object(jobs, "GitHubClient", return_value=github):
+            service.run_worker("123456789abc")
+
+        updated = jobs.read_job("123456789abc")
+        self.assertEqual(
+            updated["clarification_kind"], "github_repo_create_confirmation"
+        )
+        self.assertEqual(updated["github_repository"], "acme/payments")
+        self.assertIn("Create private acme/payments?", str(updated["question"]))
+        github.require_organization_create_access.assert_called_once_with("acme")
+
+    def test_org_repo_create_uses_spoken_org_not_focused_page(self) -> None:
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "create a GitHub repository in the acme org called payments",
+                "trusted_utterance": (
+                    "create a GitHub repository in the acme org called payments"
+                ),
+                "context_repository": "focused/page",
+                "github_repository": "focused/page",
+                "issue_provider": "github",
+                "github_repo_create_requested": True,
+                "github_repo_create_org_requested": True,
+                "status": "queued",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        github = mock.Mock()
+        github.authenticated_login.return_value = "alice"
+        github.require_organization_create_access.return_value = "acme"
+        with mock.patch.object(jobs, "GitHubClient", return_value=github):
+            service.run_worker("123456789abc")
+
+        updated = jobs.read_job("123456789abc")
+        self.assertEqual(
+            updated["clarification_kind"], "github_repo_create_confirmation"
+        )
+        self.assertEqual(updated["github_repository"], "acme/payments")
+        self.assertEqual(updated["github_repo_create_owner"], "acme")
+        self.assertEqual(updated["github_repo_create_visibility"], "private")
+        self.assertIn("Create private acme/payments?", str(updated["question"]))
+        github.list_organizations.assert_not_called()
+        github.require_organization_create_access.assert_called_once_with("acme")
+        github.submit_repository_creation.assert_not_called()
+
+    def test_org_repo_create_does_not_use_untrusted_page_repository(self) -> None:
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "create a GitHub repository in an organization called payments",
+                "trusted_utterance": (
+                    "create a GitHub repository in an organization called payments"
+                ),
+                "context_repository": "focused/page",
+                "github_repository": "focused/page",
+                "issue_provider": "github",
+                "github_repo_create_requested": True,
+                "github_repo_create_org_requested": True,
+                "status": "queued",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        github = mock.Mock()
+        github.authenticated_login.return_value = "alice"
+        github.list_organizations.return_value = ("acme", "widgets")
+        with mock.patch.object(jobs, "GitHubClient", return_value=github):
+            service.run_worker("123456789abc")
+
+        updated = jobs.read_job("123456789abc")
+        self.assertEqual(updated["clarification_kind"], "github_repo_create_org")
+        self.assertEqual(updated["question"], "Which org?")
+        github.require_organization_create_access.assert_not_called()
+        github.submit_repository_creation.assert_not_called()
+
+    def test_org_repo_create_fails_closed_when_user_cannot_create_there(self) -> None:
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "create a GitHub repository in the acme org called payments",
+                "trusted_utterance": (
+                    "create a GitHub repository in the acme org called payments"
+                ),
+                "issue_provider": "github",
+                "github_repo_create_requested": True,
+                "github_repo_create_org_requested": True,
+                "status": "queued",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        github = mock.Mock()
+        github.authenticated_login.return_value = "alice"
+        github.require_organization_create_access.side_effect = GitHubError(
+            "authenticated user cannot create a repository in acme"
+        )
+        with mock.patch.object(jobs, "GitHubClient", return_value=github):
+            service.run_worker("123456789abc")
+
+        updated = jobs.read_job("123456789abc")
+        self.assertEqual(updated["status"], "completed")
+        self.assertIn("cannot create a GitHub repository", str(updated["result"]))
+        github.submit_repository_creation.assert_not_called()
+        github.ensure_repository_clone.assert_not_called()
+
+    def test_confirmed_org_repo_creation_clones_once_without_starting_herdr(
+        self,
+    ) -> None:
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "create a GitHub repository in the acme org called payments",
+                "trusted_utterance": (
+                    "create a GitHub repository in the acme org called payments"
+                ),
+                "issue_provider": "github",
+                "github_repository": "acme/payments",
+                "github_repo_create_requested": True,
+                "github_repo_create_org_requested": True,
+                "github_repo_create_owner": "acme",
+                "github_repo_create_confirmed": True,
+                "github_repo_create_visibility": "private",
+                "github_repo_create_marker": "a" * 32,
+                "github_repo_create_operation_state": "planned",
+                "status": "queued",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        created = GitHubRepoCreationResult(
+            GitHubRepository(
+                "acme/payments",
+                "https://github.com/acme/payments",
+                True,
+                "main",
+            ),
+            "https://github.com/acme/payments",
+            "a" * 32,
+        )
+        github = mock.Mock()
+        github.authenticated_login.return_value = "alice"
+        github.require_organization_create_access.return_value = "acme"
+        github.lookup_repository.return_value = None
+        github.submit_repository_creation.return_value = created
+        github.ensure_repository_clone.return_value = Path("/home/test/src/payments")
+        herdr = mock.Mock()
+        with (
+            mock.patch.object(jobs, "GitHubClient", return_value=github),
+            mock.patch.object(jobs, "HerdrClient", return_value=herdr),
+        ):
+            service.run_worker("123456789abc")
+
+        updated = jobs.read_job("123456789abc")
+        self.assertEqual(updated["status"], "completed")
+        self.assertEqual(updated["github_repo_create_operation_state"], "created")
+        self.assertEqual(
+            updated["github_repo_created_url"],
+            "https://github.com/acme/payments",
+        )
+        plan = github.submit_repository_creation.call_args.args[0]
+        self.assertEqual(plan.owner, "acme")
+        self.assertEqual(plan.slug, "payments")
+        self.assertEqual(plan.visibility, "private")
+        github.ensure_repository_clone.assert_called_once()
+        herdr.assert_not_called()
+
+    def test_existing_same_name_org_repo_is_not_a_successful_create(self) -> None:
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "create a GitHub repository in the acme org called payments",
+                "trusted_utterance": (
+                    "create a GitHub repository in the acme org called payments"
+                ),
+                "issue_provider": "github",
+                "github_repository": "acme/payments",
+                "github_repo_create_requested": True,
+                "github_repo_create_org_requested": True,
+                "github_repo_create_owner": "acme",
+                "github_repo_create_confirmed": True,
+                "github_repo_create_visibility": "private",
+                "github_repo_create_marker": "a" * 32,
+                "github_repo_create_operation_state": "planned",
+                "status": "queued",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        existing = GitHubRepository(
+            "acme/payments",
+            "https://github.com/acme/payments",
+            True,
+            "main",
+        )
+        github = mock.Mock()
+        github.authenticated_login.return_value = "alice"
+        github.require_organization_create_access.return_value = "acme"
+        github.lookup_repository.return_value = existing
+        github.observe_repository_creation.return_value = None
+        with mock.patch.object(jobs, "GitHubClient", return_value=github):
+            service.run_worker("123456789abc")
+
+        updated = jobs.read_job("123456789abc")
+        self.assertEqual(updated["status"], "awaiting_user")
+        self.assertEqual(updated["clarification_kind"], "github_repo_create_slug")
+        self.assertIn("already exists", str(updated["question"]))
+        self.assertIsNone(updated.get("github_repo_created_url"))
+        github.submit_repository_creation.assert_not_called()
+        github.ensure_repository_clone.assert_not_called()
+
+    def test_ambiguous_org_repo_creation_is_not_resubmitted(self) -> None:
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "create a GitHub repository in the acme org called payments",
+                "trusted_utterance": (
+                    "create a GitHub repository in the acme org called payments"
+                ),
+                "issue_provider": "github",
+                "github_repository": "acme/payments",
+                "github_repo_create_requested": True,
+                "github_repo_create_org_requested": True,
+                "github_repo_create_owner": "acme",
+                "github_repo_create_confirmed": True,
+                "github_repo_create_visibility": "private",
+                "github_repo_create_marker": "a" * 32,
+                "github_repo_create_operation_state": "ambiguous",
+                "status": "queued",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        github = mock.Mock()
+        github.authenticated_login.return_value = "alice"
+        github.require_organization_create_access.return_value = "acme"
+        github.lookup_repository.return_value = None
+        with mock.patch.object(jobs, "GitHubClient", return_value=github):
+            try:
+                service.run_worker("123456789abc")
+            except jobs.HarnessError:
+                pass
+        github.submit_repository_creation.assert_not_called()
+        self.assertNotEqual(
+            jobs.read_job("123456789abc")["github_repo_create_operation_state"],
+            "created",
+        )
 
     def test_worker_checks_issue_capability_before_herdr_side_effects(self) -> None:
         jobs.write_job(
