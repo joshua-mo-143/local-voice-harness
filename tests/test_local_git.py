@@ -10,8 +10,10 @@ from unittest import mock
 
 from local_voice_harness.local_git import (
     ExpectedRemote,
+    GitPublicationSnapshot,
     LocalGitError,
     LocalGitOperationAmbiguous,
+    LocalGitRefChanged,
     LocalGitRepository,
     remote_identity,
 )
@@ -360,6 +362,105 @@ class LocalGitRepositoryTests(unittest.TestCase):
                 any("clone" in call.args[0] for call in run.call_args_list)
             )
 
+    def test_observe_materialized_never_clones_and_rejects_collisions(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            destination = root / "source" / "project"
+            repository = LocalGitRepository(clone_root=root, allowed_root=root)
+            expected = ExpectedRemote.from_url("https://example.com/source/project")
+
+            with mock.patch("local_voice_harness.local_git.run_command") as run:
+                self.assertIsNone(
+                    repository.observe_materialized(
+                        Path("source/project"),
+                        expected=expected,
+                    )
+                )
+            run.assert_not_called()
+            self.assertFalse(destination.exists())
+
+            (destination / ".git").mkdir(parents=True)
+            with (
+                mock.patch(
+                    "local_voice_harness.local_git.run_command",
+                    return_value=_completed("https://example.com/other/project\n"),
+                ) as run,
+                self.assertRaisesRegex(LocalGitError, "origin is not"),
+            ):
+                repository.observe_materialized(
+                    Path("source/project"),
+                    expected=expected,
+                )
+            self.assertFalse(
+                any("clone" in call.args[0] for call in run.call_args_list)
+            )
+
+    def test_observe_materialized_binds_generic_remote_across_protocols(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            destination = root / "source" / "project"
+            (destination / ".git").mkdir(parents=True)
+            repository = LocalGitRepository(clone_root=root, allowed_root=root)
+            expected = ExpectedRemote.from_url("https://example.com/source/project")
+
+            with mock.patch(
+                "local_voice_harness.local_git.run_command",
+                return_value=_completed("git@example.com:source/project.git\n"),
+            ) as run:
+                observed = repository.observe_materialized(
+                    Path("source/project"),
+                    expected=expected,
+                )
+
+            self.assertEqual(observed, destination.resolve())
+            self.assertEqual(run.call_count, 1)
+            self.assertNotIn("clone", run.call_args.args[0])
+
+    def test_observe_materialized_rejects_escaping_destination_symlink(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            allowed = Path(temporary)
+            root = allowed / "src"
+            outside = allowed / "outside"
+            (outside / ".git").mkdir(parents=True)
+            destination = root / "source" / "project"
+            destination.parent.mkdir(parents=True)
+            destination.symlink_to(outside, target_is_directory=True)
+            repository = LocalGitRepository(clone_root=root, allowed_root=allowed)
+            expected = ExpectedRemote.from_url("https://example.com/source/project")
+
+            with (
+                mock.patch("local_voice_harness.local_git.run_command") as run,
+                self.assertRaisesRegex(LocalGitError, "escapes its root"),
+            ):
+                repository.observe_materialized(
+                    Path("source/project"),
+                    expected=expected,
+                )
+
+            run.assert_not_called()
+
+    def test_observe_materialized_rejects_escaping_destination_parent(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            allowed = Path(temporary)
+            root = allowed / "src"
+            outside = allowed / "outside"
+            outside.mkdir()
+            root.mkdir()
+            (root / "source").symlink_to(outside, target_is_directory=True)
+            repository = LocalGitRepository(clone_root=root, allowed_root=allowed)
+            expected = ExpectedRemote.from_url("https://example.com/source/project")
+
+            with (
+                mock.patch("local_voice_harness.local_git.run_command") as run,
+                self.assertRaisesRegex(LocalGitError, "escapes its root"),
+            ):
+                repository.observe_materialized(
+                    Path("source/project"),
+                    expected=expected,
+                )
+
+            run.assert_not_called()
+
     def test_materialize_accepts_adapter_clone_command(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -678,3 +779,201 @@ class LocalGitRepositoryTests(unittest.TestCase):
             self.assertFalse(thread.is_alive())
             self.assertEqual(len(errors), 1)
             self.assertIsInstance(errors[0], Cancelled)
+
+    def test_commit_and_push_require_confirmation_and_leave_clean_checkout(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkout = root / "project"
+            (checkout / ".git").mkdir(parents=True)
+            repository = LocalGitRepository(clone_root=root, allowed_root=root)
+            with self.assertRaisesRegex(LocalGitError, "confirmation"):
+                repository.commit_unpublished_changes(
+                    checkout, "Subject", confirmed=False
+                )
+            with self.assertRaisesRegex(LocalGitError, "confirmation"):
+                repository.push_current_branch(checkout, confirmed=False)
+
+            with mock.patch.object(
+                repository,
+                "git",
+                side_effect=lambda _checkout, *arguments, **_kwargs: (
+                    _completed("https://github.com/example/project\n")
+                    if arguments == ("remote", "get-url", "origin")
+                    else (
+                        _completed("voice/job\n")
+                        if arguments == ("rev-parse", "--abbrev-ref", "HEAD")
+                        else (
+                            _completed("b" * 40 + "\n")
+                            if arguments == ("rev-parse", "HEAD")
+                            else _completed()
+                        )
+                    )
+                ),
+            ) as git:
+                self.assertIsNone(
+                    repository.commit_unpublished_changes(
+                        checkout, "Subject", confirmed=True
+                    )
+                )
+                self.assertEqual(
+                    repository.push_current_branch(checkout, confirmed=True),
+                    "voice/job",
+                )
+            commands = [call.args[1:] for call in git.call_args_list]
+            self.assertIn(
+                ("status", "--porcelain=v1", "-z", "--untracked-files=all"),
+                commands,
+            )
+            self.assertNotIn(("add", "-A"), commands)
+            self.assertIn(("push", "-u", "origin", "voice/job"), commands)
+
+    def test_commit_unpublished_changes_adds_and_returns_head(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkout = root / "project"
+            (checkout / ".git").mkdir(parents=True)
+            repository = LocalGitRepository(clone_root=root, allowed_root=root)
+            (checkout / "file.py").write_text("change")
+            with mock.patch.object(
+                repository,
+                "git",
+                side_effect=lambda _checkout, *arguments, **_kwargs: (
+                    _completed("https://github.com/example/project\n")
+                    if arguments == ("remote", "get-url", "origin")
+                    else (
+                        _completed("voice/job\n")
+                        if arguments == ("rev-parse", "--abbrev-ref", "HEAD")
+                        else (
+                            _completed("c" * 40 + "\n")
+                            if arguments == ("rev-parse", "HEAD")
+                            else (
+                                _completed(" M file.py\0")
+                                if arguments
+                                == (
+                                    "status",
+                                    "--porcelain=v1",
+                                    "-z",
+                                    "--untracked-files=all",
+                                )
+                                else _completed()
+                            )
+                        )
+                    )
+                ),
+            ) as git:
+                oid = repository.commit_unpublished_changes(
+                    checkout, "Fix the reader", confirmed=True
+                )
+            self.assertEqual(oid, "c" * 40)
+            commands = [call.args[1:] for call in git.call_args_list]
+            self.assertIn(("add", "-A"), commands)
+            self.assertIn(("commit", "-m", "Fix the reader"), commands)
+
+    def test_publication_snapshot_rejects_stale_commit_and_push_state(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkout = root / "project"
+            (checkout / ".git").mkdir(parents=True)
+            repository = LocalGitRepository(clone_root=root, allowed_root=root)
+            expected = GitPublicationSnapshot(
+                "github.com/example/project",
+                "voice/job",
+                "a" * 40,
+                "b" * 64,
+                True,
+            )
+            changed = GitPublicationSnapshot(
+                "github.com/example/project",
+                "voice/job",
+                "c" * 40,
+                "d" * 64,
+                True,
+            )
+
+            with mock.patch.object(
+                repository, "publication_snapshot", return_value=changed
+            ):
+                with self.assertRaises(LocalGitRefChanged):
+                    repository.require_publication_snapshot(checkout, expected)
+                with self.assertRaises(LocalGitRefChanged):
+                    repository.commit_unpublished_changes(
+                        checkout,
+                        "Fix the reader",
+                        confirmed=True,
+                        expected=expected,
+                    )
+                with self.assertRaises(LocalGitRefChanged):
+                    repository.push_current_branch(
+                        checkout,
+                        confirmed=True,
+                        expected=expected,
+                    )
+
+    def test_status_digest_binds_symlink_directory_and_absent_paths(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            checkout = Path(temporary)
+            (checkout / "folder").mkdir()
+            (checkout / "target").write_text("content")
+            (checkout / "link").symlink_to("target")
+
+            digest = LocalGitRepository._status_digest(
+                checkout,
+                "?? link\0?? folder\0?? missing\0malformed\0",
+            )
+
+            self.assertEqual(len(digest), 64)
+
+    def test_commit_and_push_reject_invalid_checkout_and_subject(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkout = root / "project"
+            (checkout / ".git").mkdir(parents=True)
+            repository = LocalGitRepository(clone_root=root, allowed_root=root)
+            outside = Path(temporary).resolve().parent / "outside-checkout"
+            with self.assertRaisesRegex(LocalGitError, "allowed project root"):
+                repository.has_unpublished_changes(outside)
+            with self.assertRaisesRegex(LocalGitError, "non-empty subject"):
+                repository.commit_unpublished_changes(checkout, "   ", confirmed=True)
+            with self.assertRaisesRegex(LocalGitError, "too long"):
+                repository.commit_unpublished_changes(
+                    checkout, "x" * 73, confirmed=True
+                )
+            with mock.patch.object(
+                repository,
+                "git",
+                side_effect=lambda _checkout, *arguments, **_kwargs: (
+                    _completed("https://github.com/example/project\n")
+                    if arguments == ("remote", "get-url", "origin")
+                    else _completed("HEAD\n")
+                ),
+            ):
+                with self.assertRaisesRegex(LocalGitError, "named branch"):
+                    repository.push_current_branch(checkout, confirmed=True)
+
+    def test_push_timeout_is_ambiguous(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            checkout = root / "project"
+            (checkout / ".git").mkdir(parents=True)
+            repository = LocalGitRepository(clone_root=root, allowed_root=root)
+
+            def git(
+                _checkout: Path, *arguments: str, **kwargs: object
+            ) -> subprocess.CompletedProcess[str]:
+                if kwargs.get("timeout") == 180:
+                    raise LocalGitOperationAmbiguous("timed out")
+                if arguments == ("remote", "get-url", "origin"):
+                    return _completed("https://github.com/example/project\n")
+                if arguments == ("rev-parse", "--abbrev-ref", "HEAD"):
+                    return _completed("voice/job\n")
+                if arguments == ("rev-parse", "HEAD"):
+                    return _completed("b" * 40 + "\n")
+                return _completed()
+
+            with (
+                mock.patch.object(repository, "git", side_effect=git),
+                self.assertRaises(LocalGitOperationAmbiguous),
+            ):
+                repository.push_current_branch(checkout, confirmed=True)

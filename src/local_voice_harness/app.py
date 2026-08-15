@@ -84,6 +84,8 @@ def _context_for_route(
         in {
             Intent.AGENT_SUBMIT,
             Intent.GITHUB_ISSUE_CREATE,
+            Intent.GITHUB_REPO_CREATE,
+            Intent.GITHUB_ORG_REPO_CREATE,
             Intent.LINEAR_TICKET_CREATE,
             Intent.WORKSPACE_CONSULTATION,
         }
@@ -268,6 +270,11 @@ def respond(text: str, *, user_config: UserConfig | None = None) -> None:
                         delivery_claims=delivery_claims,
                         integrations=integrations,
                     )[0]
+            elif route.actionable and route.intent == Intent.GITHUB_PR_CREATE:
+                response = (
+                    "I don't have a recent completed job checkout to open a "
+                    "pull request from."
+                )
             elif route.actionable and route.intent == Intent.GITHUB_ISSUE_CREATE:
                 response = cursor_turn(
                     CursorTurnRequest(
@@ -277,6 +284,29 @@ def respond(text: str, *, user_config: UserConfig | None = None) -> None:
                             context.github_repository or repository_from_utterance(text)
                         ),
                         github_issue_create_requested=True,
+                    ),
+                    delivery_claims=delivery_claims,
+                    integrations=integrations,
+                )[0]
+            elif route.actionable and route.intent == Intent.GITHUB_REPO_CREATE:
+                response = cursor_turn(
+                    CursorTurnRequest(
+                        context.text,
+                        utterance=text,
+                        github_repository=repository_from_utterance(text),
+                        github_repo_create_requested=True,
+                    ),
+                    delivery_claims=delivery_claims,
+                    integrations=integrations,
+                )[0]
+            elif route.actionable and route.intent == Intent.GITHUB_ORG_REPO_CREATE:
+                response = cursor_turn(
+                    CursorTurnRequest(
+                        context.text,
+                        utterance=text,
+                        github_repository=repository_from_utterance(text),
+                        github_repo_create_requested=True,
+                        github_repo_create_org_requested=True,
                     ),
                     delivery_claims=delivery_claims,
                     integrations=integrations,
@@ -387,6 +417,14 @@ def respond(text: str, *, user_config: UserConfig | None = None) -> None:
                     "I did not create an issue because the request was unclear. "
                     "Please name the repository and issue."
                 )
+            elif route.intent in {
+                Intent.GITHUB_REPO_CREATE,
+                Intent.GITHUB_ORG_REPO_CREATE,
+            }:
+                response = (
+                    "I did not create a repository because the request was unclear. "
+                    "Please name the repository."
+                )
             elif route.intent == Intent.LINEAR_TICKET_CREATE:
                 response = (
                     "I did not create a Linear ticket because the request was unclear. "
@@ -402,10 +440,9 @@ def respond(text: str, *, user_config: UserConfig | None = None) -> None:
                     delivery_claims=delivery_claims,
                     integrations=integrations,
                 )[0]
-            elif route.intent == Intent.AGENT_PR_UNSUPPORTED:
+            elif route.intent == Intent.GITHUB_PR_CREATE:
                 response = (
-                    "I can't open pull requests. I can review the changes or run "
-                    "the tests instead."
+                    "I did not open a pull request because the request was unclear."
                 )
             elif route.actionable and route.intent == Intent.AGENT_REPLY:
                 reply_target = grouped_reply or repository_reply

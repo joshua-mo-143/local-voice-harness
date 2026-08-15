@@ -94,6 +94,36 @@ def _awaiting(store: JobStore, question: Question | None = None) -> CursorJob:
     )
 
 
+def _clone_confirmation_awaiting(store: JobStore) -> CursorJob:
+    pending = replace(
+        _question(sensitivity=QuestionSensitivity.DESTRUCTIVE),
+        text="Please confirm: should I clone example/project under the configured GitHub root?",
+        owner="clone_confirmation",
+    )
+    return store.create(
+        CursorJob.from_dict(
+            {
+                "id": "aaaaaaaaaaaa",
+                "request": "Use Cursor to fix the bug",
+                "trusted_utterance": "example/project",
+                "status": JobStatus.AWAITING_USER.value,
+                "created_at": 1,
+                "updated_at": 10,
+                "delivered": True,
+                "question": pending.text,
+                "result": pending.text,
+                "clarification_kind": pending.owner,
+                "turn": 1,
+                "turn_token": pending.origin.turn_token,
+                "voice_question": pending.to_dict(),
+                "repository_hint": "example/project",
+                "clone_source": "example/project",
+                "clone_operation_state": "planned",
+            }
+        )
+    )
+
+
 def _issue_creation_awaiting(store: JobStore) -> CursorJob:
     pending = replace(
         _question(sensitivity=QuestionSensitivity.DESTRUCTIVE),
@@ -122,6 +152,205 @@ def _issue_creation_awaiting(store: JobStore) -> CursorJob:
                 "github_issue_create_body": "Startup fails.",
                 "github_issue_create_marker": "a" * 32,
                 "github_issue_create_operation_state": "planned",
+            }
+        )
+    )
+
+
+def _pr_creation_awaiting(store: JobStore) -> CursorJob:
+    pending = replace(
+        _question(sensitivity=QuestionSensitivity.DESTRUCTIVE),
+        text="Open this pull request?",
+        owner="github_pr_create_confirmation",
+    )
+    return store.create(
+        CursorJob.from_dict(
+            {
+                "id": "aaaaaaaaaaaa",
+                "request": "open a pull request",
+                "trusted_utterance": "open a pull request",
+                "status": JobStatus.AWAITING_USER.value,
+                "created_at": 1,
+                "updated_at": 10,
+                "delivered": True,
+                "question": pending.text,
+                "result": pending.text,
+                "clarification_kind": pending.owner,
+                "turn": 1,
+                "turn_token": pending.origin.turn_token,
+                "voice_question": pending.to_dict(),
+                "github_repository": "example/project",
+                "worktree_branch": "voice/job",
+                "github_pr_create_requested": True,
+                "github_pr_create_title": "Open the change",
+                "github_pr_create_body": "Detailed body",
+                "github_pr_create_marker": "a" * 32,
+                "github_pr_create_base": "main",
+                "github_pr_create_head_oid": "b" * 40,
+                "github_pr_create_head_repository": "example/project",
+                "github_pr_create_checkout_origin": "github.com/example/project",
+                "github_pr_create_status_digest": "d" * 64,
+                "github_pr_create_operation_state": "planned",
+            }
+        )
+    )
+
+
+def _repo_creation_awaiting(store: JobStore) -> CursorJob:
+    pending = replace(
+        _question(sensitivity=QuestionSensitivity.DESTRUCTIVE),
+        text="Create private alice/payments? Say yes or no.",
+        owner="github_repo_create_confirmation",
+    )
+    return store.create(
+        CursorJob.from_dict(
+            {
+                "id": "aaaaaaaaaaaa",
+                "request": "create a GitHub repository called payments",
+                "trusted_utterance": "create a GitHub repository called payments",
+                "status": JobStatus.AWAITING_USER.value,
+                "created_at": 1,
+                "updated_at": 10,
+                "delivered": True,
+                "question": pending.text,
+                "result": pending.text,
+                "clarification_kind": pending.owner,
+                "turn": 1,
+                "turn_token": pending.origin.turn_token,
+                "voice_question": pending.to_dict(),
+                "github_repository": "alice/payments",
+                "github_repo_create_requested": True,
+                "github_repo_create_visibility": "private",
+                "github_repo_create_marker": "a" * 32,
+                "github_repo_create_operation_state": "planned",
+            }
+        )
+    )
+
+
+def _repo_create_slug_awaiting(store: JobStore) -> CursorJob:
+    pending = replace(
+        _question(),
+        text="What should I name the repository?",
+        owner="github_repo_create_slug",
+    )
+    return store.create(
+        CursorJob.from_dict(
+            {
+                "id": "aaaaaaaaaaaa",
+                "request": "create a GitHub repository",
+                "trusted_utterance": "create a GitHub repository",
+                "status": JobStatus.AWAITING_USER.value,
+                "created_at": 1,
+                "updated_at": 10,
+                "delivered": True,
+                "question": pending.text,
+                "result": pending.text,
+                "clarification_kind": pending.owner,
+                "turn": 1,
+                "turn_token": pending.origin.turn_token,
+                "voice_question": pending.to_dict(),
+                "github_repository": "alice",
+                "github_repo_create_requested": True,
+            }
+        )
+    )
+
+
+def _file_as_issue_one_awaiting(store: JobStore) -> CursorJob:
+    pending = replace(
+        _question(sensitivity=QuestionSensitivity.DESTRUCTIVE),
+        text="File this as issue 1?",
+        owner="github_issue_file_as_one",
+    )
+    return store.create(
+        CursorJob.from_dict(
+            {
+                "id": "aaaaaaaaaaaa",
+                "request": "create me a SaaS called widgets",
+                "trusted_utterance": "create me a SaaS called widgets",
+                "status": JobStatus.AWAITING_USER.value,
+                "created_at": 1,
+                "updated_at": 10,
+                "delivered": True,
+                "question": pending.text,
+                "result": pending.text,
+                "clarification_kind": pending.owner,
+                "turn": 1,
+                "turn_token": pending.origin.turn_token,
+                "voice_question": pending.to_dict(),
+                "github_repository": "alice/widgets",
+                "github_repo_create_requested": True,
+                "github_repo_create_continue_workflow": True,
+                "github_repo_create_operation_state": "created",
+                "github_repo_create_visibility": "private",
+                "github_repo_create_marker": "a" * 32,
+                "github_issue_create_title": "create me a SaaS called widgets",
+                "github_issue_create_body": "create me a SaaS called widgets",
+                "github_issue_create_marker": "b" * 32,
+                "github_issue_create_operation_state": "planned",
+            }
+        )
+    )
+
+
+def _repository_or_create_awaiting(
+    store: JobStore,
+    *,
+    candidate: str | None = "payments",
+) -> CursorJob:
+    text = (
+        f"Using {candidate}, or create a new repo?"
+        if candidate
+        else "New repo, or in an already existing one?"
+    )
+    pending = replace(_question(), text=text, owner="repository_or_create")
+    return store.create(
+        CursorJob.from_dict(
+            {
+                "id": "aaaaaaaaaaaa",
+                "request": "create me a SaaS called widgets",
+                "trusted_utterance": "create me a SaaS called widgets",
+                "status": JobStatus.AWAITING_USER.value,
+                "created_at": 1,
+                "updated_at": 10,
+                "delivered": True,
+                "question": pending.text,
+                "result": pending.text,
+                "clarification_kind": pending.owner,
+                "turn": 1,
+                "turn_token": pending.origin.turn_token,
+                "voice_question": pending.to_dict(),
+                "grouped_repository_candidates": [candidate] if candidate else [],
+            }
+        )
+    )
+
+
+def _repo_create_org_awaiting(store: JobStore) -> CursorJob:
+    pending = replace(
+        _question(),
+        text="Which org?",
+        owner="github_repo_create_org",
+    )
+    return store.create(
+        CursorJob.from_dict(
+            {
+                "id": "aaaaaaaaaaaa",
+                "request": "create a GitHub repository in an organization",
+                "trusted_utterance": "create a GitHub repository in an organization",
+                "status": JobStatus.AWAITING_USER.value,
+                "created_at": 1,
+                "updated_at": 10,
+                "delivered": True,
+                "question": pending.text,
+                "result": pending.text,
+                "clarification_kind": pending.owner,
+                "turn": 1,
+                "turn_token": pending.origin.turn_token,
+                "voice_question": pending.to_dict(),
+                "github_repo_create_requested": True,
+                "github_repo_create_org_requested": True,
             }
         )
     )
@@ -551,6 +780,46 @@ def test_automated_answer_cannot_approve_plan(store: JobStore) -> None:
     launch.assert_not_called()
 
 
+def test_only_direct_answer_confirms_clone(store: JobStore) -> None:
+    original = _clone_confirmation_awaiting(store)
+    with mock.patch.object(service, "launch_worker") as launch:
+        message = service.reply_job(
+            original.id,
+            "yes",
+            answer_provenance=AnswerProvenance.AUTOMATION,
+        )
+        assert message is not None
+        assert store.get(original.id).revision == original.revision
+        service.reply_job(
+            original.id,
+            "yes",
+            trusted_utterance="yes",
+            answer_provenance=AnswerProvenance.USER_VOICE,
+        )
+
+    updated = store.get(original.id)
+    assert updated.clone_confirmed
+    assert updated.status == JobStatus.QUEUED
+    launch.assert_called_once_with(original.id)
+
+
+def test_rejecting_clone_completes_without_launch(store: JobStore) -> None:
+    original = _clone_confirmation_awaiting(store)
+    with mock.patch.object(service, "launch_worker") as launch:
+        service.reply_job(
+            original.id,
+            "no",
+            trusted_utterance="no",
+            answer_provenance=AnswerProvenance.USER_VOICE,
+        )
+
+    updated = store.get(original.id)
+    assert updated.status == JobStatus.COMPLETED
+    assert not updated.clone_confirmed
+    assert updated.clone_operation_state == "planned"
+    launch.assert_not_called()
+
+
 def test_only_direct_answer_confirms_github_issue_creation(store: JobStore) -> None:
     original = _issue_creation_awaiting(store)
     with mock.patch.object(service, "launch_worker") as launch:
@@ -591,6 +860,311 @@ def test_rejecting_github_issue_creation_completes_without_launch(
     assert not updated.github_issue_create_confirmed
     assert updated.github_issue_create_operation_state == "planned"
     launch.assert_not_called()
+
+
+def test_only_direct_answer_confirms_github_pr_creation(store: JobStore) -> None:
+    original = _pr_creation_awaiting(store)
+    with mock.patch.object(service, "launch_worker") as launch:
+        message = service.reply_job(
+            original.id,
+            "yes",
+            answer_provenance=AnswerProvenance.AUTOMATION,
+        )
+        assert message is not None
+        assert store.get(original.id).revision == original.revision
+        service.reply_job(
+            original.id,
+            "yes",
+            trusted_utterance="yes",
+            answer_provenance=AnswerProvenance.USER_VOICE,
+        )
+
+    updated = store.get(original.id)
+    assert updated.github_pr_create_confirmed
+    assert updated.status == JobStatus.QUEUED
+    launch.assert_called_once_with(original.id)
+
+
+def test_rejecting_github_pr_creation_completes_without_launch(
+    store: JobStore,
+) -> None:
+    original = _pr_creation_awaiting(store)
+    with mock.patch.object(service, "launch_worker") as launch:
+        service.reply_job(
+            original.id,
+            "no",
+            trusted_utterance="no",
+            answer_provenance=AnswerProvenance.USER_VOICE,
+        )
+
+    updated = store.get(original.id)
+    assert updated.status == JobStatus.COMPLETED
+    assert not updated.github_pr_create_confirmed
+    assert updated.github_pr_create_operation_state == "planned"
+    assert "did not open a pull request" in (updated.result or "")
+    launch.assert_not_called()
+
+
+def test_only_direct_answer_confirms_github_repo_creation(store: JobStore) -> None:
+    original = _repo_creation_awaiting(store)
+    with mock.patch.object(service, "launch_worker") as launch:
+        message = service.reply_job(
+            original.id,
+            "yes",
+            answer_provenance=AnswerProvenance.AUTOMATION,
+        )
+        assert message is not None
+        assert store.get(original.id).revision == original.revision
+        service.reply_job(
+            original.id,
+            "yes",
+            trusted_utterance="yes",
+            answer_provenance=AnswerProvenance.USER_VOICE,
+        )
+
+    updated = store.get(original.id)
+    assert updated.github_repo_create_confirmed
+    assert updated.status == JobStatus.QUEUED
+    launch.assert_called_once_with(original.id)
+
+
+def test_rejecting_github_repo_creation_completes_without_launch(
+    store: JobStore,
+) -> None:
+    original = _repo_creation_awaiting(store)
+    with mock.patch.object(service, "launch_worker") as launch:
+        service.reply_job(
+            original.id,
+            "no",
+            trusted_utterance="no",
+            answer_provenance=AnswerProvenance.USER_VOICE,
+        )
+
+    updated = store.get(original.id)
+    assert updated.status == JobStatus.COMPLETED
+    assert not updated.github_repo_create_confirmed
+    assert updated.github_repo_create_operation_state == "planned"
+    assert "did not create" in str(updated.result)
+    launch.assert_not_called()
+
+
+def test_only_direct_answer_names_github_repo_create_slug(store: JobStore) -> None:
+    original = _repo_create_slug_awaiting(store)
+    with mock.patch.object(service, "launch_worker") as launch:
+        message = service.reply_job(
+            original.id,
+            "payments",
+            answer_provenance=AnswerProvenance.AUTOMATION,
+        )
+        assert message is not None
+        assert store.get(original.id).revision == original.revision
+        service.reply_job(
+            original.id,
+            "payments",
+            trusted_utterance="payments",
+            answer_provenance=AnswerProvenance.USER_VOICE,
+        )
+
+    updated = store.get(original.id)
+    assert updated.github_repository == "alice/payments"
+    assert updated.status == JobStatus.QUEUED
+    launch.assert_called_once_with(original.id)
+
+
+def test_file_as_issue_one_yes_confirms_without_second_prompt(
+    store: JobStore,
+) -> None:
+    original = _file_as_issue_one_awaiting(store)
+    with mock.patch.object(service, "launch_worker") as launch:
+        service.reply_job(
+            original.id,
+            "yes",
+            trusted_utterance="yes",
+            answer_provenance=AnswerProvenance.USER_VOICE,
+        )
+
+    updated = store.get(original.id)
+    assert updated.status == JobStatus.QUEUED
+    assert updated.github_issue_create_requested
+    assert updated.github_issue_create_confirmed
+    launch.assert_called_once_with(original.id)
+
+
+def test_file_as_issue_one_no_does_not_create(store: JobStore) -> None:
+    original = _file_as_issue_one_awaiting(store)
+    with mock.patch.object(service, "launch_worker") as launch:
+        service.reply_job(
+            original.id,
+            "no",
+            trusted_utterance="no",
+            answer_provenance=AnswerProvenance.USER_VOICE,
+        )
+
+    updated = store.get(original.id)
+    assert updated.status == JobStatus.QUEUED
+    assert not updated.github_issue_create_requested
+    assert not updated.github_issue_create_confirmed
+    launch.assert_called_once_with(original.id)
+
+
+def test_file_as_issue_one_cancel_does_not_create(store: JobStore) -> None:
+    original = _file_as_issue_one_awaiting(store)
+    with mock.patch.object(service, "launch_worker") as launch:
+        service.reply_job(
+            original.id,
+            "cancel",
+            trusted_utterance="cancel",
+            answer_provenance=AnswerProvenance.USER_VOICE,
+        )
+
+    updated = store.get(original.id)
+    assert updated.status == JobStatus.QUEUED
+    assert not updated.github_issue_create_requested
+    assert not updated.github_issue_create_confirmed
+    launch.assert_called_once_with(original.id)
+
+
+def test_untrusted_file_as_issue_one_yes_does_not_create(store: JobStore) -> None:
+    original = _file_as_issue_one_awaiting(store)
+    with mock.patch.object(service, "launch_worker") as launch:
+        message = service.reply_job(
+            original.id,
+            "yes",
+            answer_provenance=AnswerProvenance.AUTOMATION,
+        )
+
+    updated = store.get(original.id)
+    assert updated.revision == original.revision
+    assert message is not None
+    assert not updated.github_issue_create_requested
+    assert not updated.github_issue_create_confirmed
+    launch.assert_not_called()
+
+
+def test_file_as_issue_one_speaks_question_and_displays_brief(
+    store: JobStore,
+) -> None:
+    original = _file_as_issue_one_awaiting(store)
+    response = service.render_job_announcement(original)
+    assert response.spoken_text == "File this as issue 1?"
+    assert response.display_text == (
+        "Title: create me a SaaS called widgets\n\n"
+        "Body:\ncreate me a SaaS called widgets"
+    )
+
+
+def test_yes_does_not_resolve_repository_or_create(store: JobStore) -> None:
+    original = _repository_or_create_awaiting(store)
+    with mock.patch.object(service, "launch_worker") as launch:
+        spoken = service.reply_job(
+            original.id,
+            "yes",
+            trusted_utterance="yes",
+            answer_provenance=AnswerProvenance.USER_VOICE,
+        )
+
+    updated = store.get(original.id)
+    assert updated.status == JobStatus.AWAITING_USER
+    assert updated.clarification_kind == "repository_or_create"
+    assert spoken == original.question
+    assert not updated.github_repo_create_requested
+    launch.assert_not_called()
+
+
+def test_new_repo_from_or_question_requests_create_and_continue(
+    store: JobStore,
+) -> None:
+    original = _repository_or_create_awaiting(store)
+    with mock.patch.object(service, "launch_worker") as launch:
+        service.reply_job(
+            original.id,
+            "new repo",
+            trusted_utterance="new repo",
+            answer_provenance=AnswerProvenance.USER_VOICE,
+        )
+
+    updated = store.get(original.id)
+    assert updated.status == JobStatus.QUEUED
+    assert updated.github_repo_create_requested
+    assert updated.github_repo_create_continue_workflow
+    launch.assert_called_once_with(original.id)
+
+
+def test_existing_from_or_question_asks_which_repository(
+    store: JobStore,
+) -> None:
+    original = _repository_or_create_awaiting(store)
+    with mock.patch.object(service, "launch_worker") as launch:
+        spoken = service.reply_job(
+            original.id,
+            "existing",
+            trusted_utterance="existing",
+            answer_provenance=AnswerProvenance.USER_VOICE,
+        )
+
+    updated = store.get(original.id)
+    assert updated.status == JobStatus.AWAITING_USER
+    assert updated.clarification_kind == "repository"
+    assert spoken == "Which repository should Cursor use?"
+    assert updated.repository_hint is None
+    launch.assert_not_called()
+
+
+def test_this_one_from_or_question_attaches_candidate(store: JobStore) -> None:
+    original = _repository_or_create_awaiting(store)
+    with mock.patch.object(service, "launch_worker") as launch:
+        service.reply_job(
+            original.id,
+            "this one",
+            trusted_utterance="this one",
+            answer_provenance=AnswerProvenance.USER_VOICE,
+        )
+
+    updated = store.get(original.id)
+    assert updated.status == JobStatus.QUEUED
+    assert updated.repository_hint == "payments"
+    assert not updated.github_repo_create_requested
+    launch.assert_called_once_with(original.id)
+
+
+def test_untrusted_new_repo_does_not_start_create(store: JobStore) -> None:
+    original = _repository_or_create_awaiting(store)
+    with mock.patch.object(service, "launch_worker") as launch:
+        message = service.reply_job(
+            original.id,
+            "new repo",
+            answer_provenance=AnswerProvenance.AUTOMATION,
+        )
+
+    updated = store.get(original.id)
+    assert updated.revision == original.revision
+    assert message is not None
+    assert not updated.github_repo_create_requested
+    launch.assert_not_called()
+
+
+def test_only_direct_answer_names_github_repo_create_org(store: JobStore) -> None:
+    original = _repo_create_org_awaiting(store)
+    with mock.patch.object(service, "launch_worker") as launch:
+        message = service.reply_job(
+            original.id,
+            "acme",
+            answer_provenance=AnswerProvenance.AUTOMATION,
+        )
+        assert message is not None
+        assert store.get(original.id).revision == original.revision
+        service.reply_job(
+            original.id,
+            "acme",
+            trusted_utterance="acme",
+            answer_provenance=AnswerProvenance.USER_VOICE,
+        )
+
+    updated = store.get(original.id)
+    assert updated.github_repo_create_owner == "acme"
+    assert updated.github_repository == "acme"
+    assert updated.status == JobStatus.QUEUED
+    launch.assert_called_once_with(original.id)
 
 
 def test_only_direct_answer_confirms_linear_ticket_creation(store: JobStore) -> None:

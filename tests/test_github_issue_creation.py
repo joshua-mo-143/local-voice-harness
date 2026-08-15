@@ -7,6 +7,7 @@ from unittest import mock
 from local_voice_harness.errors import HarnessError
 from local_voice_harness.github_issue_creation import (
     draft_github_issue,
+    issue_draft_from_trusted_brief,
     repository_from_utterance,
 )
 
@@ -76,6 +77,22 @@ class GitHubIssueDraftTests(unittest.TestCase):
             self.assertRaisesRegex(HarnessError, "title is too long"),
         ):
             draft_github_issue("Create an issue", "example/project")
+
+    def test_trusted_brief_becomes_title_and_body(self) -> None:
+        draft = issue_draft_from_trusted_brief(
+            "create me a SaaS called widgets",
+            "alice/widgets",
+        )
+        self.assertEqual(draft.repository, "alice/widgets")
+        self.assertEqual(draft.title, "create me a SaaS called widgets")
+        self.assertEqual(draft.body, "create me a SaaS called widgets")
+
+    def test_trusted_brief_truncates_oversized_title(self) -> None:
+        brief = "word " * 80
+        draft = issue_draft_from_trusted_brief(brief, "alice/widgets")
+        self.assertLessEqual(len(draft.title), 200)
+        self.assertTrue(draft.title.endswith("…"))
+        self.assertEqual(draft.body, brief.strip())
 
 
 if __name__ == "__main__":

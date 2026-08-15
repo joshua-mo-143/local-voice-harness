@@ -58,6 +58,24 @@ class CursorPromptTests(unittest.TestCase):
         self.assertIn("Issue: #42", prompt)
         self.assertIn("read it with gh", prompt)
         self.assertIn("Do not comment on, edit, label, assign, close", prompt)
+        self.assertIn(
+            "Do not modify external systems, commit, push, open a pull request",
+            prompt,
+        )
+
+    def test_implementation_and_follow_up_prompts_still_forbid_git_writes(
+        self,
+    ) -> None:
+        forbidden = "Do not modify external systems, commit, push, open a pull request"
+        self.assertIn(forbidden, cursor_prompt("implement the change", "token"))
+        self.assertIn(
+            forbidden,
+            cursor_prompt("review the changes", "token", continuation=True),
+        )
+        self.assertIn(
+            forbidden,
+            planning_prompt("plan the change", "token", tier="simple"),
+        )
 
     def test_issue_completion_summary_uses_exact_concise_wording(self) -> None:
         prompt = cursor_prompt(

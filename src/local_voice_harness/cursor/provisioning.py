@@ -13,7 +13,11 @@ from pathlib import Path
 from ..agents.harness import HarnessCapability, HarnessSession, ReconciliationState
 from ..diagnostic_safety import redact_diagnostic
 from ..errors import HarnessError
-from ..github_issue_creation import draft_github_issue
+from ..github_issue_creation import (
+    draft_github_issue,
+    issue_draft_from_trusted_brief,
+    repository_from_utterance,
+)
 from ..integrations.github import (
     GitHubClient,
     GitHubCommandStartError,
@@ -25,7 +29,11 @@ from ..integrations.github import (
     GitHubOperationAmbiguous,
     GitHubProvider,
     GitHubPullRequestCheckoutInputs,
+    GitHubPullRequestCreationPlan,
+    GitHubPullRequestCreationResult,
+    GitHubRepoCreationResult,
     GitHubRepository,
+    github_repository_from_url,
 )
 from ..integrations.herdr import (
     SETTLED,
@@ -37,6 +45,7 @@ from ..integrations.herdr import (
     extract_marker,
     herdr_provider,
     normalize_name,
+    repository_name_from_url,
 )
 from ..integrations.linear import (
     LinearError,
@@ -57,7 +66,13 @@ from ..integrations.registry import (
 )
 from ..job_lifecycle import SessionControlMode, WorkerCallbackEvent
 from ..linear_ticket_creation import draft_linear_ticket
-from ..local_git import LocalGitRefChanged
+from ..local_git import (
+    ExpectedRemote,
+    GitPublicationSnapshot,
+    LocalGitError,
+    LocalGitOperationAmbiguous,
+    LocalGitRefChanged,
+)
 from ..prompt_operations import (
     AmbiguousPrompt,
     PlannedPrompt,
@@ -417,6 +432,51 @@ def repository_question(
     return f"{prefix}Which repository should Cursor use?"
 
 
+_IN_REPO_CUE = re.compile(
+    r"\b(?:in this repo|in this repository|in that repo|in that repository)\b",
+    re.IGNORECASE,
+)
+_GREENFIELD_CREATE_ME = re.compile(
+    r"\b(?:create|build|make|start)\s+me\b",
+    re.IGNORECASE,
+)
+_GREENFIELD_HELP_CREATE = re.compile(
+    r"\bhelp\s+me\s+(?:to\s+)?(?:create|build|make|start)\b",
+    re.IGNORECASE,
+)
+_GREENFIELD_CREATE_PROJECT = re.compile(
+    r"\bcreate\s+(?:a\s+|an\s+)?(?:new\s+)?"
+    r"(?:saas|app|application|project|website|site|startup)\b",
+    re.IGNORECASE,
+)
+_GREENFIELD_EXCLUDED = re.compile(
+    r"\b(?:issue|ticket|pull request|\bpr\b|repo|repository)\b",
+    re.IGNORECASE,
+)
+
+
+def utterance_has_in_repo_cue(value: str) -> bool:
+    return _IN_REPO_CUE.search(value) is not None
+
+
+def is_greenfield_repository_admission(value: str) -> bool:
+    if utterance_has_in_repo_cue(value):
+        return False
+    if _GREENFIELD_EXCLUDED.search(value):
+        return False
+    return (
+        _GREENFIELD_CREATE_ME.search(value) is not None
+        or _GREENFIELD_HELP_CREATE.search(value) is not None
+        or _GREENFIELD_CREATE_PROJECT.search(value) is not None
+    )
+
+
+def checkout_or_new_repository_question(candidate_name: str | None) -> str:
+    if candidate_name:
+        return f"Using {candidate_name}, or create a new repo?"
+    return "New repo, or in an already existing one?"
+
+
 def resolve_job_repository(
     client: HerdrClient,
     job: CursorJob,
@@ -434,6 +494,204 @@ def resolve_job_repository(
         )
         candidates = context_candidates or candidates
     return repository, candidates
+
+
+def parse_voice_clone_source(value: str) -> str | None:
+    """Return a Git URL or owner/repo that can be cloned, else None."""
+    from ..integrations.github import GitHubClient as github_client_cls
+
+    candidate = value.strip()
+    if not candidate:
+        return None
+    if repository_name_from_url(candidate) is not None:
+        return candidate
+    try:
+        return github_client_cls.validate_repository(candidate)
+    except GitHubError:
+        return None
+
+
+def _clone_destination_label(github: GitHubProvider) -> str:
+    root = getattr(getattr(github, "local_git", None), "clone_root", None)
+    if isinstance(root, Path):
+        return f"the configured GitHub root at {root}"
+    return "the configured GitHub root"
+
+
+def _materialize_voice_clone(
+    github: GitHubProvider,
+    source: str,
+    *,
+    checkpoint: Callable[[], None],
+) -> Path:
+    from ..integrations.github import GitHubClient as github_client_cls
+
+    repository = github_repository_from_url(source)
+    if repository is None:
+        try:
+            repository = github_client_cls.validate_repository(source)
+        except GitHubError:
+            repository = None
+    if repository is not None:
+        resolved = github.resolve_repository(repository)
+        return github.materialize_repository(resolved, checkpoint=checkpoint)
+    name = repository_name_from_url(source)
+    if name is None:
+        raise HarnessError("clone source is not a Git URL or owner/repository")
+    try:
+        return github.local_git.materialize(
+            Path(name),
+            clone_url=source,
+            expected=ExpectedRemote.from_url(source),
+            checkpoint=checkpoint,
+        )
+    except LocalGitOperationAmbiguous as exc:
+        raise GitHubOperationAmbiguous(str(exc)) from exc
+    except LocalGitError as exc:
+        raise GitHubError(str(exc)) from exc
+
+
+def _observe_voice_clone(github: GitHubProvider, source: str) -> Path | None:
+    """Observe a previously submitted clone without resubmitting it."""
+
+    from ..integrations.github import GitHubClient as github_client_cls
+
+    repository = github_repository_from_url(source)
+    if repository is None:
+        try:
+            repository = github_client_cls.validate_repository(source)
+        except GitHubError:
+            repository = None
+    if repository is not None:
+        resolved = github.resolve_repository(repository)
+        return github.observe_repository_materialization(resolved)
+    name = repository_name_from_url(source)
+    if name is None:
+        raise HarnessError("clone source is not a Git URL or owner/repository")
+    try:
+        return github.local_git.observe_materialized(
+            Path(name),
+            expected=ExpectedRemote.from_url(source),
+        )
+    except LocalGitOperationAmbiguous as exc:
+        raise GitHubOperationAmbiguous(str(exc)) from exc
+    except LocalGitError as exc:
+        raise GitHubError(str(exc)) from exc
+
+
+_REPO_SLUG = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9._-]{0,98}[A-Za-z0-9])?$")
+_NAMED_REPO_SLUG = re.compile(
+    r"\b(?:called|named)\s+([A-Za-z0-9][A-Za-z0-9._-]{0,99})",
+    re.IGNORECASE,
+)
+
+
+def parse_repo_create_slug(value: str) -> str | None:
+    candidate = value.strip().removesuffix(".git")
+    match = _NAMED_REPO_SLUG.search(candidate)
+    if match is not None:
+        candidate = match.group(1).removesuffix(".git")
+    else:
+        tokens = re.findall(r"[A-Za-z0-9][A-Za-z0-9._-]{0,99}", candidate)
+        reserved = {
+            "a",
+            "an",
+            "the",
+            "create",
+            "empty",
+            "github",
+            "new",
+            "please",
+            "private",
+            "public",
+            "repo",
+            "repository",
+        }
+        leftover = [token for token in tokens if token.casefold() not in reserved]
+        if len(leftover) != 1:
+            return None
+        candidate = leftover[0]
+    if not _REPO_SLUG.fullmatch(candidate) or candidate in {".", ".."}:
+        return None
+    return candidate
+
+
+def parse_repo_create_visibility(value: str) -> str:
+    normalized = re.sub(r"[^\w\s]", "", value.casefold())
+    if re.search(r"\bpublic\b", normalized):
+        return "public"
+    return "private"
+
+
+_ORG_LOGIN = re.compile(r"^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$")
+_ORG_SUFFIX = re.compile(
+    r"\b(?:the\s+)?([A-Za-z0-9](?:[A-Za-z0-9-]{0,38}))\s+"
+    r"(?:org|organization|organisation)\b",
+    re.IGNORECASE,
+)
+_ORG_PREFIX = re.compile(
+    r"\b(?:org|organization|organisation)\s+"
+    r"([A-Za-z0-9](?:[A-Za-z0-9-]{0,38}))\b",
+    re.IGNORECASE,
+)
+_ORG_PREPOSITION = re.compile(
+    r"\b(?:in|under)\s+(?:the\s+)?"
+    r"([A-Za-z0-9](?:[A-Za-z0-9-]{0,38}))"
+    r"(?:\s+(?:org|organization|organisation))?\b",
+    re.IGNORECASE,
+)
+_ORG_RESERVED = frozenset(
+    {
+        "a",
+        "an",
+        "the",
+        "create",
+        "empty",
+        "github",
+        "new",
+        "please",
+        "private",
+        "public",
+        "repo",
+        "repository",
+        "org",
+        "organization",
+        "organisation",
+        "in",
+        "under",
+        "for",
+        "called",
+        "named",
+        "my",
+        "our",
+    }
+)
+_ORG_CREATE_DENIED = "I cannot create a GitHub repository in that organization."
+_WHICH_ORG_QUESTION = "Which org?"
+
+
+def parse_repo_create_org(value: str) -> str | None:
+    candidate = value.strip()
+    match = (
+        _ORG_SUFFIX.search(candidate)
+        or _ORG_PREFIX.search(candidate)
+        or _ORG_PREPOSITION.search(candidate)
+    )
+    if match is not None:
+        candidate = match.group(1)
+    else:
+        tokens = re.findall(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})", candidate)
+        leftover = [token for token in tokens if token.casefold() not in _ORG_RESERVED]
+        if len(leftover) != 1:
+            return None
+        if any(
+            token.casefold() in {"create", "repo", "repository"} for token in tokens
+        ):
+            return None
+        candidate = leftover[0]
+    if candidate.casefold() in _ORG_RESERVED or not _ORG_LOGIN.fullmatch(candidate):
+        return None
+    return candidate
 
 
 def complete_from_output(
@@ -631,6 +889,14 @@ def _finish_github_issue_creation(
 
     def finish(job: CursorJob) -> CursorJob:
         now = time.time()
+        if job.github_repo_create_continue_workflow:
+            return job.evolve(
+                issue_provider="github",
+                github_issue=issue.number,
+                github_issue_url=url,
+                github_issue_create_operation_state="created",
+                worker_operation=None,
+            )
         return job.evolve_for_delivery(
             now=now,
             status=JobStatus.COMPLETED,
@@ -741,6 +1007,11 @@ def _run_github_issue_creation(
         raise HarnessError("GitHub issue creation requires reconciliation before retry")
 
     def mark_submitted(current: CursorJob) -> CursorJob:
+        if current.github_repo_create_continue_workflow:
+            return current.evolve(
+                github_issue_create_operation_state="submitted",
+                worker_operation="github_issue_create",
+            )
         return current.evolve(
             status=JobStatus.RUNNING,
             github_issue_create_operation_state="submitted",
@@ -794,7 +1065,7 @@ def _run_github_issue_creation(
                 store,
                 job.id,
                 token,
-                {JobStatus.RUNNING},
+                {JobStatus.ROUTING, JobStatus.RUNNING},
                 ambiguous,
                 expected_revision=submitted.revision,
             )
@@ -818,7 +1089,7 @@ def _run_github_issue_creation(
             store,
             job.id,
             token,
-            {JobStatus.RUNNING},
+            {JobStatus.ROUTING, JobStatus.RUNNING},
             retry_after_start_failure,
             expected_revision=submitted.revision,
         )
@@ -829,6 +1100,916 @@ def _run_github_issue_creation(
         token,
         result,
         expected_revision=submitted.revision,
+    )
+
+
+def _record_github_repo_remote_created(
+    store: JobStore,
+    job_id: str,
+    token: WorkerClaim,
+    result: GitHubRepoCreationResult,
+    *,
+    expected_revision: int,
+) -> CursorJob | None:
+    url = str(result.url)
+
+    return _worker_change(
+        store,
+        job_id,
+        token,
+        {JobStatus.ROUTING, JobStatus.RUNNING},
+        lambda job: job.evolve(
+            github_repository=result.repository.name_with_owner,
+            github_repo_created_url=url,
+            github_repo_create_operation_state="remote_created",
+        ),
+        expected_revision=expected_revision,
+    )
+
+
+def _pr_create_commit_subject(title: str) -> str:
+    subject = " ".join(title.split())
+    return subject[:72].rstrip()
+
+
+def _retained_pr_checkout(job: CursorJob) -> Path | None:
+    for candidate in (job.worktree_path, job.repository):
+        if not candidate:
+            continue
+        path = Path(candidate)
+        if path.exists():
+            return path
+    return None
+
+
+def _finish_github_pr_creation(
+    store: JobStore,
+    job_id: str,
+    token: WorkerClaim,
+    result: GitHubPullRequestCreationResult,
+    *,
+    expected_revision: int,
+) -> None:
+    pull_request = result.pull_request
+    url = str(result.url)
+
+    def finish(job: CursorJob) -> CursorJob:
+        now = time.time()
+        return job.evolve_for_delivery(
+            now=now,
+            status=JobStatus.COMPLETED,
+            result=f"Opened GitHub pull request {pull_request.number}: {url}",
+            completed_at=now,
+            github_pr_created_number=pull_request.number,
+            github_pr_created_url=url,
+            github_pr_create_operation_state="created",
+            worker_pid=None,
+            worker_boot_id=None,
+            worker_process_start=None,
+            worker_token=None,
+            worker_operation=None,
+        )
+
+    _worker_change(
+        store,
+        job_id,
+        token,
+        {JobStatus.ROUTING, JobStatus.RUNNING},
+        finish,
+        expected_revision=expected_revision,
+    )
+
+
+def _run_github_pr_creation(
+    store: JobStore,
+    job: CursorJob,
+    token: WorkerClaim,
+    clients: ClientFactories,
+    checkpoint: Callable[[], None],
+) -> None:
+    checkout = _retained_pr_checkout(job)
+    if checkout is None:
+        _complete_github_repo_creation_without_write(
+            store,
+            job.id,
+            token,
+            "I don't have a retained checkout to open a pull request from.",
+            expected_revision=job.revision,
+        )
+        return
+    github = _github_provider(clients.github)
+    checkpoint()
+    try:
+        checkout_repository = github.repository_for_checkout(checkout)
+        requested_repository = (job.github_repository or "").strip()
+        if (
+            requested_repository
+            and requested_repository.casefold() != checkout_repository.casefold()
+        ):
+            raise GitHubError(
+                "retained checkout origin does not match the target repository"
+            )
+        source = github.resolve_repository(checkout_repository)
+        repository = source.name_with_owner
+        if not source.default_branch:
+            raise GitHubError("target repository default branch could not be verified")
+        snapshot = github.local_git.publication_snapshot(checkout)
+        expected_origin = f"github.com/{checkout_repository.casefold()}"
+        if snapshot.origin_identity != expected_origin:
+            raise GitHubError("retained checkout origin changed unexpectedly")
+    except (GitHubError, LocalGitError):
+        _complete_github_repo_creation_without_write(
+            store,
+            job.id,
+            token,
+            "I couldn't verify one repository, branch, base, and checkout snapshot "
+            "for that pull request.",
+            expected_revision=job.revision,
+        )
+        return
+    head = snapshot.branch
+    head_owner = checkout_repository.split("/", 1)[0]
+    qualified_head = f"{head_owner}:{head}"
+    if not job.github_pr_create_title or job.github_pr_create_body is None:
+        draft = issue_draft_from_trusted_brief(
+            job.trusted_utterance or job.request,
+            repository,
+        )
+        commit_subject = (
+            _pr_create_commit_subject(draft.title) if snapshot.dirty else None
+        )
+        plan = github.plan_pull_request_creation(
+            draft.repository,
+            draft.title,
+            draft.body,
+            qualified_head,
+            source.default_branch,
+            snapshot.head_oid,
+            checkout_repository,
+            correlation_marker=uuid.uuid4().hex,
+        )
+
+        def persist_draft(current: CursorJob) -> CursorJob:
+            return current.evolve(
+                github_repository=plan.repository,
+                worktree_branch=head,
+                github_pr_create_title=plan.title,
+                github_pr_create_body=plan.body,
+                github_pr_create_marker=plan.correlation_marker,
+                github_pr_create_commit_subject=commit_subject,
+                github_pr_create_base=plan.base,
+                github_pr_create_head_oid=snapshot.head_oid,
+                github_pr_create_published_head_oid=None,
+                github_pr_create_head_repository=plan.head_repository,
+                github_pr_create_checkout_origin=snapshot.origin_identity,
+                github_pr_create_status_digest=snapshot.status_digest,
+                github_pr_create_operation_state="planned",
+            )
+
+        updated = _worker_change(
+            store,
+            job.id,
+            token,
+            {JobStatus.ROUTING},
+            persist_draft,
+            expected_revision=job.revision,
+        )
+        if updated is None:
+            return
+        job = updated
+    plan = github.plan_pull_request_creation(
+        job.github_repository or repository,
+        job.github_pr_create_title or "",
+        job.github_pr_create_body or "",
+        (
+            f"{(job.github_pr_create_head_repository or checkout_repository).split('/', 1)[0]}:"
+            f"{job.worktree_branch or head}"
+        ),
+        job.github_pr_create_base or "",
+        job.github_pr_create_published_head_oid or job.github_pr_create_head_oid or "",
+        job.github_pr_create_head_repository or "",
+        correlation_marker=job.github_pr_create_marker,
+    )
+
+    def confirmation_preview(
+        confirmation_plan: GitHubPullRequestCreationPlan,
+        status_digest: str,
+    ) -> str:
+        commit_line = (
+            f"Commit: {job.github_pr_create_commit_subject}\n\n"
+            if job.github_pr_create_commit_subject
+            else ""
+        )
+        return (
+            f"Open a pull request in {confirmation_plan.repository} from "
+            f"{confirmation_plan.head} into {confirmation_plan.base}?\n\n"
+            f"Checkout origin: {confirmation_plan.head_repository}\n"
+            f"Confirmed HEAD: {confirmation_plan.head_oid}\n"
+            f"Status digest: {status_digest}\n\n"
+            f"Title: {confirmation_plan.title}\n\n"
+            f"Body:\n{confirmation_plan.body}\n\n"
+            f"{commit_line}"
+            "Say yes to open it or no to cancel."
+        )
+
+    if not job.github_pr_create_confirmed:
+        _worker_question(
+            store,
+            job.id,
+            token,
+            confirmation_preview(plan, job.github_pr_create_status_digest or ""),
+            expected_revision=job.revision,
+            clarification_kind="github_pr_create_confirmation",
+            sensitivity=QuestionSensitivity.DESTRUCTIVE,
+        )
+        return
+    expected_snapshot = GitPublicationSnapshot(
+        origin_identity=job.github_pr_create_checkout_origin or "",
+        branch=job.worktree_branch or "",
+        head_oid=job.github_pr_create_head_oid or "",
+        status_digest=job.github_pr_create_status_digest or "",
+        dirty=bool(job.github_pr_create_commit_subject),
+    )
+    if snapshot != expected_snapshot:
+        refreshed_plan = github.plan_pull_request_creation(
+            plan.repository,
+            plan.title,
+            plan.body,
+            f"{head_owner}:{snapshot.branch}",
+            plan.base,
+            snapshot.head_oid,
+            checkout_repository,
+            correlation_marker=plan.correlation_marker,
+        )
+
+        def require_reconfirmation(current: CursorJob) -> CursorJob:
+            return current.evolve(
+                github_pr_create_confirmed=False,
+                worktree_branch=snapshot.branch,
+                github_pr_create_head_oid=snapshot.head_oid,
+                github_pr_create_published_head_oid=None,
+                github_pr_create_checkout_origin=snapshot.origin_identity,
+                github_pr_create_status_digest=snapshot.status_digest,
+                github_pr_create_commit_subject=(
+                    current.github_pr_create_commit_subject
+                    or _pr_create_commit_subject(plan.title)
+                    if snapshot.dirty
+                    else None
+                ),
+                github_pr_create_operation_state="planned",
+            )
+
+        refreshed = _worker_change(
+            store,
+            job.id,
+            token,
+            {JobStatus.ROUTING},
+            require_reconfirmation,
+            expected_revision=job.revision,
+        )
+        if refreshed is None:
+            return
+        _worker_question(
+            store,
+            job.id,
+            token,
+            confirmation_preview(refreshed_plan, snapshot.status_digest),
+            expected_revision=refreshed.revision,
+            clarification_kind="github_pr_create_confirmation",
+            sensitivity=QuestionSensitivity.DESTRUCTIVE,
+        )
+        return
+    if job.github_pr_create_operation_state not in {None, "planned"}:
+        raise HarnessError(
+            "GitHub pull request creation requires reconciliation before retry"
+        )
+
+    def mark_submitted(current: CursorJob) -> CursorJob:
+        return current.evolve(
+            status=JobStatus.RUNNING,
+            github_pr_create_operation_state="submitted",
+            worker_operation="github_pr_create",
+        )
+
+    submitted = _worker_change(
+        store,
+        job.id,
+        token,
+        {JobStatus.ROUTING},
+        mark_submitted,
+        expected_revision=job.revision,
+    )
+    if submitted is None:
+        return
+    operation_job = submitted
+    try:
+        checkpoint()
+        if job.github_pr_create_commit_subject:
+            github.local_git.commit_unpublished_changes(
+                checkout,
+                job.github_pr_create_commit_subject,
+                confirmed=True,
+                expected=expected_snapshot,
+            )
+        checkpoint()
+        published_snapshot = github.local_git.publication_snapshot(checkout)
+        if published_snapshot.origin_identity != expected_snapshot.origin_identity:
+            raise LocalGitRefChanged(
+                "Git checkout origin changed after pull request confirmation"
+            )
+        if published_snapshot.branch != expected_snapshot.branch:
+            raise LocalGitRefChanged(
+                "Git checkout branch changed after pull request confirmation"
+            )
+
+        def record_published_head(current: CursorJob) -> CursorJob:
+            return current.evolve(
+                github_pr_create_published_head_oid=published_snapshot.head_oid,
+            )
+
+        persisted = _worker_change(
+            store,
+            job.id,
+            token,
+            {JobStatus.RUNNING},
+            record_published_head,
+            expected_revision=submitted.revision,
+        )
+        if persisted is None:
+            return
+        operation_job = persisted
+        plan = github.plan_pull_request_creation(
+            plan.repository,
+            plan.title,
+            plan.body,
+            plan.head,
+            plan.base,
+            published_snapshot.head_oid,
+            plan.head_repository,
+            correlation_marker=plan.correlation_marker,
+        )
+        github.local_git.push_current_branch(
+            checkout,
+            confirmed=True,
+            expected=published_snapshot,
+        )
+        checkpoint()
+        result = github.submit_pull_request_creation(plan, confirmed=True)
+    except (GitHubError, LocalGitError) as exc:
+        checkpoint()
+        try:
+            visible = github.observe_pull_request_creation(plan)
+        except GitHubError:
+            visible = None
+        if visible is not None:
+            _finish_github_pr_creation(
+                store,
+                job.id,
+                token,
+                visible,
+                expected_revision=operation_job.revision,
+            )
+            return
+        retryable_start = isinstance(exc, GitHubCommandStartError) and not isinstance(
+            exc, (GitHubOperationAmbiguous, LocalGitOperationAmbiguous)
+        )
+        if not retryable_start:
+
+            def ambiguous(current: CursorJob) -> CursorJob:
+                return current.evolve(
+                    status=JobStatus.QUEUED,
+                    queued_at=time.time(),
+                    github_pr_create_operation_state="ambiguous",
+                    reconcile=True,
+                    worker_pid=None,
+                    worker_boot_id=None,
+                    worker_process_start=None,
+                    worker_token=None,
+                    worker_operation=None,
+                )
+
+            _worker_change(
+                store,
+                job.id,
+                token,
+                {JobStatus.ROUTING, JobStatus.RUNNING},
+                ambiguous,
+                expected_revision=operation_job.revision,
+            )
+            return
+
+        def retry_after_start_failure(current: CursorJob) -> CursorJob:
+            return current.evolve(
+                status=JobStatus.QUEUED,
+                queued_at=time.time(),
+                github_pr_create_operation_state="planned",
+                worker_pid=None,
+                worker_boot_id=None,
+                worker_process_start=None,
+                worker_token=None,
+                worker_operation=None,
+                worker_claim_operation=None,
+                worker_claimed_at=None,
+            )
+
+        _worker_change(
+            store,
+            job.id,
+            token,
+            {JobStatus.ROUTING, JobStatus.RUNNING},
+            retry_after_start_failure,
+            expected_revision=operation_job.revision,
+        )
+        return
+    _finish_github_pr_creation(
+        store,
+        job.id,
+        token,
+        result,
+        expected_revision=operation_job.revision,
+    )
+
+
+def _offer_file_as_issue_one(
+    store: JobStore,
+    job: CursorJob,
+    token: WorkerClaim,
+    clients: ClientFactories,
+    checkpoint: Callable[[], None],
+) -> None:
+    repository = (job.github_repository or "").strip()
+    if not repository:
+        return
+    github = _github_provider(clients.github)
+    checkpoint()
+    draft = issue_draft_from_trusted_brief(
+        job.trusted_utterance or job.request,
+        repository,
+    )
+    plan = github.plan_issue_creation(
+        draft.repository,
+        draft.title,
+        draft.body,
+        correlation_marker=uuid.uuid4().hex,
+    )
+    _worker_question(
+        store,
+        job.id,
+        token,
+        "File this as issue 1?",
+        expected_revision=job.revision,
+        clarification_kind="github_issue_file_as_one",
+        sensitivity=QuestionSensitivity.DESTRUCTIVE,
+        job_changes={
+            "github_repository": plan.repository,
+            "github_issue_create_title": plan.title,
+            "github_issue_create_body": plan.body,
+            "github_issue_create_marker": plan.correlation_marker,
+            "github_issue_create_operation_state": "planned",
+        },
+    )
+
+
+def _complete_github_repo_creation_without_write(
+    store: JobStore,
+    job_id: str,
+    token: WorkerClaim,
+    message: str,
+    *,
+    expected_revision: int,
+) -> None:
+    revision = expected_revision
+    snapshot = store.get(job_id)
+    if snapshot.status == JobStatus.ROUTING:
+
+        def mark_running(job: CursorJob) -> CursorJob:
+            return job.evolve(status=JobStatus.RUNNING)
+
+        running = _worker_change(
+            store,
+            job_id,
+            token,
+            {JobStatus.ROUTING},
+            mark_running,
+            expected_revision=revision,
+        )
+        if running is None:
+            return
+        revision = running.revision
+
+    def finish(job: CursorJob) -> CursorJob:
+        now = time.time()
+        return job.evolve_for_delivery(
+            now=now,
+            status=JobStatus.COMPLETED,
+            result=message,
+            completed_at=now,
+            worker_pid=None,
+            worker_boot_id=None,
+            worker_process_start=None,
+            worker_token=None,
+            worker_operation=None,
+        )
+
+    _worker_change(
+        store,
+        job_id,
+        token,
+        {JobStatus.RUNNING},
+        finish,
+        expected_revision=revision,
+    )
+
+
+def _resolve_github_repo_create_owner(
+    store: JobStore,
+    job: CursorJob,
+    token: WorkerClaim,
+    github: GitHubProvider,
+    login: str,
+    trusted: str,
+) -> str | None:
+    if not job.github_repo_create_org_requested:
+        return login
+    named = (job.github_repo_create_owner or "").strip()
+    if not named:
+        named = parse_repo_create_org(trusted) or ""
+    if not named:
+        spoken_repository = repository_from_utterance(trusted)
+        if spoken_repository and "/" in spoken_repository:
+            named = spoken_repository.split("/", 1)[0].strip()
+    if not named:
+        try:
+            organizations = github.list_organizations()
+        except GitHubError:
+            _complete_github_repo_creation_without_write(
+                store,
+                job.id,
+                token,
+                _ORG_CREATE_DENIED,
+                expected_revision=job.revision,
+            )
+            return None
+        if len(organizations) > 1:
+            _worker_question(
+                store,
+                job.id,
+                token,
+                _WHICH_ORG_QUESTION,
+                expected_revision=job.revision,
+                clarification_kind="github_repo_create_org",
+            )
+            return None
+        if len(organizations) != 1:
+            _complete_github_repo_creation_without_write(
+                store,
+                job.id,
+                token,
+                _ORG_CREATE_DENIED,
+                expected_revision=job.revision,
+            )
+            return None
+        named = organizations[0]
+    try:
+        return github.require_organization_membership(named)
+    except GitHubError:
+        _complete_github_repo_creation_without_write(
+            store,
+            job.id,
+            token,
+            _ORG_CREATE_DENIED,
+            expected_revision=job.revision,
+        )
+        return None
+
+
+def _finish_github_repo_creation(
+    store: JobStore,
+    job_id: str,
+    token: WorkerClaim,
+    result: GitHubRepoCreationResult,
+    *,
+    expected_revision: int,
+) -> None:
+    url = str(result.url)
+
+    def finish(job: CursorJob) -> CursorJob:
+        if not job.repository:
+            raise HarnessError("created GitHub repository clone was not verified")
+        now = time.time()
+        if job.github_repo_create_continue_workflow:
+            return job.evolve(
+                github_repository=result.repository.name_with_owner,
+                github_repo_created_url=url,
+                github_repo_create_operation_state="clone_verified",
+                repository=job.repository,
+                worker_operation=None,
+            )
+        return job.evolve_for_delivery(
+            now=now,
+            status=JobStatus.COMPLETED,
+            issue_provider="github",
+            result=(
+                f"Created GitHub repository {result.repository.name_with_owner}: {url}"
+            ),
+            completed_at=now,
+            github_repository=result.repository.name_with_owner,
+            github_repo_created_url=url,
+            github_repo_create_operation_state="clone_verified",
+            repository=job.repository,
+            worker_pid=None,
+            worker_boot_id=None,
+            worker_process_start=None,
+            worker_token=None,
+            worker_operation=None,
+        )
+
+    _worker_change(
+        store,
+        job_id,
+        token,
+        {JobStatus.ROUTING, JobStatus.RUNNING},
+        finish,
+        expected_revision=expected_revision,
+    )
+
+
+def _materialize_created_github_repo(
+    store: JobStore,
+    job: CursorJob,
+    token: WorkerClaim,
+    github: GitHubProvider,
+    result: GitHubRepoCreationResult,
+    checkpoint: Callable[[], None],
+) -> None:
+    remote_created = _record_github_repo_remote_created(
+        store,
+        job.id,
+        token,
+        result,
+        expected_revision=job.revision,
+    )
+    if remote_created is None:
+        return
+    try:
+        checkout = github.materialize_repository(
+            result.repository,
+            checkpoint=checkpoint,
+        )
+    except GitHubError:
+
+        def queue_recovery(current: CursorJob) -> CursorJob:
+            return current.evolve(
+                status=JobStatus.QUEUED,
+                queued_at=time.time(),
+                reconcile=True,
+                worker_pid=None,
+                worker_boot_id=None,
+                worker_process_start=None,
+                worker_token=None,
+                worker_operation=None,
+            )
+
+        _worker_change(
+            store,
+            job.id,
+            token,
+            {JobStatus.ROUTING, JobStatus.RUNNING},
+            queue_recovery,
+            expected_revision=remote_created.revision,
+        )
+        return
+    updated = _worker_change(
+        store,
+        job.id,
+        token,
+        {JobStatus.ROUTING, JobStatus.RUNNING},
+        lambda current: current.evolve(repository=str(checkout)),
+        expected_revision=remote_created.revision,
+    )
+    if updated is not None:
+        _finish_github_repo_creation(
+            store,
+            job.id,
+            token,
+            result,
+            expected_revision=updated.revision,
+        )
+
+
+def _run_github_repo_creation(
+    store: JobStore,
+    job: CursorJob,
+    token: WorkerClaim,
+    clients: ClientFactories,
+    checkpoint: Callable[[], None],
+) -> None:
+    github = _github_provider(clients.github)
+    checkpoint()
+    login = github.authenticated_login()
+    checkpoint()
+    trusted = job.trusted_utterance or job.request
+    visibility = job.github_repo_create_visibility or parse_repo_create_visibility(
+        trusted
+    )
+    owner = _resolve_github_repo_create_owner(store, job, token, github, login, trusted)
+    if owner is None:
+        return
+    repository = (job.github_repository or "").strip()
+    slug = ""
+    if repository and "/" in repository:
+        stored_owner, slug = repository.split("/", 1)
+        if stored_owner.casefold() != owner.casefold():
+            slug = ""
+    if not slug:
+        slug = parse_repo_create_slug(trusted) or ""
+    if not slug:
+        slug_changes = {"github_repository": owner}
+        if job.github_repo_create_org_requested:
+            slug_changes["github_repo_create_owner"] = owner
+        _worker_question(
+            store,
+            job.id,
+            token,
+            "What should I name the repository?",
+            expected_revision=job.revision,
+            clarification_kind="github_repo_create_slug",
+            job_changes=slug_changes,
+        )
+        return
+    if not job.github_repo_create_marker:
+        plan = github.plan_repository_creation(
+            owner,
+            slug,
+            visibility,
+            correlation_marker=uuid.uuid4().hex,
+        )
+
+        def persist_plan(current: CursorJob) -> CursorJob:
+            return current.evolve(
+                github_repository=plan.name_with_owner,
+                github_repo_create_owner=(
+                    plan.owner if current.github_repo_create_org_requested else None
+                ),
+                github_repo_create_visibility=plan.visibility,
+                github_repo_create_marker=plan.correlation_marker,
+                github_repo_create_operation_state="planned",
+            )
+
+        updated = _worker_change(
+            store,
+            job.id,
+            token,
+            {JobStatus.ROUTING},
+            persist_plan,
+            expected_revision=job.revision,
+        )
+        if updated is None:
+            return
+        job = updated
+    plan = github.plan_repository_creation(
+        owner,
+        slug,
+        job.github_repo_create_visibility or visibility,
+        correlation_marker=job.github_repo_create_marker,
+    )
+    if not job.github_repo_create_confirmed:
+        confirm = f"Create {plan.visibility} {plan.name_with_owner}?"
+        if not job.github_repo_create_continue_workflow:
+            confirm = f"{confirm} Say yes or no."
+        _worker_question(
+            store,
+            job.id,
+            token,
+            confirm,
+            expected_revision=job.revision,
+            clarification_kind="github_repo_create_confirmation",
+            sensitivity=QuestionSensitivity.DESTRUCTIVE,
+        )
+        return
+    existing = github.lookup_repository(plan.name_with_owner)
+    checkpoint()
+    if existing is not None:
+        observed = github.observe_repository_creation(plan)
+        if observed is None:
+            _worker_question(
+                store,
+                job.id,
+                token,
+                (
+                    f"{plan.name_with_owner} already exists. "
+                    "What other repository name should I use?"
+                ),
+                expected_revision=job.revision,
+                clarification_kind="github_repo_create_slug",
+                job_changes={
+                    "github_repository": owner,
+                    "github_repo_create_confirmed": False,
+                    "github_repo_create_marker": None,
+                    "github_repo_create_operation_state": None,
+                    **(
+                        {"github_repo_create_owner": owner}
+                        if job.github_repo_create_org_requested
+                        else {}
+                    ),
+                },
+            )
+            return
+        _materialize_created_github_repo(
+            store, job, token, github, observed, checkpoint
+        )
+        return
+    if job.github_repo_create_operation_state not in {None, "planned"}:
+        raise HarnessError(
+            "GitHub repository creation requires reconciliation before retry"
+        )
+
+    def mark_submitted(current: CursorJob) -> CursorJob:
+        if current.github_repo_create_continue_workflow:
+            return current.evolve(
+                github_repo_create_operation_state="submitted",
+                worker_operation="github_repo_create",
+            )
+        return current.evolve(
+            status=JobStatus.RUNNING,
+            github_repo_create_operation_state="submitted",
+            worker_operation="github_repo_create",
+        )
+
+    submitted = _worker_change(
+        store,
+        job.id,
+        token,
+        {JobStatus.ROUTING},
+        mark_submitted,
+        expected_revision=job.revision,
+    )
+    if submitted is None:
+        return
+    try:
+        checkpoint()
+        result = github.submit_repository_creation(plan, confirmed=True)
+    except GitHubError as exc:
+        checkpoint()
+        try:
+            visible = github.observe_repository_creation(plan)
+        except GitHubError:
+            visible = None
+        if visible is not None:
+            _materialize_created_github_repo(
+                store, submitted, token, github, visible, checkpoint
+            )
+            return
+        if not isinstance(exc, GitHubCommandStartError):
+
+            def ambiguous(current: CursorJob) -> CursorJob:
+                return current.evolve(
+                    status=JobStatus.QUEUED,
+                    queued_at=time.time(),
+                    github_repo_create_operation_state="ambiguous",
+                    reconcile=True,
+                    worker_pid=None,
+                    worker_boot_id=None,
+                    worker_process_start=None,
+                    worker_token=None,
+                    worker_operation=None,
+                )
+
+            _worker_change(
+                store,
+                job.id,
+                token,
+                {JobStatus.ROUTING, JobStatus.RUNNING},
+                ambiguous,
+                expected_revision=submitted.revision,
+            )
+            return
+
+        def retry_after_start_failure(current: CursorJob) -> CursorJob:
+            return current.evolve(
+                status=JobStatus.QUEUED,
+                queued_at=time.time(),
+                github_repo_create_operation_state="planned",
+                worker_pid=None,
+                worker_boot_id=None,
+                worker_process_start=None,
+                worker_token=None,
+                worker_operation=None,
+                worker_claim_operation=None,
+                worker_claimed_at=None,
+            )
+
+        _worker_change(
+            store,
+            job.id,
+            token,
+            {JobStatus.ROUTING, JobStatus.RUNNING},
+            retry_after_start_failure,
+            expected_revision=submitted.revision,
+        )
+        return
+    _materialize_created_github_repo(
+        store, submitted, token, github, result, checkpoint
     )
 
 
@@ -4706,8 +5887,8 @@ def run_claimed_worker(  # pyright: ignore[reportGeneralTypeIssues]
             checkpoint()
             _resume_plan_approval_completion(store, job, worker_token)
             return
-        if job.github_issue_create_requested:
-            _run_github_issue_creation(
+        if job.github_pr_create_requested:
+            _run_github_pr_creation(
                 store,
                 job,
                 worker_token,
@@ -4715,6 +5896,68 @@ def run_claimed_worker(  # pyright: ignore[reportGeneralTypeIssues]
                 checkpoint,
             )
             return
+        if job.github_repo_create_requested:
+            if job.github_repo_create_operation_state != "clone_verified":
+                _run_github_repo_creation(
+                    store,
+                    job,
+                    worker_token,
+                    clients,
+                    checkpoint,
+                )
+                job = store.get(job_id)
+            if not (
+                job.github_repo_create_continue_workflow
+                and job.github_repo_create_operation_state == "clone_verified"
+            ):
+                return
+            if not job.repository and job.github_repository:
+                github = _github_provider(clients.github)
+                resolved = github.resolve_repository(job.github_repository)
+                checkout = github.materialize_repository(
+                    resolved, checkpoint=checkpoint
+                )
+                cloned = _worker_change(
+                    store,
+                    job_id,
+                    worker_token,
+                    {JobStatus.ROUTING, JobStatus.RUNNING},
+                    lambda current: current.evolve(repository=str(checkout)),
+                    expected_revision=job.revision,
+                )
+                if cloned is None:
+                    return
+                job = cloned
+            if not job.repository:
+                return
+            if (
+                not job.github_issue_create_requested
+                and job.github_issue_created_number is None
+                and not job.github_issue_create_title
+            ):
+                _offer_file_as_issue_one(
+                    store,
+                    job,
+                    worker_token,
+                    clients,
+                    checkpoint,
+                )
+                return
+        if job.github_issue_create_requested:
+            if job.github_issue_create_operation_state != "created":
+                _run_github_issue_creation(
+                    store,
+                    job,
+                    worker_token,
+                    clients,
+                    checkpoint,
+                )
+                job = store.get(job_id)
+            if not (
+                job.github_repo_create_continue_workflow
+                and job.github_issue_create_operation_state == "created"
+            ):
+                return
         if job.linear_ticket_create_requested:
             _run_linear_ticket_creation(
                 store,
@@ -5075,6 +6318,12 @@ def run_claimed_worker(  # pyright: ignore[reportGeneralTypeIssues]
             hint = (job.repository_hint or "").strip() or None
             issue_key = active_issue_key
             reason = ""
+            if (
+                job.github_repo_create_continue_workflow
+                and job.github_repo_create_operation_state == "clone_verified"
+                and job.repository
+            ):
+                repository = Path(job.repository)
             if job.github_pull_request:
                 github_repository = (job.github_repository or "").strip()
                 number = job.github_pull_request
@@ -5267,7 +6516,9 @@ def run_claimed_worker(  # pyright: ignore[reportGeneralTypeIssues]
                 if updated is None:
                     return
                 job = updated
-            elif job.github_issue:
+            elif job.github_issue and not (
+                job.github_repo_create_continue_workflow and repository is not None
+            ):
                 github_repository = (job.github_repository or "").strip()
                 number = job.github_issue
                 if not github_repository or number <= 0:
@@ -5342,39 +6593,207 @@ def run_claimed_worker(  # pyright: ignore[reportGeneralTypeIssues]
                     repository, candidates = resolve_job_repository(
                         client, job, repositories
                     )
+                    trusted_admission = (
+                        job.trusted_utterance or job.request or ""
+                    ).strip()
+                    if (
+                        repository is not None
+                        and not hint
+                        and is_greenfield_repository_admission(trusted_admission)
+                    ):
+                        if repository not in candidates:
+                            candidates = [repository, *candidates]
+                        repository = None
                 checkpoint()
             if repository is None:
-                shortlist = [path.name for path in candidates]
-                page, _shortlist_rest = repository_name_page(shortlist)
-                remaining_names = [
-                    path.name for path in repositories if path.name not in page
-                ]
-                question = repository_question(
-                    [],
-                    reason
-                    or (
-                        "The repository could not be determined confidently."
-                        if hint or issue_key
-                        else ""
-                    ),
-                    names=page,
-                    remaining=len(remaining_names),
-                )
-                _worker_question(
-                    store,
-                    job_id,
-                    worker_token,
-                    question,
-                    expected_revision=job.revision,
-                    clarification_kind="repository",
-                    job_changes={
-                        "participant_admission_state": "waiting",
-                        # Remaining speakable names for later "list repositories"
-                        # pages. Unused by the grouped-ticket owner.
-                        "grouped_repository_candidates": remaining_names,
-                    },
-                )
-                return
+                clone_source = (
+                    job.clone_source or ""
+                ).strip() or parse_voice_clone_source(hint or "")
+                if clone_source:
+                    github = _github_provider(clients.github)
+                    checkout: Path | None = None
+                    if job.clone_operation_state == "ambiguous":
+                        checkout = _observe_voice_clone(github, clone_source)
+                        if checkout is None:
+                            return
+                    elif job.clone_operation_state not in {None, "planned"}:
+                        raise HarnessError(
+                            "repository clone requires reconciliation before retry"
+                        )
+                    if checkout is None and not job.clone_confirmed:
+                        destination = _clone_destination_label(github)
+                        _worker_question(
+                            store,
+                            job_id,
+                            worker_token,
+                            (
+                                f"Please confirm: should I clone {clone_source} "
+                                f"under {destination}? Say yes or no."
+                            ),
+                            expected_revision=job.revision,
+                            clarification_kind="clone_confirmation",
+                            sensitivity=QuestionSensitivity.DESTRUCTIVE,
+                            job_changes={
+                                "clone_source": clone_source,
+                                "clone_operation_state": "planned",
+                            },
+                        )
+                        return
+
+                    if checkout is None:
+
+                        def mark_clone_submitted(current: CursorJob) -> CursorJob:
+                            return current.evolve(
+                                clone_source=clone_source,
+                                clone_operation_state="submitted",
+                                worker_operation="repository_clone",
+                            )
+
+                        submitted = _worker_change(
+                            store,
+                            job_id,
+                            worker_token,
+                            {JobStatus.ROUTING},
+                            mark_clone_submitted,
+                            expected_revision=job.revision,
+                        )
+                        if submitted is None:
+                            return
+                        job = submitted
+                        try:
+                            checkpoint()
+                            checkout = _materialize_voice_clone(
+                                github,
+                                clone_source,
+                                checkpoint=checkpoint,
+                            )
+                        except GitHubOperationAmbiguous:
+
+                            def mark_clone_ambiguous(current: CursorJob) -> CursorJob:
+                                return current.evolve(
+                                    status=JobStatus.QUEUED,
+                                    queued_at=time.time(),
+                                    clone_operation_state="ambiguous",
+                                    reconcile=True,
+                                    worker_pid=None,
+                                    worker_boot_id=None,
+                                    worker_process_start=None,
+                                    worker_token=None,
+                                    worker_operation=None,
+                                )
+
+                            _worker_change(
+                                store,
+                                job_id,
+                                worker_token,
+                                {JobStatus.ROUTING},
+                                mark_clone_ambiguous,
+                                expected_revision=job.revision,
+                            )
+                            return
+                        except GitHubCommandStartError:
+
+                            def reset_clone_plan(current: CursorJob) -> CursorJob:
+                                return current.evolve(
+                                    status=JobStatus.QUEUED,
+                                    queued_at=time.time(),
+                                    clone_operation_state="planned",
+                                    worker_pid=None,
+                                    worker_boot_id=None,
+                                    worker_process_start=None,
+                                    worker_token=None,
+                                    worker_operation=None,
+                                    worker_claim_operation=None,
+                                    worker_claimed_at=None,
+                                )
+
+                            _worker_change(
+                                store,
+                                job_id,
+                                worker_token,
+                                {JobStatus.ROUTING},
+                                reset_clone_plan,
+                                expected_revision=job.revision,
+                            )
+                            return
+
+                    def record_clone(current: CursorJob) -> CursorJob:
+                        return current.evolve(
+                            repository=str(checkout),
+                            clone_operation_state="cloned",
+                            reconcile=False,
+                            worker_operation=None,
+                        )
+
+                    updated = _worker_change(
+                        store,
+                        job_id,
+                        worker_token,
+                        {JobStatus.ROUTING},
+                        record_clone,
+                        expected_revision=job.revision,
+                    )
+                    if updated is None:
+                        return
+                    job = updated
+                    repository = checkout
+                if repository is None:
+                    trusted_admission = (
+                        job.trusted_utterance or job.request or ""
+                    ).strip()
+                    if (
+                        is_greenfield_repository_admission(trusted_admission)
+                        and not job.github_repo_create_continue_workflow
+                    ):
+                        candidate_name = (
+                            candidates[0].name if len(candidates) == 1 else None
+                        )
+                        _worker_question(
+                            store,
+                            job_id,
+                            worker_token,
+                            checkout_or_new_repository_question(candidate_name),
+                            expected_revision=job.revision,
+                            clarification_kind="repository_or_create",
+                            job_changes={
+                                "participant_admission_state": "waiting",
+                                "grouped_repository_candidates": (
+                                    [candidate_name] if candidate_name else []
+                                ),
+                            },
+                        )
+                        return
+                    shortlist = [path.name for path in candidates]
+                    page, _shortlist_rest = repository_name_page(shortlist)
+                    remaining_names = [
+                        path.name for path in repositories if path.name not in page
+                    ]
+                    question = repository_question(
+                        [],
+                        reason
+                        or (
+                            "The repository could not be determined confidently."
+                            if hint or issue_key
+                            else ""
+                        ),
+                        names=page,
+                        remaining=len(remaining_names),
+                    )
+                    _worker_question(
+                        store,
+                        job_id,
+                        worker_token,
+                        question,
+                        expected_revision=job.revision,
+                        clarification_kind="repository",
+                        job_changes={
+                            "participant_admission_state": "waiting",
+                            # Remaining speakable names for later "list repositories"
+                            # pages. Unused by the grouped-ticket owner.
+                            "grouped_repository_candidates": remaining_names,
+                        },
+                    )
+                    return
             for _attempt in range(3):
                 reservation: CursorJob | None = None
                 agent_settled = False

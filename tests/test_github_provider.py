@@ -15,7 +15,11 @@ from local_voice_harness.integrations.github import (
     GitHubProvider,
     GitHubPullRequest,
     GitHubPullRequestCheckoutInputs,
+    GitHubPullRequestCreationPlan,
+    GitHubPullRequestCreationResult,
     GitHubPullRequestPlan,
+    GitHubRepoCreationPlan,
+    GitHubRepoCreationResult,
     GitHubRepository,
     dump_github_provider_state,
     load_github_provider_state,
@@ -230,6 +234,105 @@ class GitHubProviderTests(unittest.TestCase):
         self.assertRegex(first.correlation_marker, r"^[0-9a-f]{32}$")
         self.assertRegex(second.correlation_marker, r"^[0-9a-f]{32}$")
         self.assertNotEqual(first.correlation_marker, second.correlation_marker)
+
+    def test_provider_plans_observes_and_submits_pull_request_creation(self) -> None:
+        result = GitHubPullRequestCreationResult(
+            GitHubPullRequest("example", "project", 7),
+            "https://github.com/example/project/pull/7",
+            "a" * 32,
+        )
+        self.client.observe_pull_request_creation.return_value = None
+        self.client.submit_pull_request_creation.return_value = result
+
+        plan = self.provider.plan_pull_request_creation(
+            " example/project.git ",
+            " Open the change ",
+            " Detailed body ",
+            " example:voice/job ",
+            " main ",
+            "b" * 40,
+            "example/project",
+            correlation_marker="a" * 32,
+        )
+
+        self.assertEqual(
+            plan,
+            GitHubPullRequestCreationPlan(
+                "example/project",
+                "Open the change",
+                "Detailed body",
+                "example:voice/job",
+                "main",
+                "b" * 40,
+                "example/project",
+                "a" * 32,
+            ),
+        )
+        self.assertIsNone(self.provider.observe_pull_request_creation(plan))
+        self.assertEqual(
+            self.provider.submit_pull_request_creation(plan, confirmed=True),
+            result,
+        )
+        self.client.observe_pull_request_creation.assert_called_once_with(plan)
+        self.client.submit_pull_request_creation.assert_called_once_with(
+            plan, confirmed=True
+        )
+        with self.assertRaisesRegex(GitHubError, "confirmation"):
+            self.provider.submit_pull_request_creation(plan, confirmed=False)
+        self.assertEqual(self.client.submit_pull_request_creation.call_count, 1)
+
+    def test_provider_plans_observes_and_submits_repo_creation(self) -> None:
+        created = GitHubRepoCreationResult(
+            GitHubRepository(
+                "alice/payments",
+                "https://github.com/alice/payments",
+                True,
+                "main",
+            ),
+            "https://github.com/alice/payments",
+            "a" * 32,
+        )
+        self.client.observe_repository_creation.return_value = None
+        self.client.submit_repository_creation.return_value = created
+
+        plan = self.provider.plan_repository_creation(
+            " alice ",
+            " payments ",
+            "private",
+            correlation_marker="a" * 32,
+        )
+
+        self.assertEqual(
+            plan,
+            GitHubRepoCreationPlan("alice", "payments", "private", "a" * 32),
+        )
+        self.assertIsNone(self.provider.observe_repository_creation(plan))
+        self.assertEqual(
+            self.provider.submit_repository_creation(plan, confirmed=True),
+            created,
+        )
+        self.client.observe_repository_creation.assert_called_once_with(plan)
+        self.client.submit_repository_creation.assert_called_once_with(
+            plan, confirmed=True
+        )
+
+    def test_provider_delegates_organization_membership_identity(self) -> None:
+        self.client.list_organizations.return_value = ("acme", "widgets")
+        self.client.require_organization_membership.return_value = "acme"
+
+        self.assertEqual(self.provider.list_organizations(), ("acme", "widgets"))
+        self.assertEqual(
+            self.provider.require_organization_membership("acme"),
+            "acme",
+        )
+        self.client.list_organizations.assert_called_once_with()
+        self.client.require_organization_membership.assert_called_once_with("acme")
+
+    def test_provider_requires_confirmation_before_repo_submission(self) -> None:
+        plan = GitHubRepoCreationPlan("alice", "payments", "private", "a" * 32)
+        with self.assertRaisesRegex(GitHubError, "confirmation"):
+            self.provider.submit_repository_creation(plan, confirmed=False)
+        self.client.submit_repository_creation.assert_not_called()
 
     def test_provider_requires_confirmation_before_issue_submission(self) -> None:
         plan = GitHubIssueCreationPlan("example/project", "Title", "Body", "a" * 32)

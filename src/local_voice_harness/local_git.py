@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import fcntl
+import hashlib
 import os
 import re
 import shutil
@@ -68,6 +69,15 @@ class ExpectedRemote:
         if identity is None:
             raise LocalGitError("expected repository remote URL is invalid")
         return cls(url=url, identity=identity)
+
+
+@dataclass(frozen=True, slots=True)
+class GitPublicationSnapshot:
+    origin_identity: str
+    branch: str
+    head_oid: str
+    status_digest: str
+    dirty: bool
 
 
 class LocalGitRepository:
@@ -292,6 +302,41 @@ class LocalGitRepository:
         elif temporary.exists():
             shutil.rmtree(temporary)
 
+    def observe_materialized(
+        self,
+        relative_destination: Path,
+        *,
+        expected: ExpectedRemote,
+        expected_label: str | None = None,
+    ) -> Path | None:
+        """Observe an expected clone without creating or repairing it."""
+
+        relative_destination = self._relative_destination(relative_destination)
+        self._validate_root()
+        destination = self.clone_root / relative_destination
+        resolved_parent = destination.parent.resolve()
+        try:
+            resolved_parent.relative_to(self.clone_root)
+        except ValueError as exc:
+            raise LocalGitError(
+                "repository clone destination escapes its root"
+            ) from exc
+        if not destination.exists() and not destination.is_symlink():
+            return None
+        if destination.is_symlink():
+            try:
+                destination.resolve().relative_to(self.clone_root)
+            except ValueError as exc:
+                raise LocalGitError(
+                    "repository clone destination escapes its root"
+                ) from exc
+        self.verify_checkout(
+            destination,
+            expected,
+            expected_label=expected_label,
+        )
+        return destination.resolve()
+
     def materialize(
         self,
         relative_destination: Path,
@@ -380,3 +425,145 @@ class LocalGitRepository:
             finally:
                 self._cleanup_temporary(temporary)
             return destination.resolve()
+
+    def _require_allowed_checkout(self, checkout: Path) -> Path:
+        resolved = checkout.expanduser().resolve()
+        try:
+            resolved.relative_to(self.allowed_root)
+        except ValueError as exc:
+            raise LocalGitError(
+                "Git checkout escapes the allowed project root"
+            ) from exc
+        self.verify_checkout(resolved)
+        return resolved
+
+    def has_unpublished_changes(self, checkout: Path) -> bool:
+        return self.publication_snapshot(checkout).dirty
+
+    @staticmethod
+    def _status_digest(checkout: Path, status: str) -> str:
+        digest = hashlib.sha256()
+        records = status.split("\0")
+        for record in records:
+            if not record:
+                continue
+            if len(record) >= 3 and record[2] == " ":
+                code = record[:2]
+                path_text = record[3:]
+                category = code if code in {"??", "!!"} else "changed"
+            else:
+                category = "path"
+                path_text = record
+            digest.update(category.encode())
+            digest.update(b"\0")
+            digest.update(path_text.encode(errors="surrogateescape"))
+            digest.update(b"\0")
+            path = checkout / path_text
+            try:
+                if path.is_symlink():
+                    digest.update(b"symlink\0")
+                    digest.update(os.readlink(path).encode(errors="surrogateescape"))
+                elif path.is_file():
+                    digest.update(b"file\0")
+                    with path.open("rb") as source:
+                        for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                            digest.update(chunk)
+                elif path.exists():
+                    digest.update(b"other\0")
+                else:
+                    digest.update(b"absent\0")
+            except OSError as exc:
+                raise LocalGitError(
+                    "Git checkout status contents could not be verified"
+                ) from exc
+            digest.update(b"\0")
+        return digest.hexdigest()
+
+    def publication_snapshot(self, checkout: Path) -> GitPublicationSnapshot:
+        checkout = self._require_allowed_checkout(checkout)
+        origin = self.git(checkout, "remote", "get-url", "origin").stdout.strip()
+        identity = remote_identity(origin)
+        if identity is None:
+            raise LocalGitError("Git origin URL could not be verified")
+        branch = self.current_branch(checkout)
+        if not branch or branch == "HEAD":
+            raise LocalGitError("Git checkout is not on a named branch")
+        self.git(checkout, "check-ref-format", "--branch", branch)
+        head_oid = self.git(checkout, "rev-parse", "HEAD").stdout.strip().lower()
+        if re.fullmatch(r"[0-9a-f]{40}", head_oid) is None:
+            raise LocalGitError("Git HEAD could not be verified")
+        status = self.git(
+            checkout,
+            "status",
+            "--porcelain=v1",
+            "-z",
+            "--untracked-files=all",
+        ).stdout
+        return GitPublicationSnapshot(
+            origin_identity=identity,
+            branch=branch,
+            head_oid=head_oid,
+            status_digest=self._status_digest(checkout, status),
+            dirty=bool(status),
+        )
+
+    def require_publication_snapshot(
+        self,
+        checkout: Path,
+        expected: GitPublicationSnapshot,
+    ) -> GitPublicationSnapshot:
+        actual = self.publication_snapshot(checkout)
+        if actual != expected:
+            raise LocalGitRefChanged(
+                "Git checkout changed after pull request confirmation"
+            )
+        return actual
+
+    def commit_unpublished_changes(
+        self,
+        checkout: Path,
+        subject: str,
+        *,
+        confirmed: bool,
+        expected: GitPublicationSnapshot | None = None,
+    ) -> str | None:
+        if not confirmed:
+            raise LocalGitError("Git commit requires explicit confirmation")
+        checkout = self._require_allowed_checkout(checkout)
+        message = " ".join(subject.split())
+        if not message:
+            raise LocalGitError("Git commit requires a non-empty subject")
+        if len(message) > 72:
+            raise LocalGitError("Git commit subject is too long")
+        snapshot = self.publication_snapshot(checkout)
+        if expected is not None and snapshot != expected:
+            raise LocalGitRefChanged(
+                "Git checkout changed after pull request confirmation"
+            )
+        if not snapshot.dirty:
+            return None
+        self.require_publication_snapshot(checkout, snapshot)
+        self.git(checkout, "add", "-A")
+        self.require_publication_snapshot(checkout, snapshot)
+        self.git(checkout, "commit", "-m", message)
+        return self.git(checkout, "rev-parse", "HEAD").stdout.strip() or None
+
+    def push_current_branch(
+        self,
+        checkout: Path,
+        *,
+        confirmed: bool,
+        expected: GitPublicationSnapshot | None = None,
+    ) -> str:
+        if not confirmed:
+            raise LocalGitError("Git push requires explicit confirmation")
+        checkout = self._require_allowed_checkout(checkout)
+        snapshot = self.publication_snapshot(checkout)
+        if expected is not None and snapshot != expected:
+            raise LocalGitRefChanged(
+                "Git checkout changed after pull request confirmation"
+            )
+        branch = snapshot.branch
+        self.require_publication_snapshot(checkout, snapshot)
+        self.git(checkout, "push", "-u", "origin", branch, timeout=180)
+        return branch

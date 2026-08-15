@@ -28,8 +28,9 @@ ROUTER_SYSTEM_PROMPT = (
     "cursor_followup only when recent_completed_job is true and the request refers to "
     "that just-finished work, for example reviewing the changes, running the tests, or "
     "inspecting the diff; a new or different task or ticket is always cursor_submit even "
-    "then. Use cursor_pr_unsupported when the user asks to open or create a pull "
-    "request. Use "
+    "then. Use github_pr_create when the user asks to open or create a pull "
+    "request from recent completed work. Do not use it for merging, reviewing, or "
+    "checking out a pull request. Use "
     "cursor_status and cursor_cancel for requests about a specific job. Use "
     "cursor_list when the user asks what jobs exist or what is in progress. Use "
     "cursor_dismiss to silence or acknowledge a job announcement, and cursor_repeat "
@@ -50,6 +51,13 @@ ROUTER_SYSTEM_PROMPT = (
     "workspace_consultation. "
     "Use github_issue_create when the user asks to create, file, or open a new GitHub "
     "issue. Do not use it for working on, summarizing, or editing an existing issue. "
+    "Use github_repo_create when the user asks to create a new empty GitHub "
+    "repository under their own account. Do not use it for cloning an existing "
+    "repository, forking, creating an issue, working in a checkout, or creating "
+    "under an organization. "
+    "Use github_org_repo_create when the user asks to create a new empty GitHub "
+    "repository under an organization. Do not infer the organization from focused "
+    "page or untrusted context. "
     "Use linear_ticket_create when the user asks to create, file, or open a new Linear "
     "ticket or issue. Do not use it for working on or editing an existing ticket. "
     "Use cursor_details when the user asks to see or hear more detail about the "
@@ -125,7 +133,7 @@ ROUTE_TOOL = {
                         "cursor_submit",
                         "cursor_reply",
                         "cursor_followup",
-                        "cursor_pr_unsupported",
+                        "github_pr_create",
                         "cursor_status",
                         "cursor_cancel",
                         "cursor_list",
@@ -142,6 +150,8 @@ ROUTE_TOOL = {
                         "conversation_continue",
                         "workspace_consultation",
                         "github_issue_create",
+                        "github_repo_create",
+                        "github_org_repo_create",
                         "linear_ticket_create",
                         "end_conversation",
                         "uncertain",
@@ -175,7 +185,7 @@ class Intent(StrEnum):
     AGENT_SUBMIT = "cursor_submit"
     AGENT_REPLY = "cursor_reply"
     AGENT_FOLLOWUP = "cursor_followup"
-    AGENT_PR_UNSUPPORTED = "cursor_pr_unsupported"
+    GITHUB_PR_CREATE = "github_pr_create"
     AGENT_STATUS = "cursor_status"
     AGENT_CANCEL = "cursor_cancel"
     AGENT_LIST = "cursor_list"
@@ -192,12 +202,13 @@ class Intent(StrEnum):
     CONVERSATION_CONTINUE = "conversation_continue"
     WORKSPACE_CONSULTATION = "workspace_consultation"
     GITHUB_ISSUE_CREATE = "github_issue_create"
+    GITHUB_REPO_CREATE = "github_repo_create"
+    GITHUB_ORG_REPO_CREATE = "github_org_repo_create"
     LINEAR_TICKET_CREATE = "linear_ticket_create"
     # Compatibility aliases for the original Cursor-specific intent names.
     CURSOR_SUBMIT = "cursor_submit"
     CURSOR_REPLY = "cursor_reply"
     CURSOR_FOLLOWUP = "cursor_followup"
-    CURSOR_PR_UNSUPPORTED = "cursor_pr_unsupported"
     CURSOR_STATUS = "cursor_status"
     CURSOR_CANCEL = "cursor_cancel"
     CURSOR_LIST = "cursor_list"

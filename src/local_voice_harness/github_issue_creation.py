@@ -72,6 +72,16 @@ def _validated_draft(repository: str, title: object, body: object) -> GitHubIssu
     return GitHubIssueDraft(repository, title, body)
 
 
+def issue_draft_from_trusted_brief(utterance: str, repository: str) -> GitHubIssueDraft:
+    body = utterance.strip()
+    if not body:
+        raise HarnessError("GitHub issue creation requires a spoken request")
+    title = " ".join(body.split())
+    if len(title) > MAX_ISSUE_TITLE_CHARS:
+        title = title[: MAX_ISSUE_TITLE_CHARS - 1].rstrip() + "…"
+    return _validated_draft(repository, title, body)
+
+
 def draft_github_issue(
     utterance: str,
     repository: str,

@@ -80,6 +80,41 @@ class IntentRouterTests(LocalRouterTestCase):
         self.assertEqual(route.intent, intent.Intent.GITHUB_ISSUE_CREATE)
         self.assertTrue(route.actionable)
 
+    def test_routes_new_github_repo_creation_as_a_distinct_action(self) -> None:
+        with mock.patch.object(
+            llm_transport.urllib.request,
+            "urlopen",
+            return_value=_response("github_repo_create"),
+        ):
+            route = intent.route_intent(
+                "Create a new GitHub repository called payments",
+                RequestContext("Create a new GitHub repository called payments"),
+            )
+
+        self.assertEqual(route.intent, intent.Intent.GITHUB_REPO_CREATE)
+        self.assertTrue(route.actionable)
+
+    def test_routes_org_github_repo_creation_as_a_distinct_action(self) -> None:
+        with mock.patch.object(
+            llm_transport.urllib.request,
+            "urlopen",
+            return_value=_response("github_org_repo_create"),
+        ):
+            route = intent.route_intent(
+                "Create a new GitHub repository in the acme organization",
+                RequestContext(
+                    "Create a new GitHub repository in the acme organization",
+                    focused_repository="focused/page",
+                ),
+            )
+
+        self.assertEqual(route.intent, intent.Intent.GITHUB_ORG_REPO_CREATE)
+        self.assertTrue(route.actionable)
+        self.assertIn(
+            "github_org_repo_create",
+            intent.ROUTE_TOOL["function"]["parameters"]["properties"]["intent"]["enum"],
+        )
+
     def test_routes_new_linear_ticket_creation_as_a_distinct_action(self) -> None:
         with mock.patch.object(
             llm_transport.urllib.request,
@@ -330,7 +365,8 @@ class FollowUpIntentTests(LocalRouterTestCase):
         ]
         self.assertIn("cursor_followup", enum)
         self.assertIn("cursor_details", enum)
-        self.assertIn("cursor_pr_unsupported", enum)
+        self.assertIn("github_pr_create", enum)
+        self.assertNotIn("cursor_pr_unsupported", enum)
 
     def test_recent_completion_flag_is_forwarded(self) -> None:
         with mock.patch.object(
@@ -387,15 +423,15 @@ class FollowUpIntentTests(LocalRouterTestCase):
         )
         self.assertEqual(router_input["clarification_kind"], "repository")
 
-    def test_pr_unsupported_is_actionable(self) -> None:
+    def test_github_pr_create_is_actionable(self) -> None:
         with mock.patch.object(
             llm_transport.urllib.request,
             "urlopen",
-            return_value=_response("cursor_pr_unsupported"),
+            return_value=_response("github_pr_create"),
         ):
             route = intent.route_intent("open a pull request", RequestContext("open"))
         self.assertTrue(route.actionable)
-        self.assertEqual(route.intent, intent.Intent.CURSOR_PR_UNSUPPORTED)
+        self.assertEqual(route.intent, intent.Intent.GITHUB_PR_CREATE)
 
 
 class EndConversationIntentTests(LocalRouterTestCase):
