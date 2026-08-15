@@ -30,7 +30,9 @@ ROUTER_SYSTEM_PROMPT = (
     "inspecting the diff; a new or different task or ticket is always cursor_submit even "
     "then. Use github_pr_create when the user asks to open or create a pull "
     "request from recent completed work. Do not use it for merging, reviewing, or "
-    "checking out a pull request. Use "
+    "checking out a pull request. Use github_pr_merge when the user asks to merge "
+    "an identified pull request. Do not use github_pr_merge for opening, creating, "
+    "reviewing, or checking out a pull request. Use "
     "cursor_status and cursor_cancel for requests about a specific job. Use "
     "cursor_list when the user asks what jobs exist or what is in progress. Use "
     "cursor_dismiss to silence or acknowledge a job announcement, and cursor_repeat "
@@ -134,6 +136,7 @@ ROUTE_TOOL = {
                         "cursor_reply",
                         "cursor_followup",
                         "github_pr_create",
+                        "github_pr_merge",
                         "cursor_status",
                         "cursor_cancel",
                         "cursor_list",
@@ -186,6 +189,7 @@ class Intent(StrEnum):
     AGENT_REPLY = "cursor_reply"
     AGENT_FOLLOWUP = "cursor_followup"
     GITHUB_PR_CREATE = "github_pr_create"
+    GITHUB_PR_MERGE = "github_pr_merge"
     AGENT_STATUS = "cursor_status"
     AGENT_CANCEL = "cursor_cancel"
     AGENT_LIST = "cursor_list"

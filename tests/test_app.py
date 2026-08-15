@@ -635,6 +635,64 @@ class AppContextTests(unittest.TestCase):
             play.call_args.args[0],
         )
 
+    def test_medium_confidence_merge_does_not_write(self) -> None:
+        with (
+            mock.patch.object(app, "start_components"),
+            mock.patch.object(
+                app,
+                "request_context",
+                side_effect=lambda text, **_settings: RequestContext(text),
+            ),
+            mock.patch.object(
+                app,
+                "route_intent",
+                return_value=IntentRoute(Intent.GITHUB_PR_MERGE, "medium"),
+            ),
+            mock.patch.object(app, "qwen_response") as qwen,
+            mock.patch.object(app, "cursor_turn") as cursor,
+            mock.patch.object(app, "stream_and_play") as play,
+        ):
+            app.respond("merge the pull request")
+
+        qwen.assert_not_called()
+        cursor.assert_not_called()
+        self.assertIn(
+            "did not merge a pull request because the request was unclear",
+            play.call_args.args[0],
+        )
+
+    def test_high_confidence_merge_starts_job_without_merging_immediately(self) -> None:
+        with (
+            mock.patch.object(app, "start_components"),
+            mock.patch.object(
+                app,
+                "request_context",
+                side_effect=lambda text, **_settings: RequestContext(
+                    text,
+                    github_repository="source/project",
+                    github_pull_request=7,
+                ),
+            ),
+            mock.patch.object(
+                app,
+                "route_intent",
+                return_value=IntentRoute(Intent.GITHUB_PR_MERGE, "high"),
+            ),
+            mock.patch.object(app, "qwen_response") as qwen,
+            mock.patch.object(
+                app, "cursor_turn", return_value=("Merge it?", None)
+            ) as cursor,
+            mock.patch.object(app, "stream_and_play"),
+        ):
+            app.respond("merge this pull request")
+
+        qwen.assert_not_called()
+        cursor.assert_called_once()
+        request = cursor.call_args.args[0]
+        self.assertTrue(request.github_pr_merge_requested)
+        self.assertEqual(request.github_repository, "source/project")
+        self.assertEqual(request.github_pr_merge_number, 7)
+
     def test_actionable_github_issue_metadata_reaches_cursor(self) -> None:
         context = RequestContext(
             "work on this\n\nIssue: #42",

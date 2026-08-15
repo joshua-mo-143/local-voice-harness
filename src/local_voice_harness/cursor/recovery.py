@@ -817,6 +817,77 @@ def reconcile_uncertain_pr_creation(
     store.update(job.id, reconcile)
 
 
+def reconcile_uncertain_pr_merge(
+    store: JobStore,
+    job: CursorJob,
+    *,
+    now: float,
+    github_factory: GitHubFactory = GitHubClient,
+) -> None:
+    states = frozenset({"submitting", "submitted", "ambiguous"})
+    if job.github_pr_merge_operation_state not in states:
+        return
+    repository = job.github_repository or ""
+    number = job.github_pr_merge_number
+    marker = job.github_pr_merge_marker
+    try:
+        github = _github_provider(github_factory)
+        if not repository or number is None or not marker:
+            result = None
+        else:
+            plan = github.plan_pull_request_merge(
+                repository,
+                number,
+                correlation_marker=marker,
+            )
+            result = github.observe_pull_request_merge(plan)
+    except GitHubError:
+        result = None
+
+    def reconcile(current: CursorJob) -> CursorJob | None:
+        if current.github_pr_merge_operation_state not in states:
+            return None
+        if result is None:
+            message = (
+                "GitHub pull request merge could not be reconciled automatically. "
+                "Check the pull request on GitHub before trying again."
+            )
+            return current.evolve_recovery(
+                now=now,
+                status=JobStatus.BLOCKED,
+                github_pr_merge_operation_state="manual_required",
+                result=message,
+                completed_at=now,
+                reconcile=False,
+                worker_operation=None,
+                worker_pid=None,
+                worker_boot_id=None,
+                worker_process_start=None,
+                worker_token=None,
+                prepare_delivery=True,
+            )
+        return current.evolve_recovery(
+            now=now,
+            status=JobStatus.COMPLETED,
+            github_pr_merge_number=result.pull_request.number,
+            github_pr_merge_url=result.url,
+            github_pr_merge_operation_state="merged",
+            result=(
+                f"Merged GitHub pull request {result.pull_request.number}: {result.url}"
+            ),
+            completed_at=now,
+            reconcile=False,
+            worker_operation=None,
+            worker_pid=None,
+            worker_boot_id=None,
+            worker_process_start=None,
+            worker_token=None,
+            prepare_delivery=True,
+        )
+
+    store.update(job.id, reconcile)
+
+
 def reconcile_uncertain_repo_creation(
     store: JobStore,
     job: CursorJob,
@@ -1159,6 +1230,13 @@ def reconcile_uncertain_operations(
     )
     current = store.get(job.id)
     reconcile_uncertain_pr_creation(
+        store,
+        current,
+        now=now,
+        github_factory=github_factory,
+    )
+    current = store.get(job.id)
+    reconcile_uncertain_pr_merge(
         store,
         current,
         now=now,

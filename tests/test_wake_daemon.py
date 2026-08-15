@@ -31,6 +31,7 @@ from local_voice_harness.cursor.service import CursorTurnRequest
 from local_voice_harness.cursor.store import JobStore
 from local_voice_harness.diagnostics.help import harness_help_response
 from local_voice_harness.errors import HarnessError, NoSpeechError, SpeechDeliveryError
+from local_voice_harness.integrations.github import GitHubPullRequest
 from local_voice_harness.integrations.registry import build_integration_registry
 from local_voice_harness.intent import Intent, IntentRoute
 from local_voice_harness.questions import (
@@ -7745,6 +7746,37 @@ class CompletedFollowupContextTests(unittest.TestCase):
         cursor_turn.assert_not_called()
         self._last_qwen.assert_not_called()
         self.assertIsNotNone(daemon.completed_followup)
+
+    def test_merge_uses_conversation_created_pull_request(self) -> None:
+        daemon = _bare_daemon()
+        daemon.conversation_created_pull_request = GitHubPullRequest(
+            "source", "project", 7
+        )
+        cursor_turn = self._run_route(
+            daemon,
+            IntentRoute(Intent.GITHUB_PR_MERGE, "high"),
+            transcript="merge it",
+        )
+        cursor_turn.assert_called_once()
+        request = cursor_turn.call_args.args[0]
+        self.assertTrue(request.github_pr_merge_requested)
+        self.assertEqual(request.github_repository, "source/project")
+        self.assertEqual(request.github_pr_merge_number, 7)
+        self.assertNotEqual(request.action, "follow_up")
+        self._last_qwen.assert_not_called()
+
+    def test_medium_confidence_merge_does_not_write(self) -> None:
+        daemon = _bare_daemon()
+        daemon.conversation_created_pull_request = GitHubPullRequest(
+            "source", "project", 7
+        )
+        cursor_turn = self._run_route(
+            daemon,
+            IntentRoute(Intent.GITHUB_PR_MERGE, "medium"),
+            transcript="merge it",
+        )
+        cursor_turn.assert_not_called()
+        self._last_qwen.assert_not_called()
 
 
 class LastTranscriptReplayTests(unittest.TestCase):

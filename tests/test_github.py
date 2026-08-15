@@ -20,9 +20,13 @@ from local_voice_harness.integrations.github import (
     GitHubPullRequest,
     GitHubPullRequestCreationPlan,
     GitHubPullRequestCreationResult,
+    GitHubPullRequestMergePlan,
+    GitHubPullRequestMergeResult,
     GitHubRepoCreationPlan,
     GitHubRepoCreationResult,
     GitHubRepository,
+    PullRequestMergeIdentity,
+    resolve_pull_request_merge_identity,
 )
 from local_voice_harness.local_git import LocalGitOperationAmbiguous
 
@@ -566,6 +570,118 @@ class GitHubClientTests(unittest.TestCase):
             self.assertRaises(GitHubOperationAmbiguous),
         ):
             client.submit_pull_request_creation(plan, confirmed=True)
+
+    def test_pull_request_merge_requires_confirmation_and_default_flags(self) -> None:
+        client = GitHubClient()
+        plan = GitHubPullRequestMergePlan(
+            "example/project",
+            7,
+            "https://github.com/example/project/pull/7",
+            "a" * 32,
+        )
+        with (
+            mock.patch.object(client, "_run") as run,
+            self.assertRaisesRegex(GitHubError, "confirmation"),
+        ):
+            client.submit_pull_request_merge(plan, confirmed=False)
+        run.assert_not_called()
+
+        view = {
+            "number": 7,
+            "url": "https://github.com/example/project/pull/7",
+            "state": "MERGED",
+            "mergedAt": "2026-01-01T00:00:00Z",
+        }
+        with mock.patch.object(
+            client,
+            "_run",
+            side_effect=[_completed(""), _completed(json.dumps(view))],
+        ) as run:
+            result = client.submit_pull_request_merge(plan, confirmed=True)
+
+        self.assertEqual(
+            result,
+            GitHubPullRequestMergeResult(
+                GitHubPullRequest("example", "project", 7),
+                "https://github.com/example/project/pull/7",
+                "a" * 32,
+            ),
+        )
+        merge_command = run.call_args_list[0].args[0]
+        self.assertEqual(
+            merge_command,
+            ["gh", "pr", "merge", "7", "--repo", "example/project"],
+        )
+        self.assertNotIn("--admin", merge_command)
+        self.assertNotIn("--delete-branch", merge_command)
+        self.assertNotIn("--squash", merge_command)
+
+    def test_open_pull_request_observation_is_not_merged(self) -> None:
+        client = GitHubClient()
+        plan = GitHubPullRequestMergePlan(
+            "example/project",
+            7,
+            "https://github.com/example/project/pull/7",
+            "a" * 32,
+        )
+        view = {
+            "number": 7,
+            "url": "https://github.com/example/project/pull/7",
+            "state": "OPEN",
+            "mergedAt": None,
+        }
+        with mock.patch.object(
+            client, "_run", return_value=_completed(json.dumps(view))
+        ):
+            self.assertIsNone(client.observe_pull_request_merge(plan))
+
+    def test_unprovable_merge_result_is_ambiguous(self) -> None:
+        client = GitHubClient()
+        plan = GitHubPullRequestMergePlan(
+            "example/project",
+            7,
+            "https://github.com/example/project/pull/7",
+            "a" * 32,
+        )
+        with (
+            mock.patch(
+                "local_voice_harness.integrations.github.run_command",
+                side_effect=subprocess.TimeoutExpired(["gh"], 1),
+            ),
+            self.assertRaises(GitHubOperationAmbiguous),
+        ):
+            client.submit_pull_request_merge(plan, confirmed=True)
+
+    def test_merge_identity_uses_utterance_and_asks_when_sources_conflict(self) -> None:
+        self.assertEqual(
+            resolve_pull_request_merge_identity(
+                utterance="merge https://github.com/example/project/pull/7"
+            ),
+            PullRequestMergeIdentity("example/project", 7),
+        )
+        self.assertEqual(
+            resolve_pull_request_merge_identity(
+                utterance="merge pull request 9 in source/project"
+            ),
+            PullRequestMergeIdentity("source/project", 9),
+        )
+        self.assertEqual(
+            resolve_pull_request_merge_identity(
+                utterance="merge it",
+                conversation_repository="source/project",
+                conversation_number=4,
+            ),
+            PullRequestMergeIdentity("source/project", 4),
+        )
+        self.assertIsNone(
+            resolve_pull_request_merge_identity(
+                utterance="merge it",
+                focused_repository="source/project",
+                focused_number=1,
+                conversation_repository="source/project",
+                conversation_number=2,
+            )
+        )
 
     def test_repo_creation_uses_description_marker_and_observes(self) -> None:
         client = GitHubClient()

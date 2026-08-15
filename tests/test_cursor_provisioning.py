@@ -49,6 +49,7 @@ from local_voice_harness.integrations.github import (
     GitHubOperationAmbiguous,
     GitHubPullRequest,
     GitHubPullRequestCreationResult,
+    GitHubPullRequestMergeResult,
     GitHubRepoCreationResult,
     GitHubRepository,
     ProvisionedIssue,
@@ -3585,6 +3586,7 @@ class CursorJobStateTests(unittest.TestCase):
         github.local_git.commit_unpublished_changes.assert_called_once()
         github.local_git.push_current_branch.assert_called_once()
         github.submit_pull_request_creation.assert_called_once()
+        github.submit_pull_request_merge.assert_not_called()
         herdr.assert_not_called()
 
     def test_pull_request_creation_fails_closed_for_mixed_repository_state(
@@ -3764,6 +3766,148 @@ class CursorJobStateTests(unittest.TestCase):
         self.assertIsNone(updated.get("github_pr_created_number"))
         github.submit_pull_request_creation.assert_called_once()
         github.observe_pull_request_creation.assert_called_once()
+
+    def test_worker_asks_before_merging_an_identified_pull_request(self) -> None:
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "merge pull request 7 in source/project",
+                "trusted_utterance": "merge pull request 7 in source/project",
+                "github_pr_merge_requested": True,
+                "status": "queued",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        source = GitHubRepository(
+            "source/project",
+            "https://github.com/source/project",
+            False,
+            "main",
+        )
+        github = mock.Mock()
+        github.inspect_repository.return_value = source
+        with mock.patch.object(jobs, "GitHubClient", return_value=github):
+            service.run_worker("123456789abc")
+
+        updated = jobs.read_job("123456789abc")
+        self.assertEqual(updated["status"], "awaiting_user")
+        self.assertEqual(
+            updated["clarification_kind"],
+            "github_pr_merge_confirmation",
+        )
+        self.assertEqual(updated["github_pr_merge_number"], 7)
+        self.assertEqual(updated["github_pr_merge_operation_state"], "planned")
+        github.submit_pull_request_merge.assert_not_called()
+
+    def test_confirmed_pull_request_merge_speaks_identity(self) -> None:
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "merge pull request 7 in source/project",
+                "trusted_utterance": "merge pull request 7 in source/project",
+                "github_pr_merge_requested": True,
+                "github_pr_merge_confirmed": True,
+                "github_pr_merge_number": 7,
+                "github_pr_merge_url": "https://github.com/source/project/pull/7",
+                "github_pr_merge_marker": "a" * 32,
+                "github_pr_merge_operation_state": "planned",
+                "github_repository": "source/project",
+                "status": "queued",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        source = GitHubRepository(
+            "source/project",
+            "https://github.com/source/project",
+            False,
+            "main",
+        )
+        result = GitHubPullRequestMergeResult(
+            GitHubPullRequest("source", "project", 7),
+            "https://github.com/source/project/pull/7",
+            "a" * 32,
+        )
+        github = mock.Mock()
+        github.inspect_repository.return_value = source
+        github.submit_pull_request_merge.return_value = result
+        herdr = mock.Mock()
+        with (
+            mock.patch.object(jobs, "GitHubClient", return_value=github),
+            mock.patch.object(jobs, "HerdrClient", return_value=herdr),
+        ):
+            service.run_worker("123456789abc")
+
+        updated = jobs.read_job("123456789abc")
+        self.assertEqual(updated["status"], "completed")
+        self.assertEqual(updated["github_pr_merge_operation_state"], "merged")
+        self.assertIn("https://github.com/source/project/pull/7", updated["result"])
+        github.submit_pull_request_merge.assert_called_once()
+        github.submit_pull_request_creation.assert_not_called()
+        herdr.assert_not_called()
+
+    def test_missing_merge_identity_asks_instead_of_writing(self) -> None:
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "merge the pull request",
+                "trusted_utterance": "merge the pull request",
+                "github_pr_merge_requested": True,
+                "status": "queued",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        github = mock.Mock()
+        with mock.patch.object(jobs, "GitHubClient", return_value=github):
+            service.run_worker("123456789abc")
+
+        updated = jobs.read_job("123456789abc")
+        self.assertEqual(updated["status"], "awaiting_user")
+        self.assertEqual(updated["clarification_kind"], "github_pr_merge_identity")
+        github.submit_pull_request_merge.assert_not_called()
+
+    def test_timed_out_pull_request_merge_is_reconciled_without_resubmission(
+        self,
+    ) -> None:
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "merge pull request 7 in source/project",
+                "trusted_utterance": "merge pull request 7 in source/project",
+                "github_pr_merge_requested": True,
+                "github_pr_merge_confirmed": True,
+                "github_pr_merge_number": 7,
+                "github_pr_merge_url": "https://github.com/source/project/pull/7",
+                "github_pr_merge_marker": "a" * 32,
+                "github_pr_merge_operation_state": "planned",
+                "github_repository": "source/project",
+                "status": "queued",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        source = GitHubRepository(
+            "source/project",
+            "https://github.com/source/project",
+            False,
+            "main",
+        )
+        github = mock.Mock()
+        github.inspect_repository.return_value = source
+        github.submit_pull_request_merge.side_effect = GitHubOperationAmbiguous(
+            "timed out"
+        )
+        github.observe_pull_request_merge.return_value = None
+        with mock.patch.object(jobs, "GitHubClient", return_value=github):
+            service.run_worker("123456789abc")
+
+        updated = jobs.read_job("123456789abc")
+        self.assertEqual(updated["github_pr_merge_operation_state"], "ambiguous")
+        self.assertTrue(updated.get("reconcile"))
+        github.submit_pull_request_merge.assert_called_once()
+        github.observe_pull_request_merge.assert_called_once()
 
     def test_worker_drafts_linear_ticket_before_requesting_confirmation(self) -> None:
         jobs.write_job(
@@ -4481,6 +4625,8 @@ class CursorJobStateTests(unittest.TestCase):
             github_issue_context=None,
             github_issue_create_requested=False,
             github_pr_create_requested=False,
+            github_pr_merge_requested=False,
+            github_pr_merge_number=None,
             github_repo_create_requested=False,
             github_repo_create_org_requested=False,
             linear_team=None,

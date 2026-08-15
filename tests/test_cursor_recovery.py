@@ -47,6 +47,7 @@ from local_voice_harness.cursor.recovery import (
     reconcile_uncertain_issue_creation,
     reconcile_uncertain_linear_ticket_creation,
     reconcile_uncertain_pr_creation,
+    reconcile_uncertain_pr_merge,
     reconcile_uncertain_repo_creation,
     recover_jobs,
     resolve_manual_reconciliation,
@@ -64,6 +65,7 @@ from local_voice_harness.integrations.github import (
     GitHubIssueCreationResult,
     GitHubPullRequest,
     GitHubPullRequestCreationResult,
+    GitHubPullRequestMergeResult,
     GitHubRepoCreationResult,
     GitHubRepository,
 )
@@ -534,6 +536,79 @@ class CursorRecoveryTests(unittest.TestCase):
             "manual_required",
         )
         client.submit_pull_request_creation.assert_not_called()
+
+    def test_reconciles_ambiguous_pr_merge_without_resubmitting(self) -> None:
+        job = self.create(
+            {
+                "id": "123456789abc",
+                "status": "reconciling",
+                "request": "merge the pull request",
+                "created_at": 1,
+                "delivered": False,
+                "github_repository": "example/project",
+                "github_pr_merge_requested": True,
+                "github_pr_merge_confirmed": True,
+                "github_pr_merge_number": 7,
+                "github_pr_merge_url": "https://github.com/example/project/pull/7",
+                "github_pr_merge_marker": "a" * 32,
+                "github_pr_merge_operation_state": "ambiguous",
+            }
+        )
+        client = mock.Mock(spec=GitHubClient)
+        client.observe_pull_request_merge.return_value = GitHubPullRequestMergeResult(
+            GitHubPullRequest("example", "project", 7),
+            "https://github.com/example/project/pull/7",
+            "a" * 32,
+        )
+
+        reconcile_uncertain_pr_merge(
+            self.store,
+            job,
+            now=100,
+            github_factory=lambda: client,
+        )
+
+        updated = self.store.get(job.id)
+        self.assertEqual(updated.status, JobStatus.COMPLETED)
+        self.assertEqual(updated.github_pr_merge_operation_state, "merged")
+        self.assertIn("https://github.com/example/project/pull/7", updated.result or "")
+        client.submit_pull_request_merge.assert_not_called()
+
+    def test_unobserved_pr_merge_requires_manual_check(self) -> None:
+        job = self.create(
+            {
+                "id": "123456789abc",
+                "status": "queued",
+                "request": "merge the pull request",
+                "created_at": 1,
+                "queued_at": 1,
+                "delivered": False,
+                "github_repository": "example/project",
+                "github_pr_merge_requested": True,
+                "github_pr_merge_confirmed": True,
+                "github_pr_merge_number": 7,
+                "github_pr_merge_url": "https://github.com/example/project/pull/7",
+                "github_pr_merge_marker": "a" * 32,
+                "github_pr_merge_operation_state": "ambiguous",
+            }
+        )
+        client = mock.Mock(spec=GitHubClient)
+        client.observe_pull_request_merge.return_value = None
+
+        reconcile_uncertain_pr_merge(
+            self.store,
+            job,
+            now=100,
+            github_factory=lambda: client,
+        )
+
+        updated = self.store.get(job.id)
+        self.assertEqual(updated.status, JobStatus.BLOCKED)
+        self.assertEqual(
+            updated.github_pr_merge_operation_state,
+            "manual_required",
+        )
+        client.submit_pull_request_merge.assert_not_called()
 
     def test_reconciles_ambiguous_repo_creation_without_resubmitting(self) -> None:
         job = self.create(

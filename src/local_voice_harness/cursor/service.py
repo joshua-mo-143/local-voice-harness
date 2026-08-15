@@ -124,6 +124,8 @@ class StartJobRequest:
     github_issue_context: str | None = None
     github_issue_create_requested: bool = False
     github_pr_create_requested: bool = False
+    github_pr_merge_requested: bool = False
+    github_pr_merge_number: int | None = None
     github_repo_create_requested: bool = False
     github_repo_create_org_requested: bool = False
     linear_team: str | None = None
@@ -148,6 +150,8 @@ class CursorTurnRequest:
     github_issue_context: str | None = None
     github_issue_create_requested: bool = False
     github_pr_create_requested: bool = False
+    github_pr_merge_requested: bool = False
+    github_pr_merge_number: int | None = None
     github_repo_create_requested: bool = False
     github_repo_create_org_requested: bool = False
     linear_team: str | None = None
@@ -381,6 +385,7 @@ def _build_start_job(
         if (
             request.github_issue_create_requested
             or request.github_pr_create_requested
+            or request.github_pr_merge_requested
             or request.github_repo_create_requested
             or request.linear_ticket_create_requested
         )
@@ -402,6 +407,7 @@ def _build_start_job(
                 if (
                     request.github_issue is not None
                     or request.github_issue_create_requested
+                    or request.github_pr_merge_requested
                     or request.github_repo_create_requested
                 )
                 else None
@@ -461,6 +467,8 @@ def _build_start_job(
             github_issue_context=request.github_issue_context,
             github_issue_create_requested=request.github_issue_create_requested,
             github_pr_create_requested=request.github_pr_create_requested,
+            github_pr_merge_requested=request.github_pr_merge_requested,
+            github_pr_merge_number=request.github_pr_merge_number,
             github_repo_create_requested=request.github_repo_create_requested,
             github_repo_create_org_requested=request.github_repo_create_org_requested,
             linear_ticket_create_requested=request.linear_ticket_create_requested,
@@ -520,6 +528,8 @@ def start_job(
     github_issue_context: str | None = None,
     github_issue_create_requested: bool = False,
     github_pr_create_requested: bool = False,
+    github_pr_merge_requested: bool = False,
+    github_pr_merge_number: int | None = None,
     github_repo_create_requested: bool = False,
     github_repo_create_org_requested: bool = False,
     linear_team: str | None = None,
@@ -546,6 +556,8 @@ def start_job(
             github_issue_context=github_issue_context,
             github_issue_create_requested=github_issue_create_requested,
             github_pr_create_requested=github_pr_create_requested,
+            github_pr_merge_requested=github_pr_merge_requested,
+            github_pr_merge_number=github_pr_merge_number,
             github_repo_create_requested=github_repo_create_requested,
             github_repo_create_org_requested=github_repo_create_org_requested,
             linear_team=linear_team,
@@ -2650,6 +2662,8 @@ def cursor_turn(
     github_issue_context: str | None = None,
     github_issue_create_requested: bool = False,
     github_pr_create_requested: bool = False,
+    github_pr_merge_requested: bool = False,
+    github_pr_merge_number: int | None = None,
     github_repo_create_requested: bool = False,
     github_repo_create_org_requested: bool = False,
     linear_team: str | None = None,
@@ -2686,6 +2700,8 @@ def cursor_turn(
         github_issue_context = request.github_issue_context
         github_issue_create_requested = request.github_issue_create_requested
         github_pr_create_requested = request.github_pr_create_requested
+        github_pr_merge_requested = request.github_pr_merge_requested
+        github_pr_merge_number = request.github_pr_merge_number
         github_repo_create_requested = request.github_repo_create_requested
         github_repo_create_org_requested = request.github_repo_create_org_requested
         linear_team = request.linear_team
@@ -2869,6 +2885,8 @@ def cursor_turn(
                 github_issue_context=github_issue_context,
                 github_issue_create_requested=github_issue_create_requested,
                 github_pr_create_requested=github_pr_create_requested,
+                github_pr_merge_requested=github_pr_merge_requested,
+                github_pr_merge_number=github_pr_merge_number,
                 github_repo_create_requested=github_repo_create_requested,
                 github_repo_create_org_requested=github_repo_create_org_requested,
                 linear_team=linear_team,
@@ -2922,6 +2940,8 @@ def cursor_turn(
                 github_issue_context=github_issue_context,
                 github_issue_create_requested=github_issue_create_requested,
                 github_pr_create_requested=github_pr_create_requested,
+                github_pr_merge_requested=github_pr_merge_requested,
+                github_pr_merge_number=github_pr_merge_number,
                 github_repo_create_requested=github_repo_create_requested,
                 github_repo_create_org_requested=github_repo_create_org_requested,
                 linear_team=linear_team,
@@ -3001,6 +3021,19 @@ def render_job_announcement(job: CursorJob) -> AssistantResponse:
                 spoken_text=f"Created GitHub issue {job.github_issue}.",
                 display_text=detail,
             )
+        if (
+            job.github_pr_merge_requested
+            and job.github_pr_merge_operation_state == "merged"
+        ):
+            return AssistantResponse(
+                spoken_text=(
+                    f"Merged GitHub pull request {job.github_pr_merge_number}: "
+                    f"{job.github_pr_merge_url}."
+                    if job.github_pr_merge_number and job.github_pr_merge_url
+                    else "Merged the GitHub pull request."
+                ),
+                display_text=detail,
+            )
         if job.github_pr_create_requested and job.github_pr_created_url:
             return AssistantResponse(
                 spoken_text=(
@@ -3051,6 +3084,19 @@ def render_job_announcement(job: CursorJob) -> AssistantResponse:
                 spoken_text=(
                     f"I drafted “{job.github_issue_create_title}” for "
                     f"{job.github_repository}. Should I create it?"
+                ),
+                display_text=question,
+            )
+        if job.clarification_kind == "github_pr_merge_identity":
+            return AssistantResponse(
+                spoken_text=question,
+                display_text=question,
+            )
+        if job.clarification_kind == "github_pr_merge_confirmation":
+            return AssistantResponse(
+                spoken_text=(
+                    f"Merge pull request {job.github_pr_merge_number} in "
+                    f"{job.github_repository}?"
                 ),
                 display_text=question,
             )
@@ -3205,6 +3251,7 @@ def _foreground_delivery_result(
         if (
             completed.github_issue_create_requested
             or completed.github_pr_create_requested
+            or completed.github_pr_merge_requested
             or completed.github_repo_create_requested
             or completed.linear_ticket_create_requested
         ):
@@ -3244,6 +3291,25 @@ def _foreground_delivery_result(
                 ),
                 job_id,
                 mutated=True,
+            )
+        if awaiting.clarification_kind == "github_pr_merge_identity":
+            return CursorTurnResult(
+                AssistantResponse(
+                    spoken_text=rendered_question,
+                    display_text=rendered_question,
+                ),
+                job_id,
+            )
+        if awaiting.clarification_kind == "github_pr_merge_confirmation":
+            return CursorTurnResult(
+                AssistantResponse(
+                    spoken_text=(
+                        f"Merge pull request {awaiting.github_pr_merge_number} in "
+                        f"{awaiting.github_repository}?"
+                    ),
+                    display_text=rendered_question,
+                ),
+                job_id,
             )
         if awaiting.clarification_kind == "github_pr_create_confirmation":
             return CursorTurnResult(

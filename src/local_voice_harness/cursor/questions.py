@@ -304,6 +304,9 @@ def _queue_answer(
     github_issue_create_confirmed: bool | None = None,
     github_issue_create_requested: bool | None = None,
     github_pr_create_confirmed: bool | None = None,
+    github_pr_merge_confirmed: bool | None = None,
+    github_pr_merge_number: int | None = None,
+    github_pr_merge_url: str | None = None,
     github_repo_create_confirmed: bool | None = None,
     github_repo_create_continue_workflow: bool | None = None,
     github_repo_create_owner: str | None = None,
@@ -349,6 +352,21 @@ def _queue_answer(
             job.github_pr_create_confirmed
             if github_pr_create_confirmed is None
             else github_pr_create_confirmed
+        ),
+        github_pr_merge_confirmed=(
+            job.github_pr_merge_confirmed
+            if github_pr_merge_confirmed is None
+            else github_pr_merge_confirmed
+        ),
+        github_pr_merge_number=(
+            job.github_pr_merge_number
+            if github_pr_merge_number is None
+            else github_pr_merge_number
+        ),
+        github_pr_merge_url=(
+            job.github_pr_merge_url
+            if github_pr_merge_url is None
+            else github_pr_merge_url
         ),
         github_repo_create_confirmed=(
             job.github_repo_create_confirmed
@@ -935,6 +953,109 @@ def _github_pr_create_confirmation_answer(
     return AnswerTransition(completed)
 
 
+def _github_pr_merge_identity_answer(
+    job: CursorJob,
+    question: Question,
+    resolution: AnswerResolution,
+    context: AnswerContext,
+) -> AnswerTransition:
+    if context.trusted_text is None:
+        return AnswerTransition(
+            None,
+            message=(
+                "Please name the pull request directly. Say the repository and number."
+            ),
+        )
+    from ..integrations.github import (
+        resolve_pull_request_merge_identity,
+    )
+
+    identity = resolve_pull_request_merge_identity(
+        utterance=context.trusted_text,
+        focused_repository=job.github_repository,
+        focused_number=job.github_pr_merge_number,
+    )
+    if identity is None:
+        return AnswerTransition(
+            None,
+            message=(
+                "I still need one pull request. Please say the repository and number."
+            ),
+        )
+    return AnswerTransition(
+        _queue_answer(
+            job,
+            question,
+            resolution,
+            context,
+            continuation=False,
+            clear_target=True,
+            github_repository=identity.repository,
+            github_pr_merge_number=identity.number,
+            github_pr_merge_url=identity.url,
+        ),
+        launch=True,
+    )
+
+
+def _github_pr_merge_confirmation_answer(
+    job: CursorJob,
+    question: Question,
+    resolution: AnswerResolution,
+    context: AnswerContext,
+) -> AnswerTransition:
+    if context.trusted_text is None:
+        return AnswerTransition(
+            None,
+            message="Please confirm directly. Should I merge this pull request?",
+        )
+    confirmation = _confirmation(
+        context.trusted_text,
+        confirmations=_FORK_CONFIRMATIONS
+        | {"merge the pull request", "merge it", "merge this pull request"},
+        rejections=_FORK_REJECTIONS,
+    )
+    if confirmation is None:
+        return AnswerTransition(
+            None,
+            message="Please answer yes or no. Should I merge this pull request?",
+        )
+    if confirmation:
+        return AnswerTransition(
+            _queue_answer(
+                job,
+                question,
+                resolution,
+                context,
+                continuation=False,
+                clear_target=True,
+                github_pr_merge_confirmed=True,
+            ),
+            launch=True,
+        )
+    completed = job.evolve_for_delivery(
+        now=context.now,
+        status=JobStatus.COMPLETED,
+        question=None,
+        clarification_kind=None,
+        result="Okay, I did not merge that pull request.",
+        completed_at=context.now,
+        worker_pid=None,
+        worker_boot_id=None,
+        worker_process_start=None,
+        worker_token=None,
+        voice_question=envelope(
+            question,
+            QuestionState.RESOLVED,
+            job=job,
+            answer="no",
+            trusted_answer=context.trusted_text,
+            answered_at=context.now,
+        ),
+    )
+    return AnswerTransition(completed)
+
+
 def _github_repo_create_org_answer(
     job: CursorJob,
     question: Question,
@@ -1474,6 +1595,8 @@ _ANSWER_HANDLERS: dict[str, AnswerHandler] = {
     "github_issue_create_confirmation": _github_issue_create_confirmation_answer,
     "github_issue_file_as_one": _github_issue_file_as_one_answer,
     "github_pr_create_confirmation": _github_pr_create_confirmation_answer,
+    "github_pr_merge_identity": _github_pr_merge_identity_answer,
+    "github_pr_merge_confirmation": _github_pr_merge_confirmation_answer,
     "github_repo_create_org": _github_repo_create_org_answer,
     "github_repo_create_slug": _github_repo_create_slug_answer,
     "github_repo_create_confirmation": _github_repo_create_confirmation_answer,

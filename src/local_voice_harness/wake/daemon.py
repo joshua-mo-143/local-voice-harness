@@ -112,6 +112,11 @@ from ..diagnostics.health import self_health_response
 from ..diagnostics.help import harness_help_response
 from ..errors import HarnessError, NoSpeechError, SpeechDeliveryError
 from ..github_issue_creation import repository_from_utterance
+from ..integrations.github import (
+    GitHubPullRequest,
+    github_pull_request_from_url,
+    resolve_pull_request_merge_identity,
+)
 from ..integrations.registry import (
     IntegrationRegistry,
     build_integration_registry,
@@ -227,6 +232,7 @@ SIDE_EFFECTING_INTENTS = frozenset(
         Intent.ANNOUNCEMENT_DIGEST,
         Intent.GITHUB_ISSUE_CREATE,
         Intent.GITHUB_PR_CREATE,
+        Intent.GITHUB_PR_MERGE,
         Intent.GITHUB_REPO_CREATE,
         Intent.GITHUB_ORG_REPO_CREATE,
         Intent.LINEAR_TICKET_CREATE,
@@ -751,6 +757,7 @@ class WakeConversationDaemon:
         self.history: list[dict[str, str]] = []
         self.cursor_session: str | None = None
         self.completed_followup: CompletedFollowup | None = None
+        self.conversation_created_pull_request: GitHubPullRequest | None = None
         self.recent_playback: collections.deque[RecentPlayback] = collections.deque(
             maxlen=RECENT_PLAYBACK_LIMIT
         )
@@ -970,6 +977,7 @@ class WakeConversationDaemon:
         self.history.clear()
         self.cursor_session = None
         self.completed_followup = None
+        self.conversation_created_pull_request = None
         self.recent_playback.clear()
         self.pending_target_readback = None
         self.pending_target_resolution = None
@@ -1394,6 +1402,14 @@ class WakeConversationDaemon:
             ),
             display_fingerprint=display_fingerprint,
         )
+        created_url = job.github_pr_created_url
+        created = (
+            github_pull_request_from_url(created_url)
+            if isinstance(created_url, str)
+            else None
+        )
+        if created is not None and job.github_pr_created_number == created.number:
+            self.conversation_created_pull_request = created
         log(f"follow-up context retained for completed job {job_id}")
 
     def _active_completed_followup(self) -> CompletedFollowup | None:
@@ -2953,6 +2969,7 @@ class WakeConversationDaemon:
                             Intent.AGENT_SUBMIT,
                             Intent.GITHUB_ISSUE_CREATE,
                             Intent.GITHUB_PR_CREATE,
+                            Intent.GITHUB_PR_MERGE,
                             Intent.GITHUB_REPO_CREATE,
                             Intent.GITHUB_ORG_REPO_CREATE,
                             Intent.LINEAR_TICKET_CREATE,
@@ -3004,6 +3021,35 @@ class WakeConversationDaemon:
                 self.completed_followup = None
                 response, next_cursor_session = self._dispatch_cursor_turn(
                     confirmed_request,
+                    delivery_claims=delivery_claims,
+                    integrations=self.integrations,
+                )
+            elif route.actionable and route.intent == Intent.GITHUB_PR_MERGE:
+                created = self.conversation_created_pull_request
+                identity = resolve_pull_request_merge_identity(
+                    utterance=text,
+                    focused_repository=context.github_repository,
+                    focused_number=context.github_pull_request,
+                    conversation_repository=(
+                        created.name_with_owner if created is not None else None
+                    ),
+                    conversation_number=(
+                        created.number if created is not None else None
+                    ),
+                )
+                self.completed_followup = None
+                response, next_cursor_session = cursor_turn(
+                    CursorTurnRequest(
+                        context.text,
+                        utterance=text,
+                        github_repository=(
+                            identity.repository if identity is not None else None
+                        ),
+                        github_pr_merge_requested=True,
+                        github_pr_merge_number=(
+                            identity.number if identity is not None else None
+                        ),
+                    ),
                     delivery_claims=delivery_claims,
                     integrations=self.integrations,
                 )
@@ -3366,6 +3412,10 @@ class WakeConversationDaemon:
                         self.pending_target_resolution = None
             elif route.intent == Intent.AGENT_SUBMIT:
                 response = NON_ACTIONABLE_SUBMIT_RESPONSE
+            elif route.intent == Intent.GITHUB_PR_MERGE:
+                response = (
+                    "I did not merge a pull request because the request was unclear."
+                )
             elif route.intent == Intent.GITHUB_ISSUE_CREATE:
                 response = (
                     "I did not create an issue because the request was unclear. "
