@@ -19,6 +19,7 @@ from local_voice_harness.integrations.github import (
     GitHubMergeQueueArmedError,
     GitHubOperationAmbiguous,
     GitHubPreconditionError,
+    GitHubProvider,
     GitHubPullRequest,
     GitHubPullRequestCreationPlan,
     GitHubPullRequestCreationResult,
@@ -274,8 +275,38 @@ class GitHubClientTests(unittest.TestCase):
             run.call_args.args[0][:6],
             ["gh", "issue", "view", "42", "--repo", "example/project"],
         )
+        self.assertIn("updatedAt", run.call_args.args[0][-1])
         self.assertEqual(issue.reference, "example/project#42")
         self.assertEqual(issue.url, "https://github.com/example/project/issues/42")
+
+    def test_ticket_snapshot_rejects_mismatched_focused_context(self) -> None:
+        client = GitHubClient()
+        provider = GitHubProvider(client)
+        details = {
+            "number": 12,
+            "title": "Expected title",
+            "body": "Expected body",
+            "updatedAt": "2026-08-15T10:00:00Z",
+            "state": "OPEN",
+            "url": "https://github.com/owner/repo/issues/12",
+        }
+        with mock.patch.object(client, "issue_details", return_value=details):
+            snapshot = provider.ticket_snapshot("owner/repo#12")
+
+        self.assertEqual(snapshot.identity, "owner/repo#12")
+        self.assertEqual(snapshot.body, "Expected body")
+        with (
+            mock.patch.object(
+                client,
+                "issue_details",
+                return_value={
+                    **details,
+                    "url": "https://github.com/unrelated/repo/issues/99",
+                },
+            ),
+            self.assertRaisesRegex(GitHubError, "invalid ticket snapshot"),
+        ):
+            provider.ticket_snapshot("owner/repo#12")
 
     def test_issue_submission_uses_stdin_and_validates_canonical_result(self) -> None:
         client = GitHubClient()

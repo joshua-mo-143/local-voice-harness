@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import fcntl
+import json
 import re
 import shutil
 import subprocess
@@ -19,6 +20,12 @@ from urllib.parse import SplitResult, urlsplit
 from ..config import DURABLE_STATE_DIR
 from ..context_fragment import ContextFragment
 from ..errors import HarnessError
+from ..ticket_snapshot import (
+    MAX_SNAPSHOT_BODY_CHARS,
+    MAX_SNAPSHOT_REVISION_CHARS,
+    MAX_SNAPSHOT_TITLE_CHARS,
+    TicketSnapshot,
+)
 from .herdr import HerdrError, agent_session_identity, extract_marker
 from .herdr.cursor_auth import CursorMcpAuthError, CursorMcpAuthLinker
 
@@ -398,6 +405,89 @@ class LinearIntegration:
 
     def canonicalize_issue_reference(self, reference: str) -> str:
         return reference.strip().upper()
+
+    def ticket_snapshot(
+        self,
+        client: CreationClient,
+        reference: str,
+        *,
+        checkpoint: Any = None,
+    ) -> TicketSnapshot:
+        """Fetch and identity-check the current Linear issue fields."""
+
+        identifier = self.canonicalize_issue_reference(reference)
+        if not self.owns_issue_reference(identifier):
+            raise LinearError("Linear ticket snapshot requires an exact issue identity")
+        self.require_capabilities()
+        token = f"linear-snapshot-{uuid.uuid4().hex[:12]}"
+        with _router_owner(checkpoint):
+            try:
+                router = client.ensure_router(set(), checkpoint=checkpoint)
+                outcome = client.prompt_and_wait(
+                    router.target,
+                    (
+                        "Use configured Linear MCP tools read-only. Fetch exactly one "
+                        f"issue whose identifier is {identifier}. Do not create or "
+                        "modify anything. If and only if the returned issue identifier "
+                        "matches exactly, return one compact single-line JSON object "
+                        "with keys identifier, id, title, description, url, updatedAt, "
+                        f"and state after this marker:\nVOICE_LINEAR_SNAPSHOT[{token}]: "
+                        "<json>\nIf the issue is absent, ambiguous, incomplete, or has "
+                        "a different identifier, return no snapshot marker."
+                    ),
+                    token=token,
+                    timeout=180,
+                    checkpoint=checkpoint,
+                )
+            except HerdrError as exc:
+                raise LinearError(
+                    f"I couldn't fetch Linear ticket {identifier}."
+                ) from exc
+        payload = extract_marker(outcome.output, "VOICE_LINEAR_SNAPSHOT", token)
+        try:
+            value = json.loads(payload or "")
+        except json.JSONDecodeError as exc:
+            raise LinearError("Linear MCP returned an invalid ticket snapshot") from exc
+        if not isinstance(value, dict):
+            raise LinearError("Linear MCP returned an invalid ticket snapshot")
+        returned = value.get("identifier")
+        issue_id = value.get("id")
+        title = value.get("title")
+        body = value.get("description")
+        url = value.get("url")
+        revision = value.get("updatedAt")
+        state = value.get("state")
+        issue = linear_issue_from_url(url) if isinstance(url, str) else None
+        if (
+            not isinstance(returned, str)
+            or self.canonicalize_issue_reference(returned) != identifier
+            or issue is None
+            or issue.identifier != identifier
+            or not isinstance(issue_id, str)
+            or not issue_id.strip()
+            or len(issue_id.strip()) > 128
+            or re.search(r"[\s\x00-\x1f]", issue_id) is not None
+            or not isinstance(title, str)
+            or not title.strip()
+            or not isinstance(body, str)
+            or not isinstance(revision, str)
+            or not revision.strip()
+            or not isinstance(state, str)
+            or len(title.strip()) > MAX_SNAPSHOT_TITLE_CHARS
+            or len(body) > MAX_SNAPSHOT_BODY_CHARS
+            or len(revision.strip()) > MAX_SNAPSHOT_REVISION_CHARS
+        ):
+            raise LinearError("Linear MCP returned an invalid ticket snapshot")
+        return TicketSnapshot(
+            provider=self.name,
+            identity=identifier,
+            provider_id=issue_id.strip(),
+            title=title.strip(),
+            body=body.strip(),
+            revision=revision.strip(),
+            url=url.strip(),
+            state=state.strip(),
+        )
 
     @staticmethod
     def validate_team(team: str) -> str:

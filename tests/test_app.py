@@ -17,6 +17,7 @@ from local_voice_harness.errors import SpeechDeliveryError
 from local_voice_harness.intent import Intent, IntentRoute
 from local_voice_harness.questions import AnswerProvenance
 from local_voice_harness.responses import AssistantResponse
+from local_voice_harness.ticket_snapshot import TicketSnapshot
 from local_voice_harness.user_config import default_user_config
 
 
@@ -176,6 +177,16 @@ class ForegroundDeliveryTests(unittest.TestCase):
             spoken_text="Scope is too broad.",
             display_text="Acceptance criteria mix two children.",
         )
+        snapshot = TicketSnapshot(
+            "github",
+            "owner/repo#12",
+            "https://github.com/owner/repo/issues/12",
+            "Bound the scope",
+            "fetched body",
+            "2026-08-15T10:00:00Z",
+            "https://github.com/owner/repo/issues/12",
+            "OPEN",
+        )
         with (
             mock.patch.object(app, "start_components"),
             mock.patch.object(app, "build_integration_registry", return_value=registry),
@@ -193,6 +204,7 @@ class ForegroundDeliveryTests(unittest.TestCase):
             mock.patch.object(
                 app.cursor_consultation, "workspace_target", return_value=target
             ),
+            mock.patch.object(app, "ticket_snapshot", return_value=snapshot) as fetch,
             mock.patch.object(
                 app.cursor_consultation, "consult_ticket", return_value=findings
             ) as consult,
@@ -206,9 +218,14 @@ class ForegroundDeliveryTests(unittest.TestCase):
             client,
             target,
             "review this ticket",
-            ticket="owner/repo#12",
+            snapshot=snapshot,
             kind="review",
-            ticket_context="untrusted body",
+        )
+        fetch.assert_called_once_with(
+            "owner/repo#12",
+            registry,
+            provider="github",
+            client=client,
         )
         cursor.assert_not_called()
         qwen.assert_not_called()

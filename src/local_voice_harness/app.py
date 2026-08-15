@@ -34,7 +34,11 @@ from .diagnostics.help import harness_help_response
 from .errors import HarnessError, SpeechDeliveryError
 from .github_issue_creation import repository_from_utterance
 from .integrations.github import resolve_pull_request_merge_identity
-from .integrations.registry import IntegrationRegistry, build_integration_registry
+from .integrations.registry import (
+    IntegrationRegistry,
+    build_integration_registry,
+    ticket_snapshot,
+)
 from .intent import (
     NON_ACTIONABLE_SUBMIT_RESPONSE,
     ForkIntent,
@@ -309,13 +313,19 @@ def respond(text: str, *, user_config: UserConfig | None = None) -> None:
                         else:
                             _acknowledge_consultation(speech_renderer, settings)
                             assert ticket_admission.ticket.canonical is not None
+                            assert ticket_admission.ticket.source is not None
+                            snapshot = ticket_snapshot(
+                                ticket_admission.ticket.canonical,
+                                integrations,
+                                provider=ticket_admission.ticket.source,
+                                client=client,
+                            )
                             response = cursor_consultation.consult_ticket(
                                 client,
                                 target,
                                 text,
-                                ticket=ticket_admission.ticket.canonical,
+                                snapshot=snapshot,
                                 kind=ticket_admission.kind,
-                                ticket_context=context.github_issue_context,
                             )
                     except Exception:  # noqa: BLE001 - consultation fails closed
                         response = cursor_consultation.CONSULTATION_FAILED

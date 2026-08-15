@@ -12,6 +12,7 @@ from ..agents.harness import HarnessCapability, UnsupportedCapabilityError
 from ..agents.model import HarnessKind
 from ..context_fragment import ContextFragment, ContextProvider
 from ..errors import HarnessError
+from ..ticket_snapshot import TicketSnapshot
 from ..user_config import (
     IntegrationSettings,
     PlatformSettings,
@@ -272,6 +273,40 @@ def resolve_issue_reference(
     return (
         str(canonicalize(reference)) if canonicalize is not None else reference.strip()
     )
+
+
+def ticket_snapshot(
+    reference: str,
+    integrations: RegistryInput = None,
+    *,
+    provider: str,
+    client: object | None = None,
+) -> TicketSnapshot:
+    """Fetch one provider-owned snapshot after exact identity resolution."""
+
+    integration = _integration_for_issue(
+        reference,
+        integrations,
+        provider=provider,
+    )
+    if integration is None:
+        raise HarnessError("selected ticket provider is unavailable")
+    snapshot = getattr(integration, "ticket_snapshot", None)
+    if snapshot is None:
+        raise HarnessError("selected ticket provider cannot fetch ticket snapshots")
+    result = (
+        snapshot(reference)
+        if provider.strip().casefold() == "github"
+        else snapshot(client, reference)
+    )
+    if not isinstance(result, TicketSnapshot):
+        raise HarnessError("selected ticket provider returned an invalid snapshot")
+    if (
+        result.provider.casefold() != provider.strip().casefold()
+        or result.identity.casefold() != reference.strip().casefold()
+    ):
+        raise HarnessError("ticket snapshot identity changed during resolution")
+    return result
 
 
 def require_issue_capabilities(

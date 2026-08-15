@@ -121,6 +121,7 @@ from ..integrations.registry import (
     IntegrationRegistry,
     build_integration_registry,
     capture_context,
+    ticket_snapshot,
 )
 from ..intent import (
     NON_ACTIONABLE_SUBMIT_RESPONSE,
@@ -3084,13 +3085,19 @@ class WakeConversationDaemon:
                             if interruption is not None:
                                 return interruption
                             assert ticket_admission.ticket.canonical is not None
+                            assert ticket_admission.ticket.source is not None
+                            snapshot = ticket_snapshot(
+                                ticket_admission.ticket.canonical,
+                                self.integrations,
+                                provider=ticket_admission.ticket.source,
+                                client=client,
+                            )
                             response = cursor_consultation.consult_ticket(
                                 client,
                                 target,
                                 text,
-                                ticket=ticket_admission.ticket.canonical,
+                                snapshot=snapshot,
                                 kind=ticket_admission.kind,
-                                ticket_context=context.github_issue_context,
                             )
                         ordinary_reply = True
                     except Exception:  # noqa: BLE001 - consultation fails closed

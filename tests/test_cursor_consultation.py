@@ -20,6 +20,7 @@ from local_voice_harness.questions import (
     QuestionSensitivity,
 )
 from local_voice_harness.responses import AssistantResponse
+from local_voice_harness.ticket_snapshot import TicketSnapshot
 from local_voice_harness.ticket_targets import extract_ticket_targets
 
 
@@ -780,9 +781,17 @@ def test_consult_ticket_uses_ask_mode_and_splits_spoken_from_display() -> None:
         client,
         target,
         "review this ticket",
-        ticket="owner/repo#12",
+        snapshot=TicketSnapshot(
+            "github",
+            "owner/repo#12",
+            "https://github.com/owner/repo/issues/12",
+            "Bound the scope",
+            "untrusted ticket body",
+            "2026-08-15T10:00:00Z",
+            "https://github.com/owner/repo/issues/12",
+            "OPEN",
+        ),
         kind="review",
-        ticket_context="untrusted ticket body",
     )
 
     assert response == AssistantResponse(

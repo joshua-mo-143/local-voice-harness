@@ -50,6 +50,7 @@ from local_voice_harness.self_management import (
     SettingKey,
 )
 from local_voice_harness.speech import SpeechRenderer
+from local_voice_harness.ticket_snapshot import TicketSnapshot
 from local_voice_harness.tts.queue import PlaybackQueue, PlaybackRequest
 from local_voice_harness.user_config import default_user_config, load_user_config
 from local_voice_harness.vocabulary import (
@@ -2590,6 +2591,16 @@ class ProcessUtteranceTests(unittest.TestCase):
             spoken_text="Scope is too broad.",
             display_text="Acceptance criteria mix two children.",
         )
+        snapshot = TicketSnapshot(
+            "github",
+            "owner/repo#12",
+            "https://github.com/owner/repo/issues/12",
+            "Bound the scope",
+            "fetched body",
+            "2026-08-15T10:00:00Z",
+            "https://github.com/owner/repo/issues/12",
+            "OPEN",
+        )
         played: list[str] = []
 
         def play(response: AssistantResponse) -> tuple[dict[str, object], None]:
@@ -2623,6 +2634,9 @@ class ProcessUtteranceTests(unittest.TestCase):
                 return_value=target,
             ),
             mock.patch.object(
+                wake_daemon, "ticket_snapshot", return_value=snapshot
+            ) as fetch,
+            mock.patch.object(
                 wake_daemon.cursor_consultation,
                 "consult_ticket",
                 return_value=findings,
@@ -2638,9 +2652,14 @@ class ProcessUtteranceTests(unittest.TestCase):
             client,
             target,
             "review this ticket",
-            ticket="owner/repo#12",
+            snapshot=snapshot,
             kind="review",
-            ticket_context="untrusted body",
+        )
+        fetch.assert_called_once_with(
+            "owner/repo#12",
+            daemon.integrations,
+            provider="github",
+            client=client,
         )
         cursor_turn.assert_not_called()
         qwen_turn.assert_not_called()

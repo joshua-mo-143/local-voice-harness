@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import multiprocessing
 import subprocess
 import tempfile
@@ -479,6 +480,44 @@ class LinearTicketCreationTests(unittest.TestCase):
             "The launcher fails after reboot.",
             correlation_marker="a" * 32,
         )
+
+    def test_ticket_snapshot_fetches_identity_checked_content(self) -> None:
+        client = mock.Mock()
+        client.ensure_router.return_value = mock.Mock(target="router")
+
+        def prompt(
+            _target: str,
+            _text: str,
+            *,
+            token: str,
+            **_kwargs: object,
+        ) -> mock.Mock:
+            payload = {
+                "identifier": "API-42",
+                "id": "linear-issue-id",
+                "title": "Expected title",
+                "description": "Expected body",
+                "url": "https://linear.app/acme/issue/API-42/expected-title",
+                "updatedAt": "2026-08-15T10:00:00Z",
+                "state": "In Progress",
+            }
+            return mock.Mock(
+                output=f"VOICE_LINEAR_SNAPSHOT[{token}]: {json.dumps(payload)}"
+            )
+
+        client.prompt_and_wait.side_effect = prompt
+        with (
+            tempfile.TemporaryDirectory() as temporary,
+            mock.patch.object(
+                linear, "LINEAR_ROUTER_LOCK", Path(temporary) / "router.lock"
+            ),
+            mock.patch.object(self.integration, "require_capabilities"),
+        ):
+            snapshot = self.integration.ticket_snapshot(client, "api-42")
+
+        self.assertEqual(snapshot.identity, "API-42")
+        self.assertEqual(snapshot.body, "Expected body")
+        self.assertIn("read-only", client.prompt_and_wait.call_args.args[1])
 
     def test_submit_requires_confirmation_and_returns_validated_identity(self) -> None:
         client = mock.Mock()

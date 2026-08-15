@@ -22,6 +22,12 @@ from ..local_git import (
     remote_identity,
 )
 from ..process import run_command
+from ..ticket_snapshot import (
+    MAX_SNAPSHOT_BODY_CHARS,
+    MAX_SNAPSHOT_REVISION_CHARS,
+    MAX_SNAPSHOT_TITLE_CHARS,
+    TicketSnapshot,
+)
 
 REPOSITORY = re.compile(
     r"^(?P<owner>[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?)/"
@@ -1407,7 +1413,7 @@ class GitHubClient:
                     "--repo",
                     repository,
                     "--json",
-                    "number,title,state,author,labels,body,comments,url",
+                    "number,title,state,author,labels,body,comments,url,updatedAt",
                 ],
                 timeout=15,
                 check=False,
@@ -2423,6 +2429,49 @@ class GitHubProvider:
         """Validate and resolve current forge metadata for an issue."""
 
         return self._client.issue_details(issue)
+
+    def ticket_snapshot(self, reference: str) -> TicketSnapshot:
+        """Fetch and identity-check the current GitHub issue fields."""
+
+        match = ISSUE_REFERENCE.fullmatch(reference.strip())
+        if match is None:
+            raise GitHubError("GitHub ticket snapshot requires an exact issue identity")
+        repository = GitHubClient.validate_repository(
+            f"{match.group('owner')}/{match.group('repo')}"
+        )
+        owner, name = repository.split("/", 1)
+        issue = GitHubIssue(owner, name, int(match.group("number")))
+        details = self.resolve_issue(issue)
+        number = details.get("number")
+        url = str(details.get("url") or "").strip()
+        title = details.get("title")
+        body = details.get("body")
+        revision = details.get("updatedAt")
+        state = details.get("state")
+        if (
+            number != issue.number
+            or url != issue.url
+            or not isinstance(title, str)
+            or not title.strip()
+            or not isinstance(body, str)
+            or not isinstance(revision, str)
+            or not revision.strip()
+            or not isinstance(state, str)
+            or len(title.strip()) > MAX_SNAPSHOT_TITLE_CHARS
+            or len(body) > MAX_SNAPSHOT_BODY_CHARS
+            or len(revision.strip()) > MAX_SNAPSHOT_REVISION_CHARS
+        ):
+            raise GitHubError("GitHub returned an invalid ticket snapshot")
+        return TicketSnapshot(
+            provider=self.name,
+            identity=issue.reference,
+            provider_id=url,
+            title=title.strip(),
+            body=body.strip(),
+            revision=revision.strip(),
+            url=url,
+            state=state.strip(),
+        )
 
     def plan_issue_creation(
         self,
