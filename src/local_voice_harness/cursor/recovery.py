@@ -1825,7 +1825,8 @@ def relinquish_session_control(
             changes["manual_reconcile_token"] = uuid.uuid4().hex
             changes["manual_reconcile_required_at"] = relinquished_at
         if (
-            job.agent_dispatch_state == "dispatching"
+            job.agent_dispatch_state
+            in {"dispatching", "ambiguous", "failed_observing"}
             and job.manual_reconcile_operation is None
             and "manual_reconcile_operation" not in changes
         ):

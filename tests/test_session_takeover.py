@@ -14,6 +14,7 @@ from local_voice_harness.cursor.model import CursorJob, JobStatus
 from local_voice_harness.cursor.recovery import (
     recover_jobs,
     relinquish_session_control,
+    resolve_manual_reconciliation,
     resume_session_control,
 )
 from local_voice_harness.cursor.store import JobStore
@@ -169,6 +170,33 @@ class SessionTakeoverTests(unittest.TestCase):
             ),
             AmbiguousPrompt(identity),
         )
+
+    def test_uncertain_agent_states_require_reconciliation_after_takeover(
+        self,
+    ) -> None:
+        for state in ("dispatching", "ambiguous", "failed_observing"):
+            with self.subTest(state=state):
+                self.store = JobStore(
+                    self.root / state / "jobs",
+                    self.root / state / "legacy",
+                )
+                job = self.create(agent_dispatch_state=state)
+
+                updated = relinquish_session_control(self.store, job.id, now=10)
+
+                self.assertEqual(updated.agent_dispatch_state, "manual_required")
+                self.assertEqual(updated.manual_reconcile_operation, "agent")
+                self.assertIsNotNone(updated.manual_reconcile_token)
+                resolved = resolve_manual_reconciliation(
+                    self.store,
+                    job.id,
+                    "agent",
+                    updated.manual_reconcile_token or "",
+                    "materialized",
+                    now=11,
+                )
+                self.assertEqual(resolved.agent_dispatch_state, "retained")
+                self.assertIsNone(resolved.manual_reconcile_operation)
 
     def test_session_replacement_blocks_hand_back(self) -> None:
         job = self.create()
