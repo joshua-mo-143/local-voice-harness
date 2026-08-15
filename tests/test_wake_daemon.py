@@ -7822,9 +7822,7 @@ class LastTranscriptReplayTests(unittest.TestCase):
             side_effect=HarnessError("store unavailable"),
         ):
             with self.assertRaisesRegex(HarnessError, "store unavailable"):
-                daemon._dispatch_cursor_turn(
-                    CursorTurnRequest("fix the failing tests")
-                )
+                daemon._dispatch_cursor_turn(CursorTurnRequest("fix the failing tests"))
 
         assert daemon.last_transcript is not None
         self.assertFalse(daemon.last_transcript.dispatched)
