@@ -18,6 +18,7 @@ from local_voice_harness.cursor.delivery import (
 )
 from local_voice_harness.cursor.model import CursorJob
 from local_voice_harness.cursor.store import JobStore
+from tests.support import join_threads
 
 
 class CursorDeliveryTests(unittest.TestCase):
@@ -64,8 +65,7 @@ class CursorDeliveryTests(unittest.TestCase):
         threads = [threading.Thread(target=claim) for _ in range(2)]
         for thread in threads:
             thread.start()
-        for thread in threads:
-            thread.join()
+        join_threads(threads)
 
         winner = next(item for item in claims if item is not None)
         self.assertEqual(sum(item is not None for item in claims), 1)

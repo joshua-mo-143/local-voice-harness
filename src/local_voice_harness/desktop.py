@@ -7,6 +7,8 @@ import subprocess
 from dataclasses import dataclass
 from typing import Protocol
 
+from .platform_services import user_services
+
 
 class DesktopError(RuntimeError):
     pass
@@ -28,6 +30,20 @@ class Window:
     token: str
     window_class: str
     pid: int | None
+
+
+@dataclass(frozen=True)
+class DesktopCapabilities:
+    """Detected desktop features; missing APIs are reported, not required."""
+
+    name: str
+    session: str
+    active_window: bool
+    clipboard: bool
+    type_text: bool
+    send_key: bool
+    overlay: bool
+    detail: str
 
 
 def _run(
@@ -75,13 +91,9 @@ def _refresh_desktop_environment() -> None:
     """Recover graphical-session variables imported after this service started."""
     if os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"):
         return
-    process = _run(["systemctl", "--user", "show-environment"])
-    if process is None or process.returncode:
-        return
     allowed = set(DESKTOP_ENVIRONMENT)
-    for line in process.stdout.splitlines():
-        name, separator, value = line.partition("=")
-        if separator and name in allowed and value:
+    for name, value in user_services().user_environment().items():
+        if name in allowed and value:
             os.environ.setdefault(name, value)
 
 
@@ -97,6 +109,8 @@ class Desktop(Protocol):
     def send_key(self, key: str, *, window: Window | None = None) -> bool: ...
 
     def type_text(self, text: str, *, window: Window | None = None) -> None: ...
+
+    def capabilities(self) -> DesktopCapabilities: ...
 
 
 class X11Desktop:
@@ -171,6 +185,32 @@ class X11Desktop:
                 "could not insert recognized text into the active window"
             )
 
+    def capabilities(self) -> DesktopCapabilities:
+        clipboard = self.has_clipboard()
+        input_ready = shutil.which("xdotool") is not None
+        missing: list[str] = []
+        if not input_ready:
+            missing.append("xdotool")
+        if not clipboard:
+            missing.append("xclip")
+        if missing:
+            detail = (
+                "X11 focused-window automation is incomplete; missing "
+                + ", ".join(missing)
+            )
+        else:
+            detail = "X11 focused-window automation is available"
+        return DesktopCapabilities(
+            name="x11",
+            session="x11",
+            active_window=input_ready,
+            clipboard=clipboard,
+            type_text=input_ready,
+            send_key=input_ready,
+            overlay=True,
+            detail=detail,
+        )
+
 
 class WaylandDesktop:
     def active_window(self) -> Window | None:
@@ -224,6 +264,41 @@ class WaylandDesktop:
                 "could not insert recognized text into the active window"
             )
 
+    def _wayland_tool_capabilities(
+        self,
+        *,
+        name: str,
+        active_window: bool,
+        overlay: bool,
+        window_tool: str,
+    ) -> DesktopCapabilities:
+        clipboard = self.has_clipboard()
+        input_ready = shutil.which("wtype") is not None
+        missing: list[str] = []
+        if not active_window:
+            missing.append(window_tool)
+        if not clipboard:
+            missing.append("wl-clipboard")
+        if not input_ready:
+            missing.append("wtype")
+        if missing:
+            detail = (
+                f"{name} focused-window automation is incomplete; missing "
+                + ", ".join(missing)
+            )
+        else:
+            detail = f"{name} focused-window automation is available"
+        return DesktopCapabilities(
+            name=name,
+            session="wayland",
+            active_window=active_window,
+            clipboard=clipboard,
+            type_text=input_ready and active_window,
+            send_key=input_ready and active_window,
+            overlay=overlay,
+            detail=detail,
+        )
+
 
 class HyprlandDesktop(WaylandDesktop):
     def active_window(self) -> Window | None:
@@ -247,6 +322,14 @@ class HyprlandDesktop(WaylandDesktop):
                 value.get("class") or value.get("initialClass") or ""
             ).casefold(),
             pid=_integer(value.get("pid")),
+        )
+
+    def capabilities(self) -> DesktopCapabilities:
+        return self._wayland_tool_capabilities(
+            name="hyprland",
+            active_window=shutil.which("hyprctl") is not None,
+            overlay=True,
+            window_tool="hyprctl",
         )
 
 
@@ -292,6 +375,58 @@ class SwayDesktop(WaylandDesktop):
             pid=_integer(node.get("pid")),
         )
 
+    def capabilities(self) -> DesktopCapabilities:
+        return self._wayland_tool_capabilities(
+            name="sway",
+            active_window=shutil.which("swaymsg") is not None,
+            overlay=True,
+            window_tool="swaymsg",
+        )
+
+
+def _desktop_tokens(value: str) -> set[str]:
+    return {token for token in value.replace(":", ";").split(";") if token}
+
+
+def _desktop_matches(desktop_name: str, *needles: str) -> bool:
+    tokens = _desktop_tokens(desktop_name)
+    return any(needle in token for token in tokens for needle in needles)
+
+
+class DegradedWaylandDesktop(WaylandDesktop):
+    """Clipboard-only Wayland desktop when compositor APIs are unavailable."""
+
+    def __init__(self, name: str, detail: str) -> None:
+        self._name = name
+        self._detail = detail
+
+    def active_window(self) -> Window | None:
+        return None
+
+    def send_key(self, key: str, *, window: Window | None = None) -> bool:
+        raise DesktopError(self._detail)
+
+    def type_text(self, text: str, *, window: Window | None = None) -> None:
+        raise DesktopError(self._detail)
+
+    def capabilities(self) -> DesktopCapabilities:
+        clipboard = self.has_clipboard()
+        detail = self._detail
+        if clipboard:
+            detail = f"{detail}; clipboard access is available"
+        else:
+            detail = f"{detail}; install wl-clipboard for clipboard access"
+        return DesktopCapabilities(
+            name=self._name,
+            session="wayland",
+            active_window=False,
+            clipboard=clipboard,
+            type_text=False,
+            send_key=False,
+            overlay=False,
+            detail=detail,
+        )
+
 
 def get_desktop() -> Desktop | None:
     _refresh_desktop_environment()
@@ -304,4 +439,20 @@ def get_desktop() -> Desktop | None:
         return HyprlandDesktop()
     if os.environ.get("SWAYSOCK") or desktop_name == "sway":
         return SwayDesktop()
-    return None
+    if _desktop_matches(desktop_name, "gnome"):
+        return DegradedWaylandDesktop(
+            "gnome",
+            "GNOME Wayland does not expose a supported focused-window or "
+            "keyboard-injection API; dictation insertion degrades to stdout",
+        )
+    if _desktop_matches(desktop_name, "kde", "plasma"):
+        return DegradedWaylandDesktop(
+            "kde",
+            "KDE Plasma Wayland does not expose a supported focused-window or "
+            "keyboard-injection API; dictation insertion degrades to stdout",
+        )
+    return DegradedWaylandDesktop(
+        desktop_name or "wayland",
+        "this Wayland compositor has no supported focused-window automation; "
+        "dictation insertion degrades to stdout",
+    )

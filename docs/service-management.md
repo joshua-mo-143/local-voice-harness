@@ -1,5 +1,11 @@
 # Service management
 
+The Python CLI is the user-facing service manager. Core orchestration talks to
+platform interfaces for user-service supervision, credential storage, and
+notifications. On Linux those interfaces are implemented by systemd user units,
+the desktop Secret Service (`secret-tool`), and `notify-send`. Systemd hardening
+and unit-audit logic stay inside that systemd implementation.
+
 The Python CLI is the user-facing service manager; systemd remains responsible for
 process supervision, dependencies, restarts, and journal logs:
 

@@ -48,13 +48,14 @@ expects an NVIDIA GPU. The tested all-local machine has an RTX 5070 Ti Laptop GP
 with 12 GB VRAM and 32 GB system RAM.
 
 CPU dictation and hosted LLM/TTS configurations are available through the
-[manual installation guide](docs/installation.md), but the one-shot installer is
-not yet a GPU-free installation path. See the guide for
+[manual installation guide](docs/installation.md). The showcase installer
+profile is a GPU-free Venice LLM/TTS plus CPU dictation path. See the guide for
 [compute requirements](docs/installation.md#compute-requirements) and
 [external prerequisites](docs/installation.md#external-prerequisites).
 
-The supplied systemd units assume the repository is cloned to
-`$HOME/local-voice-harness`.
+The installer supports Arch, Ubuntu/Debian, and Fedora. Shipped systemd units
+resolve through `$HOME/local-voice-harness`; the installer links that path to
+the discovered checkout when needed.
 
 ## Quick start
 
@@ -73,10 +74,17 @@ should use `local` or `venice`; the choices can also be supplied non-interactive
 
 ```bash
 LLM_PROVIDER=venice TTS_PROVIDER=venice ./scripts/install.sh
+PROFILE=showcase ./scripts/install.sh
+./scripts/install.sh --profile showcase
 ```
 
-After installation, select the PipeWire microphone and, when using the local LLM,
-the llama.cpp CUDA device:
+`PROFILE=showcase` selects Venice LLM/TTS and CPU dictation, installs no CUDA or
+NVIDIA packages, and omits local LLM/TTS extras, models, and the local LLM
+service. The existing local CUDA path remains the default when a local provider
+is selected.
+
+After installation, override PipeWire's system-selected microphone only when
+needed. When using the local LLM, also confirm the llama.cpp CUDA device:
 
 ```bash
 wpctl status

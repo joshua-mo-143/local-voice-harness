@@ -45,6 +45,9 @@ packages = ["src/local_voice_harness"]
 
 [tool.uv]
 override-dependencies = [
+  # OpenWakeWord declares TFLite on Linux, but production selects its ONNX backend.
+  # TFLite 2.14 has no CPython 3.12 wheel, so retain it only where installable.
+  "tflite-runtime==2.14.0; python_version < '3.12'",
   "torch==2.10.0",
   "torchaudio==2.10.0",
 ]
@@ -92,12 +95,13 @@ reportMissingTypeStubs = false
 [tool.pytest.ini_options]
 minversion = "8.0"
 testpaths = ["tests"]
+faulthandler_timeout = 120
 addopts = [
   "--strict-config",
   "--strict-markers",
   "--cov=local_voice_harness",
   "--cov-branch",
-  "--cov-fail-under=40",
+  "--cov-fail-under=75",
   "--cov-report=term-missing:skip-covered",
 ]
 
@@ -110,8 +114,13 @@ show_missing = true
 skip_covered = true
 
 [tool.voice-harness.coverage.module-minimums]
+"src/local_voice_harness/config_activation.py" = 70
 "src/local_voice_harness/cursor/provisioning.py" = 70
+"src/local_voice_harness/cursor/recovery.py" = 70
 "src/local_voice_harness/cursor/service.py" = 70
+"src/local_voice_harness/cursor/sqlite_store.py" = 70
+"src/local_voice_harness/cursor/store.py" = 65
+"src/local_voice_harness/cursor/worker_lifecycle.py" = 60
 "src/local_voice_harness/integrations/github.py" = 65
 "src/local_voice_harness/integrations/herdr/client.py" = 50
 "src/local_voice_harness/integrations/herdr/repository.py" = 45
@@ -122,4 +131,6 @@ skip_covered = true
 "src/local_voice_harness/llm.py" = 85
 "src/local_voice_harness/service_manager.py" = 35
 "src/local_voice_harness/tts/client.py" = 75
+"src/local_voice_harness/tts/queue.py" = 70
+"src/local_voice_harness/user_config.py" = 80
 "src/local_voice_harness/wake/daemon.py" = 60

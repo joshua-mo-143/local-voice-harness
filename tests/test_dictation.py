@@ -429,6 +429,22 @@ class DictationTests(unittest.TestCase):
         ):
             dictation.inject("hello")
 
+    def test_gnome_wayland_reports_capability_degradation(self) -> None:
+        from local_voice_harness.desktop import DegradedWaylandDesktop
+
+        backend = DegradedWaylandDesktop(
+            "gnome",
+            "GNOME Wayland does not expose a supported focused-window or "
+            "keyboard-injection API; dictation insertion degrades to stdout",
+        )
+        with (
+            mock.patch.dict("os.environ", {"DICTATION_INJECT": "paste"}),
+            mock.patch.object(dictation, "_send_to_herdr", return_value=False),
+            mock.patch.object(dictation, "get_desktop", return_value=backend),
+            self.assertRaisesRegex(HarnessError, "GNOME Wayland"),
+        ):
+            dictation.inject("hello")
+
     def test_auto_injection_keeps_native_herdr_path(self) -> None:
         with (
             mock.patch.dict("os.environ", {"DICTATION_INJECT": "auto"}),

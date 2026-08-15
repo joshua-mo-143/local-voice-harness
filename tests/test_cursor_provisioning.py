@@ -63,6 +63,7 @@ from local_voice_harness.integrations.linear import (
 )
 from local_voice_harness.linear_ticket_creation import LinearTicketDraft
 from local_voice_harness.local_git import LocalGitRefChanged
+from tests.support import join_threads
 
 WORKER = WorkerOwnership("worker", 42, "boot", "start", "test", 1)
 WORKER_2 = WorkerOwnership("worker-2", 43, "boot-2", "start-2", "test", 1)
@@ -2876,8 +2877,7 @@ class CursorJobStateTests(unittest.TestCase):
             ]
             for thread in threads:
                 thread.start()
-            for thread in threads:
-                thread.join()
+            join_threads(threads)
 
         self.assertEqual(len({path for path, _ref, _branch in calls}), 2)
         self.assertEqual(len({branch for _path, _ref, branch in calls}), 2)
@@ -5512,8 +5512,7 @@ class CursorJobStateTests(unittest.TestCase):
             ]
             for thread in threads:
                 thread.start()
-            for thread in threads:
-                thread.join()
+            join_threads(threads)
 
         self.assertEqual(len(successes), 1)
         self.assertEqual(len(errors), 1)
@@ -5540,8 +5539,7 @@ class CursorJobStateTests(unittest.TestCase):
             threads = [threading.Thread(target=claim) for _ in range(2)]
             for thread in threads:
                 thread.start()
-            for thread in threads:
-                thread.join()
+            join_threads(threads)
 
         self.assertEqual(sum(claim is not None for claim in claims), 1)
 

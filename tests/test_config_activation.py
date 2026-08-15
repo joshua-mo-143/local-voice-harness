@@ -989,19 +989,14 @@ class ConfigActivationTests(unittest.TestCase):
     def test_systemd_controller_uses_exact_user_restart_without_herdr(self) -> None:
         controller = config_activation.SystemdUserServiceController()
         completed = subprocess.CompletedProcess([], 0, "", "")
+        supervisor = mock.Mock()
+        supervisor.try_restart.return_value = completed
         with mock.patch.object(
-            config_activation.subprocess,
-            "run",
-            return_value=completed,
-        ) as run:
+            config_activation, "user_services", return_value=supervisor
+        ):
             controller.restart(WAKE)
 
-        run.assert_called_once_with(
-            ["systemctl", "--user", "try-restart", WAKE],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
+        supervisor.try_restart.assert_called_once_with(WAKE)
         with self.assertRaises(config_activation.ActivationStateError):
             controller.restart("herdr")
 
@@ -1048,25 +1043,19 @@ class ConfigActivationTests(unittest.TestCase):
                 process_start="start-42",
                 state_dir=state_dir,
             )
-            completed = subprocess.CompletedProcess(
-                [],
-                0,
-                (
-                    "LoadState=loaded\n"
-                    "ActiveState=active\n"
-                    "SubState=running\n"
-                    "InvocationID=current\n"
-                    "MainPID=43\n"
-                ),
-                "",
-            )
             controller = config_activation.SystemdUserServiceController(
                 state_dir=state_dir
             )
+            supervisor = mock.Mock()
+            supervisor.show.return_value = {
+                "LoadState": "loaded",
+                "ActiveState": "active",
+                "SubState": "running",
+                "InvocationID": "current",
+                "MainPID": "43",
+            }
             with mock.patch.object(
-                config_activation.subprocess,
-                "run",
-                return_value=completed,
+                config_activation, "user_services", return_value=supervisor
             ):
                 snapshot = controller.snapshot(WAKE)
 

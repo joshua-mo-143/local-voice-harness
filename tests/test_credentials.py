@@ -52,6 +52,47 @@ class VeniceCredentialTests(unittest.TestCase):
             ["/usr/bin/secret-tool", "lookup", *credentials.SECRET_ATTRIBUTES],
         )
 
+    def test_secret_service_availability_requires_working_service(self) -> None:
+        with mock.patch.object(credentials.shutil, "which", return_value=None):
+            self.assertFalse(credentials.secret_service_available())
+            self.assertFalse(credentials.SecretServiceStore().available())
+        with (
+            mock.patch.object(
+                credentials.shutil, "which", return_value="/usr/bin/secret-tool"
+            ),
+            mock.patch.object(
+                credentials.subprocess, "run", return_value=_completed()
+            ) as run,
+        ):
+            self.assertTrue(credentials.secret_service_available())
+        self.assertEqual(
+            run.call_args.args[0],
+            [
+                "/usr/bin/secret-tool",
+                "search",
+                "--all",
+                "application",
+                "local-voice-harness",
+            ],
+        )
+        self.assertEqual(
+            run.call_args.kwargs["timeout"],
+            credentials.CAPABILITY_PROBE_TIMEOUT_SECONDS,
+        )
+
+    def test_secret_service_probe_timeout_is_unavailable(self) -> None:
+        with (
+            mock.patch.object(
+                credentials.shutil, "which", return_value="/usr/bin/secret-tool"
+            ),
+            mock.patch.object(
+                credentials.subprocess,
+                "run",
+                side_effect=subprocess.TimeoutExpired("secret-tool", 2),
+            ),
+        ):
+            self.assertFalse(credentials.secret_service_available())
+
     def test_missing_tool_and_missing_key_are_clear_errors(self) -> None:
         with (
             mock.patch.object(credentials.shutil, "which", return_value=None),

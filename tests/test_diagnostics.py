@@ -353,37 +353,63 @@ class ExecutableCheckTests(unittest.TestCase):
         self.assertTrue(all(r.severity is Severity.WARNING for r in results))
 
     def test_focus_automation_ok_when_x11_stack_present(self) -> None:
-        def which(name: str) -> str | None:
-            return "/usr/bin/tool" if name in {"xdotool", "xclip"} else None
+        from local_voice_harness.desktop import X11Desktop
 
-        with mock.patch.object(checks, "_which", side_effect=which):
+        with (
+            mock.patch.object(checks, "get_desktop", return_value=X11Desktop()),
+            mock.patch(
+                "local_voice_harness.desktop.shutil.which",
+                return_value="/usr/bin/tool",
+            ),
+        ):
             results = checks.check_focus_automation()
         self.assertIs(results[0].severity, Severity.OK)
         self.assertIn("X11", results[0].detail)
 
     def test_focus_automation_ok_when_wayland_stack_present(self) -> None:
-        def which(name: str) -> str | None:
-            return "/usr/bin/tool" if name in {"wtype", "wl-copy", "wl-paste"} else None
+        from local_voice_harness.desktop import HyprlandDesktop
 
-        with mock.patch.object(checks, "_which", side_effect=which):
+        with (
+            mock.patch.object(checks, "get_desktop", return_value=HyprlandDesktop()),
+            mock.patch(
+                "local_voice_harness.desktop.shutil.which",
+                return_value="/usr/bin/tool",
+            ),
+        ):
             results = checks.check_focus_automation()
         self.assertIs(results[0].severity, Severity.OK)
+        self.assertIn("hyprland", results[0].detail)
 
     def test_focus_automation_warns_without_any_stack(self) -> None:
-        with mock.patch.object(checks, "_which", return_value=None):
+        from local_voice_harness.desktop import X11Desktop
+
+        with (
+            mock.patch.object(checks, "get_desktop", return_value=X11Desktop()),
+            mock.patch("local_voice_harness.desktop.shutil.which", return_value=None),
+        ):
             results = checks.check_focus_automation()
         self.assertIs(results[0].severity, Severity.WARNING)
+
+
+def _local_tts_snapshot():
+    config = default_user_config()
+    config = replace(config, providers=replace(config.providers, tts_provider="local"))
+    return checks.DiagnosticSnapshot(
+        config=config,
+        registry=checks.build_integration_registry(config),
+    )
 
 
 class PythonEnvironmentTests(unittest.TestCase):
     def test_present_environment_is_ok(self) -> None:
         with mock.patch.object(Path, "exists", return_value=True):
-            results = checks.check_python_environments()
+            results = checks.check_python_environments(_local_tts_snapshot())
         self.assertTrue(all(r.severity is Severity.OK for r in results))
+        self.assertTrue(any("chatterbox" in result.name for result in results))
 
     def test_missing_environment_is_fatal(self) -> None:
         with mock.patch.object(Path, "exists", return_value=False):
-            results = checks.check_python_environments()
+            results = checks.check_python_environments(_local_tts_snapshot())
         self.assertTrue(all(r.severity is Severity.FATAL for r in results))
         self.assertTrue(all(r.suggestion for r in results))
 
@@ -392,8 +418,14 @@ class PythonEnvironmentTests(unittest.TestCase):
             return "bin" not in self.parts
 
         with mock.patch.object(Path, "exists", exists):
-            results = checks.check_python_environments()
+            results = checks.check_python_environments(_local_tts_snapshot())
         self.assertTrue(all(r.severity is Severity.WARNING for r in results))
+
+    def test_hosted_tts_skips_local_chatterbox_environment(self) -> None:
+        with mock.patch.object(Path, "exists", return_value=False):
+            results = checks.check_python_environments(_snapshot())
+        self.assertFalse(any("chatterbox" in result.name for result in results))
+        self.assertTrue(results)
 
 
 class ModelAndCudaTests(unittest.TestCase):
@@ -460,27 +492,149 @@ class ModelAndCudaTests(unittest.TestCase):
         self.assertIs(results[0].severity, Severity.WARNING)
 
 
-class PipewireTests(unittest.TestCase):
-    def test_missing_wpctl_is_warning(self) -> None:
-        with mock.patch.object(checks, "_which", return_value=None):
-            results = checks.check_pipewire_devices()
-        self.assertIs(results[0].severity, Severity.WARNING)
+_WPCTL_STATUS = """\
+Audio
+ ├─ Devices:
+ │      40. alsa_card.pci-0000_00_1f.3
+ ├─ Sinks:
+ │  *   62. alsa_output.pci-0000_00_1f.3.analog-stereo [vol: 0.50]
+ ├─ Sources:
+ │  *   63. alsa_input.pci-0000_00_1f.3.analog-stereo [vol: 1.00]
+ ├─ Filters:
+"""
 
-    def test_wpctl_ok(self) -> None:
+_WPCTL_FILTER_STATUS = _WPCTL_STATUS.replace(
+    " ├─ Filters:\n",
+    " ├─ Filters:\n │      72. voice_harness_aec_sink\n │  *   73. voice_harness_aec\n",
+)
+
+
+class PipewireTests(unittest.TestCase):
+    def test_terminal_section_header_is_parsed(self) -> None:
+        status = """\
+Audio
+ ├─ Sinks:
+ │  *   62. output.node
+ └─ Sources:
+    *   63. input.node
+"""
+        self.assertEqual(
+            checks.pipewire_section_devices(status, "Sources"),
+            ("input.node",),
+        )
+
+    def test_missing_wpctl_is_fatal(self) -> None:
+        with mock.patch.object(checks, "_which", return_value=None):
+            results = checks.check_pipewire_devices(_snapshot())
+        self.assertIs(results[0].severity, Severity.FATAL)
+        self.assertIn("system default source", results[0].detail)
+
+    def test_wpctl_ok_uses_system_default_when_unconfigured(self) -> None:
         with (
             mock.patch.object(checks, "_which", return_value="/usr/bin/wpctl"),
-            mock.patch.object(checks, "_run", return_value=_completed(0, "audio")),
+            mock.patch.object(
+                checks, "_run", return_value=_completed(0, _WPCTL_STATUS)
+            ) as run,
         ):
-            results = checks.check_pipewire_devices()
+            results = checks.check_pipewire_devices(_snapshot())
+        self.assertIs(results[0].severity, Severity.OK)
+        self.assertIn("system default source", results[0].detail)
+        self.assertIn("system default sink", results[0].detail)
+        run.assert_called_once_with(["wpctl", "status", "--name"], timeout=5)
+
+    def test_configured_node_names_match_capture_targets(self) -> None:
+        snapshot = _snapshot()
+        assert snapshot.config is not None
+        snapshot = checks.DiagnosticSnapshot(
+            config=replace(
+                snapshot.config,
+                audio=replace(
+                    snapshot.config.audio,
+                    source="alsa_input.pci-0000_00_1f.3.analog-stereo",
+                    sink="alsa_output.pci-0000_00_1f.3.analog-stereo",
+                ),
+            ),
+            registry=snapshot.registry,
+        )
+        with (
+            mock.patch.object(checks, "_which", return_value="/usr/bin/wpctl"),
+            mock.patch.object(
+                checks, "_run", return_value=_completed(0, _WPCTL_STATUS)
+            ),
+        ):
+            results = checks.check_pipewire_devices(snapshot)
         self.assertIs(results[0].severity, Severity.OK)
 
-    def test_wpctl_failure_is_warning(self) -> None:
+    def test_configured_filter_node_matches_virtual_capture_target(self) -> None:
+        snapshot = _snapshot()
+        assert snapshot.config is not None
+        snapshot = checks.DiagnosticSnapshot(
+            config=replace(
+                snapshot.config,
+                audio=replace(snapshot.config.audio, source="voice_harness_aec"),
+            ),
+            registry=snapshot.registry,
+        )
+        with (
+            mock.patch.object(checks, "_which", return_value="/usr/bin/wpctl"),
+            mock.patch.object(
+                checks, "_run", return_value=_completed(0, _WPCTL_FILTER_STATUS)
+            ),
+        ):
+            results = checks.check_pipewire_devices(snapshot)
+        self.assertIs(results[0].severity, Severity.OK)
+
+    def test_missing_configured_dictation_source_is_fatal(self) -> None:
+        snapshot = _snapshot()
+        assert snapshot.config is not None
+        snapshot = checks.DiagnosticSnapshot(
+            config=replace(
+                snapshot.config,
+                dictation=replace(
+                    snapshot.config.dictation,
+                    source="missing-dictation-mic",
+                ),
+            ),
+            registry=snapshot.registry,
+        )
+        with (
+            mock.patch.object(checks, "_which", return_value="/usr/bin/wpctl"),
+            mock.patch.object(
+                checks, "_run", return_value=_completed(0, _WPCTL_STATUS)
+            ),
+        ):
+            results = checks.check_pipewire_devices(snapshot)
+        self.assertIs(results[0].severity, Severity.FATAL)
+        self.assertIn("missing-dictation-mic", results[0].detail)
+        self.assertIn("dictation.source", results[0].suggestion or "")
+
+    def test_wpctl_failure_is_fatal(self) -> None:
         with (
             mock.patch.object(checks, "_which", return_value="/usr/bin/wpctl"),
             mock.patch.object(checks, "_run", return_value=_completed(1)),
         ):
-            results = checks.check_pipewire_devices()
-        self.assertIs(results[0].severity, Severity.WARNING)
+            results = checks.check_pipewire_devices(_snapshot())
+        self.assertIs(results[0].severity, Severity.FATAL)
+
+    def test_missing_configured_source_is_fatal(self) -> None:
+        snapshot = _snapshot()
+        assert snapshot.config is not None
+        snapshot = checks.DiagnosticSnapshot(
+            config=replace(
+                snapshot.config,
+                audio=replace(snapshot.config.audio, source="missing-mic"),
+            ),
+            registry=snapshot.registry,
+        )
+        with (
+            mock.patch.object(checks, "_which", return_value="/usr/bin/wpctl"),
+            mock.patch.object(
+                checks, "_run", return_value=_completed(0, _WPCTL_STATUS)
+            ),
+        ):
+            results = checks.check_pipewire_devices(snapshot)
+        self.assertIs(results[0].severity, Severity.FATAL)
+        self.assertIn("missing-mic", results[0].detail)
 
 
 class SystemdUnitTests(unittest.TestCase):
@@ -493,9 +647,12 @@ class SystemdUnitTests(unittest.TestCase):
         def show(name: str, _properties: object) -> dict[str, str]:
             return props.get(name, {})
 
+        supervisor = mock.Mock()
+        supervisor.available.return_value = True
         with (
             mock.patch.object(checks, "SYSTEMD_USER_DIR", tmp),
             mock.patch.object(checks, "_systemctl_show", side_effect=show),
+            mock.patch.object(checks, "user_services", return_value=supervisor),
         ):
             return checks.check_systemd_units()
 
@@ -695,20 +852,26 @@ class SocketCheckTests(unittest.TestCase):
 
 class RepairActionTests(unittest.TestCase):
     def test_restart_service_repair_success(self) -> None:
-        with mock.patch.object(checks, "_run", return_value=_completed(0)):
+        supervisor = mock.Mock()
+        supervisor.restart.return_value = _completed(0)
+        with mock.patch.object(checks, "user_services", return_value=supervisor):
             repair = checks._restart_service_repair("dictation.service")
             message = repair.action()
         self.assertIn("restarted dictation.service", message)
 
     def test_restart_service_repair_failure_raises(self) -> None:
-        with mock.patch.object(checks, "_run", return_value=_completed(1, "", "boom")):
+        supervisor = mock.Mock()
+        supervisor.restart.return_value = _completed(1, "", "boom")
+        with mock.patch.object(checks, "user_services", return_value=supervisor):
             repair = checks._restart_service_repair("dictation.service")
             with self.assertRaises(checks.HarnessError) as caught:
                 repair.action()
         self.assertIn("boom", str(caught.exception))
 
     def test_restart_service_repair_spawn_failure_raises(self) -> None:
-        with mock.patch.object(checks, "_run", return_value=None):
+        supervisor = mock.Mock()
+        supervisor.restart.side_effect = OSError("gone")
+        with mock.patch.object(checks, "user_services", return_value=supervisor):
             repair = checks._restart_service_repair("dictation.service")
             with self.assertRaises(checks.HarnessError):
                 repair.action()

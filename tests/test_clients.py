@@ -18,6 +18,7 @@ from local_voice_harness.stt import client as stt_client
 from local_voice_harness.stt import server as stt_server
 from local_voice_harness.tts import client as tts_client
 from local_voice_harness.user_config import DictationDevice
+from tests.support import join_threads
 
 
 class SpeechToTextClientTests(unittest.TestCase):
@@ -615,6 +616,7 @@ class TextToSpeechClientTests(unittest.TestCase):
             settings = replace(
                 tts_client.default_user_config().audio,
                 voice="/tmp/voice.wav",
+                sink="usb-dac",
             )
             result = tts_client.synthesize_and_play("hello", settings)
 
@@ -630,7 +632,13 @@ class TextToSpeechClientTests(unittest.TestCase):
         )
         request.assert_called_once_with(tts_client.TTS_SOCKET, payload, timeout=120)
         run.assert_called_once_with(
-            ["pw-play", "/runtime/reply-request-id.wav"], check=True
+            [
+                "pw-play",
+                "--target",
+                "usb-dac",
+                "/runtime/reply-request-id.wav",
+            ],
+            check=True,
         )
         self.assertEqual(result["stage"], "tts")
         self.assertEqual(result["request_seconds"], 0.125)
@@ -679,8 +687,7 @@ class TextToSpeechClientTests(unittest.TestCase):
             ]
             for thread in threads:
                 thread.start()
-            for thread in threads:
-                thread.join()
+            join_threads(threads)
 
         self.assertEqual(maximum_active, 1)
 

@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import contextlib
 import fcntl
-import subprocess
 import time
 import urllib.error
 import urllib.request
@@ -17,6 +16,7 @@ from .config import (
 from .credentials import CredentialError, get_venice_api_key
 from .errors import HarnessError
 from .ipc import socket_ready
+from .platform_services import user_services
 from .user_config import default_user_config
 
 
@@ -55,10 +55,7 @@ def start_components(
     services = ["voice-harness-tts.service"]
     if resolved.llm_provider == "local":
         services.insert(0, "voice-harness-llm.service")
-    subprocess.run(
-        ["systemctl", "--user", "start", *services],
-        check=True,
-    )
+    user_services().start(*services)
     deadline = time.monotonic() + timeout
     llm_is_ready = False
     tts_is_ready = False
@@ -83,15 +80,7 @@ def stop_components() -> None:
     STATE_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
     with (STATE_DIR / "components.lock").open("a+b") as lock:
         fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
-        subprocess.run(
-            [
-                "systemctl",
-                "--user",
-                "stop",
-                "voice-harness-llm.service",
-                "voice-harness-tts.service",
-            ],
-            check=False,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+        user_services().stop(
+            "voice-harness-llm.service",
+            "voice-harness-tts.service",
         )

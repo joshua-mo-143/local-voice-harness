@@ -13,6 +13,7 @@ from unittest import mock
 
 from local_voice_harness import cli, llm_launcher, service_manager
 from local_voice_harness.config import START_SERVICES
+from local_voice_harness.install_profile import resolve_installation_plan
 from local_voice_harness.integrations.registry import build_integration_registry
 from local_voice_harness.stt import server as stt_server
 from local_voice_harness.user_config import default_user_config
@@ -174,7 +175,7 @@ class ServiceManagementTests(unittest.TestCase):
         with mock.patch.object(
             llm_launcher, "load_user_config", return_value=configured
         ):
-            command = llm_launcher.command()
+            command = llm_launcher.command(cuda_available=True)
 
         self.assertNotIn("--model", unit)
         self.assertNotIn("--device", unit)
@@ -211,7 +212,11 @@ class ServiceManagementTests(unittest.TestCase):
                 for dependency in extras["dictation-cuda"]
             )
         )
-        self.assertIn("--extra dictation-cuda", installer)
+        self.assertIn('--extra "$INSTALL_DICTATION_EXTRA"', installer)
+        self.assertEqual(
+            resolve_installation_plan(profile="local-cuda").dictation_extra,
+            "dictation-cuda",
+        )
         self.assertTrue(
             any(
                 dependency.startswith("onnxruntime")

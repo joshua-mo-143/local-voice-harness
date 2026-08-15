@@ -15,8 +15,9 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 
 from .config import PROJECT_ROOT, SERVICE_FILES, backend_config_path, xdg_config_home
-from .credentials import CredentialError, get_venice_api_key
+from .credentials import CredentialError, get_venice_api_key, secret_service_available
 from .integrations.registry import capability_statuses
+from .platform_services import user_services
 from .user_config import (
     AnnouncementMode,
     IntegrationSettings,
@@ -272,6 +273,18 @@ _CONFIG_FIELDS: dict[str, ConfigField] = {
         attribute="cuda_device",
         services=(_LLM_SERVICE,),
     ),
+    "compute.llm_device": _field(
+        parse=_parse_str,
+        section="compute",
+        attribute="llm_device",
+        services=(_LLM_SERVICE,),
+    ),
+    "compute.tts_device": _field(
+        parse=_parse_str,
+        section="compute",
+        attribute="tts_device",
+        services=(_TTS_SERVICE,),
+    ),
     "compute.dictation_device": _field(
         parse=_parse_str,
         section="compute",
@@ -313,6 +326,12 @@ _CONFIG_FIELDS: dict[str, ConfigField] = {
         section="audio",
         attribute="source",
         services=(_WAKE_SERVICE,),
+    ),
+    "audio.sink": _field(
+        parse=_parse_str,
+        section="audio",
+        attribute="sink",
+        services=(_WAKE_SERVICE, _TTS_SERVICE),
     ),
     "audio.voice": _field(
         parse=_parse_str,
@@ -640,13 +659,7 @@ def active_services(services: Sequence[str]) -> tuple[str, ...]:
     for name in services:
         if name not in SERVICE_FILES:
             continue
-        process = subprocess.run(
-            ["systemctl", "--user", "is-active", name],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        if process.stdout.strip() == "active":
+        if user_services().is_active(name) == "active":
             active.append(name)
     return tuple(active)
 
@@ -874,7 +887,7 @@ def _venice_available() -> bool:
         get_venice_api_key()
         return True
     except CredentialError:
-        return shutil.which("secret-tool") is not None
+        return secret_service_available()
 
 
 def _available_dictation_backends() -> tuple[str, ...]:
@@ -912,6 +925,9 @@ def run_setup(
         llm_provider = "venice"
         tts_provider = "venice"
         dictation_backend = "parakeet"
+        dictation_device = "cpu" if profile == "showcase" else None
+        llm_device = "cpu" if profile == "showcase" else None
+        tts_device = "cpu" if profile == "showcase" else None
         github_enabled = True
         zendesk_enabled = False
         linear_enabled = False
@@ -967,6 +983,9 @@ def run_setup(
             == "true"
         )
         wake_threshold = input_fn("Wake threshold (0.0-1.0) [0.55]: ").strip() or "0.55"
+        dictation_device = None
+        llm_device = None
+        tts_device = None
 
     assignments = {
         "providers.llm.provider": llm_provider,
@@ -977,6 +996,12 @@ def run_setup(
         "integrations.linear": "true" if linear_enabled else "false",
         "audio.wake_threshold": wake_threshold,
     }
+    if dictation_device is not None:
+        assignments["compute.dictation_device"] = dictation_device
+    if llm_device is not None:
+        assignments["compute.llm_device"] = llm_device
+    if tts_device is not None:
+        assignments["compute.tts_device"] = tts_device
     result = commit_config_change(
         assignments,
         paths=resolved_paths,

@@ -66,8 +66,9 @@ class ComponentReadinessTests(unittest.TestCase):
             self.assertFalse(components.llm_ready())
 
     def test_start_waits_until_both_components_are_ready(self) -> None:
+        supervisor = mock.Mock()
         with (
-            mock.patch.object(components.subprocess, "run") as run,
+            mock.patch.object(components, "user_services", return_value=supervisor),
             mock.patch.object(components, "llm_ready", side_effect=[False, True]),
             mock.patch.object(components, "socket_ready", return_value=True) as ready,
             mock.patch.object(
@@ -77,22 +78,16 @@ class ComponentReadinessTests(unittest.TestCase):
         ):
             components.start_components(timeout=1)
 
-        run.assert_called_once_with(
-            [
-                "systemctl",
-                "--user",
-                "start",
-                "voice-harness-llm.service",
-                "voice-harness-tts.service",
-            ],
-            check=True,
+        supervisor.start.assert_called_once_with(
+            "voice-harness-llm.service",
+            "voice-harness-tts.service",
         )
         ready.assert_called_once_with(components.TTS_SOCKET)
         sleep.assert_called_once_with(0.25)
 
     def test_start_reports_the_configured_timeout(self) -> None:
         with (
-            mock.patch.object(components.subprocess, "run"),
+            mock.patch.object(components, "user_services", return_value=mock.Mock()),
             mock.patch.object(components.time, "monotonic", side_effect=[10.0, 10.5]),
             self.assertRaisesRegex(HarnessError, "within 0.25 seconds"),
         ):
@@ -100,7 +95,7 @@ class ComponentReadinessTests(unittest.TestCase):
 
     def test_start_reports_the_component_that_is_not_ready(self) -> None:
         with (
-            mock.patch.object(components.subprocess, "run"),
+            mock.patch.object(components, "user_services", return_value=mock.Mock()),
             mock.patch.object(components, "llm_ready", return_value=True),
             mock.patch.object(components, "socket_ready", return_value=False),
             mock.patch.object(
@@ -129,18 +124,19 @@ class ComponentReadinessTests(unittest.TestCase):
                 "get_venice_api_key",
                 side_effect=CredentialError("Venice API key is not stored"),
             ),
-            mock.patch.object(components.subprocess, "run") as run,
+            mock.patch.object(components, "user_services") as services,
             self.assertRaisesRegex(CredentialError, "API key is not stored"),
         ):
             components.start_components()
 
-        run.assert_not_called()
+        services.assert_not_called()
 
     def test_venice_starts_only_tts_service_and_uses_key_readiness(self) -> None:
         settings = replace(
             self.settings,
             llm_provider="venice",
         )
+        supervisor = mock.Mock()
         with (
             mock.patch.object(
                 components,
@@ -150,33 +146,23 @@ class ComponentReadinessTests(unittest.TestCase):
             mock.patch.object(
                 components, "get_venice_api_key", return_value="secret"
             ) as get_key,
-            mock.patch.object(components.subprocess, "run") as run,
+            mock.patch.object(components, "user_services", return_value=supervisor),
             mock.patch.object(components, "socket_ready", return_value=True),
         ):
             self.assertTrue(components.llm_ready())
             components.start_components()
 
         get_key.assert_called_with()
-        run.assert_called_once_with(
-            ["systemctl", "--user", "start", "voice-harness-tts.service"],
-            check=True,
-        )
+        supervisor.start.assert_called_once_with("voice-harness-tts.service")
 
     def test_stop_is_best_effort(self) -> None:
-        with mock.patch.object(components.subprocess, "run") as run:
+        supervisor = mock.Mock()
+        with mock.patch.object(components, "user_services", return_value=supervisor):
             components.stop_components()
 
-        run.assert_called_once_with(
-            [
-                "systemctl",
-                "--user",
-                "stop",
-                "voice-harness-llm.service",
-                "voice-harness-tts.service",
-            ],
-            check=False,
-            stdout=components.subprocess.DEVNULL,
-            stderr=components.subprocess.DEVNULL,
+        supervisor.stop.assert_called_once_with(
+            "voice-harness-llm.service",
+            "voice-harness-tts.service",
         )
 
     def test_stop_waits_for_active_cross_process_usage(self) -> None:
@@ -188,10 +174,11 @@ class ComponentReadinessTests(unittest.TestCase):
                 usage_started.set()
                 release_usage.wait(timeout=2)
 
+        supervisor = mock.Mock()
         with (
             tempfile.TemporaryDirectory() as temporary,
             mock.patch.object(components, "STATE_DIR", Path(temporary)),
-            mock.patch.object(components.subprocess, "run") as run,
+            mock.patch.object(components, "user_services", return_value=supervisor),
         ):
             usage = threading.Thread(target=use_components)
             usage.start()
@@ -199,12 +186,12 @@ class ComponentReadinessTests(unittest.TestCase):
             stopping = threading.Thread(target=components.stop_components)
             stopping.start()
             time.sleep(0.02)
-            run.assert_not_called()
+            supervisor.stop.assert_not_called()
             release_usage.set()
             usage.join(timeout=2)
             stopping.join(timeout=2)
 
-        run.assert_called_once()
+        supervisor.stop.assert_called_once()
 
 
 if __name__ == "__main__":

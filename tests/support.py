@@ -6,6 +6,7 @@ import socket
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -18,6 +19,27 @@ from typing import Any, Generic, TypeVar
 T = TypeVar("T")
 _CONTEXT = multiprocessing.get_context("fork")
 _STOP_TIMEOUT = 0.25
+THREAD_JOIN_TIMEOUT = 2.0
+
+
+def join_thread(thread: threading.Thread, timeout: float = THREAD_JOIN_TIMEOUT) -> None:
+    """Join one test thread and fail instead of hanging if it does not finish."""
+
+    thread.join(timeout)
+    if thread.is_alive():
+        raise TimeoutError(
+            f"test thread {thread.name!r} did not finish within {timeout:g}s"
+        )
+
+
+def join_threads(
+    threads: Sequence[threading.Thread], timeout: float = THREAD_JOIN_TIMEOUT
+) -> None:
+    """Join test threads against one shared deadline."""
+
+    deadline = time.monotonic() + timeout
+    for thread in threads:
+        join_thread(thread, timeout=max(0.0, deadline - time.monotonic()))
 
 
 @dataclass(frozen=True)

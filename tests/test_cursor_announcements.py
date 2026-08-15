@@ -29,6 +29,7 @@ from local_voice_harness.cursor.store import JobStore
 from local_voice_harness.notifications import NotificationResult
 from local_voice_harness.responses import AssistantResponse
 from local_voice_harness.user_config import AnnouncementMode, AnnouncementSettings
+from tests.support import join_threads
 
 
 def _job(
@@ -429,6 +430,5 @@ class AnnouncementDrainTests(unittest.TestCase):
         threads = [threading.Thread(target=race) for _ in range(2)]
         for thread in threads:
             thread.start()
-        for thread in threads:
-            thread.join()
+        join_threads(threads)
         self.assertEqual(sorted(winners), [False, True])

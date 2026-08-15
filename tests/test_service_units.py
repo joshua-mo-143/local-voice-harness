@@ -384,6 +384,48 @@ class ServiceUnitValidationTests(unittest.TestCase):
         self.assertEqual(result.context, "staged-user")
         self.assertEqual(result.rooted_user_context, "supported")
 
+    def test_runtime_directory_lookup_failure_is_unsupported_user_context(self) -> None:
+        self.assertTrue(
+            service_units.user_context_unsupported(
+                "Failed to lookup RuntimeDirectory path: No such device or address\n"
+                "Failed to initialize manager: No such device or address\n"
+            )
+        )
+        self.assertTrue(
+            service_units.user_context_unsupported("Failed to connect to bus")
+        )
+        self.assertFalse(service_units.user_context_unsupported("missing executable"))
+
+    def test_systemd_analyze_falls_back_when_runtime_directory_lookup_fails(
+        self,
+    ) -> None:
+        path = (
+            service_units.PROJECT_ROOT
+            / service_units.SOURCE_RELATIVE
+            / "voice-harness-llm.service"
+        )
+        unsupported = subprocess.CompletedProcess(
+            [],
+            1,
+            "",
+            "Failed to lookup RuntimeDirectory path: No such device or address",
+        )
+        completed = subprocess.CompletedProcess([], 0, "", "")
+
+        with mock.patch.object(
+            service_units.subprocess,
+            "run",
+            side_effect=[unsupported, completed],
+        ) as run:
+            result = service_units.systemd_analyze([path], executable="/tool")
+
+        self.assertIsNotNone(result)
+        assert result is not None
+        self.assertEqual(result.context, "staged-system")
+        self.assertEqual(result.rooted_user_context, "unsupported")
+        self.assertIn("RuntimeDirectory", result.reason or "")
+        self.assertEqual(run.call_count, 2)
+
     def test_systemd_analyze_falls_back_when_rooted_user_mode_is_unsupported(
         self,
     ) -> None:

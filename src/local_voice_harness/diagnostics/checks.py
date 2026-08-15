@@ -23,8 +23,14 @@ from ..config import (
     SYSTEMD_USER_DIR,
     TTS_SOCKET,
 )
-from ..credentials import CredentialError, get_venice_api_key
+from ..credentials import (
+    CredentialError,
+    get_venice_api_key,
+    secret_service_available,
+    secret_service_binary_available,
+)
 from ..cursor.sqlite_store import SQLiteJobDatabase
+from ..desktop import get_desktop
 from ..diagnostic_safety import redact_diagnostic
 from ..errors import HarnessError
 from ..integrations.herdr import HerdrError
@@ -34,8 +40,19 @@ from ..integrations.registry import (
     capability_statuses,
 )
 from ..ipc import socket_ready
+from ..notifications import (
+    notification_service_available,
+    notification_service_binary_available,
+)
+from ..platform_services import user_services
 from ..process import capability_diagnostics
-from ..user_config import UserConfig, UserConfigurationError, load_user_config
+from ..user_config import (
+    ComputeDevice,
+    UserConfig,
+    UserConfigurationError,
+    load_user_config,
+    resolve_local_compute,
+)
 from .model import CheckResult, Repair, Severity
 
 
@@ -144,17 +161,7 @@ def _run(
 
 
 def _systemctl_show(name: str, properties: Sequence[str]) -> dict[str, str]:
-    command = ["systemctl", "--user", "show", name]
-    command.extend(f"--property={prop}" for prop in properties)
-    process = _run(command)
-    values: dict[str, str] = {}
-    if process is None or process.returncode:
-        return values
-    for line in process.stdout.splitlines():
-        key, separator, value = line.partition("=")
-        if separator:
-            values[key] = value
-    return values
+    return user_services().show(name, properties)
 
 
 def _service_active_state(name: str) -> str:
@@ -163,13 +170,12 @@ def _service_active_state(name: str) -> str:
 
 def _restart_service_repair(name: str) -> Repair:
     def action() -> str:
-        process = _run(["systemctl", "--user", "restart", name], timeout=30)
-        if process is None:
-            raise HarnessError(f"could not run systemctl --user restart {name}")
+        try:
+            process = user_services().restart(name)
+        except OSError as exc:
+            raise HarnessError(f"could not restart {name}") from exc
         if process.returncode:
-            raise HarnessError(
-                process.stderr.strip() or f"systemctl --user restart {name} failed"
-            )
+            raise HarnessError(process.stderr.strip() or f"could not restart {name}")
         return f"restarted {name}"
 
     return Repair(summary=f"restart {name}", action=action)
@@ -305,51 +311,50 @@ def check_optional_executables(
 def check_focus_automation(
     _snapshot: DiagnosticSnapshot | None = None,
 ) -> list[CheckResult]:
-    """One complete X11 or Wayland stack enables focused-window dictation."""
+    """Report detected desktop capabilities without requiring unavailable APIs."""
 
-    x11 = {tool: _which(tool) is not None for tool in ("xdotool", "xclip")}
-    wayland = {
-        tool: _which(tool) is not None for tool in ("wtype", "wl-copy", "wl-paste")
-    }
-    x11_ready = all(x11.values())
-    wayland_ready = all(wayland.values())
-    if x11_ready or wayland_ready:
-        stacks = []
-        if x11_ready:
-            stacks.append("X11 (xdotool, xclip)")
-        if wayland_ready:
-            stacks.append("Wayland (wtype, wl-clipboard)")
+    desktop = get_desktop()
+    if desktop is None:
         return [
             CheckResult(
                 name="focus-automation",
-                category="executables",
-                severity=Severity.OK,
-                detail=f"focused-window automation available: {', '.join(stacks)}",
+                category="desktop",
+                severity=Severity.WARNING,
+                detail=(
+                    "no desktop session was detected; dictation insertion "
+                    "will fall back to stdout"
+                ),
             )
         ]
-    missing_x11 = sorted(tool for tool, present in x11.items() if not present)
-    missing_wayland = sorted(tool for tool, present in wayland.items() if not present)
+    capabilities = desktop.capabilities()
+    if capabilities.active_window and capabilities.type_text and capabilities.send_key:
+        return [
+            CheckResult(
+                name="focus-automation",
+                category="desktop",
+                severity=Severity.OK,
+                detail=capabilities.detail,
+            )
+        ]
     return [
         CheckResult(
             name="focus-automation",
-            category="executables",
+            category="desktop",
             severity=Severity.WARNING,
-            detail=(
-                "no complete focused-window automation stack; dictation insertion "
-                f"will fall back to stdout. Missing X11 tools: {missing_x11}; "
-                f"missing Wayland tools: {missing_wayland}"
-            ),
+            detail=capabilities.detail,
             suggestion=(
-                "paru -S --needed xdotool xclip  # X11, or: "
-                "paru -S --needed wtype wl-clipboard  # Wayland"
+                "set DICTATION_INJECT=stdout if focused-window insertion is "
+                "not required"
             ),
         )
     ]
 
 
-def _python_environments() -> tuple[tuple[str, Path, Path, str], ...]:
+def _python_environments(
+    config: UserConfig | None,
+) -> tuple[tuple[str, Path, Path, str], ...]:
     home = Path.home()
-    return (
+    environments = [
         (
             "wake/management (.venv)",
             PROJECT_ROOT / ".venv",
@@ -363,21 +368,26 @@ def _python_environments() -> tuple[tuple[str, Path, Path, str], ...]:
             "env UV_PROJECT_ENVIRONMENT=.venv-dictation "
             "uv sync --python 3.11 --extra dictation --no-dev",
         ),
-        (
-            "chatterbox tts",
-            home / "chatterbox-audition" / ".venv",
-            home / "chatterbox-audition" / ".venv" / "bin" / "voice-harness-tts",
-            'UV_PROJECT_ENVIRONMENT="$HOME/chatterbox-audition/.venv" '
-            "uv sync --python 3.11 --extra tts --no-dev",
-        ),
-    )
+    ]
+    if config is None or config.providers.tts_provider == "local":
+        environments.append(
+            (
+                "chatterbox tts",
+                home / "chatterbox-audition" / ".venv",
+                home / "chatterbox-audition" / ".venv" / "bin" / "voice-harness-tts",
+                'UV_PROJECT_ENVIRONMENT="$HOME/chatterbox-audition/.venv" '
+                "uv sync --python 3.11 --extra tts --no-dev",
+            )
+        )
+    return tuple(environments)
 
 
 def check_python_environments(
-    _snapshot: DiagnosticSnapshot | None = None,
+    snapshot: DiagnosticSnapshot | None = None,
 ) -> list[CheckResult]:
     results: list[CheckResult] = []
-    for label, venv_dir, executable, suggestion in _python_environments():
+    config = _resolved(snapshot).config
+    for label, venv_dir, executable, suggestion in _python_environments(config):
         if executable.exists():
             results.append(
                 CheckResult(
@@ -485,6 +495,88 @@ def check_model_caches(
     ]
 
 
+def _local_cuda_expected(config: UserConfig) -> bool:
+    if config.compute.dictation_device is not ComputeDevice.CPU:
+        return True
+    if (
+        config.providers.llm_provider == "local"
+        and config.compute.llm_device is not ComputeDevice.CPU
+    ):
+        return True
+    if (
+        config.providers.tts_provider == "local"
+        and config.compute.tts_device is not ComputeDevice.CPU
+    ):
+        return True
+    return False
+
+
+def _explicit_local_cuda_required(config: UserConfig) -> bool:
+    if config.compute.dictation_device is ComputeDevice.CUDA:
+        return True
+    if (
+        config.providers.llm_provider == "local"
+        and config.compute.llm_device is ComputeDevice.CUDA
+    ):
+        return True
+    if (
+        config.providers.tts_provider == "local"
+        and config.compute.tts_device is ComputeDevice.CUDA
+    ):
+        return True
+    return False
+
+
+def check_compute_modes(
+    snapshot: DiagnosticSnapshot | None = None,
+) -> list[CheckResult]:
+    resolved = _resolved(snapshot)
+    if resolved.config is None:
+        return []
+    settings = resolved.config
+    compute = settings.compute
+    results: list[CheckResult] = []
+    for name, requested, local in (
+        ("llm", compute.llm_device, settings.providers.llm_provider == "local"),
+        ("tts", compute.tts_device, settings.providers.tts_provider == "local"),
+        ("dictation", compute.dictation_device, True),
+    ):
+        if not local:
+            results.append(
+                CheckResult(
+                    name=f"compute:{name}",
+                    category="compute",
+                    severity=Severity.OK,
+                    detail=(
+                        f"{name} provider is hosted; configured local compute "
+                        f"{requested} is unused"
+                    ),
+                )
+            )
+            continue
+        if requested is ComputeDevice.CPU:
+            effective = resolve_local_compute(
+                requested, cuda_available=False, label=name
+            )
+            detail = (
+                f"{name} configured compute={requested}; effective compute={effective}"
+            )
+        else:
+            detail = (
+                f"{name} configured compute={requested}; effective compute is "
+                "resolved at service start without changing the configured mode"
+            )
+        results.append(
+            CheckResult(
+                name=f"compute:{name}",
+                category="compute",
+                severity=Severity.OK,
+                detail=detail,
+            )
+        )
+    return results
+
+
 def check_cuda(snapshot: DiagnosticSnapshot | None = None) -> list[CheckResult]:
     resolved = _resolved(snapshot)
     if resolved.config is None:
@@ -496,15 +588,38 @@ def check_cuda(snapshot: DiagnosticSnapshot | None = None) -> list[CheckResult]:
     if settings.providers.tts_provider == "local":
         selected_models.append("TTS")
     model_label = "/".join(selected_models)
+    mode_label = (
+        f"llm={settings.compute.llm_device} tts={settings.compute.tts_device} "
+        f"dictation={settings.compute.dictation_device}"
+    )
+    if not _local_cuda_expected(settings):
+        return [
+            CheckResult(
+                name="gpu:cuda",
+                category="gpu",
+                severity=Severity.OK,
+                detail=(
+                    "CUDA tools were not invoked; configured local compute is "
+                    f"CPU or hosted ({mode_label})"
+                ),
+            )
+        ]
+    explicit_cuda = _explicit_local_cuda_required(settings)
+    unavailable_severity = Severity.FATAL if explicit_cuda else Severity.WARNING
+    unavailable_behavior = (
+        "explicit CUDA configuration cannot start"
+        if explicit_cuda
+        else "auto mode will fall back to substantially slower CPU execution"
+    )
     if _which("nvidia-smi") is None:
         return [
             CheckResult(
                 name="gpu:cuda",
                 category="gpu",
-                severity=Severity.WARNING,
+                severity=unavailable_severity,
                 detail=(
                     f"nvidia-smi not found; GPU acceleration for {model_label} is "
-                    "unavailable and CPU fallback is substantially slower"
+                    f"unavailable; {unavailable_behavior}"
                 ),
                 suggestion=INSTALL_HINTS.get("nvidia-smi"),
             )
@@ -518,8 +633,8 @@ def check_cuda(snapshot: DiagnosticSnapshot | None = None) -> list[CheckResult]:
             CheckResult(
                 name="gpu:cuda",
                 category="gpu",
-                severity=Severity.WARNING,
-                detail=detail,
+                severity=unavailable_severity,
+                detail=f"{detail}; {unavailable_behavior}",
                 suggestion="nvidia-smi  # confirm the driver is loaded",
             )
         ]
@@ -530,44 +645,150 @@ def check_cuda(snapshot: DiagnosticSnapshot | None = None) -> list[CheckResult]:
             severity=Severity.OK,
             detail=(
                 f"nvidia-smi reports a working GPU for {model_label}; "
-                f"the configured CUDA device is {settings.compute.cuda_device}"
+                f"the configured CUDA device is {settings.compute.cuda_device} "
+                f"({mode_label})"
             ),
         )
     ]
+
+
+def pipewire_section_devices(status: str, section: str) -> tuple[str, ...]:
+    """Return device names listed under a ``wpctl status`` Audio section."""
+
+    lines = status.splitlines()
+    collecting = False
+    names: list[str] = []
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("Audio"):
+            collecting = False
+        if stripped.rstrip(":") in {
+            section,
+            f"├─ {section}",
+            f"└─ {section}",
+            f"│  {section}",
+        }:
+            collecting = True
+            continue
+        if collecting and (
+            stripped.startswith("├─")
+            or stripped.startswith("└─")
+            or stripped == "Video"
+        ):
+            break
+        if not collecting:
+            continue
+        label = stripped.lstrip("│").strip()
+        if not label or label.startswith("├") or label.startswith("└"):
+            continue
+        label = label.lstrip("* ").strip()
+        if label[:1].isdigit():
+            _, _, remainder = label.partition(".")
+            label = remainder.strip() or label
+        name, _, _volume = label.partition("[")
+        name = name.strip()
+        if name:
+            names.append(name)
+    return tuple(names)
 
 
 def check_pipewire_devices(
     snapshot: DiagnosticSnapshot | None = None,
 ) -> list[CheckResult]:
     resolved = _resolved(snapshot)
-    configured_source = (
-        resolved.config.audio.source if resolved.config is not None else "unavailable"
+    source = resolved.config.audio.source if resolved.config is not None else ""
+    sink = resolved.config.audio.sink if resolved.config is not None else ""
+    dictation_source = (
+        resolved.config.dictation.source if resolved.config is not None else ""
     )
+    source_label = source or "PipeWire system default source"
+    sink_label = sink or "PipeWire system default sink"
+    dictation_source_label = dictation_source or "PipeWire system default source"
     if _which("wpctl") is None:
         return [
             CheckResult(
                 name="audio:pipewire",
                 category="audio",
-                severity=Severity.WARNING,
+                severity=Severity.FATAL,
                 detail=(
                     "wpctl not found; cannot enumerate PipeWire capture/playback "
-                    f"devices. Configured source: {configured_source}"
+                    f"devices. Configured source: {source_label}; sink: {sink_label}"
                 ),
                 suggestion=INSTALL_HINTS.get("wpctl"),
             )
         ]
-    process = _run(["wpctl", "status"], timeout=5)
+    # Capture uses PipeWire's stable ``node.name`` through ``pw-record
+    # --target``. Ask wpctl for those names instead of its default human
+    # descriptions so diagnostics validate the same identifier contract.
+    process = _run(["wpctl", "status", "--name"], timeout=5)
     if process is None or process.returncode:
         return [
             CheckResult(
                 name="audio:pipewire",
                 category="audio",
-                severity=Severity.WARNING,
+                severity=Severity.FATAL,
                 detail=(
                     "wpctl status failed; PipeWire may not be running for this "
-                    f"session. Configured source: {configured_source}"
+                    f"session. Configured source: {source_label}; sink: {sink_label}"
                 ),
                 suggestion="systemctl --user status pipewire wireplumber",
+            )
+        ]
+    sources = pipewire_section_devices(process.stdout, "Sources")
+    sinks = pipewire_section_devices(process.stdout, "Sinks")
+    filters = pipewire_section_devices(process.stdout, "Filters")
+    if not sources or not sinks:
+        return [
+            CheckResult(
+                name="audio:pipewire",
+                category="audio",
+                severity=Severity.FATAL,
+                detail=(
+                    "PipeWire reported no capture or playback devices. "
+                    f"Configured source: {source_label}; sink: {sink_label}"
+                ),
+                suggestion="wpctl status  # confirm a source and sink are available",
+            )
+        ]
+    if source and source not in {*sources, *filters}:
+        return [
+            CheckResult(
+                name="audio:pipewire",
+                category="audio",
+                severity=Severity.FATAL,
+                detail=(
+                    f"configured capture source {source} was not found among "
+                    f"PipeWire sources: {', '.join(sources)}"
+                ),
+                suggestion="voice-harness config set audio.source '<PIPEWIRE_SOURCE_NAME>'",
+            )
+        ]
+    if dictation_source and dictation_source not in {*sources, *filters}:
+        return [
+            CheckResult(
+                name="audio:pipewire",
+                category="audio",
+                severity=Severity.FATAL,
+                detail=(
+                    f"configured dictation source {dictation_source} was not found "
+                    f"among PipeWire sources: {', '.join((*sources, *filters))}"
+                ),
+                suggestion=(
+                    "voice-harness config set dictation.source '<PIPEWIRE_SOURCE_NAME>'"
+                ),
+            )
+        ]
+    if sink and sink not in {*sinks, *filters}:
+        return [
+            CheckResult(
+                name="audio:pipewire",
+                category="audio",
+                severity=Severity.FATAL,
+                detail=(
+                    f"configured playback sink {sink} was not found among "
+                    f"PipeWire sinks: {', '.join(sinks)}"
+                ),
+                suggestion="voice-harness config set audio.sink '<PIPEWIRE_SINK_NAME>'",
             )
         ]
     return [
@@ -576,16 +797,135 @@ def check_pipewire_devices(
             category="audio",
             severity=Severity.OK,
             detail=(
-                "PipeWire is responding to wpctl; configured capture source is "
-                f"{configured_source} (override with VOICE_HARNESS_SOURCE)"
+                "PipeWire is responding to wpctl; capture uses "
+                f"{source_label}; dictation uses {dictation_source_label}; "
+                f"playback uses {sink_label}"
             ),
         )
     ]
 
 
+def check_platform_capabilities(
+    _snapshot: DiagnosticSnapshot | None = None,
+) -> list[CheckResult]:
+    """Report service, credential, notification, and desktop capabilities."""
+
+    results: list[CheckResult] = []
+    services = user_services()
+    if services.available():
+        results.append(
+            CheckResult(
+                name="platform:services",
+                category="platform",
+                severity=Severity.OK,
+                detail="user service supervision is available",
+            )
+        )
+    else:
+        detail = (
+            "systemctl is installed but the systemd user bus is not responding"
+            if services.binary_available()
+            else "systemctl is not installed"
+        )
+        results.append(
+            CheckResult(
+                name="platform:services",
+                category="platform",
+                severity=Severity.WARNING,
+                detail=(f"{detail}; systemd unit state will not be required"),
+            )
+        )
+    if secret_service_available():
+        results.append(
+            CheckResult(
+                name="platform:credentials",
+                category="platform",
+                severity=Severity.OK,
+                detail="desktop Secret Service lookup is available",
+            )
+        )
+    else:
+        detail = (
+            "secret-tool is installed but no usable desktop Secret Service responded"
+            if secret_service_binary_available()
+            else "secret-tool is not installed"
+        )
+        results.append(
+            CheckResult(
+                name="platform:credentials",
+                category="platform",
+                severity=Severity.WARNING,
+                detail=(f"{detail}; Venice credentials cannot be stored or read"),
+                suggestion="install libsecret and a Secret Service provider",
+            )
+        )
+    if notification_service_available():
+        results.append(
+            CheckResult(
+                name="platform:notifications",
+                category="platform",
+                severity=Severity.OK,
+                detail="desktop notifications are available",
+            )
+        )
+    else:
+        detail = (
+            "notify-send is installed but no usable notification service responded"
+            if notification_service_binary_available()
+            else "notify-send is not installed"
+        )
+        results.append(
+            CheckResult(
+                name="platform:notifications",
+                category="platform",
+                severity=Severity.WARNING,
+                detail=(
+                    f"{detail}; voice operation continues without desktop notifications"
+                ),
+            )
+        )
+    desktop = get_desktop()
+    if desktop is None:
+        results.append(
+            CheckResult(
+                name="platform:desktop",
+                category="platform",
+                severity=Severity.WARNING,
+                detail="no desktop session was detected",
+            )
+        )
+        return results
+    capabilities = desktop.capabilities()
+    results.append(
+        CheckResult(
+            name="platform:desktop",
+            category="platform",
+            severity=(
+                Severity.OK
+                if capabilities.active_window and capabilities.type_text
+                else Severity.WARNING
+            ),
+            detail=capabilities.detail,
+        )
+    )
+    return results
+
+
 def check_systemd_units(
     _snapshot: DiagnosticSnapshot | None = None,
 ) -> list[CheckResult]:
+    if not user_services().available():
+        return [
+            CheckResult(
+                name="platform:services",
+                category="platform",
+                severity=Severity.WARNING,
+                detail=(
+                    "user service supervision is unavailable; installed unit "
+                    "state was not queried"
+                ),
+            )
+        ]
     results: list[CheckResult] = []
     for name in SERVICE_FILES:
         always_on = name in START_SERVICES
@@ -1210,12 +1550,14 @@ ALL_CHECKS: tuple[Check, ...] = (
     check_python_environments,
     check_model_file,
     check_model_caches,
+    check_compute_modes,
     check_cuda,
     check_pipewire_devices,
     check_systemd_units,
     check_runtime_sockets,
     check_runtime_directories,
     check_process_capabilities,
+    check_platform_capabilities,
     check_cursor_jobs,
     check_herdr,
     check_cursor_cli,

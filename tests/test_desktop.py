@@ -25,25 +25,22 @@ class DesktopSelectionTests(unittest.TestCase):
             self.assertIsInstance(desktop.get_desktop(), desktop.X11Desktop)
 
     def test_recovers_x11_environment_imported_after_service_start(self) -> None:
-        manager_environment = "\n".join(
-            (
-                "DISPLAY=:0",
-                "XAUTHORITY=/run/user/1000/xauth",
-                "UNRELATED_SECRET=do-not-import",
-            )
-        )
+        supervisor = mock.Mock()
+        supervisor.user_environment.return_value = {
+            "DISPLAY": ":0",
+            "XAUTHORITY": "/run/user/1000/xauth",
+            "UNRELATED_SECRET": "do-not-import",
+        }
         with (
             mock.patch.dict("os.environ", {}, clear=True),
-            mock.patch.object(
-                desktop, "_run", return_value=completed(manager_environment)
-            ) as run,
+            mock.patch.object(desktop, "user_services", return_value=supervisor),
         ):
             self.assertIsInstance(desktop.get_desktop(), desktop.X11Desktop)
             self.assertEqual(desktop.os.environ["DISPLAY"], ":0")
             self.assertEqual(desktop.os.environ["XAUTHORITY"], "/run/user/1000/xauth")
             self.assertNotIn("UNRELATED_SECRET", desktop.os.environ)
 
-        run.assert_called_once_with(["systemctl", "--user", "show-environment"])
+        supervisor.user_environment.assert_called_once_with()
 
     def test_existing_graphical_environment_is_not_replaced(self) -> None:
         with (
@@ -73,14 +70,39 @@ class DesktopSelectionTests(unittest.TestCase):
         with mock.patch.dict("os.environ", environment, clear=True):
             self.assertIsInstance(desktop.get_desktop(), desktop.SwayDesktop)
 
-    def test_other_wayland_compositors_are_unsupported(self) -> None:
+    def test_gnome_wayland_degrades_without_injection(self) -> None:
         environment = {
             "XDG_SESSION_TYPE": "wayland",
             "WAYLAND_DISPLAY": "wayland-1",
             "XDG_CURRENT_DESKTOP": "GNOME",
         }
         with mock.patch.dict("os.environ", environment, clear=True):
-            self.assertIsNone(desktop.get_desktop())
+            backend = desktop.get_desktop()
+        self.assertIsInstance(backend, desktop.DegradedWaylandDesktop)
+        assert backend is not None
+        capabilities = backend.capabilities()
+        self.assertEqual(capabilities.name, "gnome")
+        self.assertFalse(capabilities.active_window)
+        self.assertFalse(capabilities.type_text)
+        self.assertFalse(capabilities.overlay)
+        with self.assertRaisesRegex(desktop.DesktopError, "GNOME Wayland"):
+            backend.type_text("hello")
+
+    def test_kde_wayland_degrades_without_injection(self) -> None:
+        environment = {
+            "XDG_SESSION_TYPE": "wayland",
+            "WAYLAND_DISPLAY": "wayland-1",
+            "XDG_CURRENT_DESKTOP": "KDE",
+        }
+        with mock.patch.dict("os.environ", environment, clear=True):
+            backend = desktop.get_desktop()
+        self.assertIsInstance(backend, desktop.DegradedWaylandDesktop)
+        assert backend is not None
+        capabilities = backend.capabilities()
+        self.assertEqual(capabilities.name, "kde")
+        self.assertFalse(capabilities.send_key)
+        with self.assertRaisesRegex(desktop.DesktopError, "KDE Plasma"):
+            backend.send_key("ctrl+v")
 
 
 class WindowMetadataTests(unittest.TestCase):

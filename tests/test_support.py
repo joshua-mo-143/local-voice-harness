@@ -4,11 +4,17 @@ import multiprocessing
 import signal
 import socket
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
 
-from tests.support import UnixSocketServer, run_concurrently, run_fresh_interpreter
+from tests.support import (
+    UnixSocketServer,
+    join_thread,
+    run_concurrently,
+    run_fresh_interpreter,
+)
 
 CONTEXT = multiprocessing.get_context("fork")
 
@@ -40,6 +46,22 @@ class TestSupportTests(unittest.TestCase):
             result = run_fresh_interpreter(script)
 
         self.assertEqual(result.returncode, -signal.SIGKILL)
+
+    def test_join_thread_fails_instead_of_hanging(self) -> None:
+        started = threading.Event()
+        release = threading.Event()
+
+        def hang() -> None:
+            started.set()
+            release.wait()
+
+        thread = threading.Thread(target=hang, name="stuck-test-thread")
+        thread.start()
+        self.assertTrue(started.wait(timeout=1))
+        with self.assertRaisesRegex(TimeoutError, "stuck-test-thread"):
+            join_thread(thread, timeout=0.05)
+        release.set()
+        join_thread(thread, timeout=1)
 
     def test_concurrent_outcomes_preserve_call_order_and_errors(self) -> None:
         def fail() -> int:

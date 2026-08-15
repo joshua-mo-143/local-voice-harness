@@ -28,6 +28,7 @@ conflicts = [[
 
 [manifest]
 overrides = [
+    { name = "tflite-runtime", marker = "python_full_version < '3.12'", specifier = "==2.14.0" },
     { name = "torch", specifier = "==2.10.0" },
     { name = "torchaudio", specifier = "==2.10.0" },
 ]
@@ -1334,7 +1335,7 @@ dependencies = [
     { name = "requests" },
     { name = "scikit-learn" },
     { name = "scipy" },
-    { name = "tflite-runtime", marker = "sys_platform == 'linux' or (extra == 'extra-19-local-voice-harness-dictation' and extra == 'extra-19-local-voice-harness-dictation-cuda')" },
+    { name = "tflite-runtime", marker = "python_full_version < '3.12' or (extra == 'extra-19-local-voice-harness-dictation' and extra == 'extra-19-local-voice-harness-dictation-cuda')" },
     { name = "tqdm" },
 ]
 sdist = { url = "https://files.pythonhosted.org/packages/b5/9b/73b7d98b07f4e1f525ad39703e0c5f30ff61c3fa16c8bfe4d99eadc0567a/openwakeword-0.6.0.tar.gz", hash = "sha256:36858d90f1183e307485597a912a4e3c3384b14ea9923f83feaffae7c1565565", size = 70830, upload-time = "2024-02-11T20:56:17.854Z" }

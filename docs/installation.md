@@ -1,12 +1,19 @@
 # Manual installation
 
 The [Quick start](../README.md#quick-start) path runs `scripts/install.sh`, which
-automates the tested Arch/CachyOS CUDA setup and pauses for interactive choices or
-logins when needed. This document also covers partial setups, CPU dictation,
-troubleshooting, and non-Arch systems.
+supports Arch, Ubuntu/Debian, and Fedora. It installs only the packages required
+by the selected providers, audio stack, and compute profile, then pauses for
+interactive choices or logins when needed. Hosted-only (showcase) installs skip
+CUDA packages and local model downloads on every supported family. Re-running the
+installer is idempotent.
 
-The supplied systemd units assume the repository is cloned to
-`$HOME/local-voice-harness`.
+The installer discovers the checkout, `~/.local/bin`, and the systemd user
+directory from its own path and XDG locations. If the checkout is not
+`$HOME/local-voice-harness`, it creates that symlink so shipped user units resolve.
+The standard-library plan resolver requires Python 3.11 or newer. Before resolving
+packages, the installer installs the distro `python3` package with `paru`, `apt-get`,
+or `dnf` when necessary, verifies its version, and stops with manual guidance if the
+distro package is still too old.
 
 ## Compute requirements
 
@@ -43,8 +50,19 @@ The tested configuration uses CUDA for Parakeet and Chatterbox, but dictation ca
 run independently on CPU. CPU dictation has substantially higher latency. The
 optional faster-whisper backend supports the same `auto`, `cpu`, and `cuda` device
 selection. Hosted LLM/TTS with CPU dictation can avoid local model inference on the
-GPU, but the current one-shot installer still provisions CUDA dictation and NVIDIA
-packages; use the manual CPU instructions below for a GPU-free profile.
+GPU. The showcase installer profile is that GPU-free path:
+
+```bash
+PROFILE=showcase ./scripts/install.sh
+./scripts/install.sh --profile showcase
+```
+
+It installs no CUDA or NVIDIA packages, uses the CPU `dictation` extra, and
+omits local LLM/TTS extras, Qwen/Chatterbox downloads, and the local LLM
+service. With local providers, the default `auto` compute mode installs CUDA
+artifacts only when a bounded `nvidia-smi` probe confirms usable CUDA; otherwise it
+installs the CPU dictation and llama.cpp artifacts. Setting a device or the
+`local-cuda` profile explicitly is a strict CUDA requirement.
 
 ## External prerequisites
 
@@ -71,6 +89,15 @@ On Arch/CachyOS, the base packages are approximately:
 paru -S --needed pipewire libnotify git curl github-cli xdotool xclip \
   wl-clipboard wtype uv libsndfile ffmpeg
 ```
+
+On Ubuntu/Debian, the installer maps those names to `apt-get` packages such as
+`libnotify-bin`, `gh`, `libsecret-tools`, and `gnome-keyring`, and bootstraps
+`uv` when the distro does not package it. On Fedora it uses `dnf` with the
+same mapping (`gh`, `libsecret`, `gnome-keyring`). Hosted-only installs do not
+install CUDA packages on any family. Local CUDA llama.cpp packages remain
+Arch-specific. An explicit CUDA plan on Ubuntu/Debian or Fedora fails before
+package installation because those adapters cannot currently satisfy `cuda` and
+`llama.cpp-cuda`; use the supported Arch adapter or select CPU/hosted compute.
 
 On Arch/CachyOS, install the CUDA-enabled llama.cpp AUR package (it conflicts with
 `llama.cpp-vulkan` and other non-CUDA variants):
@@ -198,6 +225,7 @@ Venice is selected. Its choices can also be supplied non-interactively:
 
 ```bash
 env LLM_PROVIDER=venice TTS_PROVIDER=venice ./scripts/install.sh
+PROFILE=showcase ./scripts/install.sh
 ```
 
 Venice credentials are stored through libsecret in the desktop Secret Service, not
@@ -306,11 +334,12 @@ Find the PipeWire microphone:
 wpctl status
 ```
 
-The source currently defaults to the microphone from the original development
-machine. Store the selected source in unified configuration:
+Capture and playback default to PipeWire's system-selected source and sink.
+Store an explicit source or sink only when you need to override that default:
 
 ```bash
 voice-harness config set audio.source '<PIPEWIRE_SOURCE_NAME>'
+voice-harness config set audio.sink '<PIPEWIRE_SINK_NAME>'
 ```
 
 Optional Chatterbox voice cloning accepts a reference WAV:

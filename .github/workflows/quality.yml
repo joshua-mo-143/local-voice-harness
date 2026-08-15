@@ -16,6 +16,7 @@ jobs:
   checks:
     name: Python ${{ matrix.python-version }}
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     env:
       UV_PYTHON: ${{ matrix.python-version }}
     strategy:
@@ -52,3 +53,26 @@ jobs:
         run: |
           uv run --locked coverage json -o coverage.json
           uv run --locked python -m local_voice_harness.coverage_gate coverage.json
+
+  production-extras:
+    name: Production extras ${{ matrix.python-version }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      UV_PYTHON: ${{ matrix.python-version }}
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - name: Install uv and Python
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          python-version: ${{ matrix.python-version }}
+          enable-cache: true
+      - name: Build wheel and smoke-check production extras
+        run: |
+          PYTHONPATH=src uv run --no-project python -m local_voice_harness.production_extras \
+            --python "$UV_PYTHON"

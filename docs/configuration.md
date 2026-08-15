@@ -224,7 +224,9 @@ supported on the current machine. Use `--defaults` for a non-interactive first
 write with Venice LLM/TTS and local Parakeet dictation. The equivalent
 `--profile showcase` also migrates an existing `backends.toml` into the unified
 configuration and retains the original as `backends.toml.migrated` so legacy
-provider values cannot override the selected profile. `config set` accepts dotted keys such as
+provider values cannot override the selected profile. The showcase profile
+selects Venice LLM/TTS and CPU dictation. The matching installer path is
+`PROFILE=showcase ./scripts/install.sh`. `config set` accepts dotted keys such as
 `audio.wake_threshold`, `compute.dictation_backend`, and
 `platform.cursor_followup`. After a change, the CLI reports which installed
 services are currently running and need a restart, for example
@@ -322,7 +324,8 @@ voice-harness plan-approval ask
 
 | Variable | Purpose | Default | Configuration channel |
 | --- | --- | --- | --- |
-| `VOICE_HARNESS_SOURCE` | PipeWire microphone source | Development-machine source | Process environment override |
+| `VOICE_HARNESS_SOURCE` | PipeWire microphone source; empty uses the system default | System default | Process environment override |
+| `VOICE_HARNESS_SINK` | PipeWire playback sink; empty uses the system default | System default | Process environment override |
 | `VOICE_HARNESS_VOICE` | Absolute Chatterbox reference WAV path | Built-in voice | Process environment override |
 | `VOICE_HARNESS_WAKE_THRESHOLD` | OpenWakeWord activation threshold (`0`–`1`) | `0.55` | Process environment override |
 | `VOICE_HARNESS_MIN_SPEECH_RMS` | Non-negative speech energy gate | `1100` | Process environment override |
@@ -358,11 +361,22 @@ voice-harness plan-approval ask
 | `DICTATION_VAD_MAX_SECONDS` | Positive maximum duration of each VAD utterance | `120` | Environment override |
 | `DICTATION_VAD_MIN_SPEECH_RMS` | Non-negative VAD speech energy gate | `1100` | Environment override |
 | `DICTATION_BACKEND` | Dictation engine (`parakeet` or `whisper`) | `parakeet` | Environment override; legacy `backend.env` input |
+| `VOICE_HARNESS_LLM_DEVICE` | Local LLM compute device (`auto`, `cpu`, or `cuda`) | `auto` | Environment override |
+| `VOICE_HARNESS_TTS_DEVICE` | Local TTS compute device (`auto`, `cpu`, or `cuda`) | `auto` | Environment override |
 | `DICTATION_DEVICE` | Dictation compute device (`auto`, `cpu`, or `cuda`) | `auto` | Environment override; legacy `backend.env` input |
 | `DICTATION_MODEL` | Backend model | `nemo-parakeet-tdt-0.6b-v2` | Environment override; legacy `backend.env` input |
 | `DICTATION_QUANTIZATION` | Parakeet ONNX quantization (`none` disables it) | `int8` | Environment override; legacy `backend.env` input |
 | `DICTATION_COMPUTE` | faster-whisper compute type | `float16` | Environment override; legacy `backend.env` input |
 | `DICTATION_LANGUAGE` | Spoken language to transcribe (`en`, `zh`, `english`, `chinese`, or `auto`) | `auto` | Environment override; legacy `backend.env` input |
+
+Local LLM and TTS use the same typed `auto`, `cpu`, and `cuda` selectors through
+`compute.llm_device` and `compute.tts_device`. CPU paths never probe or call CUDA:
+llama.cpp is launched with `--n-gpu-layers 0` and no `--device`, and Chatterbox
+loads on `device="cpu"` without `torch.cuda` synchronization. Explicit `cuda`
+fails at service start when the device is unavailable. `auto` prefers CUDA when
+the launcher can prove it and otherwise uses CPU. Installation and `voice-harness
+doctor` report the configured modes and skip CUDA packages/tools when every local
+component is CPU.
 
 `cpu` is a strict CPU path: Parakeet receives only ONNX Runtime's CPU provider,
 faster-whisper receives `device="cpu"`, incompatible half-precision Whisper compute
