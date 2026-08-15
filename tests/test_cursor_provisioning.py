@@ -5330,7 +5330,9 @@ class CursorJobStateTests(unittest.TestCase):
 
         updated = jobs.read_job("123456789abc")
         self.assertEqual(updated["status"], "completed")
-        self.assertEqual(updated["github_repo_create_operation_state"], "created")
+        self.assertEqual(
+            updated["github_repo_create_operation_state"], "clone_verified"
+        )
         self.assertEqual(
             updated["github_repo_created_url"],
             "https://github.com/acme/payments",
