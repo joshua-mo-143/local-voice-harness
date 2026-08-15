@@ -494,6 +494,19 @@ _WPCTL_FILTER_STATUS = _WPCTL_STATUS.replace(
 
 
 class PipewireTests(unittest.TestCase):
+    def test_terminal_section_header_is_parsed(self) -> None:
+        status = """\
+Audio
+ ├─ Sinks:
+ │  *   62. output.node
+ └─ Sources:
+    *   63. input.node
+"""
+        self.assertEqual(
+            checks.pipewire_section_devices(status, "Sources"),
+            ("input.node",),
+        )
+
     def test_missing_wpctl_is_fatal(self) -> None:
         with mock.patch.object(checks, "_which", return_value=None):
             results = checks.check_pipewire_devices(_snapshot())

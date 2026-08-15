@@ -665,7 +665,12 @@ def pipewire_section_devices(status: str, section: str) -> tuple[str, ...]:
         stripped = line.strip()
         if stripped.startswith("Audio"):
             collecting = False
-        if stripped.rstrip(":") in {section, f"├─ {section}", f"│  {section}"}:
+        if stripped.rstrip(":") in {
+            section,
+            f"├─ {section}",
+            f"└─ {section}",
+            f"│  {section}",
+        }:
             collecting = True
             continue
         if collecting and (
