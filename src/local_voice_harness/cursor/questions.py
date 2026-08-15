@@ -154,7 +154,11 @@ def ask(
             review_reference=str(
                 changes.get("review_artifact") or job.review_artifact or ""
             ),
-            review_accepted=bool(changes.get("review_approved", job.review_approved)),
+            review_accepted=(
+                changes.get("review_approval_source") is not None
+                if "review_approval_source" in changes
+                else job.review_approved
+            ),
         )
         changes.update(
             plan_approval_state=approval.state.value,
@@ -716,7 +720,6 @@ def _workflow_queue_answer(
     workflow_reason: str | None = None,
     review_round: int | None = None,
     active_participant: str | None = None,
-    review_approved: bool | None = None,
     review_approval_source: str | None = None,
     clear_target: bool = False,
     extra_changes: Mapping[str, object] | None = None,
@@ -770,8 +773,6 @@ def _workflow_queue_answer(
         changes["review_round"] = review_round
     if active_participant is not None:
         changes["active_participant"] = active_participant
-    if review_approved is not None:
-        changes["review_approved"] = review_approved
     if review_approval_source is not None:
         changes["review_approval_source"] = review_approval_source
     changes.update(extra_changes or {})
@@ -874,7 +875,6 @@ def _workflow_review_exhausted_answer(
             context,
             continuation=False,
             workflow_phase=WorkflowPhase.IMPLEMENTING.value,
-            review_approved=approved_review.approved,
             review_approval_source=ReviewApprovalSource.USER.value,
             extra_changes={
                 "plan_approval_state": approval.state.value,

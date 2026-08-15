@@ -3159,7 +3159,6 @@ def _advance_workflow_output(
                     classification_reason[:500],
                 ),
                 prompt_operation_state="none",
-                review_approved=False,
                 review_decision=None,
                 review_approval_source=None,
             ),
@@ -3280,7 +3279,6 @@ def _advance_workflow_output(
                     prompt_operation_state="none",
                     job_changes={
                         "review_artifact": reference,
-                        "review_approved": True,
                         "review_decision": "approve",
                         "review_approval_source": "reviewer",
                         "plan_approval_state": "awaiting",
@@ -3479,7 +3477,6 @@ def _advance_workflow_output(
                     plan_artifact=None,
                     review_artifact=None,
                     prompt_operation_state="none",
-                    review_approved=False,
                     review_decision=None,
                     review_approval_source=None,
                     plan_approval_state="none",

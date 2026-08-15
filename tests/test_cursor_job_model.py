@@ -14,7 +14,11 @@ from local_voice_harness.cursor.model import (
     transition,
     validate_reservations,
 )
-from local_voice_harness.cursor.workflow import LegacyPlanApprovalProof
+from local_voice_harness.cursor.workflow import (
+    ArtifactReference,
+    LegacyPlanApprovalProof,
+    ReviewDecision,
+)
 from local_voice_harness.job_lifecycle import ReconcilingJob
 
 
@@ -517,6 +521,182 @@ class CursorJobModelTests(unittest.TestCase):
             CursorJob.from_dict(job.to_dict()).plan_approval,
             job.plan_approval,
         )
+        self.assertTrue(job.review_approved)
+        self.assertNotIn("review_approved", job.to_dict())
+
+    def test_legacy_review_boolean_imports_to_approval_source(self) -> None:
+        job = CursorJob.from_dict(
+            {
+                "schema_version": 9,
+                "id": "123456789abc",
+                "revision": 0,
+                "request": "change recovery",
+                "status": "queued",
+                "created_at": 1,
+                "queued_at": 1,
+                "delivered": False,
+                "workflow_tier": "medium",
+                "workflow_classification_reason": "recovery",
+                "workflow_phase": "reviewing",
+                "review_round": 0,
+                "plan_artifact": ".artifacts/123456789abc/plan-0.json",
+                "review_artifact": ".artifacts/123456789abc/review-0.json",
+                "review_decision": "approve",
+                "review_approved": True,
+            }
+        )
+
+        self.assertEqual(job.review_approval_source, "reviewer")
+        self.assertTrue(job.review_approved)
+        self.assertNotIn("review_approved", job.to_dict())
+
+    def test_native_review_approval_cannot_disagree_with_source(self) -> None:
+        with self.assertRaisesRegex(JobValidationError, "must be paired"):
+            CursorJob.from_dict(
+                {
+                    "schema_version": CURRENT_SCHEMA_VERSION,
+                    "id": "123456789abc",
+                    "revision": 0,
+                    "request": "change recovery",
+                    "status": "queued",
+                    "created_at": 1,
+                    "queued_at": 1,
+                    "delivered": False,
+                    "workflow_tier": "medium",
+                    "workflow_classification_reason": "recovery",
+                    "workflow_phase": "reviewing",
+                    "review_round": 0,
+                    "plan_artifact": ".artifacts/123456789abc/plan-0.json",
+                    "review_artifact": ".artifacts/123456789abc/review-0.json",
+                    "review_decision": "approve",
+                    "review_approved": True,
+                    "review_approval_source": None,
+                }
+            )
+        with self.assertRaisesRegex(JobValidationError, "must be paired"):
+            CursorJob.from_dict(
+                {
+                    "schema_version": CURRENT_SCHEMA_VERSION,
+                    "id": "bbbbbbbbbbbb",
+                    "revision": 0,
+                    "request": "change recovery",
+                    "status": "queued",
+                    "created_at": 1,
+                    "queued_at": 1,
+                    "delivered": False,
+                    "workflow_tier": "medium",
+                    "workflow_classification_reason": "recovery",
+                    "workflow_phase": "reviewing",
+                    "review_round": 0,
+                    "plan_artifact": ".artifacts/123456789abc/plan-0.json",
+                    "review_artifact": ".artifacts/123456789abc/review-0.json",
+                    "review_decision": "approve",
+                    "review_approved": False,
+                    "review_approval_source": "reviewer",
+                }
+            )
+
+    def test_reviewer_approval_still_requires_decision_and_artifact(self) -> None:
+        with self.assertRaisesRegex(JobValidationError, "approving review decision"):
+            CursorJob.from_dict(
+                {
+                    "schema_version": CURRENT_SCHEMA_VERSION,
+                    "id": "123456789abc",
+                    "revision": 0,
+                    "request": "change recovery",
+                    "status": "queued",
+                    "created_at": 1,
+                    "queued_at": 1,
+                    "delivered": False,
+                    "workflow_tier": "medium",
+                    "workflow_classification_reason": "recovery",
+                    "workflow_phase": "reviewing",
+                    "review_round": 0,
+                    "plan_artifact": ".artifacts/123456789abc/plan-0.json",
+                    "review_artifact": ".artifacts/123456789abc/review-0.json",
+                    "review_decision": "revise",
+                    "review_approval_source": "reviewer",
+                }
+            )
+        with self.assertRaisesRegex(JobValidationError, "review artifact"):
+            CursorJob.from_dict(
+                {
+                    "schema_version": CURRENT_SCHEMA_VERSION,
+                    "id": "bbbbbbbbbbbb",
+                    "revision": 0,
+                    "request": "change recovery",
+                    "status": "queued",
+                    "created_at": 1,
+                    "queued_at": 1,
+                    "delivered": False,
+                    "workflow_tier": "medium",
+                    "workflow_classification_reason": "recovery",
+                    "workflow_phase": "reviewing",
+                    "review_round": 0,
+                    "plan_artifact": ".artifacts/bbbbbbbbbbbb/plan-0.json",
+                    "review_decision": "approve",
+                    "review_approval_source": "reviewer",
+                }
+            )
+
+    def test_user_override_still_requires_exhausted_high_risk_proof(self) -> None:
+        with self.assertRaisesRegex(JobValidationError, "exhausted high-risk"):
+            CursorJob.from_dict(
+                {
+                    "schema_version": CURRENT_SCHEMA_VERSION,
+                    "id": "123456789abc",
+                    "revision": 0,
+                    "request": "change recovery",
+                    "status": "queued",
+                    "created_at": 1,
+                    "queued_at": 1,
+                    "delivered": False,
+                    "workflow_tier": "high-risk",
+                    "workflow_classification_reason": "recovery",
+                    "workflow_phase": "reviewing",
+                    "review_round": 1,
+                    "plan_artifact": ".artifacts/123456789abc/plan-1.json",
+                    "review_artifact": ".artifacts/123456789abc/review-1.json",
+                    "review_decision": "revise",
+                    "review_approval_source": "user",
+                }
+            )
+
+    def test_native_review_transition_does_not_emit_approval_boolean(self) -> None:
+        job = CursorJob.from_dict(
+            {
+                "schema_version": CURRENT_SCHEMA_VERSION,
+                "id": "123456789abc",
+                "revision": 0,
+                "request": "change recovery",
+                "status": "queued",
+                "created_at": 1,
+                "queued_at": 1,
+                "delivered": False,
+                "workflow_tier": "medium",
+                "workflow_classification_reason": "recovery",
+                "workflow_phase": "reviewing",
+                "review_round": 0,
+                "plan_artifact": ".artifacts/123456789abc/plan-0.json",
+            }
+        )
+        approved = job.evolve_review(
+            job.review_state.publish_review(
+                ArtifactReference.parse(
+                    ".artifacts/123456789abc/review-0.json",
+                    job_id=job.id,
+                    kind="review",
+                ),
+                ReviewDecision.APPROVE,
+            )
+        )
+
+        self.assertTrue(approved.review_approved)
+        self.assertEqual(approved.review_approval_source, "reviewer")
+        self.assertNotIn("review_approved", approved.to_dict())
+        reloaded = CursorJob.from_dict(approved.to_dict())
+        self.assertTrue(reloaded.review_approved)
+        self.assertEqual(reloaded.review_state.approved, reloaded.review_approved)
 
     def test_v9_exhausted_review_migrates_to_explicit_clarification(self) -> None:
         job = CursorJob.from_dict(

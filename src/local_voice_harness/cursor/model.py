@@ -971,6 +971,20 @@ def _canonicalize_announcement_dismissal(
     values.pop("announcement_dismissed", None)
 
 
+def _canonicalize_review_approval(values: dict[str, object]) -> None:
+    """Translate legacy approval boolean, fail closed on conflict, then drop it."""
+
+    approved_present = "review_approved" in values
+    source_present = "review_approval_source" in values
+    approved = bool(values.get("review_approved")) if approved_present else None
+    source = values.get("review_approval_source")
+    if approved_present and source_present and approved != (source is not None):
+        raise JobValidationError("review approval and approval source must be paired")
+    if approved_present and not source_present and approved:
+        values["review_approval_source"] = "reviewer"
+    values.pop("review_approved", None)
+
+
 def _pair_worker_ownership(values: dict[str, object]) -> None:
     """Keep newly typed worker claims all-or-nothing without rewriting legacy rows."""
     if "worker_claimed_at" not in values:
@@ -1079,6 +1093,7 @@ def migrate_job_record(raw: Mapping[str, object]) -> tuple[dict[str, object], in
         values,
         legacy_record=loaded_version < CURRENT_SCHEMA_VERSION,
     )
+    _canonicalize_review_approval(values)
     values["schema_version"] = CURRENT_SCHEMA_VERSION
     return values, loaded_version
 
@@ -3071,7 +3086,7 @@ class AgentJob:
 
     @property
     def review_approved(self) -> bool:
-        return self._boolean_field("review_approved")
+        return self.review_approval_source is not None
 
     @property
     def review_decision(self) -> str | None:
@@ -3175,7 +3190,6 @@ class AgentJob:
             review_decision=(
                 review.decision.value if review.decision is not None else None
             ),
-            review_approved=review.approved,
             review_approval_source=(
                 review.approval_source.value
                 if review.approval_source is not None
