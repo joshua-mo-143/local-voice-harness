@@ -21,6 +21,8 @@ COMPUTE_DEVICES = frozenset({"auto", "cpu", "cuda"})
 NVIDIA_PACKAGE_MARKERS = ("cuda", "nvidia-", "llama.cpp-cuda")
 BASE_PACKAGES = (
     "pipewire",
+    "pipewire-tools",
+    "wireplumber",
     "libnotify",
     "git",
     "curl",

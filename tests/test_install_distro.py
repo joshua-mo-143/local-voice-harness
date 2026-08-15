@@ -105,6 +105,20 @@ class DistroPackageAdapterTests(unittest.TestCase):
         self.assertTrue(fedora.uv_bootstrap)
         self.assertFalse(arch.uv_bootstrap)
 
+    def test_every_family_installs_pipewire_control_and_capture_tools(self) -> None:
+        expected = {
+            DistroFamily.ARCH: {"pipewire-audio", "wireplumber"},
+            DistroFamily.DEBIAN: {"pipewire-bin", "wireplumber"},
+            DistroFamily.FEDORA: {"pipewire-utils", "wireplumber"},
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            checkout = Path(temporary) / "checkout"
+            checkout.mkdir()
+            for family, packages in expected.items():
+                with self.subTest(family=family.value):
+                    plan = _plan(family, checkout=checkout)
+                    self.assertTrue(packages.issubset(plan.packages))
+
     def test_local_cuda_cuda_packages_stay_arch_specific(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             checkout = Path(temporary) / "checkout"
