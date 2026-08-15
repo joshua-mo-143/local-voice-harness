@@ -266,7 +266,8 @@ class ServerStreamingTests(unittest.TestCase):
             },
         )
         self.assertEqual(request.get_header("Authorization"), "Bearer venice-secret")
-        self.assertEqual(urlopen.call_args.kwargs["timeout"], 19)
+        self.assertGreater(urlopen.call_args.kwargs["timeout"], 0)
+        self.assertLessEqual(urlopen.call_args.kwargs["timeout"], 19)
 
     def test_venice_synthesis_uses_request_voice_as_provider_override(self) -> None:
         settings = replace(
@@ -466,6 +467,42 @@ class ServerStreamingTests(unittest.TestCase):
                 server.VENICE_RETRY_BACKOFF_SECONDS * 2,
             ],
         )
+
+    def test_venice_does_not_retry_after_speech_timeout_budget(self) -> None:
+        settings = replace(
+            load_backend_settings({}),
+            tts_provider="venice",
+            tts_endpoint="https://api.venice.ai/api/v1/audio/speech",
+            tts_timeout=19,
+        )
+        closed = urllib.error.URLError("Remote end closed connection without response")
+        clock = {"now": 0.0}
+
+        def fail_and_consume_budget(*_args: object, **_kwargs: object) -> object:
+            clock["now"] = settings.tts_timeout
+            raise closed
+
+        with (
+            mock.patch.object(server, "SETTINGS", settings),
+            mock.patch.object(
+                server, "get_venice_api_key", return_value="venice-secret"
+            ),
+            mock.patch.object(
+                server, "pooled_urlopen", side_effect=fail_and_consume_budget
+            ) as urlopen,
+            mock.patch.object(
+                server.time, "monotonic", side_effect=lambda: clock["now"]
+            ),
+            mock.patch.object(server.time, "sleep") as sleep,
+            self.assertRaisesRegex(
+                RuntimeError,
+                "Venice TTS request failed: .*Remote end closed connection",
+            ),
+        ):
+            server._venice_audio("Hello.")
+
+        urlopen.assert_called_once()
+        sleep.assert_not_called()
 
     def test_venice_rejects_truncated_wav_before_returning_audio(self) -> None:
         headers = Message()

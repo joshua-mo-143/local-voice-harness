@@ -235,16 +235,26 @@ def _venice_audio(
     )
     attempts_remaining = VENICE_AUDIO_ATTEMPTS
     backoff = VENICE_RETRY_BACKOFF_SECONDS
+    deadline = time.monotonic() + settings.tts_timeout
+    last_error: RuntimeError | None = None
     while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            if last_error is not None:
+                raise last_error
+            raise RuntimeError("Venice TTS request failed: timed out")
         started = time.perf_counter()
         try:
-            with pooled_urlopen(request, timeout=settings.tts_timeout) as response:
+            with pooled_urlopen(request, timeout=remaining) as response:
                 content_type = response.headers.get_content_type()
                 audio = response.read(MAX_AUDIO_BYTES + 1)
         except urllib.error.HTTPError as exc:
             error = _venice_http_failure(exc)
+            last_error = error
             attempts_remaining -= 1
             if exc.code not in VENICE_RETRYABLE_HTTP_CODES or attempts_remaining <= 0:
+                raise error from exc
+            if deadline - time.monotonic() <= backoff:
                 raise error from exc
             log(f"Venice TTS HTTP {exc.code}; retrying ({attempts_remaining} left)")
             time.sleep(backoff)
@@ -252,8 +262,11 @@ def _venice_audio(
             continue
         except (OSError, urllib.error.URLError) as exc:
             error = RuntimeError(f"Venice TTS request failed: {exc}")
+            last_error = error
             attempts_remaining -= 1
             if attempts_remaining <= 0:
+                raise error from exc
+            if deadline - time.monotonic() <= backoff:
                 raise error from exc
             log(f"Venice TTS transport failed; retrying ({attempts_remaining} left)")
             time.sleep(backoff)
