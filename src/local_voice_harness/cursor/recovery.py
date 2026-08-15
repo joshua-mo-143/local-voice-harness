@@ -1004,6 +1004,63 @@ def reconcile_uncertain_repo_creation(
     store.update(job.id, clone_verified)
 
 
+def reconcile_uncertain_clone(
+    store: JobStore,
+    job: CursorJob,
+    *,
+    now: float,
+    github_factory: GitHubFactory = GitHubClient,
+) -> None:
+    states = frozenset({"submitted", "ambiguous"})
+    if job.clone_operation_state not in states:
+        return
+    source = (job.clone_source or "").strip()
+    try:
+        checkout = (
+            _github_provider(github_factory).observe_clone(source) if source else None
+        )
+    except GitHubError:
+        checkout = None
+
+    def reconcile(current: CursorJob) -> CursorJob | None:
+        if current.clone_operation_state not in states:
+            return None
+        if checkout is None:
+            message = (
+                "Repository clone could not be reconciled automatically. "
+                "Check the configured GitHub root before trying again."
+            )
+            return current.evolve_recovery(
+                now=now,
+                status=JobStatus.BLOCKED,
+                clone_operation_state="manual_required",
+                result=message,
+                completed_at=now,
+                reconcile=False,
+                worker_operation=None,
+                worker_pid=None,
+                worker_boot_id=None,
+                worker_process_start=None,
+                worker_token=None,
+                prepare_delivery=True,
+            )
+        return current.evolve_recovery(
+            now=now,
+            status=JobStatus.QUEUED,
+            queued_at=now,
+            repository=str(checkout),
+            clone_operation_state="cloned",
+            reconcile=False,
+            worker_operation=None,
+            worker_pid=None,
+            worker_boot_id=None,
+            worker_process_start=None,
+            worker_token=None,
+        )
+
+    store.update(job.id, reconcile)
+
+
 def reconcile_uncertain_linear_ticket_creation(
     store: JobStore,
     job: CursorJob,
@@ -1257,6 +1314,8 @@ def reconcile_uncertain_operations(
         herdr_factory=herdr_factory,
         linear_factory=linear_factory,
     )
+    current = store.get(job.id)
+    reconcile_uncertain_clone(store, current, now=now, github_factory=github_factory)
     current = store.get(job.id)
     reconcile_uncertain_fork(store, current, now=now, github_factory=github_factory)
     current = store.get(job.id)

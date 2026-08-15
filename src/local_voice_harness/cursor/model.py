@@ -502,6 +502,7 @@ _CLONE_OPERATION_STATES = frozenset(
         "submitted",
         "cloned",
         "ambiguous",
+        "manual_required",
     }
 )
 _WORKTREE_OPERATION_STATES = frozenset(

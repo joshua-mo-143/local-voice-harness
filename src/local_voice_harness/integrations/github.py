@@ -1398,6 +1398,44 @@ class GitHubClient:
         except LocalGitError as exc:
             self._raise_local_git_error(exc)
 
+    def observe_clone(self, source: str) -> Path | None:
+        """Return the checkout if a prior clone already landed. Never clones."""
+
+        repository = github_repository_from_url(source)
+        if repository is None:
+            try:
+                repository = self.validate_repository(source)
+            except GitHubError:
+                repository = None
+        if repository is not None:
+            owner, name = repository.split("/", 1)
+            destination = self.local_git.clone_root / owner / name
+            if not destination.exists():
+                return None
+            try:
+                expected = ExpectedRemote.from_url(f"https://github.com/{repository}")
+                self.local_git.verify_checkout(
+                    destination,
+                    expected,
+                    expected_label=repository,
+                )
+            except LocalGitError:
+                return None
+            return destination.resolve()
+        name = source.strip().rstrip("/").rsplit("/", 1)[-1]
+        if name.casefold().endswith(".git"):
+            name = name[:-4]
+        if not name or name.startswith("."):
+            return None
+        destination = self.local_git.clone_root / name
+        if not destination.exists():
+            return None
+        try:
+            self.local_git.verify_checkout(destination)
+        except LocalGitError:
+            return None
+        return destination.resolve()
+
     def find_repository_checkout(
         self, source: GitHubRepository, candidates: list[Path]
     ) -> Path | None:
@@ -2308,6 +2346,9 @@ class GitHubProvider:
             )
         except LocalGitError as exc:
             self._client._raise_local_git_error(exc)
+
+    def observe_clone(self, source: str) -> Path | None:
+        return self._client.observe_clone(source)
 
     def materialize_fork(
         self,

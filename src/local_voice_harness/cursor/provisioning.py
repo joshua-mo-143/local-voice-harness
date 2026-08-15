@@ -16,7 +16,6 @@ from ..errors import HarnessError
 from ..github_issue_creation import (
     draft_github_issue,
     issue_draft_from_trusted_brief,
-    repository_from_utterance,
 )
 from ..integrations.github import (
     GitHubClient,
@@ -32,6 +31,7 @@ from ..integrations.github import (
     GitHubPullRequestCreationPlan,
     GitHubPullRequestCreationResult,
     GitHubPullRequestMergeResult,
+    GitHubRepoCreationPlan,
     GitHubRepoCreationResult,
     GitHubRepository,
     github_repository_from_url,
@@ -1857,6 +1857,43 @@ def _complete_github_repo_creation_without_write(
     )
 
 
+def _github_repo_name_collision(exc: BaseException) -> bool:
+    return "already exists" in str(exc).casefold()
+
+
+def _ask_other_repo_create_name(
+    store: JobStore,
+    job: CursorJob,
+    token: WorkerClaim,
+    plan: GitHubRepoCreationPlan,
+    owner: str,
+    *,
+    expected_revision: int,
+) -> None:
+    _worker_question(
+        store,
+        job.id,
+        token,
+        (
+            f"{plan.name_with_owner} already exists. "
+            "What other repository name should I use?"
+        ),
+        expected_revision=expected_revision,
+        clarification_kind="github_repo_create_slug",
+        job_changes={
+            "github_repository": owner,
+            "github_repo_create_confirmed": False,
+            "github_repo_create_marker": None,
+            "github_repo_create_operation_state": None,
+            **(
+                {"github_repo_create_owner": owner}
+                if job.github_repo_create_org_requested
+                else {}
+            ),
+        },
+    )
+
+
 def _resolve_github_repo_create_owner(
     store: JobStore,
     job: CursorJob,
@@ -1870,10 +1907,6 @@ def _resolve_github_repo_create_owner(
     named = (job.github_repo_create_owner or "").strip()
     if not named:
         named = parse_repo_create_org(trusted) or ""
-    if not named:
-        spoken_repository = repository_from_utterance(trusted)
-        if spoken_repository and "/" in spoken_repository:
-            named = spoken_repository.split("/", 1)[0].strip()
     if not named:
         try:
             organizations = github.list_organizations()
@@ -2128,27 +2161,13 @@ def _run_github_repo_creation(
     if existing is not None:
         observed = github.observe_repository_creation(plan)
         if observed is None:
-            _worker_question(
+            _ask_other_repo_create_name(
                 store,
-                job.id,
+                job,
                 token,
-                (
-                    f"{plan.name_with_owner} already exists. "
-                    "What other repository name should I use?"
-                ),
+                plan,
+                owner,
                 expected_revision=job.revision,
-                clarification_kind="github_repo_create_slug",
-                job_changes={
-                    "github_repository": owner,
-                    "github_repo_create_confirmed": False,
-                    "github_repo_create_marker": None,
-                    "github_repo_create_operation_state": None,
-                    **(
-                        {"github_repo_create_owner": owner}
-                        if job.github_repo_create_org_requested
-                        else {}
-                    ),
-                },
             )
             return
         _materialize_created_github_repo(
@@ -2196,6 +2215,22 @@ def _run_github_repo_creation(
                 store, submitted, token, github, visible, checkpoint
             )
             return
+        if _github_repo_name_collision(exc):
+            collision = None
+            try:
+                collision = github.lookup_repository(plan.name_with_owner)
+            except GitHubError:
+                collision = None
+            if collision is not None:
+                _ask_other_repo_create_name(
+                    store,
+                    job,
+                    token,
+                    plan,
+                    owner,
+                    expected_revision=submitted.revision,
+                )
+                return
         if not isinstance(exc, GitHubCommandStartError):
 
             def ambiguous(current: CursorJob) -> CursorJob:

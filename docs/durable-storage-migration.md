@@ -50,9 +50,9 @@ success.
 | Import-only fields | 4 |
 | Directly exposed `CursorJob` properties | 187 |
 | Compatibility adapters | 38 |
-| Public transition entry points | 78 |
+| Public transition entry points | 79 |
 | Documented duplicate authorities | 0 |
-| Lifecycle-related module lines | 29341 |
+| Lifecycle-related module lines | 29446 |
 
 #358 unified ordinary and clarification submission onto one
 `prompt_operations.PromptOperationState`. #359 made that typed operation the

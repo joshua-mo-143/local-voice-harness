@@ -441,7 +441,11 @@ def _build_field_ownership() -> tuple[FieldOwnership, ...]:
             typed_runtime="CheckoutOperation / ForkOperation",
             transition_owner="cursor.operations.CheckoutOperation.transition / ForkOperation.transition",
             adapter="CursorJob.checkout_operation / fork_operation",
-            callers=_CHECKOUT_CALLERS + ("cursor.recovery.reconcile_uncertain_fork",),
+            callers=_CHECKOUT_CALLERS
+            + (
+                "cursor.recovery.reconcile_uncertain_fork",
+                "cursor.recovery.reconcile_uncertain_clone",
+            ),
             duplicate=(
                 "Fork labels such as retained, quarantined, confirmed_absent, "
                 "and failed_observing still collapse into generic "
@@ -1169,6 +1173,12 @@ TRANSITION_ENTRY_POINTS: tuple[TransitionEntry, ...] = (
         AuthorityKind.CALLER_INTERPRETS,
     ),
     _entry(
+        "local_voice_harness.cursor.recovery.reconcile_uncertain_clone",
+        "cursor.recovery",
+        "repository-clone observation",
+        AuthorityKind.CALLER_INTERPRETS,
+    ),
+    _entry(
         "local_voice_harness.cursor.recovery.reconcile_uncertain_linear_ticket_creation",
         "cursor.recovery",
         "Linear ticket-create observation",
@@ -1456,7 +1466,7 @@ BASELINE_COUNTS: dict[str, int] = {
     "import_only_fields": 4,
     "cursor_job_public_properties": 187,
     "compatibility_adapters": 38,
-    "transition_entry_points": 78,
+    "transition_entry_points": 79,
     "duplicate_authorities": 0,
-    "lifecycle_module_lines": 29341,
+    "lifecycle_module_lines": 29446,
 }
