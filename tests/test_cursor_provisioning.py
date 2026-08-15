@@ -4097,6 +4097,7 @@ class CursorJobStateTests(unittest.TestCase):
             utterance=None,
             context_repository=None,
             issue_key=None,
+            harness_kind=None,
             foreground_seconds=5.0,
             integrations=mock.ANY,
         )
