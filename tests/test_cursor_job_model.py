@@ -1225,6 +1225,58 @@ class CursorJobModelTests(unittest.TestCase):
         self.assertIsNone(targeted.github_issue_created_url)
         self.assertNotIn("github_issue_created_number", targeted.to_dict())
 
+    def _pull_request_job(self, **fields: object) -> CursorJob:
+        values: dict[str, object] = {
+            "schema_version": CURRENT_SCHEMA_VERSION,
+            "id": "123456789abc",
+            "revision": 0,
+            "request": "review pull request 42",
+            "status": "queued",
+            "created_at": 1,
+            "queued_at": 1,
+            "delivered": False,
+            "repository": "/repo",
+            "github_repository": "example/project",
+            "github_pull_request": 42,
+            "worktree_branch": "voice/github-pr-123456789abc",
+            "worktree_path": "/repo-wt",
+            "worktree_workspace_id": "workspace",
+            "worktree_root_pane_id": "root-pane",
+            "worktree_provision_state": "ready",
+            "pull_request_worktree_state": "ready",
+            "pull_request_remote_url": "https://github.com/example/project",
+            "pull_request_head_ref": "refs/pull/42/head",
+            "pull_request_head_oid": "a" * 40,
+        }
+        values.update(fields)
+        return CursorJob.from_dict(values)
+
+    def test_legacy_pull_request_branch_imports_to_worktree_branch(self) -> None:
+        job = self._pull_request_job(
+            worktree_branch=None,
+            pull_request_branch="voice/github-pr-123456789abc",
+        )
+
+        self.assertEqual(job.worktree_branch, "voice/github-pr-123456789abc")
+        self.assertEqual(job.pull_request_branch, "voice/github-pr-123456789abc")
+        self.assertNotIn("pull_request_branch", job.to_dict())
+
+    def test_native_pull_request_branch_cannot_disagree_with_worktree_branch(
+        self,
+    ) -> None:
+        with self.assertRaisesRegex(JobValidationError, "must match"):
+            self._pull_request_job(pull_request_branch="voice/other-branch")
+
+    def test_ready_pull_request_job_does_not_emit_branch_mirror(self) -> None:
+        job = self._pull_request_job()
+
+        self.assertEqual(job.worktree_branch, "voice/github-pr-123456789abc")
+        self.assertEqual(job.pull_request_branch, "voice/github-pr-123456789abc")
+        self.assertNotIn("pull_request_branch", job.to_dict())
+        reloaded = CursorJob.from_dict(job.to_dict())
+        self.assertEqual(reloaded.pull_request_branch, reloaded.worktree_branch)
+        self.assertNotIn("pull_request_branch", reloaded.to_dict())
+
     def test_unfinished_create_states_keep_marker_without_created_identity(
         self,
     ) -> None:

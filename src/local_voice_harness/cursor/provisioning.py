@@ -1697,6 +1697,11 @@ def _prepare_pull_request_checkout(
                         checkpoint()
                     continue
                 raise
+            if checked_out_branch != branch:
+                raise HarnessError(
+                    "checked-out pull-request branch does not match the planned "
+                    "worktree branch"
+                )
             break
         if checkpoint is not None:
             checkpoint()
@@ -1721,7 +1726,6 @@ def _prepare_pull_request_checkout(
 
     def ready(current: CursorJob) -> CursorJob:
         return current.evolve(
-            pull_request_branch=checked_out_branch or branch,
             pull_request_worktree_state="ready",
             pull_request_worktree_error=None,
         )

@@ -1326,6 +1326,7 @@ _GITHUB_STATE_DERIVED_FIELDS = frozenset(
     {
         "github_issue_created_number",
         "github_issue_created_url",
+        "pull_request_branch",
     }
 )
 

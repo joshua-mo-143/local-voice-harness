@@ -574,6 +574,8 @@ class GitHubProviderStateTests(unittest.TestCase):
         }
 
         nested = dump_github_provider_state(flat)
+        expected = dict(flat)
+        expected.pop("pull_request_branch")
 
         self.assertEqual(nested["version"], 1)
         self.assertEqual(
@@ -585,17 +587,30 @@ class GitHubProviderStateTests(unittest.TestCase):
             {
                 "number": 7,
                 "worktree_state": "ready",
-                "branch": "voice/pr",
                 "worktree_error": None,
                 "remote_url": "https://github.com/source/project",
                 "head_ref": "refs/pull/7/head",
                 "head_oid": "a" * 40,
             },
         )
-        self.assertEqual(load_github_provider_state(nested), flat)
+        self.assertEqual(load_github_provider_state(nested), expected)
         self.assertEqual(
-            GitHubProvider.load_state(GitHubProvider.dump_state(flat)), flat
+            GitHubProvider.load_state(GitHubProvider.dump_state(flat)), expected
         )
+
+    def test_legacy_pull_request_branch_still_imports(self) -> None:
+        nested = {
+            "version": 1,
+            "pull_request": {
+                "number": 7,
+                "branch": "voice/pr",
+                "worktree_state": "ready",
+            },
+        }
+
+        loaded = load_github_provider_state(nested)
+        self.assertEqual(loaded["pull_request_branch"], "voice/pr")
+        self.assertEqual(loaded["github_pull_request"], 7)
 
     def test_legacy_created_identity_loads_and_native_dump_omits_mirrors(
         self,

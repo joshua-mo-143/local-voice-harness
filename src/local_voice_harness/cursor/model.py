@@ -1075,6 +1075,20 @@ def _canonicalize_github_issue_creation_identity(values: dict[str, object]) -> N
     values.pop("github_issue_created_url", None)
 
 
+def _canonicalize_pull_request_branch(values: dict[str, object]) -> None:
+    """Translate legacy PR branch, fail closed on conflict, then drop the mirror."""
+
+    stored = values.get("pull_request_branch")
+    planned = values.get("worktree_branch")
+    if stored is not None and planned is not None and str(stored) != str(planned):
+        raise JobValidationError(
+            "pull-request branch must match the planned worktree branch"
+        )
+    if stored is not None and planned is None:
+        values["worktree_branch"] = str(stored)
+    values.pop("pull_request_branch", None)
+
+
 def _default_participant_admission_state(values: Mapping[str, object]) -> str:
     status = str(values.get("status") or "")
     if any(
@@ -1160,6 +1174,7 @@ def migrate_job_record(raw: Mapping[str, object]) -> tuple[dict[str, object], in
         legacy_record=loaded_version < CURRENT_SCHEMA_VERSION,
     )
     _canonicalize_github_issue_creation_identity(values)
+    _canonicalize_pull_request_branch(values)
     values["schema_version"] = CURRENT_SCHEMA_VERSION
     return values, loaded_version
 
@@ -2662,7 +2677,11 @@ class AgentJob:
 
     @property
     def pull_request_branch(self) -> str | None:
-        return self._optional_string("pull_request_branch")
+        if self.github_pull_request is None:
+            return None
+        if self.pull_request_worktree_state not in {"ready", "retained"}:
+            return None
+        return self.worktree_branch
 
     @property
     def pull_request_worktree_error(self) -> str | None:
