@@ -14,7 +14,7 @@ inventory remains as historical design context for the compatibility importer.
 
 ## Current schema-v18 relational inventory
 
-`CursorJob` currently produces 240 persisted field names, including the
+`CursorJob` currently produces 243 persisted field names, including the
 dynamically emitted `pane_retained_at` cleanup and
 `grouped_repository_coordinator_id` handoff fields. Database schema v2
 assigns each exactly once: 222 named lifecycle columns, two immutable artifact
@@ -32,7 +32,7 @@ state.
 | Workflow, review, approval, and participant | `job_workflow_review_approval_participant` | 31 lifecycle values |
 | Immutable artifact references | `plan_artifact` and `review_artifact` columns, foreign-key evidence in `artifacts` | 2 |
 | Checkout and fork | `job_checkout_fork` | 49 |
-| Provider and ticket creation | `job_provider_ticket` | 46 |
+| Provider and ticket creation | `job_provider_ticket` | 52 |
 | Session, pane, reconciliation, and release | `job_session_pane` | 39 |
 | Worker ownership | `job_worker` (with claim projection in `worker_claims`) | 7 |
 | Import-only compatibility | `schema_version`, `migration_source_schema_version`, `phase_prompt_active`, `agent_identity_legacy_compatible` | 4 |
@@ -45,14 +45,14 @@ success.
 
 | Baseline | Count |
 |---|---:|
-| Persisted field names | 242 |
-| Named table fields | 237 |
+| Persisted field names | 250 |
+| Named table fields | 245 |
 | Import-only fields | 4 |
-| Directly exposed `CursorJob` properties | 181 |
+| Directly exposed `CursorJob` properties | 189 |
 | Compatibility adapters | 38 |
-| Public transition entry points | 77 |
+| Public transition entry points | 78 |
 | Documented duplicate authorities | 0 |
-| Lifecycle-related module lines | 28924 |
+| Lifecycle-related module lines | 29763 |
 
 #358 unified ordinary and clarification submission onto one
 `prompt_operations.PromptOperationState`. #359 made that typed operation the

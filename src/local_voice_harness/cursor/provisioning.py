@@ -16,7 +16,6 @@ from ..errors import HarnessError
 from ..github_issue_creation import (
     draft_github_issue,
     issue_draft_from_trusted_brief,
-    repository_from_utterance,
 )
 from ..integrations.github import (
     GitHubClient,
@@ -26,14 +25,19 @@ from ..integrations.github import (
     GitHubIssue,
     GitHubIssueCreationResult,
     GitHubIssueLookupError,
+    GitHubMergeQueueArmedError,
     GitHubOperationAmbiguous,
+    GitHubPreconditionError,
     GitHubProvider,
     GitHubPullRequestCheckoutInputs,
     GitHubPullRequestCreationPlan,
     GitHubPullRequestCreationResult,
+    GitHubPullRequestMergeResult,
+    GitHubRepoCreationPlan,
     GitHubRepoCreationResult,
     GitHubRepository,
     github_repository_from_url,
+    resolve_pull_request_merge_identity,
 )
 from ..integrations.herdr import (
     SETTLED,
@@ -1530,6 +1534,352 @@ def _run_github_pr_creation(
     )
 
 
+def _finish_github_pr_merge(
+    store: JobStore,
+    job_id: str,
+    token: WorkerClaim,
+    result: GitHubPullRequestMergeResult,
+    *,
+    expected_revision: int,
+) -> None:
+    pull_request = result.pull_request
+    url = str(result.url)
+
+    def finish(job: CursorJob) -> CursorJob:
+        now = time.time()
+        return job.evolve_for_delivery(
+            now=now,
+            status=JobStatus.COMPLETED,
+            result=f"Merged GitHub pull request {pull_request.number}: {url}",
+            completed_at=now,
+            github_pr_merge_number=pull_request.number,
+            github_pr_merge_url=url,
+            github_pr_merge_operation_state="merged",
+            worker_pid=None,
+            worker_boot_id=None,
+            worker_process_start=None,
+            worker_token=None,
+            worker_operation=None,
+        )
+
+    _worker_change(
+        store,
+        job_id,
+        token,
+        {JobStatus.ROUTING, JobStatus.RUNNING},
+        finish,
+        expected_revision=expected_revision,
+    )
+
+
+def _finish_github_pr_merge_without_write(
+    store: JobStore,
+    job_id: str,
+    token: WorkerClaim,
+    message: str,
+    *,
+    expected_revision: int,
+) -> None:
+    def finish(job: CursorJob) -> CursorJob:
+        now = time.time()
+        return job.evolve_for_delivery(
+            now=now,
+            status=JobStatus.COMPLETED,
+            result=message,
+            completed_at=now,
+            github_pr_merge_confirmed=False,
+            github_pr_merge_operation_state="planned",
+            worker_pid=None,
+            worker_boot_id=None,
+            worker_process_start=None,
+            worker_token=None,
+            worker_operation=None,
+        )
+
+    _worker_change(
+        store,
+        job_id,
+        token,
+        {JobStatus.ROUTING, JobStatus.RUNNING},
+        finish,
+        expected_revision=expected_revision,
+    )
+
+
+def _finish_github_pr_merge_queued(
+    store: JobStore,
+    job_id: str,
+    token: WorkerClaim,
+    *,
+    expected_revision: int,
+) -> None:
+    def finish(job: CursorJob) -> CursorJob:
+        now = time.time()
+        return job.evolve_for_delivery(
+            now=now,
+            status=JobStatus.BLOCKED,
+            result=(
+                "GitHub reports that this pull request remains queued for merge. "
+                "The queue side effect is armed and requires manual review; I will "
+                "not submit another merge."
+            ),
+            completed_at=now,
+            github_pr_merge_operation_state="manual_required",
+            worker_pid=None,
+            worker_boot_id=None,
+            worker_process_start=None,
+            worker_token=None,
+            worker_operation=None,
+        )
+
+    _worker_change(
+        store,
+        job_id,
+        token,
+        {JobStatus.ROUTING, JobStatus.RUNNING},
+        finish,
+        expected_revision=expected_revision,
+    )
+
+
+def _run_github_pr_merge(
+    store: JobStore,
+    job: CursorJob,
+    token: WorkerClaim,
+    clients: ClientFactories,
+    checkpoint: Callable[[], None],
+) -> None:
+    repository = (job.github_repository or "").strip()
+    number = job.github_pr_merge_number
+    if not repository or number is None:
+        identity = resolve_pull_request_merge_identity(
+            utterance=job.trusted_utterance or job.request,
+            focused_repository=job.github_repository,
+            focused_number=job.github_pr_merge_number,
+        )
+        if identity is None:
+            _worker_question(
+                store,
+                job.id,
+                token,
+                "Which GitHub pull request should I merge? "
+                "Please say the repository and number.",
+                expected_revision=job.revision,
+                clarification_kind="github_pr_merge_identity",
+            )
+            return
+        repository = identity.repository
+        number = identity.number
+
+        def persist_identity(current: CursorJob) -> CursorJob:
+            return current.evolve(
+                github_repository=identity.repository,
+                github_pr_merge_number=identity.number,
+                github_pr_merge_url=identity.url,
+            )
+
+        updated = _worker_change(
+            store,
+            job.id,
+            token,
+            {JobStatus.ROUTING},
+            persist_identity,
+            expected_revision=job.revision,
+        )
+        if updated is None:
+            return
+        job = updated
+    github = _github_provider(clients.github)
+    checkpoint()
+    source = github.resolve_repository(repository)
+    repository = source.name_with_owner
+    if not job.github_pr_merge_url or job.github_pr_merge_marker is None:
+        plan = github.plan_pull_request_merge(
+            repository,
+            number,
+            correlation_marker=uuid.uuid4().hex,
+        )
+
+        def persist_plan(current: CursorJob) -> CursorJob:
+            return current.evolve(
+                github_repository=plan.repository,
+                github_pr_merge_number=plan.number,
+                github_pr_merge_url=plan.url,
+                github_pr_merge_marker=plan.correlation_marker,
+                github_pr_merge_snapshot=plan.snapshot.serialize(),
+                github_pr_merge_method=plan.method,
+                github_pr_merge_operation_state="planned",
+            )
+
+        updated = _worker_change(
+            store,
+            job.id,
+            token,
+            {JobStatus.ROUTING},
+            persist_plan,
+            expected_revision=job.revision,
+        )
+        if updated is None:
+            return
+        job = updated
+    plan = github.plan_pull_request_merge(
+        job.github_repository or repository,
+        job.github_pr_merge_number or number,
+        correlation_marker=job.github_pr_merge_marker,
+        snapshot=job.github_pr_merge_snapshot,
+        method=job.github_pr_merge_method or "squash",
+    )
+    if not job.github_pr_merge_confirmed:
+        preview = (
+            f"Merge GitHub pull request {plan.number} in {plan.repository}?\n\n"
+            f"{plan.url}\n\nTitle: {plan.snapshot.title}\n\n"
+            f"Target: {plan.snapshot.base_ref} "
+            f"({'default branch' if plan.snapshot.base_ref == plan.snapshot.default_branch else 'non-default branch'})\n\n"
+            f"Head: {plan.snapshot.head_ref} at {plan.snapshot.head_oid}\n\n"
+            f"Draft: {'yes' if plan.snapshot.is_draft else 'no'}\n\n"
+            f"Checks: {plan.snapshot.checks}\n\n"
+            f"Reviews: {plan.snapshot.review_decision or 'not required'}\n\n"
+            f"Mergeability: {plan.snapshot.mergeable} "
+            f"({plan.snapshot.merge_state_status})\n\n"
+            f"Method: {plan.method}\n\n"
+            "Say yes to merge it or no to cancel."
+        )
+        _worker_question(
+            store,
+            job.id,
+            token,
+            preview,
+            expected_revision=job.revision,
+            clarification_kind="github_pr_merge_confirmation",
+            sensitivity=QuestionSensitivity.DESTRUCTIVE,
+        )
+        return
+    if job.github_pr_merge_operation_state not in {None, "planned"}:
+        raise HarnessError(
+            "GitHub pull request merge requires reconciliation before retry"
+        )
+    try:
+        checkpoint()
+        github.confirm_pull_request_merge_state(plan)
+    except GitHubPreconditionError as exc:
+        _finish_github_pr_merge_without_write(
+            store,
+            job.id,
+            token,
+            str(exc),
+            expected_revision=job.revision,
+        )
+        return
+
+    def mark_submitted(current: CursorJob) -> CursorJob:
+        return current.evolve(
+            status=JobStatus.RUNNING,
+            github_pr_merge_operation_state="submitted",
+            worker_operation="github_pr_merge",
+        )
+
+    submitted = _worker_change(
+        store,
+        job.id,
+        token,
+        {JobStatus.ROUTING},
+        mark_submitted,
+        expected_revision=job.revision,
+    )
+    if submitted is None:
+        return
+    try:
+        checkpoint()
+        result = github.submit_pull_request_merge(plan, confirmed=True)
+    except GitHubMergeQueueArmedError:
+        _finish_github_pr_merge_queued(
+            store,
+            job.id,
+            token,
+            expected_revision=submitted.revision,
+        )
+        return
+    except GitHubPreconditionError as exc:
+        _finish_github_pr_merge_without_write(
+            store,
+            job.id,
+            token,
+            str(exc),
+            expected_revision=submitted.revision,
+        )
+        return
+    except GitHubError as exc:
+        checkpoint()
+        try:
+            visible = github.observe_pull_request_merge(plan)
+        except GitHubError:
+            visible = None
+        if visible is not None:
+            _finish_github_pr_merge(
+                store,
+                job.id,
+                token,
+                visible,
+                expected_revision=submitted.revision,
+            )
+            return
+        if not isinstance(exc, GitHubCommandStartError):
+
+            def ambiguous(current: CursorJob) -> CursorJob:
+                return current.evolve(
+                    status=JobStatus.QUEUED,
+                    queued_at=time.time(),
+                    github_pr_merge_operation_state="ambiguous",
+                    reconcile=True,
+                    worker_pid=None,
+                    worker_boot_id=None,
+                    worker_process_start=None,
+                    worker_token=None,
+                    worker_operation=None,
+                )
+
+            _worker_change(
+                store,
+                job.id,
+                token,
+                {JobStatus.ROUTING, JobStatus.RUNNING},
+                ambiguous,
+                expected_revision=submitted.revision,
+            )
+            return
+
+        def retry_after_start_failure(current: CursorJob) -> CursorJob:
+            return current.evolve(
+                status=JobStatus.QUEUED,
+                queued_at=time.time(),
+                github_pr_merge_operation_state="planned",
+                worker_pid=None,
+                worker_boot_id=None,
+                worker_process_start=None,
+                worker_token=None,
+                worker_operation=None,
+                worker_claim_operation=None,
+                worker_claimed_at=None,
+            )
+
+        _worker_change(
+            store,
+            job.id,
+            token,
+            {JobStatus.ROUTING, JobStatus.RUNNING},
+            retry_after_start_failure,
+            expected_revision=submitted.revision,
+        )
+        return
+    _finish_github_pr_merge(
+        store,
+        job.id,
+        token,
+        result,
+        expected_revision=submitted.revision,
+    )
+
+
 def _offer_file_as_issue_one(
     store: JobStore,
     job: CursorJob,
@@ -1621,6 +1971,43 @@ def _complete_github_repo_creation_without_write(
     )
 
 
+def _github_repo_name_collision(exc: BaseException) -> bool:
+    return "already exists" in str(exc).casefold()
+
+
+def _ask_other_repo_create_name(
+    store: JobStore,
+    job: CursorJob,
+    token: WorkerClaim,
+    plan: GitHubRepoCreationPlan,
+    owner: str,
+    *,
+    expected_revision: int,
+) -> None:
+    _worker_question(
+        store,
+        job.id,
+        token,
+        (
+            f"{plan.name_with_owner} already exists. "
+            "What other repository name should I use?"
+        ),
+        expected_revision=expected_revision,
+        clarification_kind="github_repo_create_slug",
+        job_changes={
+            "github_repository": owner,
+            "github_repo_create_confirmed": False,
+            "github_repo_create_marker": None,
+            "github_repo_create_operation_state": None,
+            **(
+                {"github_repo_create_owner": owner}
+                if job.github_repo_create_org_requested
+                else {}
+            ),
+        },
+    )
+
+
 def _resolve_github_repo_create_owner(
     store: JobStore,
     job: CursorJob,
@@ -1634,10 +2021,6 @@ def _resolve_github_repo_create_owner(
     named = (job.github_repo_create_owner or "").strip()
     if not named:
         named = parse_repo_create_org(trusted) or ""
-    if not named:
-        spoken_repository = repository_from_utterance(trusted)
-        if spoken_repository and "/" in spoken_repository:
-            named = spoken_repository.split("/", 1)[0].strip()
     if not named:
         try:
             organizations = github.list_organizations()
@@ -1680,6 +2063,17 @@ def _resolve_github_repo_create_owner(
             _ORG_CREATE_DENIED,
             expected_revision=job.revision,
         )
+        return None
+
+
+def _checkout_created_repository(
+    github: GitHubProvider,
+    result: GitHubRepoCreationResult,
+    checkpoint: Callable[[], None],
+) -> Path | None:
+    try:
+        return github.materialize_repository(result.repository, checkpoint=checkpoint)
+    except (GitHubError, LocalGitError):
         return None
 
 
@@ -1892,27 +2286,13 @@ def _run_github_repo_creation(
     if existing is not None:
         observed = github.observe_repository_creation(plan)
         if observed is None:
-            _worker_question(
+            _ask_other_repo_create_name(
                 store,
-                job.id,
+                job,
                 token,
-                (
-                    f"{plan.name_with_owner} already exists. "
-                    "What other repository name should I use?"
-                ),
+                plan,
+                owner,
                 expected_revision=job.revision,
-                clarification_kind="github_repo_create_slug",
-                job_changes={
-                    "github_repository": owner,
-                    "github_repo_create_confirmed": False,
-                    "github_repo_create_marker": None,
-                    "github_repo_create_operation_state": None,
-                    **(
-                        {"github_repo_create_owner": owner}
-                        if job.github_repo_create_org_requested
-                        else {}
-                    ),
-                },
             )
             return
         _materialize_created_github_repo(
@@ -1960,6 +2340,22 @@ def _run_github_repo_creation(
                 store, submitted, token, github, visible, checkpoint
             )
             return
+        if _github_repo_name_collision(exc):
+            collision = None
+            try:
+                collision = github.lookup_repository(plan.name_with_owner)
+            except GitHubError:
+                collision = None
+            if collision is not None:
+                _ask_other_repo_create_name(
+                    store,
+                    job,
+                    token,
+                    plan,
+                    owner,
+                    expected_revision=submitted.revision,
+                )
+                return
         if not isinstance(exc, GitHubCommandStartError):
 
             def ambiguous(current: CursorJob) -> CursorJob:
@@ -5887,6 +6283,15 @@ def run_claimed_worker(  # pyright: ignore[reportGeneralTypeIssues]
             checkpoint()
             _resume_plan_approval_completion(store, job, worker_token)
             return
+        if job.github_pr_merge_requested:
+            _run_github_pr_merge(
+                store,
+                job,
+                worker_token,
+                clients,
+                checkpoint,
+            )
+            return
         if job.github_pr_create_requested:
             _run_github_pr_creation(
                 store,
@@ -5930,10 +6335,15 @@ def run_claimed_worker(  # pyright: ignore[reportGeneralTypeIssues]
                 job = cloned
             if not job.repository:
                 return
+            already_offered_issue_one = any(
+                str(record.get("owner") or "") == "github_issue_file_as_one"
+                for record in (job.clarifications or ())
+            )
             if (
                 not job.github_issue_create_requested
                 and job.github_issue_created_number is None
                 and not job.github_issue_create_title
+                and not already_offered_issue_one
             ):
                 _offer_file_as_issue_one(
                     store,
@@ -6713,6 +7123,30 @@ def run_claimed_worker(  # pyright: ignore[reportGeneralTypeIssues]
                                 worker_token,
                                 {JobStatus.ROUTING},
                                 reset_clone_plan,
+                                expected_revision=job.revision,
+                            )
+                            return
+                        except (GitHubError, HarnessError):
+
+                            def mark_clone_ambiguous(current: CursorJob) -> CursorJob:
+                                return current.evolve(
+                                    status=JobStatus.QUEUED,
+                                    queued_at=time.time(),
+                                    clone_operation_state="ambiguous",
+                                    reconcile=True,
+                                    worker_pid=None,
+                                    worker_boot_id=None,
+                                    worker_process_start=None,
+                                    worker_token=None,
+                                    worker_operation=None,
+                                )
+
+                            _worker_change(
+                                store,
+                                job_id,
+                                worker_token,
+                                {JobStatus.ROUTING},
+                                mark_clone_ambiguous,
                                 expected_revision=job.revision,
                             )
                             return

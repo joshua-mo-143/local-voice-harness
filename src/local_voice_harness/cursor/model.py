@@ -208,6 +208,8 @@ _BOOL_FIELDS = frozenset(
         "github_issue_create_confirmed",
         "github_pr_create_requested",
         "github_pr_create_confirmed",
+        "github_pr_merge_requested",
+        "github_pr_merge_confirmed",
         "github_repo_create_requested",
         "github_repo_create_org_requested",
         "github_repo_create_continue_workflow",
@@ -240,6 +242,7 @@ _INT_FIELDS = frozenset(
         "github_issue",
         "github_issue_created_number",
         "github_pr_created_number",
+        "github_pr_merge_number",
         "github_pull_request",
         "worker_pid",
         "target_release_owner_pid",
@@ -331,6 +334,11 @@ _STRING_FIELDS = frozenset(
         "github_pr_create_status_digest",
         "github_pr_create_operation_state",
         "github_pr_created_url",
+        "github_pr_merge_marker",
+        "github_pr_merge_snapshot",
+        "github_pr_merge_method",
+        "github_pr_merge_operation_state",
+        "github_pr_merge_url",
         "github_repo_create_owner",
         "github_repo_create_visibility",
         "github_repo_create_marker",
@@ -480,12 +488,23 @@ _REPO_CREATE_OPERATION_STATES = _ISSUE_CREATE_OPERATION_STATES | {
     "remote_created",
     "clone_verified",
 }
+_PR_MERGE_OPERATION_STATES = frozenset(
+    {
+        "planned",
+        "submitting",
+        "submitted",
+        "merged",
+        "ambiguous",
+        "manual_required",
+    }
+)
 _CLONE_OPERATION_STATES = frozenset(
     {
         "planned",
         "submitted",
         "cloned",
         "ambiguous",
+        "manual_required",
     }
 )
 _WORKTREE_OPERATION_STATES = frozenset(
@@ -536,6 +555,8 @@ class NewAgentJob:
     github_issue_create_body: str | None = None
     github_issue_create_marker: str | None = None
     github_pr_create_requested: bool = False
+    github_pr_merge_requested: bool = False
+    github_pr_merge_number: int | None = None
     github_repo_create_requested: bool = False
     github_repo_create_org_requested: bool = False
     linear_ticket_create_requested: bool = False
@@ -2045,6 +2066,8 @@ class AgentJob:
                 "github_issue_create_body": spec.github_issue_create_body,
                 "github_issue_create_marker": spec.github_issue_create_marker,
                 "github_pr_create_requested": spec.github_pr_create_requested,
+                "github_pr_merge_requested": spec.github_pr_merge_requested,
+                "github_pr_merge_number": spec.github_pr_merge_number,
                 "github_repo_create_requested": spec.github_repo_create_requested,
                 "github_repo_create_org_requested": (
                     spec.github_repo_create_org_requested
@@ -2666,6 +2689,38 @@ class AgentJob:
     @property
     def github_pr_created_url(self) -> str | None:
         return self._optional_string("github_pr_created_url")
+
+    @property
+    def github_pr_merge_requested(self) -> bool:
+        return self._boolean_field("github_pr_merge_requested")
+
+    @property
+    def github_pr_merge_confirmed(self) -> bool:
+        return self._boolean_field("github_pr_merge_confirmed")
+
+    @property
+    def github_pr_merge_number(self) -> int | None:
+        return self._optional_int("github_pr_merge_number")
+
+    @property
+    def github_pr_merge_url(self) -> str | None:
+        return self._optional_string("github_pr_merge_url")
+
+    @property
+    def github_pr_merge_marker(self) -> str | None:
+        return self._optional_string("github_pr_merge_marker")
+
+    @property
+    def github_pr_merge_snapshot(self) -> str | None:
+        return self._optional_string("github_pr_merge_snapshot")
+
+    @property
+    def github_pr_merge_method(self) -> str | None:
+        return self._optional_string("github_pr_merge_method")
+
+    @property
+    def github_pr_merge_operation_state(self) -> str | None:
+        return self._optional_string("github_pr_merge_operation_state")
 
     @property
     def github_repo_create_requested(self) -> bool:
@@ -3679,6 +3734,7 @@ class AgentJob:
             "fork": self.fork_operation_state,
             "issue_create": self.github_issue_create_operation_state,
             "pr_create": self.github_pr_create_operation_state,
+            "pr_merge": self.github_pr_merge_operation_state,
             "linear_ticket_create": self.linear_ticket_create_operation_state,
             "worktree": self.worktree_provision_state,
             "prompt": self.prompt_operation_state,
@@ -4049,6 +4105,39 @@ class AgentJob:
                 "GitHub pull request creation confirmation requires a creation request"
             )
         if (
+            self.github_pr_merge_operation_state is not None
+            and self.github_pr_merge_operation_state not in _PR_MERGE_OPERATION_STATES
+        ):
+            raise JobValidationError("github_pr_merge_operation_state is invalid")
+        if self.github_pr_merge_confirmed and not self.github_pr_merge_requested:
+            raise JobValidationError(
+                "GitHub pull request merge confirmation requires a merge request"
+            )
+        if self.github_pr_merge_operation_state is not None and not all(
+            (
+                self.github_repository,
+                self.github_pr_merge_number,
+                self.github_pr_merge_url,
+                self.github_pr_merge_marker,
+                self.github_pr_merge_snapshot,
+                self.github_pr_merge_method,
+            )
+        ):
+            raise JobValidationError(
+                "GitHub pull request merge operation requires repository, number, "
+                "URL, marker, immutable snapshot, and merge method"
+            )
+        if (
+            self.github_pr_merge_method is not None
+            and self.github_pr_merge_method
+            not in {
+                "merge",
+                "squash",
+                "rebase",
+            }
+        ):
+            raise JobValidationError("github_pr_merge_method is invalid")
+        if (
             self.github_repo_create_operation_state is not None
             and self.github_repo_create_operation_state
             not in _REPO_CREATE_OPERATION_STATES
@@ -4165,6 +4254,7 @@ class AgentJob:
             and not self.github_issue_create_requested
             and not self.github_repo_create_requested
             and not self.github_pr_create_requested
+            and not self.github_pr_merge_requested
         ):
             raise JobValidationError(
                 "github issue_provider requires a GitHub issue identity"
@@ -4587,6 +4677,7 @@ class AgentJob:
             or self.worktree_provision_state in _UNCERTAIN_OPERATION_STATES
             or self.github_issue_create_operation_state in {"submitted", "ambiguous"}
             or self.github_pr_create_operation_state in {"submitted", "ambiguous"}
+            or self.github_pr_merge_operation_state in {"submitted", "ambiguous"}
             or self.clone_operation_state in {"submitted", "ambiguous"}
             or self.github_repo_create_operation_state in {"submitted", "ambiguous"}
             or self.linear_ticket_create_operation_state

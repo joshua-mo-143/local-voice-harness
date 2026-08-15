@@ -49,6 +49,8 @@ from local_voice_harness.integrations.github import (
     GitHubOperationAmbiguous,
     GitHubPullRequest,
     GitHubPullRequestCreationResult,
+    GitHubPullRequestMergeResult,
+    GitHubPullRequestMergeSnapshot,
     GitHubRepoCreationResult,
     GitHubRepository,
     ProvisionedIssue,
@@ -66,7 +68,11 @@ from local_voice_harness.integrations.linear import (
     LinearTicketCreationResult,
 )
 from local_voice_harness.linear_ticket_creation import LinearTicketDraft
-from local_voice_harness.local_git import GitPublicationSnapshot, LocalGitRefChanged
+from local_voice_harness.local_git import (
+    GitPublicationSnapshot,
+    LocalGitError,
+    LocalGitRefChanged,
+)
 from tests.support import join_threads
 
 WORKER = WorkerOwnership("worker", 42, "boot", "start", "test", 1)
@@ -270,6 +276,29 @@ class _ProvisioningTestAdapter:
             include_process_group=include_process_group,
             is_alive=lambda current: service._worker_is_alive(current),
         )
+
+
+def _merge_snapshot() -> GitHubPullRequestMergeSnapshot:
+    return GitHubPullRequestMergeSnapshot(
+        "source/project",
+        7,
+        "https://github.com/source/project/pull/7",
+        "Safe change",
+        "main",
+        "main",
+        "feature/safe",
+        "b" * 40,
+        "OPEN",
+        False,
+        "passing",
+        "APPROVED",
+        "MERGEABLE",
+        "CLEAN",
+        False,
+        None,
+        False,
+        False,
+    )
 
 
 jobs: Any = _ProvisioningTestAdapter()
@@ -3503,6 +3532,48 @@ class CursorJobStateTests(unittest.TestCase):
         github.local_git.commit_unpublished_changes.assert_not_called()
         github.local_git.push_current_branch.assert_not_called()
 
+    def test_unpublished_change_inspection_failure_does_not_open_pr(self) -> None:
+        checkout = self._pr_checkout()
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "open a pull request",
+                "trusted_utterance": "open a pull request",
+                "github_pr_create_requested": True,
+                "worktree_path": str(checkout),
+                "worktree_branch": "voice/job",
+                "github_repository": "source/project",
+                "status": "queued",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        source = GitHubRepository(
+            "source/project",
+            "https://github.com/source/project",
+            False,
+            "main",
+        )
+        github = mock.Mock()
+        github.inspect_repository.return_value = source
+        github.local_git = mock.Mock()
+        github.local_git.verify_checkout.return_value = None
+        github.local_git.current_branch.return_value = "voice/job"
+        github.local_git.has_unpublished_changes.side_effect = LocalGitError(
+            "status failed"
+        )
+        with mock.patch.object(jobs, "GitHubClient", return_value=github):
+            service.run_worker("123456789abc")
+
+        updated = jobs.read_job("123456789abc")
+        self.assertEqual(updated["status"], "completed")
+        self.assertIn("couldn't verify", str(updated["result"]))
+        self.assertIn("checkout snapshot", str(updated["result"]))
+        self.assertIsNone(updated.get("github_pr_created_url"))
+        github.submit_pull_request_creation.assert_not_called()
+        github.local_git.commit_unpublished_changes.assert_not_called()
+        github.local_git.push_current_branch.assert_not_called()
+
     def test_confirmed_pull_request_creation_commits_pushes_and_speaks_url(
         self,
     ) -> None:
@@ -3585,6 +3656,7 @@ class CursorJobStateTests(unittest.TestCase):
         github.local_git.commit_unpublished_changes.assert_called_once()
         github.local_git.push_current_branch.assert_called_once()
         github.submit_pull_request_creation.assert_called_once()
+        github.submit_pull_request_merge.assert_not_called()
         herdr.assert_not_called()
 
     def test_pull_request_creation_fails_closed_for_mixed_repository_state(
@@ -3764,6 +3836,155 @@ class CursorJobStateTests(unittest.TestCase):
         self.assertIsNone(updated.get("github_pr_created_number"))
         github.submit_pull_request_creation.assert_called_once()
         github.observe_pull_request_creation.assert_called_once()
+
+    def test_worker_asks_before_merging_an_identified_pull_request(self) -> None:
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "merge pull request 7 in source/project",
+                "trusted_utterance": "merge pull request 7 in source/project",
+                "github_pr_merge_requested": True,
+                "status": "queued",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        source = GitHubRepository(
+            "source/project",
+            "https://github.com/source/project",
+            False,
+            "main",
+        )
+        github = mock.Mock()
+        github.inspect_repository.return_value = source
+        github.inspect_pull_request_merge.return_value = _merge_snapshot()
+        with mock.patch.object(jobs, "GitHubClient", return_value=github):
+            service.run_worker("123456789abc")
+
+        updated = jobs.read_job("123456789abc")
+        self.assertEqual(updated["status"], "awaiting_user")
+        self.assertEqual(
+            updated["clarification_kind"],
+            "github_pr_merge_confirmation",
+        )
+        self.assertEqual(updated["github_pr_merge_number"], 7)
+        self.assertEqual(updated["github_pr_merge_operation_state"], "planned")
+        github.submit_pull_request_merge.assert_not_called()
+
+    def test_confirmed_pull_request_merge_speaks_identity(self) -> None:
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "merge pull request 7 in source/project",
+                "trusted_utterance": "merge pull request 7 in source/project",
+                "github_pr_merge_requested": True,
+                "github_pr_merge_confirmed": True,
+                "github_pr_merge_number": 7,
+                "github_pr_merge_url": "https://github.com/source/project/pull/7",
+                "github_pr_merge_marker": "a" * 32,
+                "github_pr_merge_snapshot": _merge_snapshot().serialize(),
+                "github_pr_merge_method": "squash",
+                "github_pr_merge_operation_state": "planned",
+                "github_repository": "source/project",
+                "status": "queued",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        source = GitHubRepository(
+            "source/project",
+            "https://github.com/source/project",
+            False,
+            "main",
+        )
+        result = GitHubPullRequestMergeResult(
+            GitHubPullRequest("source", "project", 7),
+            "https://github.com/source/project/pull/7",
+            "a" * 32,
+        )
+        github = mock.Mock()
+        github.inspect_repository.return_value = source
+        github.inspect_pull_request_merge.return_value = _merge_snapshot()
+        github.submit_pull_request_merge.return_value = result
+        herdr = mock.Mock()
+        with (
+            mock.patch.object(jobs, "GitHubClient", return_value=github),
+            mock.patch.object(jobs, "HerdrClient", return_value=herdr),
+        ):
+            service.run_worker("123456789abc")
+
+        updated = jobs.read_job("123456789abc")
+        self.assertEqual(updated["status"], "completed")
+        self.assertEqual(updated["github_pr_merge_operation_state"], "merged")
+        self.assertIn("https://github.com/source/project/pull/7", updated["result"])
+        github.submit_pull_request_merge.assert_called_once()
+        github.submit_pull_request_creation.assert_not_called()
+        herdr.assert_not_called()
+
+    def test_missing_merge_identity_asks_instead_of_writing(self) -> None:
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "merge the pull request",
+                "trusted_utterance": "merge the pull request",
+                "github_pr_merge_requested": True,
+                "status": "queued",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        github = mock.Mock()
+        with mock.patch.object(jobs, "GitHubClient", return_value=github):
+            service.run_worker("123456789abc")
+
+        updated = jobs.read_job("123456789abc")
+        self.assertEqual(updated["status"], "awaiting_user")
+        self.assertEqual(updated["clarification_kind"], "github_pr_merge_identity")
+        github.submit_pull_request_merge.assert_not_called()
+
+    def test_timed_out_pull_request_merge_is_reconciled_without_resubmission(
+        self,
+    ) -> None:
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "merge pull request 7 in source/project",
+                "trusted_utterance": "merge pull request 7 in source/project",
+                "github_pr_merge_requested": True,
+                "github_pr_merge_confirmed": True,
+                "github_pr_merge_number": 7,
+                "github_pr_merge_url": "https://github.com/source/project/pull/7",
+                "github_pr_merge_marker": "a" * 32,
+                "github_pr_merge_snapshot": _merge_snapshot().serialize(),
+                "github_pr_merge_method": "squash",
+                "github_pr_merge_operation_state": "planned",
+                "github_repository": "source/project",
+                "status": "queued",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        source = GitHubRepository(
+            "source/project",
+            "https://github.com/source/project",
+            False,
+            "main",
+        )
+        github = mock.Mock()
+        github.inspect_repository.return_value = source
+        github.inspect_pull_request_merge.return_value = _merge_snapshot()
+        github.submit_pull_request_merge.side_effect = GitHubOperationAmbiguous(
+            "timed out"
+        )
+        github.observe_pull_request_merge.return_value = None
+        with mock.patch.object(jobs, "GitHubClient", return_value=github):
+            service.run_worker("123456789abc")
+
+        updated = jobs.read_job("123456789abc")
+        self.assertEqual(updated["github_pr_merge_operation_state"], "ambiguous")
+        self.assertTrue(updated.get("reconcile"))
+        github.submit_pull_request_merge.assert_called_once()
+        github.observe_pull_request_merge.assert_called_once()
 
     def test_worker_drafts_linear_ticket_before_requesting_confirmation(self) -> None:
         jobs.write_job(
@@ -4481,6 +4702,8 @@ class CursorJobStateTests(unittest.TestCase):
             github_issue_context=None,
             github_issue_create_requested=False,
             github_pr_create_requested=False,
+            github_pr_merge_requested=False,
+            github_pr_merge_number=None,
             github_repo_create_requested=False,
             github_repo_create_org_requested=False,
             linear_team=None,
@@ -5604,6 +5827,45 @@ class CursorJobStateTests(unittest.TestCase):
         self.assertNotEqual(updated.get("clone_operation_state"), "cloned")
         self.assertIsNone(updated.get("repository"))
 
+    def test_clone_github_error_after_submit_is_ambiguous(self) -> None:
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "Use Cursor to fix the bug",
+                "repository_hint": "example/project",
+                "clone_source": "example/project",
+                "clone_confirmed": True,
+                "clone_operation_state": "planned",
+                "status": "queued",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        source = GitHubRepository(
+            "example/project",
+            "https://github.com/example/project",
+            False,
+            "main",
+        )
+        github = mock.Mock()
+        github.local_git.clone_root = Path("/home/test/src")
+        github.inspect_repository.return_value = source
+        github.ensure_repository_clone.side_effect = GitHubError("clone failed")
+        client = mock.Mock()
+        client.repository_roots.return_value = []
+        client.resolve_repository.return_value = (None, [])
+        with (
+            mock.patch.object(jobs, "HerdrClient", return_value=client),
+            mock.patch.object(jobs, "GitHubClient", return_value=github),
+        ):
+            service.run_worker("123456789abc")
+
+        updated = jobs.read_job("123456789abc")
+        self.assertEqual(updated["clone_operation_state"], "ambiguous")
+        self.assertTrue(updated["reconcile"])
+        self.assertIsNone(updated.get("repository"))
+        github.ensure_repository_clone.assert_called_once()
+
     def test_parse_repo_create_slug_and_visibility(self) -> None:
         self.assertEqual(production_jobs.parse_repo_create_slug("payments"), "payments")
         self.assertEqual(
@@ -5779,6 +6041,55 @@ class CursorJobStateTests(unittest.TestCase):
         github.ensure_repository_clone.assert_called_once()
         herdr.assert_not_called()
 
+    def test_repo_create_survives_materialize_failure(self) -> None:
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "create a GitHub repository called payments",
+                "trusted_utterance": "create a GitHub repository called payments",
+                "issue_provider": "github",
+                "github_repository": "alice/payments",
+                "github_repo_create_requested": True,
+                "github_repo_create_confirmed": True,
+                "github_repo_create_visibility": "private",
+                "github_repo_create_marker": "a" * 32,
+                "github_repo_create_operation_state": "planned",
+                "status": "queued",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        created = GitHubRepoCreationResult(
+            GitHubRepository(
+                "alice/payments",
+                "https://github.com/alice/payments",
+                True,
+                "main",
+            ),
+            "https://github.com/alice/payments",
+            "a" * 32,
+        )
+        github = mock.Mock()
+        github.authenticated_login.return_value = "alice"
+        github.lookup_repository.return_value = None
+        github.submit_repository_creation.return_value = created
+        github.ensure_repository_clone.side_effect = GitHubError("clone failed")
+        with mock.patch.object(jobs, "GitHubClient", return_value=github):
+            service.run_worker("123456789abc")
+
+        updated = jobs.read_job("123456789abc")
+        self.assertEqual(updated["status"], "queued")
+        self.assertEqual(
+            updated["github_repo_create_operation_state"], "remote_created"
+        )
+        self.assertEqual(
+            updated["github_repo_created_url"],
+            "https://github.com/alice/payments",
+        )
+        self.assertIsNone(updated.get("repository"))
+        self.assertTrue(updated["reconcile"])
+        github.submit_repository_creation.assert_called_once()
+
     def test_existing_same_name_repo_is_not_a_successful_create(self) -> None:
         jobs.write_job(
             {
@@ -5824,6 +6135,50 @@ class CursorJobStateTests(unittest.TestCase):
         github.submit_repository_creation.assert_not_called()
         github.ensure_repository_clone.assert_not_called()
         herdr.assert_not_called()
+
+    def test_post_submit_repo_collision_asks_for_another_name(self) -> None:
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "create a GitHub repository called payments",
+                "trusted_utterance": "create a GitHub repository called payments",
+                "issue_provider": "github",
+                "github_repository": "alice/payments",
+                "github_repo_create_requested": True,
+                "github_repo_create_confirmed": True,
+                "github_repo_create_visibility": "private",
+                "github_repo_create_marker": "a" * 32,
+                "github_repo_create_operation_state": "planned",
+                "status": "queued",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        existing = GitHubRepository(
+            "alice/payments",
+            "https://github.com/alice/payments",
+            True,
+            "main",
+        )
+        github = mock.Mock()
+        github.authenticated_login.return_value = "alice"
+        github.lookup_repository.side_effect = [None, existing]
+        github.submit_repository_creation.side_effect = GitHubOperationAmbiguous(
+            "Name already exists on this account"
+        )
+        github.observe_repository_creation.return_value = None
+        with mock.patch.object(jobs, "GitHubClient", return_value=github):
+            service.run_worker("123456789abc")
+
+        updated = jobs.read_job("123456789abc")
+        self.assertEqual(updated["status"], "awaiting_user")
+        self.assertEqual(updated["clarification_kind"], "github_repo_create_slug")
+        self.assertIn("already exists", str(updated["question"]))
+        self.assertNotEqual(
+            updated.get("github_repo_create_operation_state"), "created"
+        )
+        self.assertIsNone(updated.get("github_repo_created_url"))
+        github.ensure_repository_clone.assert_not_called()
 
     def test_timed_out_repo_creation_is_ambiguous_and_not_retried(self) -> None:
         jobs.write_job(
@@ -6085,6 +6440,37 @@ class CursorJobStateTests(unittest.TestCase):
         self.assertEqual(updated["clarification_kind"], "github_repo_create_org")
         self.assertEqual(updated["question"], "Which org?")
         github.require_organization_membership.assert_not_called()
+        github.submit_repository_creation.assert_not_called()
+
+    def test_org_repo_create_does_not_infer_owner_from_spoken_repo_slug(self) -> None:
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": (
+                    "create a GitHub repository in an organization like acme/payments"
+                ),
+                "trusted_utterance": (
+                    "create a GitHub repository in an organization like acme/payments"
+                ),
+                "issue_provider": "github",
+                "github_repo_create_requested": True,
+                "github_repo_create_org_requested": True,
+                "status": "queued",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        github = mock.Mock()
+        github.authenticated_login.return_value = "alice"
+        github.list_organizations.return_value = ("acme", "widgets")
+        with mock.patch.object(jobs, "GitHubClient", return_value=github):
+            service.run_worker("123456789abc")
+
+        updated = jobs.read_job("123456789abc")
+        self.assertEqual(updated["clarification_kind"], "github_repo_create_org")
+        self.assertEqual(updated["question"], "Which org?")
+        self.assertIsNone(updated.get("github_repo_create_owner"))
+        github.require_organization_create_access.assert_not_called()
         github.submit_repository_creation.assert_not_called()
 
     def test_org_repo_create_fails_closed_when_user_cannot_create_there(self) -> None:

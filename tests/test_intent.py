@@ -366,6 +366,7 @@ class FollowUpIntentTests(LocalRouterTestCase):
         self.assertIn("cursor_followup", enum)
         self.assertIn("cursor_details", enum)
         self.assertIn("github_pr_create", enum)
+        self.assertIn("github_pr_merge", enum)
         self.assertNotIn("cursor_pr_unsupported", enum)
 
     def test_recent_completion_flag_is_forwarded(self) -> None:
@@ -432,6 +433,18 @@ class FollowUpIntentTests(LocalRouterTestCase):
             route = intent.route_intent("open a pull request", RequestContext("open"))
         self.assertTrue(route.actionable)
         self.assertEqual(route.intent, intent.Intent.GITHUB_PR_CREATE)
+
+    def test_github_pr_merge_is_actionable(self) -> None:
+        with mock.patch.object(
+            llm_transport.urllib.request,
+            "urlopen",
+            return_value=_response("github_pr_merge"),
+        ):
+            route = intent.route_intent(
+                "merge the pull request", RequestContext("merge")
+            )
+        self.assertTrue(route.actionable)
+        self.assertEqual(route.intent, intent.Intent.GITHUB_PR_MERGE)
 
 
 class EndConversationIntentTests(LocalRouterTestCase):

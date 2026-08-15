@@ -17,6 +17,9 @@ from local_voice_harness.integrations.github import (
     GitHubPullRequestCheckoutInputs,
     GitHubPullRequestCreationPlan,
     GitHubPullRequestCreationResult,
+    GitHubPullRequestMergePlan,
+    GitHubPullRequestMergeResult,
+    GitHubPullRequestMergeSnapshot,
     GitHubPullRequestPlan,
     GitHubRepoCreationPlan,
     GitHubRepoCreationResult,
@@ -280,6 +283,66 @@ class GitHubProviderTests(unittest.TestCase):
         with self.assertRaisesRegex(GitHubError, "confirmation"):
             self.provider.submit_pull_request_creation(plan, confirmed=False)
         self.assertEqual(self.client.submit_pull_request_creation.call_count, 1)
+
+    def test_provider_plans_observes_and_submits_pull_request_merge(self) -> None:
+        snapshot = GitHubPullRequestMergeSnapshot(
+            "example/project",
+            7,
+            "https://github.com/example/project/pull/7",
+            "Safe change",
+            "main",
+            "main",
+            "feature/safe",
+            "b" * 40,
+            "OPEN",
+            False,
+            "passing",
+            "APPROVED",
+            "MERGEABLE",
+            "CLEAN",
+            False,
+            None,
+            False,
+            False,
+        )
+        result = GitHubPullRequestMergeResult(
+            GitHubPullRequest("example", "project", 7),
+            "https://github.com/example/project/pull/7",
+            "a" * 32,
+        )
+        self.client.observe_pull_request_merge.return_value = None
+        self.client.submit_pull_request_merge.return_value = result
+        self.client.inspect_pull_request_merge.return_value = snapshot
+
+        plan = self.provider.plan_pull_request_merge(
+            " example/project.git ",
+            7,
+            correlation_marker="a" * 32,
+        )
+
+        self.assertEqual(
+            plan,
+            GitHubPullRequestMergePlan(
+                "example/project",
+                7,
+                "https://github.com/example/project/pull/7",
+                "a" * 32,
+                snapshot,
+                "squash",
+            ),
+        )
+        self.assertIsNone(self.provider.observe_pull_request_merge(plan))
+        self.assertEqual(
+            self.provider.submit_pull_request_merge(plan, confirmed=True),
+            result,
+        )
+        self.client.observe_pull_request_merge.assert_called_once_with(plan)
+        self.client.submit_pull_request_merge.assert_called_once_with(
+            plan, confirmed=True
+        )
+        with self.assertRaisesRegex(GitHubError, "confirmation"):
+            self.provider.submit_pull_request_merge(plan, confirmed=False)
+        self.assertEqual(self.client.submit_pull_request_merge.call_count, 1)
 
     def test_provider_plans_observes_and_submits_repo_creation(self) -> None:
         created = GitHubRepoCreationResult(

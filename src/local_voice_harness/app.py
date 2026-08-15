@@ -33,6 +33,7 @@ from .diagnostics.health import self_health_response
 from .diagnostics.help import harness_help_response
 from .errors import HarnessError, SpeechDeliveryError
 from .github_issue_creation import repository_from_utterance
+from .integrations.github import resolve_pull_request_merge_identity
 from .integrations.registry import IntegrationRegistry, build_integration_registry
 from .intent import (
     NON_ACTIONABLE_SUBMIT_RESPONSE,
@@ -84,6 +85,7 @@ def _context_for_route(
         in {
             Intent.AGENT_SUBMIT,
             Intent.GITHUB_ISSUE_CREATE,
+            Intent.GITHUB_PR_MERGE,
             Intent.GITHUB_REPO_CREATE,
             Intent.GITHUB_ORG_REPO_CREATE,
             Intent.LINEAR_TICKET_CREATE,
@@ -127,6 +129,18 @@ def _single_pending_job() -> AgentJob | None:
         job for job in CURSOR_STORE.list() if job.status == JobStatus.AWAITING_USER
     ]
     return pending[0] if len(pending) == 1 else None
+
+
+def _recent_completed_pr_parent() -> AgentJob | None:
+    matches = [
+        job
+        for job in CURSOR_STORE.list()
+        if job.status == JobStatus.COMPLETED
+        and bool(job.worktree_path or job.repository)
+    ]
+    if not matches:
+        return None
+    return max(matches, key=lambda job: float(job.completed_at or 0))
 
 
 def acknowledge_deliveries(claims: DeliveryClaims) -> None:
@@ -270,11 +284,48 @@ def respond(text: str, *, user_config: UserConfig | None = None) -> None:
                         delivery_claims=delivery_claims,
                         integrations=integrations,
                     )[0]
-            elif route.actionable and route.intent == Intent.GITHUB_PR_CREATE:
-                response = (
-                    "I don't have a recent completed job checkout to open a "
-                    "pull request from."
+            elif route.actionable and route.intent == Intent.GITHUB_PR_MERGE:
+                identity = resolve_pull_request_merge_identity(
+                    utterance=text,
+                    focused_repository=context.github_repository,
+                    focused_number=context.github_pull_request,
                 )
+                response = cursor_turn(
+                    CursorTurnRequest(
+                        context.text,
+                        utterance=text,
+                        github_repository=(
+                            identity.repository if identity is not None else None
+                        ),
+                        github_pr_merge_requested=True,
+                        github_pr_merge_number=(
+                            identity.number if identity is not None else None
+                        ),
+                    ),
+                    delivery_claims=delivery_claims,
+                    integrations=integrations,
+                )[0]
+            elif route.actionable and route.intent == Intent.GITHUB_PR_CREATE:
+                parent = _recent_completed_pr_parent()
+                if parent is None:
+                    response = (
+                        "I don't have a recent completed job checkout to open a "
+                        "pull request from."
+                    )
+                else:
+                    response = cursor_turn(
+                        CursorTurnRequest(
+                            context.text,
+                            utterance=text,
+                            action="follow_up",
+                            job_id=parent.id,
+                            expected_parent_revision=parent.revision,
+                            expected_completed_at=parent.completed_at,
+                            github_pr_create_requested=True,
+                        ),
+                        delivery_claims=delivery_claims,
+                        integrations=integrations,
+                    )[0]
             elif route.actionable and route.intent == Intent.GITHUB_ISSUE_CREATE:
                 response = cursor_turn(
                     CursorTurnRequest(
@@ -440,6 +491,10 @@ def respond(text: str, *, user_config: UserConfig | None = None) -> None:
                     delivery_claims=delivery_claims,
                     integrations=integrations,
                 )[0]
+            elif route.intent == Intent.GITHUB_PR_MERGE:
+                response = (
+                    "I did not merge a pull request because the request was unclear."
+                )
             elif route.intent == Intent.GITHUB_PR_CREATE:
                 response = (
                     "I did not open a pull request because the request was unclear."

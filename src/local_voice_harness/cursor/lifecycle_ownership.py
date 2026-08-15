@@ -441,7 +441,11 @@ def _build_field_ownership() -> tuple[FieldOwnership, ...]:
             typed_runtime="CheckoutOperation / ForkOperation",
             transition_owner="cursor.operations.CheckoutOperation.transition / ForkOperation.transition",
             adapter="CursorJob.checkout_operation / fork_operation",
-            callers=_CHECKOUT_CALLERS + ("cursor.recovery.reconcile_uncertain_fork",),
+            callers=_CHECKOUT_CALLERS
+            + (
+                "cursor.recovery.reconcile_uncertain_fork",
+                "cursor.recovery.reconcile_uncertain_clone",
+            ),
             duplicate=(
                 "Fork labels such as retained, quarantined, confirmed_absent, "
                 "and failed_observing still collapse into generic "
@@ -481,6 +485,14 @@ def _build_field_ownership() -> tuple[FieldOwnership, ...]:
                 "github_pr_create_operation_state": CrashKind.UNCERTAINTY,
                 "github_pr_created_number": CrashKind.IDENTITY,
                 "github_pr_created_url": CrashKind.IDENTITY,
+                "github_pr_merge_requested": CrashKind.CONTENT,
+                "github_pr_merge_confirmed": CrashKind.UNCERTAINTY,
+                "github_pr_merge_number": CrashKind.IDENTITY,
+                "github_pr_merge_url": CrashKind.IDENTITY,
+                "github_pr_merge_marker": CrashKind.TOKEN,
+                "github_pr_merge_snapshot": CrashKind.TOKEN,
+                "github_pr_merge_method": CrashKind.CONTENT,
+                "github_pr_merge_operation_state": CrashKind.UNCERTAINTY,
                 "github_repo_create_requested": CrashKind.CONTENT,
                 "github_repo_create_org_requested": CrashKind.CONTENT,
                 "github_repo_create_continue_workflow": CrashKind.CONTENT,
@@ -513,10 +525,12 @@ def _build_field_ownership() -> tuple[FieldOwnership, ...]:
                 "cursor.provisioning._run_github_issue_creation",
                 "cursor.provisioning._offer_file_as_issue_one",
                 "cursor.provisioning._run_github_pr_creation",
+                "cursor.provisioning._run_github_pr_merge",
                 "cursor.provisioning._run_github_repo_creation",
                 "cursor.provisioning._run_linear_ticket_creation",
                 "cursor.recovery.reconcile_uncertain_issue_creation",
                 "cursor.recovery.reconcile_uncertain_pr_creation",
+                "cursor.recovery.reconcile_uncertain_pr_merge",
                 "cursor.recovery.reconcile_uncertain_repo_creation",
                 "cursor.recovery.reconcile_uncertain_linear_ticket_creation",
             ),
@@ -1149,9 +1163,21 @@ TRANSITION_ENTRY_POINTS: tuple[TransitionEntry, ...] = (
         AuthorityKind.CALLER_INTERPRETS,
     ),
     _entry(
+        "local_voice_harness.cursor.recovery.reconcile_uncertain_pr_merge",
+        "cursor.recovery",
+        "GitHub pull-request-merge observation",
+        AuthorityKind.CALLER_INTERPRETS,
+    ),
+    _entry(
         "local_voice_harness.cursor.recovery.reconcile_uncertain_repo_creation",
         "cursor.recovery",
         "GitHub repository-create observation",
+        AuthorityKind.CALLER_INTERPRETS,
+    ),
+    _entry(
+        "local_voice_harness.cursor.recovery.reconcile_uncertain_clone",
+        "cursor.recovery",
+        "repository-clone observation",
         AuthorityKind.CALLER_INTERPRETS,
     ),
     _entry(
@@ -1437,12 +1463,12 @@ def measured_baseline_counts() -> dict[str, int]:
 # Measured on the #357 baseline checkout. Tests fail if these drift without an
 # intentional inventory update. They are evidence, not an optimization target.
 BASELINE_COUNTS: dict[str, int] = {
-    "persisted_field_names": 242,
-    "named_table_fields": 237,
+    "persisted_field_names": 250,
+    "named_table_fields": 245,
     "import_only_fields": 4,
-    "cursor_job_public_properties": 181,
+    "cursor_job_public_properties": 189,
     "compatibility_adapters": 38,
-    "transition_entry_points": 77,
+    "transition_entry_points": 78,
     "duplicate_authorities": 0,
-    "lifecycle_module_lines": 28924,
+    "lifecycle_module_lines": 29763,
 }

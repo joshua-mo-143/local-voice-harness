@@ -6,11 +6,11 @@ import re
 import secrets
 import subprocess
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from enum import StrEnum
 from pathlib import Path
 from typing import NoReturn
-from urllib.parse import SplitResult, urlsplit
+from urllib.parse import SplitResult, quote, urlsplit
 
 from ..context_fragment import ContextFragment
 from ..diagnostic_safety import redact_diagnostic
@@ -68,6 +68,29 @@ PULL_REQUEST_PATH = re.compile(
     r"^/(?P<owner>[A-Za-z0-9_.-]+)/(?P<repo>[A-Za-z0-9_.-]+)/pull/"
     r"(?P<number>[1-9]\d*)(?:/.*)?$"
 )
+PULL_REQUEST_URL_IN_TEXT = re.compile(
+    r"https://(?:www\.)?github\.com/[A-Za-z0-9_.-]+/"
+    r"[A-Za-z0-9_.-]+/pull/[1-9]\d*",
+    re.IGNORECASE,
+)
+PULL_REQUEST_LANGUAGE = re.compile(r"\b(?:pull requests?|prs?)\b", re.IGNORECASE)
+PULL_REQUEST_IN_REPOSITORY = re.compile(
+    r"\b(?:pull request|pr)\s+#?(?P<number>[1-9]\d*)\s+(?:in|from|on)\s+"
+    r"(?P<owner>[A-Za-z0-9](?:[A-Za-z0-9-]{0,38}))/"
+    r"(?P<repo>[A-Za-z0-9_.-]+)\b",
+    re.IGNORECASE,
+)
+REPOSITORY_PULL_REQUEST = re.compile(
+    r"(?<![A-Za-z0-9_.-])"
+    r"(?P<owner>[A-Za-z0-9](?:[A-Za-z0-9-]{0,38}))/"
+    r"(?P<repo>[A-Za-z0-9_.-]+)\s+(?:pull request|pr)\s+#?"
+    r"(?P<number>[1-9]\d*)(?![A-Za-z0-9_/-])",
+    re.IGNORECASE,
+)
+BARE_PULL_REQUEST_NUMBER = re.compile(
+    r"\b(?:pull request|pr)\s+#?(?P<number>[1-9]\d*)\b",
+    re.IGNORECASE,
+)
 REPOSITORY_PATH = re.compile(
     r"^/(?P<owner>[A-Za-z0-9_.-]+)/(?P<repo>[A-Za-z0-9_.-]+)(?:/.*)?$"
 )
@@ -93,6 +116,14 @@ class GitHubOperationAmbiguous(GitHubError):
 
 class GitHubCommandStartError(GitHubError):
     """A GitHub command failed before its process could be started."""
+
+
+class GitHubPreconditionError(GitHubError):
+    """A read-only merge precondition failed before any merge write."""
+
+
+class GitHubMergeQueueArmedError(GitHubError):
+    """A pull request is accurately known to remain queued for merge."""
 
 
 class GitHubIssueLookupReason(StrEnum):
@@ -285,6 +316,76 @@ class GitHubPullRequestCreationResult:
     pull_request: GitHubPullRequest
     url: str
     correlation_marker: str
+
+
+@dataclass(frozen=True)
+class GitHubPullRequestMergeSnapshot:
+    repository: str
+    number: int
+    url: str
+    title: str
+    default_branch: str
+    base_ref: str
+    head_ref: str
+    head_oid: str
+    state: str
+    is_draft: bool
+    checks: str
+    review_decision: str
+    mergeable: str
+    merge_state_status: str
+    is_stack: bool
+    stack_parent_url: str | None
+    merge_queue_required: bool
+    auto_merge_requested: bool
+
+    def serialize(self) -> str:
+        return json.dumps(
+            asdict(self),
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+
+    @classmethod
+    def deserialize(cls, value: str) -> GitHubPullRequestMergeSnapshot:
+        try:
+            details = json.loads(value)
+            snapshot = cls(**details)
+        except (json.JSONDecodeError, TypeError) as exc:
+            raise GitHubError("GitHub pull request merge snapshot is invalid") from exc
+        return snapshot
+
+
+@dataclass(frozen=True)
+class GitHubPullRequestMergePlan:
+    repository: str
+    number: int
+    url: str
+    correlation_marker: str
+    snapshot: GitHubPullRequestMergeSnapshot
+    method: str
+
+
+@dataclass(frozen=True)
+class GitHubPullRequestMergeResult:
+    pull_request: GitHubPullRequest
+    url: str
+    correlation_marker: str
+
+
+@dataclass(frozen=True)
+class PullRequestMergeIdentity:
+    repository: str
+    number: int
+
+    @property
+    def url(self) -> str:
+        return f"https://github.com/{self.repository}/pull/{self.number}"
+
+    @property
+    def pull_request(self) -> GitHubPullRequest:
+        owner, name = self.repository.split("/", 1)
+        return GitHubPullRequest(owner=owner, repository=name, number=self.number)
 
 
 @dataclass(frozen=True)
@@ -720,6 +821,376 @@ class GitHubClient:
         if len(matches) > 1:
             raise GitHubError("GitHub pull request correlation marker is not unique")
         return matches[0] if matches else None
+
+    @staticmethod
+    def validate_pull_request_merge_plan(plan: GitHubPullRequestMergePlan) -> None:
+        if not isinstance(plan.repository, str):
+            raise GitHubError("GitHub pull request repository must be text")
+        repository = GitHubClient.validate_repository(plan.repository)
+        if repository != plan.repository:
+            raise GitHubError(
+                "GitHub pull request merge plan repository is not normalized"
+            )
+        if not isinstance(plan.number, int) or plan.number < 1:
+            raise GitHubError("GitHub pull request number must be positive")
+        expected = f"https://github.com/{repository}/pull/{plan.number}"
+        if not isinstance(plan.url, str) or plan.url != expected:
+            raise GitHubError("GitHub pull request merge URL is not canonical")
+        if (
+            not isinstance(plan.correlation_marker, str)
+            or ISSUE_CORRELATION_MARKER.fullmatch(plan.correlation_marker) is None
+        ):
+            raise GitHubError(
+                "GitHub pull request merge correlation marker must be 32 lowercase "
+                "hex characters"
+            )
+        if plan.method not in {"merge", "squash", "rebase"}:
+            raise GitHubError("GitHub pull request merge method is invalid")
+        if not isinstance(plan.snapshot, GitHubPullRequestMergeSnapshot):
+            raise GitHubError("GitHub pull request merge snapshot is invalid")
+        if (
+            plan.snapshot.repository != plan.repository
+            or plan.snapshot.number != plan.number
+            or plan.snapshot.url != plan.url
+        ):
+            raise GitHubError("GitHub pull request merge snapshot identity changed")
+        snapshot = plan.snapshot
+        required_text = (
+            snapshot.title,
+            snapshot.default_branch,
+            snapshot.base_ref,
+            snapshot.head_ref,
+            snapshot.state,
+            snapshot.checks,
+            snapshot.mergeable,
+            snapshot.merge_state_status,
+        )
+        if not all(isinstance(value, str) and value for value in required_text):
+            raise GitHubError("GitHub pull request merge snapshot is malformed")
+        if (
+            not isinstance(snapshot.head_oid, str)
+            or re.fullmatch(r"[0-9a-f]{40}", snapshot.head_oid) is None
+            or snapshot.checks not in {"passing", "pending", "failing"}
+            or snapshot.review_decision
+            not in {"", "APPROVED", "REVIEW_REQUIRED", "CHANGES_REQUESTED"}
+            or type(snapshot.is_draft) is not bool
+            or type(snapshot.is_stack) is not bool
+            or type(snapshot.merge_queue_required) is not bool
+            or type(snapshot.auto_merge_requested) is not bool
+            or (
+                snapshot.stack_parent_url is not None
+                and not isinstance(snapshot.stack_parent_url, str)
+            )
+        ):
+            raise GitHubError("GitHub pull request merge snapshot is malformed")
+
+    @staticmethod
+    def _check_state(details: dict[str, object]) -> str:
+        checks = details.get("statusCheckRollup")
+        if not isinstance(checks, list):
+            raise GitHubError("GitHub returned malformed pull request checks")
+        if not checks:
+            return "passing"
+        pending = False
+        for check in checks:
+            if not isinstance(check, dict):
+                raise GitHubError("GitHub returned malformed pull request checks")
+            status = str(check.get("status") or "").upper()
+            conclusion = str(check.get("conclusion") or "").upper()
+            if status != "COMPLETED" or not conclusion:
+                pending = True
+                continue
+            if conclusion not in {"SUCCESS", "NEUTRAL", "SKIPPED"}:
+                return "failing"
+        return "pending" if pending else "passing"
+
+    @staticmethod
+    def _merge_queue_required(rulesets: object) -> bool:
+        if not isinstance(rulesets, list) or not all(
+            isinstance(rule, dict) for rule in rulesets
+        ):
+            raise GitHubError("GitHub returned malformed repository branch rules")
+        return any(rule.get("type") == "merge_queue" for rule in rulesets)
+
+    def inspect_pull_request_merge(
+        self, repository: str, number: int
+    ) -> GitHubPullRequestMergeSnapshot:
+        repository = self.validate_repository(repository)
+        pull_process = self._run(
+            [
+                self.gh_executable,
+                "pr",
+                "view",
+                str(number),
+                "--repo",
+                repository,
+                "--json",
+                (
+                    "number,url,title,state,isDraft,headRefName,headRefOid,"
+                    "baseRefName,mergeable,mergeStateStatus,reviewDecision,"
+                    "statusCheckRollup,autoMergeRequest"
+                ),
+            ],
+            timeout=15,
+        )
+        repo_process = self._run(
+            [
+                self.gh_executable,
+                "repo",
+                "view",
+                repository,
+                "--json",
+                "nameWithOwner,defaultBranchRef",
+            ],
+            timeout=15,
+        )
+        try:
+            details = json.loads(pull_process.stdout)
+            repo_details = json.loads(repo_process.stdout)
+        except json.JSONDecodeError as exc:
+            raise GitHubError(
+                "GitHub returned malformed pull request metadata"
+            ) from exc
+        if not isinstance(details, dict) or not isinstance(repo_details, dict):
+            raise GitHubError("GitHub returned malformed pull request metadata")
+        canonical = str(repo_details.get("nameWithOwner") or "")
+        default = repo_details.get("defaultBranchRef")
+        default_branch = (
+            str(default.get("name") or "") if isinstance(default, dict) else ""
+        )
+        base_ref = str(details.get("baseRefName") or "")
+        head_ref = str(details.get("headRefName") or "")
+        head_oid = str(details.get("headRefOid") or "").casefold()
+        url = str(details.get("url") or "")
+        if (
+            canonical.casefold() != repository.casefold()
+            or details.get("number") != number
+            or url != f"https://github.com/{canonical}/pull/{number}"
+            or not default_branch
+            or not base_ref
+            or not head_ref
+            or re.fullmatch(r"[0-9a-f]{40}", head_oid) is None
+        ):
+            raise GitHubError("GitHub returned malformed pull request metadata")
+        rules_process = self._run(
+            [
+                self.gh_executable,
+                "api",
+                f"repos/{repository}/rules/branches/{quote(base_ref, safe='')}",
+            ],
+            timeout=15,
+        )
+        try:
+            rulesets = json.loads(rules_process.stdout)
+        except json.JSONDecodeError as exc:
+            raise GitHubError("GitHub returned malformed branch rules") from exc
+        stack_parent_url: str | None = None
+        is_stack = False
+        if base_ref != default_branch:
+            stack_process = self._run(
+                [
+                    self.gh_executable,
+                    "pr",
+                    "list",
+                    "--repo",
+                    canonical,
+                    "--state",
+                    "open",
+                    "--head",
+                    base_ref,
+                    "--json",
+                    "number,url,headRefName,baseRefName",
+                ],
+                timeout=15,
+            )
+            try:
+                stack_values = json.loads(stack_process.stdout)
+            except json.JSONDecodeError as exc:
+                raise GitHubError("GitHub returned malformed stack metadata") from exc
+            if not isinstance(stack_values, list):
+                raise GitHubError("GitHub returned malformed stack metadata")
+            parents = [
+                value
+                for value in stack_values
+                if isinstance(value, dict) and value.get("headRefName") == base_ref
+            ]
+            if parents:
+                is_stack = True
+                stack_parent_url = str(parents[0].get("url") or "") or None
+        return GitHubPullRequestMergeSnapshot(
+            repository=canonical,
+            number=number,
+            url=url,
+            title=str(details.get("title") or ""),
+            default_branch=default_branch,
+            base_ref=base_ref,
+            head_ref=head_ref,
+            head_oid=head_oid,
+            state=str(details.get("state") or "").upper(),
+            is_draft=details.get("isDraft") is True,
+            checks=self._check_state(details),
+            review_decision=str(details.get("reviewDecision") or "").upper(),
+            mergeable=str(details.get("mergeable") or "").upper(),
+            merge_state_status=str(details.get("mergeStateStatus") or "").upper(),
+            is_stack=is_stack,
+            stack_parent_url=stack_parent_url,
+            merge_queue_required=self._merge_queue_required(rulesets),
+            auto_merge_requested=details.get("autoMergeRequest") is not None,
+        )
+
+    @staticmethod
+    def validate_pull_request_merge_eligibility(
+        snapshot: GitHubPullRequestMergeSnapshot,
+    ) -> None:
+        if snapshot.state != "OPEN":
+            raise GitHubPreconditionError("GitHub pull request is not open")
+        if snapshot.is_draft:
+            raise GitHubPreconditionError("GitHub pull request is still a draft")
+        if snapshot.checks != "passing":
+            raise GitHubPreconditionError(
+                f"GitHub pull request checks are {snapshot.checks}"
+            )
+        if snapshot.review_decision in {"REVIEW_REQUIRED", "CHANGES_REQUESTED"}:
+            raise GitHubPreconditionError(
+                "GitHub pull request does not have eligible reviews"
+            )
+        if snapshot.mergeable != "MERGEABLE":
+            raise GitHubPreconditionError("GitHub pull request is not mergeable")
+        if snapshot.merge_state_status not in {"CLEAN", "HAS_HOOKS"}:
+            raise GitHubPreconditionError(
+                "GitHub pull request merge state is not eligible"
+            )
+        if snapshot.base_ref != snapshot.default_branch:
+            if snapshot.is_stack:
+                detail = (
+                    f" as part of the stack rooted at {snapshot.stack_parent_url}"
+                    if snapshot.stack_parent_url
+                    else " as part of a GitHub stack"
+                )
+                raise GitHubPreconditionError(
+                    f"GitHub pull request targets non-default branch "
+                    f"{snapshot.base_ref}{detail}; merging it would not integrate "
+                    f"the change into {snapshot.default_branch}"
+                )
+            raise GitHubPreconditionError(
+                f"GitHub pull request targets non-default branch {snapshot.base_ref}; "
+                f"merging it would not integrate the change into "
+                f"{snapshot.default_branch}"
+            )
+        if snapshot.merge_queue_required or snapshot.auto_merge_requested:
+            raise GitHubPreconditionError(
+                "GitHub pull request uses a merge queue; queue enrollment requires "
+                "a separate explicit authorization"
+            )
+
+    @staticmethod
+    def _pull_request_merge_result(
+        plan: GitHubPullRequestMergePlan, url: object
+    ) -> GitHubPullRequestMergeResult:
+        value = str(url or "").strip()
+        pull_request = github_pull_request_from_url(value)
+        if pull_request is None or value != pull_request.url:
+            raise GitHubError("GitHub returned a non-canonical pull request URL")
+        if pull_request.name_with_owner.casefold() != plan.repository.casefold():
+            raise GitHubError(
+                "GitHub merged a pull request in an unexpected repository"
+            )
+        if pull_request.number != plan.number:
+            raise GitHubError("GitHub merged an unexpected pull request")
+        return GitHubPullRequestMergeResult(
+            pull_request, value, plan.correlation_marker
+        )
+
+    def submit_pull_request_merge(
+        self,
+        plan: GitHubPullRequestMergePlan,
+        *,
+        confirmed: bool,
+    ) -> GitHubPullRequestMergeResult:
+        if not confirmed:
+            raise GitHubError(
+                "GitHub pull request merge requires explicit confirmation"
+            )
+        self.validate_pull_request_merge_plan(plan)
+        current = self.inspect_pull_request_merge(plan.repository, plan.number)
+        if current != plan.snapshot:
+            raise GitHubPreconditionError(
+                "GitHub pull request state changed after confirmation; confirm the "
+                "current state before merging"
+            )
+        self.validate_pull_request_merge_eligibility(current)
+        self._run(
+            [
+                self.gh_executable,
+                "pr",
+                "merge",
+                str(plan.number),
+                "--repo",
+                plan.repository,
+                f"--{plan.method}",
+                "--match-head-commit",
+                plan.snapshot.head_oid,
+            ],
+            timeout=30,
+            write=True,
+        )
+        try:
+            observed = self.observe_pull_request_merge(plan)
+        except GitHubMergeQueueArmedError:
+            raise
+        except GitHubError as exc:
+            raise GitHubOperationAmbiguous(
+                "GitHub write completed without a provable pull request merge; "
+                "an external side effect may already have occurred"
+            ) from exc
+        if observed is None:
+            raise GitHubOperationAmbiguous(
+                "GitHub write completed without a provable pull request merge; "
+                "an external side effect may already have occurred"
+            )
+        return observed
+
+    def observe_pull_request_merge(
+        self, plan: GitHubPullRequestMergePlan
+    ) -> GitHubPullRequestMergeResult | None:
+        self.validate_pull_request_merge_plan(plan)
+        process = self._run(
+            [
+                self.gh_executable,
+                "pr",
+                "view",
+                str(plan.number),
+                "--repo",
+                plan.repository,
+                "--json",
+                "number,url,state,mergedAt,autoMergeRequest,headRefOid",
+            ],
+            timeout=15,
+            check=False,
+        )
+        if process.returncode:
+            return None
+        try:
+            value = json.loads(process.stdout)
+        except json.JSONDecodeError as exc:
+            raise GitHubError(
+                "GitHub returned malformed pull request merge metadata"
+            ) from exc
+        if not isinstance(value, dict):
+            raise GitHubError("GitHub returned malformed pull request merge metadata")
+        state = str(value.get("state") or "").casefold()
+        merged_at = value.get("mergedAt")
+        if value.get("autoMergeRequest") is not None and not merged_at:
+            raise GitHubMergeQueueArmedError(
+                "GitHub pull request is queued for merge and remains armed"
+            )
+        if state != "merged" and not merged_at:
+            return None
+        result = self._pull_request_merge_result(plan, value.get("url") or plan.url)
+        number = value.get("number")
+        if not isinstance(number, int) or number != result.pull_request.number:
+            raise GitHubError("GitHub returned malformed pull request merge metadata")
+        return result
 
     def _repo_view(self, repository: str, *, required: bool) -> GitHubRepository | None:
         process = self._run(
@@ -1229,6 +1700,44 @@ class GitHubClient:
         except LocalGitError as exc:
             self._raise_local_git_error(exc)
 
+    def observe_clone(self, source: str) -> Path | None:
+        """Return the checkout if a prior clone already landed. Never clones."""
+
+        repository = github_repository_from_url(source)
+        if repository is None:
+            try:
+                repository = self.validate_repository(source)
+            except GitHubError:
+                repository = None
+        if repository is not None:
+            owner, name = repository.split("/", 1)
+            destination = self.local_git.clone_root / owner / name
+            if not destination.exists():
+                return None
+            try:
+                expected = ExpectedRemote.from_url(f"https://github.com/{repository}")
+                self.local_git.verify_checkout(
+                    destination,
+                    expected,
+                    expected_label=repository,
+                )
+            except LocalGitError:
+                return None
+            return destination.resolve()
+        name = source.strip().rstrip("/").rsplit("/", 1)[-1]
+        if name.casefold().endswith(".git"):
+            name = name[:-4]
+        if not name or name.startswith("."):
+            return None
+        destination = self.local_git.clone_root / name
+        if not destination.exists():
+            return None
+        try:
+            self.local_git.verify_checkout(destination)
+        except LocalGitError:
+            return None
+        return destination.resolve()
+
     def find_repository_checkout(
         self, source: GitHubRepository, candidates: list[Path]
     ) -> Path | None:
@@ -1470,6 +1979,107 @@ def github_pull_request_from_url(url: str) -> GitHubPullRequest | None:
     )
 
 
+def _merge_identity(repository: str, number: int) -> PullRequestMergeIdentity | None:
+    try:
+        normalized = GitHubClient.validate_repository(repository)
+    except GitHubError:
+        return None
+    if number < 1:
+        return None
+    return PullRequestMergeIdentity(normalized, number)
+
+
+def _identity_from_groups(match: re.Match[str]) -> PullRequestMergeIdentity | None:
+    return _merge_identity(
+        f"{match.group('owner')}/{match.group('repo')}",
+        int(match.group("number")),
+    )
+
+
+def pull_request_identity_from_text(text: str) -> PullRequestMergeIdentity | None:
+    """Return one explicit trusted PR identity, or None if absent or ambiguous."""
+
+    identities: list[PullRequestMergeIdentity] = []
+    seen: set[tuple[str, int]] = set()
+
+    def add(identity: PullRequestMergeIdentity | None) -> None:
+        if identity is None:
+            return
+        key = (identity.repository.casefold(), identity.number)
+        if key in seen:
+            return
+        seen.add(key)
+        identities.append(identity)
+
+    for match in PULL_REQUEST_URL_IN_TEXT.finditer(text):
+        pull_request = github_pull_request_from_url(match.group(0))
+        if pull_request is not None:
+            add(_merge_identity(pull_request.name_with_owner, pull_request.number))
+    for pattern in (PULL_REQUEST_IN_REPOSITORY, REPOSITORY_PULL_REQUEST):
+        for match in pattern.finditer(text):
+            add(_identity_from_groups(match))
+    if PULL_REQUEST_LANGUAGE.search(text) is not None:
+        for match in ISSUE_REFERENCE.finditer(text):
+            add(_identity_from_groups(match))
+    return identities[0] if len(identities) == 1 else None
+
+
+def bare_pull_request_number(text: str) -> int | None:
+    matches = [
+        int(match.group("number")) for match in BARE_PULL_REQUEST_NUMBER.finditer(text)
+    ]
+    return matches[0] if len(set(matches)) == 1 else None
+
+
+def resolve_pull_request_merge_identity(
+    *,
+    utterance: str,
+    focused_repository: str | None = None,
+    focused_number: int | None = None,
+    conversation_repository: str | None = None,
+    conversation_number: int | None = None,
+) -> PullRequestMergeIdentity | None:
+    """Return the unique merge identity, or None when it is missing or ambiguous."""
+
+    explicit = pull_request_identity_from_text(utterance)
+    if explicit is not None:
+        return explicit
+    focused = (
+        _merge_identity(focused_repository, focused_number)
+        if focused_repository and focused_number
+        else None
+    )
+    conversation = (
+        _merge_identity(conversation_repository, conversation_number)
+        if conversation_repository and conversation_number
+        else None
+    )
+    number = bare_pull_request_number(utterance)
+    candidates: list[PullRequestMergeIdentity] = []
+    if number is not None:
+        if focused_repository:
+            identity = _merge_identity(focused_repository, number)
+            if identity is not None:
+                candidates.append(identity)
+        if conversation_repository:
+            identity = _merge_identity(conversation_repository, number)
+            if identity is not None:
+                candidates.append(identity)
+    else:
+        candidates.extend(
+            identity for identity in (focused, conversation) if identity is not None
+        )
+    unique: list[PullRequestMergeIdentity] = []
+    seen: set[tuple[str, int]] = set()
+    for identity in candidates:
+        key = (identity.repository.casefold(), identity.number)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(identity)
+    return unique[0] if len(unique) == 1 else None
+
+
 def _truncate(value: object, limit: int) -> str:
     text = str(value or "").strip()
     return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
@@ -1636,6 +2246,16 @@ _GITHUB_STATE_SECTIONS: dict[str, dict[str, str]] = {
         "operation_state": "github_pr_create_operation_state",
         "created_number": "github_pr_created_number",
         "created_url": "github_pr_created_url",
+    },
+    "pull_request_merge": {
+        "requested": "github_pr_merge_requested",
+        "confirmed": "github_pr_merge_confirmed",
+        "number": "github_pr_merge_number",
+        "url": "github_pr_merge_url",
+        "marker": "github_pr_merge_marker",
+        "snapshot": "github_pr_merge_snapshot",
+        "method": "github_pr_merge_method",
+        "operation_state": "github_pr_merge_operation_state",
     },
     "repo_creation": {
         "requested": "github_repo_create_requested",
@@ -1918,6 +2538,74 @@ class GitHubProvider:
             )
         self.validate_pull_request_creation_plan(plan)
         return self._client.submit_pull_request_creation(plan, confirmed=True)
+
+    def plan_pull_request_merge(
+        self,
+        repository: str,
+        number: int,
+        *,
+        correlation_marker: str | None = None,
+        snapshot: str | None = None,
+        method: str = "squash",
+    ) -> GitHubPullRequestMergePlan:
+        if not isinstance(repository, str):
+            raise GitHubError("GitHub pull request repository must be text")
+        if not isinstance(number, int):
+            raise GitHubError("GitHub pull request number must be an integer")
+        normalized = GitHubClient.validate_repository(repository)
+        observed = (
+            GitHubPullRequestMergeSnapshot.deserialize(snapshot)
+            if snapshot is not None
+            else self._client.inspect_pull_request_merge(normalized, number)
+        )
+        plan = GitHubPullRequestMergePlan(
+            repository=normalized,
+            number=number,
+            url=f"https://github.com/{normalized}/pull/{number}",
+            correlation_marker=correlation_marker or secrets.token_hex(16),
+            snapshot=observed,
+            method=method,
+        )
+        self.validate_pull_request_merge_plan(plan)
+        GitHubClient.validate_pull_request_merge_eligibility(observed)
+        return plan
+
+    @staticmethod
+    def validate_pull_request_merge_plan(plan: GitHubPullRequestMergePlan) -> None:
+        GitHubClient.validate_pull_request_merge_plan(plan)
+
+    def observe_pull_request_merge(
+        self, plan: GitHubPullRequestMergePlan
+    ) -> GitHubPullRequestMergeResult | None:
+        self.validate_pull_request_merge_plan(plan)
+        return self._client.observe_pull_request_merge(plan)
+
+    def confirm_pull_request_merge_state(
+        self, plan: GitHubPullRequestMergePlan
+    ) -> None:
+        """Re-fetch and reject a stale or newly ineligible confirmation."""
+
+        self.validate_pull_request_merge_plan(plan)
+        current = self._client.inspect_pull_request_merge(plan.repository, plan.number)
+        if current != plan.snapshot:
+            raise GitHubPreconditionError(
+                "GitHub pull request state changed after confirmation; confirm the "
+                "current state before merging"
+            )
+        GitHubClient.validate_pull_request_merge_eligibility(current)
+
+    def submit_pull_request_merge(
+        self,
+        plan: GitHubPullRequestMergePlan,
+        *,
+        confirmed: bool,
+    ) -> GitHubPullRequestMergeResult:
+        if not confirmed:
+            raise GitHubError(
+                "GitHub pull request merge requires explicit confirmation"
+            )
+        self.validate_pull_request_merge_plan(plan)
+        return self._client.submit_pull_request_merge(plan, confirmed=True)
 
     def plan_repository_creation(
         self,
