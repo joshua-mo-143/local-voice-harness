@@ -946,7 +946,9 @@ def _default_announcement_ack(values: dict[str, object]) -> None:
     values["announcement_ack"] = AnnouncementAck.PENDING.value
 
 
-def _canonicalize_announcement_dismissal(values: dict[str, object]) -> None:
+def _canonicalize_announcement_dismissal(
+    values: dict[str, object], *, legacy_record: bool
+) -> None:
     """Translate legacy dismissal, fail closed on conflict, then drop the mirror."""
 
     raw_ack = values.get("announcement_ack")
@@ -958,7 +960,11 @@ def _canonicalize_announcement_dismissal(values: dict[str, object]) -> None:
         dismissed_present
         and raw_ack in ANNOUNCEMENT_ACK_STATES
         and dismissed != (raw_ack == AnnouncementAck.DISMISSED.value)
-        and not (values.get("delivered") and raw_ack == AnnouncementAck.PENDING.value)
+        and not (
+            legacy_record
+            and values.get("delivered")
+            and raw_ack == AnnouncementAck.PENDING.value
+        )
     ):
         raise JobValidationError("dismissal state and acknowledgement must match")
     _default_announcement_ack(values)
@@ -1070,7 +1076,10 @@ def migrate_job_record(raw: Mapping[str, object]) -> tuple[dict[str, object], in
         _default_announcement_ack(values)
     values.setdefault("session_control", SessionControlMode.AUTOMATED.value)
     values.setdefault("session_control_generation", 0)
-    _canonicalize_announcement_dismissal(values)
+    _canonicalize_announcement_dismissal(
+        values,
+        legacy_record=loaded_version < CURRENT_SCHEMA_VERSION,
+    )
     values["schema_version"] = CURRENT_SCHEMA_VERSION
     return values, loaded_version
 

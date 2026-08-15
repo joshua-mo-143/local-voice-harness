@@ -373,6 +373,26 @@ class CursorJobModelTests(unittest.TestCase):
         self.assertTrue(job.announcement_dismissed)
         self.assertNotIn("announcement_dismissed", job.to_dict())
 
+    def test_legacy_pending_ack_and_dismissal_import_as_dismissed(self) -> None:
+        job = CursorJob.from_dict(
+            {
+                "schema_version": 15,
+                "id": "123456789abc",
+                "revision": 0,
+                "request": "do it",
+                "status": "completed",
+                "created_at": 1,
+                "completed_at": 2,
+                "result": "done",
+                "delivered": True,
+                "announcement_ack": "pending",
+                "announcement_dismissed": True,
+            }
+        )
+
+        self.assertEqual(job.announcement_ack, "dismissed")
+        self.assertTrue(job.announcement_dismissed)
+
     def test_native_dismissal_cannot_disagree_with_acknowledgement(self) -> None:
         with self.assertRaisesRegex(JobValidationError, "must match"):
             CursorJob.from_dict(
@@ -404,6 +424,22 @@ class CursorJobModelTests(unittest.TestCase):
                     "delivered": True,
                     "announcement_ack": "dismissed",
                     "announcement_dismissed": False,
+                }
+            )
+        with self.assertRaisesRegex(JobValidationError, "must match"):
+            CursorJob.from_dict(
+                {
+                    "schema_version": CURRENT_SCHEMA_VERSION,
+                    "id": "cccccccccccc",
+                    "revision": 0,
+                    "request": "do it",
+                    "status": "completed",
+                    "created_at": 1,
+                    "completed_at": 2,
+                    "result": "done",
+                    "delivered": True,
+                    "announcement_ack": "pending",
+                    "announcement_dismissed": True,
                 }
             )
 
