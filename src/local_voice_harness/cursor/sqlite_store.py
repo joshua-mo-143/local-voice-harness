@@ -427,6 +427,39 @@ def _missing_named_columns(
     return missing
 
 
+# Additive columns introduced after the original quarantine table. Existing rows
+# keep NULL keys and 0 flags until import/reconciliation has source evidence.
+_QUARANTINE_ADDITIVE_COLUMNS: tuple[tuple[str, str], ...] = (
+    ("target_key", '"target_key" TEXT'),
+    ("worktree_key", '"worktree_key" TEXT'),
+    (
+        "blocks_all",
+        '"blocks_all" INTEGER NOT NULL DEFAULT 0 CHECK("blocks_all" IN (0, 1))',
+    ),
+    (
+        "reserves_target",
+        '"reserves_target" INTEGER NOT NULL DEFAULT 0 '
+        'CHECK("reserves_target" IN (0, 1))',
+    ),
+    (
+        "reserves_worktree",
+        '"reserves_worktree" INTEGER NOT NULL DEFAULT 0 '
+        'CHECK("reserves_worktree" IN (0, 1))',
+    ),
+)
+
+
+def _missing_quarantine_columns(connection: sqlite3.Connection) -> tuple[str, ...]:
+    present = {
+        str(row["name"]) for row in connection.execute("PRAGMA table_info(quarantine)")
+    }
+    return tuple(
+        column
+        for column, _definition in _QUARANTINE_ADDITIVE_COLUMNS
+        if column not in present
+    )
+
+
 def _schema_statements(script: str) -> tuple[str, ...]:
     statements: list[str] = []
     pending = ""
@@ -774,6 +807,16 @@ class SQLiteJobDatabase:
                 connection.execute(
                     f'ALTER TABLE "{table}" ADD COLUMN {_column_definition(column)}'
                 )
+        definitions = dict(_QUARANTINE_ADDITIVE_COLUMNS)
+        missing_quarantine_columns = _missing_quarantine_columns(connection)
+        for column in missing_quarantine_columns:
+            connection.execute(
+                f"ALTER TABLE quarantine ADD COLUMN {definitions[column]}"
+            )
+        if "blocks_all" in missing_quarantine_columns:
+            connection.execute(
+                "UPDATE quarantine SET blocks_all = 1 WHERE resolved_at IS NULL"
+            )
         connection.execute(
             """
             INSERT OR IGNORE INTO outbox_concurrency(effect_id, concurrency_key)
