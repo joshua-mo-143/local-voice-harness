@@ -82,7 +82,7 @@ class InstallationProfileDecisionTests(unittest.TestCase):
         self.assertFalse(plan.download_chatterbox)
 
     def test_unknown_profile_and_provider_fail_closed(self) -> None:
-        with self.assertRaisesRegex(InstallProfileError, "showcase, local-cuda"):
+        with self.assertRaisesRegex(InstallProfileError, "local-cuda, showcase"):
             resolve_installation_plan(profile="gpu-free")
         with self.assertRaisesRegex(InstallProfileError, "LLM provider"):
             resolve_installation_plan(llm_provider="openai")
@@ -94,8 +94,8 @@ class InstallationProfileDecisionTests(unittest.TestCase):
             script = Path(temporary) / "eval-plan.sh"
             script.write_text(
                 "#!/bin/sh\n"
-                "eval \"$(python3 -m local_voice_harness.install_profile "
-                "--profile showcase --format env)\"\n"
+                'eval "$(python3 -m local_voice_harness.install_profile '
+                '--profile showcase --format env)"\n'
                 'printf "%s %s %s %s\\n" '
                 '"$INSTALL_PROFILE" "$INSTALL_DICTATION_EXTRA" '
                 '"$INSTALL_CUDA_PACKAGES" "$INSTALL_TTS_EXTRA"\n'
