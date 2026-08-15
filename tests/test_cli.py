@@ -11,7 +11,11 @@ from local_voice_harness import cli
 from local_voice_harness.browser_context import RequestContext
 from local_voice_harness.cursor.service import CursorTurnRequest, CursorTurnResult
 from local_voice_harness.cursor.store import QuarantineEvidence
-from local_voice_harness.diagnostic_safety import COMMAND_FAILURE
+from local_voice_harness.diagnostic_safety import (
+    COMMAND_FAILURE,
+    SPEECH_DELIVERY_FAILURE,
+)
+from local_voice_harness.errors import SpeechDeliveryError
 from local_voice_harness.intent import Intent, IntentRoute
 from local_voice_harness.responses import AssistantResponse
 from local_voice_harness.transcript import TranscriptReplacement
@@ -581,6 +585,28 @@ class MainFailureTests(unittest.TestCase):
         self.assertIn("[REDACTED]", output)
         self.assertIn(COMMAND_FAILURE, output)
         notify.assert_called_once_with(COMMAND_FAILURE, error=True)
+
+    def test_speech_delivery_failure_is_not_a_core_command_failure(self) -> None:
+        error = SpeechDeliveryError(
+            "speech delivery failed: Venice TTS request failed: "
+            "Remote end closed connection without response"
+        )
+        stderr = io.StringIO()
+        with (
+            mock.patch.object(cli, "parser") as parser,
+            mock.patch.object(cli, "dispatch", side_effect=error),
+            mock.patch.object(cli, "notify") as notify,
+            contextlib.redirect_stderr(stderr),
+            self.assertRaises(SystemExit),
+        ):
+            parser.return_value.parse_args.return_value = mock.sentinel.args
+            cli.main()
+
+        output = stderr.getvalue()
+        self.assertIn(SPEECH_DELIVERY_FAILURE, output)
+        self.assertNotIn(COMMAND_FAILURE, output)
+        self.assertIn("speech_delivery_failed", output)
+        notify.assert_called_once_with(SPEECH_DELIVERY_FAILURE, error=True)
 
 
 if __name__ == "__main__":

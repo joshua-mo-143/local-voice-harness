@@ -10,6 +10,7 @@ COMMAND_FAILURE = "The command failed. Check the logs for details."
 VOICE_REQUEST_FAILURE = "The voice request failed. Check the logs for details."
 RECORDING_FAILURE = "Audio recording failed. Check the logs for details."
 PLAYBACK_FAILURE = "Audio playback failed. Check the logs for details."
+SPEECH_DELIVERY_FAILURE = "Speech delivery failed. Check the logs for details."
 DAEMON_FAILURE = "The voice service failed. Check the logs for details."
 CURSOR_TOOL_FAILURE = "The Cursor tool failed. Check the logs for details."
 

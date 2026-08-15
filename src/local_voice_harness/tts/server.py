@@ -42,6 +42,9 @@ MODEL: Any = None
 SETTINGS: BackendSettings | None = None
 VENICE_API_KEY: str | None = None
 MAX_AUDIO_BYTES = 32 * 1024 * 1024
+VENICE_AUDIO_ATTEMPTS = 3
+VENICE_RETRY_BACKOFF_SECONDS = 0.2
+VENICE_RETRYABLE_HTTP_CODES = frozenset({408, 429, 500, 502, 503, 504})
 
 
 def log(message: str) -> None:
@@ -192,6 +195,20 @@ def _wav_metadata(audio: bytes) -> tuple[int, float]:
     return sample_rate, len(pcm) / frame_width / sample_rate
 
 
+def _venice_http_failure(exc: urllib.error.HTTPError) -> RuntimeError:
+    try:
+        detail = exc.read(4096).decode("utf-8", errors="replace").strip()
+    except OSError:
+        detail = ""
+    finally:
+        exc.close()
+    detail = redact_diagnostic(detail)
+    suffix = f": {detail}" if detail else ""
+    return RuntimeError(
+        f"Venice TTS request failed: HTTP {exc.code} {exc.reason}{suffix}"
+    )
+
+
 def _venice_audio(
     text: str,
     voice: str | None = None,
@@ -216,34 +233,41 @@ def _venice_audio(
             "Content-Type": "application/json",
         },
     )
-    started = time.perf_counter()
-    try:
-        with pooled_urlopen(request, timeout=settings.tts_timeout) as response:
-            content_type = response.headers.get_content_type()
-            audio = response.read(MAX_AUDIO_BYTES + 1)
-    except urllib.error.HTTPError as exc:
+    attempts_remaining = VENICE_AUDIO_ATTEMPTS
+    backoff = VENICE_RETRY_BACKOFF_SECONDS
+    while True:
+        started = time.perf_counter()
         try:
-            detail = exc.read(4096).decode("utf-8", errors="replace").strip()
-        except OSError:
-            detail = ""
-        finally:
-            exc.close()
-        detail = redact_diagnostic(detail)
-        suffix = f": {detail}" if detail else ""
-        raise RuntimeError(
-            f"Venice TTS request failed: HTTP {exc.code} {exc.reason}{suffix}"
-        ) from exc
-    except (OSError, urllib.error.URLError) as exc:
-        raise RuntimeError(f"Venice TTS request failed: {exc}") from exc
-    elapsed = time.perf_counter() - started
-    if content_type not in {"audio/wav", "audio/x-wav", "audio/wave"}:
-        raise RuntimeError(
-            f"Venice TTS returned unexpected content type {content_type}"
-        )
-    if len(audio) > MAX_AUDIO_BYTES:
-        raise RuntimeError("Venice TTS response exceeds the 32 MiB limit")
-    sample_rate, duration = _wav_metadata(audio)
-    return audio, sample_rate, duration, elapsed
+            with pooled_urlopen(request, timeout=settings.tts_timeout) as response:
+                content_type = response.headers.get_content_type()
+                audio = response.read(MAX_AUDIO_BYTES + 1)
+        except urllib.error.HTTPError as exc:
+            error = _venice_http_failure(exc)
+            attempts_remaining -= 1
+            if exc.code not in VENICE_RETRYABLE_HTTP_CODES or attempts_remaining <= 0:
+                raise error from exc
+            log(f"Venice TTS HTTP {exc.code}; retrying ({attempts_remaining} left)")
+            time.sleep(backoff)
+            backoff *= 2
+            continue
+        except (OSError, urllib.error.URLError) as exc:
+            error = RuntimeError(f"Venice TTS request failed: {exc}")
+            attempts_remaining -= 1
+            if attempts_remaining <= 0:
+                raise error from exc
+            log(f"Venice TTS transport failed; retrying ({attempts_remaining} left)")
+            time.sleep(backoff)
+            backoff *= 2
+            continue
+        elapsed = time.perf_counter() - started
+        if content_type not in {"audio/wav", "audio/x-wav", "audio/wave"}:
+            raise RuntimeError(
+                f"Venice TTS returned unexpected content type {content_type}"
+            )
+        if len(audio) > MAX_AUDIO_BYTES:
+            raise RuntimeError("Venice TTS response exceeds the 32 MiB limit")
+        sample_rate, duration = _wav_metadata(audio)
+        return audio, sample_rate, duration, elapsed
 
 
 def _atempo_filter(speed: float) -> str:

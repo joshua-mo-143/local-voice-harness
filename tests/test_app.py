@@ -12,6 +12,7 @@ from local_voice_harness.agents.model import JobStatus
 from local_voice_harness.browser_context import RequestContext
 from local_voice_harness.cursor import consultation
 from local_voice_harness.cursor.service import CursorTurnRequest
+from local_voice_harness.errors import SpeechDeliveryError
 from local_voice_harness.intent import Intent, IntentRoute
 from local_voice_harness.questions import AnswerProvenance
 from local_voice_harness.responses import AssistantResponse
@@ -87,11 +88,52 @@ class ForegroundDeliveryTests(unittest.TestCase):
             ),
             mock.patch.object(app, "acknowledge_deliveries") as acknowledge,
             mock.patch.object(app, "release_deliveries") as release,
-            self.assertRaisesRegex(RuntimeError, "playback failed"),
+            self.assertRaisesRegex(SpeechDeliveryError, "speech delivery failed"),
         ):
             app.respond("Use Cursor to inspect this repository")
 
         route_intent.assert_not_called()
+        acknowledge.assert_not_called()
+        release.assert_called_once_with([("123456789abc", "claim")])
+
+    def test_exhausted_speech_failure_keeps_display_and_unspoken_claims(self) -> None:
+        output = io.StringIO()
+
+        def cursor_turn(
+            request: CursorTurnRequest,
+            *,
+            delivery_claims: list[tuple[str, str]],
+            integrations: object,
+        ) -> tuple[str, None]:
+            delivery_claims.append(("123456789abc", "claim"))
+            return "The Cursor job finished.", None
+
+        with (
+            mock.patch.object(app, "start_components"),
+            mock.patch.object(
+                app,
+                "request_context",
+                side_effect=lambda text, **_settings: RequestContext(text),
+            ),
+            mock.patch.object(app, "cursor_turn", side_effect=cursor_turn),
+            mock.patch.object(
+                app,
+                "stream_and_play",
+                side_effect=RuntimeError(
+                    "Venice TTS request failed: "
+                    "Remote end closed connection without response"
+                ),
+            ),
+            mock.patch.object(app, "acknowledge_deliveries") as acknowledge,
+            mock.patch.object(app, "release_deliveries") as release,
+            contextlib.redirect_stdout(output),
+            self.assertRaises(SpeechDeliveryError) as raised,
+        ):
+            app.respond("Use Cursor to inspect this repository")
+
+        self.assertIn("Assistant: The Cursor job finished.", output.getvalue())
+        self.assertIn("speech delivery failed", str(raised.exception))
+        self.assertIn("Remote end closed connection", str(raised.exception))
         acknowledge.assert_not_called()
         release.assert_called_once_with([("123456789abc", "claim")])
 
