@@ -3406,6 +3406,7 @@ class AgentJob:
         resolved_at: float,
         pane_id: str | None = None,
         workspace_id: str | None = None,
+        job_changes: Mapping[str, object] | None = None,
     ) -> CursorJob | None:
         retain_terminal_release = self.terminal_intent_status is not None
         state_key = {
@@ -3419,7 +3420,6 @@ class AgentJob:
             state_key: "confirmed_absent"
             if outcome == "confirmed_absent"
             else "retained",
-            f"{operation}_{'confirmed_absent' if outcome == 'confirmed_absent' else 'retained'}_at": resolved_at,
             "manual_reconcile_operation": None,
             "manual_reconcile_token": None,
             "manual_reconcile_resolved_at": resolved_at,
@@ -3430,6 +3430,10 @@ class AgentJob:
             "worker_process_start": None,
             "worker_token": None,
         }
+        if operation != "prompt":
+            changes[
+                f"{operation}_{'confirmed_absent' if outcome == 'confirmed_absent' else 'retained'}_at"
+            ] = resolved_at
         cleanup = self.cleanup_state
         if isinstance(cleanup, CleanupOwned):
             cleanup = abandon_cleanup_owner(cleanup, cleanup.token or "")
@@ -3536,6 +3540,7 @@ class AgentJob:
             )
             if participant is not None:
                 changes[f"{participant.value}_target"] = None
+        changes.update(job_changes or {})
         return self.evolve_recovery(
             changes,
             now=resolved_at,

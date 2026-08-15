@@ -1738,25 +1738,27 @@ def resolve_manual_reconciliation(
             != ("ambiguous" if operation == "prompt" else "manual_required")
         ):
             return None
-        resolved = job.resolve_manual_operation(
+        followup_changes = (
+            _agent_manual_reconciliation_changes(
+                job,
+                required_at=resolved_at,
+            )
+            if (
+                operation == "prompt"
+                and job.session_control == SessionControlMode.USER_OWNED.value
+                and job.agent_dispatch_state
+                in {"dispatching", "ambiguous", "failed_observing"}
+            )
+            else None
+        )
+        return job.resolve_manual_operation(
             operation,
             outcome,
             resolved_at=resolved_at,
             pane_id=pane_id,
             workspace_id=workspace_id,
+            job_changes=followup_changes,
         )
-        if (
-            resolved is not None
-            and operation == "prompt"
-            and resolved.session_control == SessionControlMode.USER_OWNED.value
-            and resolved.agent_dispatch_state
-            in {"dispatching", "ambiguous", "failed_observing"}
-        ):
-            return _require_agent_manual_reconciliation(
-                resolved,
-                required_at=resolved_at,
-            )
-        return resolved
 
     resolved = store.update(job_id, resolve)
     if resolved is None:
@@ -1782,11 +1784,11 @@ def _confusable_harness_operation(job: CursorJob) -> bool:
     )
 
 
-def _require_agent_manual_reconciliation(
+def _agent_manual_reconciliation_changes(
     job: CursorJob,
     *,
     required_at: float,
-) -> CursorJob:
+) -> dict[str, Any]:
     agent_operation = job.agent_session_operation
     changes: dict[str, Any] = {
         "manual_reconcile_operation": "agent",
@@ -1799,7 +1801,7 @@ def _require_agent_manual_reconciliation(
         )
     else:
         changes["agent_dispatch_state"] = "manual_required"
-    return job.evolve(**changes)
+    return changes
 
 
 def relinquish_session_control(
@@ -1837,6 +1839,9 @@ def relinquish_session_control(
             "worker_process_start": None,
             "worker_token": None,
         }
+        if job.worker_token is not None:
+            changes["status"] = JobStatus.QUEUED
+            changes["queued_at"] = relinquished_at
         try:
             operation = job.prompt_operation
         except (PromptOperationError, JobValidationError):
@@ -1864,9 +1869,11 @@ def relinquish_session_control(
             and job.manual_reconcile_operation is None
             and "manual_reconcile_operation" not in changes
         ):
-            return _require_agent_manual_reconciliation(
-                job.evolve(**changes),
-                required_at=relinquished_at,
+            changes.update(
+                _agent_manual_reconciliation_changes(
+                    job,
+                    required_at=relinquished_at,
+                )
             )
         return job.evolve(**changes)
 
