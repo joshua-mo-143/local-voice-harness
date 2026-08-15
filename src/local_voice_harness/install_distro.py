@@ -19,6 +19,8 @@ from .install_profile import InstallationPlan, resolve_installation_plan
 
 GENERIC_PACKAGES = (
     "pipewire",
+    "pipewire-tools",
+    "wireplumber",
     "libnotify",
     "git",
     "curl",
@@ -83,10 +85,15 @@ class DistroPlan:
         )
 
 
-_ARCH_PACKAGES = {name: name for name in GENERIC_PACKAGES}
+_ARCH_PACKAGES = {
+    **{name: name for name in GENERIC_PACKAGES},
+    "pipewire-tools": "pipewire-audio",
+}
 
 _DEBIAN_PACKAGES = {
     "pipewire": "pipewire",
+    "pipewire-tools": "pipewire-bin",
+    "wireplumber": "wireplumber",
     "libnotify": "libnotify-bin",
     "git": "git",
     "curl": "curl",
@@ -106,6 +113,8 @@ _DEBIAN_PACKAGES = {
 
 _FEDORA_PACKAGES = {
     "pipewire": "pipewire",
+    "pipewire-tools": "pipewire-utils",
+    "wireplumber": "wireplumber",
     "libnotify": "libnotify",
     "git": "git",
     "curl": "curl",
