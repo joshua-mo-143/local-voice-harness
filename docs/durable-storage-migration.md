@@ -45,10 +45,10 @@ success.
 
 | Baseline | Count |
 |---|---:|
-| Persisted field names | 224 |
-| Named table fields | 219 |
+| Persisted field names | 226 |
+| Named table fields | 221 |
 | Import-only fields | 4 |
-| Directly exposed `CursorJob` properties | 163 |
+| Directly exposed `CursorJob` properties | 165 |
 | Compatibility adapters | 38 |
 | Public transition entry points | 76 |
 | Documented duplicate authorities | 0 |
