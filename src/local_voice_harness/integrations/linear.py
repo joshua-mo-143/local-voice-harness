@@ -55,6 +55,32 @@ MCP_ACCESS_FAILURE = re.compile(
     r")",
     re.IGNORECASE | re.DOTALL,
 )
+MCP_AUTHORIZATION_FAILURE = re.compile(
+    r"\b(?:"
+    r"requires?\s+(?:authentication|authorization)|"
+    r"(?:authentication|authorization)\s+(?:is\s+)?required|"
+    r"not\s+(?:authenticated|authorized)|"
+    r"unauthenticated|unauthorized|forbidden|"
+    r"(?:access|permission)\s+denied|"
+    r"(?:sign[ -]?in|log[ -]?in)\s+required"
+    r")\b",
+    re.IGNORECASE,
+)
+MCP_AUTHORIZATION_CODES = frozenset(
+    {
+        "authentication_required",
+        "authorization_required",
+        "mcp_authentication_required",
+        "mcp_authorization_required",
+        "not_authenticated",
+        "not_authorized",
+        "unauthenticated",
+        "unauthorized",
+        "forbidden",
+        "permission_denied",
+        "access_denied",
+    }
+)
 
 
 @dataclass(frozen=True)
@@ -130,6 +156,16 @@ class LinearIssueLookupError(LinearError):
         if self.reason == LinearIssueLookupReason.NONPOSITIVE:
             return "I couldn't verify that Linear issue: the issue number must be positive."
         return "I couldn't verify that Linear issue."
+
+
+def _mcp_authorization_failed(*details: str) -> bool:
+    for detail in details:
+        normalized = re.sub(r"[^a-z0-9]+", "_", detail.casefold()).strip("_")
+        if normalized in MCP_AUTHORIZATION_CODES:
+            return True
+        if MCP_AUTHORIZATION_FAILURE.search(detail):
+            return True
+    return False
 
 
 def parse_linear_issue_reference(reference: str) -> LinearIssue:
@@ -517,9 +553,18 @@ class LinearIntegration:
                 )
             except HerdrError as exc:
                 raise LinearIssueLookupError(
-                    LinearIssueLookupReason.TRANSIENT,
+                    (
+                        LinearIssueLookupReason.UNAUTHORIZED
+                        if _mcp_authorization_failed(exc.code, str(exc))
+                        else LinearIssueLookupReason.TRANSIENT
+                    ),
                     str(exc),
                 ) from exc
+        if _mcp_authorization_failed(outcome.output):
+            raise LinearIssueLookupError(
+                LinearIssueLookupReason.UNAUTHORIZED,
+                f"Linear authorization is required for {issue.identifier}",
+            )
         status = extract_marker(outcome.output, "VOICE_LINEAR_STATUS", token)
         if status == "not_found":
             raise LinearIssueLookupError(

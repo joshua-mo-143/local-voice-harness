@@ -673,6 +673,7 @@ class LinearIssueResolveTests(unittest.TestCase):
         identifier: str = "ENG-1",
         url: str = "https://linear.app/acme/issue/ENG-1/title",
         herdr_error: HerdrError | None = None,
+        raw_output: str | None = None,
         reference: str = "eng-1",
     ) -> linear.LinearIssue:
         client = mock.Mock()
@@ -682,6 +683,8 @@ class LinearIssueResolveTests(unittest.TestCase):
             if herdr_error is not None:
                 raise herdr_error
             token = str(kwargs["token"])
+            if raw_output is not None:
+                return mock.Mock(output=raw_output)
             lines = [f"VOICE_LINEAR_STATUS[{token}]: {status}"]
             if identifier is not None:
                 lines.append(f"VOICE_LINEAR_IDENTIFIER[{token}]: {identifier}")
@@ -761,6 +764,39 @@ class LinearIssueResolveTests(unittest.TestCase):
             raised.exception.reason,
             linear.LinearIssueLookupReason.TRANSIENT,
         )
+
+    def test_thrown_authentication_failure_is_unauthorized(self) -> None:
+        for error in (
+            HerdrError(
+                "Linear MCP requires authentication",
+                code="mcp_authentication_required",
+            ),
+            HerdrError("MCP request rejected", code="permission_denied"),
+            HerdrError("not authorized to call the Linear tool"),
+        ):
+            with self.subTest(error=error):
+                with self.assertRaises(linear.LinearIssueLookupError) as raised:
+                    self._resolve("found", herdr_error=error)
+
+                self.assertEqual(
+                    raised.exception.reason,
+                    linear.LinearIssueLookupReason.UNAUTHORIZED,
+                )
+
+    def test_unstructured_mcp_authorization_failure_is_unauthorized(self) -> None:
+        for output in (
+            "Linear MCP server requires authentication before tools can be used.",
+            "Tool call failed: permission denied.",
+            "You are not authorized to access this Linear workspace.",
+        ):
+            with self.subTest(output=output):
+                with self.assertRaises(linear.LinearIssueLookupError) as raised:
+                    self._resolve("unknown", raw_output=output)
+
+                self.assertEqual(
+                    raised.exception.reason,
+                    linear.LinearIssueLookupReason.UNAUTHORIZED,
+                )
 
     def test_identity_mismatch_fails_closed(self) -> None:
         with self.assertRaises(linear.LinearIssueLookupError) as raised:
