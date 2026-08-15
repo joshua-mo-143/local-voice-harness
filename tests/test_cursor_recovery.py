@@ -692,6 +692,100 @@ class CursorRecoveryTests(unittest.TestCase):
         self.assertEqual(recovered.status, JobStatus.RUNNING)
         self.assertEqual(recovered.worker_boot_id, "legacy-unknown")
 
+    def test_clearing_dead_legacy_owner_preserves_terminal_reconciliation(
+        self,
+    ) -> None:
+        self.create(
+            {
+                "id": "123456789abc",
+                "status": "reconciling",
+                "request": "test",
+                "created_at": 1,
+                "delivered": True,
+                "delivered_at": 3,
+                "terminal_intent_status": "failed",
+                "terminal_intent_completed_at": 2,
+                "terminal_intent_error": "target cleanup failed",
+                "terminal_intent_result": "target cleanup failed",
+                "target_release_pending": True,
+                "target_release_token": "release",
+                "cancellation_reconciliation_pending": False,
+                "worker_token": "legacy-claim",
+                "worker_pid": 42,
+                "worker_boot_id": "boot",
+                "worker_process_start": "start",
+                "worker_claim_operation": "legacy:target_cleanup",
+                "worker_claimed_at": 1,
+                "worker_operation": "target_cleanup",
+            }
+        )
+        launch = mock.Mock()
+
+        recover_jobs(
+            self.store,
+            launch_worker=launch,
+            inspect_legacy_worker=lambda _job: "stopped",
+            is_worker_alive=lambda _job: False,
+            get_boot_identity=lambda: None,
+            get_process_identity=lambda _pid: None,
+            now=100,
+        )
+
+        recovered = self.store.get("123456789abc")
+        self.assertEqual(recovered.status, JobStatus.RECONCILING)
+        self.assertEqual(recovered.terminal_intent_status, JobStatus.FAILED)
+        self.assertEqual(recovered.terminal_intent_completed_at, 2)
+        self.assertEqual(recovered.terminal_intent_error, "target cleanup failed")
+        self.assertEqual(recovered.terminal_intent_result, "target cleanup failed")
+        self.assertTrue(recovered.target_release_pending)
+        self.assertEqual(recovered.target_release_token, "release")
+        self.assertFalse(recovered.cancellation_reconciliation_pending)
+        self.assertEqual(recovered.worker_operation, "target_cleanup")
+        self.assertTrue(recovered.delivered)
+        self.assertEqual(recovered.delivered_at, 3)
+        self.assertIsNone(recovered.worker_token)
+        self.assertIsNone(recovered.worker_pid)
+        self.assertIsNone(recovered.worker_boot_id)
+        self.assertIsNone(recovered.worker_process_start)
+        launch.assert_not_called()
+
+    def test_clearing_dead_legacy_owner_requeues_active_job_without_terminal_intent(
+        self,
+    ) -> None:
+        self.create(
+            {
+                "id": "aaaaaaaaaaaa",
+                "status": "running",
+                "request": "test",
+                "created_at": 1,
+                "delivered": False,
+                "worker_token": "legacy-claim",
+                "worker_pid": 42,
+                "worker_boot_id": "boot",
+                "worker_process_start": "start",
+                "worker_claim_operation": "legacy:running",
+                "worker_claimed_at": 1,
+            }
+        )
+        launch = mock.Mock()
+
+        recover_jobs(
+            self.store,
+            launch_worker=launch,
+            inspect_legacy_worker=lambda _job: "stopped",
+            is_worker_alive=lambda _job: False,
+            now=100,
+        )
+
+        recovered = self.store.get("aaaaaaaaaaaa")
+        self.assertEqual(recovered.status, JobStatus.QUEUED)
+        self.assertIsNone(recovered.terminal_intent_status)
+        self.assertIsNone(recovered.worker_token)
+        self.assertIsNone(recovered.worker_pid)
+        self.assertIsNone(recovered.worker_boot_id)
+        self.assertIsNone(recovered.worker_process_start)
+        launch.assert_called_once_with("aaaaaaaaaaaa")
+
     def test_all_uncertain_operations_reconcile_before_any_launch(self) -> None:
         base = {
             "status": "queued",
