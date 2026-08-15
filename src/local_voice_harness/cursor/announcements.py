@@ -66,6 +66,17 @@ class DrainResult:
     deferred: tuple[DeliveryClaim, ...] = ()
 
 
+@dataclass(frozen=True, slots=True)
+class AnnouncementSnooze:
+    """Process-local mute window. ``until`` uses the same clock as ``now``."""
+
+    until: float
+    mute_everything: bool = False
+
+    def active(self, now: float) -> bool:
+        return now < self.until
+
+
 def classify(job: CursorJob) -> AnnouncementKind:
     if job.status == JobStatus.COMPLETED:
         return AnnouncementKind.COMPLETION
@@ -115,8 +126,15 @@ def disposition(
     kind: AnnouncementKind,
     *,
     now: float | None = None,
+    snooze: AnnouncementSnooze | None = None,
 ) -> AnnouncementDisposition:
-    if settings.mode == AnnouncementMode.QUIET or in_quiet_hours(settings, now=now):
+    current = time.time() if now is None else now
+    snoozed = snooze is not None and snooze.active(current)
+    if snoozed and snooze is not None and snooze.mute_everything:
+        return AnnouncementDisposition.DEFER
+    if settings.mode == AnnouncementMode.QUIET or in_quiet_hours(settings, now=current):
+        return AnnouncementDisposition.DEFER
+    if snoozed and kind not in ACTION_REQUIRED_KINDS:
         return AnnouncementDisposition.DEFER
     if settings.mode == AnnouncementMode.DESKTOP_ONLY:
         return AnnouncementDisposition.DESKTOP
@@ -131,10 +149,11 @@ def auto_eligible(
     settings: AnnouncementSettings,
     *,
     now: float | None = None,
+    snooze: AnnouncementSnooze | None = None,
 ) -> Callable[[CursorJob], bool]:
     def eligible(job: CursorJob) -> bool:
         ack = job.announcement_ack
-        chosen = disposition(settings, classify(job), now=now)
+        chosen = disposition(settings, classify(job), now=now, snooze=snooze)
         if chosen == AnnouncementDisposition.SPEAK:
             return ack in {
                 AnnouncementAck.PENDING.value,
@@ -250,6 +269,7 @@ def drain_background_announcements(
     settings: AnnouncementSettings,
     *,
     now: float | None = None,
+    snooze: AnnouncementSnooze | None = None,
     notify: Callable[..., NotificationResult] = desktop_notify,
     render_job: Callable[[CursorJob], AssistantResponse] | None = None,
 ) -> DrainResult:
@@ -266,14 +286,14 @@ def drain_background_announcements(
             store,
             limit=ANNOUNCEMENT_BATCH_LIMIT,
             now=now,
-            eligible=auto_eligible(settings, now=now),
+            eligible=auto_eligible(settings, now=now, snooze=snooze),
         )
         speak: list[DeliveryClaim] = []
         desktop: list[DeliveryClaim] = []
         desktop_failed: list[DeliveryClaim] = []
         deferred: list[DeliveryClaim] = []
         for claim in claims:
-            chosen = disposition(settings, classify(claim.job), now=now)
+            chosen = disposition(settings, classify(claim.job), now=now, snooze=snooze)
             if chosen == AnnouncementDisposition.SPEAK:
                 speak.append(claim)
             elif chosen == AnnouncementDisposition.DESKTOP:

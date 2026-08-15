@@ -184,6 +184,7 @@ def _bare_daemon() -> WakeConversationDaemon:
     instance.omit_focused_context = False
     instance.last_focused_identity = None
     instance.hold_extensions = 0
+    instance.announcement_snooze = None
     instance.last_wake = 0.0
     instance.force_listen = threading.Event()
     instance.running = True
@@ -8445,6 +8446,133 @@ class SpokenHoldTests(unittest.TestCase):
         self.assertGreaterEqual(daemon.conversation_deadline, held_until - 1)
         assert daemon.last_transcript is not None
         self.assertGreaterEqual(daemon.last_transcript.expires_at, held_until - 1)
+
+
+class AnnouncementSnoozeTests(unittest.TestCase):
+    def test_snooze_is_process_local_and_does_not_write_config(self) -> None:
+        daemon = _bare_daemon()
+        mode = daemon.announcements.mode
+        with (
+            mock.patch.object(wake_daemon, "transcribe", return_value="snooze"),
+            mock.patch.object(wake_daemon, "start_components"),
+            mock.patch.object(wake_daemon, "apply_config_values") as apply_config,
+            mock.patch.object(wake_daemon, "cursor_turn") as cursor_turn,
+            mock.patch.object(
+                daemon,
+                "play_response",
+                return_value=(
+                    {"played_text": wake_daemon.SNOOZE_STARTED_RESPONSE},
+                    None,
+                ),
+            ) as play,
+            mock.patch.object(wake_daemon, "notify"),
+        ):
+            daemon.process_utterance(AUDIO_GENERATION, woke=False)
+
+        play.assert_called_once_with(
+            AssistantResponse.from_text(wake_daemon.SNOOZE_STARTED_RESPONSE)
+        )
+        apply_config.assert_not_called()
+        cursor_turn.assert_not_called()
+        self.assertEqual(daemon.announcements.mode, mode)
+        snooze = daemon._active_announcement_snooze()
+        self.assertIsNotNone(snooze)
+        assert snooze is not None
+        self.assertFalse(snooze.mute_everything)
+        self.assertGreater(snooze.until, time.time() + 29 * 60)
+
+    def test_mute_everything_and_clear(self) -> None:
+        daemon = _bare_daemon()
+        with (
+            mock.patch.object(
+                wake_daemon, "transcribe", return_value="mute everything"
+            ),
+            mock.patch.object(wake_daemon, "start_components"),
+            mock.patch.object(
+                daemon,
+                "play_response",
+                return_value=(
+                    {"played_text": wake_daemon.SNOOZE_MUTE_ALL_RESPONSE},
+                    None,
+                ),
+            ),
+            mock.patch.object(wake_daemon, "notify"),
+        ):
+            daemon.process_utterance(AUDIO_GENERATION, woke=False)
+
+        snooze = daemon._active_announcement_snooze()
+        self.assertIsNotNone(snooze)
+        assert snooze is not None
+        self.assertTrue(snooze.mute_everything)
+
+        with (
+            mock.patch.object(
+                wake_daemon, "transcribe", return_value="you can talk again"
+            ),
+            mock.patch.object(wake_daemon, "start_components"),
+            mock.patch.object(
+                daemon,
+                "play_response",
+                return_value=(
+                    {"played_text": wake_daemon.SNOOZE_CLEARED_RESPONSE},
+                    None,
+                ),
+            ) as play,
+            mock.patch.object(wake_daemon, "notify"),
+        ):
+            daemon.process_utterance(AUDIO_GENERATION, woke=False)
+
+        play.assert_called_once_with(
+            AssistantResponse.from_text(wake_daemon.SNOOZE_CLEARED_RESPONSE)
+        )
+        self.assertIsNone(daemon.announcement_snooze)
+
+    def test_missed_digest_still_routes_during_snooze(self) -> None:
+        daemon = _bare_daemon()
+        daemon.announcement_snooze = announcement_policy.AnnouncementSnooze(
+            until=time.time() + 1800
+        )
+        with (
+            mock.patch.object(
+                wake_daemon, "transcribe", return_value="what did I miss?"
+            ),
+            mock.patch.object(wake_daemon, "start_components"),
+            mock.patch.object(
+                wake_daemon,
+                "route_intent",
+                return_value=IntentRoute(Intent.ANNOUNCEMENT_DIGEST, "high"),
+            ),
+            mock.patch.object(
+                wake_daemon, "cursor_turn", return_value=("You missed 1 update.", None)
+            ) as cursor_turn,
+            mock.patch.object(
+                daemon,
+                "play_response",
+                return_value=({"played_text": "You missed 1 update."}, None),
+            ),
+            mock.patch.object(wake_daemon, "notify"),
+        ):
+            daemon.process_utterance(AUDIO_GENERATION, woke=False)
+
+        cursor_turn.assert_called_once()
+        self.assertEqual(cursor_turn.call_args.args[0].action, "missed")
+        self.assertIsNotNone(daemon.announcement_snooze)
+
+    def test_drain_uses_process_local_snooze(self) -> None:
+        daemon = _bare_daemon()
+        daemon.announcement_snooze = announcement_policy.AnnouncementSnooze(
+            until=time.time() + 1800
+        )
+        with mock.patch.object(
+            announcement_policy,
+            "drain_background_announcements",
+            return_value=announcement_policy.DrainResult(),
+        ) as drain:
+            wake_daemon.drain_pending_announcements(
+                daemon.announcements,
+                snooze=daemon._active_announcement_snooze(),
+            )
+        self.assertIs(drain.call_args.kwargs["snooze"], daemon.announcement_snooze)
 
 
 if __name__ == "__main__":

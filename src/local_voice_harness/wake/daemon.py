@@ -317,12 +317,14 @@ def drain_pending_announcements(
     settings: AnnouncementSettings,
     *,
     integrations: IntegrationRegistry | None = None,
+    snooze: announcement_policy.AnnouncementSnooze | None = None,
 ) -> announcement_policy.DrainResult:
     recover_jobs(integrations=integrations)
     try:
         result = announcement_policy.drain_background_announcements(
             CURSOR_STORE,
             settings,
+            snooze=snooze,
         )
     except Exception as exc:  # noqa: BLE001 - notification failures cannot stop wake
         log(f"announcement drain failed: {type(exc).__name__}: {exc}")
@@ -470,6 +472,24 @@ HOLD_PATTERN = re.compile(
     r")\s*[!.]?\s*$",
     re.IGNORECASE,
 )
+SNOOZE_PATTERN = re.compile(
+    r"^\s*(?:"
+    r"(?:please\s+)?(?:snooze|mute)"
+    r"(?:\s+(?P<target>announcements|background(?:\s+announcements)?|everything))?"
+    r"(?:\s+for\s+(?P<minutes>\d+)\s*(?:minute|minutes|min))?"
+    r"|be\s+quiet\s+for\s+a\s+(?:bit|while|minute)"
+    r"|don['’]?t\s+talk\s+at\s+all"
+    r")\s*[!.]?\s*$",
+    re.IGNORECASE,
+)
+CLEAR_SNOOZE_PATTERN = re.compile(
+    r"^\s*(?:"
+    r"you\s+can\s+talk\s+again|"
+    r"stop\s+snooz(?:e|ing)|"
+    r"unmute(?:\s+announcements)?"
+    r")\s*[!.]?\s*$",
+    re.IGNORECASE,
+)
 PENDING_SUBMIT_PATTERN = re.compile(
     r"\b(?:work\s+on|fix|change|update|implement|add|remove|run|review|inspect|"
     r"start|create|build|refactor|test)\b",
@@ -520,6 +540,15 @@ HOLD_EXHAUSTED_RESPONSE = (
     "I'm already holding. I'll keep listening until this window ends."
 )
 HOLD_INACTIVE_RESPONSE = "I can only hold while I'm already listening for a follow-up."
+DEFAULT_SNOOZE_SECONDS = 30 * 60
+SNOOZE_STARTED_RESPONSE = (
+    "Okay, I'll hold ordinary background announcements for 30 minutes."
+)
+SNOOZE_MUTE_ALL_RESPONSE = (
+    "Okay, I'll mute background announcements, including questions and failures."
+)
+SNOOZE_CLEARED_RESPONSE = "Okay, I can announce background updates again."
+SNOOZE_INACTIVE_RESPONSE = "I wasn't snoozing background announcements."
 
 
 @dataclass
@@ -696,6 +725,7 @@ class WakeConversationDaemon:
         self.omit_focused_context = False
         self.last_focused_identity: FocusedIdentity | None = None
         self.hold_extensions = 0
+        self.announcement_snooze: announcement_policy.AnnouncementSnooze | None = None
         self.last_wake = 0.0
         self.force_listen = threading.Event()
         self.running = True
@@ -1408,6 +1438,18 @@ class WakeConversationDaemon:
             app_class=context.focused_app_class,
             source_kinds=context.focused_app_sources,
         )
+
+    def _active_announcement_snooze(
+        self, now: float | None = None
+    ) -> announcement_policy.AnnouncementSnooze | None:
+        snooze = self.announcement_snooze
+        if snooze is None:
+            return None
+        current = time.time() if now is None else now
+        if not snooze.active(current):
+            self.announcement_snooze = None
+            return None
+        return snooze
 
     def _followup_listening_armed(self) -> bool:
         return bool(
@@ -2363,6 +2405,33 @@ class WakeConversationDaemon:
                 self.awaiting_followup = True
                 notify("Listening for a follow-up…")
                 return None
+            if CLEAR_SNOOZE_PATTERN.search(text):
+                terminalize_non_side_effect()
+                had_snooze = self._active_announcement_snooze() is not None
+                self.announcement_snooze = None
+                return self._speak_control_notice(
+                    SNOOZE_CLEARED_RESPONSE if had_snooze else SNOOZE_INACTIVE_RESPONSE
+                )
+            snooze_match = SNOOZE_PATTERN.search(text)
+            if snooze_match is not None:
+                terminalize_non_side_effect()
+                minutes = snooze_match.group("minutes")
+                duration = int(minutes) * 60 if minutes else DEFAULT_SNOOZE_SECONDS
+                target = (snooze_match.group("target") or "").casefold()
+                mute_everything = (
+                    target == "everything"
+                    or "don" in text.casefold()
+                    and "talk" in text.casefold()
+                )
+                self.announcement_snooze = announcement_policy.AnnouncementSnooze(
+                    until=time.time() + duration,
+                    mute_everything=mute_everything,
+                )
+                return self._speak_control_notice(
+                    SNOOZE_MUTE_ALL_RESPONSE
+                    if mute_everything
+                    else SNOOZE_STARTED_RESPONSE
+                )
             pending_resolution = getattr(self, "pending_target_resolution", None)
             resolution_active = (
                 pending_resolution is not None
@@ -3341,6 +3410,7 @@ class WakeConversationDaemon:
                 batch = drain_pending_announcements(
                     self.announcements,
                     integrations=self.integrations,
+                    snooze=self._active_announcement_snooze(),
                 )
                 if batch.speak:
                     self._enqueue_announcement_batch(batch.speak)

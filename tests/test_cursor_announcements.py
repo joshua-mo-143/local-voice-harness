@@ -11,6 +11,7 @@ from zoneinfo import ZoneInfo
 from local_voice_harness.cursor.announcements import (
     AnnouncementDisposition,
     AnnouncementKind,
+    AnnouncementSnooze,
     claim_missed_announcements,
     classify,
     disposition,
@@ -113,6 +114,59 @@ class AnnouncementPolicyTests(unittest.TestCase):
         self.assertEqual(
             disposition(_settings(AnnouncementMode.QUIET), question),
             AnnouncementDisposition.DEFER,
+        )
+
+    def test_default_snooze_defers_completions_but_speaks_action_required(self) -> None:
+        snooze = AnnouncementSnooze(until=200)
+        settings = _settings(AnnouncementMode.ALL)
+        self.assertEqual(
+            disposition(
+                settings,
+                AnnouncementKind.COMPLETION,
+                now=100,
+                snooze=snooze,
+            ),
+            AnnouncementDisposition.DEFER,
+        )
+        self.assertEqual(
+            disposition(
+                settings,
+                AnnouncementKind.CANCELLATION,
+                now=100,
+                snooze=snooze,
+            ),
+            AnnouncementDisposition.DEFER,
+        )
+        for kind in (
+            AnnouncementKind.QUESTION,
+            AnnouncementKind.FAILURE,
+            AnnouncementKind.INFORMATIONAL,
+        ):
+            with self.subTest(kind=kind):
+                self.assertEqual(
+                    disposition(settings, kind, now=100, snooze=snooze),
+                    AnnouncementDisposition.SPEAK,
+                )
+
+    def test_mute_everything_defers_action_required(self) -> None:
+        snooze = AnnouncementSnooze(until=200, mute_everything=True)
+        self.assertEqual(
+            disposition(
+                _settings(AnnouncementMode.ALL),
+                AnnouncementKind.QUESTION,
+                now=100,
+                snooze=snooze,
+            ),
+            AnnouncementDisposition.DEFER,
+        )
+        self.assertEqual(
+            disposition(
+                _settings(AnnouncementMode.ALL),
+                AnnouncementKind.QUESTION,
+                now=201,
+                snooze=snooze,
+            ),
+            AnnouncementDisposition.SPEAK,
         )
 
 
@@ -408,6 +462,27 @@ class AnnouncementDrainTests(unittest.TestCase):
         persisted = self.store.get("aaaaaaaaaaaa")
         self.assertFalse(persisted.delivered)
         self.assertEqual(persisted.announcement_ack, AnnouncementAck.DEFERRED.value)
+
+    def test_default_snooze_defers_completions_and_keeps_digest(self) -> None:
+        self._create(
+            _job("aaaaaaaaaaaa", "completed", completed_at=1),
+            _job("bbbbbbbbbbbb", "awaiting_user", completed_at=2),
+        )
+        result = drain_background_announcements(
+            self.store,
+            _settings(AnnouncementMode.ALL),
+            now=100,
+            snooze=AnnouncementSnooze(until=200),
+            notify=mock.Mock(),
+            render_job=lambda job: AssistantResponse.from_text(job.id),
+        )
+        self.assertEqual([claim.job.id for claim in result.speak], ["bbbbbbbbbbbb"])
+        self.assertEqual([claim.job.id for claim in result.deferred], ["aaaaaaaaaaaa"])
+        completed = self.store.get("aaaaaaaaaaaa")
+        self.assertEqual(completed.announcement_ack, AnnouncementAck.DEFERRED.value)
+        self.assertFalse(completed.delivered)
+        missed = inspect_missed_announcements(self.store)
+        self.assertEqual([job.id for job in missed], ["aaaaaaaaaaaa"])
 
     def test_concurrent_drainers_have_a_single_winner(self) -> None:
         self._create(_job("aaaaaaaaaaaa", "completed", completed_at=1))
