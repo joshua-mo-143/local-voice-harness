@@ -19,6 +19,7 @@ from local_voice_harness.cursor.model import (
 from local_voice_harness.cursor.sqlite_store import (
     _IMPORT_ONLY_FIELDS,
     _NAMED_TABLE_FIELDS,
+    _QUARANTINE_ADDITIVE_COLUMNS,
     _STRUCTURED_FIELDS,
     DATABASE_SCHEMA_VERSION,
     SQLiteJobDatabase,
@@ -88,6 +89,164 @@ def _install_v1_database(
             "UPDATE store_meta SET value = '1' WHERE key = 'schema_version'"
         )
     return database
+
+
+_LEGACY_QUARANTINE_COLUMNS = (
+    "evidence_id",
+    "job_id",
+    "metadata_path",
+    "payload_path",
+    "payload_digest",
+    "error",
+    "quarantined_at",
+    "resolved_at",
+    "resolution_reason",
+)
+_CURRENT_QUARANTINE_COLUMNS = (
+    "evidence_id",
+    "job_id",
+    "metadata_path",
+    "payload_path",
+    "payload_digest",
+    "error",
+    "quarantined_at",
+    "target_key",
+    "worktree_key",
+    "blocks_all",
+    "reserves_target",
+    "reserves_worktree",
+    "resolved_at",
+    "resolution_reason",
+)
+
+
+def _legacy_quarantine_rows(jobs: Path) -> list[tuple[object, ...]]:
+    return [
+        (
+            "open-evidence",
+            "aaaaaaaaaaaa",
+            str(jobs / ".quarantine" / "aaaaaaaaaaaa-open.metadata.json"),
+            str(jobs / ".quarantine" / "aaaaaaaaaaaa-open.json"),
+            "open-digest",
+            "invalid parent",
+            1.0,
+            None,
+            None,
+        ),
+        (
+            "resolved-evidence",
+            "bbbbbbbbbbbb",
+            str(jobs / ".quarantine" / "bbbbbbbbbbbb-resolved.metadata.json"),
+            str(jobs / ".quarantine" / "bbbbbbbbbbbb-resolved.json"),
+            "resolved-digest",
+            "unreadable payload",
+            2.0,
+            3.0,
+            "operator checked",
+        ),
+    ]
+
+
+def _install_legacy_quarantine_database(
+    jobs: Path,
+    *,
+    schema_version: str,
+    rows: list[tuple[object, ...]] | None = None,
+) -> Path:
+    jobs.mkdir(parents=True, exist_ok=True)
+    path = jobs / "jobs.sqlite3"
+    with sqlite3.connect(path) as connection:
+        connection.execute(
+            "CREATE TABLE store_meta(key TEXT PRIMARY KEY, value TEXT NOT NULL) STRICT"
+        )
+        connection.execute(
+            "INSERT INTO store_meta(key, value) VALUES('schema_version', ?)",
+            (schema_version,),
+        )
+        if schema_version == "1":
+            connection.execute(
+                """
+                CREATE TABLE jobs (
+                    job_id TEXT PRIMARY KEY
+                        CHECK(length(job_id) = 12 AND job_id NOT GLOB '*[^0-9a-f]*'),
+                    parent_job_id TEXT,
+                    revision INTEGER NOT NULL CHECK(revision >= 0),
+                    status TEXT NOT NULL,
+                    harness_kind TEXT NOT NULL,
+                    issue_provider TEXT,
+                    created_at REAL NOT NULL
+                ) STRICT
+                """
+            )
+        connection.execute(
+            """
+            CREATE TABLE quarantine (
+                evidence_id TEXT PRIMARY KEY,
+                job_id TEXT,
+                metadata_path TEXT NOT NULL UNIQUE,
+                payload_path TEXT,
+                payload_digest TEXT,
+                error TEXT NOT NULL,
+                quarantined_at REAL,
+                resolved_at REAL,
+                resolution_reason TEXT
+            ) STRICT
+            """
+        )
+        connection.executemany(
+            """
+            INSERT INTO quarantine(
+                evidence_id, job_id, metadata_path, payload_path,
+                payload_digest, error, quarantined_at, resolved_at,
+                resolution_reason
+            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            rows if rows is not None else _legacy_quarantine_rows(jobs),
+        )
+    return path
+
+
+def _quarantine_column_names(connection: sqlite3.Connection) -> tuple[str, ...]:
+    return tuple(
+        str(row[1]) for row in connection.execute("PRAGMA table_info(quarantine)")
+    )
+
+
+def _quarantine_snapshots(
+    connection: sqlite3.Connection,
+) -> list[tuple[object, ...]]:
+    return [
+        tuple(row)
+        for row in connection.execute(
+            "SELECT * FROM quarantine ORDER BY evidence_id"
+        ).fetchall()
+    ]
+
+
+def _write_quarantine_source(
+    jobs: Path,
+    job_id: str,
+    stem: str,
+    *,
+    error: str,
+    payload: dict[str, object],
+) -> tuple[Path, Path]:
+    quarantine = jobs / ".quarantine"
+    quarantine.mkdir(parents=True, exist_ok=True)
+    payload_path = quarantine / f"{stem}.json"
+    payload_path.write_text(json.dumps(payload))
+    metadata_path = quarantine / f"{stem}.metadata.json"
+    metadata_path.write_text(
+        json.dumps(
+            {
+                "quarantined_name": payload_path.name,
+                "quarantined_at": 10,
+                "sha256": "imported-digest",
+                "error": error,
+            }
+        )
+    )
+    return metadata_path, payload_path
 
 
 def _bootstrap_process(paths: tuple[str, str]) -> tuple[str, ...]:
@@ -816,3 +975,221 @@ def test_v1_status_normalization_updates_jobs_core_and_identity(
             "SELECT revision, status, created_at FROM job_identity"
         ).fetchone()
         assert core == identity == (4, "queued", 1.0)
+
+
+@pytest.mark.parametrize("schema_version", ["1", str(DATABASE_SCHEMA_VERSION)])
+def test_initialize_adds_missing_quarantine_columns_without_rewriting_rows(
+    tmp_path: Path,
+    schema_version: str,
+) -> None:
+    jobs = tmp_path / "jobs"
+    rows = _legacy_quarantine_rows(jobs)
+    path = _install_legacy_quarantine_database(
+        jobs, schema_version=schema_version, rows=rows
+    )
+    with sqlite3.connect(path) as connection:
+        assert _quarantine_column_names(connection) == _LEGACY_QUARANTINE_COLUMNS
+        evidence_before = _quarantine_snapshots(connection)
+
+    database = SQLiteJobDatabase(jobs)
+    database.initialize(normalize_legacy=lambda job: job)
+    with database.connect(readonly=True) as connection:
+        columns = _quarantine_column_names(connection)
+        upgraded = connection.execute(
+            """
+            SELECT evidence_id, job_id, metadata_path, payload_path,
+                payload_digest, error, quarantined_at, target_key,
+                worktree_key, blocks_all, reserves_target, reserves_worktree,
+                resolved_at, resolution_reason
+            FROM quarantine ORDER BY evidence_id
+            """
+        ).fetchall()
+        rows_after_upgrade = _quarantine_snapshots(connection)
+        schema_after_upgrade = connection.execute(
+            "SELECT type, name, sql FROM sqlite_schema ORDER BY type, name"
+        ).fetchall()
+
+    assert set(columns) == set(_CURRENT_QUARANTINE_COLUMNS)
+    assert {column for column, _definition in _QUARANTINE_ADDITIVE_COLUMNS} <= set(
+        columns
+    )
+    assert [tuple(row)[:7] + tuple(row)[12:] for row in upgraded] == evidence_before
+    assert [tuple(row)[7:12] for row in upgraded] == [
+        (None, None, 0, 0, 0),
+        (None, None, 0, 0, 0),
+    ]
+
+    database.initialize(normalize_legacy=lambda job: job)
+    with database.connect(readonly=True) as connection:
+        assert _quarantine_snapshots(connection) == rows_after_upgrade
+        assert (
+            connection.execute(
+                "SELECT type, name, sql FROM sqlite_schema ORDER BY type, name"
+            ).fetchall()
+            == schema_after_upgrade
+        )
+
+
+def test_legacy_quarantine_survives_startup_import_and_recovery(
+    tmp_path: Path,
+) -> None:
+    jobs = tmp_path / "jobs"
+    metadata_path, payload_path = _write_quarantine_source(
+        jobs,
+        "aaaaaaaaaaaa",
+        "aaaaaaaaaaaa-open",
+        error="invalid parent",
+        payload=_job(
+            "aaaaaaaaaaaa",
+            status="running",
+            herdr_target="held-agent",
+            parent_job_id="invalid",
+        ),
+    )
+    rows = [
+        (
+            "open-evidence",
+            "aaaaaaaaaaaa",
+            str(metadata_path),
+            str(payload_path),
+            "open-digest",
+            "invalid parent",
+            1.0,
+            None,
+            None,
+        ),
+        (
+            "orphan-evidence",
+            "cccccccccccc",
+            str(jobs / ".quarantine" / "cccccccccccc-orphan.metadata.json"),
+            str(jobs / ".quarantine" / "cccccccccccc-orphan.json"),
+            "orphan-digest",
+            "missing source",
+            4.0,
+            None,
+            None,
+        ),
+        (
+            "resolved-evidence",
+            "bbbbbbbbbbbb",
+            str(jobs / ".quarantine" / "bbbbbbbbbbbb-resolved.metadata.json"),
+            str(jobs / ".quarantine" / "bbbbbbbbbbbb-resolved.json"),
+            "resolved-digest",
+            "unreadable payload",
+            2.0,
+            3.0,
+            "operator checked",
+        ),
+    ]
+    _install_v1_database(jobs, [_job("dddddddddddd", request="recover after upgrade")])
+    with sqlite3.connect(jobs / "jobs.sqlite3") as connection:
+        connection.execute("DROP TABLE quarantine")
+        connection.execute(
+            """
+            CREATE TABLE quarantine (
+                evidence_id TEXT PRIMARY KEY,
+                job_id TEXT,
+                metadata_path TEXT NOT NULL UNIQUE,
+                payload_path TEXT,
+                payload_digest TEXT,
+                error TEXT NOT NULL,
+                quarantined_at REAL,
+                resolved_at REAL,
+                resolution_reason TEXT
+            ) STRICT
+            """
+        )
+        connection.executemany(
+            """
+            INSERT INTO quarantine(
+                evidence_id, job_id, metadata_path, payload_path,
+                payload_digest, error, quarantined_at, resolved_at,
+                resolution_reason
+            ) VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            rows,
+        )
+        connection.execute(
+            "UPDATE store_meta SET value = '1' WHERE key = 'schema_version'"
+        )
+
+    store = JobStore(jobs, tmp_path / "legacy")
+    recovered = store.get("dddddddddddd")
+    store.create(CursorJob.from_dict(_job("eeeeeeeeeeee", herdr_target="other-agent")))
+
+    assert recovered.request == "recover after upgrade"
+    with sqlite3.connect(store.db_path) as connection:
+        assert set(_quarantine_column_names(connection)) == set(
+            _CURRENT_QUARANTINE_COLUMNS
+        )
+        imported, orphan, resolved = connection.execute(
+            """
+            SELECT evidence_id, job_id, metadata_path, payload_path,
+                payload_digest, error, quarantined_at, target_key,
+                worktree_key, blocks_all, reserves_target, reserves_worktree,
+                resolved_at, resolution_reason
+            FROM quarantine ORDER BY evidence_id
+            """
+        ).fetchall()
+    assert imported[0] == "open-evidence"
+    assert imported[2] == str(metadata_path)
+    assert imported[3] == str(payload_path)
+    assert imported[5] == "invalid parent"
+    assert imported[7] == "held-agent"
+    assert imported[9:] == (0, 1, 0, None, None)
+    assert tuple(orphan) == (
+        "orphan-evidence",
+        "cccccccccccc",
+        rows[1][2],
+        rows[1][3],
+        "orphan-digest",
+        "missing source",
+        4.0,
+        None,
+        None,
+        0,
+        0,
+        0,
+        None,
+        None,
+    )
+    assert tuple(resolved) == (
+        "resolved-evidence",
+        "bbbbbbbbbbbb",
+        rows[2][2],
+        rows[2][3],
+        "resolved-digest",
+        "unreadable payload",
+        2.0,
+        None,
+        None,
+        0,
+        0,
+        0,
+        3.0,
+        "operator checked",
+    )
+
+
+def test_unsupported_schema_does_not_alter_legacy_quarantine(tmp_path: Path) -> None:
+    jobs = tmp_path / "jobs"
+    rows = _legacy_quarantine_rows(jobs)
+    path = _install_legacy_quarantine_database(jobs, schema_version="999", rows=rows)
+    with sqlite3.connect(path) as connection:
+        schema_before = connection.execute(
+            "SELECT type, name, sql FROM sqlite_schema ORDER BY type, name"
+        ).fetchall()
+        evidence_before = _quarantine_snapshots(connection)
+
+    with pytest.raises(sqlite3.DatabaseError, match="unsupported.*999"):
+        SQLiteJobDatabase(jobs).initialize(normalize_legacy=lambda job: job)
+
+    with sqlite3.connect(path) as connection:
+        assert _quarantine_column_names(connection) == _LEGACY_QUARANTINE_COLUMNS
+        assert _quarantine_snapshots(connection) == evidence_before
+        assert (
+            connection.execute(
+                "SELECT type, name, sql FROM sqlite_schema ORDER BY type, name"
+            ).fetchall()
+            == schema_before
+        )
