@@ -2,7 +2,13 @@ from __future__ import annotations
 
 import unittest
 
-from local_voice_harness.responses import AssistantResponse, as_assistant_response
+from local_voice_harness.responses import (
+    AssistantResponse,
+    as_assistant_response,
+    spoken_utterance_slice,
+    with_spoken_utterance_ack,
+    without_spoken_utterance_ack,
+)
 
 
 class AssistantResponseTests(unittest.TestCase):
@@ -31,6 +37,47 @@ class AssistantResponseTests(unittest.TestCase):
 
         with self.assertRaisesRegex(TypeError, "assistant response"):
             as_assistant_response(object())  # type: ignore[arg-type]
+
+
+class SpokenUtteranceSliceTests(unittest.TestCase):
+    def test_short_utterance_is_kept_in_full(self) -> None:
+        self.assertEqual(
+            spoken_utterance_slice("revert the login change"),
+            "revert the login change",
+        )
+
+    def test_first_clause_wins_before_the_word_cap(self) -> None:
+        self.assertEqual(
+            spoken_utterance_slice(
+                "revert the login change. Then review the rest of the auth work."
+            ),
+            "revert the login change",
+        )
+
+    def test_long_clause_is_capped_at_about_twelve_words(self) -> None:
+        utterance = (
+            "revert the login change and then also update the documentation "
+            "for the new auth flow please"
+        )
+        self.assertEqual(
+            spoken_utterance_slice(utterance),
+            "revert the login change and then also update the documentation for the",
+        )
+        self.assertEqual(len(spoken_utterance_slice(utterance).split()), 12)
+
+    def test_accept_sentence_names_the_slice_and_can_drop_it(self) -> None:
+        spoken = with_spoken_utterance_ack(
+            "Cursor accepted the login change and queued it.",
+            "revert the login change",
+        )
+        self.assertEqual(
+            spoken,
+            "Cursor accepted the login change and queued it for “revert the login change.”",
+        )
+        self.assertEqual(
+            without_spoken_utterance_ack(spoken),
+            "Cursor accepted the login change and queued it.",
+        )
 
 
 if __name__ == "__main__":

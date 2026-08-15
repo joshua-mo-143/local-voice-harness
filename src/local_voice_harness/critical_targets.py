@@ -18,7 +18,12 @@ from .questions import (
     QuestionSensitivity,
     resolve_answer,
 )
-from .responses import AssistantResponse, ResponseLike, as_assistant_response
+from .responses import (
+    AssistantResponse,
+    ResponseLike,
+    as_assistant_response,
+    without_spoken_utterance_ack,
+)
 from .ticket_targets import TicketExtraction, extract_ticket_targets
 
 READBACK_TIMEOUT_SECONDS = 30.0
@@ -215,7 +220,9 @@ def identified_target_response(
     rendered = as_assistant_response(response)
     spoken_target = f"{target.repository} issue {target.ticket}"
     return AssistantResponse(
-        spoken_text=f"For {spoken_target}: {rendered.spoken_text}",
+        spoken_text=(
+            f"For {spoken_target}: {without_spoken_utterance_ack(rendered.spoken_text)}"
+        ),
         display_text=f"Target {target.canonical}: {rendered.display_text}",
     )
 

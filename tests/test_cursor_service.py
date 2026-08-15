@@ -279,7 +279,7 @@ def test_fanout_preflights_every_target_before_bounded_background_starts() -> No
     assert "check the harness logs" in response.display_text
     assert response.spoken_text == (
         "One job started; one GitHub issue could not be accessed; "
-        "one job failed to start."
+        "one job failed to start for “Work on issues 1 through 3.”"
     )
     assert "job-one" not in response.spoken_text
     assert "job deletion maintenance is active" not in response.spoken_text
@@ -1213,9 +1213,62 @@ def test_queued_start_speaks_label_not_hex(
 
     response = as_assistant_response(result.text)
     assert job.id not in response.spoken_text
-    assert "update the readme" in response.spoken_text
-    assert "queued" in response.spoken_text.casefold()
+    assert response.spoken_text == "Cursor accepted update the readme and queued it."
     assert job.id in response.display_text
+    assert "Request:" not in response.display_text
+    foreground.assert_not_called()
+
+
+def test_ticket_accept_without_trusted_utterance_is_generic() -> None:
+    response = service._ticket_start_summary(
+        (
+            service.TicketStartOutcome(
+                "example/project#1",
+                "accepted",
+                job_id="123456789abc",
+            ),
+        ),
+        None,
+    )
+
+    assert response.spoken_text == "One job started."
+    assert " for “" not in response.spoken_text
+    assert "Request:" not in response.display_text
+
+
+def test_queued_start_bounds_long_trusted_utterance(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(service, "JOBS_DIR", tmp_path / "jobs")
+    monkeypatch.setattr(service, "LEGACY_JOBS_DIR", tmp_path / "legacy")
+    utterance = (
+        "revert the login change and then also update the documentation "
+        "for the new auth flow please"
+    )
+    job = CursorJob.new(
+        NewCursorJob(
+            id="123456789abc",
+            request=utterance,
+            created_at=1,
+            foreground_until=0,
+            speakable_label="the login change",
+        )
+    )
+    service._job_store().create(job)
+
+    with (
+        mock.patch.object(service, "start_job", return_value=job.id),
+        mock.patch.object(service, "_await_foreground") as foreground,
+    ):
+        result = service.cursor_turn(CursorTurnRequest(utterance, utterance=utterance))
+
+    response = as_assistant_response(result.text)
+    assert response.spoken_text == (
+        "Cursor accepted the login change and queued it for “revert the login "
+        "change and then also update the documentation for the.”"
+    )
+    assert utterance not in response.spoken_text
+    assert f"Request: {utterance}" in response.display_text
     foreground.assert_not_called()
 
 
@@ -1421,7 +1474,7 @@ def test_fanout_linear_capability_preflight_happens_before_any_start() -> None:
     response = as_assistant_response(result.text)
     assert response.display_text.startswith("Ticket starts: ENG-1: accepted")
     assert "ENG-2: accepted" in response.display_text
-    assert response.spoken_text == "Two jobs started."
+    assert response.spoken_text == ("Two jobs started for “Work on ENG-1 and ENG-2.”")
 
 
 def test_foreground_agent_failure_keeps_diagnostics_out_of_speech(

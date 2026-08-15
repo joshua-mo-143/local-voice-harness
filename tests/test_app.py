@@ -833,13 +833,23 @@ class AppConsultationTests(unittest.TestCase):
         ) -> str:
             self.assertEqual(
                 events,
-                [("play", consultation.ACKNOWLEDGEMENT)],
+                [
+                    (
+                        "play",
+                        consultation.acknowledgement("review this").spoken_text,
+                    )
+                ],
             )
             events.append(("consult", _text))
             return "Use the simpler boundary."
 
         with (
             mock.patch.object(app, "start_components"),
+            mock.patch.object(
+                app,
+                "resolve_aliases",
+                return_value="What do you think about this approach?",
+            ),
             mock.patch.object(app, "build_integration_registry", return_value=registry),
             mock.patch.object(app, "request_context", return_value=context),
             mock.patch.object(
@@ -868,14 +878,17 @@ class AppConsultationTests(unittest.TestCase):
                 side_effect=lambda text, **_kwargs: events.append(("play", text)),
             ) as play,
         ):
-            app.respond("What do you think about this approach?")
+            app.respond("review this")
 
         consult.assert_called_once_with(client, target, context.text)
         cursor.assert_not_called()
         qwen.assert_not_called()
         self.assertEqual(
             [call.args[0] for call in play.call_args_list],
-            [consultation.ACKNOWLEDGEMENT, "Use the simpler boundary."],
+            [
+                consultation.acknowledgement("review this").spoken_text,
+                "Use the simpler boundary.",
+            ],
         )
 
     def test_pending_consultation_supplies_router_context_without_replying(
@@ -899,7 +912,14 @@ class AppConsultationTests(unittest.TestCase):
         ) -> str:
             self.assertEqual(
                 events,
-                [("play", consultation.ACKNOWLEDGEMENT)],
+                [
+                    (
+                        "play",
+                        consultation.acknowledgement(
+                            "Which option do you recommend?"
+                        ).spoken_text,
+                    )
+                ],
             )
             events.append(("consult", text))
             return "Choose the safe design."
@@ -954,7 +974,12 @@ class AppConsultationTests(unittest.TestCase):
         qwen.assert_not_called()
         self.assertEqual(
             [call.args[0] for call in play.call_args_list],
-            [consultation.ACKNOWLEDGEMENT, "Choose the safe design."],
+            [
+                consultation.acknowledgement(
+                    "Which option do you recommend?"
+                ).spoken_text,
+                "Choose the safe design.",
+            ],
         )
 
     def test_ambiguous_pending_consultation_fails_without_fallback(self) -> None:
@@ -1070,7 +1095,7 @@ class AppConsultationTests(unittest.TestCase):
         self.assertEqual(
             [call.args[0] for call in play.call_args_list],
             [
-                consultation.ACKNOWLEDGEMENT,
+                consultation.acknowledgement("Inspect this checkout").spoken_text,
                 "I couldn't complete the read only consultation.",
             ],
         )

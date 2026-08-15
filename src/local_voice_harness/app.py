@@ -138,8 +138,9 @@ def release_deliveries(claims: DeliveryClaims) -> None:
 def _acknowledge_consultation(
     speech_renderer: SpeechRenderer,
     settings: UserConfig,
+    utterance: str,
 ) -> None:
-    acknowledgement = as_assistant_response(cursor_consultation.ACKNOWLEDGEMENT)
+    acknowledgement = cursor_consultation.acknowledgement(utterance)
     print(f"Assistant: {acknowledgement.display_text}")
     stream_and_play(
         speech_renderer.render(acknowledgement.spoken_text),
@@ -155,6 +156,7 @@ def respond(text: str, *, user_config: UserConfig | None = None) -> None:
     text = text.strip()
     if not text:
         raise HarnessError("request text is empty")
+    trusted_utterance = text
     text = resolve_aliases(text)
     delivery_claims: DeliveryClaims = []
     with component_usage():
@@ -268,7 +270,7 @@ def respond(text: str, *, user_config: UserConfig | None = None) -> None:
                 response = cursor_turn(
                     CursorTurnRequest(
                         context.text,
-                        utterance=text,
+                        utterance=trusted_utterance,
                         github_repository=(
                             context.github_repository or repository_from_utterance(text)
                         ),
@@ -281,7 +283,7 @@ def respond(text: str, *, user_config: UserConfig | None = None) -> None:
                 response = cursor_turn(
                     CursorTurnRequest(
                         context.text,
-                        utterance=text,
+                        utterance=trusted_utterance,
                         linear_team=(
                             context.issue_scope
                             if context.issue_scope_source == "linear"
@@ -316,7 +318,11 @@ def respond(text: str, *, user_config: UserConfig | None = None) -> None:
                 else:
                     try:
                         client = integrations.herdr_client()
-                        _acknowledge_consultation(speech_renderer, settings)
+                        _acknowledge_consultation(
+                            speech_renderer,
+                            settings,
+                            trusted_utterance,
+                        )
                         response = cursor_consultation.consult_pending_question(
                             client,
                             CURSOR_STORE,
@@ -342,7 +348,11 @@ def respond(text: str, *, user_config: UserConfig | None = None) -> None:
                     if target is None:
                         response = cursor_consultation.NO_WORKSPACE
                     else:
-                        _acknowledge_consultation(speech_renderer, settings)
+                        _acknowledge_consultation(
+                            speech_renderer,
+                            settings,
+                            trusted_utterance,
+                        )
                         response = cursor_consultation.consult(
                             client, target, context.text
                         )
@@ -352,7 +362,7 @@ def respond(text: str, *, user_config: UserConfig | None = None) -> None:
                 response = cursor_turn(
                     CursorTurnRequest(
                         context.text,
-                        utterance=text,
+                        utterance=trusted_utterance,
                         context_repository=context.focused_repository,
                         issue_key=context.external_issue_reference,
                         issue_scope=context.issue_scope,
@@ -396,7 +406,7 @@ def respond(text: str, *, user_config: UserConfig | None = None) -> None:
                         context.text,
                         action="reply",
                         reference=text,
-                        utterance=text,
+                        utterance=trusted_utterance,
                         job_id=reply_target[0] if reply_target is not None else None,
                         expected_question_id=(
                             reply_target[1] if reply_target is not None else None
@@ -413,7 +423,7 @@ def respond(text: str, *, user_config: UserConfig | None = None) -> None:
                 response = qwen_response(
                     context.text,
                     **github_arguments,
-                    trusted_utterance=text,
+                    trusted_utterance=trusted_utterance,
                     delivery_claims=delivery_claims,
                     allow_tools=False,
                     settings=settings.providers,

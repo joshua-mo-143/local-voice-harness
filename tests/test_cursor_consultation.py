@@ -642,3 +642,36 @@ def test_post_restart_and_protected_owners_cannot_apply(tmp_path: Path) -> None:
     )
     consultation.complete_recommendation_delivery(summary=summary)
     assert consultation.applicable_choice_id(destructive, destructive_job.id) is None
+
+
+def test_acknowledgement_names_a_short_trusted_utterance() -> None:
+    response = consultation.acknowledgement("revert the login change")
+
+    assert response.spoken_text == (
+        "Let me look at “revert the login change.” I'll get back to you."
+    )
+    assert response.display_text == response.spoken_text
+    assert consultation.ACKNOWLEDGEMENT not in response.spoken_text
+
+
+def test_acknowledgement_bounds_a_long_trusted_utterance() -> None:
+    utterance = (
+        "revert the login change and then also update the documentation "
+        "for the new auth flow please"
+    )
+    response = consultation.acknowledgement(utterance)
+
+    assert response.spoken_text == (
+        "Let me look at “revert the login change and then also update the "
+        "documentation for the.” I'll get back to you."
+    )
+    assert utterance not in response.spoken_text
+    assert utterance in response.display_text
+    assert "I heard" not in response.spoken_text
+
+
+def test_acknowledgement_falls_back_when_utterance_is_empty() -> None:
+    response = consultation.acknowledgement("   ")
+
+    assert response.spoken_text == consultation.ACKNOWLEDGEMENT
+    assert response.display_text == consultation.ACKNOWLEDGEMENT
