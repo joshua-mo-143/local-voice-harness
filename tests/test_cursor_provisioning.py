@@ -70,6 +70,7 @@ from local_voice_harness.integrations.linear import (
     LinearTicketCloseResult,
     LinearTicketCreationResult,
     LinearTicketUpdateResult,
+    LinearWorkflowState,
 )
 from local_voice_harness.linear_ticket_creation import LinearTicketDraft
 from local_voice_harness.local_git import (
@@ -5034,6 +5035,11 @@ class CursorJobStateTests(unittest.TestCase):
                 "resolve_issue",
                 return_value=("issue-id-api-79", LinearIssue("API-79")),
             ),
+            mock.patch.object(
+                provider,
+                "resolve_terminal_state",
+                return_value=LinearWorkflowState("state-done", "Done", "completed"),
+            ),
         ):
             service.run_worker("123456789abc")
 
@@ -5044,7 +5050,10 @@ class CursorJobStateTests(unittest.TestCase):
             "linear_ticket_close_confirmation",
         )
         self.assertEqual(updated["linear_ticket_close_operation_state"], "planned")
+        self.assertEqual(updated["linear_ticket_close_terminal_state_id"], "state-done")
+        self.assertEqual(updated["linear_ticket_close_terminal_state_name"], "Done")
         self.assertIn("API-79", str(updated["question"]))
+        self.assertIn("Done", str(updated["question"]))
         herdr.ensure_router.assert_not_called()
 
     def test_confirmed_linear_ticket_close_completes(self) -> None:
@@ -5058,6 +5067,8 @@ class CursorJobStateTests(unittest.TestCase):
                 "linear_ticket_close_requested": True,
                 "linear_ticket_close_confirmed": True,
                 "linear_ticket_close_issue_id": "issue-id-api-79",
+                "linear_ticket_close_terminal_state_id": "state-done",
+                "linear_ticket_close_terminal_state_name": "Done",
                 "linear_ticket_close_marker": "a" * 32,
                 "linear_ticket_close_operation_state": "planned",
                 "status": "queued",
@@ -5119,6 +5130,8 @@ class CursorJobStateTests(unittest.TestCase):
                 "linear_ticket_close_requested": True,
                 "linear_ticket_close_confirmed": True,
                 "linear_ticket_close_issue_id": "issue-id-api-79",
+                "linear_ticket_close_terminal_state_id": "state-done",
+                "linear_ticket_close_terminal_state_name": "Done",
                 "linear_ticket_close_marker": "a" * 32,
                 "linear_ticket_close_operation_state": "planned",
                 "status": "queued",

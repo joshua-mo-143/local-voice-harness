@@ -388,6 +388,8 @@ _STRING_FIELDS = frozenset(
         "linear_ticket_close_marker",
         "linear_ticket_close_operation_state",
         "linear_ticket_close_issue_id",
+        "linear_ticket_close_terminal_state_id",
+        "linear_ticket_close_terminal_state_name",
         "linear_ticket_close_prompt_target",
         "linear_ticket_close_prompt_session",
         "linear_ticket_close_prompt_token",
@@ -777,6 +779,8 @@ _LINEAR_STATE_FIELDS = frozenset(
         "linear_ticket_close_marker",
         "linear_ticket_close_operation_state",
         "linear_ticket_close_issue_id",
+        "linear_ticket_close_terminal_state_id",
+        "linear_ticket_close_terminal_state_name",
         "linear_ticket_close_prompt_target",
         "linear_ticket_close_prompt_session",
         "linear_ticket_close_prompt_token",
@@ -3008,6 +3012,14 @@ class AgentJob:
     @property
     def linear_ticket_close_issue_id(self) -> str | None:
         return self._optional_string("linear_ticket_close_issue_id")
+
+    @property
+    def linear_ticket_close_terminal_state_id(self) -> str | None:
+        return self._optional_string("linear_ticket_close_terminal_state_id")
+
+    @property
+    def linear_ticket_close_terminal_state_name(self) -> str | None:
+        return self._optional_string("linear_ticket_close_terminal_state_name")
 
     @property
     def linear_ticket_close_prompt_target(self) -> str | None:

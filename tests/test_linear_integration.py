@@ -938,6 +938,41 @@ class LinearTicketUpdateTests(unittest.TestCase):
             correlation_marker="a" * 32,
         )
 
+    def test_resolves_one_configured_terminal_state_deterministically(self) -> None:
+        client = mock.Mock()
+        client.ensure_router.return_value = mock.Mock(target="voice-router")
+
+        def prompt(*_args: object, **kwargs: object) -> object:
+            token = str(kwargs["token"])
+            payload = {
+                "identifier": "API-79",
+                "states": [
+                    {"id": "state-canceled", "name": "Canceled", "type": "canceled"},
+                    {"id": "state-released", "name": "Released", "type": "completed"},
+                    {"id": "state-done", "name": "Done", "type": "completed"},
+                ],
+            }
+            return mock.Mock(
+                output=(f"VOICE_LINEAR_TERMINAL_STATES[{token}]: {json.dumps(payload)}")
+            )
+
+        client.prompt_and_wait.side_effect = prompt
+        with (
+            tempfile.TemporaryDirectory() as temporary,
+            mock.patch.object(
+                linear,
+                "LINEAR_ROUTER_LOCK",
+                Path(temporary) / "router.lock",
+            ),
+            mock.patch.object(self.integration, "require_capabilities"),
+        ):
+            state = self.integration.resolve_terminal_state(client, "api-79")
+
+        self.assertEqual(
+            state, linear.LinearWorkflowState("state-done", "Done", "completed")
+        )
+        self.assertIn("read-only", client.prompt_and_wait.call_args.args[1])
+
     def test_submit_requires_confirmation_and_returns_validated_identity(self) -> None:
         client = mock.Mock()
         client.ensure_router.return_value = mock.Mock(target="voice-router")
@@ -982,6 +1017,8 @@ class LinearTicketUpdateTests(unittest.TestCase):
         submitted = client.prompt_and_wait.call_args.args[1]
         self.assertIn("Identifier: API-79", submitted)
         self.assertIn("Immutable issue ID: issue-id-api-79", submitted)
+        self.assertIn("configured workflow state named Done", submitted)
+        self.assertIn("immutable state ID is state-done", submitted)
         self.assertIn("Update title: yes", submitted)
         self.assertIn("Update description: yes", submitted)
         self.assertIn("Do not create a new issue", submitted)
@@ -1099,6 +1136,8 @@ class LinearTicketCloseTests(unittest.TestCase):
         self.plan = self.integration.plan_ticket_close(
             "issue-id-api-79",
             "API-79",
+            "state-done",
+            "Done",
             correlation_marker="a" * 32,
         )
 

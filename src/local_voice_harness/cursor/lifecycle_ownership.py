@@ -548,6 +548,8 @@ def _build_field_ownership() -> tuple[FieldOwnership, ...]:
                 "linear_ticket_close_marker": CrashKind.TOKEN,
                 "linear_ticket_close_operation_state": CrashKind.UNCERTAINTY,
                 "linear_ticket_close_issue_id": CrashKind.IDENTITY,
+                "linear_ticket_close_terminal_state_id": CrashKind.IDENTITY,
+                "linear_ticket_close_terminal_state_name": CrashKind.CONTENT,
                 "linear_ticket_close_prompt_target": CrashKind.IDENTITY,
                 "linear_ticket_close_prompt_session": CrashKind.IDENTITY,
                 "linear_ticket_close_prompt_token": CrashKind.TOKEN,

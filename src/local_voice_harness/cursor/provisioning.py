@@ -3856,16 +3856,29 @@ def _run_linear_ticket_close(
             return
         job = updated
         identifier = issue.identifier
-    if not job.linear_ticket_close_marker:
+    if (
+        not job.linear_ticket_close_marker
+        or not job.linear_ticket_close_terminal_state_id
+        or not job.linear_ticket_close_terminal_state_name
+    ):
+        terminal_state = provider.resolve_terminal_state(
+            client,
+            identifier,
+            checkpoint=checkpoint,
+        )
         plan = provider.plan_ticket_close(
             job.linear_ticket_close_issue_id or "",
             identifier,
-            correlation_marker=uuid.uuid4().hex,
+            terminal_state.id,
+            terminal_state.name,
+            correlation_marker=job.linear_ticket_close_marker or uuid.uuid4().hex,
         )
 
         def persist_plan(current: CursorJob) -> CursorJob:
             return current.evolve(
                 linear_ticket_close_issue_id=plan.issue_id,
+                linear_ticket_close_terminal_state_id=plan.terminal_state_id,
+                linear_ticket_close_terminal_state_name=plan.terminal_state_name,
                 linear_ticket_close_marker=plan.correlation_marker,
                 linear_ticket_close_operation_state="planned",
             )
@@ -3884,10 +3897,16 @@ def _run_linear_ticket_close(
     plan = provider.plan_ticket_close(
         job.linear_ticket_close_issue_id or "",
         job.issue_key or identifier,
+        job.linear_ticket_close_terminal_state_id or "",
+        job.linear_ticket_close_terminal_state_name or "",
         correlation_marker=job.linear_ticket_close_marker,
     )
     if not job.linear_ticket_close_confirmed:
-        preview = f"Close {plan.identifier}?\n\nSay yes to close it or no to cancel."
+        preview = (
+            f"Close {plan.identifier} by moving it to "
+            f"{plan.terminal_state_name}?\n\n"
+            "Say yes to close it or no to cancel."
+        )
         _worker_question(
             store,
             job.id,

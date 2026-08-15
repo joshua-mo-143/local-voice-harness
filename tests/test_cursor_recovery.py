@@ -1261,6 +1261,8 @@ class CursorRecoveryTests(unittest.TestCase):
                 "linear_ticket_close_requested": True,
                 "linear_ticket_close_confirmed": True,
                 "linear_ticket_close_issue_id": "issue-id-api-79",
+                "linear_ticket_close_terminal_state_id": "state-done",
+                "linear_ticket_close_terminal_state_name": "Done",
                 "linear_ticket_close_marker": "a" * 32,
                 "linear_ticket_close_operation_state": "ambiguous",
             }
@@ -1303,6 +1305,8 @@ class CursorRecoveryTests(unittest.TestCase):
                 "linear_ticket_close_requested": True,
                 "linear_ticket_close_confirmed": True,
                 "linear_ticket_close_issue_id": "issue-id-api-79",
+                "linear_ticket_close_terminal_state_id": "state-done",
+                "linear_ticket_close_terminal_state_name": "Done",
                 "linear_ticket_close_marker": "a" * 32,
                 "linear_ticket_close_operation_state": "ambiguous",
             }

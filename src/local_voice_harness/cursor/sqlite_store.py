@@ -238,6 +238,8 @@ _NAMED_TABLE_FIELDS: dict[str, tuple[str, ...]] = {
         "linear_ticket_close_prompt_target",
         "linear_ticket_close_prompt_token",
         "linear_ticket_close_requested",
+        "linear_ticket_close_terminal_state_id",
+        "linear_ticket_close_terminal_state_name",
         "linear_ticket_create_baseline_sequence",
         "linear_ticket_create_confirmed",
         "linear_ticket_create_description",

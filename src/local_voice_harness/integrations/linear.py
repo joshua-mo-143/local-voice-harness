@@ -103,6 +103,13 @@ class LinearTeam:
 
 
 @dataclass(frozen=True)
+class LinearWorkflowState:
+    id: str
+    name: str
+    type: str
+
+
+@dataclass(frozen=True)
 class LinearTicketCreationPlan:
     team_id: str
     team_key: str
@@ -141,6 +148,8 @@ class LinearTicketUpdateResult:
 class LinearTicketClosePlan:
     issue_id: str
     identifier: str
+    terminal_state_id: str
+    terminal_state_name: str
     correlation_marker: str
 
 
@@ -1022,6 +1031,110 @@ class LinearIntegration:
             raise LinearError("Linear MCP returned an invalid ticket identity")
         return issue_id, issue
 
+    def resolve_terminal_state(
+        self,
+        client: CreationClient,
+        identifier: str,
+        *,
+        checkpoint: Any = None,
+    ) -> LinearWorkflowState:
+        """Resolve one configured terminal state for the issue's exact team."""
+
+        identifier = self.canonicalize_issue_reference(identifier)
+        self.require_capabilities()
+        token = f"linear-terminal-state-{uuid.uuid4().hex[:12]}"
+        with _router_owner(checkpoint):
+            try:
+                router = client.ensure_router(set(), checkpoint=checkpoint)
+                outcome = client.prompt_and_wait(
+                    router.target,
+                    (
+                        "Use configured Linear MCP tools read-only. Fetch exactly one "
+                        f"issue whose identifier is {identifier}, then list every "
+                        "workflow state configured for that issue's exact team. Do not "
+                        "create or modify anything. If and only if the issue identity "
+                        "matches exactly and the complete state list was fetched, return "
+                        "one compact single-line JSON object with keys identifier and "
+                        "states after this marker. Each states item must contain only "
+                        "id, name, and type:\n"
+                        f"VOICE_LINEAR_TERMINAL_STATES[{token}]: <json>\n"
+                        "Otherwise return no terminal-states marker."
+                    ),
+                    token=token,
+                    timeout=180,
+                    checkpoint=checkpoint,
+                )
+            except HerdrError as exc:
+                raise LinearError(
+                    f"I couldn't resolve a terminal state for Linear ticket {identifier}."
+                ) from exc
+        payload = extract_marker(
+            outcome.output,
+            "VOICE_LINEAR_TERMINAL_STATES",
+            token,
+        )
+        try:
+            value = json.loads(payload or "")
+        except json.JSONDecodeError as exc:
+            raise LinearError(
+                "Linear MCP returned invalid terminal workflow states"
+            ) from exc
+        if not isinstance(value, dict):
+            raise LinearError("Linear MCP returned invalid terminal workflow states")
+        returned = value.get("identifier")
+        states = value.get("states")
+        if (
+            not isinstance(returned, str)
+            or self.canonicalize_issue_reference(returned) != identifier
+            or not isinstance(states, list)
+            or not states
+            or len(states) > 100
+        ):
+            raise LinearError("Linear MCP returned invalid terminal workflow states")
+        terminal: list[LinearWorkflowState] = []
+        for state in states:
+            if not isinstance(state, dict):
+                raise LinearError(
+                    "Linear MCP returned invalid terminal workflow states"
+                )
+            state_id = state.get("id")
+            name = state.get("name")
+            state_type = state.get("type")
+            if (
+                not isinstance(state_id, str)
+                or not state_id.strip()
+                or len(state_id.strip()) > 128
+                or re.search(r"[\s\x00-\x1f]", state_id) is not None
+                or not isinstance(name, str)
+                or not name.strip()
+                or len(name.strip()) > 200
+                or not isinstance(state_type, str)
+            ):
+                raise LinearError(
+                    "Linear MCP returned invalid terminal workflow states"
+                )
+            normalized_type = state_type.strip().casefold()
+            if normalized_type in {"completed", "canceled"}:
+                terminal.append(
+                    LinearWorkflowState(
+                        state_id.strip(),
+                        " ".join(name.split()),
+                        normalized_type,
+                    )
+                )
+        if not terminal:
+            raise LinearError(
+                f"Linear ticket {identifier} has no configured terminal workflow state."
+            )
+        return min(
+            terminal,
+            key=lambda state: (
+                0 if state.type == "completed" else 1,
+                state.name.casefold(),
+                state.id,
+            ),
+        )
+
     def _update_result(
         self,
         plan: LinearTicketUpdatePlan,
@@ -1192,6 +1305,8 @@ class LinearIntegration:
         if LINEAR_IDENTIFIER.fullmatch(identifier) is None:
             raise LinearError("Linear ticket close requires a valid identifier")
         issue_id = plan.issue_id.strip()
+        terminal_state_id = plan.terminal_state_id.strip()
+        terminal_state_name = " ".join(plan.terminal_state_name.split())
         marker = plan.correlation_marker.strip()
         if (
             not issue_id
@@ -1199,14 +1314,32 @@ class LinearIntegration:
             or re.search(r"[\s\x00-\x1f]", issue_id) is not None
         ):
             raise LinearError("Linear ticket close requires a valid issue ID")
+        if (
+            not terminal_state_id
+            or len(terminal_state_id) > 128
+            or re.search(r"[\s\x00-\x1f]", terminal_state_id) is not None
+            or not terminal_state_name
+            or len(terminal_state_name) > 200
+        ):
+            raise LinearError(
+                "Linear ticket close requires a configured terminal state"
+            )
         if not re.fullmatch(r"[0-9a-f]{32}", marker):
             raise LinearError("Linear ticket close marker is invalid")
-        return LinearTicketClosePlan(issue_id, identifier, marker)
+        return LinearTicketClosePlan(
+            issue_id,
+            identifier,
+            terminal_state_id,
+            terminal_state_name,
+            marker,
+        )
 
     def plan_ticket_close(
         self,
         issue_id: str,
         identifier: str,
+        terminal_state_id: str,
+        terminal_state_name: str,
         *,
         correlation_marker: str | None = None,
     ) -> LinearTicketClosePlan:
@@ -1214,6 +1347,8 @@ class LinearIntegration:
             LinearTicketClosePlan(
                 issue_id,
                 identifier,
+                terminal_state_id,
+                terminal_state_name,
                 correlation_marker or uuid.uuid4().hex,
             )
         )
@@ -1287,8 +1422,9 @@ class LinearIntegration:
                 "the exact bounded values below; do not infer or add fields. Do not "
                 "create a new issue. Add a comment whose body is exactly this "
                 f"correlation marker:\n{marker}\n"
-                "Then move that issue to a completed, done, canceled, or closed "
-                "workflow state.\n\n"
+                "Then move that issue to exactly the configured workflow state named "
+                f"{plan.terminal_state_name} whose immutable state ID is "
+                f"{plan.terminal_state_id}. Do not choose any other state.\n\n"
                 f"Immutable issue ID: {plan.issue_id}\n"
                 f"Identifier: {plan.identifier}\n\n"
                 "After the MCP calls succeed, return exactly:\n"
@@ -1343,8 +1479,9 @@ class LinearIntegration:
                         "Use configured Linear MCP tools read-only. Do not create or "
                         "modify anything. Fetch the issue whose identifier is "
                         f"{plan.identifier}. Return exactly one status. If that issue "
-                        "is in a completed, done, canceled, or closed workflow state "
-                        "and a comment or description contains this exact correlation "
+                        "is in the workflow state whose immutable ID is exactly "
+                        f"{plan.terminal_state_id} and a comment or description "
+                        "contains this exact correlation "
                         f"marker:\n{marker}\n"
                         f"VOICE_LINEAR_STATUS[{token}]: found\n"
                         f"VOICE_LINEAR_IDENTIFIER[{token}]: <identifier>\n"

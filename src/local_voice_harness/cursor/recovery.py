@@ -1289,6 +1289,8 @@ def reconcile_uncertain_linear_ticket_close(
         plan = provider.plan_ticket_close(
             job.linear_ticket_close_issue_id or "",
             job.issue_key or "",
+            job.linear_ticket_close_terminal_state_id or "",
+            job.linear_ticket_close_terminal_state_name or "",
             correlation_marker=job.linear_ticket_close_marker,
         )
         result = provider.observe_ticket_close(herdr_factory(), plan)
