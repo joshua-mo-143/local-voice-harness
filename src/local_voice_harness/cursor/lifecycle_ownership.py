@@ -1102,6 +1102,12 @@ TRANSITION_ENTRY_POINTS: tuple[TransitionEntry, ...] = (
         AuthorityKind.CALLER_INTERPRETS,
     ),
     _entry(
+        "local_voice_harness.cursor.recovery.reconcile_uncertain_clone",
+        "cursor.recovery",
+        "clone observation to next clone_operation_state",
+        AuthorityKind.CALLER_INTERPRETS,
+    ),
+    _entry(
         "local_voice_harness.cursor.recovery.reconcile_uncertain_issue_creation",
         "cursor.recovery",
         "GitHub issue-create observation",
@@ -1395,7 +1401,7 @@ BASELINE_COUNTS: dict[str, int] = {
     "import_only_fields": 4,
     "cursor_job_public_properties": 155,
     "compatibility_adapters": 38,
-    "transition_entry_points": 74,
+    "transition_entry_points": 75,
     "duplicate_authorities": 0,
-    "lifecycle_module_lines": 26631,
+    "lifecycle_module_lines": 26733,
 }
