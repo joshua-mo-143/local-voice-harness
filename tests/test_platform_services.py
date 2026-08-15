@@ -68,6 +68,46 @@ class PlatformServiceBoundaryTests(unittest.TestCase):
             ["systemd-run", "--user", "--unit=voice-harness-herdr", "--collect"],
         )
 
+    def test_systemd_availability_probes_user_bus_with_timeout(self) -> None:
+        from local_voice_harness import platform_services
+
+        supervisor = SystemdUserSupervisor()
+        completed = subprocess.CompletedProcess([], 0, "", "")
+        with (
+            mock.patch.object(
+                platform_services.shutil, "which", return_value="/usr/bin/systemctl"
+            ),
+            mock.patch.object(
+                platform_services.subprocess, "run", return_value=completed
+            ) as run,
+        ):
+            self.assertTrue(supervisor.available())
+
+        self.assertEqual(
+            run.call_args.args[0],
+            ["systemctl", "--user", "show-environment"],
+        )
+        self.assertEqual(
+            run.call_args.kwargs["timeout"],
+            supervisor.CAPABILITY_PROBE_TIMEOUT_SECONDS,
+        )
+
+    def test_systemd_availability_rejects_unusable_or_stalled_user_bus(self) -> None:
+        from local_voice_harness import platform_services
+
+        supervisor = SystemdUserSupervisor()
+        with (
+            mock.patch.object(
+                platform_services.shutil, "which", return_value="/usr/bin/systemctl"
+            ),
+            mock.patch.object(
+                platform_services.subprocess,
+                "run",
+                side_effect=subprocess.TimeoutExpired("systemctl", 2),
+            ),
+        ):
+            self.assertFalse(supervisor.available())
+
     def test_orchestration_does_not_invoke_platform_tools_directly(self) -> None:
         forbidden = ('["systemctl"', "['systemctl'", '"secret-tool"', '"notify-send"')
         for module in ORCHESTRATION_MODULES:
@@ -88,6 +128,7 @@ class PlatformCapabilityDiagnosticTests(unittest.TestCase):
     def test_missing_features_are_reported_not_required(self) -> None:
         supervisor = mock.Mock()
         supervisor.available.return_value = False
+        supervisor.binary_available.return_value = True
         backend = desktop.DegradedWaylandDesktop(
             "gnome",
             "GNOME Wayland does not expose a supported focused-window or "
@@ -97,7 +138,13 @@ class PlatformCapabilityDiagnosticTests(unittest.TestCase):
             mock.patch.object(checks, "user_services", return_value=supervisor),
             mock.patch.object(checks, "secret_service_available", return_value=False),
             mock.patch.object(
+                checks, "secret_service_binary_available", return_value=True
+            ),
+            mock.patch.object(
                 checks, "notification_service_available", return_value=False
+            ),
+            mock.patch.object(
+                checks, "notification_service_binary_available", return_value=True
             ),
             mock.patch.object(checks, "get_desktop", return_value=backend),
             mock.patch.object(desktop.shutil, "which", return_value=None),
@@ -111,6 +158,9 @@ class PlatformCapabilityDiagnosticTests(unittest.TestCase):
         self.assertEqual(names["platform:credentials"].severity, Severity.WARNING)
         self.assertEqual(names["platform:notifications"].severity, Severity.WARNING)
         self.assertEqual(names["platform:desktop"].severity, Severity.WARNING)
+        self.assertIn("installed", names["platform:services"].detail)
+        self.assertIn("installed", names["platform:credentials"].detail)
+        self.assertIn("installed", names["platform:notifications"].detail)
         self.assertIn("GNOME", names["platform:desktop"].detail)
         self.assertEqual(units[0].severity, Severity.WARNING)
         self.assertNotIn("not installed", units[0].detail)

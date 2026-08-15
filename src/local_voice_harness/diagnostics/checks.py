@@ -27,6 +27,7 @@ from ..credentials import (
     CredentialError,
     get_venice_api_key,
     secret_service_available,
+    secret_service_binary_available,
 )
 from ..cursor.sqlite_store import SQLiteJobDatabase
 from ..desktop import get_desktop
@@ -39,7 +40,10 @@ from ..integrations.registry import (
     capability_statuses,
 )
 from ..ipc import socket_ready
-from ..notifications import notification_service_available
+from ..notifications import (
+    notification_service_available,
+    notification_service_binary_available,
+)
 from ..platform_services import user_services
 from ..process import capability_diagnostics
 from ..user_config import (
@@ -818,15 +822,17 @@ def check_platform_capabilities(
             )
         )
     else:
+        detail = (
+            "systemctl is installed but the systemd user bus is not responding"
+            if services.binary_available()
+            else "systemctl is not installed"
+        )
         results.append(
             CheckResult(
                 name="platform:services",
                 category="platform",
                 severity=Severity.WARNING,
-                detail=(
-                    "user service supervision is unavailable; systemd unit "
-                    "state will not be required"
-                ),
+                detail=(f"{detail}; systemd unit state will not be required"),
             )
         )
     if secret_service_available():
@@ -839,15 +845,17 @@ def check_platform_capabilities(
             )
         )
     else:
+        detail = (
+            "secret-tool is installed but no usable desktop Secret Service responded"
+            if secret_service_binary_available()
+            else "secret-tool is not installed"
+        )
         results.append(
             CheckResult(
                 name="platform:credentials",
                 category="platform",
                 severity=Severity.WARNING,
-                detail=(
-                    "desktop Secret Service is unavailable; Venice credentials "
-                    "cannot be stored or read"
-                ),
+                detail=(f"{detail}; Venice credentials cannot be stored or read"),
                 suggestion="install libsecret and a Secret Service provider",
             )
         )
@@ -861,14 +869,18 @@ def check_platform_capabilities(
             )
         )
     else:
+        detail = (
+            "notify-send is installed but no usable notification service responded"
+            if notification_service_binary_available()
+            else "notify-send is not installed"
+        )
         results.append(
             CheckResult(
                 name="platform:notifications",
                 category="platform",
                 severity=Severity.WARNING,
                 detail=(
-                    "desktop notifications are unavailable; voice operation "
-                    "continues without notify-send"
+                    f"{detail}; voice operation continues without desktop notifications"
                 ),
             )
         )

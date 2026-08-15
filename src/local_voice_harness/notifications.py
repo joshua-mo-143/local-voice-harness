@@ -19,8 +19,36 @@ class NotificationService(Protocol):
     def notify(self, message: str, *, error: bool = False) -> NotificationResult: ...
 
 
-def notification_service_available() -> bool:
+CAPABILITY_PROBE_TIMEOUT_SECONDS = 2
+
+
+def notification_service_binary_available() -> bool:
     return shutil.which("notify-send") is not None
+
+
+def notification_service_available() -> bool:
+    executable = shutil.which("notify-send")
+    if executable is None:
+        return False
+    try:
+        process = subprocess.run(
+            [
+                executable,
+                "--print-id",
+                "--expire-time=1",
+                "--transient",
+                "--app-name=voice-harness",
+                "Voice harness capability probe",
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=CAPABILITY_PROBE_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return process.returncode == 0
 
 
 class NotifySendService:

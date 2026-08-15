@@ -15,6 +15,8 @@ from .notifications import NotificationService, NotifySendService
 class ServiceSupervisor(Protocol):
     """User-session service supervision used by core orchestration."""
 
+    def binary_available(self) -> bool: ...
+
     def available(self) -> bool: ...
 
     def run(
@@ -59,6 +61,8 @@ class ServiceSupervisor(Protocol):
 class SystemdUserSupervisor:
     """Linux implementation that keeps systemd command construction here."""
 
+    CAPABILITY_PROBE_TIMEOUT_SECONDS = 2
+
     def __init__(
         self,
         *,
@@ -68,8 +72,25 @@ class SystemdUserSupervisor:
         self.systemctl = systemctl
         self.systemd_run = systemd_run
 
-    def available(self) -> bool:
+    def binary_available(self) -> bool:
         return shutil.which(self.systemctl) is not None
+
+    def available(self) -> bool:
+        if not self.binary_available():
+            return False
+        try:
+            process = subprocess.run(
+                [self.systemctl, "--user", "show-environment"],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                text=True,
+                timeout=self.CAPABILITY_PROBE_TIMEOUT_SECONDS,
+                check=False,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return False
+        return process.returncode == 0
 
     def run(
         self, *arguments: str, check: bool = True
