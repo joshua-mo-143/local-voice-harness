@@ -5741,6 +5741,81 @@ class CursorJobStateTests(unittest.TestCase):
         github.submit_issue_update.assert_not_called()
         github.submit_issue_close.assert_not_called()
 
+    def test_worker_resolves_and_drafts_linear_merge_before_confirmation(
+        self,
+    ) -> None:
+        closing = encode_merge_closing((MergeClosingTicket("API-80", "0" * 32),))
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "merge API-79 and API-80",
+                "trusted_utterance": "merge API-79 and API-80",
+                "issue_provider": "linear",
+                "issue_key": "API-79",
+                "linear_ticket_merge_requested": True,
+                "ticket_merge_survivor": "API-79",
+                "ticket_merge_closing": closing,
+                "status": "queued",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        provider = linear.LinearIntegration()
+        herdr = mock.Mock()
+        with (
+            mock.patch.object(jobs, "HerdrClient", return_value=herdr),
+            mock.patch.object(
+                production_jobs,
+                "issue_provider",
+                return_value=provider,
+            ),
+            mock.patch.object(
+                provider,
+                "resolve_issue",
+                side_effect=[
+                    ("issue-id-api-79", LinearIssue("API-79")),
+                    ("issue-id-api-80", LinearIssue("API-80")),
+                ],
+            ),
+            mock.patch.object(
+                provider,
+                "resolve_terminal_state",
+                return_value=LinearWorkflowState(
+                    "state-done",
+                    "Done",
+                    "completed",
+                ),
+            ),
+            mock.patch.object(
+                provider,
+                "ticket_snapshot",
+                side_effect=_linear_merge_snapshots(),
+            ),
+            mock.patch.object(
+                production_jobs,
+                "draft_ticket_merge",
+                return_value=TicketMergeDraft(
+                    "Combined auth",
+                    "Handle login and invoices.",
+                ),
+            ),
+        ):
+            service.run_worker("123456789abc")
+
+        updated = jobs.read_job("123456789abc")
+        self.assertEqual(updated["status"], "awaiting_user")
+        self.assertEqual(
+            updated["clarification_kind"],
+            "linear_ticket_merge_confirmation",
+        )
+        self.assertEqual(
+            updated["ticket_merge_survivor_issue_id"],
+            "issue-id-api-79",
+        )
+        self.assertIn("state-done", str(updated["ticket_merge_closing"]))
+        self.assertEqual(updated["ticket_merge_operation_state"], "planned")
+        self.assertIn("Combined auth", str(updated["question"]))
+
     def test_confirmed_issue_merge_updates_survivor_and_closes_rest(self) -> None:
         closing = encode_merge_closing(
             (
