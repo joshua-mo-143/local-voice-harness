@@ -220,6 +220,7 @@ class ForegroundDeliveryTests(unittest.TestCase):
             "review this ticket",
             snapshot=snapshot,
             kind="review",
+            adversarial=False,
         )
         fetch.assert_called_once_with(
             "owner/repo#12",
@@ -235,6 +236,76 @@ class ForegroundDeliveryTests(unittest.TestCase):
                 consultation.acknowledgement("review this ticket").spoken_text,
                 "Scope is too broad.",
             ],
+        )
+
+    def test_adversarial_ticket_review_uses_consultation_not_submit(self) -> None:
+        context = RequestContext(
+            "adversarially review this ticket",
+            focused_issue="owner/repo#12",
+            focused_repository="owner/repo",
+            github_issue_context="untrusted body",
+        )
+        registry = mock.Mock()
+        client = registry.herdr_client.return_value
+        target = consultation.WorkspaceTarget(
+            checkout=Path("/tmp/project"),
+            workspace_id="workspace-1",
+            label="project",
+        )
+        findings = AssistantResponse(
+            spoken_text="Scope mixes two children.",
+            display_text="Acceptance criteria hide a second ticket.",
+        )
+        snapshot = TicketSnapshot(
+            "github",
+            "owner/repo#12",
+            "https://github.com/owner/repo/issues/12",
+            "Bound the scope",
+            "fetched body",
+            "2026-08-15T10:00:00Z",
+            "https://github.com/owner/repo/issues/12",
+            "OPEN",
+        )
+        with (
+            mock.patch.object(app, "start_components"),
+            mock.patch.object(app, "build_integration_registry", return_value=registry),
+            mock.patch.object(app, "request_context", return_value=context),
+            mock.patch.object(
+                app.cursor_consultation,
+                "pending_question_snapshot",
+                return_value=None,
+            ),
+            mock.patch.object(
+                app,
+                "route_intent",
+                return_value=IntentRoute(Intent.CURSOR_SUBMIT, "high"),
+            ),
+            mock.patch.object(
+                app.cursor_consultation, "workspace_target", return_value=target
+            ),
+            mock.patch.object(app, "ticket_snapshot", return_value=snapshot),
+            mock.patch.object(
+                app.cursor_consultation, "consult_ticket", return_value=findings
+            ) as consult,
+            mock.patch.object(app, "cursor_turn") as cursor,
+            mock.patch.object(app, "qwen_response") as qwen,
+            mock.patch.object(app, "stream_and_play") as play,
+        ):
+            app.respond("adversarially review this ticket")
+
+        consult.assert_called_once_with(
+            client,
+            target,
+            "adversarially review this ticket",
+            snapshot=snapshot,
+            kind="review",
+            adversarial=True,
+        )
+        cursor.assert_not_called()
+        qwen.assert_not_called()
+        self.assertEqual(
+            [call.args[0] for call in play.call_args_list],
+            [consultation.ACKNOWLEDGEMENT, "Scope mixes two children."],
         )
 
 

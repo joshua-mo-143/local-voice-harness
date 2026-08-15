@@ -326,6 +326,7 @@ def respond(text: str, *, user_config: UserConfig | None = None) -> None:
                                 text,
                                 snapshot=snapshot,
                                 kind=ticket_admission.kind,
+                                adversarial=ticket_admission.adversarial,
                             )
                     except Exception:  # noqa: BLE001 - consultation fails closed
                         response = cursor_consultation.CONSULTATION_FAILED

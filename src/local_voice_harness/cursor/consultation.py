@@ -103,6 +103,7 @@ class WorkspaceTarget:
 class TicketConsultationAdmission:
     kind: Literal["review", "summarize"]
     ticket: TicketReference | None
+    adversarial: bool = False
 
     @property
     def missing_identity_response(self) -> str:
@@ -310,8 +311,6 @@ def is_apply_recommendation_request(text: str) -> bool:
 def wants_ticket_consultation_context(utterance: str) -> bool:
     """Whether a review or summarize utterance may consume focused ticket context."""
 
-    if _ADVERSARIAL_REVIEW.search(utterance):
-        return False
     match = _TICKET_REVIEW_VERB.search(utterance)
     if match is None:
         return False
@@ -356,6 +355,7 @@ def admit_ticket_consultation(
     return TicketConsultationAdmission(
         kind,
         resolve_named_ticket(extraction, focused_issue=focused_issue),
+        adversarial=bool(kind == "review" and _ADVERSARIAL_REVIEW.search(utterance)),
     )
 
 
@@ -498,12 +498,23 @@ def _ticket_consultation_prompt(
     snapshot: TicketSnapshot,
     kind: Literal["review", "summarize"],
     token: str,
+    adversarial: bool = False,
 ) -> str:
-    action = (
-        "Summarize this existing GitHub or Linear ticket read-only."
-        if kind == "summarize"
-        else "Review this existing GitHub or Linear ticket read-only."
-    )
+    if kind == "summarize":
+        action = "Summarize this existing GitHub or Linear ticket read-only."
+        spoken = "a plain-text answer of at most 60 words"
+    elif adversarial:
+        action = (
+            "Independently and adversarially review this existing GitHub or "
+            "Linear ticket contract read-only. Attack acceptance criteria, "
+            "scope, missing failure cases, mixed or independently deliverable "
+            "children, and unverifiable outcomes. Do not file child tickets "
+            "or edit the parent."
+        )
+        spoken = "a short spoken list of findings of at most 60 words"
+    else:
+        action = "Review this existing GitHub or Linear ticket read-only."
+        spoken = "a plain-text answer of at most 60 words"
     context = "\n\n" + snapshot.consultation_context()
     return (
         f"{action} Do not edit files, run mutating commands, create, update, "
@@ -513,8 +524,8 @@ def _ticket_consultation_prompt(
         f"The trusted ticket identity is {snapshot.identity}. "
         f"Write the full {kind} first as {FINDINGS_MARKER}[{token}]: "
         "followed by the complete findings. Then end with exactly "
-        f"VOICE_SUMMARY[{token}]: followed by a plain-text answer of at most "
-        f"60 words.\n\nUser consultation request:\n{request}{context}"
+        f"VOICE_SUMMARY[{token}]: followed by {spoken}."
+        f"\n\nUser consultation request:\n{request}{context}"
     )
 
 
@@ -657,6 +668,7 @@ def consult_ticket(
     *,
     snapshot: TicketSnapshot,
     kind: Literal["review", "summarize"],
+    adversarial: bool = False,
 ) -> AssistantResponse:
     """Review or summarize one named ticket on the read-only Ask-mode path."""
     token = uuid.uuid4().hex
@@ -668,6 +680,7 @@ def consult_ticket(
             snapshot=snapshot,
             kind=kind,
             token=token,
+            adversarial=adversarial,
         ),
         token=token,
     )

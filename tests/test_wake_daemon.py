@@ -2654,6 +2654,7 @@ class ProcessUtteranceTests(unittest.TestCase):
             "review this ticket",
             snapshot=snapshot,
             kind="review",
+            adversarial=False,
         )
         fetch.assert_called_once_with(
             "owner/repo#12",
@@ -2673,6 +2674,95 @@ class ProcessUtteranceTests(unittest.TestCase):
             ],
         )
         self.assertNotIn("create a new repo", " ".join(played).casefold())
+
+    def test_adversarial_ticket_review_uses_consultation_not_submit(self) -> None:
+        daemon = _bare_daemon()
+        registry = mock.Mock()
+        daemon.integrations = registry
+        client = registry.herdr_client.return_value
+        target = wake_daemon.cursor_consultation.WorkspaceTarget(
+            checkout=Path("/tmp/project"),
+            workspace_id="workspace-1",
+            label="project",
+        )
+        findings = AssistantResponse(
+            spoken_text="Scope mixes two children.",
+            display_text="Acceptance criteria hide a second ticket.",
+        )
+        snapshot = TicketSnapshot(
+            "github",
+            "owner/repo#12",
+            "https://github.com/owner/repo/issues/12",
+            "Bound the scope",
+            "fetched body",
+            "2026-08-15T10:00:00Z",
+            "https://github.com/owner/repo/issues/12",
+            "OPEN",
+        )
+        played: list[str] = []
+
+        def play(response: AssistantResponse) -> tuple[dict[str, object], None]:
+            rendered = as_assistant_response(response)
+            played.append(rendered.spoken_text)
+            return {"played_text": rendered.spoken_text, "interrupted": False}, None
+
+        with (
+            mock.patch.object(
+                wake_daemon,
+                "transcribe",
+                return_value="adversarially review this ticket",
+            ),
+            mock.patch.object(wake_daemon, "start_components"),
+            mock.patch.object(
+                wake_daemon,
+                "request_context",
+                return_value=RequestContext(
+                    "adversarially review this ticket",
+                    focused_issue="owner/repo#12",
+                    focused_repository="owner/repo",
+                    github_issue_context="untrusted body",
+                ),
+            ),
+            mock.patch.object(
+                wake_daemon,
+                "route_intent",
+                return_value=IntentRoute(Intent.CURSOR_SUBMIT, "high"),
+            ),
+            mock.patch.object(
+                wake_daemon.cursor_consultation,
+                "workspace_target",
+                return_value=target,
+            ),
+            mock.patch.object(wake_daemon, "ticket_snapshot", return_value=snapshot),
+            mock.patch.object(
+                wake_daemon.cursor_consultation,
+                "consult_ticket",
+                return_value=findings,
+            ) as consult,
+            mock.patch.object(wake_daemon, "cursor_turn") as cursor_turn,
+            mock.patch.object(wake_daemon, "qwen_turn") as qwen_turn,
+            mock.patch.object(daemon, "play_response", side_effect=play),
+            mock.patch.object(wake_daemon, "notify"),
+        ):
+            daemon.process_utterance(AUDIO_GENERATION, woke=True)
+
+        consult.assert_called_once_with(
+            client,
+            target,
+            "adversarially review this ticket",
+            snapshot=snapshot,
+            kind="review",
+            adversarial=True,
+        )
+        cursor_turn.assert_not_called()
+        qwen_turn.assert_not_called()
+        self.assertEqual(
+            played,
+            [
+                wake_daemon.cursor_consultation.ACKNOWLEDGEMENT,
+                "Scope mixes two children.",
+            ],
+        )
 
     def test_pending_question_snapshot_uses_one_store_read(self) -> None:
         daemon = _bare_daemon()

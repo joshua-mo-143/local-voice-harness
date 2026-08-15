@@ -704,7 +704,7 @@ def test_ticket_consultation_requires_ticket_noun_or_spoken_identity() -> None:
         consultation.ticket_consultation_kind(
             "adversarially review this ticket", adversarial
         )
-        is None
+        == "review"
     )
 
 
@@ -737,10 +737,44 @@ def test_ticket_consultation_binds_focused_or_spoken_identity() -> None:
     assert focused is not None
     assert focused.ticket is not None
     assert focused.ticket.canonical == "owner/repo#12"
+    assert focused.adversarial is False
     assert spoken is not None
     assert spoken.ticket is not None
     assert spoken.ticket.canonical == "API-79"
     assert spoken.kind == "summarize"
+    assert spoken.adversarial is False
+
+
+def test_adversarial_ticket_consultation_matches_ordinary_admission() -> None:
+    missing = consultation.admit_ticket_consultation(
+        "adversarially review this ticket",
+        extract_ticket_targets("adversarially review this ticket"),
+        focused_issue=None,
+    )
+    focused = consultation.admit_ticket_consultation(
+        "adversarially review this ticket",
+        extract_ticket_targets("adversarially review this ticket"),
+        focused_issue="owner/repo#12",
+    )
+    spoken = consultation.admit_ticket_consultation(
+        "adversarially review API-79",
+        extract_ticket_targets("adversarially review API-79"),
+        focused_issue=None,
+    )
+
+    assert missing is not None
+    assert missing.kind == "review"
+    assert missing.adversarial is True
+    assert missing.ticket is None
+    assert missing.missing_identity_response == "Which ticket should I review?"
+    assert focused is not None
+    assert focused.adversarial is True
+    assert focused.ticket is not None
+    assert focused.ticket.canonical == "owner/repo#12"
+    assert spoken is not None
+    assert spoken.adversarial is True
+    assert spoken.ticket is not None
+    assert spoken.ticket.canonical == "API-79"
 
 
 def test_consult_ticket_uses_ask_mode_and_splits_spoken_from_display() -> None:
@@ -807,3 +841,64 @@ def test_consult_ticket_uses_ask_mode_and_splits_spoken_from_display() -> None:
     assert "untrusted ticket body" in prompt
     assert "VOICE_SUMMARY" in prompt
     assert "VOICE_FINDINGS" in prompt
+    assert "adversarially" not in prompt
+
+
+def test_consult_ticket_adversarial_stance_forbids_writes_and_child_filing() -> None:
+    client = mock.Mock()
+    client.workspace_for.return_value = {"workspace_id": "workspace-1"}
+    client.start_fresh_agent.return_value = AgentSelection(
+        "consultant",
+        "pane-2",
+        "workspace-1",
+        "/tmp/project",
+        "consultant",
+    )
+
+    def prompt_and_wait(
+        _target: object,
+        _prompt: str,
+        token: str = "",
+        **_kwargs: object,
+    ) -> PromptOutcome:
+        return PromptOutcome(
+            "done",
+            "Scope mixes two children.",
+            None,
+            (
+                f"VOICE_FINDINGS[{token}]: Acceptance criteria hide a second ticket.\n"
+                f"VOICE_SUMMARY[{token}]: Scope mixes two children."
+            ),
+        )
+
+    client.prompt_and_wait.side_effect = prompt_and_wait
+    target = consultation.WorkspaceTarget(
+        Path("/tmp/project"),
+        "workspace-1",
+        "project",
+    )
+
+    response = consultation.consult_ticket(
+        client,
+        target,
+        "adversarially review this ticket",
+        ticket="API-79",
+        kind="review",
+        ticket_context="untrusted ticket body",
+        adversarial=True,
+    )
+
+    assert response == AssistantResponse(
+        spoken_text="Scope mixes two children.",
+        display_text="Acceptance criteria hide a second ticket.",
+    )
+    assert client.start_fresh_agent.call_args.kwargs["mode"] == "ask"
+    prompt = client.prompt_and_wait.call_args.args[1]
+    assert "Independently and adversarially review" in prompt
+    assert "missing failure cases" in prompt
+    assert "Do not file child tickets or edit the parent" in prompt
+    assert "create, update, close, or file GitHub or Linear tickets" in prompt
+    assert "create a new repository" in prompt
+    assert "short spoken list of findings" in prompt
+    assert "trusted ticket identity is API-79" in prompt
+    assert "untrusted ticket body" in prompt

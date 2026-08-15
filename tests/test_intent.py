@@ -165,7 +165,7 @@ class IntentRouterTests(LocalRouterTestCase):
             payload["messages"][0]["content"],
         )
         self.assertIn(
-            "read-only review or summarize of an existing",
+            "read-only review, adversarial review, or summarize of an existing",
             payload["messages"][0]["content"],
         )
         self.assertIn(

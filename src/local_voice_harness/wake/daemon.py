@@ -3098,6 +3098,7 @@ class WakeConversationDaemon:
                                 text,
                                 snapshot=snapshot,
                                 kind=ticket_admission.kind,
+                                adversarial=ticket_admission.adversarial,
                             )
                         ordinary_reply = True
                     except Exception:  # noqa: BLE001 - consultation fails closed
