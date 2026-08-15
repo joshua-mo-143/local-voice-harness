@@ -3020,6 +3020,11 @@ def render_job_announcement(job: CursorJob) -> AssistantResponse:
                 ),
                 display_text=question,
             )
+        if job.clarification_kind == "repository_or_create":
+            return AssistantResponse(
+                spoken_text=question,
+                display_text=job.request,
+            )
         if job.clarification_kind == "github_repo_create_confirmation":
             return AssistantResponse(
                 spoken_text=question,
@@ -3185,6 +3190,14 @@ def _foreground_delivery_result(
                 ),
                 job_id,
                 mutated=True,
+            )
+        if awaiting.clarification_kind == "repository_or_create":
+            return CursorTurnResult(
+                AssistantResponse(
+                    spoken_text=rendered_question,
+                    display_text=awaiting.request,
+                ),
+                job_id,
             )
         if awaiting.clarification_kind == "github_repo_create_confirmation":
             return CursorTurnResult(

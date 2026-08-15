@@ -218,6 +218,39 @@ def _repo_create_slug_awaiting(store: JobStore) -> CursorJob:
     )
 
 
+def _repository_or_create_awaiting(
+    store: JobStore,
+    *,
+    candidate: str | None = "payments",
+) -> CursorJob:
+    text = (
+        f"Using {candidate}, or create a new repo?"
+        if candidate
+        else "New repo, or in an already existing one?"
+    )
+    pending = replace(_question(), text=text, owner="repository_or_create")
+    return store.create(
+        CursorJob.from_dict(
+            {
+                "id": "aaaaaaaaaaaa",
+                "request": "create me a SaaS called widgets",
+                "trusted_utterance": "create me a SaaS called widgets",
+                "status": JobStatus.AWAITING_USER.value,
+                "created_at": 1,
+                "updated_at": 10,
+                "delivered": True,
+                "question": pending.text,
+                "result": pending.text,
+                "clarification_kind": pending.owner,
+                "turn": 1,
+                "turn_token": pending.origin.turn_token,
+                "voice_question": pending.to_dict(),
+                "grouped_repository_candidates": [candidate] if candidate else [],
+            }
+        )
+    )
+
+
 def _repo_create_org_awaiting(store: JobStore) -> CursorJob:
     pending = replace(
         _question(),
@@ -817,6 +850,96 @@ def test_only_direct_answer_names_github_repo_create_slug(store: JobStore) -> No
     assert updated.github_repository == "alice/payments"
     assert updated.status == JobStatus.QUEUED
     launch.assert_called_once_with(original.id)
+
+
+def test_yes_does_not_resolve_repository_or_create(store: JobStore) -> None:
+    original = _repository_or_create_awaiting(store)
+    with mock.patch.object(service, "launch_worker") as launch:
+        spoken = service.reply_job(
+            original.id,
+            "yes",
+            trusted_utterance="yes",
+            answer_provenance=AnswerProvenance.USER_VOICE,
+        )
+
+    updated = store.get(original.id)
+    assert updated.status == JobStatus.AWAITING_USER
+    assert updated.clarification_kind == "repository_or_create"
+    assert spoken == original.question
+    assert not updated.github_repo_create_requested
+    launch.assert_not_called()
+
+
+def test_new_repo_from_or_question_requests_create_and_continue(
+    store: JobStore,
+) -> None:
+    original = _repository_or_create_awaiting(store)
+    with mock.patch.object(service, "launch_worker") as launch:
+        service.reply_job(
+            original.id,
+            "new repo",
+            trusted_utterance="new repo",
+            answer_provenance=AnswerProvenance.USER_VOICE,
+        )
+
+    updated = store.get(original.id)
+    assert updated.status == JobStatus.QUEUED
+    assert updated.github_repo_create_requested
+    assert updated.github_repo_create_continue_workflow
+    launch.assert_called_once_with(original.id)
+
+
+def test_existing_from_or_question_asks_which_repository(
+    store: JobStore,
+) -> None:
+    original = _repository_or_create_awaiting(store)
+    with mock.patch.object(service, "launch_worker") as launch:
+        spoken = service.reply_job(
+            original.id,
+            "existing",
+            trusted_utterance="existing",
+            answer_provenance=AnswerProvenance.USER_VOICE,
+        )
+
+    updated = store.get(original.id)
+    assert updated.status == JobStatus.AWAITING_USER
+    assert updated.clarification_kind == "repository"
+    assert spoken == "Which repository should Cursor use?"
+    assert updated.repository_hint is None
+    launch.assert_not_called()
+
+
+def test_this_one_from_or_question_attaches_candidate(store: JobStore) -> None:
+    original = _repository_or_create_awaiting(store)
+    with mock.patch.object(service, "launch_worker") as launch:
+        service.reply_job(
+            original.id,
+            "this one",
+            trusted_utterance="this one",
+            answer_provenance=AnswerProvenance.USER_VOICE,
+        )
+
+    updated = store.get(original.id)
+    assert updated.status == JobStatus.QUEUED
+    assert updated.repository_hint == "payments"
+    assert not updated.github_repo_create_requested
+    launch.assert_called_once_with(original.id)
+
+
+def test_untrusted_new_repo_does_not_start_create(store: JobStore) -> None:
+    original = _repository_or_create_awaiting(store)
+    with mock.patch.object(service, "launch_worker") as launch:
+        message = service.reply_job(
+            original.id,
+            "new repo",
+            answer_provenance=AnswerProvenance.AUTOMATION,
+        )
+
+    updated = store.get(original.id)
+    assert updated.revision == original.revision
+    assert message is not None
+    assert not updated.github_repo_create_requested
+    launch.assert_not_called()
 
 
 def test_only_direct_answer_names_github_repo_create_org(store: JobStore) -> None:

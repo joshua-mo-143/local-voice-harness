@@ -541,6 +541,53 @@ class CursorRecoveryTests(unittest.TestCase):
         )
         client.submit_repository_creation.assert_not_called()
 
+    def test_reconciles_continue_workflow_repo_creation_without_completing(
+        self,
+    ) -> None:
+        job = self.create(
+            {
+                "id": "123456789abc",
+                "status": "reconciling",
+                "request": "create me a SaaS called widgets",
+                "created_at": 1,
+                "delivered": False,
+                "github_repository": "alice/widgets",
+                "github_repo_create_requested": True,
+                "github_repo_create_continue_workflow": True,
+                "github_repo_create_confirmed": True,
+                "github_repo_create_visibility": "private",
+                "github_repo_create_marker": "a" * 32,
+                "github_repo_create_operation_state": "ambiguous",
+            }
+        )
+        client = mock.Mock(spec=GitHubClient)
+        client.observe_repository_creation.return_value = GitHubRepoCreationResult(
+            GitHubRepository(
+                "alice/widgets",
+                "https://github.com/alice/widgets",
+                True,
+                "main",
+            ),
+            "https://github.com/alice/widgets",
+            "a" * 32,
+        )
+
+        reconcile_uncertain_repo_creation(
+            self.store,
+            job,
+            now=100,
+            github_factory=lambda: client,
+        )
+
+        updated = self.store.get(job.id)
+        self.assertEqual(updated.status, JobStatus.QUEUED)
+        self.assertEqual(
+            updated.github_repo_create_operation_state,
+            "created",
+        )
+        self.assertTrue(updated.github_repo_create_continue_workflow)
+        client.submit_repository_creation.assert_not_called()
+
     def test_unobserved_repo_creation_requires_manual_check(self) -> None:
         job = self.create(
             {

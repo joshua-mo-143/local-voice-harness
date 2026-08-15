@@ -4488,6 +4488,348 @@ class CursorJobStateTests(unittest.TestCase):
         client.choose_or_clone_repository.assert_not_called()
         dispatch.assert_called_once()
 
+    def test_greenfield_without_checkout_asks_new_repo_or_existing(self) -> None:
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "create me a SaaS called widgets",
+                "trusted_utterance": "create me a SaaS called widgets",
+                "status": "queued",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        client = mock.Mock()
+        client.repository_roots.return_value = []
+        client.resolve_repository.return_value = (None, [])
+
+        with mock.patch.object(production_jobs, "HerdrClient", return_value=client):
+            service.run_worker("123456789abc")
+
+        awaiting = jobs.read_job("123456789abc")
+        self.assertEqual(awaiting["status"], "awaiting_user")
+        self.assertEqual(awaiting["clarification_kind"], "repository_or_create")
+        self.assertEqual(
+            awaiting["question"],
+            "New repo, or in an already existing one?",
+        )
+        client.choose_or_clone_repository.assert_not_called()
+        client.ensure_agent.assert_not_called()
+
+    def test_greenfield_with_focused_checkout_asks_using_name_or_create(
+        self,
+    ) -> None:
+        focused = Path("/repos/payments")
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "Can you help me create a todo app called widgets",
+                "trusted_utterance": "Can you help me create a todo app called widgets",
+                "context_repository": "payments",
+                "status": "queued",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        client = mock.Mock()
+        client.repository_roots.return_value = [focused]
+        client.resolve_repository.side_effect = [
+            (None, []),
+            (focused, [focused]),
+        ]
+
+        with mock.patch.object(production_jobs, "HerdrClient", return_value=client):
+            service.run_worker("123456789abc")
+
+        awaiting = jobs.read_job("123456789abc")
+        self.assertEqual(awaiting["status"], "awaiting_user")
+        self.assertEqual(awaiting["clarification_kind"], "repository_or_create")
+        self.assertEqual(
+            awaiting["question"],
+            "Using payments, or create a new repo?",
+        )
+        self.assertEqual(awaiting["grouped_repository_candidates"], ["payments"])
+        client.ensure_agent.assert_not_called()
+
+    def test_in_repo_cue_does_not_offer_create_as_first_question(self) -> None:
+        focused = Path("/repos/payments")
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "create me a SaaS in this repo",
+                "trusted_utterance": "create me a SaaS in this repo",
+                "context_repository": "payments",
+                "status": "queued",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        client = mock.Mock()
+        client.repository_roots.return_value = [focused]
+        client.resolve_repository.side_effect = [
+            (None, []),
+            (focused, [focused]),
+        ]
+
+        with mock.patch.object(production_jobs, "HerdrClient", return_value=client):
+            service.run_worker("123456789abc")
+
+        awaiting = jobs.read_job("123456789abc")
+        self.assertEqual(awaiting["status"], "awaiting_user")
+        self.assertEqual(awaiting["clarification_kind"], "repository")
+        self.assertTrue(
+            str(awaiting["question"]).startswith("Which repository should Cursor use?")
+        )
+        self.assertNotIn("new repo", str(awaiting["question"]).casefold())
+
+    def test_yes_does_not_resolve_checkout_or_new_question(self) -> None:
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "create me a SaaS called widgets",
+                "trusted_utterance": "create me a SaaS called widgets",
+                "status": "queued",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        client = mock.Mock()
+        client.repository_roots.return_value = []
+        client.resolve_repository.return_value = (None, [])
+
+        with mock.patch.object(production_jobs, "HerdrClient", return_value=client):
+            service.run_worker("123456789abc")
+        with mock.patch.object(
+            service, "_dispatch_waiting_jobs", return_value=frozenset()
+        ):
+            spoken = service.reply_job(
+                "123456789abc",
+                "yes",
+                trusted_utterance="yes",
+            )
+
+        updated = jobs.read_job("123456789abc")
+        self.assertEqual(updated["status"], "awaiting_user")
+        self.assertEqual(updated["clarification_kind"], "repository_or_create")
+        self.assertEqual(
+            spoken,
+            "New repo, or in an already existing one?",
+        )
+        self.assertFalse(updated.get("github_repo_create_requested"))
+        self.assertIsNone(updated.get("repository_hint"))
+
+    def test_this_one_attaches_focused_checkout_from_or_question(self) -> None:
+        focused = Path("/repos/payments")
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "create me a SaaS called widgets",
+                "trusted_utterance": "create me a SaaS called widgets",
+                "context_repository": "payments",
+                "status": "queued",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        client = mock.Mock()
+        client.repository_roots.return_value = [focused]
+        client.resolve_repository.side_effect = [
+            (None, []),
+            (focused, [focused]),
+        ]
+
+        with mock.patch.object(production_jobs, "HerdrClient", return_value=client):
+            service.run_worker("123456789abc")
+        with mock.patch.object(
+            service, "_dispatch_waiting_jobs", return_value=frozenset()
+        ) as dispatch:
+            service.reply_job(
+                "123456789abc",
+                "this one",
+                trusted_utterance="this one",
+            )
+
+        requeued = jobs.read_job("123456789abc")
+        self.assertEqual(requeued["status"], "queued")
+        self.assertEqual(requeued["repository_hint"], "payments")
+        self.assertFalse(requeued.get("github_repo_create_requested"))
+        dispatch.assert_called_once()
+
+    def test_new_repo_asks_create_private_owner_slug(self) -> None:
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "create me a SaaS called widgets",
+                "trusted_utterance": "create me a SaaS called widgets",
+                "status": "queued",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        client = mock.Mock()
+        client.repository_roots.return_value = []
+        client.resolve_repository.return_value = (None, [])
+        github = mock.Mock()
+        github.authenticated_login.return_value = "alice"
+
+        with mock.patch.object(production_jobs, "HerdrClient", return_value=client):
+            service.run_worker("123456789abc")
+        with mock.patch.object(service, "launch_worker"):
+            service.reply_job(
+                "123456789abc",
+                "new repo",
+                trusted_utterance="new repo",
+            )
+        with (
+            mock.patch.object(jobs, "GitHubClient", return_value=github),
+            mock.patch.object(jobs, "HerdrClient", return_value=client),
+        ):
+            service.run_worker("123456789abc")
+
+        updated = jobs.read_job("123456789abc")
+        self.assertEqual(updated["status"], "awaiting_user")
+        self.assertEqual(
+            updated["clarification_kind"],
+            "github_repo_create_confirmation",
+        )
+        self.assertEqual(updated["question"], "Create private alice/widgets?")
+        self.assertTrue(updated["github_repo_create_requested"])
+        self.assertTrue(updated["github_repo_create_continue_workflow"])
+        github.submit_repository_creation.assert_not_called()
+
+    def test_existing_without_a_name_asks_which_repository(self) -> None:
+        focused = Path("/repos/payments")
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "create me a SaaS called widgets",
+                "trusted_utterance": "create me a SaaS called widgets",
+                "context_repository": "payments",
+                "status": "queued",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        client = mock.Mock()
+        client.repository_roots.return_value = [focused]
+        client.resolve_repository.side_effect = [
+            (None, []),
+            (focused, [focused]),
+        ]
+
+        with mock.patch.object(production_jobs, "HerdrClient", return_value=client):
+            service.run_worker("123456789abc")
+        with mock.patch.object(
+            service, "_dispatch_waiting_jobs", return_value=frozenset()
+        ):
+            spoken = service.reply_job(
+                "123456789abc",
+                "existing",
+                trusted_utterance="existing",
+            )
+
+        updated = jobs.read_job("123456789abc")
+        self.assertEqual(updated["status"], "awaiting_user")
+        self.assertEqual(updated["clarification_kind"], "repository")
+        self.assertEqual(spoken, "Which repository should Cursor use?")
+        self.assertIsNone(updated.get("repository_hint"))
+        self.assertFalse(updated.get("github_repo_create_requested"))
+
+    def test_other_local_repository_name_attaches_from_or_question(self) -> None:
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "create me a SaaS called widgets",
+                "trusted_utterance": "create me a SaaS called widgets",
+                "status": "queued",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        client = mock.Mock()
+        client.repository_roots.return_value = []
+        client.resolve_repository.return_value = (None, [])
+
+        with mock.patch.object(production_jobs, "HerdrClient", return_value=client):
+            service.run_worker("123456789abc")
+        with mock.patch.object(
+            service, "_dispatch_waiting_jobs", return_value=frozenset()
+        ) as dispatch:
+            service.reply_job(
+                "123456789abc",
+                "billing",
+                trusted_utterance="billing",
+            )
+
+        requeued = jobs.read_job("123456789abc")
+        self.assertEqual(requeued["status"], "queued")
+        self.assertEqual(requeued["repository_hint"], "billing")
+        dispatch.assert_called_once()
+
+    def test_confirmed_create_continues_same_job_into_workflow(self) -> None:
+        checkout = Path("/home/test/src/widgets")
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "create me a SaaS called widgets",
+                "trusted_utterance": "create me a SaaS called widgets",
+                "github_repository": "alice/widgets",
+                "github_repo_create_requested": True,
+                "github_repo_create_continue_workflow": True,
+                "github_repo_create_confirmed": True,
+                "github_repo_create_visibility": "private",
+                "github_repo_create_marker": "a" * 32,
+                "github_repo_create_operation_state": "planned",
+                "status": "queued",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        created = GitHubRepoCreationResult(
+            GitHubRepository(
+                "alice/widgets",
+                "https://github.com/alice/widgets",
+                True,
+                "main",
+            ),
+            "https://github.com/alice/widgets",
+            "a" * 32,
+        )
+        github = mock.Mock()
+        github.authenticated_login.return_value = "alice"
+        github.lookup_repository.return_value = None
+        github.submit_repository_creation.return_value = created
+        github.ensure_repository_clone.return_value = checkout
+        client = mock.Mock()
+        client.repository_roots.return_value = [checkout]
+        client.resolve_repository.return_value = (checkout, [checkout])
+        client.ensure_agent.return_value = AgentSelection(
+            "agent",
+            "pane",
+            "workspace",
+            str(checkout),
+            "agent",
+            str(checkout),
+            provider="cursor/herdr",
+            provider_session_id="test-session",
+            state_sequence=7,
+        )
+        configure_tiered_outcomes(client, checkout)
+
+        with (
+            mock.patch.object(jobs, "GitHubClient", return_value=github),
+            mock.patch.object(jobs, "HerdrClient", return_value=client),
+        ):
+            service.run_worker("123456789abc")
+
+        updated = jobs.read_job("123456789abc")
+        self.assertEqual(updated["github_repo_create_operation_state"], "created")
+        self.assertEqual(updated["repository"], str(checkout))
+        self.assertIsNotNone(updated.get("workflow_tier"))
+        github.submit_repository_creation.assert_called_once()
+        github.ensure_repository_clone.assert_called_once()
+        client.ensure_agent.assert_called()
+
     def test_parse_voice_clone_source_accepts_url_and_owner_repo(self) -> None:
         self.assertEqual(
             production_jobs.parse_voice_clone_source(
@@ -4824,6 +5166,32 @@ class CursorJobStateTests(unittest.TestCase):
         )
         self.assertIsNone(
             production_jobs.parse_repo_create_org("create a GitHub repository")
+        )
+        self.assertTrue(
+            production_jobs.is_greenfield_repository_admission("create me a SaaS")
+        )
+        self.assertTrue(
+            production_jobs.is_greenfield_repository_admission(
+                "Can you help me create a todo app"
+            )
+        )
+        self.assertFalse(
+            production_jobs.is_greenfield_repository_admission(
+                "Use Cursor to fix the bug"
+            )
+        )
+        self.assertFalse(
+            production_jobs.is_greenfield_repository_admission(
+                "create me a SaaS in this repo"
+            )
+        )
+        self.assertEqual(
+            production_jobs.checkout_or_new_repository_question("payments"),
+            "Using payments, or create a new repo?",
+        )
+        self.assertEqual(
+            production_jobs.checkout_or_new_repository_question(None),
+            "New repo, or in an already existing one?",
         )
 
     def test_worker_asks_repo_create_confirmation_naming_owner_slug_visibility(

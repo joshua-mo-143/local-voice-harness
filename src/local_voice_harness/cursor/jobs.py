@@ -63,6 +63,8 @@ FORK_CONFIRMATIONS = {
 }
 FORK_REJECTIONS = {"no", "no thanks", "do not", "don't", "cancel", "stop"}
 repository_question = provisioning.repository_question
+checkout_or_new_repository_question = provisioning.checkout_or_new_repository_question
+is_greenfield_repository_admission = provisioning.is_greenfield_repository_admission
 run_claimed_worker = provisioning.run_claimed_worker
 WorkerCancelled = provisioning.WorkerCancelled
 ReservationConflict = provisioning.ReservationConflict
@@ -293,6 +295,8 @@ __all__ = [
     "release_delivery",
     "reply_job",
     "repository_question",
+    "checkout_or_new_repository_question",
+    "is_greenfield_repository_admission",
     "reserved_targets",
     "resolve_job_repository",
     "resolve_manual_reconciliation",

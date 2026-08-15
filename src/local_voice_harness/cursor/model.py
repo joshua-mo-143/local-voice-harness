@@ -208,6 +208,7 @@ _BOOL_FIELDS = frozenset(
         "github_issue_create_confirmed",
         "github_repo_create_requested",
         "github_repo_create_org_requested",
+        "github_repo_create_continue_workflow",
         "github_repo_create_confirmed",
         "linear_ticket_create_requested",
         "linear_ticket_create_confirmed",
@@ -2598,6 +2599,10 @@ class AgentJob:
         return self._boolean_field("github_repo_create_org_requested")
 
     @property
+    def github_repo_create_continue_workflow(self) -> bool:
+        return self._boolean_field("github_repo_create_continue_workflow")
+
+    @property
     def github_repo_create_owner(self) -> str | None:
         return self._optional_string("github_repo_create_owner")
 
@@ -3971,6 +3976,13 @@ class AgentJob:
         ):
             raise JobValidationError(
                 "GitHub organization repository creation requires a creation request"
+            )
+        if (
+            self.github_repo_create_continue_workflow
+            and not self.github_repo_create_requested
+        ):
+            raise JobValidationError(
+                "GitHub repository workflow continuation requires a creation request"
             )
         if self.github_repo_create_visibility is not None and (
             self.github_repo_create_visibility not in {"private", "public"}

@@ -468,6 +468,7 @@ def _build_field_ownership() -> tuple[FieldOwnership, ...]:
                 "github_issue_created_url": CrashKind.IDENTITY,
                 "github_repo_create_requested": CrashKind.CONTENT,
                 "github_repo_create_org_requested": CrashKind.CONTENT,
+                "github_repo_create_continue_workflow": CrashKind.CONTENT,
                 "github_repo_create_owner": CrashKind.IDENTITY,
                 "github_repo_create_confirmed": CrashKind.UNCERTAINTY,
                 "github_repo_create_visibility": CrashKind.CONTENT,
@@ -1412,12 +1413,12 @@ def measured_baseline_counts() -> dict[str, int]:
 # Measured on the #357 baseline checkout. Tests fail if these drift without an
 # intentional inventory update. They are evidence, not an optimization target.
 BASELINE_COUNTS: dict[str, int] = {
-    "persisted_field_names": 226,
-    "named_table_fields": 221,
+    "persisted_field_names": 227,
+    "named_table_fields": 222,
     "import_only_fields": 4,
-    "cursor_job_public_properties": 165,
+    "cursor_job_public_properties": 166,
     "compatibility_adapters": 38,
     "transition_entry_points": 76,
     "duplicate_authorities": 0,
-    "lifecycle_module_lines": 27698,
+    "lifecycle_module_lines": 28021,
 }

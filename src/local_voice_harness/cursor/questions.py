@@ -303,7 +303,9 @@ def _queue_answer(
     clone_confirmed: bool | None = None,
     github_issue_create_confirmed: bool | None = None,
     github_repo_create_confirmed: bool | None = None,
+    github_repo_create_continue_workflow: bool | None = None,
     github_repo_create_owner: str | None = None,
+    github_repo_create_requested: bool | None = None,
     linear_ticket_create_team: str | None = None,
     linear_ticket_create_confirmed: bool | None = None,
     clear_target: bool = False,
@@ -341,10 +343,20 @@ def _queue_answer(
             if github_repo_create_confirmed is None
             else github_repo_create_confirmed
         ),
+        github_repo_create_continue_workflow=(
+            job.github_repo_create_continue_workflow
+            if github_repo_create_continue_workflow is None
+            else github_repo_create_continue_workflow
+        ),
         github_repo_create_owner=(
             job.github_repo_create_owner
             if github_repo_create_owner is None
             else github_repo_create_owner
+        ),
+        github_repo_create_requested=(
+            job.github_repo_create_requested
+            if github_repo_create_requested is None
+            else github_repo_create_requested
         ),
         linear_ticket_create_confirmed=(
             job.linear_ticket_create_confirmed
@@ -401,6 +413,146 @@ def _repository_answer(
             context,
             continuation=False,
             repository_hint=context.text,
+            clear_target=True,
+        ),
+        launch=True,
+    )
+
+
+_NEW_REPO_ANSWERS = frozenset(
+    {
+        "new repo",
+        "new repository",
+        "a new repo",
+        "a new repository",
+        "create a new repo",
+        "create a new repository",
+        "create new repo",
+        "new",
+    }
+)
+_EXISTING_REPO_ANSWERS = frozenset(
+    {
+        "existing",
+        "already existing",
+        "an already existing one",
+        "already existing one",
+        "existing one",
+        "existing repo",
+        "existing repository",
+        "in an already existing one",
+        "in an existing one",
+        "already existing repo",
+    }
+)
+_THIS_CHECKOUT_ANSWERS = frozenset({"this one", "this", "that one", "that"})
+
+
+def _normalize_admission_answer(value: str) -> str:
+    normalized = re.sub(r"[^\w\s]", "", value.casefold())
+    return " ".join(normalized.split())
+
+
+def _repository_or_create_answer(
+    job: CursorJob,
+    question: Question,
+    resolution: AnswerResolution,
+    context: AnswerContext,
+) -> AnswerTransition:
+    if context.trusted_text is None:
+        return AnswerTransition(
+            None,
+            message="Please say the checkout name, this one, new repo, or existing.",
+        )
+    normalized = _normalize_admission_answer(context.trusted_text)
+    if (
+        normalized
+        in {
+            "yes",
+            "yes please",
+            "ok",
+            "okay",
+            "ok then",
+            "okay then",
+            "sure",
+            "confirm",
+            "confirmed",
+            "lgtm",
+            "sounds good",
+        }
+        or _confirmation(normalized) is False
+    ):
+        return AnswerTransition(None, message=question.text)
+    if normalized in _NEW_REPO_ANSWERS:
+        return AnswerTransition(
+            _queue_answer(
+                job,
+                question,
+                resolution,
+                context,
+                continuation=False,
+                clear_target=True,
+                github_repo_create_requested=True,
+                github_repo_create_continue_workflow=True,
+            ),
+            launch=True,
+        )
+    if normalized in _EXISTING_REPO_ANSWERS:
+        return AnswerTransition(
+            ask(
+                job,
+                QuestionSpec("Which repository should Cursor use?"),
+                owner="repository",
+                turn_token=f"{job.id}-repository-{job.revision + 1}",
+                now=context.now,
+                job_changes={
+                    "participant_admission_state": "waiting",
+                    "clarifications": [
+                        *job.clarifications,
+                        _clarification_record(job, question, resolution, context),
+                    ],
+                },
+            ),
+            launch=False,
+            message="Which repository should Cursor use?",
+        )
+    candidates = [
+        str(name).strip()
+        for name in (job.grouped_repository_candidates or ())
+        if str(name).strip()
+    ]
+    candidate_name = candidates[0] if len(candidates) == 1 else None
+    if normalized in _THIS_CHECKOUT_ANSWERS:
+        if not candidate_name:
+            return AnswerTransition(
+                None,
+                message="Which repository should Cursor use?",
+            )
+        return AnswerTransition(
+            _queue_answer(
+                job,
+                question,
+                resolution,
+                context,
+                continuation=False,
+                repository_hint=candidate_name,
+                clear_target=True,
+            ),
+            launch=True,
+        )
+    hint = context.text.strip()
+    if hint.casefold().startswith("use "):
+        hint = hint[4:].strip()
+    if not hint:
+        return AnswerTransition(None, message=question.text)
+    return AnswerTransition(
+        _queue_answer(
+            job,
+            question,
+            resolution,
+            context,
+            continuation=False,
+            repository_hint=hint,
             clear_target=True,
         ),
         launch=True,
@@ -1197,6 +1349,7 @@ def _workflow_plan_auto_offer_answer(
 _ANSWER_HANDLERS: dict[str, AnswerHandler] = {
     "agent": _agent_answer,
     "repository": _repository_answer,
+    "repository_or_create": _repository_or_create_answer,
     "github_repository": _github_repository_answer,
     "fork_confirmation": _fork_confirmation_answer,
     "clone_confirmation": _clone_confirmation_answer,

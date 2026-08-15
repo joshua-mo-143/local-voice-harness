@@ -425,6 +425,51 @@ def repository_question(
     return f"{prefix}Which repository should Cursor use?"
 
 
+_IN_REPO_CUE = re.compile(
+    r"\b(?:in this repo|in this repository|in that repo|in that repository)\b",
+    re.IGNORECASE,
+)
+_GREENFIELD_CREATE_ME = re.compile(
+    r"\b(?:create|build|make|start)\s+me\b",
+    re.IGNORECASE,
+)
+_GREENFIELD_HELP_CREATE = re.compile(
+    r"\bhelp\s+me\s+(?:to\s+)?(?:create|build|make|start)\b",
+    re.IGNORECASE,
+)
+_GREENFIELD_CREATE_PROJECT = re.compile(
+    r"\bcreate\s+(?:a\s+|an\s+)?(?:new\s+)?"
+    r"(?:saas|app|application|project|website|site|startup)\b",
+    re.IGNORECASE,
+)
+_GREENFIELD_EXCLUDED = re.compile(
+    r"\b(?:issue|ticket|pull request|\bpr\b|repo|repository)\b",
+    re.IGNORECASE,
+)
+
+
+def utterance_has_in_repo_cue(value: str) -> bool:
+    return _IN_REPO_CUE.search(value) is not None
+
+
+def is_greenfield_repository_admission(value: str) -> bool:
+    if utterance_has_in_repo_cue(value):
+        return False
+    if _GREENFIELD_EXCLUDED.search(value):
+        return False
+    return (
+        _GREENFIELD_CREATE_ME.search(value) is not None
+        or _GREENFIELD_HELP_CREATE.search(value) is not None
+        or _GREENFIELD_CREATE_PROJECT.search(value) is not None
+    )
+
+
+def checkout_or_new_repository_question(candidate_name: str | None) -> str:
+    if candidate_name:
+        return f"Using {candidate_name}, or create a new repo?"
+    return "New repo, or in an already existing one?"
+
+
 def resolve_job_repository(
     client: HerdrClient,
     job: CursorJob,
@@ -1189,6 +1234,14 @@ def _finish_github_repo_creation(
         if not job.repository:
             raise HarnessError("created GitHub repository clone was not verified")
         now = time.time()
+        if job.github_repo_create_continue_workflow:
+            return job.evolve(
+                github_repository=result.repository.name_with_owner,
+                github_repo_created_url=url,
+                github_repo_create_operation_state="created",
+                repository=job.repository,
+                worker_operation=None,
+            )
         return job.evolve_for_delivery(
             now=now,
             status=JobStatus.COMPLETED,
@@ -1358,11 +1411,14 @@ def _run_github_repo_creation(
         correlation_marker=job.github_repo_create_marker,
     )
     if not job.github_repo_create_confirmed:
+        confirm = f"Create {plan.visibility} {plan.name_with_owner}?"
+        if not job.github_repo_create_continue_workflow:
+            confirm = f"{confirm} Say yes or no."
         _worker_question(
             store,
             job.id,
             token,
-            (f"Create {plan.visibility} {plan.name_with_owner}? Say yes or no."),
+            confirm,
             expected_revision=job.revision,
             clarification_kind="github_repo_create_confirmation",
             sensitivity=QuestionSensitivity.DESTRUCTIVE,
@@ -1406,6 +1462,11 @@ def _run_github_repo_creation(
         )
 
     def mark_submitted(current: CursorJob) -> CursorJob:
+        if current.github_repo_create_continue_workflow:
+            return current.evolve(
+                github_repo_create_operation_state="submitted",
+                worker_operation="github_repo_create",
+            )
         return current.evolve(
             status=JobStatus.RUNNING,
             github_repo_create_operation_state="submitted",
@@ -1455,7 +1516,7 @@ def _run_github_repo_creation(
                 store,
                 job.id,
                 token,
-                {JobStatus.RUNNING},
+                {JobStatus.ROUTING, JobStatus.RUNNING},
                 ambiguous,
                 expected_revision=submitted.revision,
             )
@@ -1479,7 +1540,7 @@ def _run_github_repo_creation(
             store,
             job.id,
             token,
-            {JobStatus.RUNNING},
+            {JobStatus.ROUTING, JobStatus.RUNNING},
             retry_after_start_failure,
             expected_revision=submitted.revision,
         )
@@ -5373,14 +5434,39 @@ def run_claimed_worker(  # pyright: ignore[reportGeneralTypeIssues]
             )
             return
         if job.github_repo_create_requested:
-            _run_github_repo_creation(
-                store,
-                job,
-                worker_token,
-                clients,
-                checkpoint,
-            )
-            return
+            if job.github_repo_create_operation_state != "created":
+                _run_github_repo_creation(
+                    store,
+                    job,
+                    worker_token,
+                    clients,
+                    checkpoint,
+                )
+                job = store.get(job_id)
+            if not (
+                job.github_repo_create_continue_workflow
+                and job.github_repo_create_operation_state == "created"
+            ):
+                return
+            if not job.repository and job.github_repository:
+                github = _github_provider(clients.github)
+                resolved = github.resolve_repository(job.github_repository)
+                checkout = github.materialize_repository(
+                    resolved, checkpoint=checkpoint
+                )
+                cloned = _worker_change(
+                    store,
+                    job_id,
+                    worker_token,
+                    {JobStatus.ROUTING, JobStatus.RUNNING},
+                    lambda current: current.evolve(repository=str(checkout)),
+                    expected_revision=job.revision,
+                )
+                if cloned is None:
+                    return
+                job = cloned
+            if not job.repository:
+                return
         if job.linear_ticket_create_requested:
             _run_linear_ticket_creation(
                 store,
@@ -5741,6 +5827,12 @@ def run_claimed_worker(  # pyright: ignore[reportGeneralTypeIssues]
             hint = (job.repository_hint or "").strip() or None
             issue_key = active_issue_key
             reason = ""
+            if (
+                job.github_repo_create_continue_workflow
+                and job.github_repo_create_operation_state == "created"
+                and job.repository
+            ):
+                repository = Path(job.repository)
             if job.github_pull_request:
                 github_repository = (job.github_repository or "").strip()
                 number = job.github_pull_request
@@ -6008,6 +6100,17 @@ def run_claimed_worker(  # pyright: ignore[reportGeneralTypeIssues]
                     repository, candidates = resolve_job_repository(
                         client, job, repositories
                     )
+                    trusted_admission = (
+                        job.trusted_utterance or job.request or ""
+                    ).strip()
+                    if (
+                        repository is not None
+                        and not hint
+                        and is_greenfield_repository_admission(trusted_admission)
+                    ):
+                        if repository not in candidates:
+                            candidates = [repository, *candidates]
+                        repository = None
                 checkpoint()
             if repository is None:
                 clone_source = (
@@ -6142,6 +6245,31 @@ def run_claimed_worker(  # pyright: ignore[reportGeneralTypeIssues]
                     job = updated
                     repository = checkout
                 if repository is None:
+                    trusted_admission = (
+                        job.trusted_utterance or job.request or ""
+                    ).strip()
+                    if (
+                        is_greenfield_repository_admission(trusted_admission)
+                        and not job.github_repo_create_continue_workflow
+                    ):
+                        candidate_name = (
+                            candidates[0].name if len(candidates) == 1 else None
+                        )
+                        _worker_question(
+                            store,
+                            job_id,
+                            worker_token,
+                            checkout_or_new_repository_question(candidate_name),
+                            expected_revision=job.revision,
+                            clarification_kind="repository_or_create",
+                            job_changes={
+                                "participant_admission_state": "waiting",
+                                "grouped_repository_candidates": (
+                                    [candidate_name] if candidate_name else []
+                                ),
+                            },
+                        )
+                        return
                     shortlist = [path.name for path in candidates]
                     page, _shortlist_rest = repository_name_page(shortlist)
                     remaining_names = [
