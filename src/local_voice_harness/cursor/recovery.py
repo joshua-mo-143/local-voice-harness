@@ -737,6 +737,7 @@ def reconcile_uncertain_repo_creation(
     repository = job.github_repository or ""
     visibility = job.github_repo_create_visibility or ""
     marker = job.github_repo_create_marker
+    github: GitHubProvider | None = None
     try:
         github = _github_provider(github_factory)
         if "/" not in repository or not visibility or not marker:
@@ -787,10 +788,9 @@ def reconcile_uncertain_repo_creation(
         )
 
     recorded = store.update(job.id, record_remote)
-    if (
-        result is None
-        or recorded.github_repo_create_operation_state != "remote_created"
-    ):
+    if result is None or recorded is None or github is None:
+        return
+    if recorded.github_repo_create_operation_state != "remote_created":
         return
     try:
         checkout = github.materialize_repository(result.repository)
