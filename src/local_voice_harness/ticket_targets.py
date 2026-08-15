@@ -550,3 +550,59 @@ def extract_ticket_targets(
         seen.add(key)
         unique.append(candidate)
     return TicketExtraction(tuple(unique), requested_count)
+
+
+_FOCUSED_GITHUB = re.compile(
+    r"^(?P<owner>[A-Za-z0-9](?:[A-Za-z0-9-]{0,38}))/"
+    r"(?P<repo>[A-Za-z0-9_.-]+)#(?P<number>[1-9]\d*)$",
+    re.IGNORECASE,
+)
+_FOCUSED_LINEAR = re.compile(
+    r"^(?P<team>[A-Za-z][A-Za-z0-9]+)-(?P<number>[1-9]\d*)$",
+    re.IGNORECASE,
+)
+
+
+def parse_focused_ticket(focused_issue: str) -> TicketReference | None:
+    """Parse one validated focused GitHub or Linear ticket identity."""
+
+    value = focused_issue.strip()
+    github = _FOCUSED_GITHUB.fullmatch(value)
+    if github is not None:
+        reference = _github_reference(
+            value,
+            0,
+            github.group("owner"),
+            github.group("repo"),
+            github.group("number"),
+        )
+        return reference if reference.canonical is not None else None
+    linear = _FOCUSED_LINEAR.fullmatch(value)
+    if linear is not None:
+        reference = _linear_reference(
+            value,
+            0,
+            linear.group("team"),
+            linear.group("number"),
+        )
+        return reference if reference.canonical is not None else None
+    return None
+
+
+def resolve_named_ticket(
+    extraction: TicketExtraction,
+    *,
+    focused_issue: str | None = None,
+) -> TicketReference | None:
+    """Return one spoken or focused ticket, or None when identity is missing."""
+
+    resolved = [reference for reference in extraction.references if reference.canonical]
+    if extraction.requested_count > 1 or len(resolved) > 1:
+        return None
+    if len(resolved) == 1:
+        return resolved[0]
+    if extraction.requested_count:
+        return None
+    if focused_issue:
+        return parse_focused_ticket(focused_issue)
+    return None

@@ -79,18 +79,22 @@ def _context_for_route(
     integrations: IntegrationRegistry,
 ) -> RequestContext:
     """Capture external context only when the routed action can consume it."""
-    if route.intent == Intent.CONVERSATION or (
-        route.actionable
-        and route.intent
-        in {
-            Intent.AGENT_SUBMIT,
-            Intent.GITHUB_ISSUE_CREATE,
-            Intent.GITHUB_PR_MERGE,
-            Intent.GITHUB_REPO_CREATE,
-            Intent.GITHUB_ORG_REPO_CREATE,
-            Intent.LINEAR_TICKET_CREATE,
-            Intent.WORKSPACE_CONSULTATION,
-        }
+    if (
+        route.intent == Intent.CONVERSATION
+        or (
+            route.actionable
+            and route.intent
+            in {
+                Intent.AGENT_SUBMIT,
+                Intent.GITHUB_ISSUE_CREATE,
+                Intent.GITHUB_PR_MERGE,
+                Intent.GITHUB_REPO_CREATE,
+                Intent.GITHUB_ORG_REPO_CREATE,
+                Intent.LINEAR_TICKET_CREATE,
+                Intent.WORKSPACE_CONSULTATION,
+            }
+        )
+        or cursor_consultation.wants_ticket_consultation_context(text)
     ):
         return request_context(
             text,
@@ -260,6 +264,11 @@ def respond(text: str, *, user_config: UserConfig | None = None) -> None:
                 Intent.AGENT_SUBMIT,
                 Intent.UNCERTAIN,
             }
+            ticket_admission = cursor_consultation.admit_ticket_consultation(
+                text,
+                extraction,
+                focused_issue=context.focused_issue,
+            )
             if cursor_consultation.is_apply_recommendation_request(text):
                 choice_id = (
                     cursor_consultation.applicable_choice_id(
@@ -284,6 +293,32 @@ def respond(text: str, *, user_config: UserConfig | None = None) -> None:
                         delivery_claims=delivery_claims,
                         integrations=integrations,
                     )[0]
+            elif ticket_admission is not None:
+                if ticket_admission.ticket is None:
+                    response = ticket_admission.missing_identity_response
+                else:
+                    try:
+                        client = integrations.herdr_client()
+                        target = cursor_consultation.workspace_target(
+                            client,
+                            focused_repository=context.focused_repository,
+                            completed_job=None,
+                        )
+                        if target is None:
+                            response = cursor_consultation.NO_WORKSPACE
+                        else:
+                            _acknowledge_consultation(speech_renderer, settings)
+                            assert ticket_admission.ticket.canonical is not None
+                            response = cursor_consultation.consult_ticket(
+                                client,
+                                target,
+                                text,
+                                ticket=ticket_admission.ticket.canonical,
+                                kind=ticket_admission.kind,
+                                ticket_context=context.github_issue_context,
+                            )
+                    except Exception:  # noqa: BLE001 - consultation fails closed
+                        response = cursor_consultation.CONSULTATION_FAILED
             elif route.actionable and route.intent == Intent.GITHUB_PR_MERGE:
                 identity = resolve_pull_request_merge_identity(
                     utterance=text,

@@ -164,6 +164,14 @@ class IntentRouterTests(LocalRouterTestCase):
             "Do not use cursor_submit merely because",
             payload["messages"][0]["content"],
         )
+        self.assertIn(
+            "read-only review or summarize of an existing",
+            payload["messages"][0]["content"],
+        )
+        self.assertIn(
+            "Do not use cursor_submit for reviewing or summarizing",
+            payload["messages"][0]["content"],
+        )
         self.assertEqual(payload["temperature"], 0)
         # Reasoning models drop the required ``confidence`` field when the
         # completion budget is too small to finish the forced tool call.

@@ -19,6 +19,8 @@ from local_voice_harness.questions import (
     QuestionOrigin,
     QuestionSensitivity,
 )
+from local_voice_harness.responses import AssistantResponse
+from local_voice_harness.ticket_targets import extract_ticket_targets
 
 
 def _store(tmp_path: Path) -> JobStore:
@@ -677,3 +679,122 @@ def test_acknowledgement_falls_back_when_utterance_is_empty() -> None:
 
     assert response.spoken_text == consultation.ACKNOWLEDGEMENT
     assert response.display_text == consultation.ACKNOWLEDGEMENT
+
+
+def test_ticket_consultation_requires_ticket_noun_or_spoken_identity() -> None:
+    empty = extract_ticket_targets("review this")
+    spoken = extract_ticket_targets("review API-79")
+    ticket = extract_ticket_targets("review this ticket")
+    changes = extract_ticket_targets("review the changes")
+    pull = extract_ticket_targets("review this pull request")
+    adversarial = extract_ticket_targets("adversarially review this ticket")
+
+    assert consultation.ticket_consultation_kind("review this", empty) is None
+    assert consultation.ticket_consultation_kind("review API-79", spoken) == "review"
+    assert (
+        consultation.ticket_consultation_kind("summarize this ticket", ticket)
+        == "summarize"
+    )
+    assert consultation.ticket_consultation_kind("review the changes", changes) is None
+    assert (
+        consultation.ticket_consultation_kind("review this pull request", pull) is None
+    )
+    assert (
+        consultation.ticket_consultation_kind(
+            "adversarially review this ticket", adversarial
+        )
+        is None
+    )
+
+
+def test_ticket_consultation_asks_which_ticket_when_identity_is_missing() -> None:
+    extraction = extract_ticket_targets("review this ticket")
+
+    admission = consultation.admit_ticket_consultation(
+        "review this ticket",
+        extraction,
+        focused_issue=None,
+    )
+
+    assert admission is not None
+    assert admission.ticket is None
+    assert admission.missing_identity_response == "Which ticket should I review?"
+
+
+def test_ticket_consultation_binds_focused_or_spoken_identity() -> None:
+    focused = consultation.admit_ticket_consultation(
+        "review this ticket",
+        extract_ticket_targets("review this ticket"),
+        focused_issue="owner/repo#12",
+    )
+    spoken = consultation.admit_ticket_consultation(
+        "summarize API-79",
+        extract_ticket_targets("summarize API-79"),
+        focused_issue=None,
+    )
+
+    assert focused is not None
+    assert focused.ticket is not None
+    assert focused.ticket.canonical == "owner/repo#12"
+    assert spoken is not None
+    assert spoken.ticket is not None
+    assert spoken.ticket.canonical == "API-79"
+    assert spoken.kind == "summarize"
+
+
+def test_consult_ticket_uses_ask_mode_and_splits_spoken_from_display() -> None:
+    client = mock.Mock()
+    client.workspace_for.return_value = {"workspace_id": "workspace-1"}
+    client.start_fresh_agent.return_value = AgentSelection(
+        "consultant",
+        "pane-2",
+        "workspace-1",
+        "/tmp/project",
+        "consultant",
+    )
+
+    def prompt_and_wait(
+        _target: object,
+        _prompt: str,
+        token: str = "",
+        **_kwargs: object,
+    ) -> PromptOutcome:
+        return PromptOutcome(
+            "done",
+            "Scope is too broad.",
+            None,
+            (
+                f"VOICE_FINDINGS[{token}]: Acceptance criteria mix two children.\n"
+                f"VOICE_SUMMARY[{token}]: Scope is too broad."
+            ),
+        )
+
+    client.prompt_and_wait.side_effect = prompt_and_wait
+    target = consultation.WorkspaceTarget(
+        Path("/tmp/project"),
+        "workspace-1",
+        "project",
+    )
+
+    response = consultation.consult_ticket(
+        client,
+        target,
+        "review this ticket",
+        ticket="owner/repo#12",
+        kind="review",
+        ticket_context="untrusted ticket body",
+    )
+
+    assert response == AssistantResponse(
+        spoken_text="Scope is too broad.",
+        display_text="Acceptance criteria mix two children.",
+    )
+    assert client.start_fresh_agent.call_args.kwargs["mode"] == "ask"
+    prompt = client.prompt_and_wait.call_args.args[1]
+    assert "trusted ticket identity is owner/repo#12" in prompt
+    assert "Do not edit files" in prompt
+    assert "create, update, close, or file GitHub or Linear tickets" in prompt
+    assert "create a new repository" in prompt
+    assert "untrusted ticket body" in prompt
+    assert "VOICE_SUMMARY" in prompt
+    assert "VOICE_FINDINGS" in prompt

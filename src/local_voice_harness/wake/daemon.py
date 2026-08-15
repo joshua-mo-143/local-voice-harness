@@ -2976,6 +2976,7 @@ class WakeConversationDaemon:
                             Intent.WORKSPACE_CONSULTATION,
                         }
                     )
+                    or cursor_consultation.wants_ticket_consultation_context(text)
                 )
             ):
                 context = self._capture_request_context(text)
@@ -3005,6 +3006,11 @@ class WakeConversationDaemon:
                 Intent.AGENT_SUBMIT,
                 Intent.UNCERTAIN,
             }
+            ticket_admission = cursor_consultation.admit_ticket_consultation(
+                text,
+                extraction,
+                focused_issue=context.focused_issue,
+            )
             invalid_target_resolution = (
                 resuming_target_resolution
                 and not _has_exact_target_resolution(extraction, context)
@@ -3053,6 +3059,43 @@ class WakeConversationDaemon:
                     delivery_claims=delivery_claims,
                     integrations=self.integrations,
                 )
+            elif ticket_admission is not None:
+                if ticket_admission.ticket is None:
+                    response = ticket_admission.missing_identity_response
+                    ordinary_reply = True
+                else:
+                    completed_job = None
+                    if active_completed is not None:
+                        try:
+                            completed_job = CURSOR_STORE.get(active_completed.job_id)
+                        except Exception:  # noqa: BLE001 - selection must fail closed
+                            completed_job = None
+                    try:
+                        client = self.integrations.herdr_client()
+                        target = cursor_consultation.workspace_target(
+                            client,
+                            focused_repository=context.focused_repository,
+                            completed_job=completed_job,
+                        )
+                        if target is None:
+                            response = cursor_consultation.NO_WORKSPACE
+                        else:
+                            interruption = self._acknowledge_consultation()
+                            if interruption is not None:
+                                return interruption
+                            assert ticket_admission.ticket.canonical is not None
+                            response = cursor_consultation.consult_ticket(
+                                client,
+                                target,
+                                text,
+                                ticket=ticket_admission.ticket.canonical,
+                                kind=ticket_admission.kind,
+                                ticket_context=context.github_issue_context,
+                            )
+                        ordinary_reply = True
+                    except Exception:  # noqa: BLE001 - consultation fails closed
+                        response = cursor_consultation.CONSULTATION_FAILED
+                        ordinary_reply = True
             elif route.actionable and route.intent == Intent.GITHUB_ISSUE_CREATE:
                 self.completed_followup = None
                 response, next_cursor_session = self._dispatch_cursor_turn(
