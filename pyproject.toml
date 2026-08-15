@@ -92,10 +92,10 @@ reportMissingTypeStubs = false
 [tool.pytest.ini_options]
 minversion = "8.0"
 testpaths = ["tests"]
+faulthandler_timeout = 120
 addopts = [
   "--strict-config",
   "--strict-markers",
-  "--faulthandler-timeout=120",
   "--cov=local_voice_harness",
   "--cov-branch",
   "--cov-fail-under=75",
