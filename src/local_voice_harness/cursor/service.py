@@ -1108,16 +1108,16 @@ def _ticket_start_summary(
 def _queued_accept_response(
     label: str,
     job_id: str,
-    utterance: str,
+    utterance: str | None,
 ) -> AssistantResponse:
     display = f"Cursor job {job_id} was accepted and queued."
-    full = " ".join(utterance.split())
+    full = " ".join((utterance or "").split())
     if full:
         display = f"{display} Request: {full}"
     return AssistantResponse(
         spoken_text=with_spoken_utterance_ack(
             f"Cursor accepted {label} and queued it.",
-            utterance,
+            utterance or "",
         ),
         display_text=display,
     )
@@ -1466,7 +1466,7 @@ def _reply_grouped_repository(
         and on_started
     ):
         on_started()
-    message = _ticket_start_spoken(outcomes, trusted_utterance or text)
+    message = _ticket_start_spoken(outcomes, trusted_utterance)
     if remaining:
         message += (
             f" {_counted(len(remaining), 'ticket')} still needs a repository in "
@@ -2684,7 +2684,7 @@ def cursor_turn(
                 or accepted[0].status == "queued"
             ):
                 return CursorTurnResult(
-                    _ticket_start_summary(outcomes, utterance or text),
+                    _ticket_start_summary(outcomes, utterance),
                     None,
                 )
             assert len(accepted) == 1 and accepted[0].job_id is not None
@@ -2727,7 +2727,7 @@ def cursor_turn(
         if queued.participant_admission_state == "waiting":
             label = inbox.speakable_label_for(queued)
             return CursorTurnResult(
-                _queued_accept_response(label, job_id, utterance or text),
+                _queued_accept_response(label, job_id, utterance),
                 None,
             )
     return _await_foreground(

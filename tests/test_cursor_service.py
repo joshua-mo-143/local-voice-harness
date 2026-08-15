@@ -1213,12 +1213,27 @@ def test_queued_start_speaks_label_not_hex(
 
     response = as_assistant_response(result.text)
     assert job.id not in response.spoken_text
-    assert response.spoken_text == (
-        "Cursor accepted update the readme and queued it for “update the readme.”"
-    )
+    assert response.spoken_text == "Cursor accepted update the readme and queued it."
     assert job.id in response.display_text
-    assert "Request: update the readme" in response.display_text
+    assert "Request:" not in response.display_text
     foreground.assert_not_called()
+
+
+def test_ticket_accept_without_trusted_utterance_is_generic() -> None:
+    response = service._ticket_start_summary(
+        (
+            service.TicketStartOutcome(
+                "example/project#1",
+                "accepted",
+                job_id="123456789abc",
+            ),
+        ),
+        None,
+    )
+
+    assert response.spoken_text == "One job started."
+    assert " for “" not in response.spoken_text
+    assert "Request:" not in response.display_text
 
 
 def test_queued_start_bounds_long_trusted_utterance(

@@ -836,9 +836,7 @@ class AppConsultationTests(unittest.TestCase):
                 [
                     (
                         "play",
-                        consultation.acknowledgement(
-                            "What do you think about this approach?"
-                        ).spoken_text,
+                        consultation.acknowledgement("review this").spoken_text,
                     )
                 ],
             )
@@ -847,6 +845,11 @@ class AppConsultationTests(unittest.TestCase):
 
         with (
             mock.patch.object(app, "start_components"),
+            mock.patch.object(
+                app,
+                "resolve_aliases",
+                return_value="What do you think about this approach?",
+            ),
             mock.patch.object(app, "build_integration_registry", return_value=registry),
             mock.patch.object(app, "request_context", return_value=context),
             mock.patch.object(
@@ -875,7 +878,7 @@ class AppConsultationTests(unittest.TestCase):
                 side_effect=lambda text, **_kwargs: events.append(("play", text)),
             ) as play,
         ):
-            app.respond("What do you think about this approach?")
+            app.respond("review this")
 
         consult.assert_called_once_with(client, target, context.text)
         cursor.assert_not_called()
@@ -883,9 +886,7 @@ class AppConsultationTests(unittest.TestCase):
         self.assertEqual(
             [call.args[0] for call in play.call_args_list],
             [
-                consultation.acknowledgement(
-                    "What do you think about this approach?"
-                ).spoken_text,
+                consultation.acknowledgement("review this").spoken_text,
                 "Use the simpler boundary.",
             ],
         )
