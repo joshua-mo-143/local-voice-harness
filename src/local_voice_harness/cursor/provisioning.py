@@ -1163,7 +1163,7 @@ def _resolve_github_repo_create_owner(
             return None
         named = organizations[0]
     try:
-        return github.require_organization_create_access(named)
+        return github.require_organization_membership(named)
     except GitHubError:
         _complete_github_repo_creation_without_write(
             store,

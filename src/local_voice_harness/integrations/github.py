@@ -834,7 +834,9 @@ class GitHubClient:
             organizations.append(name)
         return tuple(organizations)
 
-    def require_organization_create_access(self, organization: str) -> str:
+    def require_organization_membership(self, organization: str) -> str:
+        """Return the canonical listed membership identity, not write authorization."""
+
         candidate = organization.strip()
         if not re.fullmatch(r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})", candidate):
             raise GitHubError("GitHub organization must be a valid login")
@@ -842,9 +844,7 @@ class GitHubClient:
         for name in organizations:
             if name.casefold() == candidate.casefold():
                 return name
-        raise GitHubError(
-            f"authenticated user cannot create a repository in {candidate}"
-        )
+        raise GitHubError(f"authenticated user is not a listed member of {candidate}")
 
     def prepare_public_fork(self, repository: str) -> tuple[GitHubRepository, str, str]:
         source = self.inspect_public_repository(repository)
@@ -1684,8 +1684,8 @@ class GitHubProvider:
     def list_organizations(self) -> tuple[str, ...]:
         return self._client.list_organizations()
 
-    def require_organization_create_access(self, organization: str) -> str:
-        return self._client.require_organization_create_access(organization)
+    def require_organization_membership(self, organization: str) -> str:
+        return self._client.require_organization_membership(organization)
 
     def materialize_repository(
         self,

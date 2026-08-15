@@ -5151,7 +5151,7 @@ class CursorJobStateTests(unittest.TestCase):
         self.assertNotIn("acme", str(updated["question"]))
         self.assertNotIn("widgets", str(updated["question"]))
         github.submit_repository_creation.assert_not_called()
-        github.require_organization_create_access.assert_not_called()
+        github.require_organization_membership.assert_not_called()
         herdr.assert_not_called()
 
     def test_org_repo_create_uses_sole_organization_when_none_named(self) -> None:
@@ -5173,7 +5173,7 @@ class CursorJobStateTests(unittest.TestCase):
         github = mock.Mock()
         github.authenticated_login.return_value = "alice"
         github.list_organizations.return_value = ("acme",)
-        github.require_organization_create_access.return_value = "acme"
+        github.require_organization_membership.return_value = "acme"
         with mock.patch.object(jobs, "GitHubClient", return_value=github):
             service.run_worker("123456789abc")
 
@@ -5183,7 +5183,7 @@ class CursorJobStateTests(unittest.TestCase):
         )
         self.assertEqual(updated["github_repository"], "acme/payments")
         self.assertIn("Create private acme/payments?", str(updated["question"]))
-        github.require_organization_create_access.assert_called_once_with("acme")
+        github.require_organization_membership.assert_called_once_with("acme")
 
     def test_org_repo_create_uses_spoken_org_not_focused_page(self) -> None:
         jobs.write_job(
@@ -5205,7 +5205,7 @@ class CursorJobStateTests(unittest.TestCase):
         )
         github = mock.Mock()
         github.authenticated_login.return_value = "alice"
-        github.require_organization_create_access.return_value = "acme"
+        github.require_organization_membership.return_value = "acme"
         with mock.patch.object(jobs, "GitHubClient", return_value=github):
             service.run_worker("123456789abc")
 
@@ -5218,7 +5218,7 @@ class CursorJobStateTests(unittest.TestCase):
         self.assertEqual(updated["github_repo_create_visibility"], "private")
         self.assertIn("Create private acme/payments?", str(updated["question"]))
         github.list_organizations.assert_not_called()
-        github.require_organization_create_access.assert_called_once_with("acme")
+        github.require_organization_membership.assert_called_once_with("acme")
         github.submit_repository_creation.assert_not_called()
 
     def test_org_repo_create_does_not_use_untrusted_page_repository(self) -> None:
@@ -5248,7 +5248,7 @@ class CursorJobStateTests(unittest.TestCase):
         updated = jobs.read_job("123456789abc")
         self.assertEqual(updated["clarification_kind"], "github_repo_create_org")
         self.assertEqual(updated["question"], "Which org?")
-        github.require_organization_create_access.assert_not_called()
+        github.require_organization_membership.assert_not_called()
         github.submit_repository_creation.assert_not_called()
 
     def test_org_repo_create_fails_closed_when_user_cannot_create_there(self) -> None:
@@ -5269,8 +5269,8 @@ class CursorJobStateTests(unittest.TestCase):
         )
         github = mock.Mock()
         github.authenticated_login.return_value = "alice"
-        github.require_organization_create_access.side_effect = GitHubError(
-            "authenticated user cannot create a repository in acme"
+        github.require_organization_membership.side_effect = GitHubError(
+            "authenticated user is not a listed member of acme"
         )
         with mock.patch.object(jobs, "GitHubClient", return_value=github):
             service.run_worker("123456789abc")
@@ -5317,7 +5317,7 @@ class CursorJobStateTests(unittest.TestCase):
         )
         github = mock.Mock()
         github.authenticated_login.return_value = "alice"
-        github.require_organization_create_access.return_value = "acme"
+        github.require_organization_membership.return_value = "acme"
         github.lookup_repository.return_value = None
         github.submit_repository_creation.return_value = created
         github.ensure_repository_clone.return_value = Path("/home/test/src/payments")
@@ -5372,7 +5372,7 @@ class CursorJobStateTests(unittest.TestCase):
         )
         github = mock.Mock()
         github.authenticated_login.return_value = "alice"
-        github.require_organization_create_access.return_value = "acme"
+        github.require_organization_membership.return_value = "acme"
         github.lookup_repository.return_value = existing
         github.observe_repository_creation.return_value = None
         with mock.patch.object(jobs, "GitHubClient", return_value=github):
@@ -5410,7 +5410,7 @@ class CursorJobStateTests(unittest.TestCase):
         )
         github = mock.Mock()
         github.authenticated_login.return_value = "alice"
-        github.require_organization_create_access.return_value = "acme"
+        github.require_organization_membership.return_value = "acme"
         github.lookup_repository.return_value = None
         with mock.patch.object(jobs, "GitHubClient", return_value=github):
             try:

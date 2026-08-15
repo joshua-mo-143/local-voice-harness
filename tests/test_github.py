@@ -465,12 +465,12 @@ class GitHubClientTests(unittest.TestCase):
         with mock.patch.object(
             client, "list_organizations", return_value=("acme", "widgets")
         ):
-            self.assertEqual(client.require_organization_create_access("Acme"), "acme")
+            self.assertEqual(client.require_organization_membership("Acme"), "acme")
         with (
             mock.patch.object(client, "list_organizations", return_value=("widgets",)),
-            self.assertRaisesRegex(GitHubError, "cannot create"),
+            self.assertRaisesRegex(GitHubError, "not a listed member"),
         ):
-            client.require_organization_create_access("acme")
+            client.require_organization_membership("acme")
 
     def test_repo_creation_requires_confirmation_before_running(self) -> None:
         client = GitHubClient()
