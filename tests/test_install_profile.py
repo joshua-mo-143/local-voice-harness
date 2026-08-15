@@ -129,8 +129,9 @@ class InstallationProfileDecisionTests(unittest.TestCase):
         installation = (PROJECT_ROOT / "docs/installation.md").read_text()
 
         self.assertIn("local_voice_harness.install_profile", installer)
+        self.assertIn("local_voice_harness.install_distro", installer)
         self.assertIn('--extra "$INSTALL_DICTATION_EXTRA"', installer)
-        self.assertIn("INSTALL_CUDA_PACKAGES", installer)
+        self.assertIn("INSTALL_DISTRO_CUDA_PACKAGES", installer)
         self.assertIn("--profile showcase", installer)
         self.assertIn("PROFILE=showcase", readme)
         self.assertIn("showcase", installation.casefold())

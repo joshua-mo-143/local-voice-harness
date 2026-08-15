@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# One-shot installer for the Local Voice Agent Harness on Arch/CachyOS.
+# One-shot installer for the Local Voice Agent Harness on Arch, Ubuntu, and Fedora.
 #
 # Runs every deterministic setup step (system packages, uv environments, model
 # downloads, service install) and only pauses for interactive logins that are
@@ -14,7 +14,7 @@
 #   LLM_DEVICE          Local LLM compute: auto, cpu, or cuda
 #   TTS_DEVICE          Local TTS compute: auto, cpu, or cuda
 #   DICTATION_DEVICE    Dictation compute: auto, cpu, or cuda
-#   SKIP_SYSTEM_PACKAGES=1   Skip the paru package steps
+#   SKIP_SYSTEM_PACKAGES=1   Skip distro package installation
 #   SKIP_MODELS=1            Skip Qwen/Chatterbox downloads
 #   SKIP_AUTH=1              Skip the interactive gh/cursor/linear logins
 #
@@ -82,16 +82,20 @@ require() {
   return "$missing"
 }
 
-resolve_install_plan() {
-  local python
+installer_python() {
   if have python3; then
-    python=python3
+    printf '%s\n' python3
   elif have python; then
-    python=python
+    printf '%s\n' python
   else
     warn "python3 is required to resolve installation profiles."
     return 1
   fi
+}
+
+resolve_install_plan() {
+  local python
+  python="$(installer_python)" || return 1
   PYTHONPATH="$PROJECT_DIR/src" "$python" -m local_voice_harness.install_profile "$@"
 }
 
@@ -99,6 +103,12 @@ cuda_capability_args() {
   if have nvidia-smi && timeout 10 nvidia-smi >/dev/null 2>&1; then
     printf '%s\n' "--cuda-available"
   fi
+}
+
+resolve_distro_plan() {
+  local python
+  python="$(installer_python)" || return 1
+  PYTHONPATH="$PROJECT_DIR/src" "$python" -m local_voice_harness.install_distro "$@"
 }
 
 while [[ $# -gt 0 ]]; do
@@ -126,10 +136,6 @@ cd "$PROJECT_DIR"
 
 bold "Local Voice Agent Harness installer"
 info "Project directory: $PROJECT_DIR"
-if [[ "$PROJECT_DIR" != "$HOME/local-voice-harness" ]]; then
-  warn "Shipped systemd units assume \$HOME/local-voice-harness."
-  warn "Running from $PROJECT_DIR; adjust units or clone there if services fail."
-fi
 
 step "Selecting AI providers"
 if [[ "${PROFILE,,}" == "showcase" ]]; then
@@ -142,30 +148,71 @@ else
 fi
 mapfile -t CUDA_CAPABILITY_ARGS < <(cuda_capability_args)
 eval "$(resolve_install_plan --format env --profile "$PROFILE" --llm "$LLM_PROVIDER" --tts "$TTS_PROVIDER" --llm-device "${LLM_DEVICE:-}" --tts-device "${TTS_DEVICE:-}" --dictation-device "${DICTATION_DEVICE:-}" "${CUDA_CAPABILITY_ARGS[@]}")"
+eval "$(resolve_distro_plan --format env --checkout "$PROJECT_DIR" --os-release "${OS_RELEASE_PATH:-/etc/os-release}" --profile "$PROFILE" --llm "$LLM_PROVIDER" --tts "$TTS_PROVIDER" --llm-device "${LLM_DEVICE:-}" --tts-device "${TTS_DEVICE:-}" --dictation-device "${DICTATION_DEVICE:-}" --chatterbox-dir "$CHATTERBOX_DIR" "${CUDA_CAPABILITY_ARGS[@]}")"
 LLM_PROVIDER="$INSTALL_LLM_PROVIDER"
 TTS_PROVIDER="$INSTALL_TTS_PROVIDER"
+CHATTERBOX_DIR="$INSTALL_CHATTERBOX_DIR"
 info "Installation profile: $INSTALL_PROFILE"
+info "Distro family: $INSTALL_DISTRO_FAMILY ($INSTALL_PACKAGE_MANAGER)"
 info "LLM provider: $LLM_PROVIDER"
 info "TTS provider: $TTS_PROVIDER"
 info "Dictation extra: $INSTALL_DICTATION_EXTRA ($INSTALL_DICTATION_DEVICE)"
+info "Checkout: $INSTALL_CHECKOUT"
+info "User services: $INSTALL_SYSTEMD_USER_DIR"
+if [[ "$INSTALL_CHECKOUT" != "$HOME/local-voice-harness" && ! -e "$HOME/local-voice-harness" ]]; then
+  ln -sfn "$INSTALL_CHECKOUT" "$HOME/local-voice-harness"
+  info "Linked $HOME/local-voice-harness -> $INSTALL_CHECKOUT for shipped user units"
+fi
 
 # --- 1. System packages -----------------------------------------------------
+install_distro_packages() {
+  local command="$1"
+  shift
+  if [[ $# -eq 0 ]]; then
+    return 0
+  fi
+  # shellcheck disable=SC2086
+  $command "$@"
+}
+
 if [[ "${SKIP_SYSTEM_PACKAGES:-0}" == 1 ]]; then
   step "Skipping system packages (SKIP_SYSTEM_PACKAGES=1)"
-elif have paru; then
-  step "Installing base system packages"
+else
+  PACKAGE_COMMAND="$INSTALL_PACKAGE_COMMAND"
+  if [[ "$INSTALL_DISTRO_FAMILY" == "arch" ]] && ! have paru; then
+    if have pacman; then
+      PACKAGE_COMMAND="sudo pacman -S --needed --noconfirm"
+    else
+      warn "paru or pacman is required on Arch."
+      exit 1
+    fi
+  fi
+  if [[ "$INSTALL_DISTRO_FAMILY" == "debian" ]] && ! have apt-get; then
+    warn "apt-get is required on Ubuntu/Debian."
+    exit 1
+  fi
+  if [[ "$INSTALL_DISTRO_FAMILY" == "fedora" ]] && ! have dnf; then
+    warn "dnf is required on Fedora."
+    exit 1
+  fi
+  step "Installing base system packages ($INSTALL_PACKAGE_MANAGER)"
   # shellcheck disable=SC2086
-  paru -S --needed $INSTALL_SYSTEM_PACKAGES
-  if [[ -n "${INSTALL_CUDA_PACKAGES}" ]]; then
-    step "Installing CUDA and CUDA-enabled llama.cpp"
+  install_distro_packages $PACKAGE_COMMAND $INSTALL_DISTRO_PACKAGES
+  if [[ -n "${INSTALL_DISTRO_CUDA_PACKAGES}" ]]; then
+    step "Installing CUDA packages"
     # shellcheck disable=SC2086
-    paru -S --needed $INSTALL_CUDA_PACKAGES
+    install_distro_packages $PACKAGE_COMMAND $INSTALL_DISTRO_CUDA_PACKAGES
   else
     info "Skipping CUDA and NVIDIA packages ($INSTALL_PROFILE profile)"
   fi
-else
-  warn "paru not found; skipping system packages."
-  warn "Install prerequisites manually (see README) or set SKIP_SYSTEM_PACKAGES=1."
+  if [[ -n "${INSTALL_SKIPPED_PACKAGES}" ]]; then
+    info "Distro packages not mapped and left for manual install: $INSTALL_SKIPPED_PACKAGES"
+  fi
+  if [[ "$INSTALL_UV_BOOTSTRAP" == 1 ]] && ! have uv; then
+    step "Installing uv"
+    curl -LsSf https://astral.sh/uv/install.sh | sh
+    export PATH="$HOME/.local/bin:$PATH"
+  fi
 fi
 
 require uv git curl || {
@@ -176,20 +223,20 @@ require uv git curl || {
 # --- 2. Management / wake environment ---------------------------------------
 step "Syncing management/wake environment (.venv)"
 "$PROJECT_DIR/scripts/sync-wake.sh"
-mkdir -p "$HOME/.local/bin"
-ln -sfn "$PROJECT_DIR/.venv/bin/voice-harness" "$HOME/.local/bin/voice-harness"
-info "Linked voice-harness into ~/.local/bin"
+mkdir -p "$INSTALL_USER_BIN"
+ln -sfn "$PROJECT_DIR/.venv/bin/voice-harness" "$INSTALL_VOICE_HARNESS"
+info "Linked voice-harness into $INSTALL_USER_BIN"
 case ":$PATH:" in
-  *":$HOME/.local/bin:"*) : ;;
-  *) warn "Add \$HOME/.local/bin to your PATH to use the voice-harness command." ;;
+  *":$INSTALL_USER_BIN:"*) : ;;
+  *) warn "Add $INSTALL_USER_BIN to your PATH to use the voice-harness command." ;;
 esac
 
 step "Writing backend configuration"
 if [[ "$INSTALL_PROFILE" == "showcase" ]]; then
   voice-harness setup --profile showcase
 else
-  mkdir -p "$HOME/.config/voice-harness"
-  cat >"$HOME/.config/voice-harness/backends.toml" <<EOF
+  mkdir -p "$INSTALL_CONFIG_DIR"
+  cat >"$INSTALL_CONFIG_DIR/backends.toml" <<EOF
 [llm]
 provider = "$LLM_PROVIDER"
 

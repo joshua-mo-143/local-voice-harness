@@ -53,8 +53,9 @@ profile is a GPU-free Venice LLM/TTS plus CPU dictation path. See the guide for
 [compute requirements](docs/installation.md#compute-requirements) and
 [external prerequisites](docs/installation.md#external-prerequisites).
 
-The supplied systemd units assume the repository is cloned to
-`$HOME/local-voice-harness`.
+The installer supports Arch, Ubuntu/Debian, and Fedora. Shipped systemd units
+resolve through `$HOME/local-voice-harness`; the installer links that path to
+the discovered checkout when needed.
 
 ## Quick start
 

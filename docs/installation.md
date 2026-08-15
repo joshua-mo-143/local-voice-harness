@@ -1,12 +1,15 @@
 # Manual installation
 
 The [Quick start](../README.md#quick-start) path runs `scripts/install.sh`, which
-automates the tested Arch/CachyOS CUDA setup and pauses for interactive choices or
-logins when needed. This document also covers partial setups, CPU dictation,
-troubleshooting, and non-Arch systems.
+supports Arch, Ubuntu/Debian, and Fedora. It installs only the packages required
+by the selected providers, audio stack, and compute profile, then pauses for
+interactive choices or logins when needed. Hosted-only (showcase) installs skip
+CUDA packages and local model downloads on every supported family. Re-running the
+installer is idempotent.
 
-The supplied systemd units assume the repository is cloned to
-`$HOME/local-voice-harness`.
+The installer discovers the checkout, `~/.local/bin`, and the systemd user
+directory from its own path and XDG locations. If the checkout is not
+`$HOME/local-voice-harness`, it creates that symlink so shipped user units resolve.
 
 ## Compute requirements
 
@@ -81,6 +84,14 @@ On Arch/CachyOS, the base packages are approximately:
 paru -S --needed pipewire libnotify git curl github-cli xdotool xclip \
   wl-clipboard wtype uv libsndfile ffmpeg
 ```
+
+On Ubuntu/Debian, the installer maps those names to `apt-get` packages such as
+`libnotify-bin`, `gh`, `libsecret-tools`, and `gnome-keyring`, and bootstraps
+`uv` when the distro does not package it. On Fedora it uses `dnf` with the
+same mapping (`gh`, `libsecret`, `gnome-keyring`). Hosted-only installs do not
+install CUDA packages on any family. Local CUDA llama.cpp packages remain
+Arch-specific; Ubuntu and Fedora leave `cuda` and `llama.cpp-cuda` for a
+manual llama-server install.
 
 On Arch/CachyOS, install the CUDA-enabled llama.cpp AUR package (it conflicts with
 `llama.cpp-vulkan` and other non-CUDA variants):
