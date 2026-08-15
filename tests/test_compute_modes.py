@@ -132,6 +132,18 @@ class InstallAndDiagnosticComputeTests(unittest.TestCase):
         self.assertEqual(plan.llm_device, "cpu")
         self.assertEqual(plan.tts_device, "cpu")
 
+    def test_cpu_llm_uses_cuda_build_when_another_component_needs_cuda(self) -> None:
+        plan = resolve_installation_plan(
+            llm_provider="local",
+            tts_provider="local",
+            llm_device="cpu",
+            tts_device="cuda",
+            dictation_device="cpu",
+        )
+
+        self.assertNotIn("llama.cpp", plan.system_packages)
+        self.assertIn("llama.cpp-cuda", plan.cuda_packages)
+
     def test_diagnostics_report_configured_and_effective_cpu_modes(self) -> None:
         config = default_user_config()
         snapshot = checks.DiagnosticSnapshot(

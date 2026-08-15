@@ -178,7 +178,9 @@ def resolve_installation_plan(
     cuda_packages = CUDA_PACKAGES if needs_cuda else ()
     venice_packages = VENICE_PACKAGES if "venice" in {llm, tts} else ()
     local_llm_packages = (
-        LOCAL_CPU_LLM_PACKAGES if llm == "local" and llm_compute == "cpu" else ()
+        LOCAL_CPU_LLM_PACKAGES
+        if llm == "local" and llm_compute == "cpu" and not needs_cuda
+        else ()
     )
     install_tts_extra = tts == "local"
     python_extras = ("wake", dictation_extra)
