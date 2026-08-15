@@ -8492,6 +8492,18 @@ class SpokenHoldTests(unittest.TestCase):
         self.assertEqual(daemon.hold_extensions, 0)
         self.assertEqual(daemon.conversation_deadline, 0.0)
 
+    def test_close_pending_capture_resets_hold_extensions(self) -> None:
+        daemon = _bare_daemon()
+        daemon.hold_extensions = wake_daemon.MAX_HOLD_EXTENSIONS
+        daemon.awaiting_followup = True
+        with (
+            mock.patch.object(daemon, "pause_microphone"),
+            mock.patch.object(daemon, "resume_microphone"),
+            mock.patch.object(daemon, "stop_components_when_idle"),
+        ):
+            daemon.close_pending_capture("no recognizable speech")
+        self.assertEqual(daemon.hold_extensions, 0)
+
     def test_control_notice_preserves_active_hold_deadlines(self) -> None:
         daemon = _bare_daemon()
         daemon.awaiting_followup = True
@@ -8936,6 +8948,47 @@ class RetargetPendingQuestionTests(unittest.TestCase):
         cursor_turn.assert_not_called()
         self.assertEqual(daemon.cursor_session, "aaaaaaaaaaaa")
 
+    def test_retarget_clears_stale_readback(self) -> None:
+        daemon = _bare_daemon()
+        daemon.cursor_session = "aaaaaaaaaaaa"
+        target = wake_daemon.CriticalTarget(
+            "github", "example/payments", "42", "submit"
+        )
+        candidate = wake_daemon.new_candidate(
+            wake_daemon.TargetSelection(target, (None,) * 5),
+            origin_turn="turn-1",
+        )
+        daemon.pending_target_readback = wake_daemon.PendingTargetReadback(
+            candidate,
+            wake_daemon._critical_target_request(target),
+        )
+        payments = _named_job(
+            "bbbbbbbbbbbb",
+            "awaiting_user",
+            label="payments",
+            question="Which payments table?",
+        )
+        store = self._store(payments)
+        with (
+            mock.patch.object(wake_daemon, "CURSOR_STORE", store),
+            mock.patch.object(
+                wake_daemon, "transcribe", return_value="talk about the payments issue"
+            ),
+            mock.patch.object(wake_daemon, "start_components"),
+            mock.patch.object(wake_daemon, "cursor_turn") as cursor_turn,
+            mock.patch.object(
+                daemon,
+                "play_response",
+                return_value=({"played_text": "Which payments table?"}, None),
+            ),
+            mock.patch.object(wake_daemon, "notify"),
+        ):
+            daemon.process_utterance(AUDIO_GENERATION, woke=False)
+
+        cursor_turn.assert_not_called()
+        self.assertIsNone(daemon.pending_target_readback)
+        self.assertEqual(daemon.cursor_session, "bbbbbbbbbbbb")
+
     def test_unnamed_yes_still_answers_current_session(self) -> None:
         daemon = _bare_daemon()
         daemon.cursor_session = "aaaaaaaaaaaa"
@@ -9318,6 +9371,52 @@ class ResumeAwaitingJobTests(unittest.TestCase):
         self.assertEqual(request.action, "reply")
         self.assertEqual(request.utterance, "continue with sqlite")
         self.assertEqual(daemon.cursor_session, "aaaaaaaaaaaa")
+
+    def test_continue_work_request_is_not_treated_as_resume(self) -> None:
+        daemon = _bare_daemon()
+        job = _named_job(
+            "aaaaaaaaaaaa",
+            "awaiting_user",
+            label="payments",
+            question="Which payments table?",
+        )
+        store = self._store(job)
+        with (
+            mock.patch.object(wake_daemon, "CURSOR_STORE", store),
+            mock.patch.object(
+                wake_daemon,
+                "transcribe",
+                return_value="continue implementing the feature",
+            ),
+            mock.patch.object(wake_daemon, "start_components"),
+            mock.patch.object(
+                wake_daemon,
+                "request_context",
+                side_effect=lambda text, **_settings: RequestContext(text),
+            ),
+            mock.patch.object(
+                wake_daemon,
+                "route_intent",
+                return_value=IntentRoute(Intent.AGENT_SUBMIT, "high"),
+            ) as route_intent,
+            mock.patch.object(
+                wake_daemon, "cursor_turn", return_value=("started", None)
+            ) as cursor_turn,
+            mock.patch.object(
+                daemon,
+                "play_response",
+                return_value=({"played_text": "started"}, None),
+            ),
+            mock.patch.object(wake_daemon, "notify"),
+        ):
+            daemon.process_utterance(AUDIO_GENERATION, woke=True)
+
+        route_intent.assert_called_once()
+        self.assertEqual(
+            route_intent.call_args.args[0], "continue implementing the feature"
+        )
+        cursor_turn.assert_called_once()
+        self.assertEqual(cursor_turn.call_args.args[0].action, "submit")
 
     def test_protected_confirmation_is_replayed_but_not_approved(self) -> None:
         daemon = _bare_daemon()

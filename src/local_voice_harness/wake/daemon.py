@@ -997,6 +997,7 @@ class WakeConversationDaemon:
         self.pending_spoken_alias = None
         self.conversation_deadline = 0.0
         self.awaiting_followup = False
+        self.hold_extensions = 0
         self.pause_microphone()
         try:
             self.stop_components_when_idle()
@@ -2615,6 +2616,9 @@ class WakeConversationDaemon:
                 ).strip()
                 if reference:
                     terminalize_non_side_effect()
+                    self.pending_target_readback = None
+                    self.pending_target_resolution = None
+                    self.pending_config_change = None
                     return self._speak_control_notice(
                         self._retarget_named_question(reference)
                     )
@@ -2628,7 +2632,14 @@ class WakeConversationDaemon:
                 ).strip()
                 with_prefix = bool(resume.group("with"))
                 handle_resume = True
-                if (
+                if reference and re.search(
+                    r"\b(?:work\s+on|fix|change|update|implement|add|remove|"
+                    r"run|review|inspect|start|create|build|refactor|test)",
+                    reference,
+                    re.IGNORECASE,
+                ):
+                    handle_resume = False
+                elif (
                     with_prefix
                     and reference
                     and self._pending_cursor_question() is not None
@@ -2644,6 +2655,9 @@ class WakeConversationDaemon:
                         handle_resume = False
                 if handle_resume:
                     terminalize_non_side_effect()
+                    self.pending_target_readback = None
+                    self.pending_target_resolution = None
+                    self.pending_config_change = None
                     return self._speak_control_notice(
                         self._resume_awaiting_question(reference or None)
                     )
