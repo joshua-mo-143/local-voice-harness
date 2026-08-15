@@ -1992,17 +1992,17 @@ def recover_jobs(
         def clear_legacy_owner(job: CursorJob) -> CursorJob | None:
             if not has_legacy_worker_claim(job):
                 return None
-            active = job.status in {
+            requeue = job.terminal_intent_status is None and job.status in {
                 JobStatus.QUEUED,
                 JobStatus.ROUTING,
                 JobStatus.RUNNING,
                 JobStatus.RECONCILING,
             }
             return job.evolve(
-                status=JobStatus.QUEUED if active else job.status,
-                queued_at=(job.queued_at or recovered_at) if active else job.queued_at,
+                status=JobStatus.QUEUED if requeue else job.status,
+                queued_at=(job.queued_at or recovered_at) if requeue else job.queued_at,
                 reconcile=bool(
-                    active and (job.herdr_target or job.has_uncertain_operation())
+                    requeue and (job.herdr_target or job.has_uncertain_operation())
                 ),
                 worker_token=None,
                 worker_pid=None,
