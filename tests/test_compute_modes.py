@@ -85,6 +85,12 @@ class LocalLlmComputeTests(unittest.TestCase):
         self.assertEqual(command[command.index("--n-gpu-layers") + 1], "0")
         self.assertNotIn("--device", command)
 
+    def test_cuda_probe_requires_an_exact_device_token(self) -> None:
+        process = mock.Mock(returncode=0, stdout="CUDA10: NVIDIA GPU\n")
+        with mock.patch.object(llm_launcher.subprocess, "run", return_value=process):
+            self.assertFalse(llm_launcher.llama_cuda_available("CUDA1"))
+            self.assertTrue(llm_launcher.llama_cuda_available("CUDA10"))
+
 
 class LocalTtsComputeTests(unittest.TestCase):
     def test_cpu_path_does_not_call_torch_cuda(self) -> None:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -36,7 +37,11 @@ def llama_cuda_available(
         return False
     if process.returncode:
         return False
-    return cuda_device.casefold() in process.stdout.casefold()
+    token = re.compile(
+        rf"(?<![\w.-]){re.escape(cuda_device)}(?![\w.-])",
+        re.IGNORECASE,
+    )
+    return token.search(process.stdout) is not None
 
 
 def resolve_llm_device(
