@@ -1015,7 +1015,7 @@ def test_initialize_adds_missing_quarantine_columns_without_rewriting_rows(
     )
     assert [tuple(row)[:7] + tuple(row)[12:] for row in upgraded] == evidence_before
     assert [tuple(row)[7:12] for row in upgraded] == [
-        (None, None, 0, 0, 0),
+        (None, None, 1, 0, 0),
         (None, None, 0, 0, 0),
     ]
 
@@ -1115,7 +1115,25 @@ def test_legacy_quarantine_survives_startup_import_and_recovery(
 
     store = JobStore(jobs, tmp_path / "legacy")
     recovered = store.get("dddddddddddd")
-    store.create(CursorJob.from_dict(_job("eeeeeeeeeeee", herdr_target="other-agent")))
+    with pytest.raises(
+        JobValidationError,
+        match=r"target reservation 'other-agent'.*cccccccccccc-orphan\.metadata\.json",
+    ):
+        store.create(
+            CursorJob.from_dict(_job("eeeeeeeeeeee", herdr_target="other-agent"))
+        )
+    with pytest.raises(
+        JobValidationError,
+        match=(
+            r"worktree reservation '/tmp/other-worktree'.*"
+            r"cccccccccccc-orphan\.metadata\.json"
+        ),
+    ):
+        store.create(
+            CursorJob.from_dict(
+                _job("ffffffffffff", worktree_path="/tmp/other-worktree")
+            )
+        )
 
     assert recovered.request == "recover after upgrade"
     with sqlite3.connect(store.db_path) as connection:
@@ -1147,7 +1165,7 @@ def test_legacy_quarantine_survives_startup_import_and_recovery(
         4.0,
         None,
         None,
-        0,
+        1,
         0,
         0,
         None,

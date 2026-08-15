@@ -808,9 +808,14 @@ class SQLiteJobDatabase:
                     f'ALTER TABLE "{table}" ADD COLUMN {_column_definition(column)}'
                 )
         definitions = dict(_QUARANTINE_ADDITIVE_COLUMNS)
-        for column in _missing_quarantine_columns(connection):
+        missing_quarantine_columns = _missing_quarantine_columns(connection)
+        for column in missing_quarantine_columns:
             connection.execute(
                 f"ALTER TABLE quarantine ADD COLUMN {definitions[column]}"
+            )
+        if "blocks_all" in missing_quarantine_columns:
+            connection.execute(
+                "UPDATE quarantine SET blocks_all = 1 WHERE resolved_at IS NULL"
             )
         connection.execute(
             """
