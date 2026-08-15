@@ -525,6 +525,59 @@ class ProviderAliasIdentityTests(unittest.TestCase):
             "work on owner/repo and the API-79",
         )
 
+    def test_tagged_alias_load_rejects_source_that_does_not_own_target(self) -> None:
+        store = self._store()
+        mismatches = (
+            ("github", "API-79"),
+            ("github", "help#42"),
+            ("linear", "owner/repo"),
+            ("linear", "owner/repo#35"),
+            ("zendesk", "owner/repo#35"),
+            ("zendesk", "API-79"),
+        )
+        for source, target in mismatches:
+            with self.subTest(source=source, target=target):
+                store.write_text(
+                    json.dumps(
+                        {
+                            "version": 3,
+                            "aliases": [
+                                {
+                                    "phrase": "wrong owner",
+                                    "source": source,
+                                    "target": target,
+                                    "kind": "issue",
+                                }
+                            ],
+                        }
+                    )
+                )
+                with self.assertRaisesRegex(vocabulary.VocabularyError, "does not own"):
+                    vocabulary.load(store)
+
+    def test_tagged_zendesk_alias_loads_when_source_matches_target(self) -> None:
+        store = self._store()
+        store.write_text(
+            json.dumps(
+                {
+                    "version": 3,
+                    "aliases": [
+                        {
+                            "phrase": "the help ticket",
+                            "source": "zendesk",
+                            "target": "Help#42",
+                            "kind": "issue",
+                        }
+                    ],
+                }
+            )
+        )
+        alias = vocabulary.load(store).alias_for("the help ticket")
+        assert alias is not None
+        self.assertEqual(alias.source, "zendesk")
+        self.assertEqual(alias.target, "help#42")
+        self.assertEqual(alias.kind, vocabulary.AliasKind.ISSUE)
+
     def test_voice_add_copies_fragment_source_and_issue_reference(self) -> None:
         store = self._store()
         linear = IntegrationSettings(github_enabled=True, linear_enabled=True)

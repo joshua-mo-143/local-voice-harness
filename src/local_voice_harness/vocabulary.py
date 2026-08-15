@@ -99,6 +99,11 @@ _LINEAR = re.compile(
     r"^(?P<team>[A-Za-z][A-Za-z0-9]+)-(?P<number>[1-9]\d*)$",
     re.IGNORECASE,
 )
+_ZENDESK = re.compile(
+    r"^(?P<subdomain>[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)#"
+    r"(?P<number>\d+)$",
+    re.IGNORECASE,
+)
 
 
 class VocabularyError(HarnessError):
@@ -160,6 +165,20 @@ def _canonical_target(target: str) -> tuple[str, AliasKind]:
 
 def _legacy_alias_source(kind: AliasKind) -> str:
     return "linear" if kind == AliasKind.LINEAR else "github"
+
+
+def _alias_identity(target: str) -> tuple[str, str, AliasKind]:
+    """Infer canonical target, owning source, and kind from target form."""
+
+    try:
+        canonical, kind = _canonical_target(target)
+    except VocabularyError:
+        zendesk = _ZENDESK.fullmatch(target.strip())
+        if zendesk is None:
+            raise
+        subdomain = zendesk.group("subdomain").casefold()
+        return f"{subdomain}#{int(zendesk.group('number'))}", "zendesk", AliasKind.ISSUE
+    return canonical, _legacy_alias_source(kind), kind
 
 
 def _owned_canonical(integration: object, target: str) -> tuple[str, AliasKind] | None:
@@ -548,19 +567,18 @@ def _parse_aliases(value: object) -> tuple[Alias, ...]:
         if not isinstance(phrase_raw, str) or not isinstance(target_raw, str):
             raise VocabularyError("alias 'phrase' and 'target' must be strings")
         phrase = _normalize_phrase(phrase_raw)
+        if not target_raw.strip():
+            raise VocabularyError("alias 'target' must not be empty")
+        target, inferred_source, kind = _alias_identity(target_raw)
         source_raw = record.get("source")
         if isinstance(source_raw, str) and source_raw.strip():
             source = source_raw.strip().casefold()
-            try:
-                target, kind = _canonical_target(target_raw)
-            except VocabularyError as exc:
-                target = target_raw.strip()
-                if not target:
-                    raise VocabularyError("alias 'target' must not be empty") from exc
-                kind = AliasKind.ISSUE
+            if source != inferred_source:
+                raise VocabularyError(
+                    f"alias {phrase!r} source {source!r} does not own {target!r}"
+                )
         else:
-            target, kind = _canonical_target(target_raw)
-            source = _legacy_alias_source(kind)
+            source = inferred_source
         if phrase in seen and seen[phrase] != target:
             raise VocabularyError(
                 f"alias {phrase!r} is ambiguous: it maps to both "
