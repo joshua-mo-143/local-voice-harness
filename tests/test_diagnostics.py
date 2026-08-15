@@ -555,6 +555,30 @@ class PipewireTests(unittest.TestCase):
             results = checks.check_pipewire_devices(snapshot)
         self.assertIs(results[0].severity, Severity.OK)
 
+    def test_missing_configured_dictation_source_is_fatal(self) -> None:
+        snapshot = _snapshot()
+        assert snapshot.config is not None
+        snapshot = checks.DiagnosticSnapshot(
+            config=replace(
+                snapshot.config,
+                dictation=replace(
+                    snapshot.config.dictation,
+                    source="missing-dictation-mic",
+                ),
+            ),
+            registry=snapshot.registry,
+        )
+        with (
+            mock.patch.object(checks, "_which", return_value="/usr/bin/wpctl"),
+            mock.patch.object(
+                checks, "_run", return_value=_completed(0, _WPCTL_STATUS)
+            ),
+        ):
+            results = checks.check_pipewire_devices(snapshot)
+        self.assertIs(results[0].severity, Severity.FATAL)
+        self.assertIn("missing-dictation-mic", results[0].detail)
+        self.assertIn("dictation.source", results[0].suggestion or "")
+
     def test_wpctl_failure_is_fatal(self) -> None:
         with (
             mock.patch.object(checks, "_which", return_value="/usr/bin/wpctl"),

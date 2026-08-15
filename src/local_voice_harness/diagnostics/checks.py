@@ -696,8 +696,12 @@ def check_pipewire_devices(
     resolved = _resolved(snapshot)
     source = resolved.config.audio.source if resolved.config is not None else ""
     sink = resolved.config.audio.sink if resolved.config is not None else ""
+    dictation_source = (
+        resolved.config.dictation.source if resolved.config is not None else ""
+    )
     source_label = source or "PipeWire system default source"
     sink_label = sink or "PipeWire system default sink"
+    dictation_source_label = dictation_source or "PipeWire system default source"
     if _which("wpctl") is None:
         return [
             CheckResult(
@@ -757,6 +761,21 @@ def check_pipewire_devices(
                 suggestion="voice-harness config set audio.source '<PIPEWIRE_SOURCE_NAME>'",
             )
         ]
+    if dictation_source and dictation_source not in {*sources, *filters}:
+        return [
+            CheckResult(
+                name="audio:pipewire",
+                category="audio",
+                severity=Severity.FATAL,
+                detail=(
+                    f"configured dictation source {dictation_source} was not found "
+                    f"among PipeWire sources: {', '.join((*sources, *filters))}"
+                ),
+                suggestion=(
+                    "voice-harness config set dictation.source '<PIPEWIRE_SOURCE_NAME>'"
+                ),
+            )
+        ]
     if sink and sink not in {*sinks, *filters}:
         return [
             CheckResult(
@@ -777,7 +796,8 @@ def check_pipewire_devices(
             severity=Severity.OK,
             detail=(
                 "PipeWire is responding to wpctl; capture uses "
-                f"{source_label}; playback uses {sink_label}"
+                f"{source_label}; dictation uses {dictation_source_label}; "
+                f"playback uses {sink_label}"
             ),
         )
     ]
