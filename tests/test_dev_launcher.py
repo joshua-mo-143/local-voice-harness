@@ -43,13 +43,17 @@ import signal
 import sys
 from pathlib import Path
 
-sys.path.insert(0, os.environ["FAKE_APPLICATION_SOURCE"])
-from local_voice_harness.config import JOB_LOGS_DIR, JOBS_DB
+project = Path(sys.argv[sys.argv.index("--project") + 1]).resolve()
+sys.path.insert(0, str(project / "src"))
+from local_voice_harness import config as application_config
 
 record = {
     "arguments": sys.argv[1:],
-    "jobs_database": str(JOBS_DB),
-    "job_logs_dir": str(JOB_LOGS_DIR),
+    "project": str(project),
+    "application_source": str(Path(application_config.__file__).resolve()),
+    "checkout_marker": getattr(application_config, "CHECKOUT_MARKER", None),
+    "jobs_database": str(application_config.JOBS_DB),
+    "job_logs_dir": str(application_config.JOB_LOGS_DIR),
     "environment": {
         name: os.environ.get(name)
         for name in (
@@ -67,7 +71,6 @@ record = {
 }
 Path(os.environ["FAKE_UV_RECORD"]).write_text(json.dumps(record))
 if os.environ.get("FAKE_UV_RECREATE_ENV") == "1":
-    project = Path(sys.argv[sys.argv.index("--project") + 1])
     environment = Path(
         os.environ.get("UV_PROJECT_ENVIRONMENT", str(project / ".venv"))
     )
@@ -102,7 +105,6 @@ raise SystemExit(int(os.environ.get("FAKE_SYSTEMCTL_EXIT", "3")))
                 "FAKE_SYSTEMCTL_RECORD": str(self.systemctl_record),
                 "FAKE_READY": str(self.ready),
                 "FAKE_SYSTEMCTL_EXIT": "3",
-                "FAKE_APPLICATION_SOURCE": str(PROJECT_ROOT / "src"),
                 "STATE_DIRECTORY": str(
                     self.test_root / "production-state" / "voice-harness"
                 ),
@@ -133,6 +135,27 @@ raise SystemExit(int(os.environ.get("FAKE_SYSTEMCTL_EXIT", "3")))
 
     def _uv_environment(self) -> dict[str, str | None]:
         return cast(dict[str, str | None], self._uv_invocation()["environment"])
+
+    def _write_checkout_application(self, checkout: Path, marker: str) -> Path:
+        package = checkout / "src" / "local_voice_harness"
+        package.mkdir(parents=True)
+        (package / "__init__.py").write_text("")
+        config = package / "config.py"
+        config.write_text(
+            "\n".join(
+                (
+                    "import os",
+                    "from pathlib import Path",
+                    f"CHECKOUT_MARKER = {marker!r}",
+                    'JOBS_DB = Path(os.environ["XDG_STATE_HOME"])',
+                    'JOBS_DB /= "voice-harness/jobs/jobs.sqlite3"',
+                    'JOB_LOGS_DIR = Path(os.environ["VOICE_HARNESS_BRANCH_RUNTIME"])',
+                    'JOB_LOGS_DIR /= "jobs"',
+                    "",
+                )
+            )
+        )
+        return config
 
     def test_text_uses_checkout_with_isolated_homes_and_inherited_overrides(
         self,
@@ -241,11 +264,13 @@ raise SystemExit(int(os.environ.get("FAKE_SYSTEMCTL_EXIT", "3")))
 
     def test_copied_launchers_use_distinct_checkout_databases(self) -> None:
         resolved_databases: list[str] = []
+        application_sources: list[str] = []
 
         for name in ("checkout-one", "checkout-two"):
             checkout = self.test_root / name
             scripts = checkout / "scripts"
             scripts.mkdir(parents=True)
+            config = self._write_checkout_application(checkout, name)
             launcher = scripts / "dev.sh"
             shutil.copy2(LAUNCHER, launcher)
             record = self.test_root / f"{name}-uv.json"
@@ -266,9 +291,17 @@ raise SystemExit(int(os.environ.get("FAKE_SYSTEMCTL_EXIT", "3")))
                 checkout / ".dev" / "state" / "voice-harness" / "jobs" / "jobs.sqlite3"
             )
             self.assertEqual(invocation["jobs_database"], str(expected_database))
+            self.assertEqual(invocation["project"], str(checkout))
+            self.assertEqual(invocation["checkout_marker"], name)
+            self.assertEqual(
+                invocation["application_source"],
+                str(config.resolve()),
+            )
             resolved_databases.append(cast(str, invocation["jobs_database"]))
+            application_sources.append(cast(str, invocation["application_source"]))
 
         self.assertNotEqual(*resolved_databases)
+        self.assertNotEqual(*application_sources)
 
     def test_concurrent_worktree_launchers_isolate_branch_owned_files(self) -> None:
         processes: list[subprocess.Popen[str]] = []
@@ -284,6 +317,7 @@ raise SystemExit(int(os.environ.get("FAKE_SYSTEMCTL_EXIT", "3")))
                 checkout = self.test_root / name
                 scripts = checkout / "scripts"
                 scripts.mkdir(parents=True)
+                self._write_checkout_application(checkout, name)
                 shutil.copy2(LAUNCHER, scripts / "dev.sh")
                 record = self.test_root / f"{name}-uv.json"
                 ready = self.test_root / f"{name}-ready"
@@ -336,6 +370,21 @@ raise SystemExit(int(os.environ.get("FAKE_SYSTEMCTL_EXIT", "3")))
                 for index in range(2)
             ]
             for index, checkout in enumerate(checkouts):
+                other = checkouts[1 - index]
+                self.assertEqual(invocations[index]["project"], str(checkout))
+                self.assertEqual(
+                    invocations[index]["checkout_marker"],
+                    checkout.name,
+                )
+                application_source = cast(str, invocations[index]["application_source"])
+                self.assertTrue(
+                    application_source.startswith(str(checkout / "src")),
+                    application_source,
+                )
+                self.assertFalse(
+                    application_source.startswith(str(other / "src")),
+                    application_source,
+                )
                 self.assertEqual(
                     environments[index]["XDG_RUNTIME_DIR"],
                     str(shared_runtime),
@@ -351,7 +400,6 @@ raise SystemExit(int(os.environ.get("FAKE_SYSTEMCTL_EXIT", "3")))
                 self.assertTrue((checkout / ".dev" / "config").is_dir())
                 self.assertTrue((checkout / ".dev" / "state").is_dir())
                 self.assertTrue((checkout / ".dev" / "runtime").is_dir())
-                other = checkouts[1 - index]
                 for path in owned_roots[index]:
                     self.assertIsNotNone(path)
                     assert path is not None
