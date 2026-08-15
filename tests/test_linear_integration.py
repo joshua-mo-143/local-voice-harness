@@ -519,6 +519,51 @@ class LinearTicketCreationTests(unittest.TestCase):
         self.assertEqual(snapshot.body, "Expected body")
         self.assertIn("read-only", client.prompt_and_wait.call_args.args[1])
 
+    def test_ticket_snapshot_rejects_null_or_non_string_url(self) -> None:
+        for invalid_url in (None, 42):
+            with self.subTest(invalid_url=invalid_url):
+                client = mock.Mock()
+                client.ensure_router.return_value = mock.Mock(target="router")
+
+                def prompt(
+                    _target: str,
+                    _text: str,
+                    *,
+                    token: str,
+                    invalid_url: object = invalid_url,
+                    **_kwargs: object,
+                ) -> mock.Mock:
+                    payload = {
+                        "identifier": "API-42",
+                        "id": "linear-issue-id",
+                        "title": "Expected title",
+                        "description": "Expected body",
+                        "url": invalid_url,
+                        "updatedAt": "2026-08-15T10:00:00Z",
+                        "state": "In Progress",
+                    }
+                    return mock.Mock(
+                        output=(
+                            f"VOICE_LINEAR_SNAPSHOT[{token}]: {json.dumps(payload)}"
+                        )
+                    )
+
+                client.prompt_and_wait.side_effect = prompt
+                with (
+                    tempfile.TemporaryDirectory() as temporary,
+                    mock.patch.object(
+                        linear,
+                        "LINEAR_ROUTER_LOCK",
+                        Path(temporary) / "router.lock",
+                    ),
+                    mock.patch.object(self.integration, "require_capabilities"),
+                    self.assertRaisesRegex(
+                        linear.LinearError,
+                        "invalid ticket snapshot",
+                    ),
+                ):
+                    self.integration.ticket_snapshot(client, "api-42")
+
     def test_submit_requires_confirmation_and_returns_validated_identity(self) -> None:
         client = mock.Mock()
         client.ensure_router.return_value = mock.Mock(target="voice-router")

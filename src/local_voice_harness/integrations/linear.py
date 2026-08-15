@@ -470,6 +470,7 @@ class LinearIntegration:
             or not isinstance(title, str)
             or not title.strip()
             or not isinstance(body, str)
+            or not isinstance(url, str)
             or not isinstance(revision, str)
             or not revision.strip()
             or not isinstance(state, str)
