@@ -196,7 +196,7 @@ def _owned_canonical(integration: object, target: str) -> tuple[str, AliasKind] 
         canonicalize = getattr(integration, canonicalize_name, None)
         canonical = str(canonicalize(target)) if canonicalize is not None else target
         canonical = canonical.strip()
-        if not canonical:
+        if not canonical or not owns(canonical):
             continue
         try:
             canonical, kind = _canonical_target(canonical)
@@ -215,6 +215,7 @@ def resolve_owned_alias_target(
     """Canonicalize ``target`` through one enabled provider ownership hook."""
 
     expected = source.strip().casefold() if source else None
+    owners: list[tuple[str, str, AliasKind]] = []
     for integration in enabled_integrations(integrations):
         name = str(getattr(integration, "name", "")).strip().casefold()
         if not name or (expected is not None and name != expected):
@@ -223,7 +224,11 @@ def resolve_owned_alias_target(
         if owned is None:
             continue
         canonical, kind = owned
-        return canonical, name, kind
+        owners.append((canonical, name, kind))
+    if len(owners) > 1:
+        raise VocabularyError("multiple enabled providers own that alias target")
+    if owners:
+        return owners[0]
     raise VocabularyError("no enabled provider owns that alias target")
 
 
@@ -569,16 +574,19 @@ def _parse_aliases(value: object) -> tuple[Alias, ...]:
         phrase = _normalize_phrase(phrase_raw)
         if not target_raw.strip():
             raise VocabularyError("alias 'target' must not be empty")
-        target, inferred_source, kind = _alias_identity(target_raw)
         source_raw = record.get("source")
         if isinstance(source_raw, str) and source_raw.strip():
             source = source_raw.strip().casefold()
-            if source != inferred_source:
+            target = target_raw.strip()
+            kind_raw = record.get("kind")
+            try:
+                kind = AliasKind(kind_raw)
+            except (TypeError, ValueError) as exc:
                 raise VocabularyError(
-                    f"alias {phrase!r} source {source!r} does not own {target!r}"
-                )
+                    f"alias {phrase!r} has invalid kind {kind_raw!r}"
+                ) from exc
         else:
-            source = inferred_source
+            target, source, kind = _alias_identity(target_raw)
         if phrase in seen and seen[phrase] != target:
             raise VocabularyError(
                 f"alias {phrase!r} is ambiguous: it maps to both "

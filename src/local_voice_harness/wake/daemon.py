@@ -1519,6 +1519,9 @@ class WakeConversationDaemon:
             or job.completed_at != followup.completed_at
         ):
             return None, None, None
+        if job.issue_key:
+            source = job.issue_provider.strip() if job.issue_provider else None
+            return source, None, job.issue_key
         if job.github_repository or job.github_issue:
             repository = job.github_repository
             issue = (
@@ -1527,9 +1530,6 @@ class WakeConversationDaemon:
                 else None
             )
             return "github", repository, issue
-        if job.issue_key:
-            source = job.issue_provider.strip() if job.issue_provider else None
-            return source, None, job.issue_key
         return None, None, None
 
     def _trusted_alias_identity(self) -> tuple[str | None, str | None, str | None]:

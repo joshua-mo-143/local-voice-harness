@@ -525,35 +525,121 @@ class ProviderAliasIdentityTests(unittest.TestCase):
             "work on owner/repo and the API-79",
         )
 
-    def test_tagged_alias_load_rejects_source_that_does_not_own_target(self) -> None:
+    def test_tagged_alias_load_preserves_provider_metadata_without_reparsing(
+        self,
+    ) -> None:
         store = self._store()
-        mismatches = (
-            ("github", "API-79"),
-            ("github", "help#42"),
-            ("linear", "owner/repo"),
-            ("linear", "owner/repo#35"),
-            ("zendesk", "owner/repo#35"),
-            ("zendesk", "API-79"),
-        )
-        for source, target in mismatches:
-            with self.subTest(source=source, target=target):
-                store.write_text(
-                    json.dumps(
+        store.write_text(
+            json.dumps(
+                {
+                    "version": 3,
+                    "aliases": [
                         {
-                            "version": 3,
-                            "aliases": [
-                                {
-                                    "phrase": "wrong owner",
-                                    "source": source,
-                                    "target": target,
-                                    "kind": "issue",
-                                }
-                            ],
+                            "phrase": "future ticket",
+                            "source": "future-provider",
+                            "target": "opaque:v1:42",
+                            "kind": "issue",
                         }
-                    )
-                )
-                with self.assertRaisesRegex(vocabulary.VocabularyError, "does not own"):
-                    vocabulary.load(store)
+                    ],
+                }
+            )
+        )
+        alias = vocabulary.load(store).alias_for("future ticket")
+        assert alias is not None
+        self.assertEqual(alias.source, "future-provider")
+        self.assertEqual(alias.target, "opaque:v1:42")
+        self.assertEqual(alias.kind, vocabulary.AliasKind.ISSUE)
+
+    def test_saved_provider_alias_reloads_without_provider_syntax_knowledge(
+        self,
+    ) -> None:
+        class FutureProvider:
+            name = "future-provider"
+
+            @staticmethod
+            def owns_issue_reference(reference: str) -> bool:
+                return reference.strip().casefold().startswith("opaque:")
+
+            @staticmethod
+            def canonicalize_issue_reference(reference: str) -> str:
+                return reference.strip().casefold()
+
+        store = self._store()
+        with (
+            mock.patch.object(
+                vocabulary,
+                "enabled_integrations",
+                return_value=(FutureProvider(),),
+            ),
+            redirect_stdout(io.StringIO()),
+        ):
+            vocabulary.add_alias("future ticket", "OPAQUE:V1:42", path=store)
+
+        alias = vocabulary.load(store).alias_for("future ticket")
+        assert alias is not None
+        self.assertEqual(alias.source, "future-provider")
+        self.assertEqual(alias.target, "opaque:v1:42")
+        self.assertEqual(alias.kind, vocabulary.AliasKind.ISSUE)
+
+    def test_provider_canonical_value_must_still_be_owned_before_save(self) -> None:
+        class InvalidCanonicalProvider:
+            name = "linear"
+
+            @staticmethod
+            def owns_issue_reference(reference: str) -> bool:
+                return reference == "spoken API zero"
+
+            @staticmethod
+            def canonicalize_issue_reference(_reference: str) -> str:
+                return "API-0"
+
+        store = self._store()
+        with (
+            mock.patch.object(
+                vocabulary,
+                "enabled_integrations",
+                return_value=(InvalidCanonicalProvider(),),
+            ),
+            self.assertRaisesRegex(vocabulary.VocabularyError, "no enabled provider"),
+        ):
+            vocabulary.add_alias("invalid", "spoken API zero", path=store)
+        self.assertEqual(vocabulary.load(store).aliases, ())
+
+    def test_multiple_provider_owners_are_rejected_without_registry_precedence(
+        self,
+    ) -> None:
+        class Provider:
+            def __init__(self, name: str) -> None:
+                self.name = name
+
+            @staticmethod
+            def owns_issue_reference(reference: str) -> bool:
+                return reference == "shared:42"
+
+            @staticmethod
+            def canonicalize_issue_reference(reference: str) -> str:
+                return reference
+
+        providers = (Provider("first"), Provider("second"))
+        with (
+            mock.patch.object(
+                vocabulary,
+                "enabled_integrations",
+                return_value=providers,
+            ),
+            self.assertRaisesRegex(vocabulary.VocabularyError, "multiple enabled"),
+        ):
+            vocabulary.resolve_owned_alias_target("shared:42")
+
+        with mock.patch.object(
+            vocabulary,
+            "enabled_integrations",
+            return_value=providers,
+        ):
+            self.assertEqual(
+                vocabulary.resolve_owned_alias_target("shared:42", source="second"),
+                ("shared:42", "second", vocabulary.AliasKind.ISSUE),
+            )
 
     def test_tagged_zendesk_alias_loads_when_source_matches_target(self) -> None:
         store = self._store()
@@ -575,7 +661,7 @@ class ProviderAliasIdentityTests(unittest.TestCase):
         alias = vocabulary.load(store).alias_for("the help ticket")
         assert alias is not None
         self.assertEqual(alias.source, "zendesk")
-        self.assertEqual(alias.target, "help#42")
+        self.assertEqual(alias.target, "Help#42")
         self.assertEqual(alias.kind, vocabulary.AliasKind.ISSUE)
 
     def test_voice_add_copies_fragment_source_and_issue_reference(self) -> None:

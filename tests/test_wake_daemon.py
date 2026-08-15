@@ -5002,7 +5002,11 @@ class SpokenAliasConversationTests(unittest.TestCase):
         self.assertIsNone(refreshed.existing_target)
 
         second = self._run_turn(daemon, "yes", stored_target="owner/recreated")
-        second["commit"].assert_called_once_with(refreshed, force=False)
+        second["commit"].assert_called_once_with(
+            refreshed,
+            force=False,
+            integrations=daemon.integrations,
+        )
         self.assertIsNone(daemon.pending_spoken_alias)
 
     def test_generic_yes_cannot_skip_replace_confirmation(self) -> None:
@@ -5230,6 +5234,35 @@ class SpokenAliasConversationTests(unittest.TestCase):
         ):
             store.get.return_value = job
             source, repository, issue = daemon._trusted_alias_identity()
+
+        self.assertEqual(source, "linear")
+        self.assertIsNone(repository)
+        self.assertEqual(issue, "API-79")
+
+    def test_just_used_mixed_job_prefers_explicit_provider_identity(self) -> None:
+        daemon = _bare_daemon()
+        daemon.completed_followup = wake_daemon.CompletedFollowup(
+            job_id="aaaaaaaaaaaa",
+            parent_revision=1,
+            completed_at=1.0,
+            expires_at=time.monotonic() + 60,
+        )
+        job = CursorJob.from_dict(
+            {
+                "id": "aaaaaaaaaaaa",
+                "status": "completed",
+                "request": "test",
+                "created_at": 1,
+                "completed_at": 1.0,
+                "issue_key": "API-79",
+                "issue_provider": "linear",
+                "github_repository": "legacy/repo",
+                "github_issue": 42,
+            }
+        )
+        with mock.patch.object(wake_daemon, "CURSOR_STORE") as store:
+            store.get.return_value = job
+            source, repository, issue = daemon._just_used_alias_identity()
 
         self.assertEqual(source, "linear")
         self.assertIsNone(repository)
