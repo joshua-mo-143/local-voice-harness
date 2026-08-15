@@ -45,7 +45,9 @@ from local_voice_harness.integrations.github import (
     GitHubCommandStartError,
     GitHubError,
     GitHubIssue,
+    GitHubIssueCloseResult,
     GitHubIssueCreationResult,
+    GitHubIssueUpdateResult,
     GitHubOperationAmbiguous,
     GitHubPullRequest,
     GitHubPullRequestCreationResult,
@@ -65,7 +67,10 @@ from local_voice_harness.integrations.linear import (
     LinearIssue,
     LinearOperationAmbiguous,
     LinearTeam,
+    LinearTicketCloseResult,
     LinearTicketCreationResult,
+    LinearTicketUpdateResult,
+    LinearWorkflowState,
 )
 from local_voice_harness.linear_ticket_creation import LinearTicketDraft
 from local_voice_harness.local_git import (
@@ -73,7 +78,125 @@ from local_voice_harness.local_git import (
     LocalGitError,
     LocalGitRefChanged,
 )
+from local_voice_harness.ticket_merge import (
+    MergeClosingTicket,
+    TicketMergeDraft,
+    encode_merge_closing,
+    encode_merge_snapshots,
+)
+from local_voice_harness.ticket_snapshot import TicketSnapshot
+from local_voice_harness.ticket_split import (
+    SplitChild,
+    TicketSplitDraft,
+    encode_split_children,
+)
+from local_voice_harness.ticket_update import TicketUpdateDraft
 from tests.support import join_threads
+
+
+def _github_update_snapshot(
+    title: str = "Current title",
+    body: str = "Current body",
+    revision: str = "revision-1",
+) -> TicketSnapshot:
+    return TicketSnapshot(
+        "github",
+        "source/project#12",
+        "https://github.com/source/project/issues/12",
+        title,
+        body,
+        revision,
+        "https://github.com/source/project/issues/12",
+        "OPEN",
+    )
+
+
+def _github_update_details(
+    title: str = "Current title",
+    body: str = "Current body",
+    revision: str = "revision-1",
+) -> dict[str, object]:
+    return {
+        "number": 12,
+        "title": title,
+        "body": body,
+        "updatedAt": revision,
+        "state": "OPEN",
+        "url": "https://github.com/source/project/issues/12",
+    }
+
+
+def _linear_update_snapshot(
+    title: str = "Current title",
+    body: str = "Current body",
+    revision: str = "revision-1",
+) -> TicketSnapshot:
+    return TicketSnapshot(
+        "linear",
+        "API-79",
+        "issue-id-api-79",
+        title,
+        body,
+        revision,
+        "https://linear.app/acme/issue/API-79/current-title",
+        "In Progress",
+    )
+
+
+def _github_merge_snapshots() -> tuple[TicketSnapshot, ...]:
+    return (
+        _github_update_snapshot("Auth", "Handle login.", "revision-12"),
+        TicketSnapshot(
+            "github",
+            "source/project#13",
+            "https://github.com/source/project/issues/13",
+            "Billing",
+            "Handle invoices.",
+            "revision-13",
+            "https://github.com/source/project/issues/13",
+            "OPEN",
+        ),
+    )
+
+
+def _linear_merge_snapshots() -> tuple[TicketSnapshot, ...]:
+    return (
+        _linear_update_snapshot("Auth", "Handle login.", "revision-79"),
+        TicketSnapshot(
+            "linear",
+            "API-80",
+            "issue-id-api-80",
+            "Billing",
+            "Handle invoices.",
+            "revision-80",
+            "https://linear.app/acme/issue/API-80/billing",
+            "In Progress",
+        ),
+    )
+
+
+def _configure_github_merge_snapshots(
+    github: mock.Mock,
+    current: tuple[TicketSnapshot, ...] | None = None,
+) -> None:
+    snapshots = {
+        snapshot.identity: snapshot
+        for snapshot in (current or _github_merge_snapshots())
+    }
+
+    def details(issue: GitHubIssue) -> dict[str, object]:
+        snapshot = snapshots[issue.reference]
+        return {
+            "number": issue.number,
+            "title": snapshot.title,
+            "body": snapshot.body,
+            "updatedAt": snapshot.revision,
+            "state": snapshot.state,
+            "url": snapshot.url,
+        }
+
+    github.issue_details.side_effect = details
+
 
 WORKER = WorkerOwnership("worker", 42, "boot", "start", "test", 1)
 WORKER_2 = WorkerOwnership("worker-2", 43, "boot-2", "start-2", "test", 1)
@@ -4209,6 +4332,2595 @@ class CursorJobStateTests(unittest.TestCase):
         )
         submit.assert_called_once()
 
+    def test_worker_drafts_issue_update_before_requesting_confirmation(self) -> None:
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "update the title of source/project#12",
+                "trusted_utterance": "update the title of source/project#12",
+                "issue_provider": "github",
+                "github_repository": "source/project",
+                "github_issue": 12,
+                "github_issue_update_requested": True,
+                "status": "queued",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        source = GitHubRepository(
+            "source/project",
+            "https://github.com/source/project",
+            False,
+            "main",
+        )
+        github = mock.Mock()
+        github.inspect_repository.return_value = source
+        github.issue_details.return_value = _github_update_details()
+        with (
+            mock.patch.object(jobs, "GitHubClient", return_value=github),
+            mock.patch.object(
+                production_jobs,
+                "draft_ticket_update",
+                return_value=TicketUpdateDraft(
+                    "Fix startup",
+                    "Startup fails after reboot.",
+                ),
+            ),
+        ):
+            service.run_worker("123456789abc")
+
+        updated = jobs.read_job("123456789abc")
+        self.assertEqual(updated["status"], "awaiting_user")
+        self.assertEqual(
+            updated["clarification_kind"],
+            "github_issue_update_confirmation",
+        )
+        self.assertEqual(updated["github_issue_update_title"], "Fix startup")
+        self.assertEqual(updated["github_issue_update_operation_state"], "planned")
+        self.assertIn("source/project#12", str(updated["question"]))
+        self.assertIn("Fix startup", str(updated["question"]))
+        github.submit_issue_update.assert_not_called()
+
+    def test_confirmed_issue_update_completes_without_starting_herdr(self) -> None:
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "update the title of source/project#12",
+                "trusted_utterance": "update the title of source/project#12",
+                "issue_provider": "github",
+                "github_repository": "source/project",
+                "github_issue": 12,
+                "github_issue_update_requested": True,
+                "github_issue_update_confirmed": True,
+                "github_issue_update_title": "Fix startup",
+                "github_issue_update_body": "Startup fails after reboot.",
+                "github_issue_update_base_title": "Old title",
+                "github_issue_update_base_body": "Startup fails after reboot.",
+                "github_issue_update_base_revision": "revision-1",
+                "github_issue_update_marker": "a" * 32,
+                "github_issue_update_operation_state": "planned",
+                "status": "queued",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        source = GitHubRepository(
+            "source/project",
+            "https://github.com/source/project",
+            False,
+            "main",
+        )
+        result = GitHubIssueUpdateResult(
+            GitHubIssue("source", "project", 12),
+            "https://github.com/source/project/issues/12",
+            "Fix startup",
+            "a" * 32,
+        )
+        github = mock.Mock()
+        github.inspect_repository.return_value = source
+        github.issue_details.return_value = _github_update_details(
+            "Old title", "Startup fails after reboot."
+        )
+        github.submit_issue_update.return_value = result
+        herdr = mock.Mock()
+        with (
+            mock.patch.object(jobs, "GitHubClient", return_value=github),
+            mock.patch.object(jobs, "HerdrClient", return_value=herdr),
+        ):
+            service.run_worker("123456789abc")
+
+        updated = jobs.read_job("123456789abc")
+        self.assertEqual(updated["status"], "completed")
+        self.assertEqual(updated["github_issue_update_operation_state"], "created")
+        github.submit_issue_update.assert_called_once()
+        plan = github.submit_issue_update.call_args.args[0]
+        self.assertTrue(plan.update_title)
+        self.assertFalse(plan.update_body)
+        herdr.assert_not_called()
+
+    def test_confirmed_issue_update_reconfirms_after_snapshot_drift(self) -> None:
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "update the title of source/project#12",
+                "trusted_utterance": "update the title of source/project#12",
+                "issue_provider": "github",
+                "github_repository": "source/project",
+                "github_issue": 12,
+                "github_issue_update_requested": True,
+                "github_issue_update_confirmed": True,
+                "github_issue_update_title": "Fix startup",
+                "github_issue_update_body": "Original body",
+                "github_issue_update_base_title": "Old title",
+                "github_issue_update_base_body": "Original body",
+                "github_issue_update_base_revision": "revision-1",
+                "github_issue_update_marker": "a" * 32,
+                "github_issue_update_operation_state": "planned",
+                "status": "queued",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        github = mock.Mock()
+        github.inspect_repository.return_value = GitHubRepository(
+            "source/project",
+            "https://github.com/source/project",
+            False,
+            "main",
+        )
+        github.issue_details.side_effect = [
+            _github_update_details("Old title", "Original body", "revision-1"),
+            _github_update_details(
+                "Old title",
+                "Externally changed body",
+                "revision-2",
+            ),
+        ]
+        with mock.patch.object(jobs, "GitHubClient", return_value=github):
+            service.run_worker("123456789abc")
+
+        updated = jobs.read_job("123456789abc")
+        self.assertEqual(updated["status"], "awaiting_user")
+        self.assertFalse(updated["github_issue_update_confirmed"])
+        self.assertEqual(updated["github_issue_update_body"], "Externally changed body")
+        self.assertEqual(updated["github_issue_update_base_revision"], "revision-2")
+        self.assertIn("Externally changed body", str(updated["question"]))
+        github.submit_issue_update.assert_not_called()
+
+    def test_timed_out_issue_update_is_reconciled_without_resubmission(self) -> None:
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "update the issue",
+                "trusted_utterance": "update the issue",
+                "issue_provider": "github",
+                "github_repository": "source/project",
+                "github_issue": 12,
+                "github_issue_update_requested": True,
+                "github_issue_update_confirmed": True,
+                "github_issue_update_title": "Fix startup",
+                "github_issue_update_body": "Startup fails.",
+                "github_issue_update_base_title": "Old title",
+                "github_issue_update_base_body": "Startup fails.",
+                "github_issue_update_base_revision": "revision-1",
+                "github_issue_update_marker": "a" * 32,
+                "github_issue_update_operation_state": "planned",
+                "status": "queued",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        github = mock.Mock()
+        github.inspect_repository.return_value = GitHubRepository(
+            "source/project",
+            "https://github.com/source/project",
+            False,
+            "main",
+        )
+        github.issue_details.return_value = _github_update_details(
+            "Old title", "Startup fails."
+        )
+        github.submit_issue_update.side_effect = GitHubOperationAmbiguous("timed out")
+        github.observe_issue_update.return_value = None
+        with mock.patch.object(jobs, "GitHubClient", return_value=github):
+            service.run_worker("123456789abc")
+
+        updated = jobs.read_job("123456789abc")
+        self.assertEqual(updated["status"], "queued")
+        self.assertEqual(updated["github_issue_update_operation_state"], "ambiguous")
+        self.assertEqual(github.submit_issue_update.call_count, 1)
+
+    def test_issue_update_start_failure_is_queued_and_retried_after_restart(
+        self,
+    ) -> None:
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "update the issue",
+                "trusted_utterance": "update the issue",
+                "issue_provider": "github",
+                "github_repository": "source/project",
+                "github_issue": 12,
+                "github_issue_update_requested": True,
+                "github_issue_update_confirmed": True,
+                "github_issue_update_title": "Fix startup",
+                "github_issue_update_body": "Startup fails.",
+                "github_issue_update_base_title": "Old title",
+                "github_issue_update_base_body": "Startup fails.",
+                "github_issue_update_base_revision": "revision-1",
+                "github_issue_update_marker": "a" * 32,
+                "github_issue_update_operation_state": "planned",
+                "status": "queued",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        github = mock.Mock()
+        github.inspect_repository.return_value = GitHubRepository(
+            "source/project",
+            "https://github.com/source/project",
+            False,
+            "main",
+        )
+        github.issue_details.return_value = _github_update_details(
+            "Old title", "Startup fails."
+        )
+        result = GitHubIssueUpdateResult(
+            GitHubIssue("source", "project", 12),
+            "https://github.com/source/project/issues/12",
+            "Fix startup",
+            "a" * 32,
+        )
+        github.submit_issue_update.side_effect = [
+            GitHubCommandStartError("missing gh"),
+            result,
+        ]
+        github.observe_issue_update.side_effect = GitHubError("gh still missing")
+        with (
+            mock.patch.object(jobs, "GitHubClient", return_value=github),
+            mock.patch.object(service, "launch_worker") as launch,
+        ):
+            service.run_worker("123456789abc")
+
+        updated = jobs.read_job("123456789abc")
+        self.assertEqual(updated["status"], "queued")
+        self.assertEqual(updated["github_issue_update_operation_state"], "planned")
+        self.assertFalse(updated.get("reconcile", False))
+        self.assertEqual(github.submit_issue_update.call_count, 1)
+        self.assertEqual(github.observe_issue_update.call_count, 1)
+        launch.assert_called_once_with("123456789abc")
+
+        with mock.patch.object(jobs, "GitHubClient", return_value=github):
+            service.run_worker("123456789abc")
+
+        retried = jobs.read_job("123456789abc")
+        self.assertEqual(retried["status"], "completed")
+        self.assertEqual(retried["github_issue_update_operation_state"], "created")
+        self.assertEqual(github.submit_issue_update.call_count, 2)
+        self.assertEqual(github.observe_issue_update.call_count, 1)
+
+    def test_worker_drafts_linear_ticket_update_before_requesting_confirmation(
+        self,
+    ) -> None:
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "update the title of API-79",
+                "trusted_utterance": "update the title of API-79",
+                "issue_provider": "linear",
+                "issue_key": "API-79",
+                "linear_ticket_update_requested": True,
+                "status": "queued",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        provider = linear.LinearIntegration()
+        herdr = mock.Mock()
+        with (
+            mock.patch.object(jobs, "HerdrClient", return_value=herdr),
+            mock.patch.object(
+                production_jobs,
+                "issue_provider",
+                return_value=provider,
+            ),
+            mock.patch.object(
+                provider,
+                "ticket_snapshot",
+                return_value=_linear_update_snapshot(),
+            ),
+            mock.patch.object(
+                production_jobs,
+                "draft_ticket_update",
+                return_value=TicketUpdateDraft(
+                    "Fix startup",
+                    "Startup fails after reboot.",
+                ),
+            ),
+        ):
+            service.run_worker("123456789abc")
+
+        updated = jobs.read_job("123456789abc")
+        self.assertEqual(updated["status"], "awaiting_user")
+        self.assertEqual(
+            updated["clarification_kind"],
+            "linear_ticket_update_confirmation",
+        )
+        self.assertEqual(updated["linear_ticket_update_title"], "Fix startup")
+        self.assertEqual(updated["linear_ticket_update_operation_state"], "planned")
+        self.assertIn("API-79", str(updated["question"]))
+        herdr.ensure_router.assert_not_called()
+
+    def test_worker_says_it_could_not_find_the_linear_ticket_to_update(self) -> None:
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "update the title of API-79",
+                "trusted_utterance": "update the title of API-79",
+                "issue_provider": "linear",
+                "issue_key": "API-79",
+                "linear_ticket_update_requested": True,
+                "status": "queued",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        provider = linear.LinearIntegration()
+        herdr = mock.Mock()
+        with (
+            mock.patch.object(jobs, "HerdrClient", return_value=herdr),
+            mock.patch.object(
+                production_jobs,
+                "issue_provider",
+                return_value=provider,
+            ),
+            mock.patch.object(
+                provider,
+                "ticket_snapshot",
+                side_effect=LinearError("I couldn't find Linear ticket API-79."),
+            ),
+            mock.patch.object(production_jobs, "draft_ticket_update") as draft,
+        ):
+            service.run_worker("123456789abc")
+
+        updated = jobs.read_job("123456789abc")
+        self.assertEqual(updated["status"], "failed")
+        self.assertEqual(updated["result"], "I couldn't find Linear ticket API-79.")
+        draft.assert_not_called()
+        herdr.ensure_router.assert_not_called()
+
+    def test_confirmed_linear_ticket_update_completes(self) -> None:
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "update the title of API-79",
+                "trusted_utterance": "update the title of API-79",
+                "issue_provider": "linear",
+                "issue_key": "API-79",
+                "linear_ticket_update_requested": True,
+                "linear_ticket_update_confirmed": True,
+                "linear_ticket_update_issue_id": "issue-id-api-79",
+                "linear_ticket_update_title": "Fix startup",
+                "linear_ticket_update_description": "Startup fails after reboot.",
+                "linear_ticket_update_base_title": "Old title",
+                "linear_ticket_update_base_description": "Startup fails after reboot.",
+                "linear_ticket_update_base_revision": "revision-1",
+                "linear_ticket_update_marker": "a" * 32,
+                "linear_ticket_update_operation_state": "planned",
+                "status": "queued",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        provider = linear.LinearIntegration()
+        result = LinearTicketUpdateResult(
+            LinearIssue("API-79"),
+            "https://linear.app/acme/issue/API-79/fix-startup",
+            "Fix startup",
+            "a" * 32,
+        )
+        herdr = mock.Mock()
+        snapshot = _linear_update_snapshot("Old title", "Startup fails after reboot.")
+
+        def submit(*_args: object, **kwargs: object) -> LinearTicketUpdateResult:
+            before_submit = kwargs["before_submit"]
+            accepted = kwargs["accepted"]
+            assert callable(before_submit)
+            assert callable(accepted)
+            before_submit("voice-router", "router-session", "prompt-token", 7)
+            accepted()
+            return result
+
+        with (
+            mock.patch.object(jobs, "HerdrClient", return_value=herdr),
+            mock.patch.object(
+                production_jobs,
+                "issue_provider",
+                return_value=provider,
+            ),
+            mock.patch.object(provider, "ticket_snapshot", return_value=snapshot),
+            mock.patch.object(
+                provider,
+                "submit_ticket_update",
+                side_effect=submit,
+            ) as submit,
+            mock.patch.object(
+                provider,
+                "observe_ticket_update",
+                return_value=result,
+            ) as observe,
+        ):
+            service.run_worker("123456789abc")
+
+        updated = jobs.read_job("123456789abc")
+        self.assertEqual(updated["status"], "completed")
+        self.assertEqual(updated["linear_ticket_update_operation_state"], "created")
+        submit.assert_called_once_with(
+            herdr,
+            mock.ANY,
+            confirmed=True,
+            checkpoint=mock.ANY,
+            before_submit=mock.ANY,
+            accepted=mock.ANY,
+        )
+        plan = submit.call_args.args[1]
+        self.assertTrue(plan.update_title)
+        self.assertFalse(plan.update_description)
+        observe.assert_called_once_with(
+            herdr,
+            mock.ANY,
+            checkpoint=mock.ANY,
+        )
+
+    def test_confirmed_linear_update_reconfirms_after_snapshot_drift(self) -> None:
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "update the title of API-79",
+                "trusted_utterance": "update the title of API-79",
+                "issue_provider": "linear",
+                "issue_key": "API-79",
+                "linear_ticket_update_requested": True,
+                "linear_ticket_update_confirmed": True,
+                "linear_ticket_update_issue_id": "issue-id-api-79",
+                "linear_ticket_update_title": "Fix startup",
+                "linear_ticket_update_description": "Original description",
+                "linear_ticket_update_base_title": "Old title",
+                "linear_ticket_update_base_description": "Original description",
+                "linear_ticket_update_base_revision": "revision-1",
+                "linear_ticket_update_marker": "a" * 32,
+                "linear_ticket_update_operation_state": "planned",
+                "status": "queued",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        provider = linear.LinearIntegration()
+        snapshots = [
+            _linear_update_snapshot(
+                "Old title",
+                "Original description",
+                "revision-1",
+            ),
+            _linear_update_snapshot(
+                "Old title",
+                "Externally changed description",
+                "revision-2",
+            ),
+        ]
+        herdr = mock.Mock()
+        with (
+            mock.patch.object(jobs, "HerdrClient", return_value=herdr),
+            mock.patch.object(
+                production_jobs,
+                "issue_provider",
+                return_value=provider,
+            ),
+            mock.patch.object(provider, "ticket_snapshot", side_effect=snapshots),
+            mock.patch.object(provider, "submit_ticket_update") as submit,
+        ):
+            service.run_worker("123456789abc")
+
+        updated = jobs.read_job("123456789abc")
+        self.assertEqual(updated["status"], "awaiting_user")
+        self.assertFalse(updated["linear_ticket_update_confirmed"])
+        self.assertEqual(
+            updated["linear_ticket_update_description"],
+            "Externally changed description",
+        )
+        self.assertEqual(updated["linear_ticket_update_base_revision"], "revision-2")
+        self.assertIn("Externally changed description", str(updated["question"]))
+        submit.assert_not_called()
+
+    def test_ambiguous_linear_ticket_update_queues_reconciliation(self) -> None:
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "update the Linear ticket",
+                "trusted_utterance": "update the Linear ticket",
+                "issue_provider": "linear",
+                "issue_key": "API-79",
+                "linear_ticket_update_requested": True,
+                "linear_ticket_update_confirmed": True,
+                "linear_ticket_update_issue_id": "issue-id-api-79",
+                "linear_ticket_update_title": "Fix startup",
+                "linear_ticket_update_description": "Startup fails.",
+                "linear_ticket_update_base_title": "Old title",
+                "linear_ticket_update_base_description": "Startup fails.",
+                "linear_ticket_update_base_revision": "revision-1",
+                "linear_ticket_update_marker": "a" * 32,
+                "linear_ticket_update_operation_state": "planned",
+                "status": "queued",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        provider = linear.LinearIntegration()
+        herdr = mock.Mock()
+        snapshot = _linear_update_snapshot("Old title", "Startup fails.")
+
+        def submit(*_args: object, **kwargs: object) -> object:
+            before_submit = kwargs["before_submit"]
+            accepted = kwargs["accepted"]
+            assert callable(before_submit)
+            assert callable(accepted)
+            before_submit("voice-router", "router-session", "prompt-token", 7)
+            accepted()
+            raise LinearOperationAmbiguous("timed out")
+
+        with (
+            mock.patch.object(jobs, "HerdrClient", return_value=herdr),
+            mock.patch.object(
+                production_jobs,
+                "issue_provider",
+                return_value=provider,
+            ),
+            mock.patch.object(provider, "ticket_snapshot", return_value=snapshot),
+            mock.patch.object(
+                provider,
+                "submit_ticket_update",
+                side_effect=submit,
+            ) as submit,
+            mock.patch.object(
+                provider,
+                "observe_ticket_update",
+                return_value=None,
+            ),
+        ):
+            service.run_worker("123456789abc")
+
+        updated = jobs.read_job("123456789abc")
+        self.assertEqual(updated["status"], "queued")
+        self.assertEqual(
+            updated["linear_ticket_update_operation_state"],
+            "ambiguous",
+        )
+        submit.assert_called_once()
+
+    def test_worker_persists_issue_close_before_requesting_confirmation(self) -> None:
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "close source/project#12",
+                "trusted_utterance": "close source/project#12",
+                "issue_provider": "github",
+                "github_repository": "source/project",
+                "github_issue": 12,
+                "github_issue_close_requested": True,
+                "status": "queued",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        source = GitHubRepository(
+            "source/project",
+            "https://github.com/source/project",
+            False,
+            "main",
+        )
+        github = mock.Mock()
+        github.inspect_repository.return_value = source
+        with mock.patch.object(jobs, "GitHubClient", return_value=github):
+            service.run_worker("123456789abc")
+
+        updated = jobs.read_job("123456789abc")
+        self.assertEqual(updated["status"], "awaiting_user")
+        self.assertEqual(
+            updated["clarification_kind"],
+            "github_issue_close_confirmation",
+        )
+        self.assertEqual(updated["github_issue_close_operation_state"], "planned")
+        self.assertIn("source/project#12", str(updated["question"]))
+        github.submit_issue_close.assert_not_called()
+
+    def test_confirmed_issue_close_completes_without_starting_herdr(self) -> None:
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "close source/project#12",
+                "trusted_utterance": "close source/project#12",
+                "issue_provider": "github",
+                "github_repository": "source/project",
+                "github_issue": 12,
+                "github_issue_close_requested": True,
+                "github_issue_close_confirmed": True,
+                "github_issue_close_marker": "a" * 32,
+                "github_issue_close_operation_state": "planned",
+                "status": "queued",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        source = GitHubRepository(
+            "source/project",
+            "https://github.com/source/project",
+            False,
+            "main",
+        )
+        result = GitHubIssueCloseResult(
+            GitHubIssue("source", "project", 12),
+            "https://github.com/source/project/issues/12",
+            "a" * 32,
+        )
+        github = mock.Mock()
+        github.inspect_repository.return_value = source
+        github.submit_issue_close.return_value = result
+        herdr = mock.Mock()
+        with (
+            mock.patch.object(jobs, "GitHubClient", return_value=github),
+            mock.patch.object(jobs, "HerdrClient", return_value=herdr),
+        ):
+            service.run_worker("123456789abc")
+
+        updated = jobs.read_job("123456789abc")
+        self.assertEqual(updated["status"], "completed")
+        self.assertEqual(updated["github_issue_close_operation_state"], "created")
+        github.submit_issue_close.assert_called_once()
+        herdr.assert_not_called()
+
+    def test_timed_out_issue_close_is_reconciled_without_resubmission(self) -> None:
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "close the issue",
+                "trusted_utterance": "close the issue",
+                "issue_provider": "github",
+                "github_repository": "source/project",
+                "github_issue": 12,
+                "github_issue_close_requested": True,
+                "github_issue_close_confirmed": True,
+                "github_issue_close_marker": "a" * 32,
+                "github_issue_close_operation_state": "planned",
+                "status": "queued",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        github = mock.Mock()
+        github.inspect_repository.return_value = GitHubRepository(
+            "source/project",
+            "https://github.com/source/project",
+            False,
+            "main",
+        )
+        github.submit_issue_close.side_effect = GitHubOperationAmbiguous("timed out")
+        github.observe_issue_close.return_value = None
+        with mock.patch.object(jobs, "GitHubClient", return_value=github):
+            service.run_worker("123456789abc")
+
+        updated = jobs.read_job("123456789abc")
+        self.assertEqual(updated["status"], "queued")
+        self.assertEqual(updated["github_issue_close_operation_state"], "ambiguous")
+        self.assertEqual(github.submit_issue_close.call_count, 1)
+
+    def test_issue_close_start_failure_is_queued_and_retried_after_restart(
+        self,
+    ) -> None:
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "close the issue",
+                "trusted_utterance": "close the issue",
+                "issue_provider": "github",
+                "github_repository": "source/project",
+                "github_issue": 12,
+                "github_issue_close_requested": True,
+                "github_issue_close_confirmed": True,
+                "github_issue_close_marker": "a" * 32,
+                "github_issue_close_operation_state": "planned",
+                "status": "queued",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        github = mock.Mock()
+        github.inspect_repository.return_value = GitHubRepository(
+            "source/project",
+            "https://github.com/source/project",
+            False,
+            "main",
+        )
+        result = GitHubIssueCloseResult(
+            GitHubIssue("source", "project", 12),
+            "https://github.com/source/project/issues/12",
+            "a" * 32,
+        )
+        github.submit_issue_close.side_effect = [
+            GitHubCommandStartError("missing gh"),
+            result,
+        ]
+        github.observe_issue_close.side_effect = GitHubError("gh still missing")
+        with (
+            mock.patch.object(jobs, "GitHubClient", return_value=github),
+            mock.patch.object(service, "launch_worker") as launch,
+        ):
+            service.run_worker("123456789abc")
+
+        updated = jobs.read_job("123456789abc")
+        self.assertEqual(updated["status"], "queued")
+        self.assertEqual(updated["github_issue_close_operation_state"], "planned")
+        self.assertFalse(updated.get("reconcile", False))
+        self.assertEqual(github.submit_issue_close.call_count, 1)
+        launch.assert_called_once_with("123456789abc")
+
+        with mock.patch.object(jobs, "GitHubClient", return_value=github):
+            service.run_worker("123456789abc")
+
+        retried = jobs.read_job("123456789abc")
+        self.assertEqual(retried["status"], "completed")
+        self.assertEqual(retried["github_issue_close_operation_state"], "created")
+        self.assertEqual(github.submit_issue_close.call_count, 2)
+
+    def test_worker_persists_linear_ticket_close_before_requesting_confirmation(
+        self,
+    ) -> None:
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "close API-79",
+                "trusted_utterance": "close API-79",
+                "issue_provider": "linear",
+                "issue_key": "API-79",
+                "linear_ticket_close_requested": True,
+                "status": "queued",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        provider = linear.LinearIntegration()
+        herdr = mock.Mock()
+        with (
+            mock.patch.object(jobs, "HerdrClient", return_value=herdr),
+            mock.patch.object(
+                production_jobs,
+                "issue_provider",
+                return_value=provider,
+            ),
+            mock.patch.object(
+                provider,
+                "resolve_issue_for_update",
+                return_value=("issue-id-api-79", LinearIssue("API-79")),
+            ),
+            mock.patch.object(
+                provider,
+                "resolve_terminal_state",
+                return_value=LinearWorkflowState("state-done", "Done", "completed"),
+            ),
+        ):
+            service.run_worker("123456789abc")
+
+        updated = jobs.read_job("123456789abc")
+        self.assertEqual(updated["status"], "awaiting_user")
+        self.assertEqual(
+            updated["clarification_kind"],
+            "linear_ticket_close_confirmation",
+        )
+        self.assertEqual(updated["linear_ticket_close_operation_state"], "planned")
+        self.assertEqual(updated["linear_ticket_close_terminal_state_id"], "state-done")
+        self.assertEqual(updated["linear_ticket_close_terminal_state_name"], "Done")
+        self.assertIn("API-79", str(updated["question"]))
+        self.assertIn("Done", str(updated["question"]))
+        herdr.ensure_router.assert_not_called()
+
+    def test_confirmed_linear_ticket_close_completes(self) -> None:
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "close API-79",
+                "trusted_utterance": "close API-79",
+                "issue_provider": "linear",
+                "issue_key": "API-79",
+                "linear_ticket_close_requested": True,
+                "linear_ticket_close_confirmed": True,
+                "linear_ticket_close_issue_id": "issue-id-api-79",
+                "linear_ticket_close_terminal_state_id": "state-done",
+                "linear_ticket_close_terminal_state_name": "Done",
+                "linear_ticket_close_marker": "a" * 32,
+                "linear_ticket_close_operation_state": "planned",
+                "status": "queued",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        provider = linear.LinearIntegration()
+        result = LinearTicketCloseResult(
+            LinearIssue("API-79"),
+            "https://linear.app/acme/issue/API-79/fix-startup",
+            "a" * 32,
+        )
+        herdr = mock.Mock()
+
+        def submit(*_args: object, **kwargs: object) -> LinearTicketCloseResult:
+            before_submit = kwargs["before_submit"]
+            accepted = kwargs["accepted"]
+            assert callable(before_submit)
+            assert callable(accepted)
+            before_submit("voice-router", "router-session", "prompt-token", 7)
+            accepted()
+            return result
+
+        with (
+            mock.patch.object(jobs, "HerdrClient", return_value=herdr),
+            mock.patch.object(
+                production_jobs,
+                "issue_provider",
+                return_value=provider,
+            ),
+            mock.patch.object(
+                provider,
+                "submit_ticket_close",
+                side_effect=submit,
+            ) as submit,
+            mock.patch.object(
+                provider,
+                "observe_ticket_close",
+                return_value=result,
+            ) as observe,
+        ):
+            service.run_worker("123456789abc")
+
+        updated = jobs.read_job("123456789abc")
+        self.assertEqual(updated["status"], "completed")
+        self.assertEqual(updated["linear_ticket_close_operation_state"], "created")
+        submit.assert_called_once()
+        observe.assert_called_once()
+
+    def test_ambiguous_linear_ticket_close_queues_reconciliation(self) -> None:
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "close the Linear ticket",
+                "trusted_utterance": "close the Linear ticket",
+                "issue_provider": "linear",
+                "issue_key": "API-79",
+                "linear_ticket_close_requested": True,
+                "linear_ticket_close_confirmed": True,
+                "linear_ticket_close_issue_id": "issue-id-api-79",
+                "linear_ticket_close_terminal_state_id": "state-done",
+                "linear_ticket_close_terminal_state_name": "Done",
+                "linear_ticket_close_marker": "a" * 32,
+                "linear_ticket_close_operation_state": "planned",
+                "status": "queued",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        provider = linear.LinearIntegration()
+        herdr = mock.Mock()
+
+        def submit(*_args: object, **kwargs: object) -> object:
+            before_submit = kwargs["before_submit"]
+            accepted = kwargs["accepted"]
+            assert callable(before_submit)
+            assert callable(accepted)
+            before_submit("voice-router", "router-session", "prompt-token", 7)
+            accepted()
+            raise LinearOperationAmbiguous("timed out")
+
+        with (
+            mock.patch.object(jobs, "HerdrClient", return_value=herdr),
+            mock.patch.object(
+                production_jobs,
+                "issue_provider",
+                return_value=provider,
+            ),
+            mock.patch.object(
+                provider,
+                "submit_ticket_close",
+                side_effect=submit,
+            ) as submit,
+            mock.patch.object(
+                provider,
+                "observe_ticket_close",
+                return_value=None,
+            ),
+        ):
+            service.run_worker("123456789abc")
+
+        updated = jobs.read_job("123456789abc")
+        self.assertEqual(updated["status"], "queued")
+        self.assertEqual(
+            updated["linear_ticket_close_operation_state"],
+            "ambiguous",
+        )
+        submit.assert_called_once()
+
+    def test_worker_drafts_issue_split_before_requesting_confirmation(self) -> None:
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "split source/project#12 into two issues",
+                "trusted_utterance": "split source/project#12 into two issues",
+                "issue_provider": "github",
+                "github_repository": "source/project",
+                "github_issue": 12,
+                "github_issue_split_requested": True,
+                "status": "queued",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        source = GitHubRepository(
+            "source/project",
+            "https://github.com/source/project",
+            False,
+            "main",
+        )
+        github = mock.Mock()
+        github.inspect_repository.return_value = source
+        github.issue_details.return_value = _github_update_details()
+        with (
+            mock.patch.object(jobs, "GitHubClient", return_value=github),
+            mock.patch.object(
+                production_jobs,
+                "draft_ticket_split",
+                return_value=TicketSplitDraft(
+                    (
+                        SplitChild("Auth", "Handle login.", "0" * 32),
+                        SplitChild("Billing", "Handle invoices.", "0" * 32),
+                    ),
+                    "close",
+                ),
+            ),
+        ):
+            service.run_worker("123456789abc")
+
+        updated = jobs.read_job("123456789abc")
+        self.assertEqual(updated["status"], "awaiting_user")
+        self.assertEqual(
+            updated["clarification_kind"],
+            "github_issue_split_confirmation",
+        )
+        self.assertEqual(updated["ticket_split_parent_action"], "close")
+        self.assertEqual(updated["ticket_split_operation_state"], "planned")
+        self.assertIn(
+            "Create 2 issues and close source/project#12?", str(updated["question"])
+        )
+        self.assertIn("Auth", str(updated["question"]))
+        github.submit_issue.assert_not_called()
+        github.submit_issue_close.assert_not_called()
+
+    def test_confirmed_issue_split_creates_children_and_closes_parent(self) -> None:
+        children = encode_split_children(
+            (
+                SplitChild("Auth", "Handle login.", "a" * 32),
+                SplitChild("Billing", "Handle invoices.", "b" * 32),
+            )
+        )
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "split source/project#12 into two issues",
+                "trusted_utterance": "split source/project#12 into two issues",
+                "issue_provider": "github",
+                "github_repository": "source/project",
+                "github_issue": 12,
+                "github_issue_split_requested": True,
+                "ticket_split_confirmed": True,
+                "ticket_split_children": children,
+                "ticket_split_parent_action": "close",
+                "ticket_split_parent_marker": "c" * 32,
+                "ticket_split_parent_operation_state": "planned",
+                "ticket_split_operation_state": "planned",
+                "status": "queued",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        source = GitHubRepository(
+            "source/project",
+            "https://github.com/source/project",
+            False,
+            "main",
+        )
+        first = GitHubIssueCreationResult(
+            GitHubIssue("source", "project", 21),
+            "https://github.com/source/project/issues/21",
+            "a" * 32,
+        )
+        second = GitHubIssueCreationResult(
+            GitHubIssue("source", "project", 22),
+            "https://github.com/source/project/issues/22",
+            "b" * 32,
+        )
+        closed = GitHubIssueCloseResult(
+            GitHubIssue("source", "project", 12),
+            "https://github.com/source/project/issues/12",
+            "c" * 32,
+        )
+        github = mock.Mock()
+        github.inspect_repository.return_value = source
+        github.submit_issue.side_effect = [first, second]
+        github.submit_issue_close.return_value = closed
+        herdr = mock.Mock()
+        with (
+            mock.patch.object(jobs, "GitHubClient", return_value=github),
+            mock.patch.object(jobs, "HerdrClient", return_value=herdr),
+        ):
+            service.run_worker("123456789abc")
+
+        updated = jobs.read_job("123456789abc")
+        self.assertEqual(updated["status"], "completed")
+        self.assertIn("source/project#21", str(updated["result"]))
+        self.assertIn("source/project#22", str(updated["result"]))
+        self.assertIn("Closed source/project#12", str(updated["result"]))
+        self.assertEqual(github.submit_issue.call_count, 2)
+        github.submit_issue_close.assert_called_once()
+        herdr.assert_not_called()
+
+    def test_partial_split_failure_does_not_retry_landed_child(self) -> None:
+        children = encode_split_children(
+            (
+                SplitChild("Auth", "Handle login.", "a" * 32),
+                SplitChild("Billing", "Handle invoices.", "b" * 32),
+            )
+        )
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "split the issue",
+                "trusted_utterance": "split the issue",
+                "issue_provider": "github",
+                "github_repository": "source/project",
+                "github_issue": 12,
+                "github_issue_split_requested": True,
+                "ticket_split_confirmed": True,
+                "ticket_split_children": children,
+                "ticket_split_parent_action": "close",
+                "ticket_split_parent_marker": "c" * 32,
+                "ticket_split_parent_operation_state": "planned",
+                "ticket_split_operation_state": "planned",
+                "status": "queued",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        github = mock.Mock()
+        github.inspect_repository.return_value = GitHubRepository(
+            "source/project",
+            "https://github.com/source/project",
+            False,
+            "main",
+        )
+        first = GitHubIssueCreationResult(
+            GitHubIssue("source", "project", 21),
+            "https://github.com/source/project/issues/21",
+            "a" * 32,
+        )
+        github.submit_issue.side_effect = [first, GitHubOperationAmbiguous("timed out")]
+        github.observe_issue.return_value = None
+        with mock.patch.object(jobs, "GitHubClient", return_value=github):
+            service.run_worker("123456789abc")
+
+        updated = jobs.read_job("123456789abc")
+        self.assertEqual(updated["status"], "queued")
+        self.assertEqual(updated["ticket_split_operation_state"], "ambiguous")
+        decoded = json.loads(str(updated["ticket_split_children"]))
+        self.assertEqual(decoded[0]["state"], "created")
+        self.assertEqual(decoded[0]["created_ref"], "source/project#21")
+        self.assertEqual(decoded[1]["state"], "ambiguous")
+        self.assertEqual(github.submit_issue.call_count, 2)
+        github.submit_issue_close.assert_not_called()
+
+        github.submit_issue.reset_mock()
+        github.observe_issue.return_value = None
+        with mock.patch.object(jobs, "GitHubClient", return_value=github):
+            service.run_worker("123456789abc")
+        github.submit_issue.assert_not_called()
+
+    def test_issue_split_start_failure_retries_only_unstarted_child(self) -> None:
+        children = encode_split_children(
+            (
+                SplitChild(
+                    "Auth",
+                    "Handle login.",
+                    "a" * 32,
+                    state="created",
+                    created_ref="source/project#21",
+                    created_url="https://github.com/source/project/issues/21",
+                ),
+                SplitChild("Billing", "Handle invoices.", "b" * 32),
+            )
+        )
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "split the issue",
+                "trusted_utterance": "split the issue",
+                "issue_provider": "github",
+                "github_repository": "source/project",
+                "github_issue": 12,
+                "github_issue_split_requested": True,
+                "ticket_split_confirmed": True,
+                "ticket_split_children": children,
+                "ticket_split_parent_action": "none",
+                "ticket_split_operation_state": "planned",
+                "status": "queued",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        github = mock.Mock()
+        github.inspect_repository.return_value = GitHubRepository(
+            "source/project",
+            "https://github.com/source/project",
+            False,
+            "main",
+        )
+        second = GitHubIssueCreationResult(
+            GitHubIssue("source", "project", 22),
+            "https://github.com/source/project/issues/22",
+            "b" * 32,
+        )
+        github.submit_issue.side_effect = [
+            GitHubCommandStartError("missing gh"),
+            second,
+        ]
+        github.observe_issue.side_effect = GitHubError("gh still missing")
+        with (
+            mock.patch.object(jobs, "GitHubClient", return_value=github),
+            mock.patch.object(service, "launch_worker") as launch,
+        ):
+            service.run_worker("123456789abc")
+
+        updated = jobs.read_job("123456789abc")
+        self.assertEqual(updated["status"], "queued")
+        self.assertEqual(updated["ticket_split_operation_state"], "planned")
+        decoded = json.loads(str(updated["ticket_split_children"]))
+        self.assertEqual(decoded[0]["state"], "created")
+        self.assertEqual(decoded[1]["state"], "planned")
+        self.assertEqual(github.submit_issue.call_count, 1)
+        launch.assert_called_once_with("123456789abc")
+
+        with mock.patch.object(jobs, "GitHubClient", return_value=github):
+            service.run_worker("123456789abc")
+
+        retried = jobs.read_job("123456789abc")
+        self.assertEqual(retried["status"], "completed")
+        self.assertIn("source/project#21", str(retried["result"]))
+        self.assertIn("source/project#22", str(retried["result"]))
+        self.assertEqual(github.submit_issue.call_count, 2)
+
+    def test_worker_drafts_linear_ticket_split_before_requesting_confirmation(
+        self,
+    ) -> None:
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "split API-79 into two tickets",
+                "trusted_utterance": "split API-79 into two tickets",
+                "issue_provider": "linear",
+                "issue_key": "API-79",
+                "linear_ticket_split_requested": True,
+                "status": "queued",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        provider = linear.LinearIntegration()
+        herdr = mock.Mock()
+        with (
+            mock.patch.object(jobs, "HerdrClient", return_value=herdr),
+            mock.patch.object(
+                production_jobs,
+                "issue_provider",
+                return_value=provider,
+            ),
+            mock.patch.object(
+                provider,
+                "resolve_issue_for_update",
+                return_value=("issue-id-api-79", LinearIssue("API-79")),
+            ),
+            mock.patch.object(
+                provider,
+                "resolve_team",
+                return_value=LinearTeam("team-api", "API", "API"),
+            ),
+            mock.patch.object(
+                provider,
+                "ticket_snapshot",
+                return_value=_linear_update_snapshot(),
+            ),
+            mock.patch.object(
+                provider,
+                "resolve_terminal_state",
+                return_value=LinearWorkflowState("state-done", "Done", "completed"),
+            ),
+            mock.patch.object(
+                production_jobs,
+                "draft_ticket_split",
+                return_value=TicketSplitDraft(
+                    (
+                        SplitChild("Auth", "Handle login.", "0" * 32),
+                        SplitChild("Billing", "Handle invoices.", "0" * 32),
+                    ),
+                    "close",
+                ),
+            ),
+        ):
+            service.run_worker("123456789abc")
+
+        updated = jobs.read_job("123456789abc")
+        self.assertEqual(updated["status"], "awaiting_user")
+        self.assertEqual(
+            updated["clarification_kind"],
+            "linear_ticket_split_confirmation",
+        )
+        self.assertEqual(updated["ticket_split_parent_action"], "close")
+        self.assertEqual(updated["ticket_split_parent_terminal_state_name"], "Done")
+        self.assertIn(
+            "Create 2 issues and close API-79 by moving it to Done?",
+            str(updated["question"]),
+        )
+        herdr.ensure_router.assert_not_called()
+
+    def test_confirmed_linear_ticket_split_creates_children_and_closes_parent(
+        self,
+    ) -> None:
+        children = encode_split_children(
+            (
+                SplitChild("Auth", "Handle login.", "a" * 32),
+                SplitChild("Billing", "Handle invoices.", "b" * 32),
+            )
+        )
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "split API-79 into two tickets",
+                "trusted_utterance": "split API-79 into two tickets",
+                "issue_provider": "linear",
+                "issue_key": "API-79",
+                "linear_ticket_split_requested": True,
+                "ticket_split_confirmed": True,
+                "ticket_split_children": children,
+                "ticket_split_parent_action": "close",
+                "ticket_split_parent_marker": "c" * 32,
+                "ticket_split_parent_issue_id": "issue-id-api-79",
+                "ticket_split_parent_terminal_state_id": "state-done",
+                "ticket_split_parent_terminal_state_name": "Done",
+                "ticket_split_parent_operation_state": "planned",
+                "ticket_split_team": "API",
+                "ticket_split_team_id": "team-api",
+                "ticket_split_operation_state": "planned",
+                "status": "queued",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        provider = linear.LinearIntegration()
+        first = LinearTicketCreationResult(
+            LinearIssue("API-80"),
+            "https://linear.app/acme/issue/API-80/auth",
+            "a" * 32,
+        )
+        second = LinearTicketCreationResult(
+            LinearIssue("API-81"),
+            "https://linear.app/acme/issue/API-81/billing",
+            "b" * 32,
+        )
+        closed = LinearTicketCloseResult(
+            LinearIssue("API-79"),
+            "https://linear.app/acme/issue/API-79/parent",
+            "c" * 32,
+        )
+        created = [first, second]
+
+        def submit_create(
+            *_args: object, **kwargs: object
+        ) -> LinearTicketCreationResult:
+            before_submit = kwargs["before_submit"]
+            accepted = kwargs["accepted"]
+            assert callable(before_submit)
+            assert callable(accepted)
+            before_submit("voice-router", "router-session", "prompt-token", 7)
+            accepted()
+            return created.pop(0)
+
+        def submit_close(*_args: object, **kwargs: object) -> LinearTicketCloseResult:
+            before_submit = kwargs["before_submit"]
+            accepted = kwargs["accepted"]
+            assert callable(before_submit)
+            assert callable(accepted)
+            before_submit("voice-router", "router-session", "prompt-token", 8)
+            accepted()
+            return closed
+
+        herdr = mock.Mock()
+        with (
+            mock.patch.object(jobs, "HerdrClient", return_value=herdr),
+            mock.patch.object(
+                production_jobs,
+                "issue_provider",
+                return_value=provider,
+            ),
+            mock.patch.object(
+                provider,
+                "submit_ticket_creation",
+                side_effect=submit_create,
+            ) as submit,
+            mock.patch.object(
+                provider,
+                "observe_ticket_creation",
+                side_effect=[first, second],
+            ),
+            mock.patch.object(
+                provider,
+                "submit_ticket_close",
+                side_effect=submit_close,
+            ) as close,
+            mock.patch.object(
+                provider,
+                "observe_ticket_close",
+                return_value=closed,
+            ),
+        ):
+            service.run_worker("123456789abc")
+
+        updated = jobs.read_job("123456789abc")
+        self.assertEqual(updated["status"], "completed")
+        self.assertIn("API-80", str(updated["result"]))
+        self.assertIn("API-81", str(updated["result"]))
+        self.assertIn("Closed API-79", str(updated["result"]))
+        self.assertEqual(submit.call_count, 2)
+        close.assert_called_once()
+
+    def test_worker_drafts_issue_merge_before_requesting_confirmation(self) -> None:
+        closing = encode_merge_closing(
+            (MergeClosingTicket("source/project#13", "0" * 32, number=13),)
+        )
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "merge source/project#12 and source/project#13",
+                "trusted_utterance": "merge source/project#12 and source/project#13",
+                "issue_provider": "github",
+                "github_repository": "source/project",
+                "github_issue": 12,
+                "github_issue_merge_requested": True,
+                "ticket_merge_survivor": "source/project#12",
+                "ticket_merge_closing": closing,
+                "status": "queued",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        source = GitHubRepository(
+            "source/project",
+            "https://github.com/source/project",
+            False,
+            "main",
+        )
+        github = mock.Mock()
+        _configure_github_merge_snapshots(github)
+        github.inspect_repository.return_value = source
+        with (
+            mock.patch.object(jobs, "GitHubClient", return_value=github),
+            mock.patch.object(
+                production_jobs,
+                "draft_ticket_merge",
+                return_value=TicketMergeDraft(
+                    "Combined auth",
+                    "Handle login and invoices.",
+                ),
+            ),
+        ):
+            service.run_worker("123456789abc")
+
+        updated = jobs.read_job("123456789abc")
+        self.assertEqual(updated["status"], "awaiting_user")
+        self.assertEqual(
+            updated["clarification_kind"],
+            "github_issue_merge_confirmation",
+        )
+        self.assertEqual(updated["ticket_merge_operation_state"], "planned")
+        self.assertIn(
+            "Update source/project#12 and close source/project#13?",
+            str(updated["question"]),
+        )
+        self.assertIn("Combined auth", str(updated["question"]))
+        github.submit_issue_update.assert_not_called()
+        github.submit_issue_close.assert_not_called()
+
+    def test_worker_resolves_and_drafts_linear_merge_before_confirmation(
+        self,
+    ) -> None:
+        closing = encode_merge_closing((MergeClosingTicket("API-80", "0" * 32),))
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "merge API-79 and API-80",
+                "trusted_utterance": "merge API-79 and API-80",
+                "issue_provider": "linear",
+                "issue_key": "API-79",
+                "linear_ticket_merge_requested": True,
+                "ticket_merge_survivor": "API-79",
+                "ticket_merge_closing": closing,
+                "status": "queued",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        provider = linear.LinearIntegration()
+        herdr = mock.Mock()
+        with (
+            mock.patch.object(jobs, "HerdrClient", return_value=herdr),
+            mock.patch.object(
+                production_jobs,
+                "issue_provider",
+                return_value=provider,
+            ),
+            mock.patch.object(
+                provider,
+                "resolve_issue_for_update",
+                side_effect=[
+                    ("issue-id-api-79", LinearIssue("API-79")),
+                    ("issue-id-api-80", LinearIssue("API-80")),
+                ],
+            ),
+            mock.patch.object(
+                provider,
+                "resolve_terminal_state",
+                return_value=LinearWorkflowState(
+                    "state-done",
+                    "Done",
+                    "completed",
+                ),
+            ),
+            mock.patch.object(
+                provider,
+                "ticket_snapshot",
+                side_effect=_linear_merge_snapshots(),
+            ),
+            mock.patch.object(
+                production_jobs,
+                "draft_ticket_merge",
+                return_value=TicketMergeDraft(
+                    "Combined auth",
+                    "Handle login and invoices.",
+                ),
+            ),
+        ):
+            service.run_worker("123456789abc")
+
+        updated = jobs.read_job("123456789abc")
+        self.assertEqual(updated["status"], "awaiting_user")
+        self.assertEqual(
+            updated["clarification_kind"],
+            "linear_ticket_merge_confirmation",
+        )
+        self.assertEqual(
+            updated["ticket_merge_survivor_issue_id"],
+            "issue-id-api-79",
+        )
+        self.assertIn("state-done", str(updated["ticket_merge_closing"]))
+        self.assertEqual(updated["ticket_merge_operation_state"], "planned")
+        self.assertIn("Combined auth", str(updated["question"]))
+
+    def test_confirmed_issue_merge_updates_survivor_and_closes_rest(self) -> None:
+        closing = encode_merge_closing(
+            (
+                MergeClosingTicket(
+                    "source/project#13",
+                    "b" * 32,
+                    repository="source/project",
+                    number=13,
+                ),
+            )
+        )
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "merge source/project#12 and source/project#13",
+                "trusted_utterance": "merge source/project#12 and source/project#13",
+                "issue_provider": "github",
+                "github_repository": "source/project",
+                "github_issue": 12,
+                "github_issue_merge_requested": True,
+                "ticket_merge_confirmed": True,
+                "ticket_merge_survivor": "source/project#12",
+                "ticket_merge_snapshots": encode_merge_snapshots(
+                    _github_merge_snapshots()
+                ),
+                "ticket_merge_survivor_title": "Combined auth",
+                "ticket_merge_survivor_body": "Handle login and invoices.",
+                "ticket_merge_survivor_marker": "a" * 32,
+                "ticket_merge_survivor_operation_state": "planned",
+                "ticket_merge_closing": closing,
+                "ticket_merge_operation_state": "planned",
+                "status": "queued",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        source = GitHubRepository(
+            "source/project",
+            "https://github.com/source/project",
+            False,
+            "main",
+        )
+        updated_issue = GitHubIssueUpdateResult(
+            GitHubIssue("source", "project", 12),
+            "https://github.com/source/project/issues/12",
+            "Combined auth",
+            "a" * 32,
+        )
+        closed = GitHubIssueCloseResult(
+            GitHubIssue("source", "project", 13),
+            "https://github.com/source/project/issues/13",
+            "b" * 32,
+        )
+        github = mock.Mock()
+        _configure_github_merge_snapshots(github)
+        github.inspect_repository.return_value = source
+        github.submit_issue_update.return_value = updated_issue
+        github.submit_issue_close.return_value = closed
+        herdr = mock.Mock()
+        with (
+            mock.patch.object(jobs, "GitHubClient", return_value=github),
+            mock.patch.object(jobs, "HerdrClient", return_value=herdr),
+        ):
+            service.run_worker("123456789abc")
+
+        updated = jobs.read_job("123456789abc")
+        self.assertEqual(updated["status"], "completed")
+        self.assertIn("Updated source/project#12", str(updated["result"]))
+        self.assertIn("Closed source/project#13", str(updated["result"]))
+        github.submit_issue_update.assert_called_once()
+        github.submit_issue_close.assert_called_once()
+        herdr.assert_not_called()
+
+    def test_confirmed_issue_merge_reconfirms_when_any_snapshot_drifts(self) -> None:
+        closing = encode_merge_closing(
+            (
+                MergeClosingTicket(
+                    "source/project#13",
+                    "b" * 32,
+                    repository="source/project",
+                    number=13,
+                ),
+            )
+        )
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "merge source/project#12 and source/project#13",
+                "trusted_utterance": "merge source/project#12 and source/project#13",
+                "issue_provider": "github",
+                "github_repository": "source/project",
+                "github_issue": 12,
+                "github_issue_merge_requested": True,
+                "ticket_merge_confirmed": True,
+                "ticket_merge_survivor": "source/project#12",
+                "ticket_merge_snapshots": encode_merge_snapshots(
+                    _github_merge_snapshots()
+                ),
+                "ticket_merge_survivor_title": "Combined auth",
+                "ticket_merge_survivor_body": "Handle login and invoices.",
+                "ticket_merge_survivor_marker": "a" * 32,
+                "ticket_merge_survivor_operation_state": "planned",
+                "ticket_merge_closing": closing,
+                "ticket_merge_operation_state": "planned",
+                "status": "queued",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        current = (
+            _github_merge_snapshots()[0],
+            TicketSnapshot(
+                "github",
+                "source/project#13",
+                "https://github.com/source/project/issues/13",
+                "Billing",
+                "Externally revised invoices.",
+                "revision-13b",
+                "https://github.com/source/project/issues/13",
+                "OPEN",
+            ),
+        )
+        github = mock.Mock()
+        github.inspect_repository.return_value = GitHubRepository(
+            "source/project",
+            "https://github.com/source/project",
+            False,
+            "main",
+        )
+        _configure_github_merge_snapshots(github, current)
+        with (
+            mock.patch.object(jobs, "GitHubClient", return_value=github),
+            mock.patch.object(
+                production_jobs,
+                "draft_ticket_merge",
+                return_value=TicketMergeDraft(
+                    "Combined revised auth",
+                    "Handle login and externally revised invoices.",
+                ),
+            ),
+        ):
+            service.run_worker("123456789abc")
+
+        updated = jobs.read_job("123456789abc")
+        self.assertEqual(updated["status"], "awaiting_user")
+        self.assertFalse(updated["ticket_merge_confirmed"])
+        self.assertIn("Combined revised auth", str(updated["question"]))
+        snapshots = json.loads(str(updated["ticket_merge_snapshots"]))
+        self.assertEqual(snapshots[1]["revision"], "revision-13b")
+        github.submit_issue_update.assert_not_called()
+        github.submit_issue_close.assert_not_called()
+
+    def test_partial_merge_failure_does_not_retry_landed_survivor(self) -> None:
+        closing = encode_merge_closing(
+            (
+                MergeClosingTicket(
+                    "source/project#13",
+                    "b" * 32,
+                    repository="source/project",
+                    number=13,
+                ),
+            )
+        )
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "merge the issues",
+                "trusted_utterance": "merge the issues",
+                "issue_provider": "github",
+                "github_repository": "source/project",
+                "github_issue": 12,
+                "github_issue_merge_requested": True,
+                "ticket_merge_confirmed": True,
+                "ticket_merge_survivor": "source/project#12",
+                "ticket_merge_snapshots": encode_merge_snapshots(
+                    _github_merge_snapshots()
+                ),
+                "ticket_merge_survivor_title": "Combined auth",
+                "ticket_merge_survivor_body": "Handle login and invoices.",
+                "ticket_merge_survivor_marker": "a" * 32,
+                "ticket_merge_survivor_operation_state": "planned",
+                "ticket_merge_closing": closing,
+                "ticket_merge_operation_state": "planned",
+                "status": "queued",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        github = mock.Mock()
+        _configure_github_merge_snapshots(github)
+        github.inspect_repository.return_value = GitHubRepository(
+            "source/project",
+            "https://github.com/source/project",
+            False,
+            "main",
+        )
+        github.submit_issue_update.return_value = GitHubIssueUpdateResult(
+            GitHubIssue("source", "project", 12),
+            "https://github.com/source/project/issues/12",
+            "Combined auth",
+            "a" * 32,
+        )
+        github.submit_issue_close.side_effect = GitHubOperationAmbiguous("timed out")
+        github.observe_issue_close.return_value = None
+        with mock.patch.object(jobs, "GitHubClient", return_value=github):
+            service.run_worker("123456789abc")
+
+        updated = jobs.read_job("123456789abc")
+        self.assertEqual(updated["status"], "queued")
+        self.assertEqual(updated["ticket_merge_operation_state"], "ambiguous")
+        self.assertEqual(updated["ticket_merge_survivor_operation_state"], "created")
+        decoded = json.loads(str(updated["ticket_merge_closing"]))
+        self.assertEqual(decoded[0]["state"], "ambiguous")
+        github.submit_issue_update.assert_called_once()
+        github.submit_issue_close.assert_called_once()
+
+        github.submit_issue_update.reset_mock()
+        github.submit_issue_close.reset_mock()
+        github.observe_issue_close.return_value = None
+        with mock.patch.object(jobs, "GitHubClient", return_value=github):
+            service.run_worker("123456789abc")
+        github.submit_issue_update.assert_not_called()
+        github.submit_issue_close.assert_not_called()
+
+    def test_ambiguous_issue_merge_survivor_queues_reconciliation(self) -> None:
+        closing = encode_merge_closing(
+            (
+                MergeClosingTicket(
+                    "source/project#13",
+                    "b" * 32,
+                    repository="source/project",
+                    number=13,
+                ),
+            )
+        )
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "merge the issues",
+                "trusted_utterance": "merge the issues",
+                "issue_provider": "github",
+                "github_repository": "source/project",
+                "github_issue": 12,
+                "github_issue_merge_requested": True,
+                "ticket_merge_confirmed": True,
+                "ticket_merge_survivor": "source/project#12",
+                "ticket_merge_snapshots": encode_merge_snapshots(
+                    _github_merge_snapshots()
+                ),
+                "ticket_merge_survivor_title": "Combined auth",
+                "ticket_merge_survivor_body": "Handle login and invoices.",
+                "ticket_merge_survivor_marker": "a" * 32,
+                "ticket_merge_survivor_operation_state": "planned",
+                "ticket_merge_closing": closing,
+                "ticket_merge_operation_state": "planned",
+                "status": "queued",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        github = mock.Mock()
+        _configure_github_merge_snapshots(github)
+        github.inspect_repository.return_value = GitHubRepository(
+            "source/project",
+            "https://github.com/source/project",
+            False,
+            "main",
+        )
+        github.submit_issue_update.side_effect = GitHubOperationAmbiguous("timed out")
+        github.observe_issue_update.return_value = None
+        with mock.patch.object(jobs, "GitHubClient", return_value=github):
+            service.run_worker("123456789abc")
+
+        updated = jobs.read_job("123456789abc")
+        self.assertEqual(updated["status"], "queued")
+        self.assertEqual(updated["ticket_merge_operation_state"], "ambiguous")
+        self.assertEqual(updated["ticket_merge_survivor_operation_state"], "ambiguous")
+        github.submit_issue_close.assert_not_called()
+
+    def test_issue_merge_survivor_start_failure_is_retried(self) -> None:
+        closing = encode_merge_closing(
+            (
+                MergeClosingTicket(
+                    "source/project#13",
+                    "b" * 32,
+                    repository="source/project",
+                    number=13,
+                ),
+            )
+        )
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "merge the issues",
+                "trusted_utterance": "merge the issues",
+                "issue_provider": "github",
+                "github_repository": "source/project",
+                "github_issue": 12,
+                "github_issue_merge_requested": True,
+                "ticket_merge_confirmed": True,
+                "ticket_merge_survivor": "source/project#12",
+                "ticket_merge_snapshots": encode_merge_snapshots(
+                    _github_merge_snapshots()
+                ),
+                "ticket_merge_survivor_title": "Combined auth",
+                "ticket_merge_survivor_body": "Handle login and invoices.",
+                "ticket_merge_survivor_marker": "a" * 32,
+                "ticket_merge_survivor_operation_state": "planned",
+                "ticket_merge_closing": closing,
+                "ticket_merge_operation_state": "planned",
+                "status": "queued",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        github = mock.Mock()
+        _configure_github_merge_snapshots(github)
+        github.inspect_repository.return_value = GitHubRepository(
+            "source/project",
+            "https://github.com/source/project",
+            False,
+            "main",
+        )
+        updated_issue = GitHubIssueUpdateResult(
+            GitHubIssue("source", "project", 12),
+            "https://github.com/source/project/issues/12",
+            "Combined auth",
+            "a" * 32,
+        )
+        closed = GitHubIssueCloseResult(
+            GitHubIssue("source", "project", 13),
+            "https://github.com/source/project/issues/13",
+            "b" * 32,
+        )
+        github.submit_issue_update.side_effect = [
+            GitHubCommandStartError("missing gh"),
+            updated_issue,
+        ]
+        github.observe_issue_update.side_effect = GitHubError("gh still missing")
+        github.submit_issue_close.return_value = closed
+        with (
+            mock.patch.object(jobs, "GitHubClient", return_value=github),
+            mock.patch.object(service, "launch_worker") as launch,
+        ):
+            service.run_worker("123456789abc")
+
+        updated = jobs.read_job("123456789abc")
+        self.assertEqual(updated["status"], "queued")
+        self.assertEqual(updated["ticket_merge_operation_state"], "planned")
+        self.assertEqual(updated["ticket_merge_survivor_operation_state"], "planned")
+        self.assertFalse(updated.get("reconcile", False))
+        self.assertEqual(github.submit_issue_update.call_count, 1)
+        github.submit_issue_close.assert_not_called()
+        launch.assert_called_once_with("123456789abc")
+
+        with mock.patch.object(jobs, "GitHubClient", return_value=github):
+            service.run_worker("123456789abc")
+
+        retried = jobs.read_job("123456789abc")
+        self.assertEqual(retried["status"], "completed")
+        self.assertEqual(github.submit_issue_update.call_count, 2)
+        github.submit_issue_close.assert_called_once()
+
+    def test_issue_merge_close_observes_success_after_submit_error(self) -> None:
+        closing = encode_merge_closing(
+            (
+                MergeClosingTicket(
+                    "source/project#13",
+                    "b" * 32,
+                    repository="source/project",
+                    number=13,
+                ),
+            )
+        )
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "merge the issues",
+                "trusted_utterance": "merge the issues",
+                "issue_provider": "github",
+                "github_repository": "source/project",
+                "github_issue": 12,
+                "github_issue_merge_requested": True,
+                "ticket_merge_confirmed": True,
+                "ticket_merge_survivor": "source/project#12",
+                "ticket_merge_snapshots": encode_merge_snapshots(
+                    _github_merge_snapshots()
+                ),
+                "ticket_merge_survivor_title": "Combined auth",
+                "ticket_merge_survivor_body": "Handle login and invoices.",
+                "ticket_merge_survivor_marker": "a" * 32,
+                "ticket_merge_survivor_operation_state": "created",
+                "ticket_merge_closing": closing,
+                "ticket_merge_operation_state": "planned",
+                "status": "queued",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        github = mock.Mock()
+        _configure_github_merge_snapshots(github)
+        github.inspect_repository.return_value = GitHubRepository(
+            "source/project",
+            "https://github.com/source/project",
+            False,
+            "main",
+        )
+        github.submit_issue_close.side_effect = GitHubError("gh timed out")
+        github.observe_issue_close.return_value = GitHubIssueCloseResult(
+            GitHubIssue("source", "project", 13),
+            "https://github.com/source/project/issues/13",
+            "b" * 32,
+        )
+        with mock.patch.object(jobs, "GitHubClient", return_value=github):
+            service.run_worker("123456789abc")
+
+        updated = jobs.read_job("123456789abc")
+        self.assertEqual(updated["status"], "completed")
+        self.assertIn("Closed source/project#13", str(updated["result"]))
+        github.submit_issue_update.assert_not_called()
+        github.submit_issue_close.assert_called_once()
+        github.observe_issue_close.assert_called()
+
+    def test_issue_merge_close_start_failure_is_retried(self) -> None:
+        closing = encode_merge_closing(
+            (
+                MergeClosingTicket(
+                    "source/project#13",
+                    "b" * 32,
+                    repository="source/project",
+                    number=13,
+                ),
+            )
+        )
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "merge the issues",
+                "trusted_utterance": "merge the issues",
+                "issue_provider": "github",
+                "github_repository": "source/project",
+                "github_issue": 12,
+                "github_issue_merge_requested": True,
+                "ticket_merge_confirmed": True,
+                "ticket_merge_survivor": "source/project#12",
+                "ticket_merge_snapshots": encode_merge_snapshots(
+                    _github_merge_snapshots()
+                ),
+                "ticket_merge_survivor_title": "Combined auth",
+                "ticket_merge_survivor_body": "Handle login and invoices.",
+                "ticket_merge_survivor_marker": "a" * 32,
+                "ticket_merge_survivor_operation_state": "created",
+                "ticket_merge_closing": closing,
+                "ticket_merge_operation_state": "planned",
+                "status": "queued",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        github = mock.Mock()
+        _configure_github_merge_snapshots(github)
+        github.inspect_repository.return_value = GitHubRepository(
+            "source/project",
+            "https://github.com/source/project",
+            False,
+            "main",
+        )
+        closed = GitHubIssueCloseResult(
+            GitHubIssue("source", "project", 13),
+            "https://github.com/source/project/issues/13",
+            "b" * 32,
+        )
+        github.submit_issue_close.side_effect = [
+            GitHubCommandStartError("missing gh"),
+            closed,
+        ]
+        github.observe_issue_close.side_effect = GitHubError("gh still missing")
+        with (
+            mock.patch.object(jobs, "GitHubClient", return_value=github),
+            mock.patch.object(service, "launch_worker") as launch,
+        ):
+            service.run_worker("123456789abc")
+
+        updated = jobs.read_job("123456789abc")
+        self.assertEqual(updated["status"], "queued")
+        self.assertEqual(updated["ticket_merge_operation_state"], "planned")
+        decoded = json.loads(str(updated["ticket_merge_closing"]))
+        self.assertEqual(decoded[0]["state"], "planned")
+        self.assertEqual(github.submit_issue_close.call_count, 1)
+        launch.assert_called_once_with("123456789abc")
+
+        with mock.patch.object(jobs, "GitHubClient", return_value=github):
+            service.run_worker("123456789abc")
+
+        retried = jobs.read_job("123456789abc")
+        self.assertEqual(retried["status"], "completed")
+        self.assertEqual(github.submit_issue_close.call_count, 2)
+
+    def test_issue_merge_observes_submitted_survivor_without_resubmitting(self) -> None:
+        closing = encode_merge_closing(
+            (
+                MergeClosingTicket(
+                    "source/project#13",
+                    "b" * 32,
+                    repository="source/project",
+                    number=13,
+                ),
+            )
+        )
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "merge the issues",
+                "trusted_utterance": "merge the issues",
+                "issue_provider": "github",
+                "github_repository": "source/project",
+                "github_issue": 12,
+                "github_issue_merge_requested": True,
+                "ticket_merge_confirmed": True,
+                "ticket_merge_survivor": "source/project#12",
+                "ticket_merge_snapshots": encode_merge_snapshots(
+                    _github_merge_snapshots()
+                ),
+                "ticket_merge_survivor_title": "Combined auth",
+                "ticket_merge_survivor_body": "Handle login and invoices.",
+                "ticket_merge_survivor_marker": "a" * 32,
+                "ticket_merge_survivor_operation_state": "submitted",
+                "ticket_merge_closing": closing,
+                "ticket_merge_operation_state": "planned",
+                "status": "queued",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        github = mock.Mock()
+        _configure_github_merge_snapshots(github)
+        github.inspect_repository.return_value = GitHubRepository(
+            "source/project",
+            "https://github.com/source/project",
+            False,
+            "main",
+        )
+        github.observe_issue_update.return_value = GitHubIssueUpdateResult(
+            GitHubIssue("source", "project", 12),
+            "https://github.com/source/project/issues/12",
+            "Combined auth",
+            "a" * 32,
+        )
+        github.submit_issue_close.return_value = GitHubIssueCloseResult(
+            GitHubIssue("source", "project", 13),
+            "https://github.com/source/project/issues/13",
+            "b" * 32,
+        )
+        with mock.patch.object(jobs, "GitHubClient", return_value=github):
+            service.run_worker("123456789abc")
+
+        updated = jobs.read_job("123456789abc")
+        self.assertEqual(updated["status"], "completed")
+        github.submit_issue_update.assert_not_called()
+        github.observe_issue_update.assert_called()
+        github.submit_issue_close.assert_called_once()
+
+    def test_issue_merge_unobserved_submitted_survivor_queues_reconciliation(
+        self,
+    ) -> None:
+        closing = encode_merge_closing(
+            (
+                MergeClosingTicket(
+                    "source/project#13",
+                    "b" * 32,
+                    repository="source/project",
+                    number=13,
+                ),
+            )
+        )
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "merge the issues",
+                "trusted_utterance": "merge the issues",
+                "issue_provider": "github",
+                "github_repository": "source/project",
+                "github_issue": 12,
+                "github_issue_merge_requested": True,
+                "ticket_merge_confirmed": True,
+                "ticket_merge_survivor": "source/project#12",
+                "ticket_merge_snapshots": encode_merge_snapshots(
+                    _github_merge_snapshots()
+                ),
+                "ticket_merge_survivor_title": "Combined auth",
+                "ticket_merge_survivor_body": "Handle login and invoices.",
+                "ticket_merge_survivor_marker": "a" * 32,
+                "ticket_merge_survivor_operation_state": "submitted",
+                "ticket_merge_closing": closing,
+                "ticket_merge_operation_state": "planned",
+                "status": "queued",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        github = mock.Mock()
+        _configure_github_merge_snapshots(github)
+        github.inspect_repository.return_value = GitHubRepository(
+            "source/project",
+            "https://github.com/source/project",
+            False,
+            "main",
+        )
+        github.observe_issue_update.side_effect = GitHubError("lookup failed")
+        with mock.patch.object(jobs, "GitHubClient", return_value=github):
+            service.run_worker("123456789abc")
+
+        updated = jobs.read_job("123456789abc")
+        self.assertEqual(updated["status"], "queued")
+        self.assertEqual(updated["ticket_merge_operation_state"], "ambiguous")
+        self.assertEqual(updated["ticket_merge_survivor_operation_state"], "ambiguous")
+        self.assertTrue(updated.get("reconcile", False))
+        github.submit_issue_update.assert_not_called()
+        github.submit_issue_close.assert_not_called()
+
+    def test_issue_merge_observes_ambiguous_close_without_resubmitting(self) -> None:
+        closing = encode_merge_closing(
+            (
+                MergeClosingTicket(
+                    "source/project#13",
+                    "b" * 32,
+                    state="ambiguous",
+                    repository="source/project",
+                    number=13,
+                ),
+            )
+        )
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "merge the issues",
+                "trusted_utterance": "merge the issues",
+                "issue_provider": "github",
+                "github_repository": "source/project",
+                "github_issue": 12,
+                "github_issue_merge_requested": True,
+                "ticket_merge_confirmed": True,
+                "ticket_merge_survivor": "source/project#12",
+                "ticket_merge_snapshots": encode_merge_snapshots(
+                    _github_merge_snapshots()
+                ),
+                "ticket_merge_survivor_title": "Combined auth",
+                "ticket_merge_survivor_body": "Handle login and invoices.",
+                "ticket_merge_survivor_marker": "a" * 32,
+                "ticket_merge_survivor_operation_state": "created",
+                "ticket_merge_closing": closing,
+                "ticket_merge_operation_state": "planned",
+                "status": "queued",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        github = mock.Mock()
+        _configure_github_merge_snapshots(github)
+        github.inspect_repository.return_value = GitHubRepository(
+            "source/project",
+            "https://github.com/source/project",
+            False,
+            "main",
+        )
+        github.observe_issue_close.return_value = GitHubIssueCloseResult(
+            GitHubIssue("source", "project", 13),
+            "https://github.com/source/project/issues/13",
+            "b" * 32,
+        )
+        with mock.patch.object(jobs, "GitHubClient", return_value=github):
+            service.run_worker("123456789abc")
+
+        updated = jobs.read_job("123456789abc")
+        self.assertEqual(updated["status"], "completed")
+        github.submit_issue_update.assert_not_called()
+        github.submit_issue_close.assert_not_called()
+        github.observe_issue_close.assert_called()
+
+    def test_confirmed_linear_ticket_merge_updates_survivor_and_closes_rest(
+        self,
+    ) -> None:
+        closing = encode_merge_closing(
+            (
+                MergeClosingTicket(
+                    "API-80",
+                    "b" * 32,
+                    issue_id="issue-id-api-80",
+                    terminal_state_id="state-done",
+                    terminal_state_name="Done",
+                ),
+            )
+        )
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "merge API-79 and API-80",
+                "trusted_utterance": "merge API-79 and API-80",
+                "issue_provider": "linear",
+                "issue_key": "API-79",
+                "linear_ticket_merge_requested": True,
+                "ticket_merge_confirmed": True,
+                "ticket_merge_survivor": "API-79",
+                "ticket_merge_snapshots": encode_merge_snapshots(
+                    _linear_merge_snapshots()
+                ),
+                "ticket_merge_survivor_title": "Combined auth",
+                "ticket_merge_survivor_body": "Handle login and invoices.",
+                "ticket_merge_survivor_marker": "a" * 32,
+                "ticket_merge_survivor_issue_id": "issue-id-api-79",
+                "ticket_merge_survivor_operation_state": "planned",
+                "ticket_merge_closing": closing,
+                "ticket_merge_operation_state": "planned",
+                "status": "queued",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        provider = linear.LinearIntegration()
+        updated_ticket = LinearTicketUpdateResult(
+            LinearIssue("API-79"),
+            "https://linear.app/acme/issue/API-79/combined",
+            "Combined auth",
+            "a" * 32,
+        )
+        closed = LinearTicketCloseResult(
+            LinearIssue("API-80"),
+            "https://linear.app/acme/issue/API-80/billing",
+            "b" * 32,
+        )
+
+        def submit_update(*_args: object, **kwargs: object) -> LinearTicketUpdateResult:
+            before_submit = kwargs["before_submit"]
+            accepted = kwargs["accepted"]
+            assert callable(before_submit)
+            assert callable(accepted)
+            before_submit("voice-router", "router-session", "prompt-token", 7)
+            accepted()
+            return updated_ticket
+
+        def submit_close(*_args: object, **kwargs: object) -> LinearTicketCloseResult:
+            before_submit = kwargs["before_submit"]
+            accepted = kwargs["accepted"]
+            assert callable(before_submit)
+            assert callable(accepted)
+            before_submit("voice-router", "router-session", "prompt-token", 8)
+            accepted()
+            return closed
+
+        herdr = mock.Mock()
+        with (
+            mock.patch.object(jobs, "HerdrClient", return_value=herdr),
+            mock.patch.object(
+                production_jobs,
+                "issue_provider",
+                return_value=provider,
+            ),
+            mock.patch.object(
+                provider,
+                "ticket_snapshot",
+                side_effect=_linear_merge_snapshots(),
+            ),
+            mock.patch.object(
+                provider,
+                "submit_ticket_update",
+                side_effect=submit_update,
+            ) as update,
+            mock.patch.object(
+                provider,
+                "observe_ticket_update",
+                return_value=updated_ticket,
+            ),
+            mock.patch.object(
+                provider,
+                "submit_ticket_close",
+                side_effect=submit_close,
+            ) as close,
+            mock.patch.object(
+                provider,
+                "observe_ticket_close",
+                return_value=closed,
+            ),
+        ):
+            service.run_worker("123456789abc")
+
+        updated = jobs.read_job("123456789abc")
+        self.assertEqual(updated["status"], "completed")
+        self.assertIn("Updated API-79", str(updated["result"]))
+        self.assertIn("Closed API-80", str(updated["result"]))
+        update.assert_called_once()
+        close.assert_called_once()
+
+    def test_confirmed_linear_merge_reconfirms_when_any_snapshot_drifts(self) -> None:
+        closing = encode_merge_closing(
+            (
+                MergeClosingTicket(
+                    "API-80",
+                    "b" * 32,
+                    issue_id="issue-id-api-80",
+                    terminal_state_id="state-done",
+                    terminal_state_name="Done",
+                ),
+            )
+        )
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "merge API-79 and API-80",
+                "trusted_utterance": "merge API-79 and API-80",
+                "issue_provider": "linear",
+                "issue_key": "API-79",
+                "linear_ticket_merge_requested": True,
+                "ticket_merge_confirmed": True,
+                "ticket_merge_survivor": "API-79",
+                "ticket_merge_snapshots": encode_merge_snapshots(
+                    _linear_merge_snapshots()
+                ),
+                "ticket_merge_survivor_title": "Combined auth",
+                "ticket_merge_survivor_body": "Handle login and invoices.",
+                "ticket_merge_survivor_marker": "a" * 32,
+                "ticket_merge_survivor_issue_id": "issue-id-api-79",
+                "ticket_merge_survivor_operation_state": "planned",
+                "ticket_merge_closing": closing,
+                "ticket_merge_operation_state": "planned",
+                "status": "queued",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        current = (
+            _linear_merge_snapshots()[0],
+            TicketSnapshot(
+                "linear",
+                "API-80",
+                "issue-id-api-80",
+                "Billing",
+                "Externally revised invoices.",
+                "revision-80b",
+                "https://linear.app/acme/issue/API-80/billing",
+                "In Progress",
+            ),
+        )
+        provider = linear.LinearIntegration()
+        herdr = mock.Mock()
+        with (
+            mock.patch.object(jobs, "HerdrClient", return_value=herdr),
+            mock.patch.object(
+                production_jobs,
+                "issue_provider",
+                return_value=provider,
+            ),
+            mock.patch.object(provider, "ticket_snapshot", side_effect=current),
+            mock.patch.object(
+                production_jobs,
+                "draft_ticket_merge",
+                return_value=TicketMergeDraft(
+                    "Combined revised auth",
+                    "Handle login and externally revised invoices.",
+                ),
+            ),
+            mock.patch.object(provider, "submit_ticket_update") as submit_update,
+            mock.patch.object(provider, "submit_ticket_close") as submit_close,
+        ):
+            service.run_worker("123456789abc")
+
+        updated = jobs.read_job("123456789abc")
+        self.assertEqual(updated["status"], "awaiting_user")
+        self.assertFalse(updated["ticket_merge_confirmed"])
+        self.assertIn("Combined revised auth", str(updated["question"]))
+        snapshots = json.loads(str(updated["ticket_merge_snapshots"]))
+        self.assertEqual(snapshots[1]["revision"], "revision-80b")
+        submit_update.assert_not_called()
+        submit_close.assert_not_called()
+
+    def test_linear_ticket_merge_missing_survivor_fails_closed(self) -> None:
+        closing = encode_merge_closing(
+            (
+                MergeClosingTicket(
+                    "API-80",
+                    "b" * 32,
+                    issue_id="issue-id-api-80",
+                ),
+            )
+        )
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "merge API-79 and API-80",
+                "trusted_utterance": "merge API-79 and API-80",
+                "issue_provider": "linear",
+                "issue_key": "API-79",
+                "linear_ticket_merge_requested": True,
+                "ticket_merge_confirmed": True,
+                "ticket_merge_survivor": "API-79",
+                "ticket_merge_survivor_title": "Combined auth",
+                "ticket_merge_survivor_body": "Handle login and invoices.",
+                "ticket_merge_survivor_marker": "a" * 32,
+                "ticket_merge_closing": closing,
+                "ticket_merge_operation_state": "planned",
+                "status": "queued",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        provider = linear.LinearIntegration()
+        herdr = mock.Mock()
+        with (
+            mock.patch.object(jobs, "HerdrClient", return_value=herdr),
+            mock.patch.object(
+                production_jobs,
+                "issue_provider",
+                return_value=provider,
+            ),
+            mock.patch.object(
+                provider,
+                "resolve_issue_for_update",
+                side_effect=LinearError("not found"),
+            ),
+        ):
+            service.run_worker("123456789abc")
+
+        updated = jobs.read_job("123456789abc")
+        self.assertEqual(updated["status"], "failed")
+        self.assertIn("couldn't find Linear ticket API-79", str(updated["result"]))
+
+    def test_ambiguous_linear_ticket_merge_queues_reconciliation(self) -> None:
+        closing = encode_merge_closing(
+            (
+                MergeClosingTicket(
+                    "API-80",
+                    "b" * 32,
+                    issue_id="issue-id-api-80",
+                    terminal_state_id="state-done",
+                    terminal_state_name="Done",
+                ),
+            )
+        )
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "merge API-79 and API-80",
+                "trusted_utterance": "merge API-79 and API-80",
+                "issue_provider": "linear",
+                "issue_key": "API-79",
+                "linear_ticket_merge_requested": True,
+                "ticket_merge_confirmed": True,
+                "ticket_merge_survivor": "API-79",
+                "ticket_merge_snapshots": encode_merge_snapshots(
+                    _linear_merge_snapshots()
+                ),
+                "ticket_merge_survivor_title": "Combined auth",
+                "ticket_merge_survivor_body": "Handle login and invoices.",
+                "ticket_merge_survivor_marker": "a" * 32,
+                "ticket_merge_survivor_issue_id": "issue-id-api-79",
+                "ticket_merge_survivor_operation_state": "planned",
+                "ticket_merge_closing": closing,
+                "ticket_merge_operation_state": "planned",
+                "status": "queued",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        provider = linear.LinearIntegration()
+
+        def submit_update(*_args: object, **kwargs: object) -> object:
+            before_submit = kwargs["before_submit"]
+            accepted = kwargs["accepted"]
+            assert callable(before_submit)
+            assert callable(accepted)
+            before_submit("voice-router", "router-session", "prompt-token", 7)
+            accepted()
+            raise LinearOperationAmbiguous("timed out")
+
+        herdr = mock.Mock()
+        with (
+            mock.patch.object(jobs, "HerdrClient", return_value=herdr),
+            mock.patch.object(
+                production_jobs,
+                "issue_provider",
+                return_value=provider,
+            ),
+            mock.patch.object(
+                provider,
+                "ticket_snapshot",
+                side_effect=_linear_merge_snapshots(),
+            ),
+            mock.patch.object(
+                provider,
+                "submit_ticket_update",
+                side_effect=submit_update,
+            ),
+            mock.patch.object(
+                provider,
+                "observe_ticket_update",
+                return_value=None,
+            ),
+        ):
+            service.run_worker("123456789abc")
+
+        updated = jobs.read_job("123456789abc")
+        self.assertEqual(updated["status"], "queued")
+        self.assertEqual(updated["ticket_merge_operation_state"], "ambiguous")
+        self.assertEqual(updated["ticket_merge_survivor_operation_state"], "ambiguous")
+        self.assertTrue(updated.get("reconcile", False))
+
+    def test_linear_ticket_merge_observes_submitted_survivor_without_resubmitting(
+        self,
+    ) -> None:
+        closing = encode_merge_closing(
+            (
+                MergeClosingTicket(
+                    "API-80",
+                    "b" * 32,
+                    issue_id="issue-id-api-80",
+                    terminal_state_id="state-done",
+                    terminal_state_name="Done",
+                ),
+            )
+        )
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "merge API-79 and API-80",
+                "trusted_utterance": "merge API-79 and API-80",
+                "issue_provider": "linear",
+                "issue_key": "API-79",
+                "linear_ticket_merge_requested": True,
+                "ticket_merge_confirmed": True,
+                "ticket_merge_survivor": "API-79",
+                "ticket_merge_snapshots": encode_merge_snapshots(
+                    _linear_merge_snapshots()
+                ),
+                "ticket_merge_survivor_title": "Combined auth",
+                "ticket_merge_survivor_body": "Handle login and invoices.",
+                "ticket_merge_survivor_marker": "a" * 32,
+                "ticket_merge_survivor_issue_id": "issue-id-api-79",
+                "ticket_merge_survivor_operation_state": "submitted",
+                "ticket_merge_closing": closing,
+                "ticket_merge_operation_state": "planned",
+                "status": "queued",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        provider = linear.LinearIntegration()
+        updated_ticket = LinearTicketUpdateResult(
+            LinearIssue("API-79"),
+            "https://linear.app/acme/issue/API-79/combined",
+            "Combined auth",
+            "a" * 32,
+        )
+        closed = LinearTicketCloseResult(
+            LinearIssue("API-80"),
+            "https://linear.app/acme/issue/API-80/billing",
+            "b" * 32,
+        )
+
+        def submit_close(*_args: object, **kwargs: object) -> LinearTicketCloseResult:
+            before_submit = kwargs["before_submit"]
+            accepted = kwargs["accepted"]
+            assert callable(before_submit)
+            assert callable(accepted)
+            before_submit("voice-router", "router-session", "prompt-token", 8)
+            accepted()
+            return closed
+
+        herdr = mock.Mock()
+        with (
+            mock.patch.object(jobs, "HerdrClient", return_value=herdr),
+            mock.patch.object(
+                production_jobs,
+                "issue_provider",
+                return_value=provider,
+            ),
+            mock.patch.object(
+                provider,
+                "ticket_snapshot",
+                side_effect=_linear_merge_snapshots(),
+            ),
+            mock.patch.object(
+                provider,
+                "submit_ticket_update",
+            ) as update,
+            mock.patch.object(
+                provider,
+                "observe_ticket_update",
+                return_value=updated_ticket,
+            ),
+            mock.patch.object(
+                provider,
+                "submit_ticket_close",
+                side_effect=submit_close,
+            ),
+            mock.patch.object(
+                provider,
+                "observe_ticket_close",
+                return_value=closed,
+            ),
+        ):
+            service.run_worker("123456789abc")
+
+        updated = jobs.read_job("123456789abc")
+        self.assertEqual(updated["status"], "completed")
+        update.assert_not_called()
+
     def test_only_trusted_affirmative_reply_confirms_fork(self) -> None:
         job = {
             "id": "123456789abc",
@@ -4706,8 +7418,18 @@ class CursorJobStateTests(unittest.TestCase):
             github_pr_merge_number=None,
             github_repo_create_requested=False,
             github_repo_create_org_requested=False,
+            github_issue_update_requested=False,
+            github_issue_close_requested=False,
+            github_issue_split_requested=False,
+            github_issue_merge_requested=False,
             linear_team=None,
             linear_ticket_create_requested=False,
+            linear_ticket_update_requested=False,
+            linear_ticket_close_requested=False,
+            linear_ticket_split_requested=False,
+            linear_ticket_merge_requested=False,
+            ticket_merge_survivor=None,
+            ticket_merge_closing=None,
             fork_requested=False,
             github_pull_request=None,
             agent=None,

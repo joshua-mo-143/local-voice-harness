@@ -51,6 +51,19 @@ from ..questions import (
     observe_question_prompt,
     replan_question_prompt,
 )
+from ..ticket_merge import (
+    decode_merge_closing,
+    encode_merge_closing,
+    merge_result_message,
+    replace_merge_closing,
+)
+from ..ticket_split import (
+    decode_split_children,
+    encode_split_children,
+    replace_split_child,
+    split_parent_identity,
+    split_result_message,
+)
 from ..user_config import default_user_config
 from . import questions as question_adapter
 from .agent_outbox import (
@@ -1073,6 +1086,740 @@ def reconcile_uncertain_linear_ticket_creation(
     store.update(job.id, reconcile)
 
 
+def reconcile_uncertain_issue_update(
+    store: JobStore,
+    job: CursorJob,
+    *,
+    now: float,
+    github_factory: GitHubFactory = GitHubClient,
+) -> None:
+    states = frozenset({"submitting", "submitted", "ambiguous"})
+    if job.github_issue_update_operation_state not in states:
+        return
+    repository = job.github_repository or ""
+    number = job.github_issue
+    title = job.github_issue_update_title or ""
+    body = job.github_issue_update_body or ""
+    marker = job.github_issue_update_marker
+    if number is None:
+        return
+    try:
+        github = _github_provider(github_factory)
+        plan = github.plan_issue_update(
+            repository,
+            number,
+            title,
+            body,
+            correlation_marker=marker,
+        )
+        result = github.observe_issue_update(plan)
+    except GitHubError:
+        result = None
+
+    def reconcile(current: CursorJob) -> CursorJob | None:
+        if current.github_issue_update_operation_state not in states:
+            return None
+        if result is None:
+            message = (
+                "GitHub issue update could not be reconciled automatically. "
+                "Check the issue before trying again."
+            )
+            return current.evolve_recovery(
+                now=now,
+                status=JobStatus.BLOCKED,
+                github_issue_update_operation_state="manual_required",
+                result=message,
+                completed_at=now,
+                reconcile=False,
+                worker_operation=None,
+                worker_pid=None,
+                worker_boot_id=None,
+                worker_process_start=None,
+                worker_token=None,
+                prepare_delivery=True,
+            )
+        return current.evolve_recovery(
+            now=now,
+            status=JobStatus.COMPLETED,
+            github_issue_update_operation_state="created",
+            result=f"Updated GitHub issue {result.issue.reference}: {result.url}",
+            completed_at=now,
+            reconcile=False,
+            worker_operation=None,
+            worker_pid=None,
+            worker_boot_id=None,
+            worker_process_start=None,
+            worker_token=None,
+            prepare_delivery=True,
+        )
+
+    store.update(job.id, reconcile)
+
+
+def reconcile_uncertain_linear_ticket_update(
+    store: JobStore,
+    job: CursorJob,
+    *,
+    now: float,
+    herdr_factory: HerdrFactory = HerdrClient,
+    linear_factory: LinearFactory | None = None,
+) -> None:
+    states = frozenset({"submitted", "ambiguous"})
+    if job.linear_ticket_update_operation_state not in states:
+        return
+    try:
+        provider = _linear_provider(linear_factory)
+        plan = provider.plan_ticket_update(
+            job.linear_ticket_update_issue_id or "",
+            job.issue_key or "",
+            job.linear_ticket_update_title or "",
+            job.linear_ticket_update_description or "",
+            correlation_marker=job.linear_ticket_update_marker,
+        )
+        result = provider.observe_ticket_update(herdr_factory(), plan)
+    except (HarnessError, LinearError):
+        return
+
+    def reconcile(current: CursorJob) -> CursorJob | None:
+        if current.linear_ticket_update_operation_state not in states:
+            return None
+        if result is None:
+            message = (
+                "Linear ticket update could not be reconciled automatically. "
+                "Check the ticket before trying again."
+            )
+            return current.evolve_recovery(
+                now=now,
+                status=JobStatus.BLOCKED,
+                linear_ticket_update_operation_state="manual_required",
+                result=message,
+                completed_at=now,
+                reconcile=False,
+                worker_operation=None,
+                worker_pid=None,
+                worker_boot_id=None,
+                worker_process_start=None,
+                worker_token=None,
+                prepare_delivery=True,
+            )
+        return current.evolve_recovery(
+            now=now,
+            status=JobStatus.COMPLETED,
+            linear_ticket_update_operation_state="created",
+            result=f"Updated Linear ticket {result.issue.identifier}: {result.url}",
+            completed_at=now,
+            reconcile=False,
+            worker_operation=None,
+            worker_pid=None,
+            worker_boot_id=None,
+            worker_process_start=None,
+            worker_token=None,
+            prepare_delivery=True,
+        )
+
+    store.update(job.id, reconcile)
+
+
+def reconcile_uncertain_issue_close(
+    store: JobStore,
+    job: CursorJob,
+    *,
+    now: float,
+    github_factory: GitHubFactory = GitHubClient,
+) -> None:
+    states = frozenset({"submitting", "submitted", "ambiguous"})
+    if job.github_issue_close_operation_state not in states:
+        return
+    repository = job.github_repository or ""
+    number = job.github_issue
+    marker = job.github_issue_close_marker
+    if number is None:
+        return
+    try:
+        github = _github_provider(github_factory)
+        plan = github.plan_issue_close(
+            repository,
+            number,
+            correlation_marker=marker,
+        )
+        result = github.observe_issue_close(plan)
+    except GitHubError:
+        result = None
+
+    def reconcile(current: CursorJob) -> CursorJob | None:
+        if current.github_issue_close_operation_state not in states:
+            return None
+        if result is None:
+            message = (
+                "GitHub issue close could not be reconciled automatically. "
+                "Check the issue before trying again."
+            )
+            return current.evolve_recovery(
+                now=now,
+                status=JobStatus.BLOCKED,
+                github_issue_close_operation_state="manual_required",
+                result=message,
+                completed_at=now,
+                reconcile=False,
+                worker_operation=None,
+                worker_pid=None,
+                worker_boot_id=None,
+                worker_process_start=None,
+                worker_token=None,
+                prepare_delivery=True,
+            )
+        return current.evolve_recovery(
+            now=now,
+            status=JobStatus.COMPLETED,
+            github_issue_close_operation_state="created",
+            result=f"Closed GitHub issue {result.issue.reference}: {result.url}",
+            completed_at=now,
+            reconcile=False,
+            worker_operation=None,
+            worker_pid=None,
+            worker_boot_id=None,
+            worker_process_start=None,
+            worker_token=None,
+            prepare_delivery=True,
+        )
+
+    store.update(job.id, reconcile)
+
+
+def reconcile_uncertain_linear_ticket_close(
+    store: JobStore,
+    job: CursorJob,
+    *,
+    now: float,
+    herdr_factory: HerdrFactory = HerdrClient,
+    linear_factory: LinearFactory | None = None,
+) -> None:
+    states = frozenset({"submitted", "ambiguous"})
+    if job.linear_ticket_close_operation_state not in states:
+        return
+    try:
+        provider = _linear_provider(linear_factory)
+        plan = provider.plan_ticket_close(
+            job.linear_ticket_close_issue_id or "",
+            job.issue_key or "",
+            job.linear_ticket_close_terminal_state_id or "",
+            job.linear_ticket_close_terminal_state_name or "",
+            correlation_marker=job.linear_ticket_close_marker,
+        )
+        result = provider.observe_ticket_close(herdr_factory(), plan)
+    except (HarnessError, LinearError):
+        return
+
+    def reconcile(current: CursorJob) -> CursorJob | None:
+        if current.linear_ticket_close_operation_state not in states:
+            return None
+        if result is None:
+            message = (
+                "Linear ticket close could not be reconciled automatically. "
+                "Check the ticket before trying again."
+            )
+            return current.evolve_recovery(
+                now=now,
+                status=JobStatus.BLOCKED,
+                linear_ticket_close_operation_state="manual_required",
+                result=message,
+                completed_at=now,
+                reconcile=False,
+                worker_operation=None,
+                worker_pid=None,
+                worker_boot_id=None,
+                worker_process_start=None,
+                worker_token=None,
+                prepare_delivery=True,
+            )
+        return current.evolve_recovery(
+            now=now,
+            status=JobStatus.COMPLETED,
+            linear_ticket_close_operation_state="created",
+            result=f"Closed Linear ticket {result.issue.identifier}: {result.url}",
+            completed_at=now,
+            reconcile=False,
+            worker_operation=None,
+            worker_pid=None,
+            worker_boot_id=None,
+            worker_process_start=None,
+            worker_token=None,
+            prepare_delivery=True,
+        )
+
+    store.update(job.id, reconcile)
+
+
+def reconcile_uncertain_ticket_split(
+    store: JobStore,
+    job: CursorJob,
+    *,
+    now: float,
+    github_factory: GitHubFactory = GitHubClient,
+    herdr_factory: HerdrFactory = HerdrClient,
+    linear_factory: LinearFactory | None = None,
+) -> None:
+    states = frozenset({"submitting", "submitted", "ambiguous"})
+    if not (job.github_issue_split_requested or job.linear_ticket_split_requested) or (
+        job.ticket_split_operation_state not in states
+        and job.ticket_split_parent_operation_state not in states
+    ):
+        return
+    children = decode_split_children(job.ticket_split_children)
+    parent = split_parent_identity(
+        github_repository=job.github_repository,
+        github_issue=job.github_issue,
+        issue_key=job.issue_key,
+    )
+    in_flight_index = next(
+        (index for index, child in enumerate(children) if child.state in states),
+        None,
+    )
+    observed_ref: str | None = None
+    observed_url: str | None = None
+    parent_observed = False
+    try:
+        if in_flight_index is not None:
+            child = children[in_flight_index]
+            if job.github_issue_split_requested:
+                github = _github_provider(github_factory)
+                plan = github.plan_issue_creation(
+                    job.github_repository or "",
+                    child.title,
+                    child.body,
+                    correlation_marker=child.marker,
+                )
+                result = github.observe_issue_creation(plan)
+                if result is not None:
+                    observed_ref = result.issue.reference
+                    observed_url = result.url
+            else:
+                provider = _linear_provider(linear_factory)
+                plan = provider.plan_ticket_creation(
+                    job.ticket_split_team_id or "",
+                    job.ticket_split_team or "",
+                    child.title,
+                    child.body,
+                    correlation_marker=child.marker,
+                )
+                result = provider.observe_ticket_creation(herdr_factory(), plan)
+                if result is not None:
+                    observed_ref = result.issue.identifier
+                    observed_url = result.url
+        elif job.ticket_split_parent_operation_state in states:
+            if job.github_issue_split_requested:
+                github = _github_provider(github_factory)
+                if job.ticket_split_parent_action == "update":
+                    plan = github.plan_issue_update(
+                        job.github_repository or "",
+                        job.github_issue or 0,
+                        job.ticket_split_parent_title or "",
+                        job.ticket_split_parent_body or "",
+                        correlation_marker=job.ticket_split_parent_marker,
+                    )
+                    parent_observed = github.observe_issue_update(plan) is not None
+                else:
+                    plan = github.plan_issue_close(
+                        job.github_repository or "",
+                        job.github_issue or 0,
+                        correlation_marker=job.ticket_split_parent_marker,
+                    )
+                    parent_observed = github.observe_issue_close(plan) is not None
+            else:
+                provider = _linear_provider(linear_factory)
+                if job.ticket_split_parent_action == "update":
+                    plan = provider.plan_ticket_update(
+                        job.ticket_split_parent_issue_id or "",
+                        job.issue_key or "",
+                        job.ticket_split_parent_title or "",
+                        job.ticket_split_parent_body or "",
+                        correlation_marker=job.ticket_split_parent_marker,
+                    )
+                    parent_observed = (
+                        provider.observe_ticket_update(herdr_factory(), plan)
+                        is not None
+                    )
+                else:
+                    plan = provider.plan_ticket_close(
+                        job.ticket_split_parent_issue_id or "",
+                        job.issue_key or "",
+                        job.ticket_split_parent_terminal_state_id or "",
+                        job.ticket_split_parent_terminal_state_name or "",
+                        correlation_marker=job.ticket_split_parent_marker,
+                    )
+                    parent_observed = (
+                        provider.observe_ticket_close(herdr_factory(), plan) is not None
+                    )
+    except (GitHubError, HarnessError, LinearError):
+        return
+
+    def reconcile(current: CursorJob) -> CursorJob | None:
+        if not (
+            current.github_issue_split_requested
+            or current.linear_ticket_split_requested
+        ):
+            return None
+        current_children = decode_split_children(current.ticket_split_children)
+        current_index = next(
+            (
+                index
+                for index, child in enumerate(current_children)
+                if child.state in states
+            ),
+            None,
+        )
+        if in_flight_index is not None:
+            if current_index != in_flight_index:
+                return None
+            if observed_ref is None:
+                updated = replace_split_child(
+                    current_children,
+                    in_flight_index,
+                    state="manual_required",
+                )
+                message = split_result_message(
+                    parent,
+                    updated,
+                    parent_action=current.ticket_split_parent_action or "none",
+                    parent_state=current.ticket_split_parent_operation_state,
+                )
+                return current.evolve_recovery(
+                    now=now,
+                    status=JobStatus.BLOCKED,
+                    ticket_split_children=encode_split_children(updated),
+                    ticket_split_operation_state="manual_required",
+                    result=(
+                        f"{message} Ticket split could not be reconciled "
+                        "automatically. Check the created children before trying again."
+                    ),
+                    completed_at=now,
+                    reconcile=False,
+                    worker_operation=None,
+                    worker_pid=None,
+                    worker_boot_id=None,
+                    worker_process_start=None,
+                    worker_token=None,
+                    prepare_delivery=True,
+                )
+            updated = replace_split_child(
+                current_children,
+                in_flight_index,
+                state="created",
+                created_ref=observed_ref,
+                created_url=observed_url,
+            )
+            remaining = any(child.state == "planned" for child in updated)
+            parent_pending = (
+                current.ticket_split_parent_action or "none"
+            ) != "none" and current.ticket_split_parent_operation_state != "created"
+            if remaining or parent_pending:
+                return current.evolve(
+                    status=JobStatus.QUEUED,
+                    queued_at=now,
+                    ticket_split_children=encode_split_children(updated),
+                    ticket_split_operation_state="planned",
+                    reconcile=False,
+                    worker_operation=None,
+                    worker_pid=None,
+                    worker_boot_id=None,
+                    worker_process_start=None,
+                    worker_token=None,
+                )
+            message = split_result_message(
+                parent,
+                updated,
+                parent_action=current.ticket_split_parent_action or "none",
+                parent_state=current.ticket_split_parent_operation_state,
+            )
+            return current.evolve_recovery(
+                now=now,
+                status=JobStatus.COMPLETED,
+                ticket_split_children=encode_split_children(updated),
+                ticket_split_operation_state="created",
+                result=message,
+                completed_at=now,
+                reconcile=False,
+                worker_operation=None,
+                worker_pid=None,
+                worker_boot_id=None,
+                worker_process_start=None,
+                worker_token=None,
+                prepare_delivery=True,
+            )
+        if current.ticket_split_parent_operation_state not in states:
+            return None
+        if not parent_observed:
+            message = split_result_message(
+                parent,
+                current_children,
+                parent_action=current.ticket_split_parent_action or "none",
+                parent_state="manual_required",
+            )
+            return current.evolve_recovery(
+                now=now,
+                status=JobStatus.BLOCKED,
+                ticket_split_parent_operation_state="manual_required",
+                ticket_split_operation_state="manual_required",
+                result=(
+                    f"{message} Ticket split could not be reconciled "
+                    "automatically. Check the parent ticket before trying again."
+                ),
+                completed_at=now,
+                reconcile=False,
+                worker_operation=None,
+                worker_pid=None,
+                worker_boot_id=None,
+                worker_process_start=None,
+                worker_token=None,
+                prepare_delivery=True,
+            )
+        message = split_result_message(
+            parent,
+            current_children,
+            parent_action=current.ticket_split_parent_action or "none",
+            parent_state="created",
+        )
+        return current.evolve_recovery(
+            now=now,
+            status=JobStatus.COMPLETED,
+            ticket_split_parent_operation_state="created",
+            ticket_split_operation_state="created",
+            result=message,
+            completed_at=now,
+            reconcile=False,
+            worker_operation=None,
+            worker_pid=None,
+            worker_boot_id=None,
+            worker_process_start=None,
+            worker_token=None,
+            prepare_delivery=True,
+        )
+
+    store.update(job.id, reconcile)
+
+
+def reconcile_uncertain_ticket_merge(
+    store: JobStore,
+    job: CursorJob,
+    *,
+    now: float,
+    github_factory: GitHubFactory = GitHubClient,
+    herdr_factory: HerdrFactory = HerdrClient,
+    linear_factory: LinearFactory | None = None,
+) -> None:
+    states = frozenset({"submitting", "submitted", "ambiguous"})
+    if not (job.github_issue_merge_requested or job.linear_ticket_merge_requested) or (
+        job.ticket_merge_operation_state not in states
+        and job.ticket_merge_survivor_operation_state not in states
+    ):
+        return
+    closing = decode_merge_closing(job.ticket_merge_closing)
+    survivor = job.ticket_merge_survivor or "the ticket"
+    in_flight_index = next(
+        (index for index, ticket in enumerate(closing) if ticket.state in states),
+        None,
+    )
+    observed_close = False
+    survivor_observed = False
+    try:
+        if in_flight_index is not None:
+            ticket = closing[in_flight_index]
+            if job.github_issue_merge_requested:
+                github = _github_provider(github_factory)
+                plan = github.plan_issue_close(
+                    ticket.repository or job.github_repository or "",
+                    ticket.number or 0,
+                    correlation_marker=ticket.marker,
+                )
+                observed_close = github.observe_issue_close(plan) is not None
+            else:
+                provider = _linear_provider(linear_factory)
+                plan = provider.plan_ticket_close(
+                    ticket.issue_id or "",
+                    ticket.identity,
+                    ticket.terminal_state_id or "",
+                    ticket.terminal_state_name or "",
+                    correlation_marker=ticket.marker,
+                )
+                observed_close = (
+                    provider.observe_ticket_close(herdr_factory(), plan) is not None
+                )
+        elif job.ticket_merge_survivor_operation_state in states:
+            if job.github_issue_merge_requested:
+                github = _github_provider(github_factory)
+                plan = github.plan_issue_update(
+                    job.github_repository or "",
+                    job.github_issue or 0,
+                    job.ticket_merge_survivor_title or "",
+                    job.ticket_merge_survivor_body or "",
+                    correlation_marker=job.ticket_merge_survivor_marker,
+                )
+                survivor_observed = github.observe_issue_update(plan) is not None
+            else:
+                provider = _linear_provider(linear_factory)
+                plan = provider.plan_ticket_update(
+                    job.ticket_merge_survivor_issue_id or "",
+                    job.issue_key or survivor,
+                    job.ticket_merge_survivor_title or "",
+                    job.ticket_merge_survivor_body or "",
+                    correlation_marker=job.ticket_merge_survivor_marker,
+                )
+                survivor_observed = (
+                    provider.observe_ticket_update(herdr_factory(), plan) is not None
+                )
+    except (GitHubError, HarnessError, LinearError):
+        return
+
+    def reconcile(current: CursorJob) -> CursorJob | None:
+        if not (
+            current.github_issue_merge_requested
+            or current.linear_ticket_merge_requested
+        ):
+            return None
+        current_closing = decode_merge_closing(current.ticket_merge_closing)
+        current_index = next(
+            (
+                index
+                for index, ticket in enumerate(current_closing)
+                if ticket.state in states
+            ),
+            None,
+        )
+        if in_flight_index is not None:
+            if current_index != in_flight_index:
+                return None
+            if not observed_close:
+                updated = replace_merge_closing(
+                    current_closing,
+                    in_flight_index,
+                    state="manual_required",
+                )
+                message = merge_result_message(
+                    survivor,
+                    updated,
+                    survivor_state=current.ticket_merge_survivor_operation_state,
+                )
+                return current.evolve_recovery(
+                    now=now,
+                    status=JobStatus.BLOCKED,
+                    ticket_merge_closing=encode_merge_closing(updated),
+                    ticket_merge_operation_state="manual_required",
+                    result=(
+                        f"{message} Ticket merge could not be reconciled "
+                        "automatically. Check the landed writes before trying again."
+                    ),
+                    completed_at=now,
+                    reconcile=False,
+                    worker_operation=None,
+                    worker_pid=None,
+                    worker_boot_id=None,
+                    worker_process_start=None,
+                    worker_token=None,
+                    prepare_delivery=True,
+                )
+            updated = replace_merge_closing(
+                current_closing,
+                in_flight_index,
+                state="created",
+            )
+            remaining = any(ticket.state == "planned" for ticket in updated)
+            if remaining:
+                return current.evolve(
+                    status=JobStatus.QUEUED,
+                    queued_at=now,
+                    ticket_merge_closing=encode_merge_closing(updated),
+                    ticket_merge_operation_state="planned",
+                    reconcile=False,
+                    worker_operation=None,
+                    worker_pid=None,
+                    worker_boot_id=None,
+                    worker_process_start=None,
+                    worker_token=None,
+                )
+            message = merge_result_message(
+                survivor,
+                updated,
+                survivor_state=current.ticket_merge_survivor_operation_state,
+            )
+            return current.evolve_recovery(
+                now=now,
+                status=JobStatus.COMPLETED,
+                ticket_merge_closing=encode_merge_closing(updated),
+                ticket_merge_operation_state="created",
+                result=message,
+                completed_at=now,
+                reconcile=False,
+                worker_operation=None,
+                worker_pid=None,
+                worker_boot_id=None,
+                worker_process_start=None,
+                worker_token=None,
+                prepare_delivery=True,
+            )
+        if current.ticket_merge_survivor_operation_state not in states:
+            return None
+        if not survivor_observed:
+            message = merge_result_message(
+                survivor,
+                current_closing,
+                survivor_state="manual_required",
+            )
+            return current.evolve_recovery(
+                now=now,
+                status=JobStatus.BLOCKED,
+                ticket_merge_survivor_operation_state="manual_required",
+                ticket_merge_operation_state="manual_required",
+                result=(
+                    f"{message} Ticket merge could not be reconciled "
+                    "automatically. Check the survivor before trying again."
+                ),
+                completed_at=now,
+                reconcile=False,
+                worker_operation=None,
+                worker_pid=None,
+                worker_boot_id=None,
+                worker_process_start=None,
+                worker_token=None,
+                prepare_delivery=True,
+            )
+        remaining = any(ticket.state == "planned" for ticket in current_closing)
+        if remaining:
+            return current.evolve(
+                status=JobStatus.QUEUED,
+                queued_at=now,
+                ticket_merge_survivor_operation_state="created",
+                ticket_merge_operation_state="planned",
+                reconcile=False,
+                worker_operation=None,
+                worker_pid=None,
+                worker_boot_id=None,
+                worker_process_start=None,
+                worker_token=None,
+            )
+        message = merge_result_message(
+            survivor,
+            current_closing,
+            survivor_state="created",
+        )
+        return current.evolve_recovery(
+            now=now,
+            status=JobStatus.COMPLETED,
+            ticket_merge_survivor_operation_state="created",
+            ticket_merge_operation_state="created",
+            result=message,
+            completed_at=now,
+            reconcile=False,
+            worker_operation=None,
+            worker_pid=None,
+            worker_boot_id=None,
+            worker_process_start=None,
+            worker_token=None,
+            prepare_delivery=True,
+        )
+
+    store.update(job.id, reconcile)
+
+
 def reconcile_uncertain_worktree(
     store: JobStore,
     job: CursorJob,
@@ -1261,6 +2008,54 @@ def reconcile_uncertain_operations(
     )
     current = store.get(job.id)
     reconcile_uncertain_clone(store, current, now=now, github_factory=github_factory)
+    current = store.get(job.id)
+    reconcile_uncertain_issue_update(
+        store,
+        current,
+        now=now,
+        github_factory=github_factory,
+    )
+    current = store.get(job.id)
+    reconcile_uncertain_linear_ticket_update(
+        store,
+        current,
+        now=now,
+        herdr_factory=herdr_factory,
+        linear_factory=linear_factory,
+    )
+    current = store.get(job.id)
+    reconcile_uncertain_issue_close(
+        store,
+        current,
+        now=now,
+        github_factory=github_factory,
+    )
+    current = store.get(job.id)
+    reconcile_uncertain_linear_ticket_close(
+        store,
+        current,
+        now=now,
+        herdr_factory=herdr_factory,
+        linear_factory=linear_factory,
+    )
+    current = store.get(job.id)
+    reconcile_uncertain_ticket_split(
+        store,
+        current,
+        now=now,
+        github_factory=github_factory,
+        herdr_factory=herdr_factory,
+        linear_factory=linear_factory,
+    )
+    current = store.get(job.id)
+    reconcile_uncertain_ticket_merge(
+        store,
+        current,
+        now=now,
+        github_factory=github_factory,
+        herdr_factory=herdr_factory,
+        linear_factory=linear_factory,
+    )
     current = store.get(job.id)
     reconcile_uncertain_fork(store, current, now=now, github_factory=github_factory)
     current = store.get(job.id)

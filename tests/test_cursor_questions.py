@@ -34,6 +34,8 @@ from local_voice_harness.questions import (
     resolve_answer,
 )
 from local_voice_harness.responses import as_assistant_response
+from local_voice_harness.ticket_merge import MergeClosingTicket, encode_merge_closing
+from local_voice_harness.ticket_split import SplitChild, encode_split_children
 
 
 @pytest.fixture
@@ -386,6 +388,317 @@ def _repo_create_org_awaiting(store: JobStore) -> CursorJob:
                 "voice_question": pending.to_dict(),
                 "github_repo_create_requested": True,
                 "github_repo_create_org_requested": True,
+            }
+        )
+    )
+
+
+def _issue_update_awaiting(store: JobStore) -> CursorJob:
+    pending = replace(
+        _question(sensitivity=QuestionSensitivity.DESTRUCTIVE),
+        text="Update GitHub issue example/project#12?",
+        owner="github_issue_update_confirmation",
+    )
+    return store.create(
+        CursorJob.from_dict(
+            {
+                "id": "aaaaaaaaaaaa",
+                "request": "update this issue",
+                "trusted_utterance": "update this issue",
+                "status": JobStatus.AWAITING_USER.value,
+                "created_at": 1,
+                "updated_at": 10,
+                "delivered": True,
+                "question": pending.text,
+                "result": pending.text,
+                "clarification_kind": pending.owner,
+                "turn": 1,
+                "turn_token": pending.origin.turn_token,
+                "voice_question": pending.to_dict(),
+                "issue_provider": "github",
+                "github_repository": "example/project",
+                "github_issue": 12,
+                "github_issue_update_requested": True,
+                "github_issue_update_title": "Fix startup",
+                "github_issue_update_body": "Startup fails.",
+                "github_issue_update_marker": "a" * 32,
+                "github_issue_update_operation_state": "planned",
+            }
+        )
+    )
+
+
+def _linear_update_awaiting(store: JobStore) -> CursorJob:
+    pending = replace(
+        _question(sensitivity=QuestionSensitivity.DESTRUCTIVE),
+        text="Update Linear ticket API-79?",
+        owner="linear_ticket_update_confirmation",
+    )
+    return store.create(
+        CursorJob.from_dict(
+            {
+                "id": "aaaaaaaaaaaa",
+                "request": "update this Linear ticket",
+                "trusted_utterance": "update this Linear ticket",
+                "status": JobStatus.AWAITING_USER.value,
+                "created_at": 1,
+                "updated_at": 10,
+                "delivered": True,
+                "question": pending.text,
+                "result": pending.text,
+                "clarification_kind": pending.owner,
+                "turn": 1,
+                "turn_token": pending.origin.turn_token,
+                "voice_question": pending.to_dict(),
+                "issue_provider": "linear",
+                "issue_key": "API-79",
+                "linear_ticket_update_requested": True,
+                "linear_ticket_update_issue_id": "issue-id-api-79",
+                "linear_ticket_update_title": "Fix startup",
+                "linear_ticket_update_description": "Startup fails.",
+                "linear_ticket_update_marker": "a" * 32,
+                "linear_ticket_update_operation_state": "planned",
+            }
+        )
+    )
+
+
+def _issue_close_awaiting(store: JobStore) -> CursorJob:
+    pending = replace(
+        _question(sensitivity=QuestionSensitivity.DESTRUCTIVE),
+        text="Close example/project#12?",
+        owner="github_issue_close_confirmation",
+    )
+    return store.create(
+        CursorJob.from_dict(
+            {
+                "id": "aaaaaaaaaaaa",
+                "request": "close this issue",
+                "trusted_utterance": "close this issue",
+                "status": JobStatus.AWAITING_USER.value,
+                "created_at": 1,
+                "updated_at": 10,
+                "delivered": True,
+                "question": pending.text,
+                "result": pending.text,
+                "clarification_kind": pending.owner,
+                "turn": 1,
+                "turn_token": pending.origin.turn_token,
+                "voice_question": pending.to_dict(),
+                "issue_provider": "github",
+                "github_repository": "example/project",
+                "github_issue": 12,
+                "github_issue_close_requested": True,
+                "github_issue_close_marker": "a" * 32,
+                "github_issue_close_operation_state": "planned",
+            }
+        )
+    )
+
+
+def _linear_close_awaiting(store: JobStore) -> CursorJob:
+    pending = replace(
+        _question(sensitivity=QuestionSensitivity.DESTRUCTIVE),
+        text="Close API-79?",
+        owner="linear_ticket_close_confirmation",
+    )
+    return store.create(
+        CursorJob.from_dict(
+            {
+                "id": "aaaaaaaaaaaa",
+                "request": "close this Linear ticket",
+                "trusted_utterance": "close this Linear ticket",
+                "status": JobStatus.AWAITING_USER.value,
+                "created_at": 1,
+                "updated_at": 10,
+                "delivered": True,
+                "question": pending.text,
+                "result": pending.text,
+                "clarification_kind": pending.owner,
+                "turn": 1,
+                "turn_token": pending.origin.turn_token,
+                "voice_question": pending.to_dict(),
+                "issue_provider": "linear",
+                "issue_key": "API-79",
+                "linear_ticket_close_requested": True,
+                "linear_ticket_close_issue_id": "issue-id-api-79",
+                "linear_ticket_close_marker": "a" * 32,
+                "linear_ticket_close_operation_state": "planned",
+            }
+        )
+    )
+
+
+def _issue_split_awaiting(store: JobStore) -> CursorJob:
+    pending = replace(
+        _question(sensitivity=QuestionSensitivity.DESTRUCTIVE),
+        text="Create 2 issues and close example/project#12?",
+        owner="github_issue_split_confirmation",
+    )
+    return store.create(
+        CursorJob.from_dict(
+            {
+                "id": "aaaaaaaaaaaa",
+                "request": "split this issue",
+                "trusted_utterance": "split this issue",
+                "status": JobStatus.AWAITING_USER.value,
+                "created_at": 1,
+                "updated_at": 10,
+                "delivered": True,
+                "question": pending.text,
+                "result": pending.text,
+                "clarification_kind": pending.owner,
+                "turn": 1,
+                "turn_token": pending.origin.turn_token,
+                "voice_question": pending.to_dict(),
+                "issue_provider": "github",
+                "github_repository": "example/project",
+                "github_issue": 12,
+                "github_issue_split_requested": True,
+                "ticket_split_children": encode_split_children(
+                    (
+                        SplitChild("Auth", "Handle login.", "a" * 32),
+                        SplitChild("Billing", "Handle invoices.", "b" * 32),
+                    )
+                ),
+                "ticket_split_parent_action": "close",
+                "ticket_split_parent_marker": "c" * 32,
+                "ticket_split_parent_operation_state": "planned",
+                "ticket_split_operation_state": "planned",
+            }
+        )
+    )
+
+
+def _linear_split_awaiting(store: JobStore) -> CursorJob:
+    pending = replace(
+        _question(sensitivity=QuestionSensitivity.DESTRUCTIVE),
+        text="Create 2 issues and close API-79?",
+        owner="linear_ticket_split_confirmation",
+    )
+    return store.create(
+        CursorJob.from_dict(
+            {
+                "id": "aaaaaaaaaaaa",
+                "request": "split this Linear ticket",
+                "trusted_utterance": "split this Linear ticket",
+                "status": JobStatus.AWAITING_USER.value,
+                "created_at": 1,
+                "updated_at": 10,
+                "delivered": True,
+                "question": pending.text,
+                "result": pending.text,
+                "clarification_kind": pending.owner,
+                "turn": 1,
+                "turn_token": pending.origin.turn_token,
+                "voice_question": pending.to_dict(),
+                "issue_provider": "linear",
+                "issue_key": "API-79",
+                "linear_ticket_split_requested": True,
+                "ticket_split_parent_issue_id": "issue-id-api-79",
+                "ticket_split_children": encode_split_children(
+                    (
+                        SplitChild("Auth", "Handle login.", "a" * 32),
+                        SplitChild("Billing", "Handle invoices.", "b" * 32),
+                    )
+                ),
+                "ticket_split_parent_action": "close",
+                "ticket_split_parent_marker": "c" * 32,
+                "ticket_split_parent_operation_state": "planned",
+                "ticket_split_operation_state": "planned",
+                "ticket_split_team": "API",
+                "ticket_split_team_id": "team-api",
+            }
+        )
+    )
+
+
+def _issue_merge_awaiting(store: JobStore) -> CursorJob:
+    pending = replace(
+        _question(sensitivity=QuestionSensitivity.DESTRUCTIVE),
+        text="Update example/project#12 and close example/project#13?",
+        owner="github_issue_merge_confirmation",
+    )
+    return store.create(
+        CursorJob.from_dict(
+            {
+                "id": "aaaaaaaaaaaa",
+                "request": "merge these issues",
+                "trusted_utterance": "merge these issues",
+                "status": JobStatus.AWAITING_USER.value,
+                "created_at": 1,
+                "updated_at": 10,
+                "delivered": True,
+                "question": pending.text,
+                "result": pending.text,
+                "clarification_kind": pending.owner,
+                "turn": 1,
+                "turn_token": pending.origin.turn_token,
+                "voice_question": pending.to_dict(),
+                "issue_provider": "github",
+                "github_repository": "example/project",
+                "github_issue": 12,
+                "github_issue_merge_requested": True,
+                "ticket_merge_survivor": "example/project#12",
+                "ticket_merge_survivor_title": "Combined auth",
+                "ticket_merge_survivor_body": "Handle login and invoices.",
+                "ticket_merge_survivor_marker": "a" * 32,
+                "ticket_merge_survivor_operation_state": "planned",
+                "ticket_merge_closing": encode_merge_closing(
+                    (
+                        MergeClosingTicket(
+                            "example/project#13",
+                            "b" * 32,
+                            repository="example/project",
+                            number=13,
+                        ),
+                    )
+                ),
+                "ticket_merge_operation_state": "planned",
+            }
+        )
+    )
+
+
+def _linear_merge_awaiting(store: JobStore) -> CursorJob:
+    pending = replace(
+        _question(sensitivity=QuestionSensitivity.DESTRUCTIVE),
+        text="Update API-79 and close API-80?",
+        owner="linear_ticket_merge_confirmation",
+    )
+    return store.create(
+        CursorJob.from_dict(
+            {
+                "id": "aaaaaaaaaaaa",
+                "request": "merge these Linear tickets",
+                "trusted_utterance": "merge these Linear tickets",
+                "status": JobStatus.AWAITING_USER.value,
+                "created_at": 1,
+                "updated_at": 10,
+                "delivered": True,
+                "question": pending.text,
+                "result": pending.text,
+                "clarification_kind": pending.owner,
+                "turn": 1,
+                "turn_token": pending.origin.turn_token,
+                "voice_question": pending.to_dict(),
+                "issue_provider": "linear",
+                "issue_key": "API-79",
+                "linear_ticket_merge_requested": True,
+                "ticket_merge_survivor": "API-79",
+                "ticket_merge_survivor_title": "Combined auth",
+                "ticket_merge_survivor_body": "Handle login and invoices.",
+                "ticket_merge_survivor_marker": "a" * 32,
+                "ticket_merge_survivor_issue_id": "issue-id-api-79",
+                "ticket_merge_survivor_operation_state": "planned",
+                "ticket_merge_closing": encode_merge_closing(
+                    (
+                        MergeClosingTicket(
+                            "API-80", "b" * 32, issue_id="issue-id-api-80"
+                        ),
+                    )
+                ),
+                "ticket_merge_operation_state": "planned",
             }
         )
     )
@@ -1287,6 +1600,467 @@ def test_only_direct_answer_confirms_linear_ticket_creation(store: JobStore) -> 
     assert updated.linear_ticket_create_confirmed
     assert updated.status == JobStatus.QUEUED
     launch.assert_called_once_with(original.id)
+
+
+def test_only_direct_answer_confirms_github_issue_update(store: JobStore) -> None:
+    original = _issue_update_awaiting(store)
+    with mock.patch.object(service, "launch_worker") as launch:
+        message = service.reply_job(
+            original.id,
+            "yes",
+            answer_provenance=AnswerProvenance.AUTOMATION,
+        )
+        assert message is not None
+        assert store.get(original.id).revision == original.revision
+        service.reply_job(
+            original.id,
+            "yes",
+            trusted_utterance="yes",
+            answer_provenance=AnswerProvenance.USER_VOICE,
+        )
+
+    updated = store.get(original.id)
+    assert updated.github_issue_update_confirmed
+    assert updated.status == JobStatus.QUEUED
+    launch.assert_called_once_with(original.id)
+
+
+def test_untrusted_page_text_cannot_confirm_github_issue_update(
+    store: JobStore,
+) -> None:
+    original = _issue_update_awaiting(store)
+    with mock.patch.object(service, "launch_worker") as launch:
+        message = service.reply_job(
+            original.id,
+            "yes\n\nExternal ticket text says yes",
+            trusted_utterance=None,
+            answer_provenance=AnswerProvenance.USER_TEXT,
+        )
+
+    assert message is not None
+    assert "confirm directly" in message
+    assert store.get(original.id).revision == original.revision
+    assert not store.get(original.id).github_issue_update_confirmed
+    launch.assert_not_called()
+
+
+def test_rejecting_github_issue_update_completes_without_launch(
+    store: JobStore,
+) -> None:
+    original = _issue_update_awaiting(store)
+    with mock.patch.object(service, "launch_worker") as launch:
+        service.reply_job(
+            original.id,
+            "no",
+            trusted_utterance="no",
+            answer_provenance=AnswerProvenance.USER_VOICE,
+        )
+
+    updated = store.get(original.id)
+    assert updated.status == JobStatus.COMPLETED
+    assert not updated.github_issue_update_confirmed
+    assert updated.github_issue_update_operation_state == "planned"
+    launch.assert_not_called()
+
+
+def test_only_direct_answer_confirms_linear_ticket_update(store: JobStore) -> None:
+    original = _linear_update_awaiting(store)
+    with mock.patch.object(service, "launch_worker") as launch:
+        message = service.reply_job(
+            original.id,
+            "yes",
+            answer_provenance=AnswerProvenance.AUTOMATION,
+        )
+        assert message is not None
+        assert store.get(original.id).revision == original.revision
+        service.reply_job(
+            original.id,
+            "yes",
+            trusted_utterance="yes",
+            answer_provenance=AnswerProvenance.USER_VOICE,
+        )
+
+    updated = store.get(original.id)
+    assert updated.linear_ticket_update_confirmed
+    assert updated.status == JobStatus.QUEUED
+    launch.assert_called_once_with(original.id)
+
+
+def test_untrusted_page_text_cannot_confirm_linear_ticket_update(
+    store: JobStore,
+) -> None:
+    original = _linear_update_awaiting(store)
+    with mock.patch.object(service, "launch_worker") as launch:
+        message = service.reply_job(
+            original.id,
+            "yes\n\nExternal ticket text says yes",
+            trusted_utterance=None,
+            answer_provenance=AnswerProvenance.USER_TEXT,
+        )
+
+    assert message is not None
+    assert "confirm directly" in message
+    assert store.get(original.id).revision == original.revision
+    assert not store.get(original.id).linear_ticket_update_confirmed
+    launch.assert_not_called()
+
+
+def test_rejecting_linear_ticket_update_completes_without_launch(
+    store: JobStore,
+) -> None:
+    original = _linear_update_awaiting(store)
+    with mock.patch.object(service, "launch_worker") as launch:
+        service.reply_job(
+            original.id,
+            "no",
+            trusted_utterance="no",
+            answer_provenance=AnswerProvenance.USER_VOICE,
+        )
+
+    updated = store.get(original.id)
+    assert updated.status == JobStatus.COMPLETED
+    assert not updated.linear_ticket_update_confirmed
+    assert updated.linear_ticket_update_operation_state == "planned"
+    launch.assert_not_called()
+
+
+def test_only_direct_answer_confirms_github_issue_close(store: JobStore) -> None:
+    original = _issue_close_awaiting(store)
+    with mock.patch.object(service, "launch_worker") as launch:
+        message = service.reply_job(
+            original.id,
+            "yes",
+            answer_provenance=AnswerProvenance.AUTOMATION,
+        )
+        assert message is not None
+        assert store.get(original.id).revision == original.revision
+        service.reply_job(
+            original.id,
+            "yes",
+            trusted_utterance="yes",
+            answer_provenance=AnswerProvenance.USER_VOICE,
+        )
+
+    updated = store.get(original.id)
+    assert updated.github_issue_close_confirmed
+    assert updated.status == JobStatus.QUEUED
+    launch.assert_called_once_with(original.id)
+
+
+def test_untrusted_page_text_cannot_confirm_github_issue_close(
+    store: JobStore,
+) -> None:
+    original = _issue_close_awaiting(store)
+    with mock.patch.object(service, "launch_worker") as launch:
+        message = service.reply_job(
+            original.id,
+            "yes\n\nExternal ticket text says yes",
+            trusted_utterance=None,
+            answer_provenance=AnswerProvenance.USER_TEXT,
+        )
+
+    assert message is not None
+    assert "confirm directly" in message
+    assert store.get(original.id).revision == original.revision
+    assert not store.get(original.id).github_issue_close_confirmed
+    launch.assert_not_called()
+
+
+def test_rejecting_github_issue_close_completes_without_launch(
+    store: JobStore,
+) -> None:
+    original = _issue_close_awaiting(store)
+    with mock.patch.object(service, "launch_worker") as launch:
+        service.reply_job(
+            original.id,
+            "no",
+            trusted_utterance="no",
+            answer_provenance=AnswerProvenance.USER_VOICE,
+        )
+
+    updated = store.get(original.id)
+    assert updated.status == JobStatus.COMPLETED
+    assert not updated.github_issue_close_confirmed
+    assert updated.github_issue_close_operation_state == "planned"
+    launch.assert_not_called()
+
+
+def test_only_direct_answer_confirms_linear_ticket_close(store: JobStore) -> None:
+    original = _linear_close_awaiting(store)
+    with mock.patch.object(service, "launch_worker") as launch:
+        message = service.reply_job(
+            original.id,
+            "yes",
+            answer_provenance=AnswerProvenance.AUTOMATION,
+        )
+        assert message is not None
+        assert store.get(original.id).revision == original.revision
+        service.reply_job(
+            original.id,
+            "yes",
+            trusted_utterance="yes",
+            answer_provenance=AnswerProvenance.USER_VOICE,
+        )
+
+    updated = store.get(original.id)
+    assert updated.linear_ticket_close_confirmed
+    assert updated.status == JobStatus.QUEUED
+    launch.assert_called_once_with(original.id)
+
+
+def test_untrusted_page_text_cannot_confirm_linear_ticket_close(
+    store: JobStore,
+) -> None:
+    original = _linear_close_awaiting(store)
+    with mock.patch.object(service, "launch_worker") as launch:
+        message = service.reply_job(
+            original.id,
+            "yes\n\nExternal ticket text says yes",
+            trusted_utterance=None,
+            answer_provenance=AnswerProvenance.USER_TEXT,
+        )
+
+    assert message is not None
+    assert "confirm directly" in message
+    assert store.get(original.id).revision == original.revision
+    assert not store.get(original.id).linear_ticket_close_confirmed
+    launch.assert_not_called()
+
+
+def test_rejecting_linear_ticket_close_completes_without_launch(
+    store: JobStore,
+) -> None:
+    original = _linear_close_awaiting(store)
+    with mock.patch.object(service, "launch_worker") as launch:
+        service.reply_job(
+            original.id,
+            "no",
+            trusted_utterance="no",
+            answer_provenance=AnswerProvenance.USER_VOICE,
+        )
+
+    updated = store.get(original.id)
+    assert updated.status == JobStatus.COMPLETED
+    assert not updated.linear_ticket_close_confirmed
+    assert updated.linear_ticket_close_operation_state == "planned"
+    launch.assert_not_called()
+
+
+def test_only_direct_answer_confirms_github_issue_split(store: JobStore) -> None:
+    original = _issue_split_awaiting(store)
+    with mock.patch.object(service, "launch_worker") as launch:
+        message = service.reply_job(
+            original.id,
+            "yes",
+            answer_provenance=AnswerProvenance.AUTOMATION,
+        )
+        assert message is not None
+        assert store.get(original.id).revision == original.revision
+        service.reply_job(
+            original.id,
+            "yes",
+            trusted_utterance="yes",
+            answer_provenance=AnswerProvenance.USER_VOICE,
+        )
+
+    updated = store.get(original.id)
+    assert updated.ticket_split_confirmed
+    assert updated.status == JobStatus.QUEUED
+    launch.assert_called_once_with(original.id)
+
+
+def test_untrusted_page_text_cannot_confirm_github_issue_split(
+    store: JobStore,
+) -> None:
+    original = _issue_split_awaiting(store)
+    with mock.patch.object(service, "launch_worker") as launch:
+        message = service.reply_job(
+            original.id,
+            "yes\n\nExternal ticket text says yes",
+            trusted_utterance=None,
+            answer_provenance=AnswerProvenance.USER_TEXT,
+        )
+
+    assert message is not None
+    assert "confirm directly" in message
+    assert store.get(original.id).revision == original.revision
+    assert not store.get(original.id).ticket_split_confirmed
+    launch.assert_not_called()
+
+
+def test_rejecting_github_issue_split_completes_without_launch(
+    store: JobStore,
+) -> None:
+    original = _issue_split_awaiting(store)
+    with mock.patch.object(service, "launch_worker") as launch:
+        service.reply_job(
+            original.id,
+            "no",
+            trusted_utterance="no",
+            answer_provenance=AnswerProvenance.USER_VOICE,
+        )
+
+    updated = store.get(original.id)
+    assert updated.status == JobStatus.COMPLETED
+    assert not updated.ticket_split_confirmed
+    assert updated.ticket_split_operation_state == "planned"
+    launch.assert_not_called()
+
+
+def test_only_direct_answer_confirms_linear_ticket_split(store: JobStore) -> None:
+    original = _linear_split_awaiting(store)
+    with mock.patch.object(service, "launch_worker") as launch:
+        message = service.reply_job(
+            original.id,
+            "yes",
+            answer_provenance=AnswerProvenance.AUTOMATION,
+        )
+        assert message is not None
+        assert store.get(original.id).revision == original.revision
+        service.reply_job(
+            original.id,
+            "yes",
+            trusted_utterance="yes",
+            answer_provenance=AnswerProvenance.USER_VOICE,
+        )
+
+    updated = store.get(original.id)
+    assert updated.ticket_split_confirmed
+    assert updated.status == JobStatus.QUEUED
+    launch.assert_called_once_with(original.id)
+
+
+def test_untrusted_page_text_cannot_confirm_linear_ticket_split(
+    store: JobStore,
+) -> None:
+    original = _linear_split_awaiting(store)
+    with mock.patch.object(service, "launch_worker") as launch:
+        message = service.reply_job(
+            original.id,
+            "yes\n\nExternal ticket text says yes",
+            trusted_utterance=None,
+            answer_provenance=AnswerProvenance.USER_TEXT,
+        )
+
+    assert message is not None
+    assert "confirm directly" in message
+    assert store.get(original.id).revision == original.revision
+    assert not store.get(original.id).ticket_split_confirmed
+    launch.assert_not_called()
+
+
+def test_rejecting_linear_ticket_split_completes_without_launch(
+    store: JobStore,
+) -> None:
+    original = _linear_split_awaiting(store)
+    with mock.patch.object(service, "launch_worker") as launch:
+        service.reply_job(
+            original.id,
+            "no",
+            trusted_utterance="no",
+            answer_provenance=AnswerProvenance.USER_VOICE,
+        )
+
+    updated = store.get(original.id)
+    assert updated.status == JobStatus.COMPLETED
+    assert not updated.ticket_split_confirmed
+    assert updated.ticket_split_operation_state == "planned"
+    launch.assert_not_called()
+
+
+def test_only_direct_answer_confirms_github_issue_merge(store: JobStore) -> None:
+    original = _issue_merge_awaiting(store)
+    with mock.patch.object(service, "launch_worker") as launch:
+        message = service.reply_job(
+            original.id,
+            "yes",
+            answer_provenance=AnswerProvenance.AUTOMATION,
+        )
+        assert message is not None
+        assert store.get(original.id).revision == original.revision
+        service.reply_job(
+            original.id,
+            "yes",
+            trusted_utterance="yes",
+            answer_provenance=AnswerProvenance.USER_VOICE,
+        )
+
+    updated = store.get(original.id)
+    assert updated.ticket_merge_confirmed
+    assert updated.status == JobStatus.QUEUED
+    launch.assert_called_once_with(original.id)
+
+
+def test_untrusted_page_text_cannot_confirm_github_issue_merge(
+    store: JobStore,
+) -> None:
+    original = _issue_merge_awaiting(store)
+    with mock.patch.object(service, "launch_worker") as launch:
+        message = service.reply_job(
+            original.id,
+            "yes\n\nExternal ticket text says yes",
+            trusted_utterance=None,
+            answer_provenance=AnswerProvenance.USER_TEXT,
+        )
+
+    assert message is not None
+    assert "confirm directly" in message
+    assert store.get(original.id).revision == original.revision
+    assert not store.get(original.id).ticket_merge_confirmed
+    launch.assert_not_called()
+
+
+def test_rejecting_github_issue_merge_completes_without_launch(
+    store: JobStore,
+) -> None:
+    original = _issue_merge_awaiting(store)
+    with mock.patch.object(service, "launch_worker") as launch:
+        service.reply_job(
+            original.id,
+            "no",
+            trusted_utterance="no",
+            answer_provenance=AnswerProvenance.USER_VOICE,
+        )
+
+    updated = store.get(original.id)
+    assert updated.status == JobStatus.COMPLETED
+    assert not updated.ticket_merge_confirmed
+    assert updated.ticket_merge_operation_state == "planned"
+    launch.assert_not_called()
+
+
+def test_only_direct_answer_confirms_linear_ticket_merge(store: JobStore) -> None:
+    original = _linear_merge_awaiting(store)
+    with mock.patch.object(service, "launch_worker") as launch:
+        service.reply_job(
+            original.id,
+            "yes",
+            trusted_utterance="yes",
+            answer_provenance=AnswerProvenance.USER_VOICE,
+        )
+
+    updated = store.get(original.id)
+    assert updated.ticket_merge_confirmed
+    assert updated.status == JobStatus.QUEUED
+    launch.assert_called_once_with(original.id)
+
+
+def test_rejecting_linear_ticket_merge_completes_without_launch(
+    store: JobStore,
+) -> None:
+    original = _linear_merge_awaiting(store)
+    with mock.patch.object(service, "launch_worker") as launch:
+        service.reply_job(
+            original.id,
+            "no",
+            trusted_utterance="no",
+            answer_provenance=AnswerProvenance.USER_VOICE,
+        )
+
+    updated = store.get(original.id)
+    assert updated.status == JobStatus.COMPLETED
+    assert not updated.ticket_merge_confirmed
+    launch.assert_not_called()
 
 
 def test_rejecting_linear_ticket_creation_completes_without_launch(

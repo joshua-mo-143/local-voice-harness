@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import fcntl
+import json
 import re
 import shutil
 import subprocess
@@ -19,6 +20,12 @@ from urllib.parse import SplitResult, urlsplit
 from ..config import DURABLE_STATE_DIR
 from ..context_fragment import ContextFragment
 from ..errors import HarnessError
+from ..ticket_snapshot import (
+    MAX_SNAPSHOT_BODY_CHARS,
+    MAX_SNAPSHOT_REVISION_CHARS,
+    MAX_SNAPSHOT_TITLE_CHARS,
+    TicketSnapshot,
+)
 from .herdr import HerdrError, agent_session_identity, extract_marker
 from .herdr.cursor_auth import CursorMcpAuthError, CursorMcpAuthLinker
 
@@ -96,6 +103,13 @@ class LinearTeam:
 
 
 @dataclass(frozen=True)
+class LinearWorkflowState:
+    id: str
+    name: str
+    type: str
+
+
+@dataclass(frozen=True)
 class LinearTicketCreationPlan:
     team_id: str
     team_key: str
@@ -106,6 +120,41 @@ class LinearTicketCreationPlan:
 
 @dataclass(frozen=True)
 class LinearTicketCreationResult:
+    issue: LinearIssue
+    url: str
+    correlation_marker: str
+
+
+@dataclass(frozen=True)
+class LinearTicketUpdatePlan:
+    issue_id: str
+    identifier: str
+    title: str
+    description: str
+    correlation_marker: str
+    update_title: bool = True
+    update_description: bool = True
+
+
+@dataclass(frozen=True)
+class LinearTicketUpdateResult:
+    issue: LinearIssue
+    url: str
+    title: str
+    correlation_marker: str
+
+
+@dataclass(frozen=True)
+class LinearTicketClosePlan:
+    issue_id: str
+    identifier: str
+    terminal_state_id: str
+    terminal_state_name: str
+    correlation_marker: str
+
+
+@dataclass(frozen=True)
+class LinearTicketCloseResult:
     issue: LinearIssue
     url: str
     correlation_marker: str
@@ -398,6 +447,90 @@ class LinearIntegration:
 
     def canonicalize_issue_reference(self, reference: str) -> str:
         return reference.strip().upper()
+
+    def ticket_snapshot(
+        self,
+        client: CreationClient,
+        reference: str,
+        *,
+        checkpoint: Any = None,
+    ) -> TicketSnapshot:
+        """Fetch and identity-check the current Linear issue fields."""
+
+        identifier = self.canonicalize_issue_reference(reference)
+        if not self.owns_issue_reference(identifier):
+            raise LinearError("Linear ticket snapshot requires an exact issue identity")
+        self.require_capabilities()
+        token = f"linear-snapshot-{uuid.uuid4().hex[:12]}"
+        with _router_owner(checkpoint):
+            try:
+                router = client.ensure_router(set(), checkpoint=checkpoint)
+                outcome = client.prompt_and_wait(
+                    router.target,
+                    (
+                        "Use configured Linear MCP tools read-only. Fetch exactly one "
+                        f"issue whose identifier is {identifier}. Do not create or "
+                        "modify anything. If and only if the returned issue identifier "
+                        "matches exactly, return one compact single-line JSON object "
+                        "with keys identifier, id, title, description, url, updatedAt, "
+                        f"and state after this marker:\nVOICE_LINEAR_SNAPSHOT[{token}]: "
+                        "<json>\nIf the issue is absent, ambiguous, incomplete, or has "
+                        "a different identifier, return no snapshot marker."
+                    ),
+                    token=token,
+                    timeout=180,
+                    checkpoint=checkpoint,
+                )
+            except HerdrError as exc:
+                raise LinearError(
+                    f"I couldn't fetch Linear ticket {identifier}."
+                ) from exc
+        payload = extract_marker(outcome.output, "VOICE_LINEAR_SNAPSHOT", token)
+        try:
+            value = json.loads(payload or "")
+        except json.JSONDecodeError as exc:
+            raise LinearError("Linear MCP returned an invalid ticket snapshot") from exc
+        if not isinstance(value, dict):
+            raise LinearError("Linear MCP returned an invalid ticket snapshot")
+        returned = value.get("identifier")
+        issue_id = value.get("id")
+        title = value.get("title")
+        body = value.get("description")
+        url = value.get("url")
+        revision = value.get("updatedAt")
+        state = value.get("state")
+        issue = linear_issue_from_url(url) if isinstance(url, str) else None
+        if (
+            not isinstance(returned, str)
+            or self.canonicalize_issue_reference(returned) != identifier
+            or issue is None
+            or issue.identifier != identifier
+            or not isinstance(issue_id, str)
+            or not issue_id.strip()
+            or len(issue_id.strip()) > 128
+            or re.search(r"[\s\x00-\x1f]", issue_id) is not None
+            or not isinstance(title, str)
+            or not title.strip()
+            or not isinstance(body, str)
+            or not isinstance(url, str)
+            or not isinstance(revision, str)
+            or not revision.strip()
+            or not isinstance(state, str)
+            or len(title.strip()) > MAX_SNAPSHOT_TITLE_CHARS
+            or len(body) > MAX_SNAPSHOT_BODY_CHARS
+            or len(revision.strip()) > MAX_SNAPSHOT_REVISION_CHARS
+        ):
+            raise LinearError("Linear MCP returned an invalid ticket snapshot")
+        return TicketSnapshot(
+            provider=self.name,
+            identity=identifier,
+            provider_id=issue_id.strip(),
+            title=title.strip(),
+            body=body,
+            revision=revision.strip(),
+            url=url.strip(),
+            state=state.strip(),
+        )
 
     @staticmethod
     def validate_team(team: str) -> str:
@@ -777,6 +910,607 @@ class LinearIntegration:
         if identifier is None or url is None:
             raise LinearError("Linear MCP returned an incomplete ticket observation")
         return self._creation_result(plan, identifier, url)
+
+    @classmethod
+    def validate_ticket_update_plan(
+        cls,
+        plan: LinearTicketUpdatePlan,
+    ) -> LinearTicketUpdatePlan:
+        identifier = plan.identifier.strip().upper()
+        if LINEAR_IDENTIFIER.fullmatch(identifier) is None:
+            raise LinearError("Linear ticket update requires a valid identifier")
+        issue_id = plan.issue_id.strip()
+        if not isinstance(plan.description, str):
+            raise LinearError("Linear ticket update description must be text")
+        title = " ".join(plan.title.split())
+        description = plan.description
+        marker = plan.correlation_marker.strip()
+        if (
+            not issue_id
+            or len(issue_id) > 128
+            or re.search(r"[\s\x00-\x1f]", issue_id) is not None
+        ):
+            raise LinearError("Linear ticket update requires a valid issue ID")
+        if not title or len(title) > 255:
+            raise LinearError("Linear ticket update requires a bounded title")
+        if len(description) > 10_000:
+            raise LinearError("Linear ticket update requires a bounded description")
+        if not re.fullmatch(r"[0-9a-f]{32}", marker):
+            raise LinearError("Linear ticket update marker is invalid")
+        if not isinstance(plan.update_title, bool) or not isinstance(
+            plan.update_description, bool
+        ):
+            raise LinearError("Linear ticket update field selection is invalid")
+        if not plan.update_title and not plan.update_description:
+            raise LinearError("Linear ticket update must change at least one field")
+        return LinearTicketUpdatePlan(
+            issue_id,
+            identifier,
+            title,
+            description,
+            marker,
+            plan.update_title,
+            plan.update_description,
+        )
+
+    def plan_ticket_update(
+        self,
+        issue_id: str,
+        identifier: str,
+        title: str,
+        description: str,
+        *,
+        correlation_marker: str | None = None,
+        update_title: bool = True,
+        update_description: bool = True,
+    ) -> LinearTicketUpdatePlan:
+        return self.validate_ticket_update_plan(
+            LinearTicketUpdatePlan(
+                issue_id,
+                identifier,
+                title,
+                description,
+                correlation_marker or uuid.uuid4().hex,
+                update_title,
+                update_description,
+            )
+        )
+
+    def resolve_issue_for_update(
+        self,
+        client: CreationClient,
+        identifier: str,
+        *,
+        checkpoint: Any = None,
+    ) -> tuple[str, LinearIssue]:
+        identifier = self.canonicalize_issue_reference(identifier)
+        self.require_capabilities()
+        token = f"linear-issue-{uuid.uuid4().hex[:12]}"
+        with _router_owner(checkpoint):
+            try:
+                router = client.ensure_router(set(), checkpoint=checkpoint)
+                outcome = client.prompt_and_wait(
+                    router.target,
+                    (
+                        "Use configured Linear MCP tools read-only. Resolve exactly one "
+                        f"issue whose identifier is {identifier}. Do not create or "
+                        "modify anything. Return exactly one status. If exactly one "
+                        "issue matches:\n"
+                        f"VOICE_LINEAR_STATUS[{token}]: found\n"
+                        f"VOICE_LINEAR_ISSUE_ID[{token}]: <immutable issue ID>\n"
+                        f"VOICE_LINEAR_IDENTIFIER[{token}]: <identifier>\n"
+                        f"VOICE_LINEAR_URL[{token}]: <https URL>\n"
+                        "If none match:\n"
+                        f"VOICE_LINEAR_STATUS[{token}]: not_found\n"
+                        "If multiple match or resolution is incomplete:\n"
+                        f"VOICE_LINEAR_STATUS[{token}]: ambiguous"
+                    ),
+                    token=token,
+                    timeout=180,
+                    checkpoint=checkpoint,
+                )
+            except HerdrError as exc:
+                raise LinearError(
+                    f"I couldn't find Linear ticket {identifier}."
+                ) from exc
+        status = extract_marker(outcome.output, "VOICE_LINEAR_STATUS", token)
+        if status != "found":
+            raise LinearError(f"I couldn't find Linear ticket {identifier}.")
+        issue_id = extract_marker(outcome.output, "VOICE_LINEAR_ISSUE_ID", token)
+        returned = extract_marker(outcome.output, "VOICE_LINEAR_IDENTIFIER", token)
+        url = extract_marker(outcome.output, "VOICE_LINEAR_URL", token)
+        if (
+            issue_id is None
+            or returned is None
+            or url is None
+            or self.canonicalize_issue_reference(returned) != identifier
+        ):
+            raise LinearError("Linear MCP returned an invalid ticket identity")
+        issue = linear_issue_from_url(url)
+        if issue is None or issue.identifier != identifier:
+            raise LinearError("Linear MCP returned an invalid ticket identity")
+        return issue_id, issue
+
+    def resolve_terminal_state(
+        self,
+        client: CreationClient,
+        identifier: str,
+        *,
+        checkpoint: Any = None,
+    ) -> LinearWorkflowState:
+        """Resolve one configured terminal state for the issue's exact team."""
+
+        identifier = self.canonicalize_issue_reference(identifier)
+        self.require_capabilities()
+        token = f"linear-terminal-state-{uuid.uuid4().hex[:12]}"
+        with _router_owner(checkpoint):
+            try:
+                router = client.ensure_router(set(), checkpoint=checkpoint)
+                outcome = client.prompt_and_wait(
+                    router.target,
+                    (
+                        "Use configured Linear MCP tools read-only. Fetch exactly one "
+                        f"issue whose identifier is {identifier}, then list every "
+                        "workflow state configured for that issue's exact team. Do not "
+                        "create or modify anything. If and only if the issue identity "
+                        "matches exactly and the complete state list was fetched, return "
+                        "one compact single-line JSON object with keys identifier and "
+                        "states after this marker. Each states item must contain only "
+                        "id, name, and type:\n"
+                        f"VOICE_LINEAR_TERMINAL_STATES[{token}]: <json>\n"
+                        "Otherwise return no terminal-states marker."
+                    ),
+                    token=token,
+                    timeout=180,
+                    checkpoint=checkpoint,
+                )
+            except HerdrError as exc:
+                raise LinearError(
+                    f"I couldn't resolve a terminal state for Linear ticket {identifier}."
+                ) from exc
+        payload = extract_marker(
+            outcome.output,
+            "VOICE_LINEAR_TERMINAL_STATES",
+            token,
+        )
+        try:
+            value = json.loads(payload or "")
+        except json.JSONDecodeError as exc:
+            raise LinearError(
+                "Linear MCP returned invalid terminal workflow states"
+            ) from exc
+        if not isinstance(value, dict):
+            raise LinearError("Linear MCP returned invalid terminal workflow states")
+        returned = value.get("identifier")
+        states = value.get("states")
+        if (
+            not isinstance(returned, str)
+            or self.canonicalize_issue_reference(returned) != identifier
+            or not isinstance(states, list)
+            or not states
+            or len(states) > 100
+        ):
+            raise LinearError("Linear MCP returned invalid terminal workflow states")
+        terminal: list[LinearWorkflowState] = []
+        for state in states:
+            if not isinstance(state, dict):
+                raise LinearError(
+                    "Linear MCP returned invalid terminal workflow states"
+                )
+            state_id = state.get("id")
+            name = state.get("name")
+            state_type = state.get("type")
+            if (
+                not isinstance(state_id, str)
+                or not state_id.strip()
+                or len(state_id.strip()) > 128
+                or re.search(r"[\s\x00-\x1f]", state_id) is not None
+                or not isinstance(name, str)
+                or not name.strip()
+                or len(name.strip()) > 200
+                or not isinstance(state_type, str)
+            ):
+                raise LinearError(
+                    "Linear MCP returned invalid terminal workflow states"
+                )
+            normalized_type = state_type.strip().casefold()
+            if normalized_type in {"completed", "canceled"}:
+                terminal.append(
+                    LinearWorkflowState(
+                        state_id.strip(),
+                        " ".join(name.split()),
+                        normalized_type,
+                    )
+                )
+        if not terminal:
+            raise LinearError(
+                f"Linear ticket {identifier} has no configured terminal workflow state."
+            )
+        return min(
+            terminal,
+            key=lambda state: (
+                0 if state.type == "completed" else 1,
+                state.name.casefold(),
+                state.id,
+            ),
+        )
+
+    def _update_result(
+        self,
+        plan: LinearTicketUpdatePlan,
+        identifier: str,
+        url: str,
+    ) -> LinearTicketUpdateResult:
+        issue = linear_issue_from_url(url)
+        canonical = identifier.strip().upper()
+        if (
+            issue is None
+            or issue.identifier != canonical
+            or canonical != plan.identifier
+        ):
+            raise LinearError("Linear MCP returned an invalid updated ticket identity")
+        return LinearTicketUpdateResult(
+            issue, url.strip(), plan.title, plan.correlation_marker
+        )
+
+    def submit_ticket_update(
+        self,
+        client: CreationClient,
+        plan: LinearTicketUpdatePlan,
+        *,
+        confirmed: bool,
+        checkpoint: Any = None,
+        before_submit: Callable[[str, str, str, int], None] | None = None,
+        accepted: Callable[[], None] | None = None,
+    ) -> LinearTicketUpdateResult:
+        if not confirmed:
+            raise LinearError("Linear ticket update requires explicit confirmation")
+        plan = self.validate_ticket_update_plan(plan)
+        self.require_capabilities()
+        token = f"linear-update-{uuid.uuid4().hex[:12]}"
+        with _router_owner(checkpoint):
+            try:
+                router = client.ensure_router(set(), checkpoint=checkpoint)
+                agent = client.get_agent(router.target)
+            except HerdrError as exc:
+                raise LinearError(
+                    "Could not prepare authenticated Linear MCP access"
+                ) from exc
+            session = agent_session_identity(agent.get("agent_session"))
+            if session is None:
+                raise LinearError("Linear MCP router has no durable agent session")
+            baseline = int(agent.get("state_change_seq") or 0)
+            fenced = False
+            prompt_accepted = False
+
+            def persist_fence(observed_baseline: int) -> None:
+                nonlocal fenced
+                if observed_baseline != baseline:
+                    raise LinearOperationAmbiguous(
+                        "Linear MCP router changed before submission"
+                    )
+                if before_submit is not None:
+                    before_submit(router.target, session, token, baseline)
+                fenced = True
+
+            def mark_accepted() -> None:
+                nonlocal prompt_accepted
+                if accepted is not None:
+                    accepted()
+                prompt_accepted = True
+
+            prompt = (
+                "Update exactly one existing Linear issue using the configured Linear "
+                "MCP tools. This is an explicitly confirmed external write. Use only "
+                "the exact bounded values below; do not infer or add fields. Update "
+                "only fields marked yes and omit every field marked no from the MCP "
+                "write. Do not create a new issue.\n\n"
+                f"Immutable issue ID: {plan.issue_id}\n"
+                f"Identifier: {plan.identifier}\n"
+                f"Update title: {'yes' if plan.update_title else 'no'}\n"
+                f"Title: {plan.title}\n"
+                "Update description: "
+                f"{'yes' if plan.update_description else 'no'}\n"
+                f"Description:\n{plan.description}\n\n"
+                "After the MCP call succeeds, return exactly:\n"
+                f"VOICE_LINEAR_IDENTIFIER[{token}]: <updated identifier>\n"
+                f"VOICE_LINEAR_URL[{token}]: <https URL>"
+            )
+            try:
+                outcome = client.prompt_and_wait(
+                    router.target,
+                    prompt,
+                    token=token,
+                    timeout=180,
+                    checkpoint=checkpoint,
+                    expected_agent_session=session,
+                    baseline_sequence=baseline,
+                    before_submit=persist_fence,
+                    accepted=mark_accepted,
+                )
+            except HerdrError as exc:
+                error = (
+                    LinearOperationAmbiguous(
+                        "Linear ticket update outcome is ambiguous"
+                    )
+                    if fenced or prompt_accepted
+                    else LinearError("Linear ticket update was not submitted")
+                )
+                raise error from exc
+
+        identifier = extract_marker(outcome.output, "VOICE_LINEAR_IDENTIFIER", token)
+        url = extract_marker(outcome.output, "VOICE_LINEAR_URL", token)
+        if identifier is None or url is None:
+            raise LinearOperationAmbiguous(
+                "Linear MCP did not return the updated ticket identity"
+            )
+        return self._update_result(plan, identifier, url)
+
+    def observe_ticket_update(
+        self,
+        client: CreationClient,
+        plan: LinearTicketUpdatePlan,
+        *,
+        checkpoint: Any = None,
+    ) -> LinearTicketUpdateResult | None:
+        plan = self.validate_ticket_update_plan(plan)
+        self.require_capabilities()
+        token = f"linear-observe-update-{uuid.uuid4().hex[:12]}"
+        with _router_owner(checkpoint):
+            try:
+                router = client.ensure_router(set(), checkpoint=checkpoint)
+                outcome = client.prompt_and_wait(
+                    router.target,
+                    (
+                        "Use configured Linear MCP tools read-only. Do not create or "
+                        "modify anything. Fetch the issue whose identifier is "
+                        f"{plan.identifier}. Return exactly one status. If that issue "
+                        "exists with title and description exactly equal to these "
+                        f"expected values:\nTitle: {plan.title}\n"
+                        f"Description:\n{plan.description}\n"
+                        f"VOICE_LINEAR_STATUS[{token}]: found\n"
+                        f"VOICE_LINEAR_IDENTIFIER[{token}]: <identifier>\n"
+                        f"VOICE_LINEAR_URL[{token}]: <https URL>\n"
+                        "If either exact field differs:\n"
+                        f"VOICE_LINEAR_STATUS[{token}]: not_found\n"
+                        "If the issue cannot be found:\n"
+                        f"VOICE_LINEAR_STATUS[{token}]: not_found\n"
+                        "If the search cannot be completed:\n"
+                        f"VOICE_LINEAR_STATUS[{token}]: unknown"
+                    ),
+                    token=token,
+                    timeout=180,
+                    checkpoint=checkpoint,
+                )
+            except HerdrError as exc:
+                raise LinearError("Could not observe Linear ticket update") from exc
+
+        status = extract_marker(outcome.output, "VOICE_LINEAR_STATUS", token)
+        if status == "not_found":
+            return None
+        if status != "found":
+            raise LinearError("Linear ticket update could not be observed")
+        identifier = extract_marker(outcome.output, "VOICE_LINEAR_IDENTIFIER", token)
+        url = extract_marker(outcome.output, "VOICE_LINEAR_URL", token)
+        if identifier is None or url is None:
+            raise LinearError("Linear MCP returned an incomplete ticket observation")
+        return self._update_result(plan, identifier, url)
+
+    @classmethod
+    def validate_ticket_close_plan(
+        cls,
+        plan: LinearTicketClosePlan,
+    ) -> LinearTicketClosePlan:
+        identifier = plan.identifier.strip().upper()
+        if LINEAR_IDENTIFIER.fullmatch(identifier) is None:
+            raise LinearError("Linear ticket close requires a valid identifier")
+        issue_id = plan.issue_id.strip()
+        terminal_state_id = plan.terminal_state_id.strip()
+        terminal_state_name = " ".join(plan.terminal_state_name.split())
+        marker = plan.correlation_marker.strip()
+        if (
+            not issue_id
+            or len(issue_id) > 128
+            or re.search(r"[\s\x00-\x1f]", issue_id) is not None
+        ):
+            raise LinearError("Linear ticket close requires a valid issue ID")
+        if (
+            not terminal_state_id
+            or len(terminal_state_id) > 128
+            or re.search(r"[\s\x00-\x1f]", terminal_state_id) is not None
+            or not terminal_state_name
+            or len(terminal_state_name) > 200
+        ):
+            raise LinearError(
+                "Linear ticket close requires a configured terminal state"
+            )
+        if not re.fullmatch(r"[0-9a-f]{32}", marker):
+            raise LinearError("Linear ticket close marker is invalid")
+        return LinearTicketClosePlan(
+            issue_id,
+            identifier,
+            terminal_state_id,
+            terminal_state_name,
+            marker,
+        )
+
+    def plan_ticket_close(
+        self,
+        issue_id: str,
+        identifier: str,
+        terminal_state_id: str,
+        terminal_state_name: str,
+        *,
+        correlation_marker: str | None = None,
+    ) -> LinearTicketClosePlan:
+        return self.validate_ticket_close_plan(
+            LinearTicketClosePlan(
+                issue_id,
+                identifier,
+                terminal_state_id,
+                terminal_state_name,
+                correlation_marker or uuid.uuid4().hex,
+            )
+        )
+
+    def _close_result(
+        self,
+        plan: LinearTicketClosePlan,
+        identifier: str,
+        url: str,
+    ) -> LinearTicketCloseResult:
+        issue = linear_issue_from_url(url)
+        canonical = identifier.strip().upper()
+        if (
+            issue is None
+            or issue.identifier != canonical
+            or canonical != plan.identifier
+        ):
+            raise LinearError("Linear MCP returned an invalid closed ticket identity")
+        return LinearTicketCloseResult(issue, url.strip(), plan.correlation_marker)
+
+    def submit_ticket_close(
+        self,
+        client: CreationClient,
+        plan: LinearTicketClosePlan,
+        *,
+        confirmed: bool,
+        checkpoint: Any = None,
+        before_submit: Callable[[str, str, str, int], None] | None = None,
+        accepted: Callable[[], None] | None = None,
+    ) -> LinearTicketCloseResult:
+        if not confirmed:
+            raise LinearError("Linear ticket close requires explicit confirmation")
+        plan = self.validate_ticket_close_plan(plan)
+        self.require_capabilities()
+        token = f"linear-close-{uuid.uuid4().hex[:12]}"
+        marker = self._ticket_marker(plan.correlation_marker)
+        with _router_owner(checkpoint):
+            try:
+                router = client.ensure_router(set(), checkpoint=checkpoint)
+                agent = client.get_agent(router.target)
+            except HerdrError as exc:
+                raise LinearError(
+                    "Could not prepare authenticated Linear MCP access"
+                ) from exc
+            session = agent_session_identity(agent.get("agent_session"))
+            if session is None:
+                raise LinearError("Linear MCP router has no durable agent session")
+            baseline = int(agent.get("state_change_seq") or 0)
+            fenced = False
+            prompt_accepted = False
+
+            def persist_fence(observed_baseline: int) -> None:
+                nonlocal fenced
+                if observed_baseline != baseline:
+                    raise LinearOperationAmbiguous(
+                        "Linear MCP router changed before submission"
+                    )
+                if before_submit is not None:
+                    before_submit(router.target, session, token, baseline)
+                fenced = True
+
+            def mark_accepted() -> None:
+                nonlocal prompt_accepted
+                if accepted is not None:
+                    accepted()
+                prompt_accepted = True
+
+            prompt = (
+                "Close exactly one existing Linear issue using the configured Linear "
+                "MCP tools. This is an explicitly confirmed external write. Use only "
+                "the exact bounded values below; do not infer or add fields. Do not "
+                "create a new issue. Add a comment whose body is exactly this "
+                f"correlation marker:\n{marker}\n"
+                "Then move that issue to exactly the configured workflow state named "
+                f"{plan.terminal_state_name} whose immutable state ID is "
+                f"{plan.terminal_state_id}. Do not choose any other state.\n\n"
+                f"Immutable issue ID: {plan.issue_id}\n"
+                f"Identifier: {plan.identifier}\n\n"
+                "After the MCP calls succeed, return exactly:\n"
+                f"VOICE_LINEAR_IDENTIFIER[{token}]: <closed identifier>\n"
+                f"VOICE_LINEAR_URL[{token}]: <https URL>"
+            )
+            try:
+                outcome = client.prompt_and_wait(
+                    router.target,
+                    prompt,
+                    token=token,
+                    timeout=180,
+                    checkpoint=checkpoint,
+                    expected_agent_session=session,
+                    baseline_sequence=baseline,
+                    before_submit=persist_fence,
+                    accepted=mark_accepted,
+                )
+            except HerdrError as exc:
+                error = (
+                    LinearOperationAmbiguous("Linear ticket close outcome is ambiguous")
+                    if fenced or prompt_accepted
+                    else LinearError("Linear ticket close was not submitted")
+                )
+                raise error from exc
+
+        identifier = extract_marker(outcome.output, "VOICE_LINEAR_IDENTIFIER", token)
+        url = extract_marker(outcome.output, "VOICE_LINEAR_URL", token)
+        if identifier is None or url is None:
+            raise LinearOperationAmbiguous(
+                "Linear MCP did not return the closed ticket identity"
+            )
+        return self._close_result(plan, identifier, url)
+
+    def observe_ticket_close(
+        self,
+        client: CreationClient,
+        plan: LinearTicketClosePlan,
+        *,
+        checkpoint: Any = None,
+    ) -> LinearTicketCloseResult | None:
+        plan = self.validate_ticket_close_plan(plan)
+        self.require_capabilities()
+        token = f"linear-observe-close-{uuid.uuid4().hex[:12]}"
+        marker = self._ticket_marker(plan.correlation_marker)
+        with _router_owner(checkpoint):
+            try:
+                router = client.ensure_router(set(), checkpoint=checkpoint)
+                outcome = client.prompt_and_wait(
+                    router.target,
+                    (
+                        "Use configured Linear MCP tools read-only. Do not create or "
+                        "modify anything. Fetch the issue whose identifier is "
+                        f"{plan.identifier}. Return exactly one status. If that issue "
+                        "is in the workflow state whose immutable ID is exactly "
+                        f"{plan.terminal_state_id} and a comment or description "
+                        "contains this exact correlation "
+                        f"marker:\n{marker}\n"
+                        f"VOICE_LINEAR_STATUS[{token}]: found\n"
+                        f"VOICE_LINEAR_IDENTIFIER[{token}]: <identifier>\n"
+                        f"VOICE_LINEAR_URL[{token}]: <https URL>\n"
+                        "If the issue exists but is not closed or the marker is "
+                        "absent:\n"
+                        f"VOICE_LINEAR_STATUS[{token}]: not_found\n"
+                        "If the issue cannot be found:\n"
+                        f"VOICE_LINEAR_STATUS[{token}]: not_found\n"
+                        "If the search cannot be completed:\n"
+                        f"VOICE_LINEAR_STATUS[{token}]: unknown"
+                    ),
+                    token=token,
+                    timeout=180,
+                    checkpoint=checkpoint,
+                )
+            except HerdrError as exc:
+                raise LinearError("Could not observe Linear ticket close") from exc
+
+        status = extract_marker(outcome.output, "VOICE_LINEAR_STATUS", token)
+        if status == "not_found":
+            return None
+        if status != "found":
+            raise LinearError("Linear ticket close could not be observed")
+        identifier = extract_marker(outcome.output, "VOICE_LINEAR_IDENTIFIER", token)
+        url = extract_marker(outcome.output, "VOICE_LINEAR_URL", token)
+        if identifier is None or url is None:
+            raise LinearError("Linear MCP returned an incomplete ticket observation")
+        return self._close_result(plan, identifier, url)
 
     def prompt_instructions(self, reference: str) -> tuple[str, ...]:
         if not self.owns_issue_reference(reference):

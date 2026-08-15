@@ -42,7 +42,7 @@ from local_voice_harness.questions import (
     QuestionOrigin,
     QuestionSensitivity,
 )
-from local_voice_harness.responses import AssistantResponse
+from local_voice_harness.responses import AssistantResponse, as_assistant_response
 from local_voice_harness.self_management import (
     ChangePreparation,
     ChangePreparationStatus,
@@ -50,6 +50,7 @@ from local_voice_harness.self_management import (
     SettingKey,
 )
 from local_voice_harness.speech import SpeechRenderer
+from local_voice_harness.ticket_snapshot import TicketSnapshot
 from local_voice_harness.tts.queue import PlaybackQueue, PlaybackRequest
 from local_voice_harness.user_config import default_user_config, load_user_config
 from local_voice_harness.vocabulary import (
@@ -2539,6 +2540,230 @@ class ProcessUtteranceTests(unittest.TestCase):
             wake_daemon.cursor_consultation.applicable_choice_id(
                 wake_daemon.CURSOR_STORE, "oldjob123456"
             )
+        )
+
+    def test_ticket_review_without_identity_asks_which_ticket(self) -> None:
+        daemon = _bare_daemon()
+        played: list[str] = []
+
+        def play(response: AssistantResponse) -> tuple[dict[str, object], None]:
+            rendered = as_assistant_response(response)
+            played.append(rendered.spoken_text)
+            return {"played_text": rendered.spoken_text, "interrupted": False}, None
+
+        with (
+            mock.patch.object(
+                wake_daemon, "transcribe", return_value="review this ticket"
+            ),
+            mock.patch.object(wake_daemon, "start_components"),
+            mock.patch.object(
+                wake_daemon,
+                "request_context",
+                return_value=RequestContext("review this ticket"),
+            ),
+            mock.patch.object(
+                wake_daemon,
+                "route_intent",
+                return_value=IntentRoute(Intent.CURSOR_SUBMIT, "high"),
+            ),
+            mock.patch.object(wake_daemon, "cursor_turn") as cursor_turn,
+            mock.patch.object(wake_daemon, "qwen_turn") as qwen_turn,
+            mock.patch.object(daemon, "play_response", side_effect=play),
+            mock.patch.object(wake_daemon, "notify"),
+        ):
+            daemon.process_utterance(AUDIO_GENERATION, woke=True)
+
+        cursor_turn.assert_not_called()
+        qwen_turn.assert_not_called()
+        self.assertEqual(played, ["Which ticket should I review?"])
+
+    def test_ticket_review_uses_consultation_not_submit(self) -> None:
+        daemon = _bare_daemon()
+        registry = mock.Mock()
+        daemon.integrations = registry
+        client = registry.herdr_client.return_value
+        target = wake_daemon.cursor_consultation.WorkspaceTarget(
+            checkout=Path("/tmp/project"),
+            workspace_id="workspace-1",
+            label="project",
+        )
+        findings = AssistantResponse(
+            spoken_text="Scope is too broad.",
+            display_text="Acceptance criteria mix two children.",
+        )
+        snapshot = TicketSnapshot(
+            "github",
+            "owner/repo#12",
+            "https://github.com/owner/repo/issues/12",
+            "Bound the scope",
+            "fetched body",
+            "2026-08-15T10:00:00Z",
+            "https://github.com/owner/repo/issues/12",
+            "OPEN",
+        )
+        played: list[str] = []
+
+        def play(response: AssistantResponse) -> tuple[dict[str, object], None]:
+            rendered = as_assistant_response(response)
+            played.append(rendered.spoken_text)
+            return {"played_text": rendered.spoken_text, "interrupted": False}, None
+
+        with (
+            mock.patch.object(
+                wake_daemon, "transcribe", return_value="review this ticket"
+            ),
+            mock.patch.object(wake_daemon, "start_components"),
+            mock.patch.object(
+                wake_daemon,
+                "request_context",
+                return_value=RequestContext(
+                    "review this ticket",
+                    focused_issue="owner/repo#12",
+                    focused_repository="owner/repo",
+                    github_issue_context="untrusted body",
+                ),
+            ),
+            mock.patch.object(
+                wake_daemon,
+                "route_intent",
+                return_value=IntentRoute(Intent.CURSOR_SUBMIT, "high"),
+            ),
+            mock.patch.object(
+                wake_daemon.cursor_consultation,
+                "workspace_target",
+                return_value=target,
+            ),
+            mock.patch.object(
+                wake_daemon, "ticket_snapshot", return_value=snapshot
+            ) as fetch,
+            mock.patch.object(
+                wake_daemon.cursor_consultation,
+                "consult_ticket",
+                return_value=findings,
+            ) as consult,
+            mock.patch.object(wake_daemon, "cursor_turn") as cursor_turn,
+            mock.patch.object(wake_daemon, "qwen_turn") as qwen_turn,
+            mock.patch.object(daemon, "play_response", side_effect=play),
+            mock.patch.object(wake_daemon, "notify"),
+        ):
+            daemon.process_utterance(AUDIO_GENERATION, woke=True)
+
+        consult.assert_called_once_with(
+            client,
+            target,
+            "review this ticket",
+            snapshot=snapshot,
+            kind="review",
+            adversarial=False,
+        )
+        fetch.assert_called_once_with(
+            "owner/repo#12",
+            daemon.integrations,
+            provider="github",
+            client=client,
+        )
+        cursor_turn.assert_not_called()
+        qwen_turn.assert_not_called()
+        self.assertEqual(
+            played,
+            [
+                wake_daemon.cursor_consultation.acknowledgement(
+                    "review this ticket"
+                ).spoken_text,
+                "Scope is too broad.",
+            ],
+        )
+        self.assertNotIn("create a new repo", " ".join(played).casefold())
+
+    def test_adversarial_ticket_review_uses_consultation_not_submit(self) -> None:
+        daemon = _bare_daemon()
+        registry = mock.Mock()
+        daemon.integrations = registry
+        client = registry.herdr_client.return_value
+        target = wake_daemon.cursor_consultation.WorkspaceTarget(
+            checkout=Path("/tmp/project"),
+            workspace_id="workspace-1",
+            label="project",
+        )
+        findings = AssistantResponse(
+            spoken_text="Scope mixes two children.",
+            display_text="Acceptance criteria hide a second ticket.",
+        )
+        snapshot = TicketSnapshot(
+            "github",
+            "owner/repo#12",
+            "https://github.com/owner/repo/issues/12",
+            "Bound the scope",
+            "fetched body",
+            "2026-08-15T10:00:00Z",
+            "https://github.com/owner/repo/issues/12",
+            "OPEN",
+        )
+        played: list[str] = []
+
+        def play(response: AssistantResponse) -> tuple[dict[str, object], None]:
+            rendered = as_assistant_response(response)
+            played.append(rendered.spoken_text)
+            return {"played_text": rendered.spoken_text, "interrupted": False}, None
+
+        with (
+            mock.patch.object(
+                wake_daemon,
+                "transcribe",
+                return_value="adversarially review this ticket",
+            ),
+            mock.patch.object(wake_daemon, "start_components"),
+            mock.patch.object(
+                wake_daemon,
+                "request_context",
+                return_value=RequestContext(
+                    "adversarially review this ticket",
+                    focused_issue="owner/repo#12",
+                    focused_repository="owner/repo",
+                    github_issue_context="untrusted body",
+                ),
+            ),
+            mock.patch.object(
+                wake_daemon,
+                "route_intent",
+                return_value=IntentRoute(Intent.CURSOR_SUBMIT, "high"),
+            ),
+            mock.patch.object(
+                wake_daemon.cursor_consultation,
+                "workspace_target",
+                return_value=target,
+            ),
+            mock.patch.object(wake_daemon, "ticket_snapshot", return_value=snapshot),
+            mock.patch.object(
+                wake_daemon.cursor_consultation,
+                "consult_ticket",
+                return_value=findings,
+            ) as consult,
+            mock.patch.object(wake_daemon, "cursor_turn") as cursor_turn,
+            mock.patch.object(wake_daemon, "qwen_turn") as qwen_turn,
+            mock.patch.object(daemon, "play_response", side_effect=play),
+            mock.patch.object(wake_daemon, "notify"),
+        ):
+            daemon.process_utterance(AUDIO_GENERATION, woke=True)
+
+        consult.assert_called_once_with(
+            client,
+            target,
+            "adversarially review this ticket",
+            snapshot=snapshot,
+            kind="review",
+            adversarial=True,
+        )
+        cursor_turn.assert_not_called()
+        qwen_turn.assert_not_called()
+        self.assertEqual(
+            played,
+            [
+                wake_daemon.cursor_consultation.acknowledgement(
+                    "adversarially review this ticket"
+                ).spoken_text,
+                "Scope mixes two children.",
+            ],
         )
 
     def test_pending_question_snapshot_uses_one_store_read(self) -> None:
@@ -7641,6 +7866,250 @@ class CompletedFollowupContextTests(unittest.TestCase):
         cursor_turn.assert_called_once()
         self.assertEqual(cursor_turn.call_args.args[0].action, "submit")
         self.assertIsNone(daemon.completed_followup)
+
+    def test_ticket_update_without_identity_asks_which_ticket(self) -> None:
+        daemon = _bare_daemon()
+        played: list[str] = []
+
+        def play(response: AssistantResponse) -> tuple[dict[str, object], None]:
+            rendered = as_assistant_response(response)
+            played.append(rendered.spoken_text)
+            return {"played_text": rendered.spoken_text, "interrupted": False}, None
+
+        with (
+            mock.patch.object(
+                wake_daemon, "transcribe", return_value="update this ticket title"
+            ),
+            mock.patch.object(wake_daemon, "start_components"),
+            mock.patch.object(
+                wake_daemon,
+                "request_context",
+                return_value=RequestContext("update this ticket title"),
+            ),
+            mock.patch.object(
+                wake_daemon,
+                "route_intent",
+                return_value=IntentRoute(Intent.GITHUB_ISSUE_UPDATE, "high"),
+            ),
+            mock.patch.object(wake_daemon, "cursor_turn") as cursor_turn,
+            mock.patch.object(wake_daemon, "qwen_turn") as qwen_turn,
+            mock.patch.object(daemon, "play_response", side_effect=play),
+            mock.patch.object(wake_daemon, "notify"),
+        ):
+            daemon.process_utterance(AUDIO_GENERATION, woke=True)
+
+        cursor_turn.assert_not_called()
+        qwen_turn.assert_not_called()
+        self.assertEqual(played, ["Which ticket should I update?"])
+
+    def test_ticket_update_dispatches_dedicated_job(self) -> None:
+        daemon = _bare_daemon()
+        cursor_turn = self._run_route(
+            daemon,
+            IntentRoute(Intent.GITHUB_ISSUE_UPDATE, "high"),
+            transcript="update the title of example/project#12",
+        )
+
+        request = cursor_turn.call_args.args[0]
+        self.assertTrue(request.github_issue_update_requested)
+        self.assertEqual(request.github_repository, "example/project")
+        self.assertEqual(request.github_issue, 12)
+        self._last_qwen.assert_not_called()
+
+    def test_low_confidence_ticket_update_does_not_write(self) -> None:
+        daemon = _bare_daemon()
+        cursor_turn = self._run_route(
+            daemon,
+            IntentRoute(Intent.GITHUB_ISSUE_UPDATE, "low"),
+            transcript="update the title of example/project#12",
+        )
+
+        cursor_turn.assert_not_called()
+        self._last_qwen.assert_not_called()
+
+    def test_ticket_close_without_identity_asks_which_ticket(self) -> None:
+        daemon = _bare_daemon()
+        played: list[str] = []
+
+        def play(response: AssistantResponse) -> tuple[dict[str, object], None]:
+            rendered = as_assistant_response(response)
+            played.append(rendered.spoken_text)
+            return {"played_text": rendered.spoken_text, "interrupted": False}, None
+
+        with (
+            mock.patch.object(
+                wake_daemon, "transcribe", return_value="close this ticket"
+            ),
+            mock.patch.object(wake_daemon, "start_components"),
+            mock.patch.object(
+                wake_daemon,
+                "request_context",
+                return_value=RequestContext("close this ticket"),
+            ),
+            mock.patch.object(
+                wake_daemon,
+                "route_intent",
+                return_value=IntentRoute(Intent.GITHUB_ISSUE_CLOSE, "high"),
+            ),
+            mock.patch.object(wake_daemon, "cursor_turn") as cursor_turn,
+            mock.patch.object(wake_daemon, "qwen_turn") as qwen_turn,
+            mock.patch.object(daemon, "play_response", side_effect=play),
+            mock.patch.object(wake_daemon, "notify"),
+        ):
+            daemon.process_utterance(AUDIO_GENERATION, woke=True)
+
+        cursor_turn.assert_not_called()
+        qwen_turn.assert_not_called()
+        self.assertEqual(played, ["Which ticket should I close?"])
+
+    def test_ticket_close_dispatches_dedicated_job(self) -> None:
+        daemon = _bare_daemon()
+        cursor_turn = self._run_route(
+            daemon,
+            IntentRoute(Intent.GITHUB_ISSUE_CLOSE, "high"),
+            transcript="close example/project#12",
+        )
+
+        request = cursor_turn.call_args.args[0]
+        self.assertTrue(request.github_issue_close_requested)
+        self.assertEqual(request.github_repository, "example/project")
+        self.assertEqual(request.github_issue, 12)
+        self._last_qwen.assert_not_called()
+
+    def test_low_confidence_ticket_close_does_not_write(self) -> None:
+        daemon = _bare_daemon()
+        cursor_turn = self._run_route(
+            daemon,
+            IntentRoute(Intent.GITHUB_ISSUE_CLOSE, "low"),
+            transcript="close example/project#12",
+        )
+
+        cursor_turn.assert_not_called()
+        self._last_qwen.assert_not_called()
+
+    def test_ticket_split_without_identity_asks_which_ticket(self) -> None:
+        daemon = _bare_daemon()
+        played: list[str] = []
+
+        def play(response: AssistantResponse) -> tuple[dict[str, object], None]:
+            rendered = as_assistant_response(response)
+            played.append(rendered.spoken_text)
+            return {"played_text": rendered.spoken_text, "interrupted": False}, None
+
+        with (
+            mock.patch.object(
+                wake_daemon,
+                "transcribe",
+                return_value="split this ticket into two issues",
+            ),
+            mock.patch.object(wake_daemon, "start_components"),
+            mock.patch.object(
+                wake_daemon,
+                "request_context",
+                return_value=RequestContext("split this ticket into two issues"),
+            ),
+            mock.patch.object(
+                wake_daemon,
+                "route_intent",
+                return_value=IntentRoute(Intent.GITHUB_ISSUE_SPLIT, "high"),
+            ),
+            mock.patch.object(wake_daemon, "cursor_turn") as cursor_turn,
+            mock.patch.object(wake_daemon, "qwen_turn") as qwen_turn,
+            mock.patch.object(daemon, "play_response", side_effect=play),
+            mock.patch.object(wake_daemon, "notify"),
+        ):
+            daemon.process_utterance(AUDIO_GENERATION, woke=True)
+
+        cursor_turn.assert_not_called()
+        qwen_turn.assert_not_called()
+        self.assertEqual(played, ["Which ticket should I split?"])
+
+    def test_ticket_split_dispatches_dedicated_job(self) -> None:
+        daemon = _bare_daemon()
+        cursor_turn = self._run_route(
+            daemon,
+            IntentRoute(Intent.GITHUB_ISSUE_SPLIT, "high"),
+            transcript="split example/project#12 into two issues",
+        )
+
+        request = cursor_turn.call_args.args[0]
+        self.assertTrue(request.github_issue_split_requested)
+        self.assertEqual(request.github_repository, "example/project")
+        self.assertEqual(request.github_issue, 12)
+        self._last_qwen.assert_not_called()
+
+    def test_low_confidence_ticket_split_does_not_write(self) -> None:
+        daemon = _bare_daemon()
+        cursor_turn = self._run_route(
+            daemon,
+            IntentRoute(Intent.GITHUB_ISSUE_SPLIT, "low"),
+            transcript="split example/project#12 into two issues",
+        )
+
+        cursor_turn.assert_not_called()
+        self._last_qwen.assert_not_called()
+
+    def test_ticket_merge_without_identity_asks_which_tickets(self) -> None:
+        daemon = _bare_daemon()
+        played: list[str] = []
+
+        def play(response: AssistantResponse) -> tuple[dict[str, object], None]:
+            rendered = as_assistant_response(response)
+            played.append(rendered.spoken_text)
+            return {"played_text": rendered.spoken_text, "interrupted": False}, None
+
+        with (
+            mock.patch.object(
+                wake_daemon,
+                "transcribe",
+                return_value="merge these tickets",
+            ),
+            mock.patch.object(wake_daemon, "start_components"),
+            mock.patch.object(
+                wake_daemon,
+                "request_context",
+                return_value=RequestContext("merge these tickets"),
+            ),
+            mock.patch.object(
+                wake_daemon,
+                "route_intent",
+                return_value=IntentRoute(Intent.GITHUB_ISSUE_MERGE, "high"),
+            ),
+            mock.patch.object(wake_daemon, "cursor_turn") as cursor_turn,
+            mock.patch.object(wake_daemon, "qwen_turn") as qwen_turn,
+            mock.patch.object(daemon, "play_response", side_effect=play),
+            mock.patch.object(wake_daemon, "notify"),
+        ):
+            daemon.process_utterance(AUDIO_GENERATION, woke=True)
+
+        cursor_turn.assert_not_called()
+        qwen_turn.assert_not_called()
+        self.assertEqual(played, ["Which tickets should I merge?"])
+
+    def test_ticket_merge_dispatches_dedicated_job(self) -> None:
+        daemon = _bare_daemon()
+        cursor_turn = self._run_route(
+            daemon,
+            IntentRoute(Intent.GITHUB_ISSUE_MERGE, "high"),
+            transcript="merge example/project#12 and example/project#13",
+        )
+
+        request = cursor_turn.call_args.args[0]
+        self.assertTrue(request.github_issue_merge_requested)
+        self.assertEqual(request.github_repository, "example/project")
+        self.assertEqual(request.github_issue, 12)
+        self._last_qwen.assert_not_called()
+
+    def test_low_confidence_ticket_merge_does_not_write(self) -> None:
+        daemon = _bare_daemon()
+        cursor_turn = self._run_route(
+            daemon,
+            IntentRoute(Intent.GITHUB_ISSUE_MERGE, "low"),
+            transcript="merge example/project#12 and example/project#13",
+        )
+
+        cursor_turn.assert_not_called()
+        self._last_qwen.assert_not_called()
 
     def test_github_issue_creation_dispatches_dedicated_job(self) -> None:
         daemon = _bare_daemon()

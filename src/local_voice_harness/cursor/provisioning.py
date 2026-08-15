@@ -23,8 +23,10 @@ from ..integrations.github import (
     GitHubError,
     GitHubForkPlan,
     GitHubIssue,
+    GitHubIssueCloseResult,
     GitHubIssueCreationResult,
     GitHubIssueLookupError,
+    GitHubIssueUpdateResult,
     GitHubMergeQueueArmedError,
     GitHubOperationAmbiguous,
     GitHubPreconditionError,
@@ -54,8 +56,11 @@ from ..integrations.herdr import (
 from ..integrations.linear import (
     LinearError,
     LinearIntegration,
+    LinearIssue,
     LinearOperationAmbiguous,
+    LinearTicketCloseResult,
     LinearTicketCreationResult,
+    LinearTicketUpdateResult,
 )
 from ..integrations.registry import (
     IntegrationRegistry,
@@ -101,6 +106,34 @@ from ..questions import (
     resolve_question_prompt,
     submit_question_prompt,
 )
+from ..ticket_merge import (
+    MergeClosingTicket,
+    TicketMergeDraft,
+    assign_merge_markers,
+    decode_merge_closing,
+    decode_merge_snapshots,
+    draft_ticket_merge,
+    encode_merge_closing,
+    encode_merge_snapshots,
+    merge_preview,
+    merge_result_message,
+    replace_merge_closing,
+)
+from ..ticket_snapshot import TicketSnapshot
+from ..ticket_split import (
+    SplitChild,
+    TicketSplitDraft,
+    assign_split_markers,
+    decode_split_children,
+    draft_ticket_split,
+    encode_split_children,
+    linear_team_key,
+    replace_split_child,
+    split_parent_identity,
+    split_preview,
+    split_result_message,
+)
+from ..ticket_update import draft_ticket_update
 from ..user_config import (
     PlanApprovalMode,
     PlanApprovalPreferences,
@@ -2759,6 +2792,3323 @@ def _run_linear_ticket_creation(
         visible,
         expected_revision=callback_revision,
     )
+
+
+def _finish_github_issue_update(
+    store: JobStore,
+    job_id: str,
+    token: WorkerClaim,
+    result: GitHubIssueUpdateResult,
+    *,
+    expected_revision: int,
+) -> None:
+    def finish(job: CursorJob) -> CursorJob:
+        now = time.time()
+        return job.evolve_for_delivery(
+            now=now,
+            status=JobStatus.COMPLETED,
+            result=f"Updated GitHub issue {result.issue.reference}: {result.url}",
+            completed_at=now,
+            github_issue_update_operation_state="created",
+            worker_pid=None,
+            worker_boot_id=None,
+            worker_process_start=None,
+            worker_token=None,
+            worker_operation=None,
+        )
+
+    _worker_change(
+        store,
+        job_id,
+        token,
+        {JobStatus.ROUTING, JobStatus.RUNNING},
+        finish,
+        expected_revision=expected_revision,
+    )
+
+
+def _snapshot_is_current(
+    snapshot: TicketSnapshot,
+    *,
+    base_title: str | None,
+    base_body: str | None,
+    base_revision: str | None,
+) -> bool:
+    return (
+        base_title is not None
+        and base_body is not None
+        and base_revision is not None
+        and snapshot.title == base_title
+        and snapshot.body == base_body
+        and snapshot.revision == base_revision
+    )
+
+
+def _rebased_update_values(
+    snapshot: TicketSnapshot,
+    *,
+    proposed_title: str,
+    proposed_body: str,
+    base_title: str | None,
+    base_body: str | None,
+) -> tuple[str, str]:
+    """Apply only fields changed in the confirmed proposal to a fresh snapshot."""
+
+    if base_title is None or base_body is None:
+        return proposed_title, proposed_body
+    return (
+        proposed_title if proposed_title != base_title else snapshot.title,
+        proposed_body if proposed_body != base_body else snapshot.body,
+    )
+
+
+def _run_github_issue_update(
+    store: JobStore,
+    job: CursorJob,
+    token: WorkerClaim,
+    clients: ClientFactories,
+    checkpoint: Callable[[], None],
+) -> None:
+    repository = (job.github_repository or "").strip()
+    number = job.github_issue
+    if not repository or number is None:
+        raise HarnessError("GitHub issue update requires a trusted ticket identity")
+    github = _github_provider(clients.github)
+    checkpoint()
+    source = github.resolve_repository(repository)
+    repository = source.name_with_owner
+    checkpoint()
+    snapshot = github.ticket_snapshot(f"{repository}#{number}")
+    if not job.github_issue_update_title or job.github_issue_update_body is None:
+        config = default_user_config()
+        draft = draft_ticket_update(
+            job.trusted_utterance or job.request,
+            snapshot,
+            settings=config.providers,
+        )
+        plan = github.plan_issue_update(
+            repository,
+            number,
+            draft.title,
+            draft.body,
+            correlation_marker=uuid.uuid4().hex,
+            update_title=draft.title_changed,
+            update_body=draft.body_changed,
+        )
+
+        def persist_draft(current: CursorJob) -> CursorJob:
+            return current.evolve(
+                github_repository=plan.repository,
+                github_issue=plan.number,
+                github_issue_update_title=plan.title,
+                github_issue_update_body=plan.body,
+                github_issue_update_base_title=snapshot.title,
+                github_issue_update_base_body=snapshot.body,
+                github_issue_update_base_revision=snapshot.revision,
+                github_issue_update_marker=plan.correlation_marker,
+                github_issue_update_operation_state="planned",
+            )
+
+        updated = _worker_change(
+            store,
+            job.id,
+            token,
+            {JobStatus.ROUTING},
+            persist_draft,
+            expected_revision=job.revision,
+        )
+        if updated is None:
+            return
+        job = updated
+    elif not _snapshot_is_current(
+        snapshot,
+        base_title=job.github_issue_update_base_title,
+        base_body=job.github_issue_update_base_body,
+        base_revision=job.github_issue_update_base_revision,
+    ):
+        title, body = _rebased_update_values(
+            snapshot,
+            proposed_title=job.github_issue_update_title,
+            proposed_body=job.github_issue_update_body,
+            base_title=job.github_issue_update_base_title,
+            base_body=job.github_issue_update_base_body,
+        )
+
+        def persist_drift(current: CursorJob) -> CursorJob:
+            return current.evolve(
+                github_issue_update_confirmed=False,
+                github_issue_update_title=title,
+                github_issue_update_body=body,
+                github_issue_update_base_title=snapshot.title,
+                github_issue_update_base_body=snapshot.body,
+                github_issue_update_base_revision=snapshot.revision,
+                github_issue_update_operation_state="planned",
+            )
+
+        updated = _worker_change(
+            store,
+            job.id,
+            token,
+            {JobStatus.ROUTING},
+            persist_drift,
+            expected_revision=job.revision,
+        )
+        if updated is None:
+            return
+        job = updated
+    plan = github.plan_issue_update(
+        job.github_repository or repository,
+        job.github_issue or number,
+        job.github_issue_update_title or "",
+        job.github_issue_update_body or "",
+        correlation_marker=job.github_issue_update_marker,
+        update_title=job.github_issue_update_title
+        != job.github_issue_update_base_title,
+        update_body=job.github_issue_update_body != job.github_issue_update_base_body,
+    )
+    if not job.github_issue_update_confirmed:
+        preview = (
+            f"Update GitHub issue {plan.repository}#{plan.number}?\n\n"
+            f"Snapshot revision: {job.github_issue_update_base_revision}\n\n"
+            f"Exact title: {plan.title}\n\nExact body:\n{plan.body}\n\n"
+            "Say yes to update it or no to cancel."
+        )
+        _worker_question(
+            store,
+            job.id,
+            token,
+            preview,
+            expected_revision=job.revision,
+            clarification_kind="github_issue_update_confirmation",
+            sensitivity=QuestionSensitivity.DESTRUCTIVE,
+        )
+        return
+    if job.github_issue_update_operation_state not in {None, "planned"}:
+        raise HarnessError("GitHub issue update requires reconciliation before retry")
+    checkpoint()
+    latest = github.ticket_snapshot(f"{plan.repository}#{plan.number}")
+    if not _snapshot_is_current(
+        latest,
+        base_title=job.github_issue_update_base_title,
+        base_body=job.github_issue_update_base_body,
+        base_revision=job.github_issue_update_base_revision,
+    ):
+        title, body = _rebased_update_values(
+            latest,
+            proposed_title=plan.title,
+            proposed_body=plan.body,
+            base_title=job.github_issue_update_base_title,
+            base_body=job.github_issue_update_base_body,
+        )
+
+        def reconfirm_drift(current: CursorJob) -> CursorJob:
+            return current.evolve(
+                github_issue_update_confirmed=False,
+                github_issue_update_title=title,
+                github_issue_update_body=body,
+                github_issue_update_base_title=latest.title,
+                github_issue_update_base_body=latest.body,
+                github_issue_update_base_revision=latest.revision,
+                github_issue_update_operation_state="planned",
+            )
+
+        updated = _worker_change(
+            store,
+            job.id,
+            token,
+            {JobStatus.ROUTING},
+            reconfirm_drift,
+            expected_revision=job.revision,
+        )
+        if updated is None:
+            return
+        refreshed = github.plan_issue_update(
+            updated.github_repository or repository,
+            updated.github_issue or number,
+            updated.github_issue_update_title or "",
+            updated.github_issue_update_body or "",
+            correlation_marker=updated.github_issue_update_marker,
+            update_title=updated.github_issue_update_title
+            != updated.github_issue_update_base_title,
+            update_body=updated.github_issue_update_body
+            != updated.github_issue_update_base_body,
+        )
+        preview = (
+            f"Ticket changed. Reconfirm GitHub issue {refreshed.repository}"
+            f"#{refreshed.number}?\n\n"
+            f"Snapshot revision: {updated.github_issue_update_base_revision}\n\n"
+            f"Exact title: {refreshed.title}\n\nExact body:\n{refreshed.body}\n\n"
+            "Say yes to update it or no to cancel."
+        )
+        _worker_question(
+            store,
+            job.id,
+            token,
+            preview,
+            expected_revision=updated.revision,
+            clarification_kind="github_issue_update_confirmation",
+            sensitivity=QuestionSensitivity.DESTRUCTIVE,
+        )
+        return
+
+    def mark_submitted(current: CursorJob) -> CursorJob:
+        return current.evolve(
+            status=JobStatus.RUNNING,
+            github_issue_update_operation_state="submitted",
+            worker_operation="github_issue_update",
+        )
+
+    submitted = _worker_change(
+        store,
+        job.id,
+        token,
+        {JobStatus.ROUTING},
+        mark_submitted,
+        expected_revision=job.revision,
+    )
+    if submitted is None:
+        return
+    try:
+        checkpoint()
+        result = github.submit_issue_update(plan, confirmed=True)
+    except GitHubError as exc:
+        checkpoint()
+        try:
+            visible = github.observe_issue_update(plan)
+        except GitHubError:
+            visible = None
+        if visible is not None:
+            _finish_github_issue_update(
+                store,
+                job.id,
+                token,
+                visible,
+                expected_revision=submitted.revision,
+            )
+            return
+        if not isinstance(exc, GitHubCommandStartError):
+
+            def ambiguous(current: CursorJob) -> CursorJob:
+                return current.evolve(
+                    status=JobStatus.QUEUED,
+                    queued_at=time.time(),
+                    github_issue_update_operation_state="ambiguous",
+                    reconcile=True,
+                    worker_pid=None,
+                    worker_boot_id=None,
+                    worker_process_start=None,
+                    worker_token=None,
+                    worker_operation=None,
+                )
+
+            _worker_change(
+                store,
+                job.id,
+                token,
+                {JobStatus.RUNNING},
+                ambiguous,
+                expected_revision=submitted.revision,
+            )
+            return
+
+        def retry_after_start_failure(current: CursorJob) -> CursorJob:
+            return current.evolve(
+                status=JobStatus.QUEUED,
+                queued_at=time.time(),
+                github_issue_update_operation_state="planned",
+                worker_pid=None,
+                worker_boot_id=None,
+                worker_process_start=None,
+                worker_token=None,
+                worker_operation=None,
+                worker_claim_operation=None,
+                worker_claimed_at=None,
+            )
+
+        _worker_change(
+            store,
+            job.id,
+            token,
+            {JobStatus.RUNNING},
+            retry_after_start_failure,
+            expected_revision=submitted.revision,
+        )
+        return
+    _finish_github_issue_update(
+        store,
+        job.id,
+        token,
+        result,
+        expected_revision=submitted.revision,
+    )
+
+
+def _finish_linear_ticket_update(
+    store: JobStore,
+    job_id: str,
+    token: WorkerClaim,
+    result: LinearTicketUpdateResult,
+    *,
+    expected_revision: int,
+) -> None:
+    def finish(job: CursorJob) -> CursorJob:
+        now = time.time()
+        return job.evolve_for_delivery(
+            now=now,
+            status=JobStatus.COMPLETED,
+            result=f"Updated Linear ticket {result.issue.identifier}: {result.url}",
+            completed_at=now,
+            linear_ticket_update_operation_state="created",
+            worker_pid=None,
+            worker_boot_id=None,
+            worker_process_start=None,
+            worker_token=None,
+            worker_operation=None,
+        )
+
+    _worker_change(
+        store,
+        job_id,
+        token,
+        {JobStatus.ROUTING, JobStatus.RUNNING},
+        finish,
+        expected_revision=expected_revision,
+    )
+
+
+def _run_linear_ticket_update(
+    store: JobStore,
+    job: CursorJob,
+    token: WorkerClaim,
+    clients: ClientFactories,
+    checkpoint: Callable[[], None],
+) -> None:
+    identifier = (job.issue_key or "").strip()
+    if not identifier:
+        raise HarnessError("Linear ticket update requires a trusted ticket identity")
+    registry = clients.integrations or build_integration_registry(default_user_config())
+    provider = issue_provider("linear", registry)
+    if not isinstance(provider, LinearIntegration):
+        raise HarnessError("selected Linear provider cannot update tickets")
+    client = clients.herdr()
+    checkpoint()
+    try:
+        snapshot = provider.ticket_snapshot(
+            client,
+            identifier,
+            checkpoint=checkpoint,
+        )
+    except LinearError:
+        message = f"I couldn't find Linear ticket {identifier}."
+
+        def finish_missing(current: CursorJob) -> CursorJob:
+            now = time.time()
+            return recovery.stage_terminal_intent(
+                current,
+                JobStatus.FAILED,
+                now=now,
+                result=message,
+                error=message,
+            )
+
+        _worker_change(
+            store,
+            job.id,
+            token,
+            MODEL_WORKER_STATUSES,
+            finish_missing,
+            expected_revision=job.revision,
+        )
+        return
+
+    if not job.linear_ticket_update_issue_id:
+
+        def persist_issue(current: CursorJob) -> CursorJob:
+            return current.evolve(
+                issue_key=snapshot.identity,
+                linear_ticket_update_issue_id=snapshot.provider_id,
+            )
+
+        updated = _worker_change(
+            store,
+            job.id,
+            token,
+            {JobStatus.ROUTING},
+            persist_issue,
+            expected_revision=job.revision,
+        )
+        if updated is None:
+            return
+        job = updated
+        identifier = snapshot.identity
+    if (
+        not job.linear_ticket_update_title
+        or job.linear_ticket_update_description is None
+    ):
+        config = default_user_config()
+        draft = draft_ticket_update(
+            job.trusted_utterance or job.request,
+            snapshot,
+            settings=config.providers,
+        )
+        plan = provider.plan_ticket_update(
+            job.linear_ticket_update_issue_id or "",
+            identifier,
+            draft.title,
+            draft.body,
+            correlation_marker=uuid.uuid4().hex,
+            update_title=draft.title_changed,
+            update_description=draft.body_changed,
+        )
+
+        def persist_draft(current: CursorJob) -> CursorJob:
+            return current.evolve(
+                linear_ticket_update_issue_id=plan.issue_id,
+                linear_ticket_update_title=plan.title,
+                linear_ticket_update_description=plan.description,
+                linear_ticket_update_base_title=snapshot.title,
+                linear_ticket_update_base_description=snapshot.body,
+                linear_ticket_update_base_revision=snapshot.revision,
+                linear_ticket_update_marker=plan.correlation_marker,
+                linear_ticket_update_operation_state="planned",
+            )
+
+        updated = _worker_change(
+            store,
+            job.id,
+            token,
+            {JobStatus.ROUTING},
+            persist_draft,
+            expected_revision=job.revision,
+        )
+        if updated is None:
+            return
+        job = updated
+    elif not _snapshot_is_current(
+        snapshot,
+        base_title=job.linear_ticket_update_base_title,
+        base_body=job.linear_ticket_update_base_description,
+        base_revision=job.linear_ticket_update_base_revision,
+    ):
+        title, description = _rebased_update_values(
+            snapshot,
+            proposed_title=job.linear_ticket_update_title,
+            proposed_body=job.linear_ticket_update_description,
+            base_title=job.linear_ticket_update_base_title,
+            base_body=job.linear_ticket_update_base_description,
+        )
+
+        def persist_drift(current: CursorJob) -> CursorJob:
+            return current.evolve(
+                linear_ticket_update_confirmed=False,
+                linear_ticket_update_issue_id=snapshot.provider_id,
+                linear_ticket_update_title=title,
+                linear_ticket_update_description=description,
+                linear_ticket_update_base_title=snapshot.title,
+                linear_ticket_update_base_description=snapshot.body,
+                linear_ticket_update_base_revision=snapshot.revision,
+                linear_ticket_update_operation_state="planned",
+            )
+
+        updated = _worker_change(
+            store,
+            job.id,
+            token,
+            {JobStatus.ROUTING},
+            persist_drift,
+            expected_revision=job.revision,
+        )
+        if updated is None:
+            return
+        job = updated
+    plan = provider.plan_ticket_update(
+        job.linear_ticket_update_issue_id or "",
+        job.issue_key or identifier,
+        job.linear_ticket_update_title or "",
+        job.linear_ticket_update_description or "",
+        correlation_marker=job.linear_ticket_update_marker,
+        update_title=job.linear_ticket_update_title
+        != job.linear_ticket_update_base_title,
+        update_description=job.linear_ticket_update_description
+        != job.linear_ticket_update_base_description,
+    )
+    if not job.linear_ticket_update_confirmed:
+        preview = (
+            f"Update Linear ticket {plan.identifier}?\n\n"
+            f"Snapshot revision: {job.linear_ticket_update_base_revision}\n\n"
+            f"Exact title: {plan.title}\n\nExact description:\n{plan.description}\n\n"
+            "Say yes to update it or no to cancel."
+        )
+        _worker_question(
+            store,
+            job.id,
+            token,
+            preview,
+            expected_revision=job.revision,
+            clarification_kind="linear_ticket_update_confirmation",
+            sensitivity=QuestionSensitivity.DESTRUCTIVE,
+        )
+        return
+    if job.linear_ticket_update_operation_state not in {None, "planned"}:
+        raise HarnessError("Linear ticket update requires reconciliation before retry")
+    checkpoint()
+    latest = provider.ticket_snapshot(
+        client,
+        plan.identifier,
+        checkpoint=checkpoint,
+    )
+    if not _snapshot_is_current(
+        latest,
+        base_title=job.linear_ticket_update_base_title,
+        base_body=job.linear_ticket_update_base_description,
+        base_revision=job.linear_ticket_update_base_revision,
+    ):
+        title, description = _rebased_update_values(
+            latest,
+            proposed_title=plan.title,
+            proposed_body=plan.description,
+            base_title=job.linear_ticket_update_base_title,
+            base_body=job.linear_ticket_update_base_description,
+        )
+
+        def reconfirm_drift(current: CursorJob) -> CursorJob:
+            return current.evolve(
+                linear_ticket_update_confirmed=False,
+                linear_ticket_update_issue_id=latest.provider_id,
+                linear_ticket_update_title=title,
+                linear_ticket_update_description=description,
+                linear_ticket_update_base_title=latest.title,
+                linear_ticket_update_base_description=latest.body,
+                linear_ticket_update_base_revision=latest.revision,
+                linear_ticket_update_operation_state="planned",
+            )
+
+        updated = _worker_change(
+            store,
+            job.id,
+            token,
+            {JobStatus.ROUTING},
+            reconfirm_drift,
+            expected_revision=job.revision,
+        )
+        if updated is None:
+            return
+        refreshed = provider.plan_ticket_update(
+            updated.linear_ticket_update_issue_id or "",
+            updated.issue_key or identifier,
+            updated.linear_ticket_update_title or "",
+            updated.linear_ticket_update_description or "",
+            correlation_marker=updated.linear_ticket_update_marker,
+            update_title=updated.linear_ticket_update_title
+            != updated.linear_ticket_update_base_title,
+            update_description=updated.linear_ticket_update_description
+            != updated.linear_ticket_update_base_description,
+        )
+        preview = (
+            f"Ticket changed. Reconfirm Linear ticket {refreshed.identifier}?\n\n"
+            f"Snapshot revision: {updated.linear_ticket_update_base_revision}\n\n"
+            f"Exact title: {refreshed.title}\n\n"
+            f"Exact description:\n{refreshed.description}\n\n"
+            "Say yes to update it or no to cancel."
+        )
+        _worker_question(
+            store,
+            job.id,
+            token,
+            preview,
+            expected_revision=updated.revision,
+            clarification_kind="linear_ticket_update_confirmation",
+            sensitivity=QuestionSensitivity.DESTRUCTIVE,
+        )
+        return
+
+    def mark_running(current: CursorJob) -> CursorJob:
+        return current.evolve(
+            status=JobStatus.RUNNING,
+            worker_operation="linear_ticket_update",
+        )
+
+    running = _worker_change(
+        store,
+        job.id,
+        token,
+        {JobStatus.ROUTING},
+        mark_running,
+        expected_revision=job.revision,
+    )
+    if running is None:
+        return
+    callback_revision = running.revision
+
+    def persist_submit_fence(
+        target: str,
+        session: str,
+        prompt_token: str,
+        baseline: int,
+    ) -> None:
+        nonlocal callback_revision
+
+        def fence(current: CursorJob) -> CursorJob:
+            return current.evolve(
+                linear_ticket_update_operation_state="submitting",
+                linear_ticket_update_prompt_target=target,
+                linear_ticket_update_prompt_session=session,
+                linear_ticket_update_prompt_token=prompt_token,
+                linear_ticket_update_baseline_sequence=baseline,
+            )
+
+        if (
+            _worker_change(
+                store,
+                job.id,
+                token,
+                {JobStatus.RUNNING},
+                fence,
+                expected_revision=callback_revision,
+            )
+            is None
+        ):
+            raise WorkerCancelled
+        callback_revision += 1
+
+    def persist_prompt_acceptance() -> None:
+        nonlocal callback_revision
+
+        def accepted(current: CursorJob) -> CursorJob:
+            if current.linear_ticket_update_operation_state != "submitting":
+                raise JobValidationError(
+                    "Linear ticket update prompt acceptance requires a submit fence"
+                )
+            return current.evolve(
+                linear_ticket_update_operation_state="submitted",
+            )
+
+        if (
+            _worker_change(
+                store,
+                job.id,
+                token,
+                {JobStatus.RUNNING},
+                accepted,
+                expected_revision=callback_revision,
+            )
+            is None
+        ):
+            raise WorkerCancelled
+        callback_revision += 1
+
+    def queue_ambiguous() -> None:
+        def ambiguous(current: CursorJob) -> CursorJob:
+            return current.evolve(
+                status=JobStatus.QUEUED,
+                queued_at=time.time(),
+                linear_ticket_update_operation_state="ambiguous",
+                reconcile=True,
+                worker_pid=None,
+                worker_boot_id=None,
+                worker_process_start=None,
+                worker_token=None,
+                worker_operation=None,
+            )
+
+        _worker_change(
+            store,
+            job.id,
+            token,
+            {JobStatus.RUNNING},
+            ambiguous,
+            expected_revision=callback_revision,
+        )
+
+    try:
+        checkpoint()
+        provider.submit_ticket_update(
+            client,
+            plan,
+            confirmed=True,
+            checkpoint=checkpoint,
+            before_submit=persist_submit_fence,
+            accepted=persist_prompt_acceptance,
+        )
+    except LinearError as exc:
+        checkpoint()
+        current = store.get(job.id)
+        uncertain = isinstance(
+            exc, LinearOperationAmbiguous
+        ) or current.linear_ticket_update_operation_state in {"submitting", "submitted"}
+        if uncertain:
+            try:
+                visible = provider.observe_ticket_update(
+                    client,
+                    plan,
+                    checkpoint=checkpoint,
+                )
+            except LinearError:
+                visible = None
+            if visible is not None:
+                _finish_linear_ticket_update(
+                    store,
+                    job.id,
+                    token,
+                    visible,
+                    expected_revision=callback_revision,
+                )
+                return
+            queue_ambiguous()
+            return
+
+        def failed_before_submit(current: CursorJob) -> CursorJob:
+            return current.evolve(
+                worker_operation=None,
+            )
+
+        fenced = _worker_change(
+            store,
+            job.id,
+            token,
+            {JobStatus.RUNNING},
+            failed_before_submit,
+            expected_revision=callback_revision,
+        )
+        _carry_observed_revision(exc, fenced)
+        raise
+    current = store.get(job.id)
+    if current.linear_ticket_update_operation_state != "submitted":
+        queue_ambiguous()
+        return
+    try:
+        visible = provider.observe_ticket_update(
+            client,
+            plan,
+            checkpoint=checkpoint,
+        )
+    except LinearError:
+        visible = None
+    if visible is None:
+        queue_ambiguous()
+        return
+    _finish_linear_ticket_update(
+        store,
+        job.id,
+        token,
+        visible,
+        expected_revision=callback_revision,
+    )
+
+
+def _finish_github_issue_close(
+    store: JobStore,
+    job_id: str,
+    token: WorkerClaim,
+    result: GitHubIssueCloseResult,
+    *,
+    expected_revision: int,
+) -> None:
+    def finish(job: CursorJob) -> CursorJob:
+        now = time.time()
+        return job.evolve_for_delivery(
+            now=now,
+            status=JobStatus.COMPLETED,
+            result=f"Closed GitHub issue {result.issue.reference}: {result.url}",
+            completed_at=now,
+            github_issue_close_operation_state="created",
+            worker_pid=None,
+            worker_boot_id=None,
+            worker_process_start=None,
+            worker_token=None,
+            worker_operation=None,
+        )
+
+    _worker_change(
+        store,
+        job_id,
+        token,
+        {JobStatus.ROUTING, JobStatus.RUNNING},
+        finish,
+        expected_revision=expected_revision,
+    )
+
+
+def _run_github_issue_close(
+    store: JobStore,
+    job: CursorJob,
+    token: WorkerClaim,
+    clients: ClientFactories,
+    checkpoint: Callable[[], None],
+) -> None:
+    repository = (job.github_repository or "").strip()
+    number = job.github_issue
+    if not repository or number is None:
+        raise HarnessError("GitHub issue close requires a trusted ticket identity")
+    github = _github_provider(clients.github)
+    checkpoint()
+    source = github.resolve_repository(repository)
+    repository = source.name_with_owner
+    checkpoint()
+    if not job.github_issue_close_marker:
+        plan = github.plan_issue_close(
+            repository,
+            number,
+            correlation_marker=uuid.uuid4().hex,
+        )
+
+        def persist_plan(current: CursorJob) -> CursorJob:
+            return current.evolve(
+                github_repository=plan.repository,
+                github_issue=plan.number,
+                github_issue_close_marker=plan.correlation_marker,
+                github_issue_close_operation_state="planned",
+            )
+
+        updated = _worker_change(
+            store,
+            job.id,
+            token,
+            {JobStatus.ROUTING},
+            persist_plan,
+            expected_revision=job.revision,
+        )
+        if updated is None:
+            return
+        job = updated
+    plan = github.plan_issue_close(
+        job.github_repository or repository,
+        job.github_issue or number,
+        correlation_marker=job.github_issue_close_marker,
+    )
+    if not job.github_issue_close_confirmed:
+        preview = (
+            f"Close {plan.repository}#{plan.number}?\n\n"
+            "Say yes to close it or no to cancel."
+        )
+        _worker_question(
+            store,
+            job.id,
+            token,
+            preview,
+            expected_revision=job.revision,
+            clarification_kind="github_issue_close_confirmation",
+            sensitivity=QuestionSensitivity.DESTRUCTIVE,
+        )
+        return
+    if job.github_issue_close_operation_state not in {None, "planned"}:
+        raise HarnessError("GitHub issue close requires reconciliation before retry")
+
+    def mark_submitted(current: CursorJob) -> CursorJob:
+        return current.evolve(
+            status=JobStatus.RUNNING,
+            github_issue_close_operation_state="submitted",
+            worker_operation="github_issue_close",
+        )
+
+    submitted = _worker_change(
+        store,
+        job.id,
+        token,
+        {JobStatus.ROUTING},
+        mark_submitted,
+        expected_revision=job.revision,
+    )
+    if submitted is None:
+        return
+    try:
+        checkpoint()
+        result = github.submit_issue_close(plan, confirmed=True)
+    except GitHubError as exc:
+        checkpoint()
+        try:
+            visible = github.observe_issue_close(plan)
+        except GitHubError:
+            visible = None
+        if visible is not None:
+            _finish_github_issue_close(
+                store,
+                job.id,
+                token,
+                visible,
+                expected_revision=submitted.revision,
+            )
+            return
+        if not isinstance(exc, GitHubCommandStartError):
+
+            def ambiguous(current: CursorJob) -> CursorJob:
+                return current.evolve(
+                    status=JobStatus.QUEUED,
+                    queued_at=time.time(),
+                    github_issue_close_operation_state="ambiguous",
+                    reconcile=True,
+                    worker_pid=None,
+                    worker_boot_id=None,
+                    worker_process_start=None,
+                    worker_token=None,
+                    worker_operation=None,
+                )
+
+            _worker_change(
+                store,
+                job.id,
+                token,
+                {JobStatus.RUNNING},
+                ambiguous,
+                expected_revision=submitted.revision,
+            )
+            return
+
+        def retry_after_start_failure(current: CursorJob) -> CursorJob:
+            return current.evolve(
+                status=JobStatus.QUEUED,
+                queued_at=time.time(),
+                github_issue_close_operation_state="planned",
+                worker_pid=None,
+                worker_boot_id=None,
+                worker_process_start=None,
+                worker_token=None,
+                worker_operation=None,
+                worker_claim_operation=None,
+                worker_claimed_at=None,
+            )
+
+        _worker_change(
+            store,
+            job.id,
+            token,
+            {JobStatus.RUNNING},
+            retry_after_start_failure,
+            expected_revision=submitted.revision,
+        )
+        return
+    _finish_github_issue_close(
+        store,
+        job.id,
+        token,
+        result,
+        expected_revision=submitted.revision,
+    )
+
+
+def _finish_linear_ticket_close(
+    store: JobStore,
+    job_id: str,
+    token: WorkerClaim,
+    result: LinearTicketCloseResult,
+    *,
+    expected_revision: int,
+) -> None:
+    def finish(job: CursorJob) -> CursorJob:
+        now = time.time()
+        return job.evolve_for_delivery(
+            now=now,
+            status=JobStatus.COMPLETED,
+            result=f"Closed Linear ticket {result.issue.identifier}: {result.url}",
+            completed_at=now,
+            linear_ticket_close_operation_state="created",
+            worker_pid=None,
+            worker_boot_id=None,
+            worker_process_start=None,
+            worker_token=None,
+            worker_operation=None,
+        )
+
+    _worker_change(
+        store,
+        job_id,
+        token,
+        {JobStatus.ROUTING, JobStatus.RUNNING},
+        finish,
+        expected_revision=expected_revision,
+    )
+
+
+def _run_linear_ticket_close(
+    store: JobStore,
+    job: CursorJob,
+    token: WorkerClaim,
+    clients: ClientFactories,
+    checkpoint: Callable[[], None],
+) -> None:
+    identifier = (job.issue_key or "").strip()
+    if not identifier:
+        raise HarnessError("Linear ticket close requires a trusted ticket identity")
+    registry = clients.integrations or build_integration_registry(default_user_config())
+    provider = issue_provider("linear", registry)
+    if not isinstance(provider, LinearIntegration):
+        raise HarnessError("selected Linear provider cannot close tickets")
+    client = clients.herdr()
+    checkpoint()
+    if not job.linear_ticket_close_issue_id:
+        try:
+            issue_id, issue = provider.resolve_issue_for_update(
+                client,
+                identifier,
+                checkpoint=checkpoint,
+            )
+        except LinearError:
+            message = f"I couldn't find Linear ticket {identifier}."
+
+            def finish_missing(current: CursorJob) -> CursorJob:
+                now = time.time()
+                return recovery.stage_terminal_intent(
+                    current,
+                    JobStatus.FAILED,
+                    now=now,
+                    result=message,
+                    error=message,
+                )
+
+            _worker_change(
+                store,
+                job.id,
+                token,
+                MODEL_WORKER_STATUSES,
+                finish_missing,
+                expected_revision=job.revision,
+            )
+            return
+
+        def persist_issue(current: CursorJob) -> CursorJob:
+            return current.evolve(
+                issue_key=issue.identifier,
+                linear_ticket_close_issue_id=issue_id,
+            )
+
+        updated = _worker_change(
+            store,
+            job.id,
+            token,
+            {JobStatus.ROUTING},
+            persist_issue,
+            expected_revision=job.revision,
+        )
+        if updated is None:
+            return
+        job = updated
+        identifier = issue.identifier
+    if (
+        not job.linear_ticket_close_marker
+        or not job.linear_ticket_close_terminal_state_id
+        or not job.linear_ticket_close_terminal_state_name
+    ):
+        terminal_state = provider.resolve_terminal_state(
+            client,
+            identifier,
+            checkpoint=checkpoint,
+        )
+        plan = provider.plan_ticket_close(
+            job.linear_ticket_close_issue_id or "",
+            identifier,
+            terminal_state.id,
+            terminal_state.name,
+            correlation_marker=job.linear_ticket_close_marker or uuid.uuid4().hex,
+        )
+
+        def persist_plan(current: CursorJob) -> CursorJob:
+            return current.evolve(
+                linear_ticket_close_issue_id=plan.issue_id,
+                linear_ticket_close_terminal_state_id=plan.terminal_state_id,
+                linear_ticket_close_terminal_state_name=plan.terminal_state_name,
+                linear_ticket_close_marker=plan.correlation_marker,
+                linear_ticket_close_operation_state="planned",
+            )
+
+        updated = _worker_change(
+            store,
+            job.id,
+            token,
+            {JobStatus.ROUTING},
+            persist_plan,
+            expected_revision=job.revision,
+        )
+        if updated is None:
+            return
+        job = updated
+    plan = provider.plan_ticket_close(
+        job.linear_ticket_close_issue_id or "",
+        job.issue_key or identifier,
+        job.linear_ticket_close_terminal_state_id or "",
+        job.linear_ticket_close_terminal_state_name or "",
+        correlation_marker=job.linear_ticket_close_marker,
+    )
+    if not job.linear_ticket_close_confirmed:
+        preview = (
+            f"Close {plan.identifier} by moving it to "
+            f"{plan.terminal_state_name}?\n\n"
+            "Say yes to close it or no to cancel."
+        )
+        _worker_question(
+            store,
+            job.id,
+            token,
+            preview,
+            expected_revision=job.revision,
+            clarification_kind="linear_ticket_close_confirmation",
+            sensitivity=QuestionSensitivity.DESTRUCTIVE,
+        )
+        return
+    if job.linear_ticket_close_operation_state not in {None, "planned"}:
+        raise HarnessError("Linear ticket close requires reconciliation before retry")
+
+    def mark_running(current: CursorJob) -> CursorJob:
+        return current.evolve(
+            status=JobStatus.RUNNING,
+            worker_operation="linear_ticket_close",
+        )
+
+    running = _worker_change(
+        store,
+        job.id,
+        token,
+        {JobStatus.ROUTING},
+        mark_running,
+        expected_revision=job.revision,
+    )
+    if running is None:
+        return
+    callback_revision = running.revision
+
+    def persist_submit_fence(
+        target: str,
+        session: str,
+        prompt_token: str,
+        baseline: int,
+    ) -> None:
+        nonlocal callback_revision
+
+        def fence(current: CursorJob) -> CursorJob:
+            return current.evolve(
+                linear_ticket_close_operation_state="submitting",
+                linear_ticket_close_prompt_target=target,
+                linear_ticket_close_prompt_session=session,
+                linear_ticket_close_prompt_token=prompt_token,
+                linear_ticket_close_baseline_sequence=baseline,
+            )
+
+        if (
+            _worker_change(
+                store,
+                job.id,
+                token,
+                {JobStatus.RUNNING},
+                fence,
+                expected_revision=callback_revision,
+            )
+            is None
+        ):
+            raise WorkerCancelled
+        callback_revision += 1
+
+    def persist_prompt_acceptance() -> None:
+        nonlocal callback_revision
+
+        def accepted(current: CursorJob) -> CursorJob:
+            if current.linear_ticket_close_operation_state != "submitting":
+                raise JobValidationError(
+                    "Linear ticket close prompt acceptance requires a submit fence"
+                )
+            return current.evolve(
+                linear_ticket_close_operation_state="submitted",
+            )
+
+        if (
+            _worker_change(
+                store,
+                job.id,
+                token,
+                {JobStatus.RUNNING},
+                accepted,
+                expected_revision=callback_revision,
+            )
+            is None
+        ):
+            raise WorkerCancelled
+        callback_revision += 1
+
+    def queue_ambiguous() -> None:
+        def ambiguous(current: CursorJob) -> CursorJob:
+            return current.evolve(
+                status=JobStatus.QUEUED,
+                queued_at=time.time(),
+                linear_ticket_close_operation_state="ambiguous",
+                reconcile=True,
+                worker_pid=None,
+                worker_boot_id=None,
+                worker_process_start=None,
+                worker_token=None,
+                worker_operation=None,
+            )
+
+        _worker_change(
+            store,
+            job.id,
+            token,
+            {JobStatus.RUNNING},
+            ambiguous,
+            expected_revision=callback_revision,
+        )
+
+    try:
+        checkpoint()
+        provider.submit_ticket_close(
+            client,
+            plan,
+            confirmed=True,
+            checkpoint=checkpoint,
+            before_submit=persist_submit_fence,
+            accepted=persist_prompt_acceptance,
+        )
+    except LinearError as exc:
+        checkpoint()
+        current = store.get(job.id)
+        uncertain = isinstance(
+            exc, LinearOperationAmbiguous
+        ) or current.linear_ticket_close_operation_state in {"submitting", "submitted"}
+        if uncertain:
+            try:
+                visible = provider.observe_ticket_close(
+                    client,
+                    plan,
+                    checkpoint=checkpoint,
+                )
+            except LinearError:
+                visible = None
+            if visible is not None:
+                _finish_linear_ticket_close(
+                    store,
+                    job.id,
+                    token,
+                    visible,
+                    expected_revision=callback_revision,
+                )
+                return
+            queue_ambiguous()
+            return
+
+        def failed_before_submit(current: CursorJob) -> CursorJob:
+            return current.evolve(
+                worker_operation=None,
+            )
+
+        fenced = _worker_change(
+            store,
+            job.id,
+            token,
+            {JobStatus.RUNNING},
+            failed_before_submit,
+            expected_revision=callback_revision,
+        )
+        _carry_observed_revision(exc, fenced)
+        raise
+    current = store.get(job.id)
+    if current.linear_ticket_close_operation_state != "submitted":
+        queue_ambiguous()
+        return
+    try:
+        visible = provider.observe_ticket_close(
+            client,
+            plan,
+            checkpoint=checkpoint,
+        )
+    except LinearError:
+        visible = None
+    if visible is None:
+        queue_ambiguous()
+        return
+    _finish_linear_ticket_close(
+        store,
+        job.id,
+        token,
+        visible,
+        expected_revision=callback_revision,
+    )
+
+
+def _run_ticket_split(
+    store: JobStore,
+    job: CursorJob,
+    token: WorkerClaim,
+    clients: ClientFactories,
+    checkpoint: Callable[[], None],
+) -> None:
+    if job.github_issue_split_requested:
+        _run_github_issue_split(store, job, token, clients, checkpoint)
+        return
+    _run_linear_ticket_split(store, job, token, clients, checkpoint)
+
+
+def _split_parent_label(job: CursorJob) -> str:
+    return split_parent_identity(
+        github_repository=job.github_repository,
+        github_issue=job.github_issue,
+        issue_key=job.issue_key,
+    )
+
+
+def _persist_split_job(
+    store: JobStore,
+    job: CursorJob,
+    token: WorkerClaim,
+    mutate: Callable[[CursorJob], CursorJob],
+    *,
+    statuses: set[JobStatus],
+) -> CursorJob | None:
+    return _worker_change(
+        store,
+        job.id,
+        token,
+        statuses,
+        mutate,
+        expected_revision=store.get(job.id).revision,
+    )
+
+
+def _persist_split_children(
+    store: JobStore,
+    job: CursorJob,
+    token: WorkerClaim,
+    children: tuple[SplitChild, ...],
+    *,
+    operation_state: str,
+) -> CursorJob | None:
+    payload = encode_split_children(children)
+
+    def persist(current: CursorJob) -> CursorJob:
+        return current.evolve(
+            ticket_split_children=payload,
+            ticket_split_operation_state=operation_state,
+        )
+
+    return _persist_split_job(store, job, token, persist, statuses={JobStatus.RUNNING})
+
+
+def _finish_ticket_split(
+    store: JobStore,
+    job: CursorJob,
+    token: WorkerClaim,
+    children: tuple[object, ...],
+    *,
+    parent_state: str | None,
+) -> None:
+    parent = _split_parent_label(job)
+    message = split_result_message(
+        parent,
+        children,  # type: ignore[arg-type]
+        parent_action=job.ticket_split_parent_action or "none",
+        parent_state=parent_state,
+    )
+
+    def finish(current: CursorJob) -> CursorJob:
+        now = time.time()
+        return current.evolve_for_delivery(
+            now=now,
+            status=JobStatus.COMPLETED,
+            result=message,
+            completed_at=now,
+            ticket_split_children=encode_split_children(children),  # type: ignore[arg-type]
+            ticket_split_parent_operation_state=parent_state,
+            ticket_split_operation_state="created",
+            worker_pid=None,
+            worker_boot_id=None,
+            worker_process_start=None,
+            worker_token=None,
+            worker_operation=None,
+        )
+
+    _worker_change(
+        store,
+        job.id,
+        token,
+        {JobStatus.ROUTING, JobStatus.RUNNING},
+        finish,
+        expected_revision=store.get(job.id).revision,
+    )
+
+
+def _queue_split_ambiguous(
+    store: JobStore,
+    job: CursorJob,
+    token: WorkerClaim,
+    children: tuple[object, ...],
+    *,
+    parent_state: str | None = None,
+) -> None:
+    def ambiguous(current: CursorJob) -> CursorJob:
+        return current.evolve(
+            status=JobStatus.QUEUED,
+            queued_at=time.time(),
+            ticket_split_children=encode_split_children(children),  # type: ignore[arg-type]
+            ticket_split_parent_operation_state=(
+                parent_state
+                if parent_state is not None
+                else current.ticket_split_parent_operation_state
+            ),
+            ticket_split_operation_state="ambiguous",
+            reconcile=True,
+            worker_pid=None,
+            worker_boot_id=None,
+            worker_process_start=None,
+            worker_token=None,
+            worker_operation=None,
+        )
+
+    _worker_change(
+        store,
+        job.id,
+        token,
+        {JobStatus.RUNNING, JobStatus.ROUTING},
+        ambiguous,
+        expected_revision=store.get(job.id).revision,
+    )
+
+
+def _queue_split_retry(
+    store: JobStore,
+    job: CursorJob,
+    token: WorkerClaim,
+    children: tuple[object, ...],
+    *,
+    parent_state: str | None = None,
+) -> None:
+    def retry(current: CursorJob) -> CursorJob:
+        return current.evolve(
+            status=JobStatus.QUEUED,
+            queued_at=time.time(),
+            ticket_split_children=encode_split_children(children),  # type: ignore[arg-type]
+            ticket_split_parent_operation_state=(
+                parent_state
+                if parent_state is not None
+                else current.ticket_split_parent_operation_state
+            ),
+            ticket_split_operation_state="planned",
+            worker_pid=None,
+            worker_boot_id=None,
+            worker_process_start=None,
+            worker_token=None,
+            worker_operation=None,
+            worker_claim_operation=None,
+            worker_claimed_at=None,
+        )
+
+    _worker_change(
+        store,
+        job.id,
+        token,
+        {JobStatus.RUNNING, JobStatus.ROUTING},
+        retry,
+        expected_revision=store.get(job.id).revision,
+    )
+
+
+def _ask_split_confirmation(
+    store: JobStore,
+    job: CursorJob,
+    token: WorkerClaim,
+    draft: TicketSplitDraft,
+    *,
+    github: bool,
+) -> None:
+    parent = _split_parent_label(job)
+    preview = split_preview(
+        parent,
+        draft,
+        terminal_state_name=(
+            None if github else job.ticket_split_parent_terminal_state_name
+        ),
+    )
+    _worker_question(
+        store,
+        job.id,
+        token,
+        preview,
+        expected_revision=job.revision,
+        clarification_kind=(
+            "github_issue_split_confirmation"
+            if github
+            else "linear_ticket_split_confirmation"
+        ),
+        sensitivity=QuestionSensitivity.DESTRUCTIVE,
+    )
+
+
+def _run_github_issue_split(
+    store: JobStore,
+    job: CursorJob,
+    token: WorkerClaim,
+    clients: ClientFactories,
+    checkpoint: Callable[[], None],
+) -> None:
+    repository = (job.github_repository or "").strip()
+    number = job.github_issue
+    if not repository or number is None:
+        raise HarnessError("GitHub issue split requires a trusted ticket identity")
+    github = _github_provider(clients.github)
+    checkpoint()
+    source = github.resolve_repository(repository)
+    repository = source.name_with_owner
+    checkpoint()
+    if not job.ticket_split_children:
+        snapshot = github.ticket_snapshot(f"{repository}#{number}")
+        config = default_user_config()
+        draft = assign_split_markers(
+            draft_ticket_split(
+                job.trusted_utterance or job.request,
+                snapshot,
+                settings=config.providers,
+            )
+        )
+        parent_marker = (
+            uuid.uuid4().hex if draft.parent_action in {"close", "update"} else None
+        )
+
+        def persist_draft(current: CursorJob) -> CursorJob:
+            return current.evolve(
+                github_repository=repository,
+                github_issue=number,
+                ticket_split_children=encode_split_children(draft.children),
+                ticket_split_parent_action=draft.parent_action,
+                ticket_split_parent_title=draft.parent_title,
+                ticket_split_parent_body=draft.parent_body,
+                ticket_split_parent_marker=parent_marker,
+                ticket_split_parent_operation_state=(
+                    "planned" if draft.parent_action in {"close", "update"} else None
+                ),
+                ticket_split_operation_state="planned",
+            )
+
+        updated = _persist_split_job(
+            store, job, token, persist_draft, statuses={JobStatus.ROUTING}
+        )
+        if updated is None:
+            return
+        job = updated
+    children = decode_split_children(job.ticket_split_children)
+    draft = TicketSplitDraft(
+        children,
+        job.ticket_split_parent_action or "none",
+        job.ticket_split_parent_title,
+        job.ticket_split_parent_body,
+    )
+    if not job.ticket_split_confirmed:
+        _ask_split_confirmation(store, job, token, draft, github=True)
+        return
+    if job.ticket_split_operation_state not in {None, "planned"}:
+        raise HarnessError("GitHub issue split requires reconciliation before retry")
+
+    def mark_running(current: CursorJob) -> CursorJob:
+        return current.evolve(
+            status=JobStatus.RUNNING,
+            worker_operation="github_issue_split",
+        )
+
+    running = _persist_split_job(
+        store, job, token, mark_running, statuses={JobStatus.ROUTING}
+    )
+    if running is None:
+        return
+    job = running
+    for index, child in enumerate(children):
+        if child.state == "created":
+            continue
+        if child.state in {"submitted", "ambiguous"}:
+            plan = github.plan_issue_creation(
+                repository,
+                child.title,
+                child.body,
+                correlation_marker=child.marker,
+            )
+            checkpoint()
+            try:
+                visible = github.observe_issue_creation(plan)
+            except GitHubError:
+                visible = None
+            if visible is None:
+                children = replace_split_child(children, index, state="ambiguous")
+                _queue_split_ambiguous(store, job, token, children)
+                return
+            children = replace_split_child(
+                children,
+                index,
+                state="created",
+                created_ref=visible.issue.reference,
+                created_url=visible.url,
+            )
+            persisted = _persist_split_children(
+                store, job, token, children, operation_state="planned"
+            )
+            if persisted is None:
+                return
+            job = persisted
+            continue
+        children = replace_split_child(children, index, state="submitted")
+        submitted = _persist_split_children(
+            store, job, token, children, operation_state="submitted"
+        )
+        if submitted is None:
+            return
+        job = submitted
+        plan = github.plan_issue_creation(
+            repository,
+            child.title,
+            child.body,
+            correlation_marker=child.marker,
+        )
+        try:
+            checkpoint()
+            result = github.submit_issue_creation(plan, confirmed=True)
+        except GitHubError as exc:
+            checkpoint()
+            try:
+                visible = github.observe_issue_creation(plan)
+            except GitHubError:
+                visible = None
+            if visible is not None:
+                children = replace_split_child(
+                    children,
+                    index,
+                    state="created",
+                    created_ref=visible.issue.reference,
+                    created_url=visible.url,
+                )
+                persisted = _persist_split_children(
+                    store, job, token, children, operation_state="planned"
+                )
+                if persisted is None:
+                    return
+                job = persisted
+                continue
+            if isinstance(exc, GitHubCommandStartError):
+                children = replace_split_child(children, index, state="planned")
+                _queue_split_retry(store, job, token, children)
+                return
+            children = replace_split_child(children, index, state="ambiguous")
+            _queue_split_ambiguous(store, job, token, children)
+            return
+        children = replace_split_child(
+            children,
+            index,
+            state="created",
+            created_ref=result.issue.reference,
+            created_url=result.url,
+        )
+        persisted = _persist_split_children(
+            store, job, token, children, operation_state="planned"
+        )
+        if persisted is None:
+            return
+        job = persisted
+    parent_action = job.ticket_split_parent_action or "none"
+    parent_state = job.ticket_split_parent_operation_state
+    if parent_action == "none":
+        _finish_ticket_split(store, job, token, children, parent_state=None)
+        return
+    if parent_state == "created":
+        _finish_ticket_split(store, job, token, children, parent_state="created")
+        return
+    if parent_state in {"submitted", "ambiguous"}:
+        if parent_action == "update":
+            plan = github.plan_issue_update(
+                repository,
+                number,
+                job.ticket_split_parent_title or "",
+                job.ticket_split_parent_body or "",
+                correlation_marker=job.ticket_split_parent_marker,
+            )
+            checkpoint()
+            try:
+                visible = github.observe_issue_update(plan)
+            except GitHubError:
+                visible = None
+        else:
+            plan = github.plan_issue_close(
+                repository,
+                number,
+                correlation_marker=job.ticket_split_parent_marker,
+            )
+            checkpoint()
+            try:
+                visible = github.observe_issue_close(plan)
+            except GitHubError:
+                visible = None
+        if visible is None:
+            _queue_split_ambiguous(
+                store, job, token, children, parent_state="ambiguous"
+            )
+            return
+        _finish_ticket_split(store, job, token, children, parent_state="created")
+        return
+    submitted = _persist_split_job(
+        store,
+        job,
+        token,
+        lambda current: current.evolve(
+            ticket_split_parent_operation_state="submitted",
+            ticket_split_operation_state="submitted",
+        ),
+        statuses={JobStatus.RUNNING},
+    )
+    if submitted is None:
+        return
+    job = submitted
+    try:
+        checkpoint()
+        if parent_action == "update":
+            plan = github.plan_issue_update(
+                repository,
+                number,
+                job.ticket_split_parent_title or "",
+                job.ticket_split_parent_body or "",
+                correlation_marker=job.ticket_split_parent_marker,
+            )
+            github.submit_issue_update(plan, confirmed=True)
+        else:
+            plan = github.plan_issue_close(
+                repository,
+                number,
+                correlation_marker=job.ticket_split_parent_marker,
+            )
+            github.submit_issue_close(plan, confirmed=True)
+    except GitHubError as exc:
+        checkpoint()
+        try:
+            if parent_action == "update":
+                visible = github.observe_issue_update(
+                    github.plan_issue_update(
+                        repository,
+                        number,
+                        job.ticket_split_parent_title or "",
+                        job.ticket_split_parent_body or "",
+                        correlation_marker=job.ticket_split_parent_marker,
+                    )
+                )
+            else:
+                visible = github.observe_issue_close(
+                    github.plan_issue_close(
+                        repository,
+                        number,
+                        correlation_marker=job.ticket_split_parent_marker,
+                    )
+                )
+        except GitHubError:
+            visible = None
+        if visible is not None:
+            _finish_ticket_split(store, job, token, children, parent_state="created")
+            return
+        if isinstance(exc, GitHubCommandStartError):
+            _queue_split_retry(store, job, token, children, parent_state="planned")
+            return
+        _queue_split_ambiguous(store, job, token, children, parent_state="ambiguous")
+        return
+    _finish_ticket_split(store, job, token, children, parent_state="created")
+
+
+def _run_linear_ticket_split(
+    store: JobStore,
+    job: CursorJob,
+    token: WorkerClaim,
+    clients: ClientFactories,
+    checkpoint: Callable[[], None],
+) -> None:
+    identifier = (job.issue_key or "").strip()
+    if not identifier:
+        raise HarnessError("Linear ticket split requires a trusted ticket identity")
+    registry = clients.integrations or build_integration_registry(default_user_config())
+    provider = issue_provider("linear", registry)
+    if not isinstance(provider, LinearIntegration):
+        raise HarnessError("selected Linear provider cannot split tickets")
+    client = clients.herdr()
+    checkpoint()
+    if not job.ticket_split_parent_issue_id:
+        try:
+            issue_id, issue = provider.resolve_issue_for_update(
+                client,
+                identifier,
+                checkpoint=checkpoint,
+            )
+        except LinearError:
+            message = f"I couldn't find Linear ticket {identifier}."
+
+            def finish_missing(current: CursorJob) -> CursorJob:
+                now = time.time()
+                return recovery.stage_terminal_intent(
+                    current,
+                    JobStatus.FAILED,
+                    now=now,
+                    result=message,
+                    error=message,
+                )
+
+            _worker_change(
+                store,
+                job.id,
+                token,
+                MODEL_WORKER_STATUSES,
+                finish_missing,
+                expected_revision=job.revision,
+            )
+            return
+
+        def persist_issue(current: CursorJob) -> CursorJob:
+            return current.evolve(
+                issue_key=issue.identifier,
+                ticket_split_parent_issue_id=issue_id,
+            )
+
+        updated = _persist_split_job(
+            store, job, token, persist_issue, statuses={JobStatus.ROUTING}
+        )
+        if updated is None:
+            return
+        job = updated
+        identifier = issue.identifier
+    if not job.ticket_split_team_id:
+        team_key = job.ticket_split_team or linear_team_key(identifier)
+        team = provider.resolve_team(client, team_key, checkpoint=checkpoint)
+
+        def persist_team(current: CursorJob) -> CursorJob:
+            return current.evolve(
+                ticket_split_team=team.key,
+                ticket_split_team_id=team.id,
+            )
+
+        updated = _persist_split_job(
+            store, job, token, persist_team, statuses={JobStatus.ROUTING}
+        )
+        if updated is None:
+            return
+        job = updated
+    if not job.ticket_split_children:
+        snapshot = provider.ticket_snapshot(
+            client,
+            identifier,
+            checkpoint=checkpoint,
+        )
+        if snapshot.provider_id != job.ticket_split_parent_issue_id:
+            raise HarnessError("Linear split parent identity changed during resolution")
+        config = default_user_config()
+        draft = assign_split_markers(
+            draft_ticket_split(
+                job.trusted_utterance or job.request,
+                snapshot,
+                settings=config.providers,
+            )
+        )
+        terminal_state = (
+            provider.resolve_terminal_state(
+                client,
+                identifier,
+                checkpoint=checkpoint,
+            )
+            if draft.parent_action == "close"
+            else None
+        )
+        parent_marker = (
+            uuid.uuid4().hex if draft.parent_action in {"close", "update"} else None
+        )
+
+        def persist_draft(current: CursorJob) -> CursorJob:
+            return current.evolve(
+                ticket_split_children=encode_split_children(draft.children),
+                ticket_split_parent_action=draft.parent_action,
+                ticket_split_parent_title=draft.parent_title,
+                ticket_split_parent_body=draft.parent_body,
+                ticket_split_parent_marker=parent_marker,
+                ticket_split_parent_terminal_state_id=(
+                    terminal_state.id if terminal_state is not None else None
+                ),
+                ticket_split_parent_terminal_state_name=(
+                    terminal_state.name if terminal_state is not None else None
+                ),
+                ticket_split_parent_operation_state=(
+                    "planned" if draft.parent_action in {"close", "update"} else None
+                ),
+                ticket_split_operation_state="planned",
+            )
+
+        updated = _persist_split_job(
+            store, job, token, persist_draft, statuses={JobStatus.ROUTING}
+        )
+        if updated is None:
+            return
+        job = updated
+    children = decode_split_children(job.ticket_split_children)
+    draft = TicketSplitDraft(
+        children,
+        job.ticket_split_parent_action or "none",
+        job.ticket_split_parent_title,
+        job.ticket_split_parent_body,
+    )
+    if not job.ticket_split_confirmed:
+        _ask_split_confirmation(store, job, token, draft, github=False)
+        return
+    if job.ticket_split_operation_state not in {None, "planned"}:
+        raise HarnessError("Linear ticket split requires reconciliation before retry")
+
+    def mark_running(current: CursorJob) -> CursorJob:
+        return current.evolve(
+            status=JobStatus.RUNNING,
+            worker_operation="linear_ticket_split",
+        )
+
+    running = _persist_split_job(
+        store, job, token, mark_running, statuses={JobStatus.ROUTING}
+    )
+    if running is None:
+        return
+    job = running
+    callback_revision = job.revision
+
+    def persist_submit_fence(
+        target: str,
+        session: str,
+        prompt_token: str,
+        baseline: int,
+    ) -> None:
+        nonlocal callback_revision
+
+        def fence(current: CursorJob) -> CursorJob:
+            return current.evolve(
+                ticket_split_operation_state="submitting",
+                ticket_split_prompt_target=target,
+                ticket_split_prompt_session=session,
+                ticket_split_prompt_token=prompt_token,
+                ticket_split_baseline_sequence=baseline,
+            )
+
+        if (
+            _worker_change(
+                store,
+                job.id,
+                token,
+                {JobStatus.RUNNING},
+                fence,
+                expected_revision=callback_revision,
+            )
+            is None
+        ):
+            raise WorkerCancelled
+        callback_revision += 1
+
+    def persist_prompt_acceptance() -> None:
+        nonlocal callback_revision
+
+        def accepted(current: CursorJob) -> CursorJob:
+            return current.evolve(ticket_split_operation_state="submitted")
+
+        if (
+            _worker_change(
+                store,
+                job.id,
+                token,
+                {JobStatus.RUNNING},
+                accepted,
+                expected_revision=callback_revision,
+            )
+            is None
+        ):
+            raise WorkerCancelled
+        callback_revision += 1
+
+    for index, child in enumerate(children):
+        if child.state == "created":
+            continue
+        plan = provider.plan_ticket_creation(
+            job.ticket_split_team_id or "",
+            job.ticket_split_team or "",
+            child.title,
+            child.body,
+            correlation_marker=child.marker,
+        )
+        if child.state in {"submitted", "ambiguous"}:
+            checkpoint()
+            try:
+                visible = provider.observe_ticket_creation(
+                    client, plan, checkpoint=checkpoint
+                )
+            except LinearError:
+                visible = None
+            if visible is None:
+                children = replace_split_child(children, index, state="ambiguous")
+                _queue_split_ambiguous(store, job, token, children)
+                return
+            children = replace_split_child(
+                children,
+                index,
+                state="created",
+                created_ref=visible.issue.identifier,
+                created_url=visible.url,
+            )
+            persisted = _persist_split_children(
+                store, job, token, children, operation_state="planned"
+            )
+            if persisted is None:
+                return
+            job = persisted
+            callback_revision = job.revision
+            continue
+        children = replace_split_child(children, index, state="submitted")
+        submitted = _persist_split_children(
+            store, job, token, children, operation_state="planned"
+        )
+        if submitted is None:
+            return
+        job = submitted
+        callback_revision = job.revision
+        try:
+            checkpoint()
+            provider.submit_ticket_creation(
+                client,
+                plan,
+                confirmed=True,
+                checkpoint=checkpoint,
+                before_submit=persist_submit_fence,
+                accepted=persist_prompt_acceptance,
+            )
+        except LinearError as exc:
+            checkpoint()
+            current = store.get(job.id)
+            uncertain = isinstance(exc, LinearOperationAmbiguous) or (
+                current.ticket_split_operation_state in {"submitting", "submitted"}
+            )
+            if uncertain:
+                try:
+                    visible = provider.observe_ticket_creation(
+                        client, plan, checkpoint=checkpoint
+                    )
+                except LinearError:
+                    visible = None
+                if visible is not None:
+                    children = replace_split_child(
+                        children,
+                        index,
+                        state="created",
+                        created_ref=visible.issue.identifier,
+                        created_url=visible.url,
+                    )
+                    persisted = _persist_split_children(
+                        store, job, token, children, operation_state="planned"
+                    )
+                    if persisted is None:
+                        return
+                    job = persisted
+                    callback_revision = job.revision
+                    continue
+                children = replace_split_child(children, index, state="ambiguous")
+                _queue_split_ambiguous(store, job, token, children)
+                return
+            children = replace_split_child(children, index, state="planned")
+            _queue_split_retry(store, job, token, children)
+            return
+        current = store.get(job.id)
+        if current.ticket_split_operation_state != "submitted":
+            children = replace_split_child(children, index, state="ambiguous")
+            _queue_split_ambiguous(store, job, token, children)
+            return
+        try:
+            visible = provider.observe_ticket_creation(
+                client, plan, checkpoint=checkpoint
+            )
+        except LinearError:
+            visible = None
+        if visible is None:
+            children = replace_split_child(children, index, state="ambiguous")
+            _queue_split_ambiguous(store, job, token, children)
+            return
+        children = replace_split_child(
+            children,
+            index,
+            state="created",
+            created_ref=visible.issue.identifier,
+            created_url=visible.url,
+        )
+        persisted = _persist_split_children(
+            store, job, token, children, operation_state="planned"
+        )
+        if persisted is None:
+            return
+        job = persisted
+        callback_revision = job.revision
+    parent_action = job.ticket_split_parent_action or "none"
+    parent_state = job.ticket_split_parent_operation_state
+    if parent_action == "none" or parent_state == "created":
+        _finish_ticket_split(
+            store,
+            job,
+            token,
+            children,
+            parent_state=None if parent_action == "none" else "created",
+        )
+        return
+    if parent_state in {"submitted", "ambiguous"}:
+        if parent_action == "update":
+            plan = provider.plan_ticket_update(
+                job.ticket_split_parent_issue_id or "",
+                job.issue_key or identifier,
+                job.ticket_split_parent_title or "",
+                job.ticket_split_parent_body or "",
+                correlation_marker=job.ticket_split_parent_marker,
+            )
+            try:
+                visible = provider.observe_ticket_update(
+                    client, plan, checkpoint=checkpoint
+                )
+            except LinearError:
+                visible = None
+        else:
+            plan = provider.plan_ticket_close(
+                job.ticket_split_parent_issue_id or "",
+                job.issue_key or identifier,
+                job.ticket_split_parent_terminal_state_id or "",
+                job.ticket_split_parent_terminal_state_name or "",
+                correlation_marker=job.ticket_split_parent_marker,
+            )
+            try:
+                visible = provider.observe_ticket_close(
+                    client, plan, checkpoint=checkpoint
+                )
+            except LinearError:
+                visible = None
+        if visible is None:
+            _queue_split_ambiguous(
+                store, job, token, children, parent_state="ambiguous"
+            )
+            return
+        _finish_ticket_split(store, job, token, children, parent_state="created")
+        return
+    submitted = _persist_split_job(
+        store,
+        job,
+        token,
+        lambda current: current.evolve(
+            ticket_split_parent_operation_state="planned",
+            ticket_split_operation_state="planned",
+        ),
+        statuses={JobStatus.RUNNING},
+    )
+    if submitted is None:
+        return
+    job = submitted
+    callback_revision = job.revision
+    try:
+        checkpoint()
+        if parent_action == "update":
+            plan = provider.plan_ticket_update(
+                job.ticket_split_parent_issue_id or "",
+                job.issue_key or identifier,
+                job.ticket_split_parent_title or "",
+                job.ticket_split_parent_body or "",
+                correlation_marker=job.ticket_split_parent_marker,
+            )
+            provider.submit_ticket_update(
+                client,
+                plan,
+                confirmed=True,
+                checkpoint=checkpoint,
+                before_submit=persist_submit_fence,
+                accepted=persist_prompt_acceptance,
+            )
+        else:
+            plan = provider.plan_ticket_close(
+                job.ticket_split_parent_issue_id or "",
+                job.issue_key or identifier,
+                job.ticket_split_parent_terminal_state_id or "",
+                job.ticket_split_parent_terminal_state_name or "",
+                correlation_marker=job.ticket_split_parent_marker,
+            )
+            provider.submit_ticket_close(
+                client,
+                plan,
+                confirmed=True,
+                checkpoint=checkpoint,
+                before_submit=persist_submit_fence,
+                accepted=persist_prompt_acceptance,
+            )
+    except LinearError as exc:
+        checkpoint()
+        current = store.get(job.id)
+        uncertain = isinstance(exc, LinearOperationAmbiguous) or (
+            current.ticket_split_operation_state in {"submitting", "submitted"}
+        )
+        if uncertain:
+            try:
+                if parent_action == "update":
+                    visible = provider.observe_ticket_update(
+                        client,
+                        provider.plan_ticket_update(
+                            job.ticket_split_parent_issue_id or "",
+                            job.issue_key or identifier,
+                            job.ticket_split_parent_title or "",
+                            job.ticket_split_parent_body or "",
+                            correlation_marker=job.ticket_split_parent_marker,
+                        ),
+                        checkpoint=checkpoint,
+                    )
+                else:
+                    visible = provider.observe_ticket_close(
+                        client,
+                        provider.plan_ticket_close(
+                            job.ticket_split_parent_issue_id or "",
+                            job.issue_key or identifier,
+                            job.ticket_split_parent_terminal_state_id or "",
+                            job.ticket_split_parent_terminal_state_name or "",
+                            correlation_marker=job.ticket_split_parent_marker,
+                        ),
+                        checkpoint=checkpoint,
+                    )
+            except LinearError:
+                visible = None
+            if visible is not None:
+                _finish_ticket_split(
+                    store, job, token, children, parent_state="created"
+                )
+                return
+            _queue_split_ambiguous(
+                store, job, token, children, parent_state="ambiguous"
+            )
+            return
+        _queue_split_retry(store, job, token, children, parent_state="planned")
+        return
+    current = store.get(job.id)
+    if current.ticket_split_operation_state != "submitted":
+        _queue_split_ambiguous(store, job, token, children, parent_state="ambiguous")
+        return
+    try:
+        if parent_action == "update":
+            visible = provider.observe_ticket_update(
+                client,
+                provider.plan_ticket_update(
+                    job.ticket_split_parent_issue_id or "",
+                    job.issue_key or identifier,
+                    job.ticket_split_parent_title or "",
+                    job.ticket_split_parent_body or "",
+                    correlation_marker=job.ticket_split_parent_marker,
+                ),
+                checkpoint=checkpoint,
+            )
+        else:
+            visible = provider.observe_ticket_close(
+                client,
+                provider.plan_ticket_close(
+                    job.ticket_split_parent_issue_id or "",
+                    job.issue_key or identifier,
+                    job.ticket_split_parent_terminal_state_id or "",
+                    job.ticket_split_parent_terminal_state_name or "",
+                    correlation_marker=job.ticket_split_parent_marker,
+                ),
+                checkpoint=checkpoint,
+            )
+    except LinearError:
+        visible = None
+    if visible is None:
+        _queue_split_ambiguous(store, job, token, children, parent_state="ambiguous")
+        return
+    _finish_ticket_split(store, job, token, children, parent_state="created")
+
+
+def _run_ticket_merge(
+    store: JobStore,
+    job: CursorJob,
+    token: WorkerClaim,
+    clients: ClientFactories,
+    checkpoint: Callable[[], None],
+) -> None:
+    if job.github_issue_merge_requested:
+        _run_github_issue_merge(store, job, token, clients, checkpoint)
+        return
+    _run_linear_ticket_merge(store, job, token, clients, checkpoint)
+
+
+def _persist_merge_job(
+    store: JobStore,
+    job: CursorJob,
+    token: WorkerClaim,
+    mutate: Callable[[CursorJob], CursorJob],
+    *,
+    statuses: set[JobStatus],
+) -> CursorJob | None:
+    return _persist_split_job(store, job, token, mutate, statuses=statuses)
+
+
+def _persist_merge_closing(
+    store: JobStore,
+    job: CursorJob,
+    token: WorkerClaim,
+    closing: tuple[MergeClosingTicket, ...],
+    *,
+    operation_state: str,
+) -> CursorJob | None:
+    payload = encode_merge_closing(closing)
+
+    def persist(current: CursorJob) -> CursorJob:
+        return current.evolve(
+            ticket_merge_closing=payload,
+            ticket_merge_operation_state=operation_state,
+        )
+
+    return _persist_merge_job(store, job, token, persist, statuses={JobStatus.RUNNING})
+
+
+def _merge_snapshots_match(
+    expected: tuple[TicketSnapshot, ...],
+    current: tuple[TicketSnapshot, ...],
+) -> bool:
+    return len(expected) == len(current) and all(
+        (
+            left.provider.casefold(),
+            left.identity.casefold(),
+            left.provider_id,
+            left.title,
+            left.body,
+            left.revision,
+        )
+        == (
+            right.provider.casefold(),
+            right.identity.casefold(),
+            right.provider_id,
+            right.title,
+            right.body,
+            right.revision,
+        )
+        for left, right in zip(expected, current, strict=True)
+    )
+
+
+def _linear_merge_snapshots(
+    provider: LinearIntegration,
+    client: HerdrClient,
+    survivor: str,
+    survivor_issue_id: str,
+    closing: tuple[MergeClosingTicket, ...],
+    checkpoint: Callable[[], None],
+) -> tuple[TicketSnapshot, ...]:
+    snapshots = (
+        provider.ticket_snapshot(client, survivor, checkpoint=checkpoint),
+        *(
+            provider.ticket_snapshot(
+                client,
+                ticket.identity,
+                checkpoint=checkpoint,
+            )
+            for ticket in closing
+        ),
+    )
+    expected_ids = (survivor_issue_id, *(ticket.issue_id or "" for ticket in closing))
+    if any(
+        snapshot.provider_id != expected
+        for snapshot, expected in zip(snapshots, expected_ids, strict=True)
+    ):
+        raise HarnessError("Linear merge identity changed during snapshot resolution")
+    return snapshots
+
+
+def _finish_ticket_merge(
+    store: JobStore,
+    job: CursorJob,
+    token: WorkerClaim,
+    closing: tuple[MergeClosingTicket, ...],
+    *,
+    survivor_state: str | None,
+) -> None:
+    message = merge_result_message(
+        job.ticket_merge_survivor or "the ticket",
+        closing,
+        survivor_state=survivor_state,
+    )
+
+    def finish(current: CursorJob) -> CursorJob:
+        now = time.time()
+        return current.evolve_for_delivery(
+            now=now,
+            status=JobStatus.COMPLETED,
+            result=message,
+            completed_at=now,
+            ticket_merge_closing=encode_merge_closing(closing),
+            ticket_merge_survivor_operation_state=survivor_state,
+            ticket_merge_operation_state="created",
+            worker_pid=None,
+            worker_boot_id=None,
+            worker_process_start=None,
+            worker_token=None,
+            worker_operation=None,
+        )
+
+    _worker_change(
+        store,
+        job.id,
+        token,
+        {JobStatus.ROUTING, JobStatus.RUNNING},
+        finish,
+        expected_revision=store.get(job.id).revision,
+    )
+
+
+def _queue_merge_ambiguous(
+    store: JobStore,
+    job: CursorJob,
+    token: WorkerClaim,
+    closing: tuple[MergeClosingTicket, ...],
+    *,
+    survivor_state: str | None = None,
+) -> None:
+    def ambiguous(current: CursorJob) -> CursorJob:
+        return current.evolve(
+            status=JobStatus.QUEUED,
+            queued_at=time.time(),
+            ticket_merge_closing=encode_merge_closing(closing),
+            ticket_merge_survivor_operation_state=(
+                survivor_state
+                if survivor_state is not None
+                else current.ticket_merge_survivor_operation_state
+            ),
+            ticket_merge_operation_state="ambiguous",
+            reconcile=True,
+            worker_pid=None,
+            worker_boot_id=None,
+            worker_process_start=None,
+            worker_token=None,
+            worker_operation=None,
+        )
+
+    _worker_change(
+        store,
+        job.id,
+        token,
+        {JobStatus.RUNNING, JobStatus.ROUTING},
+        ambiguous,
+        expected_revision=store.get(job.id).revision,
+    )
+
+
+def _queue_merge_retry(
+    store: JobStore,
+    job: CursorJob,
+    token: WorkerClaim,
+    closing: tuple[MergeClosingTicket, ...],
+    *,
+    survivor_state: str | None = None,
+) -> None:
+    def retry(current: CursorJob) -> CursorJob:
+        return current.evolve(
+            status=JobStatus.QUEUED,
+            queued_at=time.time(),
+            ticket_merge_closing=encode_merge_closing(closing),
+            ticket_merge_survivor_operation_state=(
+                survivor_state
+                if survivor_state is not None
+                else current.ticket_merge_survivor_operation_state
+            ),
+            ticket_merge_operation_state="planned",
+            worker_pid=None,
+            worker_boot_id=None,
+            worker_process_start=None,
+            worker_token=None,
+            worker_operation=None,
+            worker_claim_operation=None,
+            worker_claimed_at=None,
+        )
+
+    _worker_change(
+        store,
+        job.id,
+        token,
+        {JobStatus.RUNNING, JobStatus.ROUTING},
+        retry,
+        expected_revision=store.get(job.id).revision,
+    )
+
+
+def _ask_merge_confirmation(
+    store: JobStore,
+    job: CursorJob,
+    token: WorkerClaim,
+    draft: TicketMergeDraft,
+    closing: tuple[MergeClosingTicket, ...],
+    *,
+    github: bool,
+) -> None:
+    preview = merge_preview(job.ticket_merge_survivor or "the ticket", draft, closing)
+    _worker_question(
+        store,
+        job.id,
+        token,
+        preview,
+        expected_revision=job.revision,
+        clarification_kind=(
+            "github_issue_merge_confirmation"
+            if github
+            else "linear_ticket_merge_confirmation"
+        ),
+        sensitivity=QuestionSensitivity.DESTRUCTIVE,
+    )
+
+
+def _run_github_issue_merge(
+    store: JobStore,
+    job: CursorJob,
+    token: WorkerClaim,
+    clients: ClientFactories,
+    checkpoint: Callable[[], None],
+) -> None:
+    repository = (job.github_repository or "").strip()
+    number = job.github_issue
+    survivor = (job.ticket_merge_survivor or "").strip()
+    if not repository or number is None or not survivor:
+        raise HarnessError("GitHub issue merge requires a trusted survivor identity")
+    github = _github_provider(clients.github)
+    checkpoint()
+    source = github.resolve_repository(repository)
+    repository = source.name_with_owner
+    checkpoint()
+    closing = decode_merge_closing(job.ticket_merge_closing)
+    current_snapshots: tuple[TicketSnapshot, ...] | None = None
+    if not job.ticket_merge_survivor_title:
+        current_snapshots = (
+            github.ticket_snapshot(f"{repository}#{number}"),
+            *(github.ticket_snapshot(ticket.identity) for ticket in closing),
+        )
+        config = default_user_config()
+        draft, closing, survivor_marker = assign_merge_markers(
+            draft_ticket_merge(
+                job.trusted_utterance or job.request,
+                survivor,
+                current_snapshots,
+                settings=config.providers,
+            ),
+            closing,
+        )
+        snapshot_payload = encode_merge_snapshots(current_snapshots)
+
+        def persist_draft(current: CursorJob) -> CursorJob:
+            return current.evolve(
+                github_repository=repository,
+                github_issue=number,
+                ticket_merge_survivor=survivor,
+                ticket_merge_closing=encode_merge_closing(closing),
+                ticket_merge_snapshots=snapshot_payload,
+                ticket_merge_survivor_title=draft.title,
+                ticket_merge_survivor_body=draft.body,
+                ticket_merge_survivor_marker=survivor_marker,
+                ticket_merge_survivor_operation_state="planned",
+                ticket_merge_operation_state="planned",
+            )
+
+        updated = _persist_merge_job(
+            store, job, token, persist_draft, statuses={JobStatus.ROUTING}
+        )
+        if updated is None:
+            return
+        job = updated
+    closing = decode_merge_closing(job.ticket_merge_closing)
+    expected_snapshots = decode_merge_snapshots(job.ticket_merge_snapshots)
+    if current_snapshots is None:
+        current_snapshots = (
+            github.ticket_snapshot(f"{repository}#{number}"),
+            *(github.ticket_snapshot(ticket.identity) for ticket in closing),
+        )
+    if not _merge_snapshots_match(expected_snapshots, current_snapshots):
+        config = default_user_config()
+        refreshed = draft_ticket_merge(
+            job.trusted_utterance or job.request,
+            survivor,
+            current_snapshots,
+            settings=config.providers,
+        )
+
+        def persist_drift(current: CursorJob) -> CursorJob:
+            return current.evolve(
+                ticket_merge_confirmed=False,
+                ticket_merge_snapshots=encode_merge_snapshots(current_snapshots),
+                ticket_merge_survivor_title=refreshed.title,
+                ticket_merge_survivor_body=refreshed.body,
+                ticket_merge_survivor_operation_state="planned",
+                ticket_merge_operation_state="planned",
+            )
+
+        updated = _persist_merge_job(
+            store,
+            job,
+            token,
+            persist_drift,
+            statuses={JobStatus.ROUTING},
+        )
+        if updated is None:
+            return
+        job = updated
+    draft = TicketMergeDraft(
+        job.ticket_merge_survivor_title or "",
+        job.ticket_merge_survivor_body or "",
+    )
+    if not job.ticket_merge_confirmed:
+        _ask_merge_confirmation(store, job, token, draft, closing, github=True)
+        return
+    if job.ticket_merge_operation_state not in {None, "planned"}:
+        raise HarnessError("GitHub issue merge requires reconciliation before retry")
+
+    def mark_running(current: CursorJob) -> CursorJob:
+        return current.evolve(
+            status=JobStatus.RUNNING,
+            worker_operation="github_issue_merge",
+        )
+
+    running = _persist_merge_job(
+        store, job, token, mark_running, statuses={JobStatus.ROUTING}
+    )
+    if running is None:
+        return
+    job = running
+    survivor_state = job.ticket_merge_survivor_operation_state
+    if survivor_state != "created":
+        if survivor_state in {"submitted", "ambiguous"}:
+            plan = github.plan_issue_update(
+                repository,
+                number,
+                job.ticket_merge_survivor_title or "",
+                job.ticket_merge_survivor_body or "",
+                correlation_marker=job.ticket_merge_survivor_marker,
+            )
+            checkpoint()
+            try:
+                visible = github.observe_issue_update(plan)
+            except GitHubError:
+                visible = None
+            if visible is None:
+                _queue_merge_ambiguous(
+                    store, job, token, closing, survivor_state="ambiguous"
+                )
+                return
+        else:
+            submitted = _persist_merge_job(
+                store,
+                job,
+                token,
+                lambda current: current.evolve(
+                    ticket_merge_survivor_operation_state="submitted",
+                    ticket_merge_operation_state="submitted",
+                ),
+                statuses={JobStatus.RUNNING},
+            )
+            if submitted is None:
+                return
+            job = submitted
+            try:
+                checkpoint()
+                plan = github.plan_issue_update(
+                    repository,
+                    number,
+                    job.ticket_merge_survivor_title or "",
+                    job.ticket_merge_survivor_body or "",
+                    correlation_marker=job.ticket_merge_survivor_marker,
+                )
+                github.submit_issue_update(plan, confirmed=True)
+            except GitHubError as exc:
+                checkpoint()
+                try:
+                    visible = github.observe_issue_update(
+                        github.plan_issue_update(
+                            repository,
+                            number,
+                            job.ticket_merge_survivor_title or "",
+                            job.ticket_merge_survivor_body or "",
+                            correlation_marker=job.ticket_merge_survivor_marker,
+                        )
+                    )
+                except GitHubError:
+                    visible = None
+                if visible is None:
+                    if isinstance(exc, GitHubCommandStartError):
+                        _queue_merge_retry(
+                            store, job, token, closing, survivor_state="planned"
+                        )
+                        return
+                    _queue_merge_ambiguous(
+                        store, job, token, closing, survivor_state="ambiguous"
+                    )
+                    return
+        persisted = _persist_merge_job(
+            store,
+            job,
+            token,
+            lambda current: current.evolve(
+                ticket_merge_survivor_operation_state="created",
+                ticket_merge_operation_state="planned",
+            ),
+            statuses={JobStatus.RUNNING},
+        )
+        if persisted is None:
+            return
+        job = persisted
+        survivor_state = "created"
+    for index, ticket in enumerate(closing):
+        if ticket.state == "created":
+            continue
+        close_repository = ticket.repository or repository
+        close_number = ticket.number
+        if close_number is None:
+            raise HarnessError("GitHub issue merge closing ticket requires a number")
+        if ticket.state in {"submitted", "ambiguous"}:
+            plan = github.plan_issue_close(
+                close_repository,
+                close_number,
+                correlation_marker=ticket.marker,
+            )
+            checkpoint()
+            try:
+                visible = github.observe_issue_close(plan)
+            except GitHubError:
+                visible = None
+            if visible is None:
+                closing = replace_merge_closing(closing, index, state="ambiguous")
+                _queue_merge_ambiguous(
+                    store, job, token, closing, survivor_state="created"
+                )
+                return
+            closing = replace_merge_closing(closing, index, state="created")
+            persisted = _persist_merge_closing(
+                store, job, token, closing, operation_state="planned"
+            )
+            if persisted is None:
+                return
+            job = persisted
+            continue
+        closing = replace_merge_closing(closing, index, state="submitted")
+        submitted = _persist_merge_closing(
+            store, job, token, closing, operation_state="submitted"
+        )
+        if submitted is None:
+            return
+        job = submitted
+        try:
+            checkpoint()
+            plan = github.plan_issue_close(
+                close_repository,
+                close_number,
+                correlation_marker=ticket.marker,
+            )
+            github.submit_issue_close(plan, confirmed=True)
+        except GitHubError as exc:
+            checkpoint()
+            try:
+                visible = github.observe_issue_close(
+                    github.plan_issue_close(
+                        close_repository,
+                        close_number,
+                        correlation_marker=ticket.marker,
+                    )
+                )
+            except GitHubError:
+                visible = None
+            if visible is not None:
+                closing = replace_merge_closing(closing, index, state="created")
+                persisted = _persist_merge_closing(
+                    store, job, token, closing, operation_state="planned"
+                )
+                if persisted is None:
+                    return
+                job = persisted
+                continue
+            if isinstance(exc, GitHubCommandStartError):
+                closing = replace_merge_closing(closing, index, state="planned")
+                _queue_merge_retry(store, job, token, closing, survivor_state="created")
+                return
+            closing = replace_merge_closing(closing, index, state="ambiguous")
+            _queue_merge_ambiguous(store, job, token, closing, survivor_state="created")
+            return
+        closing = replace_merge_closing(closing, index, state="created")
+        persisted = _persist_merge_closing(
+            store, job, token, closing, operation_state="planned"
+        )
+        if persisted is None:
+            return
+        job = persisted
+    _finish_ticket_merge(store, job, token, closing, survivor_state="created")
+
+
+def _run_linear_ticket_merge(
+    store: JobStore,
+    job: CursorJob,
+    token: WorkerClaim,
+    clients: ClientFactories,
+    checkpoint: Callable[[], None],
+) -> None:
+    identifier = (job.issue_key or job.ticket_merge_survivor or "").strip()
+    if not identifier:
+        raise HarnessError("Linear ticket merge requires a trusted survivor identity")
+    registry = clients.integrations or build_integration_registry(default_user_config())
+    provider = issue_provider("linear", registry)
+    if not isinstance(provider, LinearIntegration):
+        raise HarnessError("selected Linear provider cannot merge tickets")
+    client = clients.herdr()
+    checkpoint()
+    if not job.ticket_merge_survivor_issue_id:
+        try:
+            issue_id, issue = provider.resolve_issue_for_update(
+                client,
+                identifier,
+                checkpoint=checkpoint,
+            )
+        except LinearError:
+            message = f"I couldn't find Linear ticket {identifier}."
+
+            def finish_missing(current: CursorJob) -> CursorJob:
+                now = time.time()
+                return recovery.stage_terminal_intent(
+                    current,
+                    JobStatus.FAILED,
+                    now=now,
+                    result=message,
+                    error=message,
+                )
+
+            _worker_change(
+                store,
+                job.id,
+                token,
+                MODEL_WORKER_STATUSES,
+                finish_missing,
+                expected_revision=job.revision,
+            )
+            return
+
+        def persist_issue(current: CursorJob) -> CursorJob:
+            return current.evolve(
+                issue_key=issue.identifier,
+                ticket_merge_survivor=issue.identifier,
+                ticket_merge_survivor_issue_id=issue_id,
+            )
+
+        updated = _persist_merge_job(
+            store, job, token, persist_issue, statuses={JobStatus.ROUTING}
+        )
+        if updated is None:
+            return
+        job = updated
+        identifier = issue.identifier
+    closing = decode_merge_closing(job.ticket_merge_closing)
+    resolved: list[MergeClosingTicket] = []
+    changed = False
+    for ticket in closing:
+        if ticket.issue_id and ticket.terminal_state_id and ticket.terminal_state_name:
+            resolved.append(ticket)
+            continue
+        if ticket.issue_id:
+            issue_id = ticket.issue_id
+            issue = LinearIssue(ticket.identity)
+        else:
+            try:
+                issue_id, issue = provider.resolve_issue_for_update(
+                    client,
+                    ticket.identity,
+                    checkpoint=checkpoint,
+                )
+            except LinearError:
+                missing = f"I couldn't find Linear ticket {ticket.identity}."
+
+                def finish_missing_close(
+                    current: CursorJob, *, message: str = missing
+                ) -> CursorJob:
+                    now = time.time()
+                    return recovery.stage_terminal_intent(
+                        current,
+                        JobStatus.FAILED,
+                        now=now,
+                        result=message,
+                        error=message,
+                    )
+
+                _worker_change(
+                    store,
+                    job.id,
+                    token,
+                    MODEL_WORKER_STATUSES,
+                    finish_missing_close,
+                    expected_revision=job.revision,
+                )
+                return
+        terminal_state = provider.resolve_terminal_state(
+            client,
+            issue.identifier,
+            checkpoint=checkpoint,
+        )
+        resolved.append(
+            replace(
+                ticket,
+                identity=issue.identifier,
+                issue_id=issue_id,
+                terminal_state_id=terminal_state.id,
+                terminal_state_name=terminal_state.name,
+            )
+        )
+        changed = True
+    if changed:
+        closing = tuple(resolved)
+
+        def persist_closing(current: CursorJob) -> CursorJob:
+            return current.evolve(ticket_merge_closing=encode_merge_closing(closing))
+
+        updated = _persist_merge_job(
+            store, job, token, persist_closing, statuses={JobStatus.ROUTING}
+        )
+        if updated is None:
+            return
+        job = updated
+    else:
+        closing = tuple(resolved)
+    current_snapshots: tuple[TicketSnapshot, ...] | None = None
+    if not job.ticket_merge_survivor_title:
+        current_snapshots = _linear_merge_snapshots(
+            provider,
+            client,
+            identifier,
+            job.ticket_merge_survivor_issue_id or "",
+            closing,
+            checkpoint,
+        )
+        config = default_user_config()
+        draft, closing, survivor_marker = assign_merge_markers(
+            draft_ticket_merge(
+                job.trusted_utterance or job.request,
+                identifier,
+                current_snapshots,
+                settings=config.providers,
+            ),
+            closing,
+        )
+        snapshot_payload = encode_merge_snapshots(current_snapshots)
+
+        def persist_draft(current: CursorJob) -> CursorJob:
+            return current.evolve(
+                ticket_merge_survivor=identifier,
+                ticket_merge_closing=encode_merge_closing(closing),
+                ticket_merge_snapshots=snapshot_payload,
+                ticket_merge_survivor_title=draft.title,
+                ticket_merge_survivor_body=draft.body,
+                ticket_merge_survivor_marker=survivor_marker,
+                ticket_merge_survivor_operation_state="planned",
+                ticket_merge_operation_state="planned",
+            )
+
+        updated = _persist_merge_job(
+            store, job, token, persist_draft, statuses={JobStatus.ROUTING}
+        )
+        if updated is None:
+            return
+        job = updated
+    closing = decode_merge_closing(job.ticket_merge_closing)
+    expected_snapshots = decode_merge_snapshots(job.ticket_merge_snapshots)
+    if current_snapshots is None:
+        current_snapshots = _linear_merge_snapshots(
+            provider,
+            client,
+            identifier,
+            job.ticket_merge_survivor_issue_id or "",
+            closing,
+            checkpoint,
+        )
+    if not _merge_snapshots_match(expected_snapshots, current_snapshots):
+        config = default_user_config()
+        refreshed = draft_ticket_merge(
+            job.trusted_utterance or job.request,
+            identifier,
+            current_snapshots,
+            settings=config.providers,
+        )
+
+        def persist_drift(current: CursorJob) -> CursorJob:
+            return current.evolve(
+                ticket_merge_confirmed=False,
+                ticket_merge_snapshots=encode_merge_snapshots(current_snapshots),
+                ticket_merge_survivor_title=refreshed.title,
+                ticket_merge_survivor_body=refreshed.body,
+                ticket_merge_survivor_operation_state="planned",
+                ticket_merge_operation_state="planned",
+            )
+
+        updated = _persist_merge_job(
+            store,
+            job,
+            token,
+            persist_drift,
+            statuses={JobStatus.ROUTING},
+        )
+        if updated is None:
+            return
+        job = updated
+    draft = TicketMergeDraft(
+        job.ticket_merge_survivor_title or "",
+        job.ticket_merge_survivor_body or "",
+    )
+    if not job.ticket_merge_confirmed:
+        _ask_merge_confirmation(store, job, token, draft, closing, github=False)
+        return
+    if job.ticket_merge_operation_state not in {None, "planned"}:
+        raise HarnessError("Linear ticket merge requires reconciliation before retry")
+
+    def mark_running(current: CursorJob) -> CursorJob:
+        return current.evolve(
+            status=JobStatus.RUNNING,
+            worker_operation="linear_ticket_merge",
+        )
+
+    running = _persist_merge_job(
+        store, job, token, mark_running, statuses={JobStatus.ROUTING}
+    )
+    if running is None:
+        return
+    job = running
+    callback_revision = job.revision
+
+    def persist_submit_fence(
+        target: str,
+        session: str,
+        prompt_token: str,
+        baseline: int,
+    ) -> None:
+        nonlocal callback_revision
+
+        def fence(current: CursorJob) -> CursorJob:
+            return current.evolve(
+                ticket_merge_operation_state="submitting",
+                ticket_merge_prompt_target=target,
+                ticket_merge_prompt_session=session,
+                ticket_merge_prompt_token=prompt_token,
+                ticket_merge_baseline_sequence=baseline,
+            )
+
+        if (
+            _worker_change(
+                store,
+                job.id,
+                token,
+                {JobStatus.RUNNING},
+                fence,
+                expected_revision=callback_revision,
+            )
+            is None
+        ):
+            raise WorkerCancelled
+        callback_revision += 1
+
+    def persist_prompt_acceptance() -> None:
+        nonlocal callback_revision
+
+        def accepted(current: CursorJob) -> CursorJob:
+            return current.evolve(ticket_merge_operation_state="submitted")
+
+        if (
+            _worker_change(
+                store,
+                job.id,
+                token,
+                {JobStatus.RUNNING},
+                accepted,
+                expected_revision=callback_revision,
+            )
+            is None
+        ):
+            raise WorkerCancelled
+        callback_revision += 1
+
+    survivor_state = job.ticket_merge_survivor_operation_state
+    if survivor_state != "created":
+        plan = provider.plan_ticket_update(
+            job.ticket_merge_survivor_issue_id or "",
+            job.issue_key or identifier,
+            job.ticket_merge_survivor_title or "",
+            job.ticket_merge_survivor_body or "",
+            correlation_marker=job.ticket_merge_survivor_marker,
+        )
+        if survivor_state in {"submitted", "ambiguous"}:
+            try:
+                visible = provider.observe_ticket_update(
+                    client, plan, checkpoint=checkpoint
+                )
+            except LinearError:
+                visible = None
+            if visible is None:
+                _queue_merge_ambiguous(
+                    store, job, token, closing, survivor_state="ambiguous"
+                )
+                return
+        else:
+            submitted = _persist_merge_job(
+                store,
+                job,
+                token,
+                lambda current: current.evolve(
+                    ticket_merge_survivor_operation_state="planned",
+                    ticket_merge_operation_state="planned",
+                ),
+                statuses={JobStatus.RUNNING},
+            )
+            if submitted is None:
+                return
+            job = submitted
+            callback_revision = job.revision
+            try:
+                checkpoint()
+                provider.submit_ticket_update(
+                    client,
+                    plan,
+                    confirmed=True,
+                    checkpoint=checkpoint,
+                    before_submit=persist_submit_fence,
+                    accepted=persist_prompt_acceptance,
+                )
+            except LinearError as exc:
+                checkpoint()
+                current = store.get(job.id)
+                uncertain = isinstance(exc, LinearOperationAmbiguous) or (
+                    current.ticket_merge_operation_state in {"submitting", "submitted"}
+                )
+                if uncertain:
+                    try:
+                        visible = provider.observe_ticket_update(
+                            client, plan, checkpoint=checkpoint
+                        )
+                    except LinearError:
+                        visible = None
+                    if visible is None:
+                        _queue_merge_ambiguous(
+                            store, job, token, closing, survivor_state="ambiguous"
+                        )
+                        return
+                else:
+                    _queue_merge_retry(
+                        store, job, token, closing, survivor_state="planned"
+                    )
+                    return
+            current = store.get(job.id)
+            if current.ticket_merge_operation_state != "submitted":
+                _queue_merge_ambiguous(
+                    store, job, token, closing, survivor_state="ambiguous"
+                )
+                return
+            try:
+                visible = provider.observe_ticket_update(
+                    client, plan, checkpoint=checkpoint
+                )
+            except LinearError:
+                visible = None
+            if visible is None:
+                _queue_merge_ambiguous(
+                    store, job, token, closing, survivor_state="ambiguous"
+                )
+                return
+        persisted = _persist_merge_job(
+            store,
+            job,
+            token,
+            lambda current: current.evolve(
+                ticket_merge_survivor_operation_state="created",
+                ticket_merge_operation_state="planned",
+            ),
+            statuses={JobStatus.RUNNING},
+        )
+        if persisted is None:
+            return
+        job = persisted
+        callback_revision = job.revision
+        survivor_state = "created"
+    for index, ticket in enumerate(closing):
+        if ticket.state == "created":
+            continue
+        plan = provider.plan_ticket_close(
+            ticket.issue_id or "",
+            ticket.identity,
+            ticket.terminal_state_id or "",
+            ticket.terminal_state_name or "",
+            correlation_marker=ticket.marker,
+        )
+        if ticket.state in {"submitted", "ambiguous"}:
+            try:
+                visible = provider.observe_ticket_close(
+                    client, plan, checkpoint=checkpoint
+                )
+            except LinearError:
+                visible = None
+            if visible is None:
+                closing = replace_merge_closing(closing, index, state="ambiguous")
+                _queue_merge_ambiguous(
+                    store, job, token, closing, survivor_state="created"
+                )
+                return
+            closing = replace_merge_closing(closing, index, state="created")
+            persisted = _persist_merge_closing(
+                store, job, token, closing, operation_state="planned"
+            )
+            if persisted is None:
+                return
+            job = persisted
+            callback_revision = job.revision
+            continue
+        closing = replace_merge_closing(closing, index, state="submitted")
+        submitted = _persist_merge_closing(
+            store, job, token, closing, operation_state="planned"
+        )
+        if submitted is None:
+            return
+        job = submitted
+        callback_revision = job.revision
+        try:
+            checkpoint()
+            provider.submit_ticket_close(
+                client,
+                plan,
+                confirmed=True,
+                checkpoint=checkpoint,
+                before_submit=persist_submit_fence,
+                accepted=persist_prompt_acceptance,
+            )
+        except LinearError as exc:
+            checkpoint()
+            current = store.get(job.id)
+            uncertain = isinstance(exc, LinearOperationAmbiguous) or (
+                current.ticket_merge_operation_state in {"submitting", "submitted"}
+            )
+            if uncertain:
+                try:
+                    visible = provider.observe_ticket_close(
+                        client, plan, checkpoint=checkpoint
+                    )
+                except LinearError:
+                    visible = None
+                if visible is not None:
+                    closing = replace_merge_closing(closing, index, state="created")
+                    persisted = _persist_merge_closing(
+                        store, job, token, closing, operation_state="planned"
+                    )
+                    if persisted is None:
+                        return
+                    job = persisted
+                    callback_revision = job.revision
+                    continue
+                closing = replace_merge_closing(closing, index, state="ambiguous")
+                _queue_merge_ambiguous(
+                    store, job, token, closing, survivor_state="created"
+                )
+                return
+            closing = replace_merge_closing(closing, index, state="planned")
+            _queue_merge_retry(store, job, token, closing, survivor_state="created")
+            return
+        current = store.get(job.id)
+        if current.ticket_merge_operation_state != "submitted":
+            closing = replace_merge_closing(closing, index, state="ambiguous")
+            _queue_merge_ambiguous(store, job, token, closing, survivor_state="created")
+            return
+        try:
+            visible = provider.observe_ticket_close(client, plan, checkpoint=checkpoint)
+        except LinearError:
+            visible = None
+        if visible is None:
+            closing = replace_merge_closing(closing, index, state="ambiguous")
+            _queue_merge_ambiguous(store, job, token, closing, survivor_state="created")
+            return
+        closing = replace_merge_closing(closing, index, state="created")
+        persisted = _persist_merge_closing(
+            store, job, token, closing, operation_state="planned"
+        )
+        if persisted is None:
+            return
+        job = persisted
+        callback_revision = job.revision
+    _finish_ticket_merge(store, job, token, closing, survivor_state="created")
 
 
 def _completion_preferences(
@@ -6370,6 +9720,60 @@ def run_claimed_worker(  # pyright: ignore[reportGeneralTypeIssues]
                 return
         if job.linear_ticket_create_requested:
             _run_linear_ticket_creation(
+                store,
+                job,
+                worker_token,
+                clients,
+                checkpoint,
+            )
+            return
+        if job.github_issue_update_requested:
+            _run_github_issue_update(
+                store,
+                job,
+                worker_token,
+                clients,
+                checkpoint,
+            )
+            return
+        if job.linear_ticket_update_requested:
+            _run_linear_ticket_update(
+                store,
+                job,
+                worker_token,
+                clients,
+                checkpoint,
+            )
+            return
+        if job.github_issue_close_requested:
+            _run_github_issue_close(
+                store,
+                job,
+                worker_token,
+                clients,
+                checkpoint,
+            )
+            return
+        if job.linear_ticket_close_requested:
+            _run_linear_ticket_close(
+                store,
+                job,
+                worker_token,
+                clients,
+                checkpoint,
+            )
+            return
+        if job.github_issue_split_requested or job.linear_ticket_split_requested:
+            _run_ticket_split(
+                store,
+                job,
+                worker_token,
+                clients,
+                checkpoint,
+            )
+            return
+        if job.github_issue_merge_requested or job.linear_ticket_merge_requested:
+            _run_ticket_merge(
                 store,
                 job,
                 worker_token,

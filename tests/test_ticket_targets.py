@@ -1,6 +1,10 @@
 from __future__ import annotations
 
-from local_voice_harness.ticket_targets import extract_ticket_targets
+from local_voice_harness.ticket_targets import (
+    extract_ticket_targets,
+    parse_focused_ticket,
+    resolve_named_ticket,
+)
 
 
 def test_scoped_github_numbers_preserve_order_and_deduplicate() -> None:
@@ -414,3 +418,39 @@ def test_single_scoped_number_is_identified_without_becoming_a_batch() -> None:
     assert extraction.requested_count == 1
     assert extraction.references[0].canonical == "example/project#12"
     assert extraction.references[0].scoped
+
+
+def test_resolve_named_ticket_prefers_one_spoken_canonical() -> None:
+    extraction = extract_ticket_targets("Review owner/repo#12")
+
+    ticket = resolve_named_ticket(
+        extraction,
+        focused_issue="owner/other#9",
+    )
+
+    assert ticket is not None
+    assert ticket.canonical == "owner/repo#12"
+    assert ticket.source == "github"
+
+
+def test_resolve_named_ticket_uses_focused_identity_when_speech_has_none() -> None:
+    extraction = extract_ticket_targets("Review this ticket")
+
+    github = resolve_named_ticket(extraction, focused_issue="Example/Project#42")
+    linear = resolve_named_ticket(extraction, focused_issue="API-79")
+
+    assert github is not None
+    assert github.canonical == "Example/Project#42"
+    assert linear is not None
+    assert linear.canonical == "API-79"
+
+
+def test_resolve_named_ticket_rejects_missing_ambiguous_and_unscoped() -> None:
+    missing = extract_ticket_targets("Review this ticket")
+    batch = extract_ticket_targets("Review API-79 and API-80")
+    unscoped = extract_ticket_targets("Review issue 12")
+
+    assert resolve_named_ticket(missing, focused_issue=None) is None
+    assert resolve_named_ticket(batch, focused_issue="API-79") is None
+    assert resolve_named_ticket(unscoped, focused_issue="example/project#12") is None
+    assert parse_focused_ticket("not-a-ticket") is None

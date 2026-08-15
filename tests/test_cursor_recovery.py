@@ -44,11 +44,18 @@ from local_voice_harness.cursor.recovery import (
     reconcile_uncertain_agent,
     reconcile_uncertain_clone,
     reconcile_uncertain_fork,
+    reconcile_uncertain_issue_close,
     reconcile_uncertain_issue_creation,
+    reconcile_uncertain_issue_update,
+    reconcile_uncertain_linear_ticket_close,
     reconcile_uncertain_linear_ticket_creation,
+    reconcile_uncertain_linear_ticket_update,
+    reconcile_uncertain_operations,
     reconcile_uncertain_pr_creation,
     reconcile_uncertain_pr_merge,
     reconcile_uncertain_repo_creation,
+    reconcile_uncertain_ticket_merge,
+    reconcile_uncertain_ticket_split,
     recover_jobs,
     resolve_manual_reconciliation,
     stage_terminal_intent,
@@ -62,7 +69,9 @@ from local_voice_harness.integrations.github import (
     GitHubClient,
     GitHubError,
     GitHubIssue,
+    GitHubIssueCloseResult,
     GitHubIssueCreationResult,
+    GitHubIssueUpdateResult,
     GitHubPullRequest,
     GitHubPullRequestCreationResult,
     GitHubPullRequestMergeResult,
@@ -75,13 +84,17 @@ from local_voice_harness.integrations.linear import (
     LinearError,
     LinearIntegration,
     LinearIssue,
+    LinearTicketCloseResult,
     LinearTicketCreationResult,
+    LinearTicketUpdateResult,
 )
 from local_voice_harness.prompt_operations import (
     AmbiguousPrompt,
     PromptIdentity,
     SubmittingPrompt,
 )
+from local_voice_harness.ticket_merge import MergeClosingTicket, encode_merge_closing
+from local_voice_harness.ticket_split import SplitChild, encode_split_children
 
 WORKER = WorkerOwnership("worker", 42, "boot", "start", "test", 1)
 
@@ -1003,6 +1016,602 @@ class CursorRecoveryTests(unittest.TestCase):
         updated = self.store.get(job.id)
         self.assertEqual(updated.status, JobStatus.QUEUED)
         self.assertEqual(updated.linear_ticket_create_operation_state, "ambiguous")
+
+    def test_reconciles_ambiguous_issue_update_without_resubmitting(self) -> None:
+        job = self.create(
+            {
+                "id": "123456789abc",
+                "status": "reconciling",
+                "request": "update the issue",
+                "created_at": 1,
+                "delivered": False,
+                "issue_provider": "github",
+                "github_repository": "example/project",
+                "github_issue": 12,
+                "github_issue_update_requested": True,
+                "github_issue_update_confirmed": True,
+                "github_issue_update_title": "Fix startup",
+                "github_issue_update_body": "Startup fails.",
+                "github_issue_update_marker": "a" * 32,
+                "github_issue_update_operation_state": "ambiguous",
+            }
+        )
+        client = mock.Mock(spec=GitHubClient)
+        client.observe_issue_update.return_value = GitHubIssueUpdateResult(
+            GitHubIssue("example", "project", 12),
+            "https://github.com/example/project/issues/12",
+            "Fix startup",
+            "a" * 32,
+        )
+
+        reconcile_uncertain_issue_update(
+            self.store,
+            job,
+            now=100,
+            github_factory=lambda: client,
+        )
+
+        updated = self.store.get(job.id)
+        self.assertEqual(updated.status, JobStatus.COMPLETED)
+        self.assertEqual(updated.github_issue_update_operation_state, "created")
+        client.submit_issue_update.assert_not_called()
+
+    def test_unobserved_issue_update_requires_manual_check(self) -> None:
+        job = self.create(
+            {
+                "id": "123456789abc",
+                "status": "queued",
+                "request": "update the issue",
+                "created_at": 1,
+                "queued_at": 1,
+                "delivered": False,
+                "issue_provider": "github",
+                "github_repository": "example/project",
+                "github_issue": 12,
+                "github_issue_update_requested": True,
+                "github_issue_update_confirmed": True,
+                "github_issue_update_title": "Fix startup",
+                "github_issue_update_body": "Startup fails.",
+                "github_issue_update_marker": "a" * 32,
+                "github_issue_update_operation_state": "ambiguous",
+            }
+        )
+        client = mock.Mock(spec=GitHubClient)
+        client.observe_issue_update.return_value = None
+
+        reconcile_uncertain_issue_update(
+            self.store,
+            job,
+            now=100,
+            github_factory=lambda: client,
+        )
+
+        updated = self.store.get(job.id)
+        self.assertEqual(updated.status, JobStatus.BLOCKED)
+        self.assertEqual(
+            updated.github_issue_update_operation_state,
+            "manual_required",
+        )
+        client.submit_issue_update.assert_not_called()
+
+    def test_reconciles_ambiguous_linear_update_without_resubmitting(self) -> None:
+        job = self.create(
+            {
+                "id": "123456789abc",
+                "status": "queued",
+                "request": "update the Linear ticket",
+                "created_at": 1,
+                "queued_at": 1,
+                "delivered": False,
+                "issue_provider": "linear",
+                "issue_key": "API-79",
+                "linear_ticket_update_requested": True,
+                "linear_ticket_update_confirmed": True,
+                "linear_ticket_update_issue_id": "issue-id-api-79",
+                "linear_ticket_update_title": "Fix startup",
+                "linear_ticket_update_description": "Startup fails.",
+                "linear_ticket_update_marker": "a" * 32,
+                "linear_ticket_update_operation_state": "ambiguous",
+            }
+        )
+        provider = LinearIntegration()
+        result = LinearTicketUpdateResult(
+            LinearIssue("API-79"),
+            "https://linear.app/acme/issue/API-79/fix-startup",
+            "Fix startup",
+            "a" * 32,
+        )
+        with mock.patch.object(
+            provider,
+            "observe_ticket_update",
+            return_value=result,
+        ) as observe:
+            reconcile_uncertain_linear_ticket_update(
+                self.store,
+                job,
+                now=100,
+                herdr_factory=mock.Mock,
+                linear_factory=lambda: provider,
+            )
+
+        updated = self.store.get(job.id)
+        self.assertEqual(updated.status, JobStatus.COMPLETED)
+        self.assertEqual(updated.linear_ticket_update_operation_state, "created")
+        observe.assert_called_once()
+
+    def test_unobserved_linear_update_requires_manual_check(self) -> None:
+        job = self.create(
+            {
+                "id": "123456789abc",
+                "status": "queued",
+                "request": "update the Linear ticket",
+                "created_at": 1,
+                "queued_at": 1,
+                "delivered": False,
+                "issue_provider": "linear",
+                "issue_key": "API-79",
+                "linear_ticket_update_requested": True,
+                "linear_ticket_update_confirmed": True,
+                "linear_ticket_update_issue_id": "issue-id-api-79",
+                "linear_ticket_update_title": "Fix startup",
+                "linear_ticket_update_description": "Startup fails.",
+                "linear_ticket_update_marker": "a" * 32,
+                "linear_ticket_update_operation_state": "ambiguous",
+            }
+        )
+        provider = LinearIntegration()
+        with mock.patch.object(
+            provider,
+            "observe_ticket_update",
+            return_value=None,
+        ):
+            reconcile_uncertain_linear_ticket_update(
+                self.store,
+                job,
+                now=100,
+                herdr_factory=mock.Mock,
+                linear_factory=lambda: provider,
+            )
+
+        updated = self.store.get(job.id)
+        self.assertEqual(updated.status, JobStatus.BLOCKED)
+        self.assertEqual(
+            updated.linear_ticket_update_operation_state,
+            "manual_required",
+        )
+
+    def test_reconciles_ambiguous_issue_close_without_resubmitting(self) -> None:
+        job = self.create(
+            {
+                "id": "123456789abc",
+                "status": "reconciling",
+                "request": "close the issue",
+                "created_at": 1,
+                "delivered": False,
+                "issue_provider": "github",
+                "github_repository": "example/project",
+                "github_issue": 12,
+                "github_issue_close_requested": True,
+                "github_issue_close_confirmed": True,
+                "github_issue_close_marker": "a" * 32,
+                "github_issue_close_operation_state": "ambiguous",
+            }
+        )
+        client = mock.Mock(spec=GitHubClient)
+        client.observe_issue_close.return_value = GitHubIssueCloseResult(
+            GitHubIssue("example", "project", 12),
+            "https://github.com/example/project/issues/12",
+            "a" * 32,
+        )
+
+        reconcile_uncertain_issue_close(
+            self.store,
+            job,
+            now=100,
+            github_factory=lambda: client,
+        )
+
+        updated = self.store.get(job.id)
+        self.assertEqual(updated.status, JobStatus.COMPLETED)
+        self.assertEqual(updated.github_issue_close_operation_state, "created")
+        client.submit_issue_close.assert_not_called()
+
+    def test_unobserved_issue_close_requires_manual_check(self) -> None:
+        job = self.create(
+            {
+                "id": "123456789abc",
+                "status": "queued",
+                "request": "close the issue",
+                "created_at": 1,
+                "queued_at": 1,
+                "delivered": False,
+                "issue_provider": "github",
+                "github_repository": "example/project",
+                "github_issue": 12,
+                "github_issue_close_requested": True,
+                "github_issue_close_confirmed": True,
+                "github_issue_close_marker": "a" * 32,
+                "github_issue_close_operation_state": "ambiguous",
+            }
+        )
+        client = mock.Mock(spec=GitHubClient)
+        client.observe_issue_close.return_value = None
+
+        reconcile_uncertain_issue_close(
+            self.store,
+            job,
+            now=100,
+            github_factory=lambda: client,
+        )
+
+        updated = self.store.get(job.id)
+        self.assertEqual(updated.status, JobStatus.BLOCKED)
+        self.assertEqual(
+            updated.github_issue_close_operation_state,
+            "manual_required",
+        )
+        client.submit_issue_close.assert_not_called()
+
+    def test_reconciles_ambiguous_linear_close_without_resubmitting(self) -> None:
+        job = self.create(
+            {
+                "id": "123456789abc",
+                "status": "queued",
+                "request": "close the Linear ticket",
+                "created_at": 1,
+                "queued_at": 1,
+                "delivered": False,
+                "issue_provider": "linear",
+                "issue_key": "API-79",
+                "linear_ticket_close_requested": True,
+                "linear_ticket_close_confirmed": True,
+                "linear_ticket_close_issue_id": "issue-id-api-79",
+                "linear_ticket_close_terminal_state_id": "state-done",
+                "linear_ticket_close_terminal_state_name": "Done",
+                "linear_ticket_close_marker": "a" * 32,
+                "linear_ticket_close_operation_state": "ambiguous",
+            }
+        )
+        provider = LinearIntegration()
+        result = LinearTicketCloseResult(
+            LinearIssue("API-79"),
+            "https://linear.app/acme/issue/API-79/fix-startup",
+            "a" * 32,
+        )
+        with mock.patch.object(
+            provider,
+            "observe_ticket_close",
+            return_value=result,
+        ) as observe:
+            reconcile_uncertain_linear_ticket_close(
+                self.store,
+                job,
+                now=100,
+                herdr_factory=mock.Mock,
+                linear_factory=lambda: provider,
+            )
+
+        updated = self.store.get(job.id)
+        self.assertEqual(updated.status, JobStatus.COMPLETED)
+        self.assertEqual(updated.linear_ticket_close_operation_state, "created")
+        observe.assert_called_once()
+
+    def test_unobserved_linear_close_requires_manual_check(self) -> None:
+        job = self.create(
+            {
+                "id": "123456789abc",
+                "status": "queued",
+                "request": "close the Linear ticket",
+                "created_at": 1,
+                "queued_at": 1,
+                "delivered": False,
+                "issue_provider": "linear",
+                "issue_key": "API-79",
+                "linear_ticket_close_requested": True,
+                "linear_ticket_close_confirmed": True,
+                "linear_ticket_close_issue_id": "issue-id-api-79",
+                "linear_ticket_close_terminal_state_id": "state-done",
+                "linear_ticket_close_terminal_state_name": "Done",
+                "linear_ticket_close_marker": "a" * 32,
+                "linear_ticket_close_operation_state": "ambiguous",
+            }
+        )
+        provider = LinearIntegration()
+        with mock.patch.object(
+            provider,
+            "observe_ticket_close",
+            return_value=None,
+        ):
+            reconcile_uncertain_linear_ticket_close(
+                self.store,
+                job,
+                now=100,
+                herdr_factory=mock.Mock,
+                linear_factory=lambda: provider,
+            )
+
+        updated = self.store.get(job.id)
+        self.assertEqual(updated.status, JobStatus.BLOCKED)
+        self.assertEqual(
+            updated.linear_ticket_close_operation_state,
+            "manual_required",
+        )
+
+    def test_reconciles_ambiguous_issue_split_without_resubmitting(self) -> None:
+        children = encode_split_children(
+            (
+                SplitChild(
+                    "Auth",
+                    "Handle login.",
+                    "a" * 32,
+                    state="created",
+                    created_ref="example/project#21",
+                ),
+                SplitChild("Billing", "Handle invoices.", "b" * 32, state="ambiguous"),
+            )
+        )
+        job = self.create(
+            {
+                "id": "123456789abc",
+                "status": "reconciling",
+                "request": "split the issue",
+                "created_at": 1,
+                "delivered": False,
+                "issue_provider": "github",
+                "github_repository": "example/project",
+                "github_issue": 12,
+                "github_issue_split_requested": True,
+                "ticket_split_confirmed": True,
+                "ticket_split_children": children,
+                "ticket_split_parent_action": "close",
+                "ticket_split_parent_marker": "c" * 32,
+                "ticket_split_parent_operation_state": "planned",
+                "ticket_split_operation_state": "ambiguous",
+            }
+        )
+        client = mock.Mock(spec=GitHubClient)
+        client.observe_issue.return_value = GitHubIssueCreationResult(
+            GitHubIssue("example", "project", 22),
+            "https://github.com/example/project/issues/22",
+            "b" * 32,
+        )
+
+        reconcile_uncertain_ticket_split(
+            self.store,
+            job,
+            now=100,
+            github_factory=lambda: client,
+        )
+
+        updated = self.store.get(job.id)
+        self.assertEqual(updated.status, JobStatus.QUEUED)
+        self.assertEqual(updated.ticket_split_operation_state, "planned")
+        decoded = json.loads(updated.ticket_split_children or "[]")
+        self.assertEqual(decoded[0]["state"], "created")
+        self.assertEqual(decoded[1]["state"], "created")
+        self.assertEqual(decoded[1]["created_ref"], "example/project#22")
+        client.submit_issue.assert_not_called()
+        client.submit_issue_close.assert_not_called()
+
+    def test_unobserved_issue_split_requires_manual_check(self) -> None:
+        children = encode_split_children(
+            (
+                SplitChild(
+                    "Auth",
+                    "Handle login.",
+                    "a" * 32,
+                    state="created",
+                    created_ref="example/project#21",
+                ),
+                SplitChild("Billing", "Handle invoices.", "b" * 32, state="ambiguous"),
+            )
+        )
+        job = self.create(
+            {
+                "id": "123456789abc",
+                "status": "queued",
+                "request": "split the issue",
+                "created_at": 1,
+                "queued_at": 1,
+                "delivered": False,
+                "issue_provider": "github",
+                "github_repository": "example/project",
+                "github_issue": 12,
+                "github_issue_split_requested": True,
+                "ticket_split_confirmed": True,
+                "ticket_split_children": children,
+                "ticket_split_parent_action": "close",
+                "ticket_split_parent_marker": "c" * 32,
+                "ticket_split_parent_operation_state": "planned",
+                "ticket_split_operation_state": "ambiguous",
+            }
+        )
+        client = mock.Mock(spec=GitHubClient)
+        client.observe_issue.return_value = None
+
+        reconcile_uncertain_ticket_split(
+            self.store,
+            job,
+            now=100,
+            github_factory=lambda: client,
+        )
+
+        updated = self.store.get(job.id)
+        self.assertEqual(updated.status, JobStatus.BLOCKED)
+        self.assertEqual(updated.ticket_split_operation_state, "manual_required")
+        decoded = json.loads(updated.ticket_split_children or "[]")
+        self.assertEqual(decoded[0]["state"], "created")
+        self.assertEqual(decoded[0]["created_ref"], "example/project#21")
+        self.assertEqual(decoded[1]["state"], "manual_required")
+        self.assertIn("example/project#21", str(updated.result))
+        self.assertIn("manual verification for: Billing", str(updated.result))
+        self.assertIn("was not closed", str(updated.result))
+        client.submit_issue.assert_not_called()
+
+    def test_observed_issue_merge_does_not_retry_landed_survivor(self) -> None:
+        closing = encode_merge_closing(
+            (
+                MergeClosingTicket(
+                    "example/project#13",
+                    "b" * 32,
+                    state="ambiguous",
+                    repository="example/project",
+                    number=13,
+                ),
+            )
+        )
+        job = self.create(
+            {
+                "id": "123456789abc",
+                "status": "reconciling",
+                "request": "merge the issues",
+                "created_at": 1,
+                "delivered": False,
+                "issue_provider": "github",
+                "github_repository": "example/project",
+                "github_issue": 12,
+                "github_issue_merge_requested": True,
+                "ticket_merge_confirmed": True,
+                "ticket_merge_survivor": "example/project#12",
+                "ticket_merge_survivor_title": "Combined auth",
+                "ticket_merge_survivor_body": "Handle login and invoices.",
+                "ticket_merge_survivor_marker": "a" * 32,
+                "ticket_merge_survivor_operation_state": "created",
+                "ticket_merge_closing": closing,
+                "ticket_merge_operation_state": "ambiguous",
+            }
+        )
+        client = mock.Mock(spec=GitHubClient)
+        client.observe_issue_close.return_value = GitHubIssueCloseResult(
+            GitHubIssue("example", "project", 13),
+            "https://github.com/example/project/issues/13",
+            "b" * 32,
+        )
+
+        reconcile_uncertain_ticket_merge(
+            self.store,
+            job,
+            now=100,
+            github_factory=lambda: client,
+        )
+
+        updated = self.store.get(job.id)
+        self.assertEqual(updated.status, JobStatus.COMPLETED)
+        self.assertEqual(updated.ticket_merge_operation_state, "created")
+        self.assertIn("Updated example/project#12", str(updated.result))
+        self.assertIn("Closed example/project#13", str(updated.result))
+        client.submit_issue_update.assert_not_called()
+        client.submit_issue_close.assert_not_called()
+
+    def test_unobserved_issue_merge_requires_manual_check(self) -> None:
+        closing = encode_merge_closing(
+            (
+                MergeClosingTicket(
+                    "example/project#13",
+                    "b" * 32,
+                    state="ambiguous",
+                    repository="example/project",
+                    number=13,
+                ),
+            )
+        )
+        job = self.create(
+            {
+                "id": "123456789abc",
+                "status": "queued",
+                "request": "merge the issues",
+                "created_at": 1,
+                "queued_at": 1,
+                "delivered": False,
+                "issue_provider": "github",
+                "github_repository": "example/project",
+                "github_issue": 12,
+                "github_issue_merge_requested": True,
+                "ticket_merge_confirmed": True,
+                "ticket_merge_survivor": "example/project#12",
+                "ticket_merge_survivor_title": "Combined auth",
+                "ticket_merge_survivor_body": "Handle login and invoices.",
+                "ticket_merge_survivor_marker": "a" * 32,
+                "ticket_merge_survivor_operation_state": "created",
+                "ticket_merge_closing": closing,
+                "ticket_merge_operation_state": "ambiguous",
+            }
+        )
+        client = mock.Mock(spec=GitHubClient)
+        client.observe_issue_close.return_value = None
+
+        reconcile_uncertain_ticket_merge(
+            self.store,
+            job,
+            now=100,
+            github_factory=lambda: client,
+        )
+
+        updated = self.store.get(job.id)
+        self.assertEqual(updated.status, JobStatus.BLOCKED)
+        self.assertEqual(updated.ticket_merge_operation_state, "manual_required")
+        self.assertIn("Updated example/project#12", str(updated.result))
+        self.assertIn(
+            "Close outcome requires manual verification for: example/project#13",
+            str(updated.result),
+        )
+        client.submit_issue_close.assert_not_called()
+
+    def test_uncertain_operations_reconcile_ambiguous_issue_merge(self) -> None:
+        closing = encode_merge_closing(
+            (
+                MergeClosingTicket(
+                    "example/project#13",
+                    "b" * 32,
+                    state="ambiguous",
+                    repository="example/project",
+                    number=13,
+                ),
+            )
+        )
+        job = self.create(
+            {
+                "id": "123456789abc",
+                "status": "queued",
+                "request": "merge the issues",
+                "created_at": 1,
+                "queued_at": 1,
+                "delivered": False,
+                "issue_provider": "github",
+                "github_repository": "example/project",
+                "github_issue": 12,
+                "github_issue_merge_requested": True,
+                "ticket_merge_confirmed": True,
+                "ticket_merge_survivor": "example/project#12",
+                "ticket_merge_survivor_title": "Combined auth",
+                "ticket_merge_survivor_body": "Handle login and invoices.",
+                "ticket_merge_survivor_marker": "a" * 32,
+                "ticket_merge_survivor_operation_state": "created",
+                "ticket_merge_closing": closing,
+                "ticket_merge_operation_state": "ambiguous",
+                "reconcile": True,
+            }
+        )
+        client = mock.Mock(spec=GitHubClient)
+        client.observe_issue_close.return_value = GitHubIssueCloseResult(
+            GitHubIssue("example", "project", 13),
+            "https://github.com/example/project/issues/13",
+            "b" * 32,
+        )
+
+        reconcile_uncertain_operations(
+            self.store,
+            job,
+            now=100,
+            github_factory=lambda: client,
+        )
+
+        updated = self.store.get(job.id)
+        self.assertEqual(updated.status, JobStatus.COMPLETED)
+        self.assertEqual(updated.ticket_merge_operation_state, "created")
+        self.assertFalse(updated.reconcile)
+        client.submit_issue_update.assert_not_called()
+        client.submit_issue_close.assert_not_called()
 
     def test_migration_and_pruning_precede_recovery_scans(self) -> None:
         store = mock.Mock(spec=JobStore)

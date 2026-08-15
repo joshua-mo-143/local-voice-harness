@@ -34,7 +34,11 @@ from .diagnostics.help import harness_help_response
 from .errors import HarnessError, SpeechDeliveryError
 from .github_issue_creation import repository_from_utterance
 from .integrations.github import resolve_pull_request_merge_identity
-from .integrations.registry import IntegrationRegistry, build_integration_registry
+from .integrations.registry import (
+    IntegrationRegistry,
+    build_integration_registry,
+    ticket_snapshot,
+)
 from .intent import (
     NON_ACTIONABLE_SUBMIT_RESPONSE,
     ForkIntent,
@@ -54,7 +58,27 @@ from .self_management import (
     inspect_config_utterance,
 )
 from .speech import SpeechRenderer
+from .ticket_close import (
+    admit_ticket_close,
+    close_turn_arguments,
+    wants_ticket_close_context,
+)
+from .ticket_merge import (
+    admit_ticket_merge,
+    merge_turn_arguments,
+    wants_ticket_merge_context,
+)
+from .ticket_split import (
+    admit_ticket_split,
+    split_turn_arguments,
+    wants_ticket_split_context,
+)
 from .ticket_targets import MISSING_ISSUE_SCOPE_RESPONSE, extract_ticket_targets
+from .ticket_update import (
+    admit_ticket_update,
+    update_turn_arguments,
+    wants_ticket_update_context,
+)
 from .tts.client import stream_and_play
 from .user_config import UserConfig, load_user_config
 from .vocabulary import parse_spoken_alias_request, resolve_aliases
@@ -79,18 +103,34 @@ def _context_for_route(
     integrations: IntegrationRegistry,
 ) -> RequestContext:
     """Capture external context only when the routed action can consume it."""
-    if route.intent == Intent.CONVERSATION or (
-        route.actionable
-        and route.intent
-        in {
-            Intent.AGENT_SUBMIT,
-            Intent.GITHUB_ISSUE_CREATE,
-            Intent.GITHUB_PR_MERGE,
-            Intent.GITHUB_REPO_CREATE,
-            Intent.GITHUB_ORG_REPO_CREATE,
-            Intent.LINEAR_TICKET_CREATE,
-            Intent.WORKSPACE_CONSULTATION,
-        }
+    if (
+        route.intent == Intent.CONVERSATION
+        or (
+            route.actionable
+            and route.intent
+            in {
+                Intent.AGENT_SUBMIT,
+                Intent.GITHUB_ISSUE_CREATE,
+                Intent.GITHUB_PR_MERGE,
+                Intent.GITHUB_REPO_CREATE,
+                Intent.GITHUB_ORG_REPO_CREATE,
+                Intent.LINEAR_TICKET_CREATE,
+                Intent.GITHUB_ISSUE_UPDATE,
+                Intent.LINEAR_TICKET_UPDATE,
+                Intent.GITHUB_ISSUE_CLOSE,
+                Intent.LINEAR_TICKET_CLOSE,
+                Intent.GITHUB_ISSUE_SPLIT,
+                Intent.LINEAR_TICKET_SPLIT,
+                Intent.GITHUB_ISSUE_MERGE,
+                Intent.LINEAR_TICKET_MERGE,
+                Intent.WORKSPACE_CONSULTATION,
+            }
+        )
+        or cursor_consultation.wants_ticket_consultation_context(text)
+        or wants_ticket_update_context(text)
+        or wants_ticket_close_context(text)
+        or wants_ticket_split_context(text)
+        or wants_ticket_merge_context(text)
     ):
         return request_context(
             text,
@@ -260,6 +300,31 @@ def respond(text: str, *, user_config: UserConfig | None = None) -> None:
                 Intent.AGENT_SUBMIT,
                 Intent.UNCERTAIN,
             }
+            ticket_admission = cursor_consultation.admit_ticket_consultation(
+                text,
+                extraction,
+                focused_issue=context.focused_issue,
+            )
+            update_admission = admit_ticket_update(
+                text,
+                extraction,
+                focused_issue=context.focused_issue,
+            )
+            close_admission = admit_ticket_close(
+                text,
+                extraction,
+                focused_issue=context.focused_issue,
+            )
+            split_admission = admit_ticket_split(
+                text,
+                extraction,
+                focused_issue=context.focused_issue,
+            )
+            merge_admission = admit_ticket_merge(
+                text,
+                extraction,
+                focused_issue=context.focused_issue,
+            )
             if cursor_consultation.is_apply_recommendation_request(text):
                 choice_id = (
                     cursor_consultation.applicable_choice_id(
@@ -280,6 +345,151 @@ def respond(text: str, *, user_config: UserConfig | None = None) -> None:
                             expected_question_id=pending.question_id,
                             expected_question_turn=pending.turn_token,
                             answer_provenance=AnswerProvenance.USER_TEXT,
+                        ),
+                        delivery_claims=delivery_claims,
+                        integrations=integrations,
+                    )[0]
+            elif ticket_admission is not None:
+                if ticket_admission.ticket is None:
+                    response = ticket_admission.missing_identity_response
+                else:
+                    try:
+                        client = integrations.herdr_client()
+                        target = cursor_consultation.workspace_target(
+                            client,
+                            focused_repository=context.focused_repository,
+                            completed_job=None,
+                        )
+                        if target is None:
+                            response = cursor_consultation.NO_WORKSPACE
+                        else:
+                            _acknowledge_consultation(speech_renderer, settings, text)
+                            assert ticket_admission.ticket.canonical is not None
+                            assert ticket_admission.ticket.source is not None
+                            snapshot = ticket_snapshot(
+                                ticket_admission.ticket.canonical,
+                                integrations,
+                                provider=ticket_admission.ticket.source,
+                                client=client,
+                            )
+                            response = cursor_consultation.consult_ticket(
+                                client,
+                                target,
+                                text,
+                                snapshot=snapshot,
+                                kind=ticket_admission.kind,
+                                adversarial=ticket_admission.adversarial,
+                            )
+                    except Exception:  # noqa: BLE001 - consultation fails closed
+                        response = cursor_consultation.CONSULTATION_FAILED
+            elif update_admission is not None:
+                if update_admission.ticket is None:
+                    response = update_admission.missing_identity_response
+                elif not route.actionable:
+                    response = (
+                        "I did not update a ticket because the request was unclear. "
+                        "Please name the ticket and the title or body change."
+                    )
+                else:
+                    dispatch = update_turn_arguments(update_admission.ticket)
+                    response = cursor_turn(
+                        CursorTurnRequest(
+                            context.text,
+                            utterance=text,
+                            github_repository=dispatch.github_repository,
+                            github_issue=dispatch.github_issue,
+                            github_issue_update_requested=(
+                                dispatch.github_issue_update_requested
+                            ),
+                            issue_key=dispatch.issue_key,
+                            linear_ticket_update_requested=(
+                                dispatch.linear_ticket_update_requested
+                            ),
+                        ),
+                        delivery_claims=delivery_claims,
+                        integrations=integrations,
+                    )[0]
+            elif close_admission is not None:
+                if close_admission.ticket is None:
+                    response = close_admission.missing_identity_response
+                elif not route.actionable:
+                    response = (
+                        "I did not close a ticket because the request was unclear. "
+                        "Please name the ticket to close."
+                    )
+                else:
+                    dispatch = close_turn_arguments(close_admission.ticket)
+                    response = cursor_turn(
+                        CursorTurnRequest(
+                            context.text,
+                            utterance=text,
+                            github_repository=dispatch.github_repository,
+                            github_issue=dispatch.github_issue,
+                            github_issue_close_requested=(
+                                dispatch.github_issue_close_requested
+                            ),
+                            issue_key=dispatch.issue_key,
+                            linear_ticket_close_requested=(
+                                dispatch.linear_ticket_close_requested
+                            ),
+                        ),
+                        delivery_claims=delivery_claims,
+                        integrations=integrations,
+                    )[0]
+            elif split_admission is not None:
+                if split_admission.ticket is None:
+                    response = split_admission.missing_identity_response
+                elif not route.actionable:
+                    response = (
+                        "I did not split a ticket because the request was unclear. "
+                        "Please name the ticket to split."
+                    )
+                else:
+                    dispatch = split_turn_arguments(split_admission.ticket)
+                    response = cursor_turn(
+                        CursorTurnRequest(
+                            context.text,
+                            utterance=text,
+                            github_repository=dispatch.github_repository,
+                            github_issue=dispatch.github_issue,
+                            github_issue_split_requested=(
+                                dispatch.github_issue_split_requested
+                            ),
+                            issue_key=dispatch.issue_key,
+                            linear_ticket_split_requested=(
+                                dispatch.linear_ticket_split_requested
+                            ),
+                        ),
+                        delivery_claims=delivery_claims,
+                        integrations=integrations,
+                    )[0]
+            elif merge_admission is not None:
+                if merge_admission.survivor is None:
+                    response = merge_admission.missing_identity_response
+                elif not route.actionable:
+                    response = (
+                        "I did not merge tickets because the request was unclear. "
+                        "Please name at least two tickets to merge."
+                    )
+                else:
+                    dispatch = merge_turn_arguments(
+                        merge_admission.survivor, merge_admission.tickets
+                    )
+                    response = cursor_turn(
+                        CursorTurnRequest(
+                            context.text,
+                            utterance=text,
+                            github_repository=dispatch.github_repository,
+                            github_issue=dispatch.github_issue,
+                            github_issue_merge_requested=(
+                                dispatch.github_issue_merge_requested
+                            ),
+                            issue_key=dispatch.issue_key,
+                            linear_ticket_merge_requested=(
+                                dispatch.linear_ticket_merge_requested
+                            ),
+                            ticket_merge_survivor=dispatch.ticket_merge_survivor,
+                            ticket_merge_closing=dispatch.ticket_merge_closing,
                         ),
                         delivery_claims=delivery_claims,
                         integrations=integrations,
@@ -480,6 +690,22 @@ def respond(text: str, *, user_config: UserConfig | None = None) -> None:
                 response = (
                     "I did not create a Linear ticket because the request was unclear. "
                     "Please name the Linear team and ticket."
+                )
+            elif route.intent in {
+                Intent.GITHUB_ISSUE_UPDATE,
+                Intent.LINEAR_TICKET_UPDATE,
+            }:
+                response = (
+                    "I did not update a ticket because the request was unclear. "
+                    "Please name the ticket and the title or body change."
+                )
+            elif route.intent in {
+                Intent.GITHUB_ISSUE_CLOSE,
+                Intent.LINEAR_TICKET_CLOSE,
+            }:
+                response = (
+                    "I did not close a ticket because the request was unclear. "
+                    "Please name the ticket to close."
                 )
             elif route.actionable and route.intent in CURSOR_MANAGEMENT_ACTIONS:
                 response = cursor_turn(
