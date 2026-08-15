@@ -63,6 +63,11 @@ from .ticket_close import (
     close_turn_arguments,
     wants_ticket_close_context,
 )
+from .ticket_merge import (
+    admit_ticket_merge,
+    merge_turn_arguments,
+    wants_ticket_merge_context,
+)
 from .ticket_split import (
     admit_ticket_split,
     split_turn_arguments,
@@ -116,6 +121,8 @@ def _context_for_route(
                 Intent.LINEAR_TICKET_CLOSE,
                 Intent.GITHUB_ISSUE_SPLIT,
                 Intent.LINEAR_TICKET_SPLIT,
+                Intent.GITHUB_ISSUE_MERGE,
+                Intent.LINEAR_TICKET_MERGE,
                 Intent.WORKSPACE_CONSULTATION,
             }
         )
@@ -123,6 +130,7 @@ def _context_for_route(
         or wants_ticket_update_context(text)
         or wants_ticket_close_context(text)
         or wants_ticket_split_context(text)
+        or wants_ticket_merge_context(text)
     ):
         return request_context(
             text,
@@ -312,6 +320,11 @@ def respond(text: str, *, user_config: UserConfig | None = None) -> None:
                 extraction,
                 focused_issue=context.focused_issue,
             )
+            merge_admission = admit_ticket_merge(
+                text,
+                extraction,
+                focused_issue=context.focused_issue,
+            )
             if cursor_consultation.is_apply_recommendation_request(text):
                 choice_id = (
                     cursor_consultation.applicable_choice_id(
@@ -446,6 +459,37 @@ def respond(text: str, *, user_config: UserConfig | None = None) -> None:
                             linear_ticket_split_requested=(
                                 dispatch.linear_ticket_split_requested
                             ),
+                        ),
+                        delivery_claims=delivery_claims,
+                        integrations=integrations,
+                    )[0]
+            elif merge_admission is not None:
+                if merge_admission.survivor is None:
+                    response = merge_admission.missing_identity_response
+                elif not route.actionable:
+                    response = (
+                        "I did not merge tickets because the request was unclear. "
+                        "Please name at least two tickets to merge."
+                    )
+                else:
+                    dispatch = merge_turn_arguments(
+                        merge_admission.survivor, merge_admission.tickets
+                    )
+                    response = cursor_turn(
+                        CursorTurnRequest(
+                            context.text,
+                            utterance=text,
+                            github_repository=dispatch.github_repository,
+                            github_issue=dispatch.github_issue,
+                            github_issue_merge_requested=(
+                                dispatch.github_issue_merge_requested
+                            ),
+                            issue_key=dispatch.issue_key,
+                            linear_ticket_merge_requested=(
+                                dispatch.linear_ticket_merge_requested
+                            ),
+                            ticket_merge_survivor=dispatch.ticket_merge_survivor,
+                            ticket_merge_closing=dispatch.ticket_merge_closing,
                         ),
                         delivery_claims=delivery_claims,
                         integrations=integrations,

@@ -224,6 +224,37 @@ class IntentRouterTests(LocalRouterTestCase):
         self.assertEqual(route.intent, intent.Intent.LINEAR_TICKET_SPLIT)
         self.assertTrue(route.actionable)
 
+    def test_routes_github_issue_merge_as_a_distinct_action(self) -> None:
+        with mock.patch.object(
+            llm_transport.urllib.request,
+            "urlopen",
+            return_value=_response("github_issue_merge"),
+        ):
+            route = intent.route_intent(
+                "Merge these GitHub issues",
+                RequestContext(
+                    "Merge these GitHub issues",
+                    focused_issue="example/project#12",
+                ),
+            )
+
+        self.assertEqual(route.intent, intent.Intent.GITHUB_ISSUE_MERGE)
+        self.assertTrue(route.actionable)
+
+    def test_routes_linear_ticket_merge_as_a_distinct_action(self) -> None:
+        with mock.patch.object(
+            llm_transport.urllib.request,
+            "urlopen",
+            return_value=_response("linear_ticket_merge"),
+        ):
+            route = intent.route_intent(
+                "Merge API-79 and API-80",
+                RequestContext("Merge API-79 and API-80"),
+            )
+
+        self.assertEqual(route.intent, intent.Intent.LINEAR_TICKET_MERGE)
+        self.assertTrue(route.actionable)
+
     def test_sends_bounded_context_to_forced_router_tool(self) -> None:
         context = RequestContext(
             text="work on this\n\nuntrusted issue body",
@@ -271,6 +302,8 @@ class IntentRouterTests(LocalRouterTestCase):
         self.assertIn("linear_ticket_close", payload["messages"][0]["content"])
         self.assertIn("github_issue_split", payload["messages"][0]["content"])
         self.assertIn("linear_ticket_split", payload["messages"][0]["content"])
+        self.assertIn("github_issue_merge", payload["messages"][0]["content"])
+        self.assertIn("linear_ticket_merge", payload["messages"][0]["content"])
         self.assertEqual(payload["temperature"], 0)
         # Reasoning models drop the required ``confidence`` field when the
         # completion budget is too small to finish the forced tool call.

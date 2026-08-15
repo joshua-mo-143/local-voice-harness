@@ -53,6 +53,7 @@ from local_voice_harness.cursor.recovery import (
     reconcile_uncertain_pr_creation,
     reconcile_uncertain_pr_merge,
     reconcile_uncertain_repo_creation,
+    reconcile_uncertain_ticket_merge,
     reconcile_uncertain_ticket_split,
     recover_jobs,
     resolve_manual_reconciliation,
@@ -91,6 +92,7 @@ from local_voice_harness.prompt_operations import (
     PromptIdentity,
     SubmittingPrompt,
 )
+from local_voice_harness.ticket_merge import MergeClosingTicket, encode_merge_closing
 from local_voice_harness.ticket_split import SplitChild, encode_split_children
 
 WORKER = WorkerOwnership("worker", 42, "boot", "start", "test", 1)
@@ -1444,6 +1446,112 @@ class CursorRecoveryTests(unittest.TestCase):
         self.assertIn("manual verification for: Billing", str(updated.result))
         self.assertIn("was not closed", str(updated.result))
         client.submit_issue.assert_not_called()
+
+    def test_observed_issue_merge_does_not_retry_landed_survivor(self) -> None:
+        closing = encode_merge_closing(
+            (
+                MergeClosingTicket(
+                    "example/project#13",
+                    "b" * 32,
+                    state="ambiguous",
+                    repository="example/project",
+                    number=13,
+                ),
+            )
+        )
+        job = self.create(
+            {
+                "id": "123456789abc",
+                "status": "reconciling",
+                "request": "merge the issues",
+                "created_at": 1,
+                "delivered": False,
+                "issue_provider": "github",
+                "github_repository": "example/project",
+                "github_issue": 12,
+                "github_issue_merge_requested": True,
+                "ticket_merge_confirmed": True,
+                "ticket_merge_survivor": "example/project#12",
+                "ticket_merge_survivor_title": "Combined auth",
+                "ticket_merge_survivor_body": "Handle login and invoices.",
+                "ticket_merge_survivor_marker": "a" * 32,
+                "ticket_merge_survivor_operation_state": "created",
+                "ticket_merge_closing": closing,
+                "ticket_merge_operation_state": "ambiguous",
+            }
+        )
+        client = mock.Mock(spec=GitHubClient)
+        client.observe_issue_close.return_value = GitHubIssueCloseResult(
+            GitHubIssue("example", "project", 13),
+            "https://github.com/example/project/issues/13",
+            "b" * 32,
+        )
+
+        reconcile_uncertain_ticket_merge(
+            self.store,
+            job,
+            now=100,
+            github_factory=lambda: client,
+        )
+
+        updated = self.store.get(job.id)
+        self.assertEqual(updated.status, JobStatus.COMPLETED)
+        self.assertEqual(updated.ticket_merge_operation_state, "created")
+        self.assertIn("Updated example/project#12", str(updated.result))
+        self.assertIn("Closed example/project#13", str(updated.result))
+        client.submit_issue_update.assert_not_called()
+        client.submit_issue_close.assert_not_called()
+
+    def test_unobserved_issue_merge_requires_manual_check(self) -> None:
+        closing = encode_merge_closing(
+            (
+                MergeClosingTicket(
+                    "example/project#13",
+                    "b" * 32,
+                    state="ambiguous",
+                    repository="example/project",
+                    number=13,
+                ),
+            )
+        )
+        job = self.create(
+            {
+                "id": "123456789abc",
+                "status": "queued",
+                "request": "merge the issues",
+                "created_at": 1,
+                "queued_at": 1,
+                "delivered": False,
+                "issue_provider": "github",
+                "github_repository": "example/project",
+                "github_issue": 12,
+                "github_issue_merge_requested": True,
+                "ticket_merge_confirmed": True,
+                "ticket_merge_survivor": "example/project#12",
+                "ticket_merge_survivor_title": "Combined auth",
+                "ticket_merge_survivor_body": "Handle login and invoices.",
+                "ticket_merge_survivor_marker": "a" * 32,
+                "ticket_merge_survivor_operation_state": "created",
+                "ticket_merge_closing": closing,
+                "ticket_merge_operation_state": "ambiguous",
+            }
+        )
+        client = mock.Mock(spec=GitHubClient)
+        client.observe_issue_close.return_value = None
+
+        reconcile_uncertain_ticket_merge(
+            self.store,
+            job,
+            now=100,
+            github_factory=lambda: client,
+        )
+
+        updated = self.store.get(job.id)
+        self.assertEqual(updated.status, JobStatus.BLOCKED)
+        self.assertEqual(updated.ticket_merge_operation_state, "manual_required")
+        self.assertIn("Updated example/project#12", str(updated.result))
+        self.assertIn("was not closed", str(updated.result))
+        client.submit_issue_close.assert_not_called()
 
     def test_migration_and_pruning_precede_recovery_scans(self) -> None:
         store = mock.Mock(spec=JobStore)

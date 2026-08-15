@@ -2533,6 +2533,9 @@ _GITHUB_STATE_SECTIONS: dict[str, dict[str, str]] = {
     "issue_split": {
         "requested": "github_issue_split_requested",
     },
+    "issue_merge": {
+        "requested": "github_issue_merge_requested",
+    },
     "pull_request": {
         "number": "github_pull_request",
         "worktree_state": "pull_request_worktree_state",

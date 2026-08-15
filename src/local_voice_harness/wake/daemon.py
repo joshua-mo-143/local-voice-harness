@@ -170,6 +170,11 @@ from ..ticket_close import (
     close_turn_arguments,
     wants_ticket_close_context,
 )
+from ..ticket_merge import (
+    admit_ticket_merge,
+    merge_turn_arguments,
+    wants_ticket_merge_context,
+)
 from ..ticket_split import (
     admit_ticket_split,
     split_turn_arguments,
@@ -2999,6 +3004,8 @@ class WakeConversationDaemon:
                             Intent.LINEAR_TICKET_UPDATE,
                             Intent.LINEAR_TICKET_CLOSE,
                             Intent.LINEAR_TICKET_SPLIT,
+                            Intent.GITHUB_ISSUE_MERGE,
+                            Intent.LINEAR_TICKET_MERGE,
                             Intent.WORKSPACE_CONSULTATION,
                         }
                     )
@@ -3006,6 +3013,7 @@ class WakeConversationDaemon:
                     or wants_ticket_update_context(text)
                     or wants_ticket_close_context(text)
                     or wants_ticket_split_context(text)
+                    or wants_ticket_merge_context(text)
                 )
             ):
                 context = self._capture_request_context(text)
@@ -3051,6 +3059,11 @@ class WakeConversationDaemon:
                 focused_issue=context.focused_issue,
             )
             split_admission = admit_ticket_split(
+                text,
+                extraction,
+                focused_issue=context.focused_issue,
+            )
+            merge_admission = admit_ticket_merge(
                 text,
                 extraction,
                 focused_issue=context.focused_issue,
@@ -3233,6 +3246,40 @@ class WakeConversationDaemon:
                             linear_ticket_split_requested=(
                                 dispatch.linear_ticket_split_requested
                             ),
+                        ),
+                        delivery_claims=delivery_claims,
+                        integrations=self.integrations,
+                    )
+            elif merge_admission is not None:
+                if merge_admission.survivor is None:
+                    response = merge_admission.missing_identity_response
+                    ordinary_reply = True
+                elif not route.actionable:
+                    response = (
+                        "I did not merge tickets because the request was unclear. "
+                        "Please name at least two tickets to merge."
+                    )
+                    ordinary_reply = True
+                else:
+                    self.completed_followup = None
+                    dispatch = merge_turn_arguments(
+                        merge_admission.survivor, merge_admission.tickets
+                    )
+                    response, next_cursor_session = cursor_turn(
+                        CursorTurnRequest(
+                            context.text,
+                            utterance=text,
+                            github_repository=dispatch.github_repository,
+                            github_issue=dispatch.github_issue,
+                            github_issue_merge_requested=(
+                                dispatch.github_issue_merge_requested
+                            ),
+                            issue_key=dispatch.issue_key,
+                            linear_ticket_merge_requested=(
+                                dispatch.linear_ticket_merge_requested
+                            ),
+                            ticket_merge_survivor=dispatch.ticket_merge_survivor,
+                            ticket_merge_closing=dispatch.ticket_merge_closing,
                         ),
                         delivery_claims=delivery_claims,
                         integrations=self.integrations,

@@ -106,6 +106,17 @@ from ..questions import (
     submit_question_prompt,
 )
 from ..ticket_snapshot import TicketSnapshot
+from ..ticket_merge import (
+    MergeClosingTicket,
+    TicketMergeDraft,
+    assign_merge_markers,
+    decode_merge_closing,
+    draft_ticket_merge,
+    encode_merge_closing,
+    merge_preview,
+    merge_result_message,
+    replace_merge_closing,
+)
 from ..ticket_split import (
     SplitChild,
     TicketSplitDraft,
@@ -5088,6 +5099,851 @@ def _run_linear_ticket_split(
     _finish_ticket_split(store, job, token, children, parent_state="created")
 
 
+def _run_ticket_merge(
+    store: JobStore,
+    job: CursorJob,
+    token: WorkerClaim,
+    clients: ClientFactories,
+    checkpoint: Callable[[], None],
+) -> None:
+    if job.github_issue_merge_requested:
+        _run_github_issue_merge(store, job, token, clients, checkpoint)
+        return
+    _run_linear_ticket_merge(store, job, token, clients, checkpoint)
+
+
+def _persist_merge_job(
+    store: JobStore,
+    job: CursorJob,
+    token: WorkerClaim,
+    mutate: Callable[[CursorJob], CursorJob],
+    *,
+    statuses: set[JobStatus],
+) -> CursorJob | None:
+    return _persist_split_job(store, job, token, mutate, statuses=statuses)
+
+
+def _persist_merge_closing(
+    store: JobStore,
+    job: CursorJob,
+    token: WorkerClaim,
+    closing: tuple[MergeClosingTicket, ...],
+    *,
+    operation_state: str,
+) -> CursorJob | None:
+    payload = encode_merge_closing(closing)
+
+    def persist(current: CursorJob) -> CursorJob:
+        return current.evolve(
+            ticket_merge_closing=payload,
+            ticket_merge_operation_state=operation_state,
+        )
+
+    return _persist_merge_job(store, job, token, persist, statuses={JobStatus.RUNNING})
+
+
+def _finish_ticket_merge(
+    store: JobStore,
+    job: CursorJob,
+    token: WorkerClaim,
+    closing: tuple[MergeClosingTicket, ...],
+    *,
+    survivor_state: str | None,
+) -> None:
+    message = merge_result_message(
+        job.ticket_merge_survivor or "the ticket",
+        closing,
+        survivor_state=survivor_state,
+    )
+
+    def finish(current: CursorJob) -> CursorJob:
+        now = time.time()
+        return current.evolve_for_delivery(
+            now=now,
+            status=JobStatus.COMPLETED,
+            result=message,
+            completed_at=now,
+            ticket_merge_closing=encode_merge_closing(closing),
+            ticket_merge_survivor_operation_state=survivor_state,
+            ticket_merge_operation_state="created",
+            worker_pid=None,
+            worker_boot_id=None,
+            worker_process_start=None,
+            worker_token=None,
+            worker_operation=None,
+        )
+
+    _worker_change(
+        store,
+        job.id,
+        token,
+        {JobStatus.ROUTING, JobStatus.RUNNING},
+        finish,
+        expected_revision=store.get(job.id).revision,
+    )
+
+
+def _queue_merge_ambiguous(
+    store: JobStore,
+    job: CursorJob,
+    token: WorkerClaim,
+    closing: tuple[MergeClosingTicket, ...],
+    *,
+    survivor_state: str | None = None,
+) -> None:
+    def ambiguous(current: CursorJob) -> CursorJob:
+        return current.evolve(
+            status=JobStatus.QUEUED,
+            queued_at=time.time(),
+            ticket_merge_closing=encode_merge_closing(closing),
+            ticket_merge_survivor_operation_state=(
+                survivor_state
+                if survivor_state is not None
+                else current.ticket_merge_survivor_operation_state
+            ),
+            ticket_merge_operation_state="ambiguous",
+            reconcile=True,
+            worker_pid=None,
+            worker_boot_id=None,
+            worker_process_start=None,
+            worker_token=None,
+            worker_operation=None,
+        )
+
+    _worker_change(
+        store,
+        job.id,
+        token,
+        {JobStatus.RUNNING, JobStatus.ROUTING},
+        ambiguous,
+        expected_revision=store.get(job.id).revision,
+    )
+
+
+def _queue_merge_retry(
+    store: JobStore,
+    job: CursorJob,
+    token: WorkerClaim,
+    closing: tuple[MergeClosingTicket, ...],
+    *,
+    survivor_state: str | None = None,
+) -> None:
+    def retry(current: CursorJob) -> CursorJob:
+        return current.evolve(
+            status=JobStatus.QUEUED,
+            queued_at=time.time(),
+            ticket_merge_closing=encode_merge_closing(closing),
+            ticket_merge_survivor_operation_state=(
+                survivor_state
+                if survivor_state is not None
+                else current.ticket_merge_survivor_operation_state
+            ),
+            ticket_merge_operation_state="planned",
+            worker_pid=None,
+            worker_boot_id=None,
+            worker_process_start=None,
+            worker_token=None,
+            worker_operation=None,
+            worker_claim_operation=None,
+            worker_claimed_at=None,
+        )
+
+    _worker_change(
+        store,
+        job.id,
+        token,
+        {JobStatus.RUNNING, JobStatus.ROUTING},
+        retry,
+        expected_revision=store.get(job.id).revision,
+    )
+
+
+def _ask_merge_confirmation(
+    store: JobStore,
+    job: CursorJob,
+    token: WorkerClaim,
+    draft: TicketMergeDraft,
+    closing: tuple[MergeClosingTicket, ...],
+    *,
+    github: bool,
+) -> None:
+    preview = merge_preview(job.ticket_merge_survivor or "the ticket", draft, closing)
+    _worker_question(
+        store,
+        job.id,
+        token,
+        preview,
+        expected_revision=job.revision,
+        clarification_kind=(
+            "github_issue_merge_confirmation"
+            if github
+            else "linear_ticket_merge_confirmation"
+        ),
+        sensitivity=QuestionSensitivity.DESTRUCTIVE,
+    )
+
+
+def _run_github_issue_merge(
+    store: JobStore,
+    job: CursorJob,
+    token: WorkerClaim,
+    clients: ClientFactories,
+    checkpoint: Callable[[], None],
+) -> None:
+    repository = (job.github_repository or "").strip()
+    number = job.github_issue
+    survivor = (job.ticket_merge_survivor or "").strip()
+    if not repository or number is None or not survivor:
+        raise HarnessError("GitHub issue merge requires a trusted survivor identity")
+    github = _github_provider(clients.github)
+    checkpoint()
+    source = github.resolve_repository(repository)
+    repository = source.name_with_owner
+    checkpoint()
+    closing = decode_merge_closing(job.ticket_merge_closing)
+    if not job.ticket_merge_survivor_title:
+        config = default_user_config()
+        draft, closing, survivor_marker = assign_merge_markers(
+            draft_ticket_merge(
+                job.trusted_utterance or job.request,
+                survivor,
+                tuple(ticket.identity for ticket in closing),
+                settings=config.providers,
+            ),
+            closing,
+        )
+
+        def persist_draft(current: CursorJob) -> CursorJob:
+            return current.evolve(
+                github_repository=repository,
+                github_issue=number,
+                ticket_merge_survivor=survivor,
+                ticket_merge_closing=encode_merge_closing(closing),
+                ticket_merge_survivor_title=draft.title,
+                ticket_merge_survivor_body=draft.body,
+                ticket_merge_survivor_marker=survivor_marker,
+                ticket_merge_survivor_operation_state="planned",
+                ticket_merge_operation_state="planned",
+            )
+
+        updated = _persist_merge_job(
+            store, job, token, persist_draft, statuses={JobStatus.ROUTING}
+        )
+        if updated is None:
+            return
+        job = updated
+    closing = decode_merge_closing(job.ticket_merge_closing)
+    draft = TicketMergeDraft(
+        job.ticket_merge_survivor_title or "",
+        job.ticket_merge_survivor_body or "",
+    )
+    if not job.ticket_merge_confirmed:
+        _ask_merge_confirmation(store, job, token, draft, closing, github=True)
+        return
+    if job.ticket_merge_operation_state not in {None, "planned"}:
+        raise HarnessError("GitHub issue merge requires reconciliation before retry")
+
+    def mark_running(current: CursorJob) -> CursorJob:
+        return current.evolve(
+            status=JobStatus.RUNNING,
+            worker_operation="github_issue_merge",
+        )
+
+    running = _persist_merge_job(
+        store, job, token, mark_running, statuses={JobStatus.ROUTING}
+    )
+    if running is None:
+        return
+    job = running
+    survivor_state = job.ticket_merge_survivor_operation_state
+    if survivor_state != "created":
+        if survivor_state in {"submitted", "ambiguous"}:
+            plan = github.plan_issue_update(
+                repository,
+                number,
+                job.ticket_merge_survivor_title or "",
+                job.ticket_merge_survivor_body or "",
+                correlation_marker=job.ticket_merge_survivor_marker,
+            )
+            checkpoint()
+            try:
+                visible = github.observe_issue_update(plan)
+            except GitHubError:
+                visible = None
+            if visible is None:
+                _queue_merge_ambiguous(
+                    store, job, token, closing, survivor_state="ambiguous"
+                )
+                return
+        else:
+            submitted = _persist_merge_job(
+                store,
+                job,
+                token,
+                lambda current: current.evolve(
+                    ticket_merge_survivor_operation_state="submitted",
+                    ticket_merge_operation_state="submitted",
+                ),
+                statuses={JobStatus.RUNNING},
+            )
+            if submitted is None:
+                return
+            job = submitted
+            try:
+                checkpoint()
+                plan = github.plan_issue_update(
+                    repository,
+                    number,
+                    job.ticket_merge_survivor_title or "",
+                    job.ticket_merge_survivor_body or "",
+                    correlation_marker=job.ticket_merge_survivor_marker,
+                )
+                github.submit_issue_update(plan, confirmed=True)
+            except GitHubError as exc:
+                checkpoint()
+                try:
+                    visible = github.observe_issue_update(
+                        github.plan_issue_update(
+                            repository,
+                            number,
+                            job.ticket_merge_survivor_title or "",
+                            job.ticket_merge_survivor_body or "",
+                            correlation_marker=job.ticket_merge_survivor_marker,
+                        )
+                    )
+                except GitHubError:
+                    visible = None
+                if visible is None:
+                    if isinstance(exc, GitHubCommandStartError):
+                        _queue_merge_retry(
+                            store, job, token, closing, survivor_state="planned"
+                        )
+                        return
+                    _queue_merge_ambiguous(
+                        store, job, token, closing, survivor_state="ambiguous"
+                    )
+                    return
+        persisted = _persist_merge_job(
+            store,
+            job,
+            token,
+            lambda current: current.evolve(
+                ticket_merge_survivor_operation_state="created",
+                ticket_merge_operation_state="planned",
+            ),
+            statuses={JobStatus.RUNNING},
+        )
+        if persisted is None:
+            return
+        job = persisted
+        survivor_state = "created"
+    for index, ticket in enumerate(closing):
+        if ticket.state == "created":
+            continue
+        close_repository = ticket.repository or repository
+        close_number = ticket.number
+        if close_number is None:
+            raise HarnessError("GitHub issue merge closing ticket requires a number")
+        if ticket.state in {"submitted", "ambiguous"}:
+            plan = github.plan_issue_close(
+                close_repository,
+                close_number,
+                correlation_marker=ticket.marker,
+            )
+            checkpoint()
+            try:
+                visible = github.observe_issue_close(plan)
+            except GitHubError:
+                visible = None
+            if visible is None:
+                closing = replace_merge_closing(closing, index, state="ambiguous")
+                _queue_merge_ambiguous(
+                    store, job, token, closing, survivor_state="created"
+                )
+                return
+            closing = replace_merge_closing(closing, index, state="created")
+            persisted = _persist_merge_closing(
+                store, job, token, closing, operation_state="planned"
+            )
+            if persisted is None:
+                return
+            job = persisted
+            continue
+        closing = replace_merge_closing(closing, index, state="submitted")
+        submitted = _persist_merge_closing(
+            store, job, token, closing, operation_state="submitted"
+        )
+        if submitted is None:
+            return
+        job = submitted
+        try:
+            checkpoint()
+            plan = github.plan_issue_close(
+                close_repository,
+                close_number,
+                correlation_marker=ticket.marker,
+            )
+            github.submit_issue_close(plan, confirmed=True)
+        except GitHubError as exc:
+            checkpoint()
+            try:
+                visible = github.observe_issue_close(
+                    github.plan_issue_close(
+                        close_repository,
+                        close_number,
+                        correlation_marker=ticket.marker,
+                    )
+                )
+            except GitHubError:
+                visible = None
+            if visible is not None:
+                closing = replace_merge_closing(closing, index, state="created")
+                persisted = _persist_merge_closing(
+                    store, job, token, closing, operation_state="planned"
+                )
+                if persisted is None:
+                    return
+                job = persisted
+                continue
+            if isinstance(exc, GitHubCommandStartError):
+                closing = replace_merge_closing(closing, index, state="planned")
+                _queue_merge_retry(store, job, token, closing, survivor_state="created")
+                return
+            closing = replace_merge_closing(closing, index, state="ambiguous")
+            _queue_merge_ambiguous(store, job, token, closing, survivor_state="created")
+            return
+        closing = replace_merge_closing(closing, index, state="created")
+        persisted = _persist_merge_closing(
+            store, job, token, closing, operation_state="planned"
+        )
+        if persisted is None:
+            return
+        job = persisted
+    _finish_ticket_merge(store, job, token, closing, survivor_state="created")
+
+
+def _run_linear_ticket_merge(
+    store: JobStore,
+    job: CursorJob,
+    token: WorkerClaim,
+    clients: ClientFactories,
+    checkpoint: Callable[[], None],
+) -> None:
+    identifier = (job.issue_key or job.ticket_merge_survivor or "").strip()
+    if not identifier:
+        raise HarnessError("Linear ticket merge requires a trusted survivor identity")
+    registry = clients.integrations or build_integration_registry(default_user_config())
+    provider = issue_provider("linear", registry)
+    if not isinstance(provider, LinearIntegration):
+        raise HarnessError("selected Linear provider cannot merge tickets")
+    client = clients.herdr()
+    checkpoint()
+    if not job.ticket_merge_survivor_issue_id:
+        try:
+            issue_id, issue = provider.resolve_issue(
+                client,
+                identifier,
+                checkpoint=checkpoint,
+            )
+        except LinearError:
+            message = f"I couldn't find Linear ticket {identifier}."
+
+            def finish_missing(current: CursorJob) -> CursorJob:
+                now = time.time()
+                return recovery.stage_terminal_intent(
+                    current,
+                    JobStatus.FAILED,
+                    now=now,
+                    result=message,
+                    error=message,
+                )
+
+            _worker_change(
+                store,
+                job.id,
+                token,
+                MODEL_WORKER_STATUSES,
+                finish_missing,
+                expected_revision=job.revision,
+            )
+            return
+
+        def persist_issue(current: CursorJob) -> CursorJob:
+            return current.evolve(
+                issue_key=issue.identifier,
+                ticket_merge_survivor=issue.identifier,
+                ticket_merge_survivor_issue_id=issue_id,
+            )
+
+        updated = _persist_merge_job(
+            store, job, token, persist_issue, statuses={JobStatus.ROUTING}
+        )
+        if updated is None:
+            return
+        job = updated
+        identifier = issue.identifier
+    closing = decode_merge_closing(job.ticket_merge_closing)
+    resolved: list[MergeClosingTicket] = []
+    changed = False
+    for ticket in closing:
+        if ticket.issue_id:
+            resolved.append(ticket)
+            continue
+        try:
+            issue_id, issue = provider.resolve_issue(
+                client,
+                ticket.identity,
+                checkpoint=checkpoint,
+            )
+        except LinearError:
+            missing = f"I couldn't find Linear ticket {ticket.identity}."
+
+            def finish_missing_close(
+                current: CursorJob, *, message: str = missing
+            ) -> CursorJob:
+                now = time.time()
+                return recovery.stage_terminal_intent(
+                    current,
+                    JobStatus.FAILED,
+                    now=now,
+                    result=message,
+                    error=message,
+                )
+
+            _worker_change(
+                store,
+                job.id,
+                token,
+                MODEL_WORKER_STATUSES,
+                finish_missing_close,
+                expected_revision=job.revision,
+            )
+            return
+        resolved.append(replace(ticket, identity=issue.identifier, issue_id=issue_id))
+        changed = True
+    if changed:
+        closing = tuple(resolved)
+
+        def persist_closing(current: CursorJob) -> CursorJob:
+            return current.evolve(ticket_merge_closing=encode_merge_closing(closing))
+
+        updated = _persist_merge_job(
+            store, job, token, persist_closing, statuses={JobStatus.ROUTING}
+        )
+        if updated is None:
+            return
+        job = updated
+    else:
+        closing = tuple(resolved)
+    if not job.ticket_merge_survivor_title:
+        config = default_user_config()
+        draft, closing, survivor_marker = assign_merge_markers(
+            draft_ticket_merge(
+                job.trusted_utterance or job.request,
+                identifier,
+                tuple(ticket.identity for ticket in closing),
+                settings=config.providers,
+            ),
+            closing,
+        )
+
+        def persist_draft(current: CursorJob) -> CursorJob:
+            return current.evolve(
+                ticket_merge_survivor=identifier,
+                ticket_merge_closing=encode_merge_closing(closing),
+                ticket_merge_survivor_title=draft.title,
+                ticket_merge_survivor_body=draft.body,
+                ticket_merge_survivor_marker=survivor_marker,
+                ticket_merge_survivor_operation_state="planned",
+                ticket_merge_operation_state="planned",
+            )
+
+        updated = _persist_merge_job(
+            store, job, token, persist_draft, statuses={JobStatus.ROUTING}
+        )
+        if updated is None:
+            return
+        job = updated
+    closing = decode_merge_closing(job.ticket_merge_closing)
+    draft = TicketMergeDraft(
+        job.ticket_merge_survivor_title or "",
+        job.ticket_merge_survivor_body or "",
+    )
+    if not job.ticket_merge_confirmed:
+        _ask_merge_confirmation(store, job, token, draft, closing, github=False)
+        return
+    if job.ticket_merge_operation_state not in {None, "planned"}:
+        raise HarnessError("Linear ticket merge requires reconciliation before retry")
+
+    def mark_running(current: CursorJob) -> CursorJob:
+        return current.evolve(
+            status=JobStatus.RUNNING,
+            worker_operation="linear_ticket_merge",
+        )
+
+    running = _persist_merge_job(
+        store, job, token, mark_running, statuses={JobStatus.ROUTING}
+    )
+    if running is None:
+        return
+    job = running
+    callback_revision = job.revision
+
+    def persist_submit_fence(
+        target: str,
+        session: str,
+        prompt_token: str,
+        baseline: int,
+    ) -> None:
+        nonlocal callback_revision
+
+        def fence(current: CursorJob) -> CursorJob:
+            return current.evolve(
+                ticket_merge_operation_state="submitting",
+                ticket_merge_prompt_target=target,
+                ticket_merge_prompt_session=session,
+                ticket_merge_prompt_token=prompt_token,
+                ticket_merge_baseline_sequence=baseline,
+            )
+
+        if (
+            _worker_change(
+                store,
+                job.id,
+                token,
+                {JobStatus.RUNNING},
+                fence,
+                expected_revision=callback_revision,
+            )
+            is None
+        ):
+            raise WorkerCancelled
+        callback_revision += 1
+
+    def persist_prompt_acceptance() -> None:
+        nonlocal callback_revision
+
+        def accepted(current: CursorJob) -> CursorJob:
+            return current.evolve(ticket_merge_operation_state="submitted")
+
+        if (
+            _worker_change(
+                store,
+                job.id,
+                token,
+                {JobStatus.RUNNING},
+                accepted,
+                expected_revision=callback_revision,
+            )
+            is None
+        ):
+            raise WorkerCancelled
+        callback_revision += 1
+
+    survivor_state = job.ticket_merge_survivor_operation_state
+    if survivor_state != "created":
+        plan = provider.plan_ticket_update(
+            job.ticket_merge_survivor_issue_id or "",
+            job.issue_key or identifier,
+            job.ticket_merge_survivor_title or "",
+            job.ticket_merge_survivor_body or "",
+            correlation_marker=job.ticket_merge_survivor_marker,
+        )
+        if survivor_state in {"submitted", "ambiguous"}:
+            try:
+                visible = provider.observe_ticket_update(
+                    client, plan, checkpoint=checkpoint
+                )
+            except LinearError:
+                visible = None
+            if visible is None:
+                _queue_merge_ambiguous(
+                    store, job, token, closing, survivor_state="ambiguous"
+                )
+                return
+        else:
+            submitted = _persist_merge_job(
+                store,
+                job,
+                token,
+                lambda current: current.evolve(
+                    ticket_merge_survivor_operation_state="planned",
+                    ticket_merge_operation_state="planned",
+                ),
+                statuses={JobStatus.RUNNING},
+            )
+            if submitted is None:
+                return
+            job = submitted
+            callback_revision = job.revision
+            try:
+                checkpoint()
+                provider.submit_ticket_update(
+                    client,
+                    plan,
+                    confirmed=True,
+                    checkpoint=checkpoint,
+                    before_submit=persist_submit_fence,
+                    accepted=persist_prompt_acceptance,
+                )
+            except LinearError as exc:
+                checkpoint()
+                current = store.get(job.id)
+                uncertain = isinstance(exc, LinearOperationAmbiguous) or (
+                    current.ticket_merge_operation_state in {"submitting", "submitted"}
+                )
+                if uncertain:
+                    try:
+                        visible = provider.observe_ticket_update(
+                            client, plan, checkpoint=checkpoint
+                        )
+                    except LinearError:
+                        visible = None
+                    if visible is None:
+                        _queue_merge_ambiguous(
+                            store, job, token, closing, survivor_state="ambiguous"
+                        )
+                        return
+                else:
+                    _queue_merge_retry(
+                        store, job, token, closing, survivor_state="planned"
+                    )
+                    return
+            current = store.get(job.id)
+            if current.ticket_merge_operation_state != "submitted":
+                _queue_merge_ambiguous(
+                    store, job, token, closing, survivor_state="ambiguous"
+                )
+                return
+            try:
+                visible = provider.observe_ticket_update(
+                    client, plan, checkpoint=checkpoint
+                )
+            except LinearError:
+                visible = None
+            if visible is None:
+                _queue_merge_ambiguous(
+                    store, job, token, closing, survivor_state="ambiguous"
+                )
+                return
+        persisted = _persist_merge_job(
+            store,
+            job,
+            token,
+            lambda current: current.evolve(
+                ticket_merge_survivor_operation_state="created",
+                ticket_merge_operation_state="planned",
+            ),
+            statuses={JobStatus.RUNNING},
+        )
+        if persisted is None:
+            return
+        job = persisted
+        callback_revision = job.revision
+        survivor_state = "created"
+    for index, ticket in enumerate(closing):
+        if ticket.state == "created":
+            continue
+        plan = provider.plan_ticket_close(
+            ticket.issue_id or "",
+            ticket.identity,
+            correlation_marker=ticket.marker,
+        )
+        if ticket.state in {"submitted", "ambiguous"}:
+            try:
+                visible = provider.observe_ticket_close(
+                    client, plan, checkpoint=checkpoint
+                )
+            except LinearError:
+                visible = None
+            if visible is None:
+                closing = replace_merge_closing(closing, index, state="ambiguous")
+                _queue_merge_ambiguous(
+                    store, job, token, closing, survivor_state="created"
+                )
+                return
+            closing = replace_merge_closing(closing, index, state="created")
+            persisted = _persist_merge_closing(
+                store, job, token, closing, operation_state="planned"
+            )
+            if persisted is None:
+                return
+            job = persisted
+            callback_revision = job.revision
+            continue
+        closing = replace_merge_closing(closing, index, state="submitted")
+        submitted = _persist_merge_closing(
+            store, job, token, closing, operation_state="planned"
+        )
+        if submitted is None:
+            return
+        job = submitted
+        callback_revision = job.revision
+        try:
+            checkpoint()
+            provider.submit_ticket_close(
+                client,
+                plan,
+                confirmed=True,
+                checkpoint=checkpoint,
+                before_submit=persist_submit_fence,
+                accepted=persist_prompt_acceptance,
+            )
+        except LinearError as exc:
+            checkpoint()
+            current = store.get(job.id)
+            uncertain = isinstance(exc, LinearOperationAmbiguous) or (
+                current.ticket_merge_operation_state in {"submitting", "submitted"}
+            )
+            if uncertain:
+                try:
+                    visible = provider.observe_ticket_close(
+                        client, plan, checkpoint=checkpoint
+                    )
+                except LinearError:
+                    visible = None
+                if visible is not None:
+                    closing = replace_merge_closing(closing, index, state="created")
+                    persisted = _persist_merge_closing(
+                        store, job, token, closing, operation_state="planned"
+                    )
+                    if persisted is None:
+                        return
+                    job = persisted
+                    callback_revision = job.revision
+                    continue
+                closing = replace_merge_closing(closing, index, state="ambiguous")
+                _queue_merge_ambiguous(
+                    store, job, token, closing, survivor_state="created"
+                )
+                return
+            closing = replace_merge_closing(closing, index, state="planned")
+            _queue_merge_retry(store, job, token, closing, survivor_state="created")
+            return
+        current = store.get(job.id)
+        if current.ticket_merge_operation_state != "submitted":
+            closing = replace_merge_closing(closing, index, state="ambiguous")
+            _queue_merge_ambiguous(store, job, token, closing, survivor_state="created")
+            return
+        try:
+            visible = provider.observe_ticket_close(client, plan, checkpoint=checkpoint)
+        except LinearError:
+            visible = None
+        if visible is None:
+            closing = replace_merge_closing(closing, index, state="ambiguous")
+            _queue_merge_ambiguous(store, job, token, closing, survivor_state="created")
+            return
+        closing = replace_merge_closing(closing, index, state="created")
+        persisted = _persist_merge_closing(
+            store, job, token, closing, operation_state="planned"
+        )
+        if persisted is None:
+            return
+        job = persisted
+        callback_revision = job.revision
+    _finish_ticket_merge(store, job, token, closing, survivor_state="created")
+
+
 def _completion_preferences(
     job: CursorJob,
 ) -> tuple[PlanApprovalPreferences | None, bool]:
@@ -8742,6 +9598,15 @@ def run_claimed_worker(  # pyright: ignore[reportGeneralTypeIssues]
             return
         if job.github_issue_split_requested or job.linear_ticket_split_requested:
             _run_ticket_split(
+                store,
+                job,
+                worker_token,
+                clients,
+                checkpoint,
+            )
+            return
+        if job.github_issue_merge_requested or job.linear_ticket_merge_requested:
+            _run_ticket_merge(
                 store,
                 job,
                 worker_token,

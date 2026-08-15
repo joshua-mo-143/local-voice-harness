@@ -14,7 +14,7 @@ inventory remains as historical design context for the compatibility importer.
 
 ## Current schema-v18 relational inventory
 
-`CursorJob` currently produces 307 persisted field names, including the
+`CursorJob` currently produces 322 persisted field names, including the
 dynamically emitted `pane_retained_at` cleanup and
 `grouped_repository_coordinator_id` handoff fields. Database schema v2
 assigns each exactly once: 222 named lifecycle columns, two immutable artifact
@@ -45,14 +45,14 @@ success.
 
 | Baseline | Count |
 |---|---:|
-| Persisted field names | 307 |
-| Named table fields | 302 |
+| Persisted field names | 322 |
+| Named table fields | 317 |
 | Import-only fields | 4 |
-| Directly exposed `CursorJob` properties | 246 |
+| Directly exposed `CursorJob` properties | 261 |
 | Compatibility adapters | 38 |
-| Public transition entry points | 83 |
+| Public transition entry points | 84 |
 | Documented duplicate authorities | 0 |
-| Lifecycle-related module lines | 33914 |
+| Lifecycle-related module lines | 35387 |
 
 #358 unified ordinary and clarification submission onto one
 `prompt_operations.PromptOperationState`. #359 made that typed operation the

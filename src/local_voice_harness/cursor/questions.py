@@ -318,6 +318,7 @@ def _queue_answer(
     github_issue_close_confirmed: bool | None = None,
     linear_ticket_close_confirmed: bool | None = None,
     ticket_split_confirmed: bool | None = None,
+    ticket_merge_confirmed: bool | None = None,
     clear_target: bool = False,
     clear_issue_create_draft: bool = False,
 ) -> CursorJob:
@@ -423,6 +424,11 @@ def _queue_answer(
             job.ticket_split_confirmed
             if ticket_split_confirmed is None
             else ticket_split_confirmed
+        ),
+        ticket_merge_confirmed=(
+            job.ticket_merge_confirmed
+            if ticket_merge_confirmed is None
+            else ticket_merge_confirmed
         ),
         linear_ticket_create_team=(
             job.linear_ticket_create_team
@@ -1572,6 +1578,120 @@ def _linear_ticket_close_confirmation_answer(
     return AnswerTransition(completed)
 
 
+def _github_issue_merge_confirmation_answer(
+    job: CursorJob,
+    question: Question,
+    resolution: AnswerResolution,
+    context: AnswerContext,
+) -> AnswerTransition:
+    if context.trusted_text is None:
+        return AnswerTransition(
+            None,
+            message="Please confirm directly. Should I merge these GitHub issues?",
+        )
+    confirmation = _confirmation(
+        context.trusted_text,
+        confirmations=_FORK_CONFIRMATIONS | {"merge the issues", "merge them"},
+        rejections=_FORK_REJECTIONS,
+    )
+    if confirmation is None:
+        return AnswerTransition(
+            None,
+            message="Please answer yes or no. Should I merge these GitHub issues?",
+        )
+    if confirmation:
+        return AnswerTransition(
+            _queue_answer(
+                job,
+                question,
+                resolution,
+                context,
+                continuation=False,
+                clear_target=True,
+                ticket_merge_confirmed=True,
+            ),
+            launch=True,
+        )
+    completed = job.evolve_for_delivery(
+        now=context.now,
+        status=JobStatus.COMPLETED,
+        question=None,
+        clarification_kind=None,
+        result="Okay, I did not merge the GitHub issues.",
+        completed_at=context.now,
+        worker_pid=None,
+        worker_boot_id=None,
+        worker_process_start=None,
+        worker_token=None,
+        voice_question=envelope(
+            question,
+            QuestionState.RESOLVED,
+            job=job,
+            answer="no",
+            trusted_answer=context.trusted_text,
+            answered_at=context.now,
+        ),
+    )
+    return AnswerTransition(completed)
+
+
+def _linear_ticket_merge_confirmation_answer(
+    job: CursorJob,
+    question: Question,
+    resolution: AnswerResolution,
+    context: AnswerContext,
+) -> AnswerTransition:
+    if context.trusted_text is None:
+        return AnswerTransition(
+            None,
+            message="Please confirm directly. Should I merge these Linear tickets?",
+        )
+    confirmation = _confirmation(
+        context.trusted_text,
+        confirmations=_FORK_CONFIRMATIONS | {"merge the tickets", "merge them"},
+        rejections=_FORK_REJECTIONS,
+    )
+    if confirmation is None:
+        return AnswerTransition(
+            None,
+            message="Please answer yes or no. Should I merge these Linear tickets?",
+        )
+    if confirmation:
+        return AnswerTransition(
+            _queue_answer(
+                job,
+                question,
+                resolution,
+                context,
+                continuation=False,
+                clear_target=True,
+                ticket_merge_confirmed=True,
+            ),
+            launch=True,
+        )
+    completed = job.evolve_for_delivery(
+        now=context.now,
+        status=JobStatus.COMPLETED,
+        question=None,
+        clarification_kind=None,
+        result="Okay, I did not merge the Linear tickets.",
+        completed_at=context.now,
+        worker_pid=None,
+        worker_boot_id=None,
+        worker_process_start=None,
+        worker_token=None,
+        voice_question=envelope(
+            question,
+            QuestionState.RESOLVED,
+            job=job,
+            answer="no",
+            trusted_answer=context.trusted_text,
+            answered_at=context.now,
+        ),
+    )
+    return AnswerTransition(completed)
+
+
 def _github_issue_split_confirmation_answer(
     job: CursorJob,
     question: Question,
@@ -2007,11 +2127,13 @@ _ANSWER_HANDLERS: dict[str, AnswerHandler] = {
     "github_issue_update_confirmation": _github_issue_update_confirmation_answer,
     "github_issue_close_confirmation": _github_issue_close_confirmation_answer,
     "github_issue_split_confirmation": _github_issue_split_confirmation_answer,
+    "github_issue_merge_confirmation": _github_issue_merge_confirmation_answer,
     "linear_team": _linear_team_answer,
     "linear_ticket_create_confirmation": _linear_ticket_create_confirmation_answer,
     "linear_ticket_update_confirmation": _linear_ticket_update_confirmation_answer,
     "linear_ticket_close_confirmation": _linear_ticket_close_confirmation_answer,
     "linear_ticket_split_confirmation": _linear_ticket_split_confirmation_answer,
+    "linear_ticket_merge_confirmation": _linear_ticket_merge_confirmation_answer,
     "workflow": _workflow_answer,
     "workflow_review": _workflow_review_answer,
     "workflow_review_exhausted": _workflow_review_exhausted_answer,

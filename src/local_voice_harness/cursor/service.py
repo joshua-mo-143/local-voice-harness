@@ -65,6 +65,10 @@ from ..responses import (
     spoken_utterance_slice,
     with_spoken_utterance_ack,
 )
+from ..ticket_merge import (
+    decode_merge_closing,
+    spoken_merge_confirmation,
+)
 from ..ticket_split import (
     decode_split_children,
     split_parent_identity,
@@ -136,11 +140,15 @@ class StartJobRequest:
     github_issue_update_requested: bool = False
     github_issue_close_requested: bool = False
     github_issue_split_requested: bool = False
+    github_issue_merge_requested: bool = False
     linear_team: str | None = None
     linear_ticket_create_requested: bool = False
     linear_ticket_update_requested: bool = False
     linear_ticket_close_requested: bool = False
     linear_ticket_split_requested: bool = False
+    linear_ticket_merge_requested: bool = False
+    ticket_merge_survivor: str | None = None
+    ticket_merge_closing: str | None = None
     fork_requested: bool = False
     github_pull_request: int | None = None
     agent: str | None = None
@@ -168,11 +176,15 @@ class CursorTurnRequest:
     github_issue_update_requested: bool = False
     github_issue_close_requested: bool = False
     github_issue_split_requested: bool = False
+    github_issue_merge_requested: bool = False
     linear_team: str | None = None
     linear_ticket_create_requested: bool = False
     linear_ticket_update_requested: bool = False
     linear_ticket_close_requested: bool = False
     linear_ticket_split_requested: bool = False
+    linear_ticket_merge_requested: bool = False
+    ticket_merge_survivor: str | None = None
+    ticket_merge_closing: str | None = None
     fork_requested: bool = False
     github_pull_request: int | None = None
     agent: str | None = None
@@ -413,6 +425,8 @@ def _build_start_job(
             or request.linear_ticket_close_requested
             or request.github_issue_split_requested
             or request.linear_ticket_split_requested
+            or request.github_issue_merge_requested
+            or request.linear_ticket_merge_requested
         )
         else (
             request.issue_key
@@ -431,6 +445,7 @@ def _build_start_job(
                 or request.linear_ticket_update_requested
                 or request.linear_ticket_close_requested
                 or request.linear_ticket_split_requested
+                or request.linear_ticket_merge_requested
             )
             else (
                 "github"
@@ -442,6 +457,7 @@ def _build_start_job(
                     or request.github_issue_update_requested
                     or request.github_issue_close_requested
                     or request.github_issue_split_requested
+                    or request.github_issue_merge_requested
                 )
                 else None
             )
@@ -473,6 +489,7 @@ def _build_start_job(
         or request.linear_ticket_update_requested
         or request.linear_ticket_close_requested
         or request.linear_ticket_split_requested
+        or request.linear_ticket_merge_requested
     ):
         require_issue_provider(issue_provider, registry)
     if harness_kind == HarnessKind.OPENCODE:
@@ -512,10 +529,14 @@ def _build_start_job(
             github_issue_update_requested=request.github_issue_update_requested,
             github_issue_close_requested=request.github_issue_close_requested,
             github_issue_split_requested=request.github_issue_split_requested,
+            github_issue_merge_requested=request.github_issue_merge_requested,
             linear_ticket_create_requested=request.linear_ticket_create_requested,
             linear_ticket_update_requested=request.linear_ticket_update_requested,
             linear_ticket_close_requested=request.linear_ticket_close_requested,
             linear_ticket_split_requested=request.linear_ticket_split_requested,
+            linear_ticket_merge_requested=request.linear_ticket_merge_requested,
+            ticket_merge_survivor=request.ticket_merge_survivor,
+            ticket_merge_closing=request.ticket_merge_closing,
             linear_ticket_create_team=request.linear_team,
             fork_requested=request.fork_requested,
             github_pull_request=request.github_pull_request,
@@ -579,11 +600,15 @@ def start_job(
     github_issue_update_requested: bool = False,
     github_issue_close_requested: bool = False,
     github_issue_split_requested: bool = False,
+    github_issue_merge_requested: bool = False,
     linear_team: str | None = None,
     linear_ticket_create_requested: bool = False,
     linear_ticket_update_requested: bool = False,
     linear_ticket_close_requested: bool = False,
     linear_ticket_split_requested: bool = False,
+    linear_ticket_merge_requested: bool = False,
+    ticket_merge_survivor: str | None = None,
+    ticket_merge_closing: str | None = None,
     fork_requested: bool = False,
     github_pull_request: int | None = None,
     agent: str | None = None,
@@ -613,11 +638,15 @@ def start_job(
             github_issue_update_requested=github_issue_update_requested,
             github_issue_close_requested=github_issue_close_requested,
             github_issue_split_requested=github_issue_split_requested,
+            github_issue_merge_requested=github_issue_merge_requested,
             linear_team=linear_team,
             linear_ticket_create_requested=linear_ticket_create_requested,
             linear_ticket_update_requested=linear_ticket_update_requested,
             linear_ticket_close_requested=linear_ticket_close_requested,
             linear_ticket_split_requested=linear_ticket_split_requested,
+            linear_ticket_merge_requested=linear_ticket_merge_requested,
+            ticket_merge_survivor=ticket_merge_survivor,
+            ticket_merge_closing=ticket_merge_closing,
             fork_requested=fork_requested,
             github_pull_request=github_pull_request,
             agent=agent,
@@ -2725,11 +2754,15 @@ def cursor_turn(
     github_issue_update_requested: bool = False,
     github_issue_close_requested: bool = False,
     github_issue_split_requested: bool = False,
+    github_issue_merge_requested: bool = False,
     linear_team: str | None = None,
     linear_ticket_create_requested: bool = False,
     linear_ticket_update_requested: bool = False,
     linear_ticket_close_requested: bool = False,
     linear_ticket_split_requested: bool = False,
+    linear_ticket_merge_requested: bool = False,
+    ticket_merge_survivor: str | None = None,
+    ticket_merge_closing: str | None = None,
     fork_requested: bool = False,
     github_pull_request: int | None = None,
     agent: str | None = None,
@@ -2769,11 +2802,15 @@ def cursor_turn(
         github_issue_update_requested = request.github_issue_update_requested
         github_issue_close_requested = request.github_issue_close_requested
         github_issue_split_requested = request.github_issue_split_requested
+        github_issue_merge_requested = request.github_issue_merge_requested
         linear_team = request.linear_team
         linear_ticket_create_requested = request.linear_ticket_create_requested
         linear_ticket_update_requested = request.linear_ticket_update_requested
         linear_ticket_close_requested = request.linear_ticket_close_requested
         linear_ticket_split_requested = request.linear_ticket_split_requested
+        linear_ticket_merge_requested = request.linear_ticket_merge_requested
+        ticket_merge_survivor = request.ticket_merge_survivor
+        ticket_merge_closing = request.ticket_merge_closing
         fork_requested = request.fork_requested
         github_pull_request = request.github_pull_request
         agent = request.agent
@@ -2938,11 +2975,16 @@ def cursor_turn(
             scope_source=issue_scope_source,
             scope=issue_scope,
         )
-        use_extracted_targets = extraction.batch_requested or bool(
-            issue_scope
-            and extraction.requested_count == 1
-            and extraction.references
-            and extraction.references[0].scoped
+        use_extracted_targets = not (
+            github_issue_merge_requested or linear_ticket_merge_requested
+        ) and (
+            extraction.batch_requested
+            or bool(
+                issue_scope
+                and extraction.requested_count == 1
+                and extraction.references
+                and extraction.references[0].scoped
+            )
         )
         if use_extracted_targets:
             base = StartJobRequest(
@@ -2960,11 +3002,15 @@ def cursor_turn(
                 github_issue_update_requested=github_issue_update_requested,
                 github_issue_close_requested=github_issue_close_requested,
                 github_issue_split_requested=github_issue_split_requested,
+                github_issue_merge_requested=github_issue_merge_requested,
                 linear_team=linear_team,
                 linear_ticket_create_requested=linear_ticket_create_requested,
                 linear_ticket_update_requested=linear_ticket_update_requested,
                 linear_ticket_close_requested=linear_ticket_close_requested,
                 linear_ticket_split_requested=linear_ticket_split_requested,
+                linear_ticket_merge_requested=linear_ticket_merge_requested,
+                ticket_merge_survivor=ticket_merge_survivor,
+                ticket_merge_closing=ticket_merge_closing,
                 fork_requested=fork_requested,
                 github_pull_request=github_pull_request,
                 agent=agent,
@@ -3021,11 +3067,15 @@ def cursor_turn(
                 github_issue_update_requested=github_issue_update_requested,
                 github_issue_close_requested=github_issue_close_requested,
                 github_issue_split_requested=github_issue_split_requested,
+                github_issue_merge_requested=github_issue_merge_requested,
                 linear_team=linear_team,
                 linear_ticket_create_requested=linear_ticket_create_requested,
                 linear_ticket_update_requested=linear_ticket_update_requested,
                 linear_ticket_close_requested=linear_ticket_close_requested,
                 linear_ticket_split_requested=linear_ticket_split_requested,
+                linear_ticket_merge_requested=linear_ticket_merge_requested,
+                ticket_merge_survivor=ticket_merge_survivor,
+                ticket_merge_closing=ticket_merge_closing,
                 fork_requested=fork_requested,
                 github_pull_request=github_pull_request,
                 agent=agent,
@@ -3173,6 +3223,11 @@ def render_job_announcement(job: CursorJob) -> AssistantResponse:
                 spoken_text=detail or "Ticket split finished.",
                 display_text=detail,
             )
+        if job.github_issue_merge_requested or job.linear_ticket_merge_requested:
+            return AssistantResponse(
+                spoken_text=detail or "Ticket merge finished.",
+                display_text=detail,
+            )
         return AssistantResponse(
             spoken_text=f"Cursor finished {label}.",
             display_text=(
@@ -3267,6 +3322,18 @@ def render_job_announcement(job: CursorJob) -> AssistantResponse:
         if job.clarification_kind == "linear_ticket_close_confirmation":
             return AssistantResponse(
                 spoken_text=f"Close {job.issue_key}?",
+                display_text=question,
+            )
+        if job.clarification_kind in {
+            "github_issue_merge_confirmation",
+            "linear_ticket_merge_confirmation",
+        }:
+            closing = decode_merge_closing(job.ticket_merge_closing)
+            return AssistantResponse(
+                spoken_text=spoken_merge_confirmation(
+                    job.ticket_merge_survivor or "the ticket",
+                    tuple(ticket.identity for ticket in closing),
+                ),
                 display_text=question,
             )
         if job.clarification_kind in {
@@ -3421,6 +3488,8 @@ def _foreground_delivery_result(
             or completed.linear_ticket_close_requested
             or completed.github_issue_split_requested
             or completed.linear_ticket_split_requested
+            or completed.github_issue_merge_requested
+            or completed.linear_ticket_merge_requested
         ):
             return CursorTurnResult(
                 render_job_announcement(completed), None, mutated=True
@@ -3558,6 +3627,22 @@ def _foreground_delivery_result(
             return CursorTurnResult(
                 AssistantResponse(
                     spoken_text=f"Close {awaiting.issue_key}?",
+                    display_text=rendered_question,
+                ),
+                job_id,
+                mutated=True,
+            )
+        if awaiting.clarification_kind in {
+            "github_issue_merge_confirmation",
+            "linear_ticket_merge_confirmation",
+        }:
+            closing = decode_merge_closing(awaiting.ticket_merge_closing)
+            return CursorTurnResult(
+                AssistantResponse(
+                    spoken_text=spoken_merge_confirmation(
+                        awaiting.ticket_merge_survivor or "the ticket",
+                        tuple(ticket.identity for ticket in closing),
+                    ),
                     display_text=rendered_question,
                 ),
                 job_id,

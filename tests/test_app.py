@@ -1949,6 +1949,73 @@ class CursorFastPathTests(unittest.TestCase):
         play.assert_called_once()
         self.assertIn("did not split a ticket", play.call_args.args[0])
 
+    def test_ticket_merge_without_identity_asks_which_tickets(self) -> None:
+        context = RequestContext("merge these tickets")
+        with (
+            mock.patch.object(app, "start_components"),
+            mock.patch.object(app, "request_context", return_value=context),
+            mock.patch.object(
+                app,
+                "route_intent",
+                return_value=IntentRoute(Intent.GITHUB_ISSUE_MERGE, "high"),
+            ),
+            mock.patch.object(app, "cursor_turn") as cursor,
+            mock.patch.object(app, "qwen_response") as qwen,
+            mock.patch.object(app, "stream_and_play") as play,
+        ):
+            app.respond("merge these tickets")
+
+        cursor.assert_not_called()
+        qwen.assert_not_called()
+        play.assert_called_once_with("Which tickets should I merge?", settings=mock.ANY)
+
+    def test_ticket_merge_dispatches_dedicated_durable_job(self) -> None:
+        context = RequestContext(
+            "merge owner/repo#12 and owner/repo#13",
+        )
+        with (
+            mock.patch.object(app, "start_components"),
+            mock.patch.object(app, "request_context", return_value=context),
+            mock.patch.object(
+                app,
+                "route_intent",
+                return_value=IntentRoute(Intent.GITHUB_ISSUE_MERGE, "high"),
+            ),
+            mock.patch.object(
+                app, "cursor_turn", return_value=("drafted", "job")
+            ) as cursor,
+            mock.patch.object(app, "stream_and_play"),
+        ):
+            app.respond("merge owner/repo#12 and owner/repo#13")
+
+        request = cursor.call_args.args[0]
+        self.assertTrue(request.github_issue_merge_requested)
+        self.assertEqual(request.github_repository, "owner/repo")
+        self.assertEqual(request.github_issue, 12)
+        self.assertEqual(request.ticket_merge_survivor, "owner/repo#12")
+        self.assertFalse(request.github_issue_create_requested)
+
+    def test_low_confidence_ticket_merge_does_not_write(self) -> None:
+        context = RequestContext("merge owner/repo#12 and owner/repo#13")
+        with (
+            mock.patch.object(app, "start_components"),
+            mock.patch.object(app, "request_context", return_value=context),
+            mock.patch.object(
+                app,
+                "route_intent",
+                return_value=IntentRoute(Intent.GITHUB_ISSUE_MERGE, "low"),
+            ),
+            mock.patch.object(app, "cursor_turn") as cursor,
+            mock.patch.object(app, "qwen_response") as qwen,
+            mock.patch.object(app, "stream_and_play") as play,
+        ):
+            app.respond("merge owner/repo#12 and owner/repo#13")
+
+        cursor.assert_not_called()
+        qwen.assert_not_called()
+        play.assert_called_once()
+        self.assertIn("did not merge tickets", play.call_args.args[0])
+
     def test_github_issue_creation_dispatches_dedicated_durable_job(self) -> None:
         context = RequestContext(
             "create an issue in this repo",

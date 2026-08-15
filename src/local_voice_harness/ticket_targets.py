@@ -606,3 +606,37 @@ def resolve_named_ticket(
     if focused_issue:
         return parse_focused_ticket(focused_issue)
     return None
+
+
+def resolve_named_tickets(
+    extraction: TicketExtraction,
+    *,
+    focused_issue: str | None = None,
+    include_focused: bool = False,
+    utterance: str = "",
+) -> tuple[TicketReference, ...]:
+    """Return every spoken or focused canonical ticket in trusted order."""
+
+    resolved = [reference for reference in extraction.references if reference.canonical]
+    seen = {reference.canonical for reference in resolved}
+    focused = parse_focused_ticket(focused_issue) if focused_issue else None
+    if include_focused and focused is not None and focused.canonical not in seen:
+        first_spoken = resolved[0].position if resolved else len(utterance)
+        deictic = re.search(
+            r"\b(?:this|that|the)\s+(?:github\s+|linear\s+)?(?:ticket|issue)s?\b",
+            utterance,
+            re.IGNORECASE,
+        )
+        if deictic is not None and deictic.start() <= first_spoken:
+            resolved = [focused, *resolved]
+        else:
+            resolved.append(focused)
+    unique: list[TicketReference] = []
+    seen_ids: set[str] = set()
+    for reference in resolved:
+        canonical = reference.canonical
+        if canonical is None or canonical in seen_ids:
+            continue
+        seen_ids.add(canonical)
+        unique.append(reference)
+    return tuple(unique)

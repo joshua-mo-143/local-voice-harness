@@ -82,6 +82,11 @@ ROUTER_SYSTEM_PROMPT = (
     "Use linear_ticket_split when the user asks to split, divide, or break an existing "
     "Linear ticket into child tickets. Do not use it for implementing, merging, or "
     "reviewing the ticket. "
+    "Use github_issue_merge when the user asks to merge two or more existing GitHub "
+    "issues into one survivor. Do not use it for pull-request merge, split, or "
+    "implementing the issues. "
+    "Use linear_ticket_merge when the user asks to merge two or more existing Linear "
+    "tickets into one survivor. Do not use it for split or implementing the tickets. "
     "Use cursor_details when the user asks to see or hear more detail about the "
     "just-announced completed result, such as 'tell me more' or 'show me the details'; "
     "this is read-only and must not start more work. "
@@ -178,10 +183,12 @@ ROUTE_TOOL = {
                         "github_issue_update",
                         "github_issue_close",
                         "github_issue_split",
+                        "github_issue_merge",
                         "linear_ticket_create",
                         "linear_ticket_update",
                         "linear_ticket_close",
                         "linear_ticket_split",
+                        "linear_ticket_merge",
                         "end_conversation",
                         "uncertain",
                     ],
@@ -237,10 +244,12 @@ class Intent(StrEnum):
     GITHUB_ISSUE_UPDATE = "github_issue_update"
     GITHUB_ISSUE_CLOSE = "github_issue_close"
     GITHUB_ISSUE_SPLIT = "github_issue_split"
+    GITHUB_ISSUE_MERGE = "github_issue_merge"
     LINEAR_TICKET_CREATE = "linear_ticket_create"
     LINEAR_TICKET_UPDATE = "linear_ticket_update"
     LINEAR_TICKET_CLOSE = "linear_ticket_close"
     LINEAR_TICKET_SPLIT = "linear_ticket_split"
+    LINEAR_TICKET_MERGE = "linear_ticket_merge"
     # Compatibility aliases for the original Cursor-specific intent names.
     CURSOR_SUBMIT = "cursor_submit"
     CURSOR_REPLY = "cursor_reply"

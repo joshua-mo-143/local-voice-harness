@@ -219,6 +219,7 @@ _BOOL_FIELDS = frozenset(
         "github_issue_close_requested",
         "github_issue_close_confirmed",
         "github_issue_split_requested",
+        "github_issue_merge_requested",
         "linear_ticket_create_requested",
         "linear_ticket_create_confirmed",
         "linear_ticket_update_requested",
@@ -226,7 +227,9 @@ _BOOL_FIELDS = frozenset(
         "linear_ticket_close_requested",
         "linear_ticket_close_confirmed",
         "linear_ticket_split_requested",
+        "linear_ticket_merge_requested",
         "ticket_split_confirmed",
+        "ticket_merge_confirmed",
         "fork_operation_source_private",
         "agent_dispatch_exited",
         "worktree_dispatch_exited",
@@ -274,6 +277,7 @@ _INT_FIELDS = frozenset(
         "linear_ticket_update_baseline_sequence",
         "linear_ticket_close_baseline_sequence",
         "ticket_split_baseline_sequence",
+        "ticket_merge_baseline_sequence",
         "agent_state_sequence",
         "session_control_generation",
     }
@@ -412,6 +416,17 @@ _STRING_FIELDS = frozenset(
         "ticket_split_prompt_target",
         "ticket_split_prompt_session",
         "ticket_split_prompt_token",
+        "ticket_merge_survivor",
+        "ticket_merge_survivor_title",
+        "ticket_merge_survivor_body",
+        "ticket_merge_survivor_marker",
+        "ticket_merge_survivor_operation_state",
+        "ticket_merge_survivor_issue_id",
+        "ticket_merge_closing",
+        "ticket_merge_operation_state",
+        "ticket_merge_prompt_target",
+        "ticket_merge_prompt_session",
+        "ticket_merge_prompt_token",
         "worktree_branch",
         "worktree_label",
         "worktree_path",
@@ -619,10 +634,14 @@ class NewAgentJob:
     github_issue_update_requested: bool = False
     github_issue_close_requested: bool = False
     github_issue_split_requested: bool = False
+    github_issue_merge_requested: bool = False
     linear_ticket_create_requested: bool = False
     linear_ticket_update_requested: bool = False
     linear_ticket_close_requested: bool = False
     linear_ticket_split_requested: bool = False
+    linear_ticket_merge_requested: bool = False
+    ticket_merge_survivor: str | None = None
+    ticket_merge_closing: str | None = None
     linear_ticket_create_team: str | None = None
     linear_ticket_create_team_id: str | None = None
     linear_ticket_create_title: str | None = None
@@ -824,6 +843,20 @@ _LINEAR_STATE_FIELDS = frozenset(
         "ticket_split_prompt_session",
         "ticket_split_prompt_token",
         "ticket_split_baseline_sequence",
+        "linear_ticket_merge_requested",
+        "ticket_merge_confirmed",
+        "ticket_merge_survivor",
+        "ticket_merge_survivor_title",
+        "ticket_merge_survivor_body",
+        "ticket_merge_survivor_marker",
+        "ticket_merge_survivor_operation_state",
+        "ticket_merge_survivor_issue_id",
+        "ticket_merge_closing",
+        "ticket_merge_operation_state",
+        "ticket_merge_prompt_target",
+        "ticket_merge_prompt_session",
+        "ticket_merge_prompt_token",
+        "ticket_merge_baseline_sequence",
     }
 )
 _CHECKOUT_ALIASES = {
@@ -2181,10 +2214,14 @@ class AgentJob:
                 "github_issue_update_requested": spec.github_issue_update_requested,
                 "github_issue_close_requested": spec.github_issue_close_requested,
                 "github_issue_split_requested": spec.github_issue_split_requested,
+                "github_issue_merge_requested": spec.github_issue_merge_requested,
                 "linear_ticket_create_requested": spec.linear_ticket_create_requested,
                 "linear_ticket_update_requested": spec.linear_ticket_update_requested,
                 "linear_ticket_close_requested": spec.linear_ticket_close_requested,
                 "linear_ticket_split_requested": spec.linear_ticket_split_requested,
+                "linear_ticket_merge_requested": spec.linear_ticket_merge_requested,
+                "ticket_merge_survivor": spec.ticket_merge_survivor,
+                "ticket_merge_closing": spec.ticket_merge_closing,
                 "linear_ticket_create_team": spec.linear_ticket_create_team,
                 "linear_ticket_create_team_id": spec.linear_ticket_create_team_id,
                 "linear_ticket_create_title": spec.linear_ticket_create_title,
@@ -2927,6 +2964,10 @@ class AgentJob:
         return self._boolean_field("github_issue_split_requested")
 
     @property
+    def github_issue_merge_requested(self) -> bool:
+        return self._boolean_field("github_issue_merge_requested")
+
+    @property
     def linear_ticket_create_requested(self) -> bool:
         return self._boolean_field("linear_ticket_create_requested")
 
@@ -3153,6 +3194,62 @@ class AgentJob:
     @property
     def ticket_split_baseline_sequence(self) -> int | None:
         return self._optional_int("ticket_split_baseline_sequence")
+
+    @property
+    def linear_ticket_merge_requested(self) -> bool:
+        return self._boolean_field("linear_ticket_merge_requested")
+
+    @property
+    def ticket_merge_confirmed(self) -> bool:
+        return self._boolean_field("ticket_merge_confirmed")
+
+    @property
+    def ticket_merge_survivor(self) -> str | None:
+        return self._optional_string("ticket_merge_survivor")
+
+    @property
+    def ticket_merge_survivor_title(self) -> str | None:
+        return self._optional_string("ticket_merge_survivor_title")
+
+    @property
+    def ticket_merge_survivor_body(self) -> str | None:
+        return self._optional_string("ticket_merge_survivor_body")
+
+    @property
+    def ticket_merge_survivor_marker(self) -> str | None:
+        return self._optional_string("ticket_merge_survivor_marker")
+
+    @property
+    def ticket_merge_survivor_operation_state(self) -> str | None:
+        return self._optional_string("ticket_merge_survivor_operation_state")
+
+    @property
+    def ticket_merge_survivor_issue_id(self) -> str | None:
+        return self._optional_string("ticket_merge_survivor_issue_id")
+
+    @property
+    def ticket_merge_closing(self) -> str | None:
+        return self._optional_string("ticket_merge_closing")
+
+    @property
+    def ticket_merge_operation_state(self) -> str | None:
+        return self._optional_string("ticket_merge_operation_state")
+
+    @property
+    def ticket_merge_prompt_target(self) -> str | None:
+        return self._optional_string("ticket_merge_prompt_target")
+
+    @property
+    def ticket_merge_prompt_session(self) -> str | None:
+        return self._optional_string("ticket_merge_prompt_session")
+
+    @property
+    def ticket_merge_prompt_token(self) -> str | None:
+        return self._optional_string("ticket_merge_prompt_token")
+
+    @property
+    def ticket_merge_baseline_sequence(self) -> int | None:
+        return self._optional_int("ticket_merge_baseline_sequence")
 
     @property
     def github_pull_request(self) -> int | None:
@@ -4760,6 +4857,50 @@ class AgentJob:
                     "Linear ticket split submission requires a durable prompt fence"
                 )
         if (
+            self.ticket_merge_operation_state is not None
+            and self.ticket_merge_operation_state not in _ISSUE_CREATE_OPERATION_STATES
+        ):
+            raise JobValidationError("ticket_merge_operation_state is invalid")
+        if (
+            self.ticket_merge_survivor_operation_state is not None
+            and self.ticket_merge_survivor_operation_state
+            not in _ISSUE_CREATE_OPERATION_STATES
+        ):
+            raise JobValidationError("ticket_merge_survivor_operation_state is invalid")
+        if self.ticket_merge_confirmed and not (
+            self.github_issue_merge_requested or self.linear_ticket_merge_requested
+        ):
+            raise JobValidationError(
+                "Ticket merge confirmation requires a merge request"
+            )
+        if self.ticket_merge_operation_state is not None and not all(
+            (
+                self.ticket_merge_survivor,
+                self.ticket_merge_closing,
+                self.ticket_merge_survivor_title,
+                self.ticket_merge_survivor_marker,
+            )
+        ):
+            raise JobValidationError(
+                "Ticket merge operation requires a survivor, closing set, title, and marker"
+            )
+        if self.ticket_merge_operation_state in {"submitting", "submitted"} and (
+            self.linear_ticket_merge_requested
+        ):
+            if (
+                not all(
+                    (
+                        self.ticket_merge_prompt_target,
+                        self.ticket_merge_prompt_session,
+                        self.ticket_merge_prompt_token,
+                    )
+                )
+                or self.ticket_merge_baseline_sequence is None
+            ):
+                raise JobValidationError(
+                    "Linear ticket merge submission requires a durable prompt fence"
+                )
+        if (
             self.github_issue is not None
             and self.issue_key is None
             and self.issue_provider != "github"
@@ -4777,6 +4918,7 @@ class AgentJob:
             and not self.github_issue_update_requested
             and not self.github_issue_close_requested
             and not self.github_issue_split_requested
+            and not self.github_issue_merge_requested
         ):
             raise JobValidationError(
                 "github issue_provider requires a GitHub issue identity"
@@ -4791,6 +4933,7 @@ class AgentJob:
                     or self.linear_ticket_update_requested
                     or self.linear_ticket_close_requested
                     or self.linear_ticket_split_requested
+                    or self.linear_ticket_merge_requested
                 )
             )
         ):
@@ -5219,6 +5362,10 @@ class AgentJob:
             or self.ticket_split_operation_state
             in {"submitting", "submitted", "ambiguous"}
             or self.ticket_split_parent_operation_state
+            in {"submitting", "submitted", "ambiguous"}
+            or self.ticket_merge_operation_state
+            in {"submitting", "submitted", "ambiguous"}
+            or self.ticket_merge_survivor_operation_state
             in {"submitting", "submitted", "ambiguous"}
             or self.prompt_operation_state in {"submitting", "ambiguous"}
             or self.participant_creation_state
