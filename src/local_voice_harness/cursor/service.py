@@ -3012,6 +3012,14 @@ def render_job_announcement(job: CursorJob) -> AssistantResponse:
             if pending is not None
             else str(job.question or job.result or "").strip()
         )
+        if job.clarification_kind == "github_issue_file_as_one":
+            return AssistantResponse(
+                spoken_text="File this as issue 1?",
+                display_text=(
+                    f"Title: {job.github_issue_create_title}\n\n"
+                    f"Body:\n{job.github_issue_create_body}"
+                ),
+            )
         if job.clarification_kind == "github_issue_create_confirmation":
             return AssistantResponse(
                 spoken_text=(
@@ -3179,6 +3187,17 @@ def _foreground_delivery_result(
             if pending is not None
             else str(awaiting.question or awaiting.result or "").strip()
         )
+        if awaiting.clarification_kind == "github_issue_file_as_one":
+            return CursorTurnResult(
+                AssistantResponse(
+                    spoken_text="File this as issue 1?",
+                    display_text=(
+                        f"Title: {awaiting.github_issue_create_title}\n\n"
+                        f"Body:\n{awaiting.github_issue_create_body}"
+                    ),
+                ),
+                job_id,
+            )
         if awaiting.clarification_kind == "github_issue_create_confirmation":
             return CursorTurnResult(
                 AssistantResponse(

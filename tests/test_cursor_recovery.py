@@ -348,6 +348,50 @@ class CursorRecoveryTests(unittest.TestCase):
         self.assertNotIn("github_issue_created_url", updated.to_dict())
         client.submit_issue.assert_not_called()
 
+    def test_reconciles_continue_workflow_issue_creation_without_completing(
+        self,
+    ) -> None:
+        job = self.create(
+            {
+                "id": "123456789abc",
+                "status": "reconciling",
+                "request": "create me a SaaS called widgets",
+                "created_at": 1,
+                "delivered": False,
+                "github_repository": "alice/widgets",
+                "github_repo_create_requested": True,
+                "github_repo_create_continue_workflow": True,
+                "github_repo_create_visibility": "private",
+                "github_repo_create_marker": "a" * 32,
+                "github_repo_create_operation_state": "created",
+                "github_issue_create_requested": True,
+                "github_issue_create_confirmed": True,
+                "github_issue_create_title": "create me a SaaS called widgets",
+                "github_issue_create_body": "create me a SaaS called widgets",
+                "github_issue_create_marker": "b" * 32,
+                "github_issue_create_operation_state": "ambiguous",
+            }
+        )
+        client = mock.Mock(spec=GitHubClient)
+        client.observe_issue.return_value = GitHubIssueCreationResult(
+            GitHubIssue("alice", "widgets", 1),
+            "https://github.com/alice/widgets/issues/1",
+            "b" * 32,
+        )
+
+        reconcile_uncertain_issue_creation(
+            self.store,
+            job,
+            now=100,
+            github_factory=lambda: client,
+        )
+
+        updated = self.store.get(job.id)
+        self.assertEqual(updated.status, JobStatus.QUEUED)
+        self.assertEqual(updated.github_issue_created_number, 1)
+        self.assertEqual(updated.github_issue_create_operation_state, "created")
+        client.submit_issue.assert_not_called()
+
     def test_unobserved_issue_creation_requires_manual_check(self) -> None:
         job = self.create(
             {

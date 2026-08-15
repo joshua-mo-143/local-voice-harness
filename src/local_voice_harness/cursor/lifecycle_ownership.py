@@ -496,6 +496,7 @@ def _build_field_ownership() -> tuple[FieldOwnership, ...]:
             adapter="CursorJob.from_dict",
             callers=(
                 "cursor.provisioning._run_github_issue_creation",
+                "cursor.provisioning._offer_file_as_issue_one",
                 "cursor.provisioning._run_github_repo_creation",
                 "cursor.provisioning._run_linear_ticket_creation",
                 "cursor.recovery.reconcile_uncertain_issue_creation",
@@ -1420,5 +1421,5 @@ BASELINE_COUNTS: dict[str, int] = {
     "compatibility_adapters": 38,
     "transition_entry_points": 76,
     "duplicate_authorities": 0,
-    "lifecycle_module_lines": 28021,
+    "lifecycle_module_lines": 28185,
 }

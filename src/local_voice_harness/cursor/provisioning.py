@@ -13,7 +13,11 @@ from pathlib import Path
 from ..agents.harness import HarnessCapability, HarnessSession, ReconciliationState
 from ..diagnostic_safety import redact_diagnostic
 from ..errors import HarnessError
-from ..github_issue_creation import draft_github_issue, repository_from_utterance
+from ..github_issue_creation import (
+    draft_github_issue,
+    issue_draft_from_trusted_brief,
+    repository_from_utterance,
+)
 from ..integrations.github import (
     GitHubClient,
     GitHubCommandStartError,
@@ -882,6 +886,13 @@ def _finish_github_issue_creation(
 
     def finish(job: CursorJob) -> CursorJob:
         now = time.time()
+        if job.github_repo_create_continue_workflow:
+            return job.evolve(
+                github_issue_created_number=issue.number,
+                github_issue_created_url=url,
+                github_issue_create_operation_state="created",
+                worker_operation=None,
+            )
         return job.evolve_for_delivery(
             now=now,
             status=JobStatus.COMPLETED,
@@ -992,6 +1003,11 @@ def _run_github_issue_creation(
         raise HarnessError("GitHub issue creation requires reconciliation before retry")
 
     def mark_submitted(current: CursorJob) -> CursorJob:
+        if current.github_repo_create_continue_workflow:
+            return current.evolve(
+                github_issue_create_operation_state="submitted",
+                worker_operation="github_issue_create",
+            )
         return current.evolve(
             status=JobStatus.RUNNING,
             github_issue_create_operation_state="submitted",
@@ -1045,7 +1061,7 @@ def _run_github_issue_creation(
                 store,
                 job.id,
                 token,
-                {JobStatus.RUNNING},
+                {JobStatus.ROUTING, JobStatus.RUNNING},
                 ambiguous,
                 expected_revision=submitted.revision,
             )
@@ -1069,7 +1085,7 @@ def _run_github_issue_creation(
             store,
             job.id,
             token,
-            {JobStatus.RUNNING},
+            {JobStatus.ROUTING, JobStatus.RUNNING},
             retry_after_start_failure,
             expected_revision=submitted.revision,
         )
@@ -1104,6 +1120,46 @@ def _record_github_repo_remote_created(
             github_repo_create_operation_state="remote_created",
         ),
         expected_revision=expected_revision,
+    )
+
+
+def _offer_file_as_issue_one(
+    store: JobStore,
+    job: CursorJob,
+    token: WorkerClaim,
+    clients: ClientFactories,
+    checkpoint: Callable[[], None],
+) -> None:
+    repository = (job.github_repository or "").strip()
+    if not repository:
+        return
+    github = _github_provider(clients.github)
+    checkpoint()
+    draft = issue_draft_from_trusted_brief(
+        job.trusted_utterance or job.request,
+        repository,
+    )
+    plan = github.plan_issue_creation(
+        draft.repository,
+        draft.title,
+        draft.body,
+        correlation_marker=uuid.uuid4().hex,
+    )
+    _worker_question(
+        store,
+        job.id,
+        token,
+        "File this as issue 1?",
+        expected_revision=job.revision,
+        clarification_kind="github_issue_file_as_one",
+        sensitivity=QuestionSensitivity.DESTRUCTIVE,
+        job_changes={
+            "github_repository": plan.repository,
+            "github_issue_create_title": plan.title,
+            "github_issue_create_body": plan.body,
+            "github_issue_create_marker": plan.correlation_marker,
+            "github_issue_create_operation_state": "planned",
+        },
     )
 
 
@@ -5424,15 +5480,6 @@ def run_claimed_worker(  # pyright: ignore[reportGeneralTypeIssues]
             checkpoint()
             _resume_plan_approval_completion(store, job, worker_token)
             return
-        if job.github_issue_create_requested:
-            _run_github_issue_creation(
-                store,
-                job,
-                worker_token,
-                clients,
-                checkpoint,
-            )
-            return
         if job.github_repo_create_requested:
             if job.github_repo_create_operation_state != "created":
                 _run_github_repo_creation(
@@ -5466,6 +5513,34 @@ def run_claimed_worker(  # pyright: ignore[reportGeneralTypeIssues]
                     return
                 job = cloned
             if not job.repository:
+                return
+            if (
+                not job.github_issue_create_requested
+                and job.github_issue_created_number is None
+                and not job.github_issue_create_title
+            ):
+                _offer_file_as_issue_one(
+                    store,
+                    job,
+                    worker_token,
+                    clients,
+                    checkpoint,
+                )
+                return
+        if job.github_issue_create_requested:
+            if job.github_issue_create_operation_state != "created":
+                _run_github_issue_creation(
+                    store,
+                    job,
+                    worker_token,
+                    clients,
+                    checkpoint,
+                )
+                job = store.get(job_id)
+            if not (
+                job.github_repo_create_continue_workflow
+                and job.github_issue_create_operation_state == "created"
+            ):
                 return
         if job.linear_ticket_create_requested:
             _run_linear_ticket_creation(

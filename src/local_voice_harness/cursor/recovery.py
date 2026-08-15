@@ -654,6 +654,21 @@ def reconcile_uncertain_issue_creation(
                 worker_token=None,
                 prepare_delivery=True,
             )
+        if current.github_repo_create_continue_workflow:
+            return current.evolve_recovery(
+                now=now,
+                status=JobStatus.QUEUED,
+                queued_at=now,
+                github_issue_created_number=result.issue.number,
+                github_issue_created_url=result.url,
+                github_issue_create_operation_state="created",
+                reconcile=False,
+                worker_operation=None,
+                worker_pid=None,
+                worker_boot_id=None,
+                worker_process_start=None,
+                worker_token=None,
+            )
         return current.evolve_recovery(
             now=now,
             status=JobStatus.COMPLETED,

@@ -52,7 +52,7 @@ success.
 | Compatibility adapters | 38 |
 | Public transition entry points | 76 |
 | Documented duplicate authorities | 0 |
-| Lifecycle-related module lines | 28021 |
+| Lifecycle-related module lines | 28185 |
 
 #358 unified ordinary and clarification submission onto one
 `prompt_operations.PromptOperationState`. #359 made that typed operation the

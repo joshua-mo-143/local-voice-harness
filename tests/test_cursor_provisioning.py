@@ -4825,9 +4825,143 @@ class CursorJobStateTests(unittest.TestCase):
         updated = jobs.read_job("123456789abc")
         self.assertEqual(updated["github_repo_create_operation_state"], "created")
         self.assertEqual(updated["repository"], str(checkout))
-        self.assertIsNotNone(updated.get("workflow_tier"))
+        self.assertEqual(updated["status"], "awaiting_user")
+        self.assertEqual(updated["clarification_kind"], "github_issue_file_as_one")
+        self.assertEqual(updated["question"], "File this as issue 1?")
+        self.assertEqual(
+            updated["github_issue_create_title"],
+            "create me a SaaS called widgets",
+        )
+        self.assertEqual(
+            updated["github_issue_create_body"],
+            "create me a SaaS called widgets",
+        )
         github.submit_repository_creation.assert_called_once()
         github.ensure_repository_clone.assert_called_once()
+        github.submit_issue.assert_not_called()
+        client.ensure_agent.assert_not_called()
+
+    def test_file_as_issue_one_yes_creates_one_issue_then_workflow(self) -> None:
+        checkout = Path("/home/test/src/widgets")
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "create me a SaaS called widgets",
+                "trusted_utterance": "create me a SaaS called widgets",
+                "github_repository": "alice/widgets",
+                "github_repo_create_requested": True,
+                "github_repo_create_continue_workflow": True,
+                "github_repo_create_operation_state": "created",
+                "github_repo_create_visibility": "private",
+                "github_repo_create_marker": "a" * 32,
+                "github_repo_created_url": "https://github.com/alice/widgets",
+                "repository": str(checkout),
+                "github_issue_create_title": "create me a SaaS called widgets",
+                "github_issue_create_body": "create me a SaaS called widgets",
+                "github_issue_create_marker": "b" * 32,
+                "github_issue_create_operation_state": "planned",
+                "github_issue_create_requested": True,
+                "github_issue_create_confirmed": True,
+                "status": "queued",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        source = GitHubRepository(
+            "alice/widgets",
+            "https://github.com/alice/widgets",
+            True,
+            "main",
+        )
+        result = GitHubIssueCreationResult(
+            GitHubIssue("alice", "widgets", 1),
+            "https://github.com/alice/widgets/issues/1",
+            "b" * 32,
+        )
+        github = mock.Mock()
+        github.inspect_repository.return_value = source
+        github.submit_issue.return_value = result
+        client = mock.Mock()
+        client.repository_roots.return_value = [checkout]
+        client.resolve_repository.return_value = (checkout, [checkout])
+        client.ensure_agent.return_value = AgentSelection(
+            "agent",
+            "pane",
+            "workspace",
+            str(checkout),
+            "agent",
+            str(checkout),
+            provider="cursor/herdr",
+            provider_session_id="test-session",
+            state_sequence=7,
+        )
+        configure_tiered_outcomes(client, checkout)
+
+        with (
+            mock.patch.object(jobs, "GitHubClient", return_value=github),
+            mock.patch.object(jobs, "HerdrClient", return_value=client),
+        ):
+            service.run_worker("123456789abc")
+
+        updated = jobs.read_job("123456789abc")
+        self.assertEqual(updated["github_issue_created_number"], 1)
+        self.assertEqual(updated["github_issue_create_operation_state"], "created")
+        self.assertIsNotNone(updated.get("workflow_tier"))
+        github.submit_issue.assert_called_once()
+        self.assertTrue(github.submit_issue.call_args.kwargs["confirmed"])
+        client.ensure_agent.assert_called()
+
+    def test_file_as_issue_one_no_skips_create_and_continues_workflow(self) -> None:
+        checkout = Path("/home/test/src/widgets")
+        jobs.write_job(
+            {
+                "id": "123456789abc",
+                "request": "create me a SaaS called widgets",
+                "trusted_utterance": "create me a SaaS called widgets",
+                "github_repository": "alice/widgets",
+                "github_repo_create_requested": True,
+                "github_repo_create_continue_workflow": True,
+                "github_repo_create_operation_state": "created",
+                "github_repo_create_visibility": "private",
+                "github_repo_create_marker": "a" * 32,
+                "github_repo_created_url": "https://github.com/alice/widgets",
+                "repository": str(checkout),
+                "github_issue_create_title": "create me a SaaS called widgets",
+                "github_issue_create_body": "create me a SaaS called widgets",
+                "github_issue_create_marker": "b" * 32,
+                "github_issue_create_operation_state": "planned",
+                "status": "queued",
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        github = mock.Mock()
+        client = mock.Mock()
+        client.repository_roots.return_value = [checkout]
+        client.resolve_repository.return_value = (checkout, [checkout])
+        client.ensure_agent.return_value = AgentSelection(
+            "agent",
+            "pane",
+            "workspace",
+            str(checkout),
+            "agent",
+            str(checkout),
+            provider="cursor/herdr",
+            provider_session_id="test-session",
+            state_sequence=7,
+        )
+        configure_tiered_outcomes(client, checkout)
+
+        with (
+            mock.patch.object(jobs, "GitHubClient", return_value=github),
+            mock.patch.object(jobs, "HerdrClient", return_value=client),
+        ):
+            service.run_worker("123456789abc")
+
+        updated = jobs.read_job("123456789abc")
+        self.assertIsNone(updated.get("github_issue_created_number"))
+        self.assertIsNotNone(updated.get("workflow_tier"))
+        github.submit_issue.assert_not_called()
         client.ensure_agent.assert_called()
 
     def test_parse_voice_clone_source_accepts_url_and_owner_repo(self) -> None:

@@ -302,6 +302,7 @@ def _queue_answer(
     fork_confirmed: bool | None = None,
     clone_confirmed: bool | None = None,
     github_issue_create_confirmed: bool | None = None,
+    github_issue_create_requested: bool | None = None,
     github_repo_create_confirmed: bool | None = None,
     github_repo_create_continue_workflow: bool | None = None,
     github_repo_create_owner: str | None = None,
@@ -337,6 +338,11 @@ def _queue_answer(
             job.github_issue_create_confirmed
             if github_issue_create_confirmed is None
             else github_issue_create_confirmed
+        ),
+        github_issue_create_requested=(
+            job.github_issue_create_requested
+            if github_issue_create_requested is None
+            else github_issue_create_requested
         ),
         github_repo_create_confirmed=(
             job.github_repo_create_confirmed
@@ -758,6 +764,54 @@ def _clone_confirmation_answer(
         ),
     )
     return AnswerTransition(completed)
+
+
+def _github_issue_file_as_one_answer(
+    job: CursorJob,
+    question: Question,
+    resolution: AnswerResolution,
+    context: AnswerContext,
+) -> AnswerTransition:
+    if context.trusted_text is None:
+        return AnswerTransition(
+            None,
+            message="Please answer directly. File this as issue 1?",
+        )
+    confirmation = _confirmation(
+        context.trusted_text,
+        confirmations=_FORK_CONFIRMATIONS | {"create the issue", "file it"},
+        rejections=_FORK_REJECTIONS,
+    )
+    if confirmation is None:
+        return AnswerTransition(
+            None,
+            message="Please answer yes or no. File this as issue 1?",
+        )
+    if confirmation:
+        return AnswerTransition(
+            _queue_answer(
+                job,
+                question,
+                resolution,
+                context,
+                continuation=False,
+                clear_target=True,
+                github_issue_create_requested=True,
+                github_issue_create_confirmed=True,
+            ),
+            launch=True,
+        )
+    return AnswerTransition(
+        _queue_answer(
+            job,
+            question,
+            resolution,
+            context,
+            continuation=False,
+            clear_target=True,
+        ),
+        launch=True,
+    )
 
 
 def _github_issue_create_confirmation_answer(
@@ -1354,6 +1408,7 @@ _ANSWER_HANDLERS: dict[str, AnswerHandler] = {
     "fork_confirmation": _fork_confirmation_answer,
     "clone_confirmation": _clone_confirmation_answer,
     "github_issue_create_confirmation": _github_issue_create_confirmation_answer,
+    "github_issue_file_as_one": _github_issue_file_as_one_answer,
     "github_repo_create_org": _github_repo_create_org_answer,
     "github_repo_create_slug": _github_repo_create_slug_answer,
     "github_repo_create_confirmation": _github_repo_create_confirmation_answer,
