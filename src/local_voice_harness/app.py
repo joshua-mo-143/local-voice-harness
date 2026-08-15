@@ -30,6 +30,7 @@ from .cursor import consultation as cursor_consultation
 from .cursor import provisioning as cursor_provisioning
 from .cursor import questions as cursor_questions
 from .diagnostics.health import self_health_response
+from .diagnostics.help import harness_help_response
 from .errors import HarnessError, SpeechDeliveryError
 from .github_issue_creation import repository_from_utterance
 from .integrations.registry import IntegrationRegistry, build_integration_registry
@@ -305,6 +306,8 @@ def respond(text: str, *, user_config: UserConfig | None = None) -> None:
                 )
             elif route.actionable and route.intent == Intent.SELF_HEALTH:
                 response = self_health_response()
+            elif route.actionable and route.intent == Intent.HARNESS_HELP:
+                response = harness_help_response()
             elif missing_ticket_scope:
                 response = MISSING_ISSUE_SCOPE_RESPONSE
             elif route.actionable and route.intent == Intent.QUESTION_CONSULTATION:

@@ -29,6 +29,7 @@ from local_voice_harness.cursor.delivery import DeliveryClaim
 from local_voice_harness.cursor.model import CursorJob, JobStatus
 from local_voice_harness.cursor.service import CursorTurnRequest
 from local_voice_harness.cursor.store import JobStore
+from local_voice_harness.diagnostics.help import harness_help_response
 from local_voice_harness.errors import HarnessError, NoSpeechError, SpeechDeliveryError
 from local_voice_harness.integrations.registry import build_integration_registry
 from local_voice_harness.intent import Intent, IntentRoute
@@ -510,6 +511,125 @@ class ProcessUtteranceTests(unittest.TestCase):
 
         health_response.assert_called_once_with()
         request_context.assert_not_called()
+        cursor_turn.assert_not_called()
+        qwen_turn.assert_not_called()
+        play.assert_called_once_with(response)
+
+    def test_harness_help_route_skips_context_cursor_conversation_and_writes(
+        self,
+    ) -> None:
+        daemon = _bare_daemon()
+        response = harness_help_response()
+        with (
+            mock.patch.object(
+                wake_daemon,
+                "transcribe",
+                return_value="What can you do?",
+            ),
+            mock.patch.object(wake_daemon, "start_components"),
+            mock.patch.object(
+                wake_daemon,
+                "route_intent",
+                return_value=IntentRoute(Intent.HARNESS_HELP, "high"),
+            ),
+            mock.patch.object(wake_daemon, "request_context") as request_context,
+            mock.patch.object(
+                wake_daemon,
+                "harness_help_response",
+                return_value=response,
+            ) as help_response,
+            mock.patch.object(wake_daemon, "commit_pending_change") as commit,
+            mock.patch.object(wake_daemon, "cursor_turn") as cursor_turn,
+            mock.patch.object(wake_daemon, "qwen_turn") as qwen_turn,
+            mock.patch.object(
+                daemon,
+                "play_response",
+                return_value=({"played_text": response.spoken_text}, None),
+            ) as play,
+            mock.patch.object(wake_daemon, "notify"),
+        ):
+            daemon.process_utterance(AUDIO_GENERATION, woke=False)
+
+        help_response.assert_called_once_with()
+        request_context.assert_not_called()
+        commit.assert_not_called()
+        cursor_turn.assert_not_called()
+        qwen_turn.assert_not_called()
+        play.assert_called_once_with(response)
+        self.assertEqual(daemon.last_ordinary_reply, response.spoken_text)
+        self.assertNotIn(Intent.HARNESS_HELP, wake_daemon.SIDE_EFFECTING_INTENTS)
+
+    def test_harness_help_does_not_answer_a_pending_job_question(self) -> None:
+        daemon = _bare_daemon()
+        daemon.cursor_session = "oldjob123456"
+        response = harness_help_response()
+        with (
+            mock.patch.object(
+                wake_daemon,
+                "transcribe",
+                return_value="What can you do?",
+            ),
+            mock.patch.object(wake_daemon, "start_components"),
+            mock.patch.object(
+                daemon,
+                "_pending_cursor_question",
+                return_value=_pending_choice_snapshot(),
+            ),
+            mock.patch.object(
+                wake_daemon,
+                "route_intent",
+                return_value=IntentRoute(Intent.HARNESS_HELP, "high"),
+            ),
+            mock.patch.object(wake_daemon, "request_context") as request_context,
+            mock.patch.object(wake_daemon, "cursor_turn") as cursor_turn,
+            mock.patch.object(wake_daemon, "qwen_turn") as qwen_turn,
+            mock.patch.object(
+                daemon,
+                "play_response",
+                return_value=({"played_text": response.spoken_text}, None),
+            ) as play,
+            mock.patch.object(wake_daemon, "notify"),
+        ):
+            daemon.process_utterance(AUDIO_GENERATION, woke=False)
+
+        request_context.assert_not_called()
+        cursor_turn.assert_not_called()
+        qwen_turn.assert_not_called()
+        play.assert_called_once_with(response)
+        self.assertEqual(daemon.cursor_session, "oldjob123456")
+
+    def test_harness_help_is_not_rewritten_to_a_pending_choice_answer(self) -> None:
+        daemon = _bare_daemon()
+        daemon.cursor_session = "oldjob123456"
+        response = harness_help_response()
+        with (
+            mock.patch.object(
+                wake_daemon,
+                "transcribe",
+                return_value="option two",
+            ),
+            mock.patch.object(wake_daemon, "start_components"),
+            mock.patch.object(
+                daemon,
+                "_pending_cursor_question",
+                return_value=_pending_choice_snapshot(),
+            ),
+            mock.patch.object(
+                wake_daemon,
+                "route_intent",
+                return_value=IntentRoute(Intent.HARNESS_HELP, "high"),
+            ),
+            mock.patch.object(wake_daemon, "cursor_turn") as cursor_turn,
+            mock.patch.object(wake_daemon, "qwen_turn") as qwen_turn,
+            mock.patch.object(
+                daemon,
+                "play_response",
+                return_value=({"played_text": response.spoken_text}, None),
+            ) as play,
+            mock.patch.object(wake_daemon, "notify"),
+        ):
+            daemon.process_utterance(AUDIO_GENERATION, woke=False)
+
         cursor_turn.assert_not_called()
         qwen_turn.assert_not_called()
         play.assert_called_once_with(response)
@@ -4305,6 +4425,22 @@ class ConfigChangeConversationTests(unittest.TestCase):
         self.assertIsNone(daemon.pending_config_change)
         response = calls["play"].call_args.args[0]
         self.assertIn("Nothing was written", response.spoken_text)
+
+    def test_help_does_not_commit_pending_config_change(self) -> None:
+        daemon = _bare_daemon()
+        pending = _pending_config()
+        daemon.pending_config_change = pending
+
+        calls = self._run_turn(
+            daemon,
+            "What can you do?",
+            route=IntentRoute(Intent.HARNESS_HELP, "high"),
+        )
+
+        calls["commit"].assert_not_called()
+        calls["cursor"].assert_not_called()
+        calls["qwen"].assert_not_called()
+        calls["play"].assert_called_once_with(harness_help_response())
 
     def test_ambiguous_confirmation_keeps_pending_and_asks_again(self) -> None:
         daemon = _bare_daemon()

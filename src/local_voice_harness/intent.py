@@ -71,6 +71,12 @@ ROUTER_SYSTEM_PROMPT = (
     "Use self_health only when the user explicitly asks whether the local voice harness "
     "itself is healthy, working, or having problems. Do not use self_health for code, "
     "repository, service-provider, personal, or general system health questions. "
+    "Use harness_help when the user asks what the voice harness can do, what they can "
+    "say, or asks for a recap of available voice commands, including bare requests "
+    "such as 'help', 'what can you do?', or 'what can I say?'. Prefer harness_help "
+    "over conversation and over cursor_reply or confirming a pending write. Do not "
+    "use harness_help when the user asks for help with a specific task such as "
+    "fixing code, filing a ticket, or changing a setting. "
     "Use end_conversation when the user signals the exchange is over and nothing "
     "further is needed, for example saying goodbye, thanking you with no new "
     "request, answering that there is nothing else, or replying with only a short "
@@ -124,6 +130,7 @@ ROUTE_TOOL = {
                         "harness_config_inspect",
                         "harness_config_change",
                         "self_health",
+                        "harness_help",
                         "question_consultation",
                         "conversation_continue",
                         "workspace_consultation",
@@ -172,6 +179,7 @@ class Intent(StrEnum):
     HARNESS_CONFIG_INSPECT = "harness_config_inspect"
     HARNESS_CONFIG_CHANGE = "harness_config_change"
     SELF_HEALTH = "self_health"
+    HARNESS_HELP = "harness_help"
     QUESTION_CONSULTATION = "question_consultation"
     CONVERSATION_CONTINUE = "conversation_continue"
     WORKSPACE_CONSULTATION = "workspace_consultation"
