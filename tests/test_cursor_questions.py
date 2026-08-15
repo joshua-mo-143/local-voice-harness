@@ -882,6 +882,7 @@ def test_protected_answer_requires_explicit_request_provenance(
             )
         )
     launch.assert_not_called()
+    assert rejected.mutated is False
     assert "direct user answer" in as_assistant_response(rejected.text).display_text
     assert store.get("aaaaaaaaaaaa").status == JobStatus.AWAITING_USER
 

@@ -1453,8 +1453,13 @@ class WakeConversationDaemon:
             self._mark_last_transcript_dispatched()
 
         guarded_request = replace(request, on_job_started=mutation_started)
-        response, session = cursor_turn(guarded_request, **kwargs)
-        if request.action in {"cancel", "dismiss", "repeat"}:
+        result = cursor_turn(guarded_request, **kwargs)
+        response, session = result[0], result[1]
+        if getattr(result, "mutated", False) or request.action in {
+            "cancel",
+            "dismiss",
+            "repeat",
+        }:
             # These synchronous operations return only after their durable update.
             self._mark_last_transcript_dispatched()
         return response, session
@@ -3176,7 +3181,7 @@ class WakeConversationDaemon:
                     response = cursor_consultation.CONSULTATION_FAILED
                     ordinary_reply = True
             elif route.actionable and route.intent == Intent.AGENT_LIST:
-                response, next_cursor_session = cursor_turn(
+                listed = cursor_turn(
                     CursorTurnRequest(
                         "",
                         self.cursor_session,
@@ -3185,8 +3190,9 @@ class WakeConversationDaemon:
                     delivery_claims=delivery_claims,
                     integrations=self.integrations,
                 )
+                response, next_cursor_session = listed[0], listed[1]
             elif route.actionable and route.intent == Intent.ANNOUNCEMENT_DIGEST:
-                response, next_cursor_session = cursor_turn(
+                missed = cursor_turn(
                     CursorTurnRequest(
                         "",
                         self.cursor_session,
@@ -3195,6 +3201,7 @@ class WakeConversationDaemon:
                     delivery_claims=delivery_claims,
                     integrations=self.integrations,
                 )
+                response, next_cursor_session = missed[0], missed[1]
             elif route.actionable and route.intent == Intent.AGENT_CANCEL:
                 response, next_cursor_session = self._dispatch_cursor_turn(
                     CursorTurnRequest(
@@ -3208,7 +3215,7 @@ class WakeConversationDaemon:
                     integrations=self.integrations,
                 )
             elif route.actionable and route.intent == Intent.AGENT_STATUS:
-                response, next_cursor_session = cursor_turn(
+                statused = cursor_turn(
                     CursorTurnRequest(
                         text,
                         self.cursor_session,
@@ -3219,6 +3226,7 @@ class WakeConversationDaemon:
                     delivery_claims=delivery_claims,
                     integrations=self.integrations,
                 )
+                response, next_cursor_session = statused[0], statused[1]
             elif route.actionable and route.intent in {
                 Intent.AGENT_DISMISS,
                 Intent.AGENT_REPEAT,

@@ -8114,6 +8114,49 @@ class LastTranscriptReplayTests(unittest.TestCase):
         self.assertEqual(daemon.last_transcript.utterance, "fix the failing tests")
         self.assertFalse(daemon.last_transcript.dispatched)
 
+    def test_refused_reply_result_does_not_mark_transcript_dispatched(self) -> None:
+        from local_voice_harness.cursor.service import CursorTurnResult
+
+        daemon = _bare_daemon()
+        daemon.last_transcript = wake_daemon.LastTranscript(
+            "fix the failing tests",
+            dispatched=False,
+            expires_at=time.monotonic() + 30,
+        )
+        pending = replace(_pending_free_text_snapshot(), job_id="aaaaaaaaaaaa")
+        daemon.cursor_session = "aaaaaaaaaaaa"
+        with (
+            mock.patch.object(
+                wake_daemon, "transcribe", return_value="continue with sqlite"
+            ),
+            mock.patch.object(wake_daemon, "start_components"),
+            mock.patch.object(
+                wake_daemon,
+                "route_intent",
+                return_value=IntentRoute(Intent.AGENT_REPLY, "high"),
+            ),
+            mock.patch.object(daemon, "_pending_cursor_question", return_value=pending),
+            mock.patch.object(
+                wake_daemon,
+                "cursor_turn",
+                return_value=CursorTurnResult(
+                    "That answer belongs to an older question, so I did not use it.",
+                    "aaaaaaaaaaaa",
+                    mutated=False,
+                ),
+            ),
+            mock.patch.object(
+                daemon,
+                "play_response",
+                return_value=({"played_text": "refused"}, None),
+            ),
+            mock.patch.object(wake_daemon, "notify"),
+        ):
+            daemon.process_utterance(AUDIO_GENERATION, woke=False)
+
+        assert daemon.last_transcript is not None
+        self.assertEqual(daemon.last_transcript.utterance, "fix the failing tests")
+        self.assertFalse(daemon.last_transcript.dispatched)
 
 class FocusedContextInspectTests(unittest.TestCase):
     def test_inspect_speaks_identity_without_bodies(self) -> None:

@@ -55,7 +55,8 @@ def test_service_request_and_result_types_are_explicit() -> None:
 
     assert start.repository == "project"
     assert turn.session_id == "123456789abc"
-    assert tuple(result) == ("done", None)
+    assert tuple(result) == ("done", None, False)
+    assert result.mutated is False
 
 
 def test_waiting_job_cancellation_releases_without_worker_launch(
@@ -1401,7 +1402,9 @@ def test_immediate_next_question_suppresses_continuation_ack_and_retries_deliver
         continuation=True,
     )
 
-    assert result == CursorTurnResult("Which database should I use?", job.id)
+    assert result == CursorTurnResult(
+        "Which database should I use?", job.id, mutated=True
+    )
     assert len(claims) == 1
     assert not store.get(job.id).delivered
 
