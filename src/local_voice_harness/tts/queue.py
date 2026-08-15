@@ -19,7 +19,7 @@ from pathlib import Path
 from ..errors import HarnessError
 from ..ipc import unix_request
 from ..user_config import AudioSettings, default_user_config
-from .client import playback_slot
+from .client import playback_command, playback_slot
 from .stream import STREAM_POLL_SECONDS, STREAM_TIMEOUT_SECONDS, TTSStreamParser
 
 PREFETCH_JOIN_SECONDS = 3.0
@@ -364,18 +364,14 @@ def _open_playback(
     sample_rate: int, settings: AudioSettings | None = None
 ) -> subprocess.Popen[bytes]:
     audio = settings or default_user_config().audio
-    command = ["pw-play"]
-    if audio.sink:
-        command.extend(("--target", audio.sink))
-    command.extend(
-        (
-            "--raw",
-            "--channels=1",
-            f"--rate={sample_rate}",
-            "--format=s16",
-            f"--latency={audio.playback_latency}",
-            "-",
-        )
+    command = playback_command(
+        audio,
+        "--raw",
+        "--channels=1",
+        f"--rate={sample_rate}",
+        "--format=s16",
+        f"--latency={audio.playback_latency}",
+        "-",
     )
     return subprocess.Popen(
         command,

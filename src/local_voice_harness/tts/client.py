@@ -66,6 +66,14 @@ def playback_slot() -> Iterator[None]:
             fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
 
 
+def playback_command(audio: AudioSettings, *arguments: str) -> list[str]:
+    command = ["pw-play"]
+    if audio.sink:
+        command.extend(("--target", audio.sink))
+    command.extend(arguments)
+    return command
+
+
 def synthesize_and_play(
     text: str, settings: AudioSettings | None = None
 ) -> dict[str, object]:
@@ -106,7 +114,7 @@ def synthesize_and_play(
         )
         print(json.dumps(result))
         with playback_slot():
-            subprocess.run(["pw-play", str(output)], check=True)
+            subprocess.run(playback_command(audio, str(output)), check=True)
         return result
     finally:
         output.unlink(missing_ok=True)
@@ -170,18 +178,14 @@ class StreamingPlayback:
                 stream_socket.shutdown(socket.SHUT_RDWR)
 
     def _open_playback(self, sample_rate: int) -> subprocess.Popen[bytes]:
-        command = ["pw-play"]
-        if self.audio.sink:
-            command.extend(("--target", self.audio.sink))
-        command.extend(
-            (
-                "--raw",
-                "--channels=1",
-                f"--rate={sample_rate}",
-                "--format=s16",
-                f"--latency={self.audio.playback_latency}",
-                "-",
-            )
+        command = playback_command(
+            self.audio,
+            "--raw",
+            "--channels=1",
+            f"--rate={sample_rate}",
+            "--format=s16",
+            f"--latency={self.audio.playback_latency}",
+            "-",
         )
         process = subprocess.Popen(
             command,
