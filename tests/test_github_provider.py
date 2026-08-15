@@ -16,6 +16,8 @@ from local_voice_harness.integrations.github import (
     GitHubPullRequest,
     GitHubPullRequestCheckoutInputs,
     GitHubPullRequestPlan,
+    GitHubRepoCreationPlan,
+    GitHubRepoCreationResult,
     GitHubRepository,
     dump_github_provider_state,
     load_github_provider_state,
@@ -230,6 +232,47 @@ class GitHubProviderTests(unittest.TestCase):
         self.assertRegex(first.correlation_marker, r"^[0-9a-f]{32}$")
         self.assertRegex(second.correlation_marker, r"^[0-9a-f]{32}$")
         self.assertNotEqual(first.correlation_marker, second.correlation_marker)
+
+    def test_provider_plans_observes_and_submits_repo_creation(self) -> None:
+        created = GitHubRepoCreationResult(
+            GitHubRepository(
+                "alice/payments",
+                "https://github.com/alice/payments",
+                True,
+                "main",
+            ),
+            "https://github.com/alice/payments",
+            "a" * 32,
+        )
+        self.client.observe_repository_creation.return_value = None
+        self.client.submit_repository_creation.return_value = created
+
+        plan = self.provider.plan_repository_creation(
+            " alice ",
+            " payments ",
+            "private",
+            correlation_marker="a" * 32,
+        )
+
+        self.assertEqual(
+            plan,
+            GitHubRepoCreationPlan("alice", "payments", "private", "a" * 32),
+        )
+        self.assertIsNone(self.provider.observe_repository_creation(plan))
+        self.assertEqual(
+            self.provider.submit_repository_creation(plan, confirmed=True),
+            created,
+        )
+        self.client.observe_repository_creation.assert_called_once_with(plan)
+        self.client.submit_repository_creation.assert_called_once_with(
+            plan, confirmed=True
+        )
+
+    def test_provider_requires_confirmation_before_repo_submission(self) -> None:
+        plan = GitHubRepoCreationPlan("alice", "payments", "private", "a" * 32)
+        with self.assertRaisesRegex(GitHubError, "confirmation"):
+            self.provider.submit_repository_creation(plan, confirmed=False)
+        self.client.submit_repository_creation.assert_not_called()
 
     def test_provider_requires_confirmation_before_issue_submission(self) -> None:
         plan = GitHubIssueCreationPlan("example/project", "Title", "Body", "a" * 32)

@@ -206,6 +206,8 @@ _BOOL_FIELDS = frozenset(
         "fork_dispatch_exited",
         "github_issue_create_requested",
         "github_issue_create_confirmed",
+        "github_repo_create_requested",
+        "github_repo_create_confirmed",
         "linear_ticket_create_requested",
         "linear_ticket_create_confirmed",
         "fork_operation_source_private",
@@ -312,6 +314,10 @@ _STRING_FIELDS = frozenset(
         "github_issue_create_marker",
         "github_issue_create_operation_state",
         "github_issue_created_url",
+        "github_repo_create_visibility",
+        "github_repo_create_marker",
+        "github_repo_create_operation_state",
+        "github_repo_created_url",
         "linear_ticket_create_team",
         "linear_ticket_create_team_id",
         "linear_ticket_create_title",
@@ -507,6 +513,7 @@ class NewAgentJob:
     github_issue_create_title: str | None = None
     github_issue_create_body: str | None = None
     github_issue_create_marker: str | None = None
+    github_repo_create_requested: bool = False
     linear_ticket_create_requested: bool = False
     linear_ticket_create_team: str | None = None
     linear_ticket_create_team_id: str | None = None
@@ -2013,6 +2020,7 @@ class AgentJob:
                 "github_issue_create_title": spec.github_issue_create_title,
                 "github_issue_create_body": spec.github_issue_create_body,
                 "github_issue_create_marker": spec.github_issue_create_marker,
+                "github_repo_create_requested": spec.github_repo_create_requested,
                 "linear_ticket_create_requested": spec.linear_ticket_create_requested,
                 "linear_ticket_create_team": spec.linear_ticket_create_team,
                 "linear_ticket_create_team_id": spec.linear_ticket_create_team_id,
@@ -2570,6 +2578,30 @@ class AgentJob:
         if not self.github_issue_create_requested:
             return None
         return self.github_issue_url
+
+    @property
+    def github_repo_create_requested(self) -> bool:
+        return self._boolean_field("github_repo_create_requested")
+
+    @property
+    def github_repo_create_confirmed(self) -> bool:
+        return self._boolean_field("github_repo_create_confirmed")
+
+    @property
+    def github_repo_create_visibility(self) -> str | None:
+        return self._optional_string("github_repo_create_visibility")
+
+    @property
+    def github_repo_create_marker(self) -> str | None:
+        return self._optional_string("github_repo_create_marker")
+
+    @property
+    def github_repo_create_operation_state(self) -> str | None:
+        return self._optional_string("github_repo_create_operation_state")
+
+    @property
+    def github_repo_created_url(self) -> str | None:
+        return self._optional_string("github_repo_created_url")
 
     @property
     def linear_ticket_create_requested(self) -> bool:
@@ -3905,6 +3937,31 @@ class AgentJob:
             raise JobValidationError(
                 "GitHub issue creation confirmation requires a creation request"
             )
+        if (
+            self.github_repo_create_operation_state is not None
+            and self.github_repo_create_operation_state
+            not in _ISSUE_CREATE_OPERATION_STATES
+        ):
+            raise JobValidationError("github_repo_create_operation_state is invalid")
+        if self.github_repo_create_confirmed and not self.github_repo_create_requested:
+            raise JobValidationError(
+                "GitHub repository creation confirmation requires a creation request"
+            )
+        if self.github_repo_create_visibility is not None and (
+            self.github_repo_create_visibility not in {"private", "public"}
+        ):
+            raise JobValidationError("github_repo_create_visibility is invalid")
+        if self.github_repo_create_operation_state is not None and not all(
+            (
+                self.github_repository,
+                self.github_repo_create_visibility,
+                self.github_repo_create_marker,
+            )
+        ):
+            raise JobValidationError(
+                "GitHub repository creation operation requires repository, "
+                "visibility, and marker"
+            )
         if self.github_issue_create_operation_state is not None and not all(
             (
                 self.github_repository,
@@ -3965,6 +4022,7 @@ class AgentJob:
             self.issue_provider == "github"
             and self.github_issue is None
             and not self.github_issue_create_requested
+            and not self.github_repo_create_requested
         ):
             raise JobValidationError(
                 "github issue_provider requires a GitHub issue identity"
@@ -4387,6 +4445,7 @@ class AgentJob:
             or self.worktree_provision_state in _UNCERTAIN_OPERATION_STATES
             or self.github_issue_create_operation_state in {"submitted", "ambiguous"}
             or self.clone_operation_state in {"submitted", "ambiguous"}
+            or self.github_repo_create_operation_state in {"submitted", "ambiguous"}
             or self.linear_ticket_create_operation_state
             in {"submitting", "submitted", "ambiguous"}
             or self.prompt_operation_state in {"submitting", "ambiguous"}

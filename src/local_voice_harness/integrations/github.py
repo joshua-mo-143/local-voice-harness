@@ -235,6 +235,25 @@ class GitHubIssueCreationResult:
 
 
 @dataclass(frozen=True)
+class GitHubRepoCreationPlan:
+    owner: str
+    slug: str
+    visibility: str
+    correlation_marker: str
+
+    @property
+    def name_with_owner(self) -> str:
+        return f"{self.owner}/{self.slug}"
+
+
+@dataclass(frozen=True)
+class GitHubRepoCreationResult:
+    repository: GitHubRepository
+    url: str
+    correlation_marker: str
+
+
+@dataclass(frozen=True)
 class GitHubPullRequest:
     owner: str
     repository: str
@@ -568,6 +587,139 @@ class GitHubClient:
         source = self._repo_view(self.validate_repository(repository), required=True)
         assert source is not None
         return source
+
+    def lookup_repository(self, repository: str) -> GitHubRepository | None:
+        return self._repo_view(self.validate_repository(repository), required=False)
+
+    @staticmethod
+    def validate_repo_creation_plan(plan: GitHubRepoCreationPlan) -> None:
+        if not isinstance(plan.owner, str) or not plan.owner.strip():
+            raise GitHubError("GitHub repository owner must be text")
+        if not isinstance(plan.slug, str) or not plan.slug.strip():
+            raise GitHubError("GitHub repository slug must be text")
+        GitHubClient.validate_repository(plan.name_with_owner)
+        if plan.visibility not in {"private", "public"}:
+            raise GitHubError("GitHub repository visibility must be private or public")
+        if (
+            not isinstance(plan.correlation_marker, str)
+            or ISSUE_CORRELATION_MARKER.fullmatch(plan.correlation_marker) is None
+        ):
+            raise GitHubError(
+                "GitHub repository correlation marker must be 32 lowercase hex characters"
+            )
+
+    @staticmethod
+    def _repo_marker(correlation_marker: str) -> str:
+        return f"local-voice-harness-correlation:{correlation_marker}"
+
+    def plan_repository_creation(
+        self,
+        owner: str,
+        slug: str,
+        visibility: str,
+        *,
+        correlation_marker: str | None = None,
+    ) -> GitHubRepoCreationPlan:
+        plan = GitHubRepoCreationPlan(
+            owner=owner.strip(),
+            slug=slug.strip(),
+            visibility=visibility,
+            correlation_marker=correlation_marker or secrets.token_hex(16),
+        )
+        self.validate_repo_creation_plan(plan)
+        return plan
+
+    def observe_repository_creation(
+        self, plan: GitHubRepoCreationPlan
+    ) -> GitHubRepoCreationResult | None:
+        self.validate_repo_creation_plan(plan)
+        process = self._run(
+            [
+                self.gh_executable,
+                "repo",
+                "view",
+                plan.name_with_owner,
+                "--json",
+                "nameWithOwner,url,isPrivate,description",
+            ],
+            timeout=15,
+            check=False,
+        )
+        if process.returncode:
+            detail = (process.stderr.strip() or process.stdout.strip()).casefold()
+            if any(
+                marker in detail
+                for marker in (
+                    "could not resolve to a repository",
+                    "repository not found",
+                    "http 404",
+                    "status 404",
+                )
+            ):
+                return None
+            raise GitHubError(
+                detail or f"could not determine whether {plan.name_with_owner} exists"
+            )
+        try:
+            value = json.loads(process.stdout)
+        except json.JSONDecodeError as exc:
+            raise GitHubError("GitHub returned malformed repository metadata") from exc
+        if not isinstance(value, dict):
+            raise GitHubError("GitHub returned malformed repository metadata")
+        description = str(value.get("description") or "")
+        if self._repo_marker(plan.correlation_marker) not in description:
+            return None
+        name = self.validate_repository(str(value.get("nameWithOwner") or ""))
+        if name.casefold() != plan.name_with_owner.casefold():
+            raise GitHubError("GitHub created a repository with an unexpected name")
+        source = GitHubRepository(
+            name_with_owner=name,
+            url=str(value.get("url") or f"https://github.com/{name}"),
+            is_private=bool(value.get("isPrivate")),
+            default_branch="",
+        )
+        expected_private = plan.visibility == "private"
+        if source.is_private != expected_private:
+            raise GitHubError("GitHub created a repository with unexpected visibility")
+        return GitHubRepoCreationResult(
+            source,
+            source.url,
+            plan.correlation_marker,
+        )
+
+    def submit_repository_creation(
+        self,
+        plan: GitHubRepoCreationPlan,
+        *,
+        confirmed: bool,
+    ) -> GitHubRepoCreationResult:
+        if not confirmed:
+            raise GitHubError(
+                "GitHub repository creation requires explicit confirmation"
+            )
+        self.validate_repo_creation_plan(plan)
+        visibility_flag = "--private" if plan.visibility == "private" else "--public"
+        self._run(
+            [
+                self.gh_executable,
+                "repo",
+                "create",
+                plan.name_with_owner,
+                visibility_flag,
+                "--description",
+                self._repo_marker(plan.correlation_marker),
+                "--clone=false",
+            ],
+            timeout=60,
+            write=True,
+        )
+        result = self.observe_repository_creation(plan)
+        if result is None:
+            raise GitHubOperationAmbiguous(
+                "GitHub write completed without a provable repository result; "
+                "an external side effect may already have occurred"
+            )
+        return result
 
     def issue_details(self, issue: GitHubIssue) -> dict[str, object]:
         if issue.number <= 0:
@@ -1240,6 +1392,14 @@ _GITHUB_STATE_SECTIONS: dict[str, dict[str, str]] = {
         "created_number": "github_issue_created_number",
         "created_url": "github_issue_created_url",
     },
+    "repo_creation": {
+        "requested": "github_repo_create_requested",
+        "confirmed": "github_repo_create_confirmed",
+        "visibility": "github_repo_create_visibility",
+        "marker": "github_repo_create_marker",
+        "operation_state": "github_repo_create_operation_state",
+        "created_url": "github_repo_created_url",
+    },
     "pull_request": {
         "number": "github_pull_request",
         "worktree_state": "pull_request_worktree_state",
@@ -1450,6 +1610,47 @@ class GitHubProvider:
         confirmed: bool,
     ) -> GitHubIssueCreationResult:
         return self.submit_issue(plan, confirmed=confirmed)
+
+    def plan_repository_creation(
+        self,
+        owner: str,
+        slug: str,
+        visibility: str,
+        *,
+        correlation_marker: str | None = None,
+    ) -> GitHubRepoCreationPlan:
+        plan = GitHubRepoCreationPlan(
+            owner=owner.strip(),
+            slug=slug.strip(),
+            visibility=visibility,
+            correlation_marker=correlation_marker or secrets.token_hex(16),
+        )
+        GitHubClient.validate_repo_creation_plan(plan)
+        return plan
+
+    def authenticated_login(self) -> str:
+        return self._client.authenticated_login()
+
+    def lookup_repository(self, repository: str) -> GitHubRepository | None:
+        return self._client.lookup_repository(repository)
+
+    def observe_repository_creation(
+        self, plan: GitHubRepoCreationPlan
+    ) -> GitHubRepoCreationResult | None:
+        return self._client.observe_repository_creation(plan)
+
+    def submit_repository_creation(
+        self,
+        plan: GitHubRepoCreationPlan,
+        *,
+        confirmed: bool,
+    ) -> GitHubRepoCreationResult:
+        if not confirmed:
+            raise GitHubError(
+                "GitHub repository creation requires explicit confirmation"
+            )
+        GitHubClient.validate_repo_creation_plan(plan)
+        return self._client.submit_repository_creation(plan, confirmed=True)
 
     def materialize_repository(
         self,

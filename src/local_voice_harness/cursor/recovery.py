@@ -724,6 +724,80 @@ def reconcile_uncertain_clone(
     store.update(job.id, reconciled)
 
 
+def reconcile_uncertain_repo_creation(
+    store: JobStore,
+    job: CursorJob,
+    *,
+    now: float,
+    github_factory: GitHubFactory = GitHubClient,
+) -> None:
+    states = frozenset({"submitting", "submitted", "ambiguous"})
+    if job.github_repo_create_operation_state not in states:
+        return
+    repository = job.github_repository or ""
+    visibility = job.github_repo_create_visibility or ""
+    marker = job.github_repo_create_marker
+    try:
+        github = _github_provider(github_factory)
+        if "/" not in repository or not visibility or not marker:
+            result = None
+        else:
+            owner, slug = repository.split("/", 1)
+            plan = github.plan_repository_creation(
+                owner,
+                slug,
+                visibility,
+                correlation_marker=marker,
+            )
+            result = github.observe_repository_creation(plan)
+    except GitHubError:
+        result = None
+
+    def reconcile(current: CursorJob) -> CursorJob | None:
+        if current.github_repo_create_operation_state not in states:
+            return None
+        if result is None:
+            message = (
+                "GitHub repository creation could not be reconciled automatically. "
+                "Check the account before trying again."
+            )
+            return current.evolve_recovery(
+                now=now,
+                status=JobStatus.BLOCKED,
+                github_repo_create_operation_state="manual_required",
+                result=message,
+                completed_at=now,
+                reconcile=False,
+                worker_operation=None,
+                worker_pid=None,
+                worker_boot_id=None,
+                worker_process_start=None,
+                worker_token=None,
+                prepare_delivery=True,
+            )
+        return current.evolve_recovery(
+            now=now,
+            status=JobStatus.COMPLETED,
+            github_repository=result.repository.name_with_owner,
+            github_repo_created_url=result.url,
+            github_repo_create_operation_state="created",
+            result=(
+                f"Created GitHub repository {result.repository.name_with_owner}: "
+                f"{result.url}"
+            ),
+            completed_at=now,
+            reconcile=False,
+            worker_operation=None,
+            worker_pid=None,
+            worker_boot_id=None,
+            worker_process_start=None,
+            worker_token=None,
+            prepare_delivery=True,
+        )
+
+    store.update(job.id, reconcile)
+
+
 def reconcile_uncertain_linear_ticket_creation(
     store: JobStore,
     job: CursorJob,
@@ -943,6 +1017,13 @@ def reconcile_uncertain_operations(
     )
     current = store.get(job.id)
     reconcile_uncertain_clone(
+        store,
+        current,
+        now=now,
+        github_factory=github_factory,
+    )
+    current = store.get(job.id)
+    reconcile_uncertain_repo_creation(
         store,
         current,
         now=now,

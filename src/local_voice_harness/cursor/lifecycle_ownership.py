@@ -466,6 +466,12 @@ def _build_field_ownership() -> tuple[FieldOwnership, ...]:
                 "github_issue_create_operation_state": CrashKind.UNCERTAINTY,
                 "github_issue_created_number": CrashKind.IDENTITY,
                 "github_issue_created_url": CrashKind.IDENTITY,
+                "github_repo_create_requested": CrashKind.CONTENT,
+                "github_repo_create_confirmed": CrashKind.UNCERTAINTY,
+                "github_repo_create_visibility": CrashKind.CONTENT,
+                "github_repo_create_marker": CrashKind.TOKEN,
+                "github_repo_create_operation_state": CrashKind.UNCERTAINTY,
+                "github_repo_created_url": CrashKind.IDENTITY,
                 "linear_ticket_create_requested": CrashKind.CONTENT,
                 "linear_ticket_create_confirmed": CrashKind.UNCERTAINTY,
                 "linear_ticket_create_team": CrashKind.IDENTITY,
@@ -487,8 +493,10 @@ def _build_field_ownership() -> tuple[FieldOwnership, ...]:
             adapter="CursorJob.from_dict",
             callers=(
                 "cursor.provisioning._run_github_issue_creation",
+                "cursor.provisioning._run_github_repo_creation",
                 "cursor.provisioning._run_linear_ticket_creation",
                 "cursor.recovery.reconcile_uncertain_issue_creation",
+                "cursor.recovery.reconcile_uncertain_repo_creation",
                 "cursor.recovery.reconcile_uncertain_linear_ticket_creation",
             ),
         )
@@ -1114,6 +1122,12 @@ TRANSITION_ENTRY_POINTS: tuple[TransitionEntry, ...] = (
         AuthorityKind.CALLER_INTERPRETS,
     ),
     _entry(
+        "local_voice_harness.cursor.recovery.reconcile_uncertain_repo_creation",
+        "cursor.recovery",
+        "GitHub repository-create observation",
+        AuthorityKind.CALLER_INTERPRETS,
+    ),
+    _entry(
         "local_voice_harness.cursor.recovery.reconcile_uncertain_linear_ticket_creation",
         "cursor.recovery",
         "Linear ticket-create observation",
@@ -1396,12 +1410,12 @@ def measured_baseline_counts() -> dict[str, int]:
 # Measured on the #357 baseline checkout. Tests fail if these drift without an
 # intentional inventory update. They are evidence, not an optimization target.
 BASELINE_COUNTS: dict[str, int] = {
-    "persisted_field_names": 218,
-    "named_table_fields": 213,
+    "persisted_field_names": 224,
+    "named_table_fields": 219,
     "import_only_fields": 4,
-    "cursor_job_public_properties": 157,
+    "cursor_job_public_properties": 163,
     "compatibility_adapters": 38,
     "transition_entry_points": 75,
     "duplicate_authorities": 0,
-    "lifecycle_module_lines": 26733,
+    "lifecycle_module_lines": 27351,
 }

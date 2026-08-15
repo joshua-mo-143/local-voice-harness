@@ -80,6 +80,20 @@ class IntentRouterTests(LocalRouterTestCase):
         self.assertEqual(route.intent, intent.Intent.GITHUB_ISSUE_CREATE)
         self.assertTrue(route.actionable)
 
+    def test_routes_new_github_repo_creation_as_a_distinct_action(self) -> None:
+        with mock.patch.object(
+            llm_transport.urllib.request,
+            "urlopen",
+            return_value=_response("github_repo_create"),
+        ):
+            route = intent.route_intent(
+                "Create a new GitHub repository called payments",
+                RequestContext("Create a new GitHub repository called payments"),
+            )
+
+        self.assertEqual(route.intent, intent.Intent.GITHUB_REPO_CREATE)
+        self.assertTrue(route.actionable)
+
     def test_routes_new_linear_ticket_creation_as_a_distinct_action(self) -> None:
         with mock.patch.object(
             llm_transport.urllib.request,

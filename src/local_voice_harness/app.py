@@ -84,6 +84,7 @@ def _context_for_route(
         in {
             Intent.AGENT_SUBMIT,
             Intent.GITHUB_ISSUE_CREATE,
+            Intent.GITHUB_REPO_CREATE,
             Intent.LINEAR_TICKET_CREATE,
             Intent.WORKSPACE_CONSULTATION,
         }
@@ -281,6 +282,17 @@ def respond(text: str, *, user_config: UserConfig | None = None) -> None:
                     delivery_claims=delivery_claims,
                     integrations=integrations,
                 )[0]
+            elif route.actionable and route.intent == Intent.GITHUB_REPO_CREATE:
+                response = cursor_turn(
+                    CursorTurnRequest(
+                        context.text,
+                        utterance=text,
+                        github_repository=repository_from_utterance(text),
+                        github_repo_create_requested=True,
+                    ),
+                    delivery_claims=delivery_claims,
+                    integrations=integrations,
+                )[0]
             elif route.actionable and route.intent == Intent.LINEAR_TICKET_CREATE:
                 response = cursor_turn(
                     CursorTurnRequest(
@@ -386,6 +398,11 @@ def respond(text: str, *, user_config: UserConfig | None = None) -> None:
                 response = (
                     "I did not create an issue because the request was unclear. "
                     "Please name the repository and issue."
+                )
+            elif route.intent == Intent.GITHUB_REPO_CREATE:
+                response = (
+                    "I did not create a repository because the request was unclear. "
+                    "Please name the repository."
                 )
             elif route.intent == Intent.LINEAR_TICKET_CREATE:
                 response = (

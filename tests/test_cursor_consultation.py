@@ -222,6 +222,7 @@ def test_pending_consultation_revalidates_checkout_binding(tmp_path: Path) -> No
     [
         ("fork_confirmation", QuestionSensitivity.ARCHITECTURE),
         ("clone_confirmation", QuestionSensitivity.DESTRUCTIVE),
+        ("github_repo_create_confirmation", QuestionSensitivity.DESTRUCTIVE),
         ("agent", QuestionSensitivity.DESTRUCTIVE),
     ],
 )

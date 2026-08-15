@@ -18,6 +18,8 @@ from local_voice_harness.integrations.github import (
     GitHubIssueLookupReason,
     GitHubOperationAmbiguous,
     GitHubPullRequest,
+    GitHubRepoCreationPlan,
+    GitHubRepoCreationResult,
     GitHubRepository,
 )
 from local_voice_harness.local_git import LocalGitOperationAmbiguous
@@ -404,6 +406,87 @@ class GitHubClientTests(unittest.TestCase):
             client, "_run", return_value=_completed(json.dumps(payload[:1]))
         ):
             self.assertIsNone(client.observe_issue(plan))
+
+    def test_repo_creation_uses_description_marker_and_observes(self) -> None:
+        client = GitHubClient()
+        plan = GitHubRepoCreationPlan("alice", "payments", "private", "a" * 32)
+        marker = f"local-voice-harness-correlation:{'a' * 32}"
+        view = {
+            "nameWithOwner": "alice/payments",
+            "url": "https://github.com/alice/payments",
+            "isPrivate": True,
+            "description": marker,
+        }
+        with mock.patch.object(
+            client,
+            "_run",
+            side_effect=[_completed(""), _completed(json.dumps(view))],
+        ) as run:
+            result = client.submit_repository_creation(plan, confirmed=True)
+
+        self.assertEqual(
+            result,
+            GitHubRepoCreationResult(
+                GitHubRepository(
+                    "alice/payments",
+                    "https://github.com/alice/payments",
+                    True,
+                    "",
+                ),
+                "https://github.com/alice/payments",
+                "a" * 32,
+            ),
+        )
+        command = run.call_args_list[0].args[0]
+        self.assertEqual(
+            command,
+            [
+                "gh",
+                "repo",
+                "create",
+                "alice/payments",
+                "--private",
+                "--description",
+                marker,
+                "--clone=false",
+            ],
+        )
+
+    def test_repo_creation_requires_confirmation_before_running(self) -> None:
+        client = GitHubClient()
+        plan = GitHubRepoCreationPlan("alice", "payments", "private", "a" * 32)
+        with (
+            mock.patch.object(client, "_run") as run,
+            self.assertRaisesRegex(GitHubError, "confirmation"),
+        ):
+            client.submit_repository_creation(plan, confirmed=False)
+        run.assert_not_called()
+
+    def test_repo_creation_timeout_is_ambiguous(self) -> None:
+        client = GitHubClient()
+        plan = GitHubRepoCreationPlan("alice", "payments", "private", "a" * 32)
+        with (
+            mock.patch(
+                "local_voice_harness.integrations.github.run_command",
+                side_effect=subprocess.TimeoutExpired(["gh", "repo", "create"], 60),
+            ),
+            self.assertRaises(GitHubOperationAmbiguous),
+        ):
+            client.submit_repository_creation(plan, confirmed=True)
+
+    def test_repo_observation_requires_correlation_marker(self) -> None:
+        client = GitHubClient()
+        plan = GitHubRepoCreationPlan("alice", "payments", "private", "a" * 32)
+        existing = {
+            "nameWithOwner": "alice/payments",
+            "url": "https://github.com/alice/payments",
+            "isPrivate": True,
+            "description": "someone else's repo",
+        }
+        with mock.patch.object(
+            client, "_run", return_value=_completed(json.dumps(existing))
+        ):
+            self.assertIsNone(client.observe_repository_creation(plan))
 
     def test_issue_lookup_failure_is_classified_and_voice_safe(self) -> None:
         client = GitHubClient()

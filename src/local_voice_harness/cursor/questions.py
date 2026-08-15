@@ -302,6 +302,7 @@ def _queue_answer(
     fork_confirmed: bool | None = None,
     clone_confirmed: bool | None = None,
     github_issue_create_confirmed: bool | None = None,
+    github_repo_create_confirmed: bool | None = None,
     linear_ticket_create_team: str | None = None,
     linear_ticket_create_confirmed: bool | None = None,
     clear_target: bool = False,
@@ -333,6 +334,11 @@ def _queue_answer(
             job.github_issue_create_confirmed
             if github_issue_create_confirmed is None
             else github_issue_create_confirmed
+        ),
+        github_repo_create_confirmed=(
+            job.github_repo_create_confirmed
+            if github_repo_create_confirmed is None
+            else github_repo_create_confirmed
         ),
         linear_ticket_create_confirmed=(
             job.linear_ticket_create_confirmed
@@ -636,6 +642,99 @@ def _github_issue_create_confirmation_answer(
         question=None,
         clarification_kind=None,
         result="Okay, I did not create the GitHub issue.",
+        completed_at=context.now,
+        worker_pid=None,
+        worker_boot_id=None,
+        worker_process_start=None,
+        worker_token=None,
+        voice_question=envelope(
+            question,
+            QuestionState.RESOLVED,
+            job=job,
+            answer="no",
+            trusted_answer=context.trusted_text,
+            answered_at=context.now,
+        ),
+    )
+    return AnswerTransition(completed)
+
+
+def _github_repo_create_slug_answer(
+    job: CursorJob,
+    question: Question,
+    resolution: AnswerResolution,
+    context: AnswerContext,
+) -> AnswerTransition:
+    if context.trusted_text is None:
+        return AnswerTransition(
+            None,
+            message="Please name the repository directly.",
+        )
+    from .provisioning import parse_repo_create_slug
+
+    slug = parse_repo_create_slug(context.trusted_text)
+    if slug is None:
+        return AnswerTransition(
+            None,
+            message="Please say a repository name, such as payments.",
+        )
+    owner = (job.github_repository or "").split("/")[0].strip()
+    repository = f"{owner}/{slug}" if owner and "/" not in slug else slug
+    return AnswerTransition(
+        _queue_answer(
+            job,
+            question,
+            resolution,
+            context,
+            continuation=False,
+            github_repository=repository,
+            clear_target=True,
+        ),
+        launch=True,
+    )
+
+
+def _github_repo_create_confirmation_answer(
+    job: CursorJob,
+    question: Question,
+    resolution: AnswerResolution,
+    context: AnswerContext,
+) -> AnswerTransition:
+    if context.trusted_text is None:
+        return AnswerTransition(
+            None,
+            message="Please confirm directly. Should I create this GitHub repository?",
+        )
+    confirmation = _confirmation(
+        context.trusted_text,
+        confirmations=_FORK_CONFIRMATIONS
+        | {"create the repository", "create the repo"},
+        rejections=_FORK_REJECTIONS,
+    )
+    if confirmation is None:
+        return AnswerTransition(
+            None,
+            message="Please answer yes or no. Should I create this GitHub repository?",
+        )
+    if confirmation:
+        return AnswerTransition(
+            _queue_answer(
+                job,
+                question,
+                resolution,
+                context,
+                continuation=False,
+                clear_target=True,
+                github_repo_create_confirmed=True,
+            ),
+            launch=True,
+        )
+    completed = job.evolve_for_delivery(
+        now=context.now,
+        status=JobStatus.COMPLETED,
+        question=None,
+        clarification_kind=None,
+        result="Okay, I did not create the GitHub repository.",
         completed_at=context.now,
         worker_pid=None,
         worker_boot_id=None,
@@ -1056,6 +1155,8 @@ _ANSWER_HANDLERS: dict[str, AnswerHandler] = {
     "fork_confirmation": _fork_confirmation_answer,
     "clone_confirmation": _clone_confirmation_answer,
     "github_issue_create_confirmation": _github_issue_create_confirmation_answer,
+    "github_repo_create_slug": _github_repo_create_slug_answer,
+    "github_repo_create_confirmation": _github_repo_create_confirmation_answer,
     "linear_team": _linear_team_answer,
     "linear_ticket_create_confirmation": _linear_ticket_create_confirmation_answer,
     "workflow": _workflow_answer,

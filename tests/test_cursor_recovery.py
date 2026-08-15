@@ -46,6 +46,7 @@ from local_voice_harness.cursor.recovery import (
     reconcile_uncertain_fork,
     reconcile_uncertain_issue_creation,
     reconcile_uncertain_linear_ticket_creation,
+    reconcile_uncertain_repo_creation,
     recover_jobs,
     resolve_manual_reconciliation,
     stage_terminal_intent,
@@ -60,6 +61,7 @@ from local_voice_harness.integrations.github import (
     GitHubError,
     GitHubIssue,
     GitHubIssueCreationResult,
+    GitHubRepoCreationResult,
     GitHubRepository,
 )
 from local_voice_harness.integrations.herdr import HerdrError
@@ -382,6 +384,86 @@ class CursorRecoveryTests(unittest.TestCase):
             "manual_required",
         )
         client.submit_issue.assert_not_called()
+
+    def test_reconciles_ambiguous_repo_creation_without_resubmitting(self) -> None:
+        job = self.create(
+            {
+                "id": "123456789abc",
+                "status": "reconciling",
+                "request": "create a GitHub repository called payments",
+                "created_at": 1,
+                "delivered": False,
+                "issue_provider": "github",
+                "github_repository": "alice/payments",
+                "github_repo_create_requested": True,
+                "github_repo_create_confirmed": True,
+                "github_repo_create_visibility": "private",
+                "github_repo_create_marker": "a" * 32,
+                "github_repo_create_operation_state": "ambiguous",
+            }
+        )
+        client = mock.Mock(spec=GitHubClient)
+        client.observe_repository_creation.return_value = GitHubRepoCreationResult(
+            GitHubRepository(
+                "alice/payments",
+                "https://github.com/alice/payments",
+                True,
+                "main",
+            ),
+            "https://github.com/alice/payments",
+            "a" * 32,
+        )
+
+        reconcile_uncertain_repo_creation(
+            self.store,
+            job,
+            now=100,
+            github_factory=lambda: client,
+        )
+
+        updated = self.store.get(job.id)
+        self.assertEqual(updated.status, JobStatus.COMPLETED)
+        self.assertEqual(
+            updated.github_repo_created_url,
+            "https://github.com/alice/payments",
+        )
+        client.submit_repository_creation.assert_not_called()
+
+    def test_unobserved_repo_creation_requires_manual_check(self) -> None:
+        job = self.create(
+            {
+                "id": "123456789abc",
+                "status": "queued",
+                "request": "create a GitHub repository called payments",
+                "created_at": 1,
+                "queued_at": 1,
+                "delivered": False,
+                "issue_provider": "github",
+                "github_repository": "alice/payments",
+                "github_repo_create_requested": True,
+                "github_repo_create_confirmed": True,
+                "github_repo_create_visibility": "private",
+                "github_repo_create_marker": "a" * 32,
+                "github_repo_create_operation_state": "ambiguous",
+            }
+        )
+        client = mock.Mock(spec=GitHubClient)
+        client.observe_repository_creation.return_value = None
+
+        reconcile_uncertain_repo_creation(
+            self.store,
+            job,
+            now=100,
+            github_factory=lambda: client,
+        )
+
+        updated = self.store.get(job.id)
+        self.assertEqual(updated.status, JobStatus.BLOCKED)
+        self.assertEqual(
+            updated.github_repo_create_operation_state,
+            "manual_required",
+        )
+        client.submit_repository_creation.assert_not_called()
 
     def test_reconciles_ambiguous_linear_creation_without_resubmitting(
         self,

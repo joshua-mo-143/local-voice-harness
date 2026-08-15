@@ -123,6 +123,7 @@ class StartJobRequest:
     github_issue: int | None = None
     github_issue_context: str | None = None
     github_issue_create_requested: bool = False
+    github_repo_create_requested: bool = False
     linear_team: str | None = None
     linear_ticket_create_requested: bool = False
     fork_requested: bool = False
@@ -144,6 +145,7 @@ class CursorTurnRequest:
     github_issue: int | None = None
     github_issue_context: str | None = None
     github_issue_create_requested: bool = False
+    github_repo_create_requested: bool = False
     linear_team: str | None = None
     linear_ticket_create_requested: bool = False
     fork_requested: bool = False
@@ -374,6 +376,7 @@ def _build_start_job(
         None
         if (
             request.github_issue_create_requested
+            or request.github_repo_create_requested
             or request.linear_ticket_create_requested
         )
         else (
@@ -394,6 +397,7 @@ def _build_start_job(
                 if (
                     request.github_issue is not None
                     or request.github_issue_create_requested
+                    or request.github_repo_create_requested
                 )
                 else None
             )
@@ -451,6 +455,7 @@ def _build_start_job(
             github_issue_url=github_issue_url,
             github_issue_context=request.github_issue_context,
             github_issue_create_requested=request.github_issue_create_requested,
+            github_repo_create_requested=request.github_repo_create_requested,
             linear_ticket_create_requested=request.linear_ticket_create_requested,
             linear_ticket_create_team=request.linear_team,
             fork_requested=request.fork_requested,
@@ -507,6 +512,7 @@ def start_job(
     github_issue: int | None = None,
     github_issue_context: str | None = None,
     github_issue_create_requested: bool = False,
+    github_repo_create_requested: bool = False,
     linear_team: str | None = None,
     linear_ticket_create_requested: bool = False,
     fork_requested: bool = False,
@@ -530,6 +536,7 @@ def start_job(
             github_issue=github_issue,
             github_issue_context=github_issue_context,
             github_issue_create_requested=github_issue_create_requested,
+            github_repo_create_requested=github_repo_create_requested,
             linear_team=linear_team,
             linear_ticket_create_requested=linear_ticket_create_requested,
             fork_requested=fork_requested,
@@ -2626,6 +2633,7 @@ def cursor_turn(
     github_issue: int | None = None,
     github_issue_context: str | None = None,
     github_issue_create_requested: bool = False,
+    github_repo_create_requested: bool = False,
     linear_team: str | None = None,
     linear_ticket_create_requested: bool = False,
     fork_requested: bool = False,
@@ -2659,6 +2667,7 @@ def cursor_turn(
         github_issue = request.github_issue
         github_issue_context = request.github_issue_context
         github_issue_create_requested = request.github_issue_create_requested
+        github_repo_create_requested = request.github_repo_create_requested
         linear_team = request.linear_team
         linear_ticket_create_requested = request.linear_ticket_create_requested
         fork_requested = request.fork_requested
@@ -2838,6 +2847,7 @@ def cursor_turn(
                 github_issue=github_issue,
                 github_issue_context=github_issue_context,
                 github_issue_create_requested=github_issue_create_requested,
+                github_repo_create_requested=github_repo_create_requested,
                 linear_team=linear_team,
                 linear_ticket_create_requested=linear_ticket_create_requested,
                 fork_requested=fork_requested,
@@ -2888,6 +2898,7 @@ def cursor_turn(
                 github_issue=github_issue,
                 github_issue_context=github_issue_context,
                 github_issue_create_requested=github_issue_create_requested,
+                github_repo_create_requested=github_repo_create_requested,
                 linear_team=linear_team,
                 linear_ticket_create_requested=linear_ticket_create_requested,
                 fork_requested=fork_requested,
@@ -2965,6 +2976,11 @@ def render_job_announcement(job: CursorJob) -> AssistantResponse:
                 spoken_text=f"Created GitHub issue {job.github_issue}.",
                 display_text=detail,
             )
+        if job.github_repo_create_requested and job.github_repo_created_url:
+            return AssistantResponse(
+                spoken_text=(f"Created GitHub repository {job.github_repository}."),
+                display_text=detail,
+            )
         if job.linear_ticket_create_requested and job.linear_ticket_created_identifier:
             return AssistantResponse(
                 spoken_text=(
@@ -2993,6 +3009,11 @@ def render_job_announcement(job: CursorJob) -> AssistantResponse:
                     f"I drafted “{job.github_issue_create_title}” for "
                     f"{job.github_repository}. Should I create it?"
                 ),
+                display_text=question,
+            )
+        if job.clarification_kind == "github_repo_create_confirmation":
+            return AssistantResponse(
+                spoken_text=question,
                 display_text=question,
             )
         if job.clarification_kind == "linear_ticket_create_confirmation":
@@ -3127,6 +3148,7 @@ def _foreground_delivery_result(
         completed = claimed if claimed is not None else job
         if (
             completed.github_issue_create_requested
+            or completed.github_repo_create_requested
             or completed.linear_ticket_create_requested
         ):
             return CursorTurnResult(
@@ -3154,6 +3176,14 @@ def _foreground_delivery_result(
                 ),
                 job_id,
                 mutated=True,
+            )
+        if awaiting.clarification_kind == "github_repo_create_confirmation":
+            return CursorTurnResult(
+                AssistantResponse(
+                    spoken_text=rendered_question,
+                    display_text=rendered_question,
+                ),
+                job_id,
             )
         if awaiting.clarification_kind == "linear_ticket_create_confirmation":
             return CursorTurnResult(

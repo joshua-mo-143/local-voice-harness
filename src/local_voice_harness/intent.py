@@ -50,6 +50,9 @@ ROUTER_SYSTEM_PROMPT = (
     "workspace_consultation. "
     "Use github_issue_create when the user asks to create, file, or open a new GitHub "
     "issue. Do not use it for working on, summarizing, or editing an existing issue. "
+    "Use github_repo_create when the user asks to create a new empty GitHub "
+    "repository. Do not use it for cloning an existing repository, forking, creating "
+    "an issue, or working in a checkout. "
     "Use linear_ticket_create when the user asks to create, file, or open a new Linear "
     "ticket or issue. Do not use it for working on or editing an existing ticket. "
     "Use cursor_details when the user asks to see or hear more detail about the "
@@ -142,6 +145,7 @@ ROUTE_TOOL = {
                         "conversation_continue",
                         "workspace_consultation",
                         "github_issue_create",
+                        "github_repo_create",
                         "linear_ticket_create",
                         "end_conversation",
                         "uncertain",
@@ -192,6 +196,7 @@ class Intent(StrEnum):
     CONVERSATION_CONTINUE = "conversation_continue"
     WORKSPACE_CONSULTATION = "workspace_consultation"
     GITHUB_ISSUE_CREATE = "github_issue_create"
+    GITHUB_REPO_CREATE = "github_repo_create"
     LINEAR_TICKET_CREATE = "linear_ticket_create"
     # Compatibility aliases for the original Cursor-specific intent names.
     CURSOR_SUBMIT = "cursor_submit"
