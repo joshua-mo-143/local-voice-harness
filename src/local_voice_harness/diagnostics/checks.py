@@ -711,7 +711,10 @@ def check_pipewire_devices(
                 suggestion=INSTALL_HINTS.get("wpctl"),
             )
         ]
-    process = _run(["wpctl", "status"], timeout=5)
+    # Capture uses PipeWire's stable ``node.name`` through ``pw-record
+    # --target``. Ask wpctl for those names instead of its default human
+    # descriptions so diagnostics validate the same identifier contract.
+    process = _run(["wpctl", "status", "--name"], timeout=5)
     if process is None or process.returncode:
         return [
             CheckResult(

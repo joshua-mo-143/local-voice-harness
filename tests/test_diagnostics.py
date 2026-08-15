@@ -479,11 +479,11 @@ class ModelAndCudaTests(unittest.TestCase):
 _WPCTL_STATUS = """\
 Audio
  ├─ Devices:
- │      40. Built-in Audio
+ │      40. alsa_card.pci-0000_00_1f.3
  ├─ Sinks:
- │  *   62. Built-in Audio Analog Stereo [vol: 0.50]
+ │  *   62. alsa_output.pci-0000_00_1f.3.analog-stereo [vol: 0.50]
  ├─ Sources:
- │  *   63. Built-in Audio Analog Stereo [vol: 1.00]
+ │  *   63. alsa_input.pci-0000_00_1f.3.analog-stereo [vol: 1.00]
  ├─ Filters:
 """
 
@@ -500,12 +500,36 @@ class PipewireTests(unittest.TestCase):
             mock.patch.object(checks, "_which", return_value="/usr/bin/wpctl"),
             mock.patch.object(
                 checks, "_run", return_value=_completed(0, _WPCTL_STATUS)
-            ),
+            ) as run,
         ):
             results = checks.check_pipewire_devices(_snapshot())
         self.assertIs(results[0].severity, Severity.OK)
         self.assertIn("system default source", results[0].detail)
         self.assertIn("system default sink", results[0].detail)
+        run.assert_called_once_with(["wpctl", "status", "--name"], timeout=5)
+
+    def test_configured_node_names_match_capture_targets(self) -> None:
+        snapshot = _snapshot()
+        assert snapshot.config is not None
+        snapshot = checks.DiagnosticSnapshot(
+            config=replace(
+                snapshot.config,
+                audio=replace(
+                    snapshot.config.audio,
+                    source="alsa_input.pci-0000_00_1f.3.analog-stereo",
+                    sink="alsa_output.pci-0000_00_1f.3.analog-stereo",
+                ),
+            ),
+            registry=snapshot.registry,
+        )
+        with (
+            mock.patch.object(checks, "_which", return_value="/usr/bin/wpctl"),
+            mock.patch.object(
+                checks, "_run", return_value=_completed(0, _WPCTL_STATUS)
+            ),
+        ):
+            results = checks.check_pipewire_devices(snapshot)
+        self.assertIs(results[0].severity, Severity.OK)
 
     def test_wpctl_failure_is_fatal(self) -> None:
         with (
