@@ -4773,6 +4773,7 @@ class CursorJobStateTests(unittest.TestCase):
                 "id": "123456789abc",
                 "request": "create me a SaaS called widgets",
                 "trusted_utterance": "create me a SaaS called widgets",
+                "issue_provider": "github",
                 "github_repository": "alice/widgets",
                 "github_repo_create_requested": True,
                 "github_repo_create_continue_workflow": True,
@@ -4848,6 +4849,7 @@ class CursorJobStateTests(unittest.TestCase):
                 "id": "123456789abc",
                 "request": "create me a SaaS called widgets",
                 "trusted_utterance": "create me a SaaS called widgets",
+                "issue_provider": "github",
                 "github_repository": "alice/widgets",
                 "github_repo_create_requested": True,
                 "github_repo_create_continue_workflow": True,
@@ -4904,9 +4906,16 @@ class CursorJobStateTests(unittest.TestCase):
             service.run_worker("123456789abc")
 
         updated = jobs.read_job("123456789abc")
-        self.assertEqual(updated["github_issue_created_number"], 1)
+        self.assertEqual(updated["issue_provider"], "github")
+        self.assertEqual(updated["github_issue"], 1)
+        self.assertEqual(
+            updated["github_issue_url"],
+            "https://github.com/alice/widgets/issues/1",
+        )
+        self.assertNotIn("github_issue_created_number", updated)
+        self.assertNotIn("github_issue_created_url", updated)
         self.assertEqual(updated["github_issue_create_operation_state"], "created")
-        self.assertIsNotNone(updated.get("workflow_tier"))
+        self.assertIsNotNone(updated.get("workflow_tier"), updated)
         github.submit_issue.assert_called_once()
         self.assertTrue(github.submit_issue.call_args.kwargs["confirmed"])
         client.ensure_agent.assert_called()

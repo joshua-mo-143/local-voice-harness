@@ -358,6 +358,7 @@ class CursorRecoveryTests(unittest.TestCase):
                 "request": "create me a SaaS called widgets",
                 "created_at": 1,
                 "delivered": False,
+                "issue_provider": "github",
                 "github_repository": "alice/widgets",
                 "github_repo_create_requested": True,
                 "github_repo_create_continue_workflow": True,
@@ -388,8 +389,16 @@ class CursorRecoveryTests(unittest.TestCase):
 
         updated = self.store.get(job.id)
         self.assertEqual(updated.status, JobStatus.QUEUED)
+        self.assertEqual(updated.issue_provider, "github")
+        self.assertEqual(updated.github_issue, 1)
+        self.assertEqual(
+            updated.github_issue_url,
+            "https://github.com/alice/widgets/issues/1",
+        )
         self.assertEqual(updated.github_issue_created_number, 1)
         self.assertEqual(updated.github_issue_create_operation_state, "created")
+        self.assertNotIn("github_issue_created_number", updated.to_dict())
+        self.assertNotIn("github_issue_created_url", updated.to_dict())
         client.submit_issue.assert_not_called()
 
     def test_unobserved_issue_creation_requires_manual_check(self) -> None:

@@ -888,8 +888,9 @@ def _finish_github_issue_creation(
         now = time.time()
         if job.github_repo_create_continue_workflow:
             return job.evolve(
-                github_issue_created_number=issue.number,
-                github_issue_created_url=url,
+                issue_provider="github",
+                github_issue=issue.number,
+                github_issue_url=url,
                 github_issue_create_operation_state="created",
                 worker_operation=None,
             )
@@ -6100,7 +6101,9 @@ def run_claimed_worker(  # pyright: ignore[reportGeneralTypeIssues]
                 if updated is None:
                     return
                 job = updated
-            elif job.github_issue:
+            elif job.github_issue and not (
+                job.github_repo_create_continue_workflow and repository is not None
+            ):
                 github_repository = (job.github_repository or "").strip()
                 number = job.github_issue
                 if not github_repository or number <= 0:
