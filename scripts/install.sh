@@ -159,9 +159,22 @@ info "TTS provider: $TTS_PROVIDER"
 info "Dictation extra: $INSTALL_DICTATION_EXTRA ($INSTALL_DICTATION_DEVICE)"
 info "Checkout: $INSTALL_CHECKOUT"
 info "User services: $INSTALL_SYSTEMD_USER_DIR"
-if [[ "$INSTALL_CHECKOUT" != "$HOME/local-voice-harness" && ! -e "$HOME/local-voice-harness" ]]; then
-  ln -sfn "$INSTALL_CHECKOUT" "$HOME/local-voice-harness"
-  info "Linked $HOME/local-voice-harness -> $INSTALL_CHECKOUT for shipped user units"
+UNIT_CHECKOUT="$HOME/local-voice-harness"
+if [[ "$INSTALL_CHECKOUT" != "$UNIT_CHECKOUT" ]]; then
+  if [[ -L "$UNIT_CHECKOUT" ]]; then
+    CURRENT_UNIT_CHECKOUT="$(readlink -f "$UNIT_CHECKOUT" 2>/dev/null || true)"
+    if [[ "$CURRENT_UNIT_CHECKOUT" != "$INSTALL_CHECKOUT" ]]; then
+      ln -sfn "$INSTALL_CHECKOUT" "$UNIT_CHECKOUT"
+      info "Updated $UNIT_CHECKOUT -> $INSTALL_CHECKOUT for shipped user units"
+    fi
+  elif [[ -e "$UNIT_CHECKOUT" ]]; then
+    warn "$UNIT_CHECKOUT exists and is not a symlink; refusing to replace it."
+    warn "Move that path aside or run the installer from $UNIT_CHECKOUT."
+    exit 1
+  else
+    ln -s "$INSTALL_CHECKOUT" "$UNIT_CHECKOUT"
+    info "Linked $UNIT_CHECKOUT -> $INSTALL_CHECKOUT for shipped user units"
+  fi
 fi
 
 # --- 1. System packages -----------------------------------------------------

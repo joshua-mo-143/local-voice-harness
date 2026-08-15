@@ -144,6 +144,19 @@ class InstallPathDiscoveryTests(unittest.TestCase):
         self.assertEqual(paths.chatterbox_dir, root / "tts")
         self.assertNotIn("local-voice-harness", str(paths.checkout))
 
+    def test_installer_relinks_stale_unit_checkout_and_preserves_directories(
+        self,
+    ) -> None:
+        installer = (
+            Path(__file__).resolve().parents[1] / "scripts" / "install.sh"
+        ).read_text()
+
+        self.assertIn('if [[ -L "$UNIT_CHECKOUT" ]]', installer)
+        self.assertIn('ln -sfn "$INSTALL_CHECKOUT" "$UNIT_CHECKOUT"', installer)
+        self.assertIn('elif [[ -e "$UNIT_CHECKOUT" ]]', installer)
+        self.assertIn("refusing to replace it", installer)
+        self.assertIn("exit 1", installer)
+
 
 class DistroServiceLifecycleTests(unittest.TestCase):
     def test_service_install_diagnostics_and_uninstall_for_each_family(self) -> None:
