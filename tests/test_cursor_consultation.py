@@ -882,9 +882,17 @@ def test_consult_ticket_adversarial_stance_forbids_writes_and_child_filing() -> 
         client,
         target,
         "adversarially review this ticket",
-        ticket="API-79",
+        snapshot=TicketSnapshot(
+            "linear",
+            "API-79",
+            "linear-issue-id",
+            "Bound the scope",
+            "untrusted ticket body",
+            "2026-08-15T10:00:00Z",
+            "https://linear.app/acme/issue/API-79/bound-the-scope",
+            "In Progress",
+        ),
         kind="review",
-        ticket_context="untrusted ticket body",
         adversarial=True,
     )
 
