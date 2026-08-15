@@ -8729,9 +8729,7 @@ class RetargetPendingQuestionTests(unittest.TestCase):
 
         with (
             mock.patch.object(wake_daemon, "CURSOR_STORE", store),
-            mock.patch.object(
-                wake_daemon, "transcribe", return_value="bbbbbbbbbbbb"
-            ),
+            mock.patch.object(wake_daemon, "transcribe", return_value="bbbbbbbbbbbb"),
             mock.patch.object(wake_daemon, "start_components"),
             mock.patch.object(wake_daemon, "route_intent") as route_intent,
             mock.patch.object(wake_daemon, "cursor_turn") as cursor_turn,
@@ -8833,9 +8831,7 @@ class RetargetPendingQuestionTests(unittest.TestCase):
         }[job_id]
         with (
             mock.patch.object(wake_daemon, "CURSOR_STORE", store),
-            mock.patch.object(
-                wake_daemon, "transcribe", return_value="bbbbbbbbbbbb"
-            ),
+            mock.patch.object(wake_daemon, "transcribe", return_value="bbbbbbbbbbbb"),
             mock.patch.object(wake_daemon, "start_components"),
             mock.patch.object(wake_daemon, "route_intent") as route_intent,
             mock.patch.object(wake_daemon, "cursor_turn") as cursor_turn,
