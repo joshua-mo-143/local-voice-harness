@@ -53,7 +53,7 @@ from ..integrations.registry import (
     resolve_issue_reference,
     route_issue_repository,
 )
-from ..job_lifecycle import WorkerCallbackEvent
+from ..job_lifecycle import SessionControlMode, WorkerCallbackEvent
 from ..linear_ticket_creation import draft_linear_ticket
 from ..local_git import LocalGitRefChanged
 from ..prompt_operations import (
@@ -2110,6 +2110,10 @@ def _execute_session_create_effect(
     pane_id = job.herdr_pane_id or ""
     workspace_id = job.herdr_workspace_id or ""
     checkout = job.agent_operation_checkout or job.worktree_path or ""
+    if job.session_control == SessionControlMode.USER_OWNED.value:
+        raise HarnessError(
+            "session.create is blocked while session control is user-owned"
+        )
     if (
         job.agent_dispatch_state != "dispatching"
         or not target
@@ -3932,6 +3936,8 @@ def _execute_phase_prompt(
     prompt: str | None = None,
     prompt_factory: Callable[[str, bool], PromptPayload] | None = None,
 ) -> tuple[str, str] | None:
+    if job.session_control == SessionControlMode.USER_OWNED.value:
+        return None
     phase = job.workflow_phase
     state = job.prompt_operation_state
     payload: PromptPayload | None = None
@@ -3987,6 +3993,7 @@ def _execute_phase_prompt(
                 current.workflow_phase != phase
                 or current.turn_token != token
                 or current.herdr_target != target
+                or current.session_control == SessionControlMode.USER_OWNED.value
             ):
                 raise WorkerCancelled
             operation = transition_prompt_plan(
@@ -4040,6 +4047,9 @@ def _execute_phase_prompt(
             target=target,
             agent_session=observed_session,
             state_sequence=sequence,
+            sequence_evidence_trusted=(
+                job.session_control != SessionControlMode.USER_OWNED.value
+            ),
         )
         if isinstance(observed_operation, SubmittedPrompt):
             assert observed_session is not None
@@ -4052,6 +4062,9 @@ def _execute_phase_prompt(
                     target=target,
                     agent_session=observed_session,
                     state_sequence=sequence,
+                    sequence_evidence_trusted=(
+                        current.session_control != SessionControlMode.USER_OWNED.value
+                    ),
                 )
                 sessions = current.prompt_context_sessions
                 if current.active_participant is not None:
@@ -4091,6 +4104,10 @@ def _execute_phase_prompt(
                         target=target,
                         agent_session=observed_session,
                         state_sequence=sequence,
+                        sequence_evidence_trusted=(
+                            current.session_control
+                            != SessionControlMode.USER_OWNED.value
+                        ),
                     ),
                     manual_reconcile_operation="prompt",
                     manual_reconcile_token=uuid.uuid4().hex,
@@ -4257,7 +4274,10 @@ def _execute_phase_prompt(
     }
 
     def admit(current: CursorJob) -> CoordinatorDecision | None:
-        if not _worker_owned(current, worker_token):
+        if (
+            not _worker_owned(current, worker_token)
+            or current.session_control == SessionControlMode.USER_OWNED.value
+        ):
             return None
         operation = begin_prompt_submission(
             current.prompt_operation,
@@ -4659,6 +4679,8 @@ def run_claimed_worker(  # pyright: ignore[reportGeneralTypeIssues]
     except JobValidationError:
         worker_token = None
     if worker_token is None:
+        return
+    if job.session_control == SessionControlMode.USER_OWNED.value:
         return
     client: HerdrClient | None = None
     target = ""

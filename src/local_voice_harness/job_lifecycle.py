@@ -38,6 +38,35 @@ class JobState(StrEnum):
     CANCELLED = "cancelled"
 
 
+class SessionControlMode(StrEnum):
+    """Who may dispatch harness prompts and session mutations."""
+
+    AUTOMATED = "automated"
+    USER_OWNED = "user_owned"
+
+
+@dataclass(frozen=True, slots=True)
+class SessionControlState:
+    """Durable automated-versus-user session ownership, fenced by generation."""
+
+    mode: SessionControlMode = SessionControlMode.AUTOMATED
+    generation: int = 0
+
+    def __post_init__(self) -> None:
+        if self.generation < 0:
+            raise JobLifecycleError("session control generation must not be negative")
+
+    def relinquish(self) -> SessionControlState:
+        if self.mode != SessionControlMode.AUTOMATED:
+            raise JobLifecycleError("session control is already user-owned")
+        return SessionControlState(SessionControlMode.USER_OWNED, self.generation + 1)
+
+    def resume(self) -> SessionControlState:
+        if self.mode != SessionControlMode.USER_OWNED:
+            raise JobLifecycleError("session control is not user-owned")
+        return SessionControlState(SessionControlMode.AUTOMATED, self.generation + 1)
+
+
 @dataclass(frozen=True, slots=True)
 class JobIdentity:
     id: str

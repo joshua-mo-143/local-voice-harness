@@ -213,15 +213,25 @@ def observe_prompt_submission(
     target: str,
     agent_session: str | None,
     state_sequence: int,
+    sequence_evidence_trusted: bool = True,
+    input_provenance: str | None = None,
 ) -> SubmittedPrompt | AmbiguousPrompt:
-    """Resolve a submit fence from positive acceptance evidence or fail closed."""
+    """Resolve a submit fence from positive acceptance evidence or fail closed.
+
+    A session sequence advance is shared by every input on that session. It is
+    acceptance evidence only when the caller can trust that no overlapping
+    manual activity could have caused it. Provider input provenance is an
+    optional stronger signal and is never assumed to exist.
+    """
     if not isinstance(operation, SubmittingPrompt):
         raise PromptOperationError("only a submitting prompt can be observed")
     _require_identity(operation, identity)
+    provenance_accepted = input_provenance == "harness"
     if (
         target == identity.target
         and agent_session == identity.agent_session
         and state_sequence > identity.baseline_sequence
+        and (sequence_evidence_trusted or provenance_accepted)
     ):
         return SubmittedPrompt(identity)
     return AmbiguousPrompt(identity)

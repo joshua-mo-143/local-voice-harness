@@ -532,15 +532,19 @@ def _build_field_ownership() -> tuple[FieldOwnership, ...]:
                 "target_release_owner_start": CrashKind.IDENTITY,
                 "target_release_manual_required": CrashKind.UNCERTAINTY,
                 "target_release_unverified_targets": CrashKind.UNCERTAINTY,
+                "session_control": CrashKind.IDENTITY,
+                "session_control_generation": CrashKind.COUNTER,
             },
             submachine="session",
-            typed_runtime="AgentSessionOperation / CleanupState / SessionIdentity",
-            transition_owner="cursor.operations.AgentSessionOperation.transition / cursor.lifecycle cleanup transitions",
-            adapter="CursorJob.agent_session_operation / load_cleanup_state",
+            typed_runtime="AgentSessionOperation / CleanupState / SessionIdentity / SessionControlState",
+            transition_owner="cursor.recovery.relinquish_session_control / resume_session_control / AgentSessionOperation.transition / cursor.lifecycle cleanup transitions",
+            adapter="CursorJob.agent_session_operation / load_cleanup_state / CursorJob.session_control_state",
             callers=_SESSION_CALLERS
             + (
                 "cursor.recovery.cancel_target_and_release",
                 "cursor.recovery.resolve_manual_reconciliation",
+                "cursor.recovery.relinquish_session_control",
+                "cursor.recovery.resume_session_control",
             ),
             duplicate=(
                 "session_id aliases herdr_target. Agent session labels now use "
@@ -680,6 +684,8 @@ _TYPED_PREFIXES: dict[str, tuple[str, ...]] = {
         "stage_terminal_intent",
         "acknowledge_worktree_quarantine",
         "resolve_manual_reconciliation",
+        "relinquish_session_control",
+        "resume_session_control",
     ),
     "local_voice_harness.cursor.delivery": (
         "claim_delivery",
@@ -1153,6 +1159,18 @@ TRANSITION_ENTRY_POINTS: tuple[TransitionEntry, ...] = (
         AuthorityKind.CANONICAL,
     ),
     _entry(
+        "local_voice_harness.cursor.recovery.relinquish_session_control",
+        "cursor.recovery",
+        "automated to user-owned session control",
+        AuthorityKind.CANONICAL,
+    ),
+    _entry(
+        "local_voice_harness.cursor.recovery.resume_session_control",
+        "cursor.recovery",
+        "user-owned to automated session control after reconcile",
+        AuthorityKind.CANONICAL,
+    ),
+    _entry(
         "local_voice_harness.cursor.delivery.claim_delivery",
         "cursor.delivery",
         "store-backed delivery claim",
@@ -1369,12 +1387,12 @@ def measured_baseline_counts() -> dict[str, int]:
 # Measured on the #357 baseline checkout. Tests fail if these drift without an
 # intentional inventory update. They are evidence, not an optimization target.
 BASELINE_COUNTS: dict[str, int] = {
-    "persisted_field_names": 213,
-    "named_table_fields": 208,
+    "persisted_field_names": 215,
+    "named_table_fields": 210,
     "import_only_fields": 4,
-    "cursor_job_public_properties": 152,
+    "cursor_job_public_properties": 154,
     "compatibility_adapters": 38,
-    "transition_entry_points": 72,
+    "transition_entry_points": 74,
     "duplicate_authorities": 0,
-    "lifecycle_module_lines": 25586,
+    "lifecycle_module_lines": 25915,
 }

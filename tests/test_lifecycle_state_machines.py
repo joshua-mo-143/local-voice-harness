@@ -367,6 +367,32 @@ def test_legal_prompt_transitions_preserve_complete_identity() -> None:
         agent_session=identity.agent_session,
         state_sequence=8,
     ) == AmbiguousPrompt(identity)
+    assert observe_prompt_submission(
+        submitting,
+        identity,
+        target=identity.target,
+        agent_session=identity.agent_session,
+        state_sequence=8,
+        sequence_evidence_trusted=False,
+    ) == AmbiguousPrompt(identity)
+    assert observe_prompt_submission(
+        submitting,
+        identity,
+        target=identity.target,
+        agent_session=identity.agent_session,
+        state_sequence=8,
+        sequence_evidence_trusted=False,
+        input_provenance="harness",
+    ) == SubmittedPrompt(identity)
+    assert observe_prompt_submission(
+        submitting,
+        identity,
+        target=identity.target,
+        agent_session=identity.agent_session,
+        state_sequence=8,
+        sequence_evidence_trusted=False,
+        input_provenance="user",
+    ) == AmbiguousPrompt(identity)
     assert mark_prompt_ambiguous(planned, identity) == AmbiguousPrompt(identity)
     assert mark_prompt_ambiguous(submitting, identity) == AmbiguousPrompt(identity)
     assert mark_prompt_ambiguous(

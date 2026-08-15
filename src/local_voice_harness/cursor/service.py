@@ -313,6 +313,8 @@ def _dispatch_waiting_jobs(
             continue
         if current.participant_admission_state != "held":
             continue
+        if current.session_control == "user_owned":
+            continue
         try:
             launch_worker(job_id)
         except Exception:
@@ -1960,6 +1962,25 @@ def job_status(job_id: str | None = None) -> str:
 
 def acknowledge_worktree_quarantine(job_id: str) -> None:
     recovery.acknowledge_worktree_quarantine(_job_store(), job_id)
+
+
+def relinquish_session_control(job_id: str) -> CursorJob:
+    return recovery.relinquish_session_control(_job_store(), job_id)
+
+
+def resume_session_control(
+    job_id: str,
+    *,
+    integrations: IntegrationRegistry | None = None,
+) -> CursorJob:
+    herdr_factory = (
+        provisioning.HerdrClient if integrations is None else integrations.herdr_client
+    )
+    return recovery.resume_session_control(
+        _job_store(),
+        job_id,
+        herdr_factory=herdr_factory,
+    )
 
 
 def resolve_manual_reconciliation(
