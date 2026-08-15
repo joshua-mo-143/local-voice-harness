@@ -42,6 +42,7 @@ from local_voice_harness.cursor.recovery import (
     cancel_target_and_release,
     reconcile_prompt_and_pane_operations,
     reconcile_uncertain_agent,
+    reconcile_uncertain_clone,
     reconcile_uncertain_fork,
     reconcile_uncertain_issue_creation,
     reconcile_uncertain_linear_ticket_creation,
@@ -121,6 +122,56 @@ class CursorRecoveryTests(unittest.TestCase):
                 values.get("worktree_path") or values.get("repository") or "/worktree",
             )
         return self.store.create(CursorJob.from_dict(values))
+
+    def test_ambiguous_clone_recovery_only_observes_expected_destination(self) -> None:
+        job = self.create(
+            {
+                "id": "123456789abc",
+                "request": "clone example/project",
+                "clone_source": "example/project",
+                "clone_confirmed": True,
+                "clone_operation_state": "ambiguous",
+                "status": "queued",
+                "reconcile": True,
+                "created_at": 1,
+                "delivered": False,
+            }
+        )
+        source = GitHubRepository(
+            "example/project",
+            "https://github.com/example/project",
+            False,
+            "main",
+        )
+        checkout = self.root / "src" / "example" / "project"
+        client = mock.Mock(spec=GitHubClient)
+        client.local_git = mock.Mock()
+        client.inspect_repository.return_value = source
+        client.local_git.observe_materialized.return_value = None
+
+        reconcile_uncertain_clone(
+            self.store,
+            job,
+            now=100,
+            github_factory=lambda: client,
+        )
+        pending = self.store.get(job.id)
+        self.assertEqual(pending.clone_operation_state, "ambiguous")
+        self.assertIsNone(pending.repository)
+        client.ensure_repository_clone.assert_not_called()
+
+        client.local_git.observe_materialized.return_value = checkout
+        reconcile_uncertain_clone(
+            self.store,
+            pending,
+            now=101,
+            github_factory=lambda: client,
+        )
+        recovered = self.store.get(job.id)
+        self.assertEqual(recovered.clone_operation_state, "cloned")
+        self.assertEqual(recovered.repository, str(checkout))
+        self.assertFalse(recovered.reconcile)
+        client.ensure_repository_clone.assert_not_called()
 
     def admit_unknown_prompt_effect(self, job: CursorJob) -> CursorJob:
         operation = job.prompt_operation

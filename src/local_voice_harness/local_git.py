@@ -292,6 +292,41 @@ class LocalGitRepository:
         elif temporary.exists():
             shutil.rmtree(temporary)
 
+    def observe_materialized(
+        self,
+        relative_destination: Path,
+        *,
+        expected: ExpectedRemote,
+        expected_label: str | None = None,
+    ) -> Path | None:
+        """Observe an expected clone without creating or repairing it."""
+
+        relative_destination = self._relative_destination(relative_destination)
+        self._validate_root()
+        destination = self.clone_root / relative_destination
+        resolved_parent = destination.parent.resolve()
+        try:
+            resolved_parent.relative_to(self.clone_root)
+        except ValueError as exc:
+            raise LocalGitError(
+                "repository clone destination escapes its root"
+            ) from exc
+        if not destination.exists() and not destination.is_symlink():
+            return None
+        if destination.is_symlink():
+            try:
+                destination.resolve().relative_to(self.clone_root)
+            except ValueError as exc:
+                raise LocalGitError(
+                    "repository clone destination escapes its root"
+                ) from exc
+        self.verify_checkout(
+            destination,
+            expected,
+            expected_label=expected_label,
+        )
+        return destination.resolve()
+
     def materialize(
         self,
         relative_destination: Path,

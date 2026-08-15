@@ -1459,6 +1459,19 @@ class GitHubProvider:
     ) -> Path:
         return self._client.ensure_repository_clone(source, checkpoint=checkpoint)
 
+    def observe_repository_materialization(
+        self, source: GitHubRepository
+    ) -> Path | None:
+        owner, name = source.name_with_owner.split("/", 1)
+        try:
+            return self._client.local_git.observe_materialized(
+                Path(owner) / name,
+                expected=self._client._expected_remote(source),
+                expected_label=source.name_with_owner,
+            )
+        except LocalGitError as exc:
+            self._client._raise_local_git_error(exc)
+
     def materialize_fork(
         self,
         plan: GitHubForkPlan,

@@ -4772,6 +4772,7 @@ class CursorJobStateTests(unittest.TestCase):
         github.ensure_repository_clone.side_effect = GitHubOperationAmbiguous(
             "timed out"
         )
+        github.local_git.observe_materialized.return_value = None
         client = mock.Mock()
         client.repository_roots.return_value = []
         client.resolve_repository.return_value = (None, [])

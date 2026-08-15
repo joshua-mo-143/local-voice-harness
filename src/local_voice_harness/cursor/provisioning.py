@@ -59,7 +59,12 @@ from ..integrations.registry import (
 )
 from ..job_lifecycle import SessionControlMode, WorkerCallbackEvent
 from ..linear_ticket_creation import draft_linear_ticket
-from ..local_git import LocalGitError, LocalGitOperationAmbiguous, LocalGitRefChanged
+from ..local_git import (
+    ExpectedRemote,
+    LocalGitError,
+    LocalGitOperationAmbiguous,
+    LocalGitRefChanged,
+)
 from ..prompt_operations import (
     AmbiguousPrompt,
     PlannedPrompt,
@@ -484,7 +489,36 @@ def _materialize_voice_clone(
         return github.local_git.materialize(
             Path(name),
             clone_url=source,
+            expected=ExpectedRemote.from_url(source),
             checkpoint=checkpoint,
+        )
+    except LocalGitOperationAmbiguous as exc:
+        raise GitHubOperationAmbiguous(str(exc)) from exc
+    except LocalGitError as exc:
+        raise GitHubError(str(exc)) from exc
+
+
+def _observe_voice_clone(github: GitHubProvider, source: str) -> Path | None:
+    """Observe a previously submitted clone without resubmitting it."""
+
+    from ..integrations.github import GitHubClient as github_client_cls
+
+    repository = github_repository_from_url(source)
+    if repository is None:
+        try:
+            repository = github_client_cls.validate_repository(source)
+        except GitHubError:
+            repository = None
+    if repository is not None:
+        resolved = github.resolve_repository(repository)
+        return github.observe_repository_materialization(resolved)
+    name = repository_name_from_url(source)
+    if name is None:
+        raise HarnessError("clone source is not a Git URL or owner/repository")
+    try:
+        return github.local_git.observe_materialized(
+            Path(name),
+            expected=ExpectedRemote.from_url(source),
         )
     except LocalGitOperationAmbiguous as exc:
         raise GitHubOperationAmbiguous(str(exc)) from exc
@@ -5405,11 +5439,16 @@ def run_claimed_worker(  # pyright: ignore[reportGeneralTypeIssues]
                 ).strip() or parse_voice_clone_source(hint or "")
                 if clone_source:
                     github = _github_provider(clients.github)
-                    if job.clone_operation_state not in {None, "planned"}:
+                    checkout: Path | None = None
+                    if job.clone_operation_state == "ambiguous":
+                        checkout = _observe_voice_clone(github, clone_source)
+                        if checkout is None:
+                            return
+                    elif job.clone_operation_state not in {None, "planned"}:
                         raise HarnessError(
                             "repository clone requires reconciliation before retry"
                         )
-                    if not job.clone_confirmed:
+                    if checkout is None and not job.clone_confirmed:
                         destination = _clone_destination_label(github)
                         _worker_question(
                             store,
@@ -5429,85 +5468,88 @@ def run_claimed_worker(  # pyright: ignore[reportGeneralTypeIssues]
                         )
                         return
 
-                    def mark_clone_submitted(current: CursorJob) -> CursorJob:
-                        return current.evolve(
-                            clone_source=clone_source,
-                            clone_operation_state="submitted",
-                            worker_operation="repository_clone",
-                        )
+                    if checkout is None:
 
-                    submitted = _worker_change(
-                        store,
-                        job_id,
-                        worker_token,
-                        {JobStatus.ROUTING},
-                        mark_clone_submitted,
-                        expected_revision=job.revision,
-                    )
-                    if submitted is None:
-                        return
-                    job = submitted
-                    try:
-                        checkpoint()
-                        checkout = _materialize_voice_clone(
-                            github,
-                            clone_source,
-                            checkpoint=checkpoint,
-                        )
-                    except GitHubOperationAmbiguous:
-
-                        def mark_clone_ambiguous(current: CursorJob) -> CursorJob:
+                        def mark_clone_submitted(current: CursorJob) -> CursorJob:
                             return current.evolve(
-                                status=JobStatus.QUEUED,
-                                queued_at=time.time(),
-                                clone_operation_state="ambiguous",
-                                reconcile=True,
-                                worker_pid=None,
-                                worker_boot_id=None,
-                                worker_process_start=None,
-                                worker_token=None,
-                                worker_operation=None,
+                                clone_source=clone_source,
+                                clone_operation_state="submitted",
+                                worker_operation="repository_clone",
                             )
 
-                        _worker_change(
+                        submitted = _worker_change(
                             store,
                             job_id,
                             worker_token,
                             {JobStatus.ROUTING},
-                            mark_clone_ambiguous,
+                            mark_clone_submitted,
                             expected_revision=job.revision,
                         )
-                        return
-                    except GitHubCommandStartError:
-
-                        def reset_clone_plan(current: CursorJob) -> CursorJob:
-                            return current.evolve(
-                                status=JobStatus.QUEUED,
-                                queued_at=time.time(),
-                                clone_operation_state="planned",
-                                worker_pid=None,
-                                worker_boot_id=None,
-                                worker_process_start=None,
-                                worker_token=None,
-                                worker_operation=None,
-                                worker_claim_operation=None,
-                                worker_claimed_at=None,
+                        if submitted is None:
+                            return
+                        job = submitted
+                        try:
+                            checkpoint()
+                            checkout = _materialize_voice_clone(
+                                github,
+                                clone_source,
+                                checkpoint=checkpoint,
                             )
+                        except GitHubOperationAmbiguous:
 
-                        _worker_change(
-                            store,
-                            job_id,
-                            worker_token,
-                            {JobStatus.ROUTING},
-                            reset_clone_plan,
-                            expected_revision=job.revision,
-                        )
-                        return
+                            def mark_clone_ambiguous(current: CursorJob) -> CursorJob:
+                                return current.evolve(
+                                    status=JobStatus.QUEUED,
+                                    queued_at=time.time(),
+                                    clone_operation_state="ambiguous",
+                                    reconcile=True,
+                                    worker_pid=None,
+                                    worker_boot_id=None,
+                                    worker_process_start=None,
+                                    worker_token=None,
+                                    worker_operation=None,
+                                )
+
+                            _worker_change(
+                                store,
+                                job_id,
+                                worker_token,
+                                {JobStatus.ROUTING},
+                                mark_clone_ambiguous,
+                                expected_revision=job.revision,
+                            )
+                            return
+                        except GitHubCommandStartError:
+
+                            def reset_clone_plan(current: CursorJob) -> CursorJob:
+                                return current.evolve(
+                                    status=JobStatus.QUEUED,
+                                    queued_at=time.time(),
+                                    clone_operation_state="planned",
+                                    worker_pid=None,
+                                    worker_boot_id=None,
+                                    worker_process_start=None,
+                                    worker_token=None,
+                                    worker_operation=None,
+                                    worker_claim_operation=None,
+                                    worker_claimed_at=None,
+                                )
+
+                            _worker_change(
+                                store,
+                                job_id,
+                                worker_token,
+                                {JobStatus.ROUTING},
+                                reset_clone_plan,
+                                expected_revision=job.revision,
+                            )
+                            return
 
                     def record_clone(current: CursorJob) -> CursorJob:
                         return current.evolve(
                             repository=str(checkout),
                             clone_operation_state="cloned",
+                            reconcile=False,
                             worker_operation=None,
                         )
 

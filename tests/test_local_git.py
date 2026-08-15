@@ -360,6 +360,39 @@ class LocalGitRepositoryTests(unittest.TestCase):
                 any("clone" in call.args[0] for call in run.call_args_list)
             )
 
+    def test_observe_materialized_never_clones_and_rejects_collisions(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            destination = root / "source" / "project"
+            repository = LocalGitRepository(clone_root=root, allowed_root=root)
+            expected = ExpectedRemote.from_url("https://example.com/source/project")
+
+            with mock.patch("local_voice_harness.local_git.run_command") as run:
+                self.assertIsNone(
+                    repository.observe_materialized(
+                        Path("source/project"),
+                        expected=expected,
+                    )
+                )
+            run.assert_not_called()
+            self.assertFalse(destination.exists())
+
+            (destination / ".git").mkdir(parents=True)
+            with (
+                mock.patch(
+                    "local_voice_harness.local_git.run_command",
+                    return_value=_completed("https://example.com/other/project\n"),
+                ) as run,
+                self.assertRaisesRegex(LocalGitError, "origin is not"),
+            ):
+                repository.observe_materialized(
+                    Path("source/project"),
+                    expected=expected,
+                )
+            self.assertFalse(
+                any("clone" in call.args[0] for call in run.call_args_list)
+            )
+
     def test_materialize_accepts_adapter_clone_command(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

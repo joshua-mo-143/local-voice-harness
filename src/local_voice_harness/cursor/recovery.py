@@ -18,11 +18,13 @@ from ..integrations.github import (
     GitHubForkPlan,
     GitHubProvider,
     GitHubRepository,
+    github_repository_from_url,
 )
 from ..integrations.herdr import (
     HerdrClient,
     HerdrError,
     agent_session_identity,
+    repository_name_from_url,
 )
 from ..integrations.linear import LinearError, LinearIntegration
 from ..integrations.registry import build_integration_registry, issue_provider
@@ -33,6 +35,7 @@ from ..job_lifecycle import (
     SessionControlMode,
     SessionControlState,
 )
+from ..local_git import ExpectedRemote, LocalGitError
 from ..prompt_operations import (
     AmbiguousPrompt,
     ObservedPrompt,
@@ -671,6 +674,56 @@ def reconcile_uncertain_issue_creation(
     store.update(job.id, reconcile)
 
 
+def reconcile_uncertain_clone(
+    store: JobStore,
+    job: CursorJob,
+    *,
+    now: float,
+    github_factory: GitHubFactory = GitHubClient,
+) -> None:
+    """Observe an ambiguous clone destination without resubmitting the clone."""
+
+    if job.clone_operation_state not in {"submitted", "ambiguous"}:
+        return
+    source = job.clone_source or ""
+    github = _github_provider(github_factory)
+    try:
+        repository = github_repository_from_url(source)
+        if repository is None:
+            try:
+                repository = GitHubClient.validate_repository(source)
+            except GitHubError:
+                repository = None
+        if repository is not None:
+            resolved = github.resolve_repository(repository)
+            checkout = github.observe_repository_materialization(resolved)
+        else:
+            name = repository_name_from_url(source)
+            if name is None:
+                return
+            checkout = github.local_git.observe_materialized(
+                Path(name),
+                expected=ExpectedRemote.from_url(source),
+            )
+    except (GitHubError, LocalGitError):
+        return
+    if checkout is None:
+        return
+
+    def reconciled(current: CursorJob) -> CursorJob | None:
+        if current.clone_operation_state not in {"submitted", "ambiguous"}:
+            return None
+        return current.evolve_recovery(
+            now=now,
+            repository=str(checkout),
+            clone_operation_state="cloned",
+            reconcile=False,
+            worker_operation=None,
+        )
+
+    store.update(job.id, reconciled)
+
+
 def reconcile_uncertain_linear_ticket_creation(
     store: JobStore,
     job: CursorJob,
@@ -883,6 +936,13 @@ def reconcile_uncertain_operations(
     reconcile_uncertain_agent(store, job, now=now, herdr_factory=herdr_factory)
     current = store.get(job.id)
     reconcile_uncertain_issue_creation(
+        store,
+        current,
+        now=now,
+        github_factory=github_factory,
+    )
+    current = store.get(job.id)
+    reconcile_uncertain_clone(
         store,
         current,
         now=now,
