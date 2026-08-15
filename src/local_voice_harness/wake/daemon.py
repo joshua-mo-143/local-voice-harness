@@ -98,11 +98,12 @@ from ..diagnostic_safety import (
     DAEMON_FAILURE,
     PLAYBACK_FAILURE,
     RECORDING_FAILURE,
+    SPEECH_DELIVERY_FAILURE,
     VOICE_REQUEST_FAILURE,
     redact_diagnostic,
 )
 from ..diagnostics.health import self_health_response
-from ..errors import HarnessError, NoSpeechError
+from ..errors import HarnessError, NoSpeechError, SpeechDeliveryError
 from ..github_issue_creation import repository_from_utterance
 from ..integrations.registry import IntegrationRegistry, build_integration_registry
 from ..intent import (
@@ -1049,9 +1050,13 @@ class WakeConversationDaemon:
                 condition.notify_all()
             playback_thread.join()
         if playback_errors:
-            raise playback_errors[0]
+            error = playback_errors[0]
+            raise SpeechDeliveryError(f"speech delivery failed: {error}") from error
         if not chunks and interruption is None:
-            playback, interruption = self.play_response(response)
+            try:
+                playback, interruption = self.play_response(response)
+            except Exception as exc:
+                raise SpeechDeliveryError(f"speech delivery failed: {exc}") from exc
             return (
                 response,
                 next_cursor_session,
@@ -1687,6 +1692,7 @@ class WakeConversationDaemon:
         delivery_terminal = retained is not None and retained.state == "terminal"
         preserve_delivery = False
         turn_failed = False
+        next_cursor_session = self.cursor_session
 
         def fence_side_effect() -> None:
             nonlocal delivery_ambiguous, preserve_delivery
@@ -2556,7 +2562,10 @@ class WakeConversationDaemon:
             print(f"Assistant: {rendered_response.display_text}", flush=True)
             cursor_session_before_playback = self.cursor_session
             if not streamed_playback:
-                playback, interruption = self.play_response(rendered_response)
+                try:
+                    playback, interruption = self.play_response(rendered_response)
+                except Exception as exc:
+                    raise SpeechDeliveryError(f"speech delivery failed: {exc}") from exc
             if remember_response:
                 played_text = (
                     str(playback.get("played_text") or "").strip()
@@ -2607,6 +2616,16 @@ class WakeConversationDaemon:
                 )
             self.awaiting_followup = True
             notify("Listening for a follow-up…")
+        except SpeechDeliveryError as exc:
+            turn_failed = True
+            release_deliveries(delivery_claims)
+            self.cursor_session = next_cursor_session
+            log(f"speech delivery failed: {type(exc).__name__}: {exc}")
+            notify(SPEECH_DELIVERY_FAILURE, error=True)
+            self.awaiting_followup = False
+            if not had_active_conversation:
+                self.conversation_deadline = 0.0
+                self.stop_components_when_idle()
         except NoSpeechError as exc:
             turn_failed = True
             release_deliveries(delivery_claims)

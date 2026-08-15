@@ -29,7 +29,7 @@ from local_voice_harness.cursor.delivery import DeliveryClaim
 from local_voice_harness.cursor.model import CursorJob, JobStatus
 from local_voice_harness.cursor.service import CursorTurnRequest
 from local_voice_harness.cursor.store import JobStore
-from local_voice_harness.errors import HarnessError, NoSpeechError
+from local_voice_harness.errors import HarnessError, NoSpeechError, SpeechDeliveryError
 from local_voice_harness.integrations.registry import build_integration_registry
 from local_voice_harness.intent import Intent, IntentRoute
 from local_voice_harness.questions import (
@@ -1305,6 +1305,31 @@ class ProcessUtteranceTests(unittest.TestCase):
             played_requests,
             ["pull request 42 changed the harness."],
         )
+
+    def test_streamed_playback_failure_is_classified_after_generation_succeeds(
+        self,
+    ) -> None:
+        daemon = _bare_daemon()
+
+        def generate(
+            callback: Callable[[str], bool],
+            _should_cancel: Callable[[], bool],
+        ) -> tuple[str, str]:
+            callback("The operation completed.")
+            return "The operation completed.", "completed-session"
+
+        with (
+            mock.patch.object(
+                daemon,
+                "_drain_playback_queue",
+                side_effect=RuntimeError("Venice retries exhausted"),
+            ),
+            self.assertRaisesRegex(
+                SpeechDeliveryError,
+                "Venice retries exhausted",
+            ),
+        ):
+            daemon.play_streamed_response(generate)
 
     def test_turn_preserves_awaiting_job_session_played_before_response(
         self,
@@ -3261,12 +3286,12 @@ class ProcessUtteranceTests(unittest.TestCase):
             delivery_claims: list[DeliveryClaim],
             allow_tools: bool = True,
             settings: object | None = None,
-        ) -> tuple[str, None]:
+        ) -> tuple[str, str]:
             self.assertEqual(trusted_utterance, "question")
             delivery_claims.append(
                 _delivery_claim("123456789abc", "completed", result="answer")
             )
-            return "answer", None
+            return "answer", "completed-session"
 
         with (
             mock.patch.object(wake_daemon, "transcribe", return_value="question"),
@@ -3289,13 +3314,20 @@ class ProcessUtteranceTests(unittest.TestCase):
             ),
             mock.patch.object(wake_daemon, "release_deliveries") as release,
             mock.patch.object(wake_daemon, "stop_components"),
-            mock.patch.object(wake_daemon, "notify"),
+            mock.patch.object(wake_daemon, "notify") as notify,
+            mock.patch.object(wake_daemon, "log") as log,
         ):
             daemon.process_utterance(AUDIO_GENERATION, woke=False)
 
         release.assert_called_once_with(
             [_delivery_claim("123456789abc", "completed", result="answer")]
         )
+        notify.assert_called_once_with(
+            wake_daemon.SPEECH_DELIVERY_FAILURE,
+            error=True,
+        )
+        self.assertIn("SpeechDeliveryError", log.call_args.args[0])
+        self.assertEqual(daemon.cursor_session, "completed-session")
         self.assertEqual(daemon.history, [])
 
 
