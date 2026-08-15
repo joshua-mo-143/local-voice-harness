@@ -26,10 +26,19 @@ from ..integrations.herdr import (
 )
 from ..integrations.linear import LinearError, LinearIntegration
 from ..integrations.registry import build_integration_registry, issue_provider
-from ..job_lifecycle import CancellationEvent, RecoveryEvent
+from ..job_lifecycle import (
+    CancellationEvent,
+    JobLifecycleError,
+    RecoveryEvent,
+    SessionControlMode,
+    SessionControlState,
+)
 from ..prompt_operations import (
     AmbiguousPrompt,
+    ObservedPrompt,
+    PlannedPrompt,
     PromptOperationError,
+    SubmittedPrompt,
     SubmittingPrompt,
     mark_prompt_ambiguous,
 )
@@ -216,6 +225,8 @@ def reconcile_uncertain_agent(
     now: float,
     herdr_factory: HerdrFactory = HerdrClient,
 ) -> None:
+    if job.session_control == SessionControlMode.USER_OWNED.value:
+        return
     states = frozenset({"dispatching", "ambiguous", "failed_observing"})
     if job.agent_dispatch_state not in states or not _reconciliation_due(
         job, "agent", now
@@ -969,6 +980,8 @@ def reconcile_prompt_and_pane_operations(
     herdr_factory: HerdrFactory = HerdrClient,
 ) -> None:
     """Resolve only externally observable acceptance; never replay a submit."""
+    if job.session_control == SessionControlMode.USER_OWNED.value:
+        return
     if job.prompt_operation_state in {"submitting", "ambiguous"}:
         try:
             operation = job.prompt_operation
@@ -1725,18 +1738,292 @@ def resolve_manual_reconciliation(
             != ("ambiguous" if operation == "prompt" else "manual_required")
         ):
             return None
+        followup_changes = (
+            _agent_manual_reconciliation_changes(
+                job,
+                required_at=resolved_at,
+            )
+            if (
+                operation == "prompt"
+                and job.session_control == SessionControlMode.USER_OWNED.value
+                and job.agent_dispatch_state
+                in {"dispatching", "ambiguous", "failed_observing"}
+            )
+            else None
+        )
         return job.resolve_manual_operation(
             operation,
             outcome,
             resolved_at=resolved_at,
             pane_id=pane_id,
             workspace_id=workspace_id,
+            job_changes=followup_changes,
         )
 
     resolved = store.update(job_id, resolve)
     if resolved is None:
         raise HarnessError(f"Cursor job {job_id} manual reconciliation fence is stale")
     return resolved
+
+
+_IN_FLIGHT_PROMPT_STATES = frozenset({"submitting", "observed", "ambiguous"})
+_UNRESOLVED_SESSION_STATES = frozenset(
+    {"dispatching", "ambiguous", "failed_observing", "manual_required"}
+)
+
+
+def _session_control_from(job: CursorJob) -> SessionControlState:
+    return job.session_control_state()
+
+
+def _confusable_harness_operation(job: CursorJob) -> bool:
+    return (
+        job.prompt_operation_state in _IN_FLIGHT_PROMPT_STATES
+        or job.agent_dispatch_state in _UNRESOLVED_SESSION_STATES
+        or job.manual_reconcile_operation is not None
+    )
+
+
+def _agent_manual_reconciliation_changes(
+    job: CursorJob,
+    *,
+    required_at: float,
+) -> dict[str, Any]:
+    agent_operation = job.agent_session_operation
+    changes: dict[str, Any] = {
+        "manual_reconcile_operation": "agent",
+        "manual_reconcile_token": uuid.uuid4().hex,
+        "manual_reconcile_required_at": required_at,
+    }
+    if agent_operation is not None:
+        changes["agent_session_operation"] = agent_operation.transition(
+            AgentSessionState.MANUAL_REQUIRED
+        )
+    else:
+        changes["agent_dispatch_state"] = "manual_required"
+    return changes
+
+
+def relinquish_session_control(
+    store: JobStore,
+    job_id: str,
+    *,
+    now: float | None = None,
+    stop_owned_worker: Callable[[CursorJob], bool] = stop_worker,
+) -> CursorJob:
+    """Durably hand a nonterminal session to the user without cancelling it."""
+
+    relinquished_at = time.time() if now is None else now
+    snapshot = store.get(job_id)
+    if snapshot.status in TERMINAL_STATUSES:
+        raise HarnessError(f"Cursor job {job_id} is already {snapshot.status.value}")
+    if snapshot.status not in {
+        JobStatus.QUEUED,
+        JobStatus.ROUTING,
+        JobStatus.RUNNING,
+        JobStatus.RECONCILING,
+        JobStatus.AWAITING_USER,
+        JobStatus.BLOCKED,
+    }:
+        raise HarnessError(f"Cursor job {job_id} cannot relinquish session control")
+    try:
+        _session_control_from(snapshot).relinquish()
+    except JobLifecycleError as exc:
+        raise HarnessError(str(exc)) from exc
+    if any(
+        value is not None
+        for value in (
+            snapshot.worker_pid,
+            snapshot.worker_boot_id,
+            snapshot.worker_process_start,
+            snapshot.worker_token,
+        )
+    ) and not stop_owned_worker(snapshot):
+        raise HarnessError(
+            f"Cursor job {job_id} worker could not be stopped; "
+            "session ownership was retained"
+        )
+
+    def relinquish(job: CursorJob) -> CursorJob | None:
+        if job.revision != snapshot.revision:
+            return None
+        if job.status in TERMINAL_STATUSES:
+            raise HarnessError(f"Cursor job {job_id} is already {job.status.value}")
+        if job.status not in {
+            JobStatus.QUEUED,
+            JobStatus.ROUTING,
+            JobStatus.RUNNING,
+            JobStatus.RECONCILING,
+            JobStatus.AWAITING_USER,
+            JobStatus.BLOCKED,
+        }:
+            raise HarnessError(f"Cursor job {job_id} cannot relinquish session control")
+        try:
+            next_control = _session_control_from(job).relinquish()
+        except JobLifecycleError as exc:
+            raise HarnessError(str(exc)) from exc
+        changes: dict[str, Any] = {
+            "session_control": next_control.mode.value,
+            "session_control_generation": next_control.generation,
+            "worker_operation": None,
+            "worker_pid": None,
+            "worker_boot_id": None,
+            "worker_process_start": None,
+            "worker_token": None,
+        }
+        if job.worker_token is not None:
+            changes["status"] = JobStatus.QUEUED
+            changes["queued_at"] = relinquished_at
+        try:
+            operation = job.prompt_operation
+        except (PromptOperationError, JobValidationError):
+            operation = None
+        if isinstance(
+            operation,
+            SubmittingPrompt | SubmittedPrompt | ObservedPrompt,
+        ):
+            changes["prompt_operation"] = mark_prompt_ambiguous(
+                operation, operation.identity
+            )
+            if job.manual_reconcile_operation is None:
+                changes["manual_reconcile_operation"] = "prompt"
+                changes["manual_reconcile_token"] = uuid.uuid4().hex
+                changes["manual_reconcile_required_at"] = relinquished_at
+        elif (
+            isinstance(operation, AmbiguousPrompt)
+            and job.manual_reconcile_operation is None
+        ):
+            changes["manual_reconcile_operation"] = "prompt"
+            changes["manual_reconcile_token"] = uuid.uuid4().hex
+            changes["manual_reconcile_required_at"] = relinquished_at
+        if (
+            job.agent_dispatch_state in {"dispatching", "ambiguous", "failed_observing"}
+            and job.manual_reconcile_operation is None
+            and "manual_reconcile_operation" not in changes
+        ):
+            changes.update(
+                _agent_manual_reconciliation_changes(
+                    job,
+                    required_at=relinquished_at,
+                )
+            )
+        return job.evolve(**changes)
+
+    updated = store.update(job_id, relinquish)
+    if updated is None:
+        raise HarnessError(f"Cursor job {job_id} session control was not updated")
+    return updated
+
+
+def resume_session_control(
+    store: JobStore,
+    job_id: str,
+    *,
+    now: float | None = None,
+    herdr_factory: HerdrFactory = HerdrClient,
+) -> CursorJob:
+    """Hand a user-owned session back after reconciling identity and baseline."""
+
+    job = store.get(job_id)
+    if job.status in TERMINAL_STATUSES:
+        raise HarnessError(f"Cursor job {job_id} is already {job.status.value}")
+    if job.session_control != SessionControlMode.USER_OWNED.value:
+        raise HarnessError(
+            f"Cursor job {job_id} is not under user-owned session control"
+        )
+    if _confusable_harness_operation(job):
+        raise HarnessError(
+            f"Cursor job {job_id} has an unresolved harness operation that "
+            "could be confused with manual activity; explicit reconciliation "
+            "is required"
+        )
+
+    target = job.herdr_target
+    expected_session = job.agent_provider_session_id
+    observed_sequence: int | None = None
+    if target and expected_session:
+        try:
+            client = herdr_factory()
+            client.ensure_server()
+            observation = client.harness.reconcile(
+                target, expected_session_id=expected_session
+            )
+        except HerdrError as exc:
+            raise HarnessError(
+                f"could not reconcile session for hand-back: {exc}"
+            ) from exc
+        if observation.state != ReconciliationState.SETTLED:
+            raise HarnessError(
+                f"Cursor job {job_id} session is not settled and quiescent; "
+                "hand-back cannot resume automation and explicit reconciliation "
+                "is required"
+            )
+        if observation.session is None:
+            raise HarnessError(
+                f"Cursor job {job_id} session identity is unprovable; "
+                "explicit reconciliation is required"
+            )
+        confirmation = client.harness.reconcile(
+            target, expected_session_id=expected_session
+        )
+        observed = observation.session
+        confirmed = confirmation.session
+        if (
+            confirmation.state != ReconciliationState.SETTLED
+            or confirmed is None
+            or confirmed.provider != observed.provider
+            or confirmed.session_id != observed.session_id
+            or confirmed.target != observed.target
+            or confirmed.state_sequence != observed.state_sequence
+        ):
+            raise HarnessError(
+                f"Cursor job {job_id} session changed during hand-back "
+                "observation; automation remains paused"
+            )
+        observed_sequence = confirmed.state_sequence
+    elif target or expected_session:
+        raise HarnessError(
+            f"Cursor job {job_id} session identity is incomplete; "
+            "explicit reconciliation is required"
+        )
+
+    def resume(current: CursorJob) -> CursorJob | None:
+        if (
+            current.session_control != SessionControlMode.USER_OWNED.value
+            or current.revision != job.revision
+            or _confusable_harness_operation(current)
+        ):
+            return None
+        next_control = _session_control_from(current).resume()
+        changes: dict[str, Any] = {
+            "session_control": next_control.mode.value,
+            "session_control_generation": next_control.generation,
+        }
+        if observed_sequence is not None:
+            changes["agent_state_sequence"] = observed_sequence
+            agent_operation = current.agent_session_operation
+            if agent_operation is not None and agent_operation.session is not None:
+                changes["agent_session_operation"] = replace(
+                    agent_operation,
+                    session=replace(
+                        agent_operation.session,
+                        state_sequence=observed_sequence,
+                    ),
+                )
+            try:
+                prompt = current.prompt_operation
+            except (PromptOperationError, JobValidationError):
+                prompt = None
+            if isinstance(prompt, PlannedPrompt | SubmittedPrompt):
+                changes["prompt_operation"] = type(prompt)(
+                    replace(prompt.identity, baseline_sequence=observed_sequence)
+                )
+        return current.evolve(**changes)
+
+    updated = store.update(job_id, resume)
+    if updated is None:
+        raise HarnessError(f"Cursor job {job_id} session control hand-back is stale")
+    return updated
 
 
 def _target_release_owner_alive(
@@ -1767,7 +2054,8 @@ def _reconcile_question_prompt(
 ) -> None:
     question = question_adapter.current(job)
     if (
-        question is None
+        job.session_control == SessionControlMode.USER_OWNED.value
+        or question is None
         or question.state != QuestionState.DISPATCHING
         or question.prompt_state
         not in {PromptOperationState.SUBMITTED, PromptOperationState.OBSERVED}
@@ -2184,6 +2472,16 @@ def recover_jobs(
                     )
                 ):
                     return job.evolve(
+                        worker_pid=None,
+                        worker_boot_id=None,
+                        worker_process_start=None,
+                        worker_token=None,
+                    )
+                return None
+            if job.session_control == SessionControlMode.USER_OWNED.value:
+                if take_release:
+                    return job.evolve(
+                        **cleanup_updates,
                         worker_pid=None,
                         worker_boot_id=None,
                         worker_process_start=None,

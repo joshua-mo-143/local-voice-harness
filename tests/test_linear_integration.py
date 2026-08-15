@@ -662,5 +662,186 @@ class LinearTicketCreationTests(unittest.TestCase):
         self.assertEqual(str(raised.exception), "I couldn't find Linear team API.")
 
 
+class LinearIssueResolveTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.integration = linear.LinearIntegration()
+
+    def _resolve(
+        self,
+        status: str,
+        *,
+        identifier: str = "ENG-1",
+        url: str = "https://linear.app/acme/issue/ENG-1/title",
+        herdr_error: HerdrError | None = None,
+        raw_output: str | None = None,
+        reference: str = "eng-1",
+    ) -> linear.LinearIssue:
+        client = mock.Mock()
+        client.ensure_router.return_value = mock.Mock(target="voice-router")
+
+        def prompt(*_args: object, **kwargs: object) -> object:
+            if herdr_error is not None:
+                raise herdr_error
+            token = str(kwargs["token"])
+            if raw_output is not None:
+                return mock.Mock(output=raw_output)
+            lines = [f"VOICE_LINEAR_STATUS[{token}]: {status}"]
+            if identifier is not None:
+                lines.append(f"VOICE_LINEAR_IDENTIFIER[{token}]: {identifier}")
+            if url is not None:
+                lines.append(f"VOICE_LINEAR_URL[{token}]: {url}")
+            return mock.Mock(output="\n".join(lines))
+
+        client.prompt_and_wait.side_effect = prompt
+        with (
+            tempfile.TemporaryDirectory() as temporary,
+            mock.patch.object(
+                linear,
+                "LINEAR_ROUTER_LOCK",
+                Path(temporary) / "router.lock",
+            ),
+            mock.patch.object(self.integration, "require_capabilities"),
+        ):
+            return self.integration.resolve_issue(client, reference)
+
+    def test_parse_rejects_malformed_and_nonpositive_keys(self) -> None:
+        with self.assertRaises(linear.LinearIssueLookupError) as malformed:
+            linear.parse_linear_issue_reference("ENG-")
+        self.assertEqual(
+            malformed.exception.reason,
+            linear.LinearIssueLookupReason.MALFORMED,
+        )
+        with self.assertRaises(linear.LinearIssueLookupError) as nonpositive:
+            linear.parse_linear_issue_reference("ENG-0")
+        self.assertEqual(
+            nonpositive.exception.reason,
+            linear.LinearIssueLookupReason.NONPOSITIVE,
+        )
+        self.assertEqual(
+            linear.parse_linear_issue_reference("eng-1").identifier, "ENG-1"
+        )
+
+    def test_resolves_canonical_identity_read_only(self) -> None:
+        issue = self._resolve("found")
+
+        self.assertEqual(issue.identifier, "ENG-1")
+
+    def test_missing_issue_is_not_found(self) -> None:
+        with self.assertRaises(linear.LinearIssueLookupError) as raised:
+            self._resolve("not_found", identifier="", url="")
+
+        self.assertEqual(
+            raised.exception.reason,
+            linear.LinearIssueLookupReason.NOT_FOUND_OR_INACCESSIBLE,
+        )
+
+    def test_inaccessible_issue_is_rejected(self) -> None:
+        with self.assertRaises(linear.LinearIssueLookupError) as raised:
+            self._resolve("inaccessible", identifier="", url="")
+
+        self.assertEqual(
+            raised.exception.reason,
+            linear.LinearIssueLookupReason.NOT_FOUND_OR_INACCESSIBLE,
+        )
+
+    def test_unauthorized_issue_is_rejected(self) -> None:
+        with self.assertRaises(linear.LinearIssueLookupError) as raised:
+            self._resolve("unauthorized", identifier="", url="")
+
+        self.assertEqual(
+            raised.exception.reason,
+            linear.LinearIssueLookupReason.UNAUTHORIZED,
+        )
+
+    def test_transient_provider_failure_fails_closed(self) -> None:
+        with self.assertRaises(linear.LinearIssueLookupError) as raised:
+            self._resolve(
+                "found",
+                herdr_error=HerdrError("timeout", code="timeout"),
+            )
+
+        self.assertEqual(
+            raised.exception.reason,
+            linear.LinearIssueLookupReason.TRANSIENT,
+        )
+
+    def test_thrown_authentication_failure_is_unauthorized(self) -> None:
+        for error in (
+            HerdrError(
+                "Linear MCP requires authentication",
+                code="mcp_authentication_required",
+            ),
+            HerdrError("MCP request rejected", code="permission_denied"),
+            HerdrError("not authorized to call the Linear tool"),
+        ):
+            with self.subTest(error=error):
+                with self.assertRaises(linear.LinearIssueLookupError) as raised:
+                    self._resolve("found", herdr_error=error)
+
+                self.assertEqual(
+                    raised.exception.reason,
+                    linear.LinearIssueLookupReason.UNAUTHORIZED,
+                )
+
+    def test_unstructured_mcp_authorization_failure_is_unauthorized(self) -> None:
+        for output in (
+            "Linear MCP server requires authentication before tools can be used.",
+            "Tool call failed: permission denied.",
+            "You are not authorized to access this Linear workspace.",
+        ):
+            with self.subTest(output=output):
+                with self.assertRaises(linear.LinearIssueLookupError) as raised:
+                    self._resolve("unknown", raw_output=output)
+
+                self.assertEqual(
+                    raised.exception.reason,
+                    linear.LinearIssueLookupReason.UNAUTHORIZED,
+                )
+
+    def test_identity_mismatch_fails_closed(self) -> None:
+        with self.assertRaises(linear.LinearIssueLookupError) as raised:
+            self._resolve(
+                "found",
+                identifier="ENG-2",
+                url="https://linear.app/acme/issue/ENG-2/other",
+            )
+
+        self.assertEqual(
+            raised.exception.reason,
+            linear.LinearIssueLookupReason.UNKNOWN,
+        )
+
+    def test_resolve_prompt_is_read_only(self) -> None:
+        client = mock.Mock()
+        client.ensure_router.return_value = mock.Mock(target="voice-router")
+
+        def prompt(*_args: object, **kwargs: object) -> object:
+            token = str(kwargs["token"])
+            return mock.Mock(
+                output=(
+                    f"VOICE_LINEAR_STATUS[{token}]: found\n"
+                    f"VOICE_LINEAR_IDENTIFIER[{token}]: ENG-1\n"
+                    f"VOICE_LINEAR_URL[{token}]: "
+                    "https://linear.app/acme/issue/ENG-1/title"
+                )
+            )
+
+        client.prompt_and_wait.side_effect = prompt
+        with (
+            tempfile.TemporaryDirectory() as temporary,
+            mock.patch.object(
+                linear,
+                "LINEAR_ROUTER_LOCK",
+                Path(temporary) / "router.lock",
+            ),
+            mock.patch.object(self.integration, "require_capabilities"),
+        ):
+            self.integration.resolve_issue(client, "ENG-1")
+
+        prompt_text = client.prompt_and_wait.call_args.args[1]
+        self.assertIn("read-only", prompt_text)
+        self.assertIn("Do not create or modify anything", prompt_text)
+
+
 if __name__ == "__main__":
     unittest.main()

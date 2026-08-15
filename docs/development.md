@@ -21,14 +21,17 @@ non-sensitive summary. This text-only smoke does not use the microphone and does
 not require stopping the installed wake listener.
 
 The launcher sets `XDG_CONFIG_HOME` to `.dev/config`, `XDG_STATE_HOME` to
-`.dev/state`, and `UV_PROJECT_ENVIRONMENT` to `.dev/venv`. For example,
+`.dev/state`, `UV_PROJECT_ENVIRONMENT` to `.dev/venv`, and
+`VOICE_HARNESS_BRANCH_RUNTIME` to `.dev/runtime`. For example,
 branch-specific backend configuration belongs at
 `.dev/config/voice-harness/backends.toml`, durable jobs are stored below
-`.dev/state/voice-harness/`, and launcher dependencies stay in `.dev/venv`.
+`.dev/state/voice-harness/`, worker logs and other branch-owned transients live
+under `.dev/runtime/`, and launcher dependencies stay in `.dev/venv`.
 The checkout-local jobs database is explicitly
 `<checkout>/.dev/state/voice-harness/jobs/jobs.sqlite3`.
 All launcher commands in one checkout share that database, while launchers in
-different checkout or worktree roots use distinct databases. The launcher also
+different checkout or worktree roots use distinct databases, logs, and worker
+environments. The launcher also
 removes an inherited systemd `STATE_DIRECTORY` before starting Python, so a shell
 carrying the installed service environment cannot override `.dev/state` or select
 the production jobs database.
@@ -151,16 +154,22 @@ remain visible in the completion response; do not retry them automatically.
 
 This is branch testing isolation, not a complete runtime profile:
 
-- `XDG_RUNTIME_DIR` is preserved. Runtime sockets, recording paths, locks, and
-  other transient resources remain shared.
-- The installed STT, TTS, and LLM services and sockets are reused, and those
-  services still use their installed configuration. This workflow is mainly for
-  application, routing, integration, and wake-daemon development.
+- Isolated per worktree: configuration (`.dev/config`), durable state
+  (`.dev/state`), branch-owned transients and worker logs (`.dev/runtime`),
+  Cursor job records, spawned worker `TMPDIR`, and the launcher virtualenv
+  (`.dev/venv`). Concurrent `scripts/dev.sh text` commands from separate
+  worktrees execute that checkout's code and do not read or modify another
+  worktree's `.dev/` files.
+- Shared: `XDG_RUNTIME_DIR` is preserved for installed STT, TTS, and LLM
+  sockets, recording paths, the wake lock, and other microphone-owned runtime.
+  Those services still use their installed configuration and endpoints.
 - Wake and audio settings are loaded when the process starts. Hot reload is out
   of scope; restart the foreground process after changing an override.
-- Only one wake listener should own the microphone and shared runtime. Stop the
-  installed wake unit yourself before using the foreground listener, then restore
-  it afterward.
+- Only one wake listener should own the microphone and shared wake runtime.
+  `scripts/dev.sh wake` still refuses to start when
+  `voice-harness-wake.service` is active, without changing systemd state. Stop
+  the installed wake unit yourself before using the foreground listener, then
+  restore it afterward.
 - Desktop Secret Service credentials and external integrations are not isolated.
   The launcher can read credentials as the application normally does, but offers
   no command that changes them.

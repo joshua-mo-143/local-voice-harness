@@ -29,6 +29,8 @@ from ..job_lifecycle import (
     RecoveryEvent,
     RoutingProvisioningJob,
     RunningJob,
+    SessionControlMode,
+    SessionControlState,
     TerminalJob,
     WorkerCallbackEvent,
     WorkerClaim,
@@ -246,6 +248,7 @@ _INT_FIELDS = frozenset(
         "plan_approval_revision",
         "linear_ticket_create_baseline_sequence",
         "agent_state_sequence",
+        "session_control_generation",
     }
 )
 _FLOAT_FIELDS = frozenset(
@@ -407,6 +410,7 @@ _STRING_FIELDS = frozenset(
         "harness_kind",
         "issue_provider",
         "session_id",
+        "session_control",
     }
 )
 _AGENT_OPERATION_STATES = frozenset(
@@ -605,6 +609,8 @@ _HARNESS_STATE_FIELDS = frozenset(
         "target_release_manual_required",
         "target_release_unverified_targets",
         "participant_session_owners",
+        "session_control",
+        "session_control_generation",
     }
 )
 _CHECKOUT_STATE_FIELDS = frozenset(
@@ -1042,6 +1048,8 @@ def migrate_job_record(raw: Mapping[str, object]) -> tuple[dict[str, object], in
             _default_participant_admission_state(values),
         )
         _default_announcement_ack(values)
+    values.setdefault("session_control", SessionControlMode.AUTOMATED.value)
+    values.setdefault("session_control_generation", 0)
     values["schema_version"] = CURRENT_SCHEMA_VERSION
     return values, loaded_version
 
@@ -2640,6 +2648,24 @@ class AgentJob:
         return self._optional_int("agent_state_sequence")
 
     @property
+    def session_control(self) -> str:
+        return (
+            self._optional_string("session_control")
+            or SessionControlMode.AUTOMATED.value
+        )
+
+    @property
+    def session_control_generation(self) -> int:
+        return self._optional_int("session_control_generation") or 0
+
+    def session_control_state(self) -> SessionControlState:
+        try:
+            mode = SessionControlMode(self.session_control)
+        except ValueError as exc:
+            raise JobValidationError("session_control has invalid value") from exc
+        return SessionControlState(mode, self.session_control_generation)
+
+    @property
     def agent_operation_checkout(self) -> str | None:
         return self._optional_string("agent_operation_checkout")
 
@@ -3380,6 +3406,7 @@ class AgentJob:
         resolved_at: float,
         pane_id: str | None = None,
         workspace_id: str | None = None,
+        job_changes: Mapping[str, object] | None = None,
     ) -> CursorJob | None:
         retain_terminal_release = self.terminal_intent_status is not None
         state_key = {
@@ -3393,7 +3420,6 @@ class AgentJob:
             state_key: "confirmed_absent"
             if outcome == "confirmed_absent"
             else "retained",
-            f"{operation}_{'confirmed_absent' if outcome == 'confirmed_absent' else 'retained'}_at": resolved_at,
             "manual_reconcile_operation": None,
             "manual_reconcile_token": None,
             "manual_reconcile_resolved_at": resolved_at,
@@ -3404,6 +3430,10 @@ class AgentJob:
             "worker_process_start": None,
             "worker_token": None,
         }
+        if operation != "prompt":
+            changes[
+                f"{operation}_{'confirmed_absent' if outcome == 'confirmed_absent' else 'retained'}_at"
+            ] = resolved_at
         cleanup = self.cleanup_state
         if isinstance(cleanup, CleanupOwned):
             cleanup = abandon_cleanup_owner(cleanup, cleanup.token or "")
@@ -3510,6 +3540,7 @@ class AgentJob:
             )
             if participant is not None:
                 changes[f"{participant.value}_target"] = None
+        changes.update(job_changes or {})
         return self.evolve_recovery(
             changes,
             now=resolved_at,
@@ -4046,6 +4077,10 @@ class AgentJob:
                 raise JobValidationError(
                     "terminal intent requires reconciling status and release fence"
                 )
+        try:
+            self.session_control_state()
+        except JobLifecycleError as exc:
+            raise JobValidationError(str(exc)) from exc
         self._validate_operation_state(
             "agent_dispatch_state",
             self.agent_dispatch_state,

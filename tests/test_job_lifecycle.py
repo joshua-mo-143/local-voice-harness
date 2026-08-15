@@ -27,6 +27,8 @@ from local_voice_harness.job_lifecycle import (
     RecoveryEvent,
     RoutingProvisioningJob,
     RunningJob,
+    SessionControlMode,
+    SessionControlState,
     TerminalJob,
     WorkerCallbackEvent,
     WorkerClaim,
@@ -210,3 +212,21 @@ def test_follow_up_event_fences_parent_completion_and_inherited_identity() -> No
     assert apply_follow_up(parent, FollowUpEvent(7, 2, child)) == child
     with pytest.raises(JobLifecycleError, match="stale follow-up"):
         apply_follow_up(parent, FollowUpEvent(6, 2, child))
+
+
+def test_session_control_relinquish_and_resume_advance_generation() -> None:
+    control = SessionControlState()
+    owned = control.relinquish()
+    resumed = owned.resume()
+
+    assert control.mode is SessionControlMode.AUTOMATED
+    assert owned.mode is SessionControlMode.USER_OWNED
+    assert owned.generation == 1
+    assert resumed.mode is SessionControlMode.AUTOMATED
+    assert resumed.generation == 2
+    with pytest.raises(JobLifecycleError, match="already user-owned"):
+        owned.relinquish()
+    with pytest.raises(JobLifecycleError, match="not user-owned"):
+        control.resume()
+    with pytest.raises(JobLifecycleError, match="must not be negative"):
+        SessionControlState(SessionControlMode.AUTOMATED, -1)

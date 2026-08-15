@@ -25,10 +25,17 @@ from ..integrations.github import (
     github_issue_from_url,
 )
 from ..integrations.herdr import HerdrClient, HerdrError
+from ..integrations.linear import (
+    LinearIssue,
+    LinearIssueLookupError,
+    LinearIssueLookupReason,
+    parse_linear_issue_reference,
+)
 from ..integrations.registry import (
     IntegrationRegistry,
     extract_issue_reference,
     integration_enabled,
+    issue_provider,
     issue_provider_identity,
     require_issue_capabilities,
     require_issue_provider,
@@ -179,6 +186,7 @@ class TicketStartOutcome:
     job_id: str | None = None
     detail: str | None = None
     github_lookup_reason: GitHubIssueLookupReason | None = None
+    linear_lookup_reason: LinearIssueLookupReason | None = None
 
 
 GROUPED_REPOSITORY_OWNER = "grouped_repository"
@@ -312,6 +320,8 @@ def _dispatch_waiting_jobs(
         except FileNotFoundError:
             continue
         if current.participant_admission_state != "held":
+            continue
+        if current.session_control == "user_owned":
             continue
         try:
             launch_worker(job_id)
@@ -574,13 +584,39 @@ def _rejected(
     detail: str,
     *,
     github_lookup_reason: GitHubIssueLookupReason | None = None,
+    linear_lookup_reason: LinearIssueLookupReason | None = None,
 ) -> TicketStartOutcome:
     return TicketStartOutcome(
         reference.label,
         "rejected",
         detail=_start_error_detail(HarnessError(detail)),
         github_lookup_reason=github_lookup_reason,
+        linear_lookup_reason=linear_lookup_reason,
     )
+
+
+def resolve_linear_issue(
+    reference: str,
+    integrations: IntegrationRegistry,
+) -> LinearIssue:
+    """Resolve one Linear issue's existence and accessibility before admission."""
+
+    parsed = parse_linear_issue_reference(reference)
+    integration = issue_provider("linear", integrations)
+    resolve = getattr(integration, "resolve_issue", None)
+    factory = getattr(integrations, "herdr_client", None)
+    if not callable(resolve) or not callable(factory):
+        raise LinearIssueLookupError(
+            LinearIssueLookupReason.TRANSIENT,
+            "Linear lookup client is unavailable",
+        )
+    resolved = resolve(factory(), parsed.identifier)
+    if not isinstance(resolved, LinearIssue):
+        raise LinearIssueLookupError(
+            LinearIssueLookupReason.UNKNOWN,
+            "Linear lookup returned an invalid issue identity",
+        )
+    return resolved
 
 
 def _github_target(
@@ -652,21 +688,44 @@ def _linear_target(
     foreground: bool,
     integrations: IntegrationRegistry,
 ) -> TicketJobRequest | TicketStartOutcome:
-    canonical = resolve_issue_reference(reference.canonical, integrations)
+    try:
+        parsed = parse_linear_issue_reference(reference.canonical or reference.raw)
+    except LinearIssueLookupError as exc:
+        return _rejected(
+            reference,
+            exc.voice_message,
+            linear_lookup_reason=exc.reason,
+        )
+    canonical = resolve_issue_reference(parsed.identifier, integrations)
     if canonical is None:
         return _rejected(
             reference,
             "Linear integration is disabled or the issue key is invalid",
         )
+    try:
+        issue = resolve_linear_issue(canonical, integrations)
+    except LinearIssueLookupError as exc:
+        return _rejected(
+            reference,
+            exc.voice_message,
+            linear_lookup_reason=exc.reason,
+        )
+    except HarnessError as exc:
+        return _rejected(
+            reference,
+            str(exc),
+            linear_lookup_reason=LinearIssueLookupReason.UNKNOWN,
+        )
+    identity = issue.identifier
     return TicketJobRequest(
-        canonical,
+        identity,
         StartJobRequest(
-            text=_scoped_request_text(base, canonical, "linear"),
+            text=_scoped_request_text(base, identity, "linear"),
             repository=base.repository,
             agent=base.agent,
-            utterance=f"Work only on Linear issue {canonical}.",
+            utterance=f"Work only on Linear issue {identity}.",
             context_repository=base.context_repository,
-            issue_key=canonical,
+            issue_key=identity,
             foreground=foreground,
         ),
     )
@@ -694,7 +753,17 @@ def _preflight_ticket_targets(
 
     for index, reference in enumerate(extraction.references):
         if reference.error is not None:
-            slots[index] = _rejected(reference, reference.error)
+            linear_reason = None
+            if reference.source == "linear":
+                try:
+                    parse_linear_issue_reference(reference.canonical or reference.raw)
+                except LinearIssueLookupError as exc:
+                    linear_reason = exc.reason
+            slots[index] = _rejected(
+                reference,
+                reference.error,
+                linear_lookup_reason=linear_reason,
+            )
             continue
         if reference.canonical is None or reference.source is None:
             slots[index] = _rejected(reference, "ticket reference is invalid")
@@ -1016,13 +1085,23 @@ def _ticket_start_spoken(
             lookup_reason,
             f"I couldn't verify {identity}.",
         )
+    if len(outcomes) == 1 and outcomes[0].linear_lookup_reason is not None:
+        return LinearIssueLookupError(
+            outcomes[0].linear_lookup_reason,
+            outcomes[0].detail or "",
+        ).voice_message
     accepted = sum(outcome.status == "accepted" for outcome in outcomes)
     queued = sum(outcome.status == "queued" for outcome in outcomes)
-    lookup_failures = sum(
+    github_lookup_failures = sum(
         outcome.github_lookup_reason is not None for outcome in outcomes
     )
+    linear_lookup_failures = sum(
+        outcome.linear_lookup_reason is not None for outcome in outcomes
+    )
     rejected = sum(
-        outcome.status == "rejected" and outcome.github_lookup_reason is None
+        outcome.status == "rejected"
+        and outcome.github_lookup_reason is None
+        and outcome.linear_lookup_reason is None
         for outcome in outcomes
     )
     start_failed = sum(outcome.status == "start-failed" for outcome in outcomes)
@@ -1032,9 +1111,13 @@ def _ticket_start_spoken(
         parts.append(f"{_counted(accepted, 'job')} started")
     if queued:
         parts.append(f"{_counted(queued, 'job')} accepted and queued")
-    if lookup_failures:
+    if github_lookup_failures:
         parts.append(
-            f"{_counted(lookup_failures, 'GitHub issue')} could not be accessed"
+            f"{_counted(github_lookup_failures, 'GitHub issue')} could not be accessed"
+        )
+    if linear_lookup_failures:
+        parts.append(
+            f"{_counted(linear_lookup_failures, 'Linear issue')} could not be accessed"
         )
     if rejected:
         parts.append(f"{_counted(rejected, 'ticket')} rejected")
@@ -1064,6 +1147,18 @@ def _ticket_display_detail(outcome: TicketStartOutcome) -> str | None:
             GitHubIssueLookupReason.UNKNOWN: "GitHub issue could not be verified",
         }
         return classified[outcome.github_lookup_reason]
+    if outcome.linear_lookup_reason is not None:
+        classified = {
+            LinearIssueLookupReason.NOT_FOUND_OR_INACCESSIBLE: (
+                "issue not found or inaccessible"
+            ),
+            LinearIssueLookupReason.UNAUTHORIZED: "Linear authorization required",
+            LinearIssueLookupReason.TRANSIENT: "Linear temporarily unavailable",
+            LinearIssueLookupReason.MALFORMED: "Linear issue key is malformed",
+            LinearIssueLookupReason.NONPOSITIVE: "Linear issue number must be positive",
+            LinearIssueLookupReason.UNKNOWN: "Linear issue could not be verified",
+        }
+        return classified[outcome.linear_lookup_reason]
     if outcome.status == "start-failed":
         if outcome.job_id:
             return f"job {outcome.job_id} failed to start; check its log"
@@ -1960,6 +2055,25 @@ def job_status(job_id: str | None = None) -> str:
 
 def acknowledge_worktree_quarantine(job_id: str) -> None:
     recovery.acknowledge_worktree_quarantine(_job_store(), job_id)
+
+
+def relinquish_session_control(job_id: str) -> CursorJob:
+    return recovery.relinquish_session_control(_job_store(), job_id)
+
+
+def resume_session_control(
+    job_id: str,
+    *,
+    integrations: IntegrationRegistry | None = None,
+) -> CursorJob:
+    herdr_factory = (
+        provisioning.HerdrClient if integrations is None else integrations.herdr_client
+    )
+    return recovery.resume_session_control(
+        _job_store(),
+        job_id,
+        herdr_factory=herdr_factory,
+    )
 
 
 def resolve_manual_reconciliation(

@@ -15,6 +15,24 @@ class ConfigPathTests(unittest.TestCase):
         self.assertEqual(config.LEGACY_JOBS_DIR, config.STATE_DIR / "jobs")
         self.assertNotEqual(config.JOBS_DIR, config.JOB_LOGS_DIR)
 
+    def test_branch_runtime_isolates_job_logs_without_moving_shared_sockets(
+        self,
+    ) -> None:
+        branch_runtime = Path("/tmp/worktree/.dev/runtime")
+        environment = {
+            "XDG_RUNTIME_DIR": "/run/user/1000",
+            "VOICE_HARNESS_BRANCH_RUNTIME": str(branch_runtime),
+        }
+
+        self.assertEqual(config.branch_runtime_dir(environment), branch_runtime)
+        self.assertIsNone(config.branch_runtime_dir({}))
+        self.assertIsNone(
+            config.branch_runtime_dir({"VOICE_HARNESS_BRANCH_RUNTIME": "relative"})
+        )
+        self.assertEqual(config.STT_SOCKET, config.RUNTIME / "dictation.sock")
+        self.assertEqual(config.TTS_SOCKET, config.RUNTIME / "voice-harness-tts.sock")
+        self.assertEqual(config.WAKE_LOCK, config.RUNTIME / "voice-harness-wake.lock")
+
     def test_xdg_state_home_uses_standard_fallback(self) -> None:
         home = Path("/home/example")
 

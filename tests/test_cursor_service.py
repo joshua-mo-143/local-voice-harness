@@ -31,10 +31,21 @@ from local_voice_harness.integrations.github import (
     GitHubIssueLookupError,
     GitHubIssueLookupReason,
 )
+from local_voice_harness.integrations.linear import (
+    LinearIssue,
+    LinearIssueLookupError,
+    LinearIssueLookupReason,
+)
 from local_voice_harness.integrations.registry import build_integration_registry
 from local_voice_harness.responses import AssistantResponse, as_assistant_response
 from local_voice_harness.ticket_targets import TicketExtraction, TicketReference
 from local_voice_harness.user_config import default_user_config
+
+
+def _resolved_linear_issue(
+    reference: str, *_args: object, **_kwargs: object
+) -> LinearIssue:
+    return LinearIssue(reference)
 
 
 def test_service_request_and_result_types_are_explicit() -> None:
@@ -367,6 +378,11 @@ def test_natural_github_target_and_genuine_linear_key_keep_providers() -> None:
         ),
         mock.patch.object(
             service,
+            "resolve_linear_issue",
+            side_effect=_resolved_linear_issue,
+        ),
+        mock.patch.object(
+            service,
             "_preflight_batch_repositories",
             side_effect=lambda prepared, _slots, **_kwargs: (
                 prepared,
@@ -453,6 +469,11 @@ def test_multi_ticket_repository_ambiguities_use_one_durable_grouped_question(
             service,
             "resolve_issue_reference",
             side_effect=lambda reference, _registry: reference,
+        ),
+        mock.patch.object(
+            service,
+            "resolve_linear_issue",
+            side_effect=_resolved_linear_issue,
         ),
         mock.patch.object(
             service,
@@ -560,6 +581,11 @@ def test_batch_provider_failure_is_rejected_without_rofi_or_question(
             service,
             "resolve_issue_reference",
             side_effect=lambda reference, _registry: reference,
+        ),
+        mock.patch.object(
+            service,
+            "resolve_linear_issue",
+            side_effect=_resolved_linear_issue,
         ),
         mock.patch.object(
             service,
@@ -804,6 +830,11 @@ def test_unresolved_batches_create_no_ticket_ownership(
             service,
             "resolve_issue_reference",
             side_effect=lambda reference, _registry: reference,
+        ),
+        mock.patch.object(
+            service,
+            "resolve_linear_issue",
+            side_effect=_resolved_linear_issue,
         ),
         mock.patch.object(
             service,
@@ -1437,11 +1468,19 @@ def test_fanout_linear_capability_preflight_happens_before_any_start() -> None:
         events.append(f"resolve-{reference}")
         return reference
 
+    def resolve_linear(
+        reference: str, *_args: object, **_kwargs: object
+    ) -> LinearIssue:
+        events.append(f"linear-{reference}")
+        return LinearIssue(reference)
+
     def start(request: StartJobRequest, **_kwargs: object) -> str:
-        assert events[:3] == [
+        assert events[:5] == [
             "capability-ENG-1",
             "resolve-ENG-1",
+            "linear-ENG-1",
             "resolve-ENG-2",
+            "linear-ENG-2",
         ]
         events.append(f"start-{request.issue_key}")
         return f"job-{request.issue_key}"
@@ -1456,6 +1495,7 @@ def test_fanout_linear_capability_preflight_happens_before_any_start() -> None:
     with (
         mock.patch.object(service, "require_issue_capabilities", side_effect=require),
         mock.patch.object(service, "resolve_issue_reference", side_effect=resolve),
+        mock.patch.object(service, "resolve_linear_issue", side_effect=resolve_linear),
         mock.patch.object(
             service,
             "_preflight_batch_repositories",
@@ -1475,6 +1515,145 @@ def test_fanout_linear_capability_preflight_happens_before_any_start() -> None:
     assert response.display_text.startswith("Ticket starts: ENG-1: accepted")
     assert "ENG-2: accepted" in response.display_text
     assert response.spoken_text == ("Two jobs started for “Work on ENG-1 and ENG-2.”")
+
+
+def test_linear_preflight_rejects_invalid_targets_before_admission(
+    tmp_path: Path,
+) -> None:
+    store = JobStore(tmp_path / "jobs", tmp_path / "legacy")
+    github_client = mock.Mock()
+    github_client.issue_details.side_effect = lambda issue: {
+        "number": issue.number,
+        "title": f"Issue {issue.number}",
+        "state": "OPEN",
+        "url": f"https://github.com/example/project/issues/{issue.number}",
+    }
+    registry = mock.Mock()
+    registry.github_client.return_value = github_client
+    started: list[TicketJobRequest] = []
+
+    def resolve_linear(
+        reference: str, *_args: object, **_kwargs: object
+    ) -> LinearIssue:
+        if reference == "ENG-1":
+            return LinearIssue("ENG-1")
+        if reference == "ENG-404":
+            raise LinearIssueLookupError(
+                LinearIssueLookupReason.NOT_FOUND_OR_INACCESSIBLE,
+                "Linear issue ENG-404 was not found",
+            )
+        if reference == "ENG-403":
+            raise LinearIssueLookupError(
+                LinearIssueLookupReason.NOT_FOUND_OR_INACCESSIBLE,
+                "Linear issue ENG-403 is inaccessible",
+            )
+        if reference == "ENG-503":
+            raise LinearIssueLookupError(
+                LinearIssueLookupReason.TRANSIENT,
+                "Linear lookup timed out",
+            )
+        raise AssertionError(reference)
+
+    def start(
+        requests: tuple[TicketJobRequest, ...], **_kwargs: object
+    ) -> tuple[service.TicketStartOutcome, ...]:
+        started.extend(requests)
+        return tuple(
+            service.TicketStartOutcome(
+                request.target,
+                "accepted",
+                job_id=f"{index + 1:012x}",
+            )
+            for index, request in enumerate(requests)
+        )
+
+    extraction = TicketExtraction(
+        (
+            TicketReference("example/project#1", 0, "github", "example/project#1"),
+            TicketReference("eng-1", 10, "linear", "eng-1"),
+            TicketReference("ENG-404", 20, "linear", "ENG-404"),
+            TicketReference("ENG-403", 30, "linear", "ENG-403"),
+            TicketReference(
+                "ENG-0",
+                40,
+                "linear",
+                None,
+                error="Linear issue number must be positive",
+            ),
+            TicketReference("ENG-", 50, "linear", "ENG-"),
+            TicketReference("ENG-503", 60, "linear", "ENG-503"),
+        ),
+        requested_count=7,
+    )
+
+    with (
+        mock.patch.object(service, "_job_store", return_value=store),
+        mock.patch.object(service, "integration_enabled", return_value=True),
+        mock.patch.object(service, "require_issue_capabilities"),
+        mock.patch.object(
+            service,
+            "resolve_issue_reference",
+            side_effect=lambda reference, _registry: reference,
+        ),
+        mock.patch.object(service, "resolve_linear_issue", side_effect=resolve_linear),
+        mock.patch.object(
+            service,
+            "_preflight_batch_repositories",
+            side_effect=lambda prepared, _slots, **_kwargs: (prepared, [], []),
+        ),
+        mock.patch.object(service, "start_jobs", side_effect=start) as start_jobs,
+        mock.patch.object(service, "launch_worker") as launch,
+    ):
+        outcomes = service._submit_extracted_targets(
+            extraction,
+            StartJobRequest(
+                "Work on example/project#1, eng-1, ENG-404, ENG-403, ENG-0, ENG-, and ENG-503",
+                foreground=False,
+            ),
+            foreground=False,
+            foreground_seconds=5,
+            concurrency=3,
+            integrations=registry,
+        )
+
+    assert [(outcome.target, outcome.status) for outcome in outcomes] == [
+        ("example/project#1", "accepted"),
+        ("ENG-1", "accepted"),
+        ("ENG-404", "rejected"),
+        ("ENG-403", "rejected"),
+        ("ENG-0", "rejected"),
+        ("ENG-", "rejected"),
+        ("ENG-503", "rejected"),
+    ]
+    assert [outcome.linear_lookup_reason for outcome in outcomes] == [
+        None,
+        None,
+        LinearIssueLookupReason.NOT_FOUND_OR_INACCESSIBLE,
+        LinearIssueLookupReason.NOT_FOUND_OR_INACCESSIBLE,
+        LinearIssueLookupReason.NONPOSITIVE,
+        LinearIssueLookupReason.MALFORMED,
+        LinearIssueLookupReason.TRANSIENT,
+    ]
+    assert [
+        (request.target, request.request.issue_key, request.request.github_issue)
+        for request in started
+    ] == [
+        ("example/project#1", None, 1),
+        ("ENG-1", "ENG-1", None),
+    ]
+    start_jobs.assert_called_once()
+    assert start_jobs.call_args.args[0] == tuple(started)
+    assert store.list() == []
+    launch.assert_not_called()
+    display = service._ticket_start_summary(outcomes).display_text
+    assert display.index("example/project#1: accepted") < display.index(
+        "ENG-1: accepted"
+    )
+    assert display.index("ENG-1: accepted") < display.index("ENG-404: rejected")
+    assert "issue not found or inaccessible" in display
+    assert "Linear issue number must be positive" in display
+    assert "Linear issue key is malformed" in display
+    assert "Linear temporarily unavailable" in display
 
 
 def test_foreground_agent_failure_keeps_diagnostics_out_of_speech(

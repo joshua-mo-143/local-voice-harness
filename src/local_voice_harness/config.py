@@ -16,8 +16,24 @@ RUNTIME = Path(os.environ.get("XDG_RUNTIME_DIR", "/tmp"))
 RECORDING_LOCK = RUNTIME / "voice-harness-recording.lock"
 WAKE_LOCK = RUNTIME / "voice-harness-wake.lock"
 STATE_DIR = RUNTIME / "voice-harness"
-LEGACY_JOBS_DIR = STATE_DIR / "jobs"
-JOB_LOGS_DIR = STATE_DIR / "jobs"
+
+
+def branch_runtime_dir(
+    environment: Mapping[str, str] = os.environ,
+) -> Path | None:
+    """Checkout-local transient runtime used by development launchers."""
+
+    configured = environment.get("VOICE_HARNESS_BRANCH_RUNTIME", "")
+    path = Path(configured) if configured else None
+    if path is not None and path.is_absolute():
+        return path
+    return None
+
+
+_BRANCH_RUNTIME = branch_runtime_dir()
+_TRANSIENT_JOBS_DIR = (_BRANCH_RUNTIME or STATE_DIR) / "jobs"
+LEGACY_JOBS_DIR = _TRANSIENT_JOBS_DIR
+JOB_LOGS_DIR = _TRANSIENT_JOBS_DIR
 
 
 def xdg_state_home(

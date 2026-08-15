@@ -411,7 +411,11 @@ def launch_worker(
     )
 
     def reserve(job: CursorJob) -> CursorJob | None:
-        if job.status != JobStatus.QUEUED or job.worker_token:
+        if (
+            job.status != JobStatus.QUEUED
+            or job.worker_token
+            or job.session_control == "user_owned"
+        ):
             return None
         return transition(
             job,
