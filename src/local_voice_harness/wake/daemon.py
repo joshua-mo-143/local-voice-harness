@@ -422,6 +422,27 @@ CLOSE_PATTERN = re.compile(
     r"\b(?:goodbye|stop listening|go to sleep|end conversation)\b", re.IGNORECASE
 )
 STOP_TALKING_PATTERN = re.compile(r"\b(?:stop talking|shut up)\b", re.IGNORECASE)
+TRANSCRIPT_REPLAY_PATTERN = re.compile(
+    r"^\s*(?:"
+    r"what\s+did\s+you\s+hear|"
+    r"what\s+did\s+i\s+(?:just\s+)?say|"
+    r"(?:please\s+)?(?:repeat|replay|read\s+back)\s+(?:the\s+)?"
+    r"(?:last\s+)?(?:transcript|utterance)|"
+    r"play\s+(?:that|it|what\s+i\s+said)\s+back"
+    r")\s*[?.!]?\s*$",
+    re.IGNORECASE,
+)
+TRANSCRIPT_CORRECTION_PATTERN = re.compile(
+    r"^\s*(?:"
+    r"i\s+said\s+|"
+    r"that(?:'s|\s+is)\s+not\s+what\s+i\s+said(?:[,.]?\s*(?:i\s+said\s+))?"
+    r")(.+?)\s*$",
+    re.IGNORECASE,
+)
+TRANSCRIPT_CORRECTION_BARE_PATTERN = re.compile(
+    r"^\s*that(?:'s|\s+is)\s+not\s+what\s+i\s+said\s*[!.]?\s*$",
+    re.IGNORECASE,
+)
 PENDING_SUBMIT_PATTERN = re.compile(
     r"\b(?:work\s+on|fix|change|update|implement|add|remove|run|review|inspect|"
     r"start|create|build|refactor|test)\b",
@@ -454,6 +475,15 @@ RECENT_DETAILS_UNAVAILABLE = (
     "I no longer have details for that recent announcement. "
     "Ask for the job by name or ID."
 )
+MISSING_TRANSCRIPT_RESPONSE = (
+    "I don't have a recent transcript to replay, so I won't invent one."
+)
+DISPATCHED_TRANSCRIPT_RESPONSE = (
+    "I already started that request, so I can't replace what I heard."
+)
+BARE_TRANSCRIPT_CORRECTION_RESPONSE = (
+    "I heard a correction but no replacement. Say I said, then the request."
+)
 
 
 @dataclass
@@ -475,6 +505,20 @@ class CompletedFollowup:
     completed_at: float | None
     expires_at: float
     display_fingerprint: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class LastTranscript:
+    """Volatile trusted utterance for the current wake conversation.
+
+    ``expires_at`` is a ``time.monotonic()`` deadline, so the slot cannot
+    survive a restart. ``dispatched`` becomes true only after a job or write
+    has started for this utterance.
+    """
+
+    utterance: str
+    dispatched: bool
+    expires_at: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -585,6 +629,7 @@ class WakeConversationDaemon:
         self.conversation_deadline = 0.0
         self.awaiting_followup = False
         self.last_ordinary_reply: str | None = None
+        self.last_transcript: LastTranscript | None = None
         self.last_wake = 0.0
         self.force_listen = threading.Event()
         self.running = True
@@ -790,6 +835,7 @@ class WakeConversationDaemon:
         self.conversation_deadline = 0.0
         self.awaiting_followup = False
         self.last_ordinary_reply = None
+        self.last_transcript = None
         self.pause_microphone()
         try:
             self.stop_components_when_idle()
@@ -1211,6 +1257,59 @@ class WakeConversationDaemon:
             return None
         return followup
 
+    def _active_last_transcript(self) -> LastTranscript | None:
+        """Return the live last-transcript slot, clearing it once it has expired."""
+        slot = self.last_transcript
+        if slot is None:
+            return None
+        if time.monotonic() >= slot.expires_at:
+            self.last_transcript = None
+            return None
+        return slot
+
+    def _remember_last_transcript(self, utterance: str) -> None:
+        text = utterance.strip()
+        if not text:
+            return
+        self.last_transcript = LastTranscript(
+            utterance=text,
+            dispatched=False,
+            expires_at=time.monotonic() + CONVERSATION_TIMEOUT_SECONDS,
+        )
+
+    def _refresh_last_transcript_deadline(self) -> None:
+        slot = self.last_transcript
+        if slot is None:
+            return
+        self.last_transcript = LastTranscript(
+            utterance=slot.utterance,
+            dispatched=slot.dispatched,
+            expires_at=time.monotonic() + CONVERSATION_TIMEOUT_SECONDS,
+        )
+
+    def _mark_last_transcript_dispatched(self) -> None:
+        slot = self._active_last_transcript()
+        if slot is None:
+            return
+        self.last_transcript = LastTranscript(
+            utterance=slot.utterance,
+            dispatched=True,
+            expires_at=slot.expires_at,
+        )
+
+    def _speak_control_notice(self, spoken: str) -> BargeIn | None:
+        self.ensure_components()
+        response = AssistantResponse.from_text(spoken)
+        print(f"Assistant: {response.display_text}", flush=True)
+        _playback, interruption = self.play_response(response)
+        if interruption is not None:
+            return interruption
+        self.awaiting_followup = True
+        self.conversation_deadline = time.monotonic() + CONVERSATION_TIMEOUT_SECONDS
+        self._refresh_last_transcript_deadline()
+        notify("Listening for a follow-up…")
+        return None
+
     def _recent_completion_details(
         self,
         followup: CompletedFollowup,
@@ -1435,6 +1534,7 @@ class WakeConversationDaemon:
             if before_mutation is not None:
                 before_mutation()
             result = commit_pending_change(pending)
+            self._mark_last_transcript_dispatched()
         except StaleConfigChangeError:
             if after_mutation is not None:
                 after_mutation()
@@ -2034,6 +2134,34 @@ class WakeConversationDaemon:
                 )
                 notify("Listening for a follow-up…")
                 return None
+            if TRANSCRIPT_REPLAY_PATTERN.search(text):
+                terminalize_non_side_effect()
+                slot = self._active_last_transcript()
+                if slot is None:
+                    return self._speak_control_notice(MISSING_TRANSCRIPT_RESPONSE)
+                return self._speak_control_notice(f"I heard: {slot.utterance}")
+            if TRANSCRIPT_CORRECTION_BARE_PATTERN.search(text):
+                terminalize_non_side_effect()
+                if self._active_last_transcript() is None:
+                    return self._speak_control_notice(MISSING_TRANSCRIPT_RESPONSE)
+                return self._speak_control_notice(BARE_TRANSCRIPT_CORRECTION_RESPONSE)
+            correction = TRANSCRIPT_CORRECTION_PATTERN.search(text)
+            if correction is not None:
+                replacement = correction.group(1).strip()
+                slot = self._active_last_transcript()
+                if slot is None or not replacement:
+                    terminalize_non_side_effect()
+                    return self._speak_control_notice(MISSING_TRANSCRIPT_RESPONSE)
+                if slot.dispatched:
+                    terminalize_non_side_effect()
+                    return self._speak_control_notice(DISPATCHED_TRANSCRIPT_RESPONSE)
+                # Abandon confirmations that belonged to the replaced utterance.
+                # The replacement re-enters the same routing path and must still
+                # satisfy ticket readback, create, fork, clone, and config checks.
+                self.pending_target_readback = None
+                self.pending_target_resolution = None
+                self.pending_config_change = None
+                text = replacement
             pending_resolution = getattr(self, "pending_target_resolution", None)
             resolution_active = (
                 pending_resolution is not None
@@ -2089,6 +2217,7 @@ class WakeConversationDaemon:
             if resuming_target_resolution:
                 assert pending_target_resolution is not None
                 text = pending_target_resolution.trusted_utterance
+            self._remember_last_transcript(text)
             next_cursor_session = self.cursor_session
             next_history = list(self.history)
             remember_response = False
@@ -2363,6 +2492,7 @@ class WakeConversationDaemon:
                 response = readback_result
             elif confirmed_request is not None:
                 self.completed_followup = None
+                self._mark_last_transcript_dispatched()
                 response, next_cursor_session = cursor_turn(
                     confirmed_request,
                     delivery_claims=delivery_claims,
@@ -2370,6 +2500,7 @@ class WakeConversationDaemon:
                 )
             elif route.actionable and route.intent == Intent.GITHUB_ISSUE_CREATE:
                 self.completed_followup = None
+                self._mark_last_transcript_dispatched()
                 response, next_cursor_session = cursor_turn(
                     CursorTurnRequest(
                         context.text,
@@ -2384,6 +2515,7 @@ class WakeConversationDaemon:
                 )
             elif route.actionable and route.intent == Intent.LINEAR_TICKET_CREATE:
                 self.completed_followup = None
+                self._mark_last_transcript_dispatched()
                 response, next_cursor_session = cursor_turn(
                     CursorTurnRequest(
                         context.text,
@@ -2476,6 +2608,7 @@ class WakeConversationDaemon:
                 if snapshot is None or choice_id is None:
                     response = cursor_consultation.RECOMMENDATION_UNAVAILABLE
                 else:
+                    self._mark_last_transcript_dispatched()
                     response, next_cursor_session = cursor_turn(
                         CursorTurnRequest(
                             choice_id,
@@ -2568,6 +2701,7 @@ class WakeConversationDaemon:
                     integrations=self.integrations,
                 )
             elif route.actionable and route.intent == Intent.AGENT_CANCEL:
+                self._mark_last_transcript_dispatched()
                 response, next_cursor_session = cursor_turn(
                     CursorTurnRequest(
                         text,
@@ -2602,6 +2736,8 @@ class WakeConversationDaemon:
                         "dismiss" if route.intent == Intent.AGENT_DISMISS else "repeat"
                     )
                 )
+                if action == "reply":
+                    self._mark_last_transcript_dispatched()
                 response, next_cursor_session = cursor_turn(
                     CursorTurnRequest(
                         text,
@@ -2634,6 +2770,7 @@ class WakeConversationDaemon:
                 and route.intent == Intent.AGENT_REPLY
                 and pending is not None
             ):
+                self._mark_last_transcript_dispatched()
                 response, next_cursor_session = cursor_turn(
                     CursorTurnRequest(
                         context.text,
@@ -2673,6 +2810,7 @@ class WakeConversationDaemon:
                         self.pending_target_resolution = None
                     response = readback_response(candidate)
                 else:
+                    self._mark_last_transcript_dispatched()
                     response, next_cursor_session = cursor_turn(
                         CursorTurnRequest(
                             context.text,
@@ -2746,6 +2884,7 @@ class WakeConversationDaemon:
                         if self.completed_followup is current_completed:
                             self.completed_followup = None
 
+                    self._mark_last_transcript_dispatched()
                     response, next_cursor_session = cursor_turn(
                         CursorTurnRequest(
                             context.text,
@@ -2848,6 +2987,7 @@ class WakeConversationDaemon:
                 self.cursor_session = next_cursor_session
             self.history = next_history
             self.conversation_deadline = time.monotonic() + CONVERSATION_TIMEOUT_SECONDS
+            self._refresh_last_transcript_deadline()
             unresolved_target = getattr(self, "pending_target_resolution", None)
             if unresolved_target is not None:
                 self.conversation_deadline = min(

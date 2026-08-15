@@ -180,6 +180,7 @@ def _bare_daemon() -> WakeConversationDaemon:
     instance.conversation_deadline = 0.0
     instance.awaiting_followup = False
     instance.last_ordinary_reply = None
+    instance.last_transcript = None
     instance.last_wake = 0.0
     instance.force_listen = threading.Event()
     instance.running = True
@@ -7677,6 +7678,318 @@ class CompletedFollowupContextTests(unittest.TestCase):
         )
         cursor_turn.assert_not_called()
         self._last_qwen.assert_not_called()
+
+
+class LastTranscriptReplayTests(unittest.TestCase):
+    def _process(
+        self,
+        daemon: WakeConversationDaemon,
+        transcript: str,
+        *,
+        route: IntentRoute | None = None,
+        play_text: str = "ok",
+    ) -> mock.Mock:
+        cursor_turn = mock.Mock(return_value=("started", None))
+        with (
+            mock.patch.object(wake_daemon, "transcribe", return_value=transcript),
+            mock.patch.object(wake_daemon, "start_components"),
+            mock.patch.object(
+                wake_daemon,
+                "request_context",
+                side_effect=lambda text, **_settings: RequestContext(text),
+            ),
+            mock.patch.object(
+                wake_daemon,
+                "route_intent",
+                return_value=route or IntentRoute(Intent.CONVERSATION, "high"),
+            ),
+            mock.patch.object(
+                wake_daemon, "qwen_turn", return_value=("it is noon", None)
+            ),
+            mock.patch.object(wake_daemon, "cursor_turn", cursor_turn),
+            mock.patch.object(
+                daemon,
+                "play_response",
+                return_value=({"played_text": play_text}, None),
+            ),
+            mock.patch.object(wake_daemon, "notify"),
+        ):
+            daemon.process_utterance(AUDIO_GENERATION, woke=False)
+        return cursor_turn
+
+    def test_replay_speaks_trusted_utterance_without_work_or_answer(self) -> None:
+        daemon = _bare_daemon()
+        pending = _pending_choice_snapshot()
+        self._process(daemon, "what time is it")
+        daemon.cursor_session = "oldjob123456"
+        self.assertIsNotNone(daemon.last_transcript)
+        assert daemon.last_transcript is not None
+        self.assertEqual(daemon.last_transcript.utterance, "what time is it")
+        self.assertFalse(daemon.last_transcript.dispatched)
+
+        with (
+            mock.patch.object(
+                wake_daemon, "transcribe", return_value="what did you hear?"
+            ),
+            mock.patch.object(wake_daemon, "start_components"),
+            mock.patch.object(wake_daemon, "qwen_turn") as qwen_turn,
+            mock.patch.object(wake_daemon, "cursor_turn") as cursor_turn,
+            mock.patch.object(
+                wake_daemon,
+                "route_intent",
+                return_value=IntentRoute(Intent.AGENT_REPLY, "high"),
+            ) as route_intent,
+            mock.patch.object(daemon, "_pending_cursor_question", return_value=pending),
+            mock.patch.object(
+                daemon,
+                "play_response",
+                return_value=({"played_text": "I heard: what time is it"}, None),
+            ) as play,
+            mock.patch.object(wake_daemon, "notify"),
+        ):
+            daemon.process_utterance(AUDIO_GENERATION, woke=False)
+
+        play.assert_called_once_with(
+            AssistantResponse.from_text("I heard: what time is it")
+        )
+        cursor_turn.assert_not_called()
+        qwen_turn.assert_not_called()
+        route_intent.assert_not_called()
+        self.assertEqual(daemon.cursor_session, "oldjob123456")
+        assert daemon.last_transcript is not None
+        self.assertEqual(daemon.last_transcript.utterance, "what time is it")
+
+    def test_correction_before_dispatch_reroutes_replacement(self) -> None:
+        daemon = _bare_daemon()
+        self._process(daemon, "what time is it")
+        self.assertFalse(daemon.last_transcript.dispatched)  # type: ignore[union-attr]
+
+        cursor_turn = mock.Mock(return_value=("started", None))
+        with (
+            mock.patch.object(
+                wake_daemon,
+                "transcribe",
+                return_value="I said fix the failing tests",
+            ),
+            mock.patch.object(wake_daemon, "start_components"),
+            mock.patch.object(
+                wake_daemon,
+                "request_context",
+                side_effect=lambda text, **_settings: RequestContext(text),
+            ),
+            mock.patch.object(
+                wake_daemon,
+                "route_intent",
+                return_value=IntentRoute(Intent.AGENT_SUBMIT, "high"),
+            ) as route_intent,
+            mock.patch.object(wake_daemon, "cursor_turn", cursor_turn),
+            mock.patch.object(wake_daemon, "qwen_turn") as qwen_turn,
+            mock.patch.object(
+                daemon,
+                "play_response",
+                return_value=({"played_text": "started"}, None),
+            ),
+            mock.patch.object(wake_daemon, "notify"),
+        ):
+            daemon.process_utterance(AUDIO_GENERATION, woke=False)
+
+        self.assertEqual(route_intent.call_args.args[0], "fix the failing tests")
+        cursor_turn.assert_called_once()
+        request = cursor_turn.call_args.args[0]
+        self.assertEqual(request.utterance, "fix the failing tests")
+        qwen_turn.assert_not_called()
+        assert daemon.last_transcript is not None
+        self.assertEqual(daemon.last_transcript.utterance, "fix the failing tests")
+        self.assertTrue(daemon.last_transcript.dispatched)
+
+    def test_correction_after_dispatch_does_not_mutate_inflight_request(self) -> None:
+        daemon = _bare_daemon()
+        first = self._process(
+            daemon,
+            "fix the failing tests",
+            route=IntentRoute(Intent.AGENT_SUBMIT, "high"),
+        )
+        first.assert_called_once()
+        stored = first.call_args.args[0]
+        assert daemon.last_transcript is not None
+        self.assertTrue(daemon.last_transcript.dispatched)
+        self.assertEqual(daemon.last_transcript.utterance, "fix the failing tests")
+
+        with (
+            mock.patch.object(
+                wake_daemon,
+                "transcribe",
+                return_value="that's not what I said, I said fix the login tests",
+            ),
+            mock.patch.object(wake_daemon, "start_components"),
+            mock.patch.object(wake_daemon, "cursor_turn") as cursor_turn,
+            mock.patch.object(wake_daemon, "qwen_turn") as qwen_turn,
+            mock.patch.object(
+                wake_daemon,
+                "route_intent",
+                return_value=IntentRoute(Intent.AGENT_SUBMIT, "high"),
+            ) as route_intent,
+            mock.patch.object(
+                daemon,
+                "play_response",
+                return_value=(
+                    {"played_text": wake_daemon.DISPATCHED_TRANSCRIPT_RESPONSE},
+                    None,
+                ),
+            ) as play,
+            mock.patch.object(wake_daemon, "notify"),
+        ):
+            daemon.process_utterance(AUDIO_GENERATION, woke=False)
+
+        play.assert_called_once_with(
+            AssistantResponse.from_text(wake_daemon.DISPATCHED_TRANSCRIPT_RESPONSE)
+        )
+        cursor_turn.assert_not_called()
+        qwen_turn.assert_not_called()
+        route_intent.assert_not_called()
+        assert daemon.last_transcript is not None
+        self.assertEqual(daemon.last_transcript.utterance, "fix the failing tests")
+        self.assertEqual(stored.utterance, "fix the failing tests")
+
+    def test_missing_and_expired_transcript_fail_closed(self) -> None:
+        daemon = _bare_daemon()
+        with (
+            mock.patch.object(
+                wake_daemon, "transcribe", return_value="what did you hear?"
+            ),
+            mock.patch.object(wake_daemon, "start_components"),
+            mock.patch.object(wake_daemon, "cursor_turn") as cursor_turn,
+            mock.patch.object(wake_daemon, "qwen_turn") as qwen_turn,
+            mock.patch.object(
+                daemon,
+                "play_response",
+                return_value=(
+                    {"played_text": wake_daemon.MISSING_TRANSCRIPT_RESPONSE},
+                    None,
+                ),
+            ) as play,
+            mock.patch.object(wake_daemon, "notify"),
+        ):
+            daemon.process_utterance(AUDIO_GENERATION, woke=False)
+
+        play.assert_called_once_with(
+            AssistantResponse.from_text(wake_daemon.MISSING_TRANSCRIPT_RESPONSE)
+        )
+        cursor_turn.assert_not_called()
+        qwen_turn.assert_not_called()
+
+        daemon.last_transcript = wake_daemon.LastTranscript(
+            "stale request",
+            dispatched=False,
+            expires_at=time.monotonic() - 1,
+        )
+        with (
+            mock.patch.object(
+                wake_daemon, "transcribe", return_value="I said work on issue 42"
+            ),
+            mock.patch.object(wake_daemon, "start_components"),
+            mock.patch.object(wake_daemon, "cursor_turn") as cursor_turn,
+            mock.patch.object(
+                daemon,
+                "play_response",
+                return_value=(
+                    {"played_text": wake_daemon.MISSING_TRANSCRIPT_RESPONSE},
+                    None,
+                ),
+            ) as play,
+            mock.patch.object(wake_daemon, "notify"),
+        ):
+            daemon.process_utterance(AUDIO_GENERATION, woke=False)
+
+        play.assert_called_once_with(
+            AssistantResponse.from_text(wake_daemon.MISSING_TRANSCRIPT_RESPONSE)
+        )
+        cursor_turn.assert_not_called()
+        self.assertIsNone(daemon.last_transcript)
+
+    def test_replay_does_not_confirm_pending_readback(self) -> None:
+        daemon = _bare_daemon()
+        self._process(daemon, "work on example/payments#42")
+        target = wake_daemon.CriticalTarget(
+            "github", "example/payments", "42", "submit"
+        )
+        candidate = wake_daemon.new_candidate(
+            wake_daemon.TargetSelection(target, (None,) * 5),
+            origin_turn="turn-1",
+        )
+        pending = wake_daemon.PendingTargetReadback(
+            candidate,
+            wake_daemon._critical_target_request(target),
+        )
+        daemon.pending_target_readback = pending
+        daemon.last_transcript = wake_daemon.LastTranscript(
+            "work on example/payments#42",
+            dispatched=False,
+            expires_at=time.monotonic() + 30,
+        )
+        daemon.conversation_deadline = time.monotonic() + 30
+
+        with (
+            mock.patch.object(
+                wake_daemon, "transcribe", return_value="what did you hear?"
+            ),
+            mock.patch.object(wake_daemon, "start_components"),
+            mock.patch.object(wake_daemon, "cursor_turn") as cursor_turn,
+            mock.patch.object(
+                daemon,
+                "play_response",
+                return_value=(
+                    {"played_text": "I heard: work on example/payments#42"},
+                    None,
+                ),
+            ),
+            mock.patch.object(wake_daemon, "notify"),
+        ):
+            daemon.process_utterance(AUDIO_GENERATION, woke=False)
+
+        self.assertIs(daemon.pending_target_readback, pending)
+        cursor_turn.assert_not_called()
+
+    def test_bare_correction_without_replacement_fails_closed(self) -> None:
+        daemon = _bare_daemon()
+        self._process(daemon, "what time is it")
+        with (
+            mock.patch.object(
+                wake_daemon, "transcribe", return_value="that's not what I said"
+            ),
+            mock.patch.object(wake_daemon, "start_components"),
+            mock.patch.object(wake_daemon, "cursor_turn") as cursor_turn,
+            mock.patch.object(wake_daemon, "qwen_turn") as qwen_turn,
+            mock.patch.object(
+                daemon,
+                "play_response",
+                return_value=(
+                    {"played_text": wake_daemon.BARE_TRANSCRIPT_CORRECTION_RESPONSE},
+                    None,
+                ),
+            ) as play,
+            mock.patch.object(wake_daemon, "notify"),
+        ):
+            daemon.process_utterance(AUDIO_GENERATION, woke=False)
+
+        play.assert_called_once_with(
+            AssistantResponse.from_text(wake_daemon.BARE_TRANSCRIPT_CORRECTION_RESPONSE)
+        )
+        cursor_turn.assert_not_called()
+        qwen_turn.assert_not_called()
+        assert daemon.last_transcript is not None
+        self.assertEqual(daemon.last_transcript.utterance, "what time is it")
+
+    def test_close_conversation_discards_last_transcript(self) -> None:
+        daemon = _bare_daemon()
+        self._process(daemon, "what time is it")
+        self.assertIsNotNone(daemon.last_transcript)
+        with (
+            mock.patch.object(wake_daemon, "stop_components"),
+            mock.patch.object(wake_daemon, "notify"),
+        ):
+            daemon.close_conversation("inactivity")
+        self.assertIsNone(daemon.last_transcript)
 
 
 if __name__ == "__main__":
