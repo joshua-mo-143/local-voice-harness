@@ -311,9 +311,7 @@ def respond(text: str, *, user_config: UserConfig | None = None) -> None:
                         if target is None:
                             response = cursor_consultation.NO_WORKSPACE
                         else:
-                            _acknowledge_consultation(
-                                speech_renderer, settings, text
-                            )
+                            _acknowledge_consultation(speech_renderer, settings, text)
                             assert ticket_admission.ticket.canonical is not None
                             assert ticket_admission.ticket.source is not None
                             snapshot = ticket_snapshot(

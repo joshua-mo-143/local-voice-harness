@@ -231,7 +231,10 @@ class ForegroundDeliveryTests(unittest.TestCase):
         qwen.assert_not_called()
         self.assertEqual(
             [call.args[0] for call in play.call_args_list],
-            [consultation.ACKNOWLEDGEMENT, "Scope is too broad."],
+            [
+                consultation.acknowledgement("review this ticket").spoken_text,
+                "Scope is too broad.",
+            ],
         )
 
 
