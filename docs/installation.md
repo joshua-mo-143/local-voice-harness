@@ -328,17 +328,19 @@ tasks still work.
 
 ## 6. Configure audio
 
-Find the PipeWire microphone:
+Capture and playback default to PipeWire's system-selected source and sink.
+To pin a microphone, pick from the devices the harness enumerates:
 
-```bash
-wpctl status
+```console
+voice-harness config set audio.source
 ```
 
-Capture and playback default to PipeWire's system-selected source and sink.
-Store an explicit source or sink only when you need to override that default:
+That writes `audio.source` and `dictation.source`, so the next
+`voice-harness-dictate` process uses the same capture node. Interactive
+`voice-harness setup` offers the same picker. Store an explicit sink only when
+you need to override playback:
 
-```bash
-voice-harness config set audio.source '<PIPEWIRE_SOURCE_NAME>'
+```console
 voice-harness config set audio.sink '<PIPEWIRE_SINK_NAME>'
 ```
 
@@ -370,7 +372,7 @@ wpctl status
 
 Set the source and mode through unified configuration:
 
-```bash
+```console
 voice-harness config set audio.source voice_harness_aec
 voice-harness config set audio.barge_in_mode vad
 ```

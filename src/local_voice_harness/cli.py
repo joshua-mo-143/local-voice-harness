@@ -19,7 +19,7 @@ from .app import respond, status
 from .browser_context import RequestContext, request_context
 from .config import CURSOR_PATTERN, PROJECT_ROOT, REPLAY_DIR
 from .config_management import (
-    commit_config_change,
+    commit_config_setting,
     format_restart_notice,
     list_integrations,
     reset_config,
@@ -150,7 +150,14 @@ def parser() -> argparse.ArgumentParser:
         "set", help="validate and persist one setting"
     )
     config_set.add_argument("key", help="dotted configuration key")
-    config_set.add_argument("value", help="new value")
+    config_set.add_argument(
+        "value",
+        nargs="?",
+        help=(
+            "new value; omit audio.source or dictation.source to pick from "
+            "PipeWire capture devices"
+        ),
+    )
     config_reset = config_commands.add_parser(
         "reset", help="restore defaults for one section or the whole file"
     )
@@ -750,7 +757,7 @@ def dispatch(args: argparse.Namespace) -> None:
         if args.config_command == "show":
             print(show_config(key=args.key, json_output=args.json_output))
         elif args.config_command == "set":
-            result = commit_config_change({args.key: args.value})
+            result = commit_config_setting(args.key, args.value)
             print(format_restart_notice(result.restart_services))
         else:
             result = reset_config(section=args.section)

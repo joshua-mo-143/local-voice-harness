@@ -523,6 +523,30 @@ Audio
             ("input.node",),
         )
 
+    def test_list_capture_sources_includes_sources_and_filters(self) -> None:
+        with (
+            mock.patch.object(checks, "_which", return_value="/usr/bin/wpctl"),
+            mock.patch.object(
+                checks, "_run", return_value=_completed(0, _WPCTL_FILTER_STATUS)
+            ),
+        ):
+            names = checks.list_pipewire_capture_sources()
+        self.assertEqual(
+            names,
+            (
+                "alsa_input.pci-0000_00_1f.3.analog-stereo",
+                "voice_harness_aec_sink",
+                "voice_harness_aec",
+            ),
+        )
+
+    def test_list_capture_sources_requires_wpctl(self) -> None:
+        with (
+            mock.patch.object(checks, "_which", return_value=None),
+            self.assertRaisesRegex(UserConfigurationError, "wpctl not found"),
+        ):
+            checks.list_pipewire_capture_sources()
+
     def test_missing_wpctl_is_fatal(self) -> None:
         with mock.patch.object(checks, "_which", return_value=None):
             results = checks.check_pipewire_devices(_snapshot())
