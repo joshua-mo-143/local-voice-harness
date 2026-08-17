@@ -303,6 +303,81 @@ raise SystemExit(int(os.environ.get("FAKE_SYSTEMCTL_EXIT", "3")))
         self.assertNotEqual(*resolved_databases)
         self.assertNotEqual(*application_sources)
 
+    def test_empty_checkout_seeds_installed_backend_defaults(self) -> None:
+        official = self.test_root / "official-config" / "voice-harness"
+        official.mkdir(parents=True)
+        (official / "config.toml").write_text(
+            '[providers.llm]\nprovider = "venice"\nmodel = "zai-org-glm-5-2"\n'
+        )
+        (official / "backends.toml").write_text(
+            '[llm]\nprovider = "venice"\nmodel = "zai-org-glm-5-2"\n'
+        )
+        (official / "plan-approval.json").write_text('{"approved": true}\n')
+        checkout = self.test_root / "seeded-checkout"
+        scripts = checkout / "scripts"
+        scripts.mkdir(parents=True)
+        self._write_checkout_application(checkout, "seeded")
+        shutil.copy2(LAUNCHER, scripts / "dev.sh")
+
+        process = subprocess.run(
+            [str(scripts / "dev.sh"), "text", "request"],
+            cwd=self.test_root,
+            env=self._environment(),
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+
+        self.assertEqual(process.returncode, 0, process.stderr)
+        seeded = checkout / ".dev" / "config" / "voice-harness"
+        self.assertEqual(
+            (seeded / "config.toml").read_text(),
+            (official / "config.toml").read_text(),
+        )
+        self.assertEqual(
+            (seeded / "backends.toml").read_text(),
+            (official / "backends.toml").read_text(),
+        )
+        self.assertEqual(
+            (official / "backends.toml").read_text(),
+            '[llm]\nprovider = "venice"\nmodel = "zai-org-glm-5-2"\n',
+        )
+        self.assertFalse((seeded / "plan-approval.json").exists())
+        self.assertEqual(
+            (official / "plan-approval.json").read_text(),
+            '{"approved": true}\n',
+        )
+
+    def test_existing_checkout_backends_are_not_replaced(self) -> None:
+        official = self.test_root / "official-config" / "voice-harness"
+        official.mkdir(parents=True)
+        (official / "backends.toml").write_text('model = "production-model"\n')
+        checkout = self.test_root / "custom-checkout"
+        scripts = checkout / "scripts"
+        scripts.mkdir(parents=True)
+        self._write_checkout_application(checkout, "custom")
+        shutil.copy2(LAUNCHER, scripts / "dev.sh")
+        existing = checkout / ".dev" / "config" / "voice-harness"
+        existing.mkdir(parents=True)
+        (existing / "backends.toml").write_text('model = "branch-model"\n')
+
+        process = subprocess.run(
+            [str(scripts / "dev.sh"), "text", "request"],
+            cwd=self.test_root,
+            env=self._environment(),
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+
+        self.assertEqual(process.returncode, 0, process.stderr)
+        self.assertEqual(
+            (existing / "backends.toml").read_text(), 'model = "branch-model"\n'
+        )
+        self.assertFalse((existing / "config.toml").exists())
+
     def test_concurrent_worktree_launchers_isolate_branch_owned_files(self) -> None:
         processes: list[subprocess.Popen[str]] = []
         records: list[Path] = []

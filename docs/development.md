@@ -24,7 +24,10 @@ The launcher sets `XDG_CONFIG_HOME` to `.dev/config`, `XDG_STATE_HOME` to
 `.dev/state`, `UV_PROJECT_ENVIRONMENT` to `.dev/venv`, and
 `VOICE_HARNESS_BRANCH_RUNTIME` to `.dev/runtime`. For example,
 branch-specific backend configuration belongs at
-`.dev/config/voice-harness/backends.toml`, durable jobs are stored below
+`.dev/config/voice-harness/backends.toml`. When that checkout has no
+`config.toml` or `backends.toml` yet, the launcher copies those files from the
+installed profile so the branch starts from production defaults; later
+checkout-local edits stay isolated. Durable jobs are stored below
 `.dev/state/voice-harness/`, worker logs and other branch-owned transients live
 under `.dev/runtime/`, and launcher dependencies stay in `.dev/venv`.
 The checkout-local jobs database is explicitly

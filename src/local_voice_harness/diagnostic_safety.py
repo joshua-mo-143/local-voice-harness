@@ -13,6 +13,7 @@ PLAYBACK_FAILURE = "Audio playback failed. Check the logs for details."
 SPEECH_DELIVERY_FAILURE = "Speech delivery failed. Check the logs for details."
 DAEMON_FAILURE = "The voice service failed. Check the logs for details."
 CURSOR_TOOL_FAILURE = "The Cursor tool failed. Check the logs for details."
+WEB_SEARCH_TOOL_FAILURE = "Web search failed. No current results are available."
 
 _AUTHORIZATION = re.compile(r"(?i)(\bauthorization\b\s*[:=]\s*)(?:[^\r\n]+)")
 _SCHEME_CREDENTIAL = re.compile(r"(?i)\b(bearer|basic)\s+[A-Za-z0-9._~+/=-]+")

@@ -752,6 +752,7 @@ def respond(text: str, *, user_config: UserConfig | None = None) -> None:
                     trusted_utterance=trusted_utterance,
                     delivery_claims=delivery_claims,
                     allow_tools=False,
+                    allow_search=True,
                     settings=settings.providers,
                 )
             rendered_response = as_assistant_response(response)

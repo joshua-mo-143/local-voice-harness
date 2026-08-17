@@ -46,8 +46,8 @@
   stays unsupported, and the in-memory follow-up reference is discarded on restart. Set
   `VOICE_HARNESS_CURSOR_FOLLOWUP=0` to disable the feature.
 - Intent routing uses the configured LLM backend, but only a high-confidence
-  authoritative route can invoke Cursor. Conversation and low-confidence fallback are
-  tool-free.
+  authoritative route can invoke Cursor. Conversation and low-confidence fallback
+  may use read-only web search and cannot submit jobs.
 - Durable job records, workflow artifacts, and quarantine evidence live under the
   private systemd `StateDirectory=voice-harness`, or
   `$XDG_STATE_HOME/voice-harness` outside the service. Conversational audio, service

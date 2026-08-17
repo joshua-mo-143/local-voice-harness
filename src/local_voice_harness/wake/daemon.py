@@ -971,6 +971,7 @@ class WakeConversationDaemon:
                         qwen_turn(
                             "Reply with only OK. Do not call a tool.",
                             allow_tools=False,
+                            allow_search=False,
                             settings=self.providers,
                         )
                     log("LLM tool graph and TTS backend are warm")
@@ -3767,7 +3768,7 @@ class WakeConversationDaemon:
                     )
             else:
                 # The authoritative router handles every mutating action above.
-                # Conversation fallback is always tool-free.
+                # Conversation fallback cannot submit jobs; it may use web search.
                 if self.providers.llm_provider == "venice":
                     (
                         response,
@@ -3785,6 +3786,7 @@ class WakeConversationDaemon:
                             on_text_chunk=on_text_chunk,
                             should_cancel=should_cancel,
                             allow_tools=False,
+                            allow_search=True,
                             settings=self.providers,
                         )
                     )
@@ -3798,6 +3800,7 @@ class WakeConversationDaemon:
                         trusted_utterance=text,
                         delivery_claims=delivery_claims,
                         allow_tools=False,
+                        allow_search=True,
                         settings=self.providers,
                     )
                 remember_response = True
