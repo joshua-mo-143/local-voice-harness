@@ -15,8 +15,9 @@ from local_voice_harness.cursor.store import QuarantineEvidence
 from local_voice_harness.diagnostic_safety import (
     COMMAND_FAILURE,
     SPEECH_DELIVERY_FAILURE,
+    diagnostic_log_path,
 )
-from local_voice_harness.errors import SpeechDeliveryError
+from local_voice_harness.errors import NoSpeechError, SpeechDeliveryError
 from local_voice_harness.intent import Intent, IntentRoute
 from local_voice_harness.responses import AssistantResponse
 from local_voice_harness.transcript import TranscriptReplacement
@@ -619,6 +620,32 @@ class MainFailureTests(unittest.TestCase):
         self.assertIn("[REDACTED]", output)
         self.assertIn(COMMAND_FAILURE, output)
         notify.assert_called_once_with(COMMAND_FAILURE, error=True)
+        log_path = diagnostic_log_path()
+        self.assertTrue(log_path.is_file())
+        persisted = log_path.read_text(encoding="utf-8")
+        self.assertNotIn("cli-secret", persisted)
+        self.assertIn("[REDACTED]", persisted)
+        self.assertIn("command_failed", persisted)
+
+    def test_harness_error_notifies_user_facing_message(self) -> None:
+        error = NoSpeechError("STT did not recognize any speech")
+        stderr = io.StringIO()
+        with (
+            mock.patch.object(cli, "parser") as parser,
+            mock.patch.object(cli, "dispatch", side_effect=error),
+            mock.patch.object(cli, "notify") as notify,
+            contextlib.redirect_stderr(stderr),
+            self.assertRaises(SystemExit),
+        ):
+            parser.return_value.parse_args.return_value = mock.sentinel.args
+            cli.main()
+
+        output = stderr.getvalue()
+        self.assertIn("STT did not recognize any speech", output)
+        self.assertNotIn(COMMAND_FAILURE, output)
+        notify.assert_called_once_with("STT did not recognize any speech", error=True)
+        persisted = diagnostic_log_path().read_text(encoding="utf-8")
+        self.assertIn("NoSpeechError", persisted)
 
     def test_speech_delivery_failure_is_not_a_core_command_failure(self) -> None:
         error = SpeechDeliveryError(

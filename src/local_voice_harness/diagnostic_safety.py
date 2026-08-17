@@ -1,11 +1,16 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import sys
 from collections.abc import Mapping, Sequence
+from pathlib import Path
+
+from .errors import HarnessError, SpeechDeliveryError
 
 DIAGNOSTIC_LIMIT = 2_000
+NOTIFICATION_LIMIT = 240
 COMMAND_FAILURE = "The command failed. Check the logs for details."
 VOICE_REQUEST_FAILURE = "The voice request failed. Check the logs for details."
 RECORDING_FAILURE = "Audio recording failed. Check the logs for details."
@@ -76,18 +81,56 @@ def redact_fields(
     return value
 
 
-def log_diagnostic(component: str, event: str, value: object) -> None:
-    """Write one redacted structured diagnostic event to standard error."""
+def diagnostic_log_path(
+    environment: Mapping[str, str] | None = None,
+) -> Path:
+    """Session-scoped JSONL sink for CLI diagnostics when stderr is discarded."""
 
-    print(
-        json.dumps(
-            {
-                "component": component,
-                "event": event,
-                "diagnostic": redact_diagnostic(value),
-            },
-            ensure_ascii=False,
-        ),
-        file=sys.stderr,
-        flush=True,
+    runtime = Path(
+        (os.environ if environment is None else environment).get(
+            "XDG_RUNTIME_DIR", "/tmp"
+        )
     )
+    return runtime / "voice-harness" / "diagnostics.jsonl"
+
+
+def user_facing_failure_message(exc: BaseException) -> str:
+    """Return a notification-safe failure string for a CLI exception."""
+
+    if isinstance(exc, SpeechDeliveryError):
+        return SPEECH_DELIVERY_FAILURE
+    if isinstance(exc, HarnessError):
+        message = redact_diagnostic(exc, limit=NOTIFICATION_LIMIT)
+        if message:
+            return message
+    return COMMAND_FAILURE
+
+
+def _append_diagnostic_log(payload: str) -> None:
+    try:
+        path = diagnostic_log_path()
+        path.parent.mkdir(mode=0o700, exist_ok=True)
+        flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND | os.O_CLOEXEC
+        fd = os.open(path, flags, 0o600)
+        try:
+            os.fchmod(fd, 0o600)
+            os.write(fd, payload.encode())
+        finally:
+            os.close(fd)
+    except OSError:
+        return
+
+
+def log_diagnostic(component: str, event: str, value: object) -> None:
+    """Write one redacted structured diagnostic event to stderr and the session log."""
+
+    payload = json.dumps(
+        {
+            "component": component,
+            "event": event,
+            "diagnostic": redact_diagnostic(value),
+        },
+        ensure_ascii=False,
+    )
+    print(payload, file=sys.stderr, flush=True)
+    _append_diagnostic_log(payload + "\n")
