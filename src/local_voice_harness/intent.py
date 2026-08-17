@@ -103,6 +103,10 @@ ROUTER_SYSTEM_PROMPT = (
     "announcement policy, quiet mode, or desktop-only announcements also uses "
     "harness_config_change. Unsupported changes still "
     "use harness_config_change so the first-party allow-list can reject them. "
+    "Use wake_mode_disable only when the user explicitly asks this voice assistant to "
+    "turn wake mode off, go to sleep, or stop listening. This stops the assistant's "
+    "services after first-party confirmation; it is distinct from setting barge-in mode "
+    "to off, stopping speech playback, ending the conversation, or discussing wake mode. "
     "Use vocabulary_alias_add when the user asks to call or name the focused or "
     "just-used repository or issue, for example 'call this repo the harness' or "
     "'call this the launcher issue'. Extract only the spoken phrase into raw_value. "
@@ -171,6 +175,7 @@ ROUTE_TOOL = {
                         "announcement_digest",
                         "harness_config_inspect",
                         "harness_config_change",
+                        "wake_mode_disable",
                         "vocabulary_alias_add",
                         "self_health",
                         "harness_help",
@@ -232,6 +237,7 @@ class Intent(StrEnum):
     ANNOUNCEMENT_DIGEST = "announcement_digest"
     HARNESS_CONFIG_INSPECT = "harness_config_inspect"
     HARNESS_CONFIG_CHANGE = "harness_config_change"
+    WAKE_MODE_DISABLE = "wake_mode_disable"
     VOCABULARY_ALIAS_ADD = "vocabulary_alias_add"
     SELF_HEALTH = "self_health"
     HARNESS_HELP = "harness_help"

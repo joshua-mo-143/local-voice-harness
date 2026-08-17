@@ -157,6 +157,7 @@ from ..self_management import (
     render_change_preparation,
     resolve_confirmation,
 )
+from ..service_manager import launch_wake_mode_stop_worker
 from ..speech import SpeechRenderer, StreamingSpeechRenderer
 from ..stt.client import (
     RetainedTranscript,
@@ -467,9 +468,7 @@ def strip_wake_prefix(text: str) -> tuple[str, bool]:
     return text.strip(), False
 
 
-CLOSE_PATTERN = re.compile(
-    r"\b(?:goodbye|stop listening|go to sleep|end conversation)\b", re.IGNORECASE
-)
+CLOSE_PATTERN = re.compile(r"\b(?:goodbye|end conversation)\b", re.IGNORECASE)
 STOP_TALKING_PATTERN = re.compile(r"\b(?:stop talking|shut up)\b", re.IGNORECASE)
 TRANSCRIPT_REPLAY_PATTERN = re.compile(
     r"^\s*(?:"
@@ -791,6 +790,8 @@ class WakeConversationDaemon:
         self.pending_question_retarget: PendingQuestionRetarget | None = None
         self.pending_config_change: PendingConfigChange | None = None
         self.pending_spoken_alias: PendingSpokenAlias | None = None
+        self.pending_wake_mode_disable = False
+        self.wake_mode_stop_after_delivery = False
         self.config_activation_store = config_activation_store or ActivationStore()
         self.config_activation_delivery: ActivationDelivery | None = None
         self.launched_config_activations: dict[str, subprocess.Popen[bytes]] = {}
@@ -1009,6 +1010,8 @@ class WakeConversationDaemon:
         self.pending_question_retarget = None
         self.pending_config_change = None
         self.pending_spoken_alias = None
+        self.pending_wake_mode_disable = False
+        self.wake_mode_stop_after_delivery = False
         self.conversation_deadline = 0.0
         self.awaiting_followup = False
         self.last_ordinary_reply = None
@@ -1031,6 +1034,8 @@ class WakeConversationDaemon:
         self.pending_question_retarget = None
         self.pending_config_change = None
         self.pending_spoken_alias = None
+        self.pending_wake_mode_disable = False
+        self.wake_mode_stop_after_delivery = False
         self.conversation_deadline = 0.0
         self.awaiting_followup = False
         self.hold_extensions = 0
@@ -2169,6 +2174,81 @@ class WakeConversationDaemon:
             after_mutation()
         return render_spoken_alias_committed(pending), decision, pending
 
+    def _resolve_pending_wake_mode_confirmation(
+        self,
+        text: str,
+        *,
+        blocked: bool,
+        before_mutation: Callable[[], None] | None = None,
+    ) -> tuple[AssistantResponse | None, ConfirmationDecision, bool]:
+        pending = self.pending_wake_mode_disable
+        if not pending or blocked:
+            return None, ConfirmationDecision.AMBIGUOUS, pending
+        decision = resolve_confirmation(text)
+        if decision == ConfirmationDecision.AMBIGUOUS:
+            return None, decision, pending
+        self.pending_wake_mode_disable = False
+        if decision == ConfirmationDecision.CANCEL:
+            return (
+                AssistantResponse.from_text(
+                    "Okay, I cancelled that request. Wake mode is still on."
+                ),
+                decision,
+                pending,
+            )
+        if before_mutation is not None:
+            before_mutation()
+        self.wake_mode_stop_after_delivery = True
+        return (
+            AssistantResponse.from_text(
+                "Okay. I will stop listening after this message is delivered. "
+                "If shutdown cannot be verified, I will show a desktop alert. Run "
+                "voice-harness services start when you want to wake me again."
+            ),
+            decision,
+            pending,
+        )
+
+    def _revert_undelivered_wake_mode_stop(self) -> None:
+        if not self.wake_mode_stop_after_delivery:
+            return
+        self.wake_mode_stop_after_delivery = False
+        self.pending_wake_mode_disable = True
+
+    def _complete_wake_mode_stop_delivery(self) -> AssistantResponse | None:
+        self.wake_mode_stop_after_delivery = False
+        try:
+            process = launch_wake_mode_stop_worker()
+        except OSError as exc:
+            log(f"wake-mode stop worker launch failed: {type(exc).__name__}: {exc}")
+            self.pending_wake_mode_disable = True
+            return AssistantResponse.from_text(
+                "I couldn't start the wake-mode shutdown action, so I am still "
+                "listening. Please try again."
+            )
+        threading.Thread(
+            target=self._observe_wake_mode_stop_worker,
+            args=(process,),
+            name="voice-harness-wake-stop-observer",
+            daemon=True,
+        ).start()
+        return None
+
+    def _observe_wake_mode_stop_worker(self, process: subprocess.Popen[bytes]) -> None:
+        try:
+            returncode = process.wait()
+        except Exception as exc:  # noqa: BLE001 - surface detached action failure
+            detail = f"{type(exc).__name__}: {exc}"
+        else:
+            if returncode == 0:
+                return
+            detail = f"worker exited with status {returncode}"
+        log(f"wake-mode shutdown failed after launch: {detail}")
+        notify(
+            "Wake-mode shutdown failed after launch; the listener may still be active.",
+            error=True,
+        )
+
     def _resolve_activation_confirmation(
         self,
         text: str,
@@ -2493,6 +2573,7 @@ class WakeConversationDaemon:
                     and pending_target_resolution is None
                     and getattr(self, "pending_config_change", None) is None
                     and getattr(self, "pending_spoken_alias", None) is None
+                    and not getattr(self, "pending_wake_mode_disable", False)
                 ):
                     raise
                 terminalize_non_side_effect()
@@ -2590,6 +2671,7 @@ class WakeConversationDaemon:
                 self.pending_target_readback = None
                 self.pending_target_resolution = None
                 self.pending_config_change = None
+                self.pending_wake_mode_disable = False
                 text = replacement
             if INSPECT_CONTEXT_PATTERN.search(text):
                 terminalize_non_side_effect()
@@ -2668,6 +2750,7 @@ class WakeConversationDaemon:
                     self.pending_target_readback = None
                     self.pending_target_resolution = None
                     self.pending_config_change = None
+                    self.pending_wake_mode_disable = False
                     return self._speak_control_notice(
                         self._retarget_named_question(reference)
                     )
@@ -2707,6 +2790,7 @@ class WakeConversationDaemon:
                     self.pending_target_readback = None
                     self.pending_target_resolution = None
                     self.pending_config_change = None
+                    self.pending_wake_mode_disable = False
                     return self._speak_control_notice(
                         self._resume_awaiting_question(reference or None)
                     )
@@ -2727,6 +2811,7 @@ class WakeConversationDaemon:
                 and not self._has_announceable_jobs()
                 and self.pending_config_change is None
                 and getattr(self, "pending_spoken_alias", None) is None
+                and not getattr(self, "pending_wake_mode_disable", False)
                 and getattr(self, "pending_target_readback", None) is None
                 and not resolution_active
                 and not activation_offer_pending
@@ -2816,6 +2901,19 @@ class WakeConversationDaemon:
                 before_mutation=fence_side_effect,
                 after_mutation=terminalize_non_side_effect,
             )
+            (
+                wake_mode_response,
+                wake_mode_decision,
+                pending_wake_mode,
+            ) = self._resolve_pending_wake_mode_confirmation(
+                text,
+                blocked=(
+                    pending_readback is not None
+                    or pending_config is not None
+                    or pending_alias is not None
+                ),
+                before_mutation=fence_side_effect,
+            )
             activation_response = (
                 self._resolve_activation_confirmation(
                     text,
@@ -2827,6 +2925,8 @@ class WakeConversationDaemon:
                 and config_response is None
                 and pending_alias is None
                 and alias_response is None
+                and not pending_wake_mode
+                and wake_mode_response is None
                 else None
             )
             active_completed = self._active_completed_followup()
@@ -2838,6 +2938,7 @@ class WakeConversationDaemon:
                 or confirmed_request is not None
                 or config_response is not None
                 or alias_response is not None
+                or wake_mode_response is not None
                 or activation_response is not None
             ):
                 route = IntentRoute(Intent.UNCERTAIN, "low")
@@ -2933,6 +3034,7 @@ class WakeConversationDaemon:
                 or confirmed_request is not None
                 or config_response is not None
                 or activation_response is not None
+                or wake_mode_response is not None
                 or (pending is not None and route.intent == Intent.AGENT_REPLY)
             )
             if not answering_existing:
@@ -2980,6 +3082,22 @@ class WakeConversationDaemon:
                 else:
                     alias_response = AssistantResponse.from_text(
                         "Please say yes to confirm that alias or no to cancel it."
+                    )
+                    route = IntentRoute(Intent.UNCERTAIN, "low")
+            if (
+                pending_wake_mode
+                and wake_mode_decision == ConfirmationDecision.AMBIGUOUS
+                and wake_mode_response is None
+            ):
+                if route.intent == Intent.WAKE_MODE_DISABLE:
+                    self.pending_wake_mode_disable = False
+                elif (
+                    route.actionable and question_control(text) != AnswerOutcome.REPEAT
+                ):
+                    self.pending_wake_mode_disable = False
+                else:
+                    wake_mode_response = AssistantResponse.from_text(
+                        "Please say yes to turn wake mode off or no to keep listening."
                     )
                     route = IntentRoute(Intent.UNCERTAIN, "low")
             if (
@@ -3076,6 +3194,8 @@ class WakeConversationDaemon:
                 response = config_response
             elif alias_response is not None:
                 response = alias_response
+            elif wake_mode_response is not None:
+                response = wake_mode_response
             elif activation_response is not None:
                 response = activation_response
             elif readback_result is not None:
@@ -3353,12 +3473,30 @@ class WakeConversationDaemon:
                     )
                     self.pending_config_change = preparation.pending
                     self.pending_spoken_alias = None
+                    self.pending_wake_mode_disable = False
                     response = render_change_preparation(preparation)
                 else:
                     self.pending_config_change = None
                     response = AssistantResponse.from_text(
                         "I couldn't identify a safe configuration change, so I didn't "
                         "write anything."
+                    )
+            elif route.intent == Intent.WAKE_MODE_DISABLE:
+                if route.actionable:
+                    self.pending_wake_mode_disable = True
+                    self.pending_config_change = None
+                    self.pending_spoken_alias = None
+                    self.pending_target_readback = None
+                    self.pending_target_resolution = None
+                    response = AssistantResponse.from_text(
+                        "Turn wake mode off and stop listening? Say yes to confirm or "
+                        "no to cancel."
+                    )
+                else:
+                    self.pending_wake_mode_disable = False
+                    response = AssistantResponse.from_text(
+                        "I couldn't confirm that wake-mode request, so I am still "
+                        "listening."
                     )
             elif route.intent == Intent.VOCABULARY_ALIAS_ADD:
                 if route.actionable:
@@ -3374,6 +3512,7 @@ class WakeConversationDaemon:
                     )
                     self.pending_spoken_alias = preparation.pending
                     self.pending_config_change = None
+                    self.pending_wake_mode_disable = False
                     response = render_spoken_alias_preparation(preparation)
                 else:
                     self.pending_spoken_alias = None
@@ -3828,6 +3967,9 @@ class WakeConversationDaemon:
                     interrupted=interruption is not None,
                 )
             if interruption is not None:
+                if self.wake_mode_stop_after_delivery:
+                    self.wake_mode_stop_after_delivery = False
+                    self.pending_wake_mode_disable = True
                 release_deliveries(delivery_claims)
                 self.history = next_history
                 return interruption
@@ -3835,6 +3977,19 @@ class WakeConversationDaemon:
                 self._complete_config_activation_delivery(
                     self.config_activation_delivery
                 )
+            shutdown_started = False
+            if self.wake_mode_stop_after_delivery:
+                terminalize_non_side_effect()
+                launch_failure = self._complete_wake_mode_stop_delivery()
+                if launch_failure is not None:
+                    print(f"Assistant: {launch_failure.display_text}", flush=True)
+                    _playback, interruption = self.play_response(launch_failure)
+                    if interruption is not None:
+                        release_deliveries(delivery_claims)
+                        self.history = next_history
+                        return interruption
+                else:
+                    shutdown_started = True
             acknowledged = acknowledge_deliveries(delivery_claims)
             completed_claims = [
                 claim
@@ -3865,11 +4020,16 @@ class WakeConversationDaemon:
                     self.conversation_deadline,
                     unresolved_target.expires_at,
                 )
-            self.awaiting_followup = True
-            notify("Listening for a follow-up…")
+            if shutdown_started:
+                self.awaiting_followup = False
+                self.conversation_deadline = 0.0
+            else:
+                self.awaiting_followup = True
+                notify("Listening for a follow-up…")
         except SpeechDeliveryError as exc:
             turn_failed = True
             release_deliveries(delivery_claims)
+            self._revert_undelivered_wake_mode_stop()
             self.cursor_session = next_cursor_session
             log(f"speech delivery failed: {type(exc).__name__}: {exc}")
             notify(SPEECH_DELIVERY_FAILURE, error=True)
@@ -3880,10 +4040,13 @@ class WakeConversationDaemon:
         except NoSpeechError as exc:
             turn_failed = True
             release_deliveries(delivery_claims)
+            self._revert_undelivered_wake_mode_stop()
             pending_confirmation = (
                 getattr(self, "pending_target_readback", None) is not None
                 or getattr(self, "pending_target_resolution", None) is not None
                 or getattr(self, "pending_config_change", None) is not None
+                or getattr(self, "pending_spoken_alias", None) is not None
+                or getattr(self, "pending_wake_mode_disable", False)
             )
             if (
                 had_active_conversation
@@ -3913,6 +4076,7 @@ class WakeConversationDaemon:
         except Exception as exc:
             turn_failed = True
             release_deliveries(delivery_claims)
+            self._revert_undelivered_wake_mode_stop()
             log(f"turn failed: {type(exc).__name__}: {exc}")
             notify(VOICE_REQUEST_FAILURE, error=True)
             self.awaiting_followup = False
@@ -4133,6 +4297,8 @@ class WakeConversationDaemon:
         self.pending_question_retarget = None
         self.pending_config_change = None
         self.pending_spoken_alias = None
+        self.pending_wake_mode_disable = False
+        self.wake_mode_stop_after_delivery = False
         if self.microphone is not None and self.microphone.poll() is None:
             if self.microphone_paused:
                 with contextlib.suppress(ProcessLookupError):

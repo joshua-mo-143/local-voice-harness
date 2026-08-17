@@ -12,7 +12,7 @@ from pathlib import Path
 from unittest import mock
 
 from local_voice_harness import cli, llm_launcher, service_manager
-from local_voice_harness.config import START_SERVICES
+from local_voice_harness.config import START_SERVICES, STOP_SERVICES
 from local_voice_harness.install_profile import resolve_installation_plan
 from local_voice_harness.integrations.registry import build_integration_registry
 from local_voice_harness.stt import server as stt_server
@@ -25,6 +25,18 @@ def _snapshot():
         config,
         build_integration_registry(config),
     )
+
+
+def _fake_clock(start: float = 0.0):
+    clock = [start]
+
+    def monotonic() -> float:
+        return clock[0]
+
+    def sleep(seconds: float) -> None:
+        clock[0] += seconds
+
+    return monotonic, sleep
 
 
 class ServiceManagementTests(unittest.TestCase):
@@ -59,6 +71,142 @@ class ServiceManagementTests(unittest.TestCase):
         with mock.patch.object(service_manager, "systemctl") as systemctl:
             service_manager.start_services()
         systemctl.assert_called_once_with("start", *START_SERVICES)
+
+    def test_wake_mode_stop_uses_normal_stop_set_without_disabling_units(self) -> None:
+        stopped = subprocess.CompletedProcess([], 0, "", "")
+        inactive = subprocess.CompletedProcess([], 3, "inactive\n", "")
+        with (
+            mock.patch.object(
+                service_manager,
+                "systemctl",
+                side_effect=[stopped, *(inactive for _service in STOP_SERVICES)],
+            ) as systemctl,
+            mock.patch.object(service_manager, "notify") as notify,
+            mock.patch.object(service_manager.time, "sleep") as sleep,
+        ):
+            service_manager.execute_wake_mode_stop()
+
+        sleep.assert_not_called()
+
+        self.assertEqual(
+            systemctl.call_args_list,
+            [
+                mock.call("stop", *STOP_SERVICES, check=False),
+                *(
+                    mock.call("is-active", service, check=False)
+                    for service in STOP_SERVICES
+                ),
+            ],
+        )
+        notify.assert_not_called()
+
+    def test_wake_mode_stop_accepts_deactivating_units(self) -> None:
+        stopped = subprocess.CompletedProcess([], 0, "", "")
+        states = [
+            subprocess.CompletedProcess(
+                [],
+                3,
+                (
+                    "deactivating\n"
+                    if service == "voice-harness-wake.service"
+                    else "inactive\n"
+                ),
+                "",
+            )
+            for service in STOP_SERVICES
+        ]
+        with (
+            mock.patch.object(
+                service_manager,
+                "systemctl",
+                side_effect=[stopped, *states],
+            ),
+            mock.patch.object(service_manager, "notify") as notify,
+            mock.patch.object(service_manager.time, "sleep") as sleep,
+        ):
+            service_manager.execute_wake_mode_stop()
+
+        notify.assert_not_called()
+        sleep.assert_not_called()
+
+    def test_wake_mode_stop_retries_active_state_until_inactive(self) -> None:
+        stopped = subprocess.CompletedProcess([], 0, "", "")
+        active = subprocess.CompletedProcess([], 0, "active\n", "")
+        inactive = subprocess.CompletedProcess([], 3, "inactive\n", "")
+        effects: list[subprocess.CompletedProcess[str]] = [stopped]
+        for service in STOP_SERVICES:
+            if service == "voice-harness-wake.service":
+                effects.extend((active, inactive))
+            else:
+                effects.append(inactive)
+        with (
+            mock.patch.object(service_manager, "systemctl", side_effect=effects),
+            mock.patch.object(service_manager, "notify") as notify,
+            mock.patch.object(service_manager.time, "monotonic", return_value=0.0),
+            mock.patch.object(service_manager.time, "sleep") as sleep,
+        ):
+            service_manager.execute_wake_mode_stop()
+
+        notify.assert_not_called()
+        sleep.assert_called_once_with(service_manager._WAKE_STOP_POLL_SECONDS)
+
+    def test_wake_mode_stop_reports_unverified_active_service(self) -> None:
+        stopped = subprocess.CompletedProcess([], 1, "", "stop failed")
+        active = subprocess.CompletedProcess([], 0, "active\n", "")
+        inactive = subprocess.CompletedProcess([], 3, "inactive\n", "")
+
+        def systemctl(command: str, *arguments: str, check: bool = True):
+            if command == "stop":
+                return stopped
+            service = arguments[0]
+            if service == "voice-harness-wake.service":
+                return active
+            return inactive
+
+        monotonic, sleep = _fake_clock()
+        with (
+            mock.patch.object(service_manager, "systemctl", side_effect=systemctl),
+            mock.patch.object(service_manager, "notify") as notify,
+            mock.patch.object(service_manager.time, "monotonic", side_effect=monotonic),
+            mock.patch.object(service_manager.time, "sleep", side_effect=sleep),
+            self.assertRaises(service_manager.HarnessError) as raised,
+        ):
+            service_manager.execute_wake_mode_stop()
+
+        self.assertIn("voice-harness-wake.service: active", str(raised.exception))
+        notify.assert_called_once_with(str(raised.exception), error=True)
+
+    def test_wake_mode_stop_worker_runs_outside_wake_service_cgroup(self) -> None:
+        process = mock.Mock()
+        with (
+            mock.patch.object(
+                service_manager.uuid,
+                "uuid4",
+                return_value=mock.Mock(hex="a" * 32),
+            ),
+            mock.patch.object(
+                service_manager.subprocess,
+                "Popen",
+                return_value=process,
+            ) as popen,
+        ):
+            returned = service_manager.launch_wake_mode_stop_worker()
+
+        self.assertIs(returned, process)
+        command = popen.call_args.args[0]
+        self.assertEqual(
+            command[:5], ["systemd-run", "--user", "--scope", "--collect", "--quiet"]
+        )
+        self.assertIn("--unit=voice-harness-wake-stop-aaaaaaaaaaaaaaaa", command)
+        self.assertEqual(
+            command[-3:],
+            [
+                "-m",
+                "local_voice_harness.service_manager",
+                "--stop-for-wake-request",
+            ],
+        )
+        self.assertTrue(popen.call_args.kwargs["start_new_session"])
 
     def test_install_preserves_external_dictation(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

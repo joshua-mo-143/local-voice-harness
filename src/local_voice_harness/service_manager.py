@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import argparse
 import importlib.resources
 import subprocess
+import sys
+import time
+import uuid
 from dataclasses import dataclass
 
 from .config import (
@@ -14,6 +18,7 @@ from .config import (
 from .errors import HarnessError
 from .integrations.herdr import HerdrError
 from .integrations.registry import IntegrationRegistry, build_integration_registry
+from .notifications import notify
 from .platform_services import user_services
 from .service_units import audit_installed
 from .user_config import UserConfig, load_user_config
@@ -131,6 +136,59 @@ def stop_services(
     )
 
 
+_WAKE_STOP_SETTLED = frozenset({"inactive", "failed", "deactivating"})
+_WAKE_STOP_SETTLE_SECONDS = 2.0
+_WAKE_STOP_POLL_SECONDS = 0.2
+
+
+def execute_wake_mode_stop() -> None:
+    """Stop the normal voice service set without changing unit enablement."""
+
+    systemctl("stop", *STOP_SERVICES, check=False)
+    failures: list[str] = []
+    for service in STOP_SERVICES:
+        deadline = time.monotonic() + _WAKE_STOP_SETTLE_SECONDS
+        while True:
+            process = systemctl("is-active", service, check=False)
+            state = process.stdout.strip()
+            if state in _WAKE_STOP_SETTLED:
+                break
+            if time.monotonic() >= deadline:
+                failures.append(f"{service}: {state or 'unverified'}")
+                break
+            time.sleep(_WAKE_STOP_POLL_SECONDS)
+    if failures:
+        detail = "; ".join(failures)
+        message = f"Wake-mode shutdown could not verify stopped services: {detail}"
+        notify(message, error=True)
+        raise HarnessError(message)
+
+
+def launch_wake_mode_stop_worker() -> subprocess.Popen[bytes]:
+    """Launch wake shutdown outside the service cgroup that it will stop."""
+
+    unit = f"voice-harness-wake-stop-{uuid.uuid4().hex[:16]}"
+    return subprocess.Popen(
+        [
+            "systemd-run",
+            "--user",
+            "--scope",
+            "--collect",
+            "--quiet",
+            f"--unit={unit}",
+            sys.executable,
+            "-m",
+            "local_voice_harness.service_manager",
+            "--stop-for-wake-request",
+        ],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+        close_fds=True,
+    )
+
+
 def restart_services(
     *,
     include_herdr: bool,
@@ -187,3 +245,20 @@ def uninstall_services(
                 continue
     systemctl("daemon-reload")
     print("Uninstalled voice harness units.")
+
+
+def _parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--stop-for-wake-request", action="store_true")
+    return parser
+
+
+def main() -> None:
+    arguments = _parser().parse_args()
+    if not arguments.stop_for_wake_request:
+        raise SystemExit("no service action requested")
+    execute_wake_mode_stop()
+
+
+if __name__ == "__main__":
+    main()
