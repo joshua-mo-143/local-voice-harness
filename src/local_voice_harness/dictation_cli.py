@@ -32,14 +32,15 @@ def main(arguments: Sequence[str] | None = None) -> None:
     try:
         _run(command)
     except Exception as exc:
-        from .diagnostic_safety import COMMAND_FAILURE, log_diagnostic
+        from .diagnostic_safety import log_diagnostic, user_facing_failure_message
         from .notifications import notify
 
         log_diagnostic(
             "dictation_cli", "command_failed", f"{type(exc).__name__}: {exc}"
         )
-        print(f"voice-harness-dictate: {COMMAND_FAILURE}", file=sys.stderr)
-        notify(COMMAND_FAILURE, error=True)
+        message = user_facing_failure_message(exc)
+        print(f"voice-harness-dictate: {message}", file=sys.stderr)
+        notify(message, error=True)
         raise SystemExit(1) from exc
 
 

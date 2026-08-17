@@ -1,8 +1,22 @@
 from __future__ import annotations
 
+import contextlib
+import json
+import os
+from pathlib import Path
+
 import pytest
 
-from local_voice_harness.diagnostic_safety import redact_diagnostic, redact_fields
+from local_voice_harness.diagnostic_safety import (
+    COMMAND_FAILURE,
+    SPEECH_DELIVERY_FAILURE,
+    diagnostic_log_path,
+    log_diagnostic,
+    redact_diagnostic,
+    redact_fields,
+    user_facing_failure_message,
+)
+from local_voice_harness.errors import HarnessError, NoSpeechError, SpeechDeliveryError
 
 
 @pytest.mark.parametrize(
@@ -60,3 +74,50 @@ def test_redact_fields_recurses_through_structured_log_values() -> None:
             {"token": "token=[REDACTED]"},
         ],
     }
+
+
+def test_log_diagnostic_persists_when_stderr_is_discarded(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    runtime = tmp_path / "runtime"
+    runtime.mkdir()
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(runtime))
+
+    with Path(os.devnull).open("w", encoding="utf-8") as discarded:
+        with contextlib.redirect_stderr(discarded):
+            log_diagnostic(
+                "cli",
+                "command_failed",
+                "NoSpeechError: STT did not recognize any speech",
+            )
+
+    path = diagnostic_log_path()
+    persisted = json.loads(path.read_text(encoding="utf-8"))
+    assert persisted["component"] == "cli"
+    assert persisted["event"] == "command_failed"
+    assert persisted["diagnostic"] == "NoSpeechError: STT did not recognize any speech"
+    assert path.stat().st_mode & 0o777 == 0o600
+
+
+def test_log_diagnostic_write_failure_does_not_raise(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    blocker = tmp_path / "runtime"
+    blocker.write_text("not a directory", encoding="utf-8")
+    monkeypatch.setenv("XDG_RUNTIME_DIR", str(blocker))
+    log_diagnostic("cli", "command_failed", "boom")
+
+
+def test_user_facing_failure_message_prefers_harness_errors() -> None:
+    assert (
+        user_facing_failure_message(NoSpeechError("STT did not recognize any speech"))
+        == "STT did not recognize any speech"
+    )
+    assert user_facing_failure_message(RuntimeError("unexpected")) == COMMAND_FAILURE
+    assert (
+        user_facing_failure_message(SpeechDeliveryError("Venice failed"))
+        == SPEECH_DELIVERY_FAILURE
+    )
+    redacted = user_facing_failure_message(HarnessError("token=super-secret-value"))
+    assert "super-secret-value" not in redacted
+    assert "[REDACTED]" in redacted

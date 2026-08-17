@@ -7,6 +7,13 @@ voice-harness services status
 voice-harness services logs
 ```
 
+Dictation Super+D reports that the command failed:
+
+The window-manager keybind discards stderr, so the generic notification is not
+the full diagnostic. User-facing harness errors such as unrecognized speech are
+shown in the notification. Redacted JSON diagnostics are also appended to
+`$XDG_RUNTIME_DIR/voice-harness/diagnostics.jsonl`.
+
 CUDA library or model errors:
 
 ```bash
