@@ -19,12 +19,38 @@ from local_voice_harness.web_search import (
     SEARCH_RESULTS_HEADER,
     SEARCH_TIMEOUT_SECONDS,
     SEARCH_UNAVAILABLE,
+    needs_web_search,
     search_web,
 )
 
 
 def _response(payload: object) -> io.BytesIO:
     return io.BytesIO(json.dumps(payload).encode())
+
+
+class NeedsWebSearchTests(unittest.TestCase):
+    def test_current_fact_questions_require_search(self) -> None:
+        for utterance in (
+            "is GLM 5.3 available",
+            "has GLM 5.3 been released",
+            "any news about GLM 5.3",
+            "does GLM 5.3 exist now",
+            "is GLM 5.3 out yet",
+        ):
+            with self.subTest(utterance=utterance):
+                self.assertTrue(needs_web_search(utterance))
+
+    def test_static_conversation_does_not_require_search(self) -> None:
+        for utterance in (
+            "hello",
+            "what is two plus two",
+            "explain recursion",
+            "which files import asyncio",
+            "what time is it",
+            "work on issue 92",
+        ):
+            with self.subTest(utterance=utterance):
+                self.assertFalse(needs_web_search(utterance))
 
 
 class WebSearchTests(unittest.TestCase):

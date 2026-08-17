@@ -278,6 +278,32 @@ class QwenClientTests(unittest.TestCase):
         self.assertNotIn("You have a Cursor coding tool", system_prompt)
         self.assertNotIn("No executable tools are available", system_prompt)
 
+    def test_conceptual_conversation_keeps_optional_search(self) -> None:
+        for utterance in (
+            "what is two plus two",
+            "explain recursion",
+            "which files import asyncio",
+        ):
+            with self.subTest(utterance=utterance):
+                with (
+                    mock.patch.object(
+                        llm_transport.urllib.request,
+                        "urlopen",
+                        return_value=_response({"content": "answer"}),
+                    ) as urlopen,
+                    mock.patch.object(llm, "search_web") as search,
+                    redirect_stdout(io.StringIO()),
+                ):
+                    llm.qwen_turn(
+                        utterance,
+                        trusted_utterance=utterance,
+                        allow_search=True,
+                    )
+
+                search.assert_not_called()
+                payload = json.loads(urlopen.call_args.args[0].data)
+                self.assertEqual(payload["tool_choice"], "auto")
+
     def test_plain_conversation_keeps_optional_search(self) -> None:
         with (
             mock.patch.object(

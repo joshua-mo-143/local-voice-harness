@@ -15,7 +15,6 @@ from .diagnostic_safety import (
     redact_fields,
 )
 from .errors import HarnessError
-from .intent import needs_intent_router
 from .llm_transport import (
     CancellationCheck,
     ChatCompletionRequest,
@@ -25,7 +24,7 @@ from .llm_transport import (
 from .notifications import notify
 from .questions import AnswerProvenance
 from .responses import ResponseLike, as_assistant_response
-from .web_search import search_web
+from .web_search import needs_web_search, search_web
 
 BASE_SYSTEM_PROMPT = (
     "You are a fast conversational voice assistant. Every spoken answer must be complete and "
@@ -286,9 +285,7 @@ def qwen_turn(
         selected_tools.extend(WEB_SEARCH_TOOLS)
     tools = selected_tools or None
     force_search = (
-        allow_search
-        and not allow_tools
-        and needs_intent_router(trusted_utterance or text)
+        allow_search and not allow_tools and needs_web_search(trusted_utterance or text)
     )
     malformed_tool_call_count = 0
     for tool_round in range(MAX_TOOL_CALL_ROUNDS):
