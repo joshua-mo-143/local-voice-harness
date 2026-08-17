@@ -461,7 +461,7 @@ fi
 step "Install complete"
 bold "Remaining hardware-specific steps (see README):"
 info "1. Set your PipeWire mic source:"
-info "     voice-harness config set audio.source <PIPEWIRE_SOURCE_NAME>  # find with: wpctl status"
+info "     voice-harness config set audio.source  # pick from listed capture devices"
 if [[ "$INSTALL_LLM_SERVICE" == 1 ]]; then
   info "2. If your NVIDIA device is not CUDA0:"
   info "     voice-harness config set compute.cuda_device <LLAMA_CPP_DEVICE>"

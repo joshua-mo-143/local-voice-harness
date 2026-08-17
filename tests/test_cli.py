@@ -366,7 +366,7 @@ class ConfigCliTests(unittest.TestCase):
         result = mock.Mock(restart_services=("voice-harness-wake.service",))
         with (
             mock.patch.object(
-                cli, "commit_config_change", return_value=result
+                cli, "commit_config_setting", return_value=result
             ) as commit,
             mock.patch.object(
                 cli,
@@ -377,9 +377,24 @@ class ConfigCliTests(unittest.TestCase):
         ):
             cli.dispatch(args)
 
-        commit.assert_called_once_with({"audio.wake_threshold": "0.6"})
+        commit.assert_called_once_with("audio.wake_threshold", "0.6")
         notice.assert_called_once_with(result.restart_services)
         self.assertIn("Restart to apply", output.call_args.args[0])
+
+    def test_config_set_allows_omitted_capture_source_value(self) -> None:
+        args = cli.parser().parse_args(["config", "set", "audio.source"])
+        result = mock.Mock(restart_services=())
+        with (
+            mock.patch.object(
+                cli, "commit_config_setting", return_value=result
+            ) as commit,
+            mock.patch.object(cli, "format_restart_notice", return_value="ok"),
+            mock.patch("builtins.print"),
+        ):
+            cli.dispatch(args)
+
+        commit.assert_called_once_with("audio.source", None)
+        self.assertIsNone(args.value)
 
     def test_integrations_enable_and_doctor(self) -> None:
         enable_args = cli.parser().parse_args(["integrations", "enable", "linear"])

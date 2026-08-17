@@ -86,9 +86,8 @@ is selected.
 After installation, override PipeWire's system-selected microphone only when
 needed. When using the local LLM, also confirm the llama.cpp CUDA device:
 
-```bash
-wpctl status
-voice-harness config set audio.source '<PIPEWIRE_SOURCE_NAME>'
+```console
+voice-harness config set audio.source
 voice-harness config set compute.cuda_device CUDA0
 ```
 
@@ -125,8 +124,8 @@ Clone the repository, open it in a coding agent such as the
 Install this project by running ./scripts/install.sh from the repository root.
 It is idempotent and installs system packages, uv environments, models, and
 systemd user services. Pause for me to complete any interactive GitHub, Cursor,
-or credential prompts. After installation, find my microphone with `wpctl
-status` and configure it with `voice-harness config set audio.source ...`.
+or credential prompts. After installation, run `voice-harness config set
+audio.source` and pick my microphone from the listed capture devices.
 If I selected the local LLM, confirm its CUDA device with `llama-server
 --list-devices` and configure `compute.cuda_device`. Finally run
 `voice-harness doctor`, `voice-harness services status`, and

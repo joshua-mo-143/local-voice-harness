@@ -692,6 +692,37 @@ def pipewire_section_devices(status: str, section: str) -> tuple[str, ...]:
     return tuple(names)
 
 
+def list_pipewire_capture_sources() -> tuple[str, ...]:
+    """Return PipeWire node names usable as ``pw-record --target``.
+
+    Includes Audio Sources and Filters so echo-cancelled capture nodes remain
+    selectable. Empty means the caller should keep PipeWire's system default.
+    """
+
+    if _which("wpctl") is None:
+        raise UserConfigurationError(
+            "wpctl not found; install WirePlumber to list capture sources"
+        )
+    process = _run(["wpctl", "status", "--name"], timeout=5)
+    if process is None or process.returncode:
+        raise UserConfigurationError(
+            "wpctl status failed; PipeWire may not be running for this session"
+        )
+    names: list[str] = []
+    seen: set[str] = set()
+    for name in (
+        *pipewire_section_devices(process.stdout, "Sources"),
+        *pipewire_section_devices(process.stdout, "Filters"),
+    ):
+        if name in seen:
+            continue
+        seen.add(name)
+        names.append(name)
+    if not names:
+        raise UserConfigurationError("PipeWire reported no capture sources")
+    return tuple(names)
+
+
 def check_pipewire_devices(
     snapshot: DiagnosticSnapshot | None = None,
 ) -> list[CheckResult]:
@@ -760,7 +791,7 @@ def check_pipewire_devices(
                     f"configured capture source {source} was not found among "
                     f"PipeWire sources: {', '.join(sources)}"
                 ),
-                suggestion="voice-harness config set audio.source '<PIPEWIRE_SOURCE_NAME>'",
+                suggestion="voice-harness config set audio.source",
             )
         ]
     if dictation_source and dictation_source not in {*sources, *filters}:
@@ -773,9 +804,7 @@ def check_pipewire_devices(
                     f"configured dictation source {dictation_source} was not found "
                     f"among PipeWire sources: {', '.join((*sources, *filters))}"
                 ),
-                suggestion=(
-                    "voice-harness config set dictation.source '<PIPEWIRE_SOURCE_NAME>'"
-                ),
+                suggestion=("voice-harness config set dictation.source"),
             )
         ]
     if sink and sink not in {*sinks, *filters}:

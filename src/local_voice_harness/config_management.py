@@ -35,6 +35,8 @@ _WAKE_SERVICE = "voice-harness-wake.service"
 _LLM_SERVICE = "voice-harness-llm.service"
 _TTS_SERVICE = "voice-harness-tts.service"
 _DICTATION_SERVICE = "dictation.service"
+_SYSTEM_DEFAULT_SOURCE_LABEL = "PipeWire system default"
+_CAPTURE_SOURCE_KEYS = frozenset({"audio.source", "dictation.source"})
 
 
 @dataclass(frozen=True)
@@ -867,6 +869,91 @@ def _format_scalar(value: object) -> str:
     return str(value)
 
 
+def _capture_source_choices() -> tuple[str, ...]:
+    from .diagnostics.checks import list_pipewire_capture_sources
+
+    return list_pipewire_capture_sources()
+
+
+def pick_capture_source(
+    *,
+    current: str = "",
+    input_fn: Callable[[str], str] = input,
+    print_fn: Callable[[str], None] = print,
+    list_sources: Callable[[], tuple[str, ...]] | None = None,
+) -> str:
+    """Prompt for a PipeWire capture node, or the system default."""
+
+    sources = (list_sources or _capture_source_choices)()
+    labels = (_SYSTEM_DEFAULT_SOURCE_LABEL, *sources)
+    default_index = 0
+    if current:
+        try:
+            default_index = sources.index(current) + 1
+        except ValueError:
+            print_fn(f"Current source {current} is not among the listed devices.")
+    print_fn("Capture sources:")
+    for index, label in enumerate(labels):
+        marker = "*" if index == default_index else " "
+        print_fn(f" {marker} {index}. {label}")
+    last = len(labels) - 1
+    while True:
+        try:
+            answer = input_fn(f"Capture source [{default_index}]: ").strip()
+        except EOFError as exc:
+            raise UserConfigurationError(
+                "capture source selection requires an interactive choice"
+            ) from exc
+        if not answer:
+            selected = labels[default_index]
+        elif answer.isdigit() and int(answer) <= last:
+            selected = labels[int(answer)]
+        elif answer.casefold() in {"default", "system"}:
+            selected = _SYSTEM_DEFAULT_SOURCE_LABEL
+        elif answer in sources or answer == _SYSTEM_DEFAULT_SOURCE_LABEL:
+            selected = answer
+        else:
+            print_fn(f"Choose 0-{last} or a listed source name.")
+            continue
+        return "" if selected == _SYSTEM_DEFAULT_SOURCE_LABEL else selected
+
+
+def commit_config_setting(
+    key: str,
+    value: str | None,
+    *,
+    paths: ConfigPaths | None = None,
+    environment: Mapping[str, str] | None = None,
+    input_fn: Callable[[str], str] = input,
+    print_fn: Callable[[str], None] = print,
+) -> ConfigChangeResult:
+    """Persist one setting, offering a capture-source picker when needed."""
+
+    normalized = key.strip().casefold()
+    if value is not None:
+        return commit_config_change({key: value}, paths=paths, environment=environment)
+    if normalized not in _CAPTURE_SOURCE_KEYS:
+        raise UserConfigurationError(f"{key} requires a value")
+    resolved_paths = paths or config_paths(environment)
+    current = load_managed_config(resolved_paths, _file_environment(environment))
+    selected = pick_capture_source(
+        current=(
+            current.audio.source
+            if normalized == "audio.source"
+            else current.dictation.source
+        ),
+        input_fn=input_fn,
+        print_fn=print_fn,
+    )
+    assignments = {normalized: selected}
+    if normalized == "audio.source":
+        assignments["dictation.source"] = selected
+        print_fn("Using this source for wake recording and dictation.")
+    return commit_config_change(
+        assignments, paths=resolved_paths, environment=environment
+    )
+
+
 def _choice(
     prompt: str,
     options: Sequence[str],
@@ -947,6 +1034,7 @@ def run_setup(
         zendesk_enabled = False
         linear_enabled = False
         wake_threshold = "0.55"
+        capture_source = None
     else:
         print_fn("Voice harness setup writes ~/.config/voice-harness/config.toml.")
         print_fn(
@@ -1001,6 +1089,14 @@ def run_setup(
         dictation_device = None
         llm_device = None
         tts_device = None
+        try:
+            capture_source: str | None = pick_capture_source(
+                input_fn=input_fn,
+                print_fn=print_fn,
+            )
+        except UserConfigurationError as exc:
+            print_fn(f"Keeping PipeWire system default source ({exc}).")
+            capture_source = None
 
     assignments = {
         "providers.llm.provider": llm_provider,
@@ -1011,6 +1107,9 @@ def run_setup(
         "integrations.linear": "true" if linear_enabled else "false",
         "audio.wake_threshold": wake_threshold,
     }
+    if capture_source is not None:
+        assignments["audio.source"] = capture_source
+        assignments["dictation.source"] = capture_source
     if dictation_device is not None:
         assignments["compute.dictation_device"] = dictation_device
     if llm_device is not None:

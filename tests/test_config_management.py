@@ -278,6 +278,11 @@ class ConfigManagementTests(unittest.TestCase):
                     "_available_tts_providers",
                     return_value=("local", "venice"),
                 ),
+                mock.patch.object(
+                    config_management,
+                    "_capture_source_choices",
+                    side_effect=UserConfigurationError("wpctl not found"),
+                ),
             ):
                 result = config_management.run_setup(
                     paths=paths,
@@ -375,6 +380,92 @@ class ConfigManagementTests(unittest.TestCase):
             self.assertEqual(paths.backends.read_text(), legacy)
             self.assertFalse(
                 paths.backends.with_name("backends.toml.migrated").exists()
+            )
+
+    def test_pick_capture_source_selects_listed_device(self) -> None:
+        prompts: list[str] = []
+
+        selected = config_management.pick_capture_source(
+            current="",
+            input_fn=lambda prompt: prompts.append(prompt) or "1",
+            print_fn=lambda _message: None,
+            list_sources=lambda: ("usb-mic", "headset-mic"),
+        )
+
+        self.assertEqual(selected, "usb-mic")
+        self.assertTrue(prompts[0].startswith("Capture source [0]"))
+
+    def test_pick_capture_source_defaults_to_current_listed_device(self) -> None:
+        selected = config_management.pick_capture_source(
+            current="headset-mic",
+            input_fn=lambda _prompt: "",
+            print_fn=lambda _message: None,
+            list_sources=lambda: ("usb-mic", "headset-mic"),
+        )
+
+        self.assertEqual(selected, "headset-mic")
+
+    def test_interactive_setup_assigns_capture_source_to_recording(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            paths = self.paths(root)
+            with (
+                mock.patch.object(
+                    config_management,
+                    "_available_llm_providers",
+                    return_value=("venice",),
+                ),
+                mock.patch.object(
+                    config_management,
+                    "_available_tts_providers",
+                    return_value=("venice",),
+                ),
+                mock.patch.object(
+                    config_management,
+                    "_capture_source_choices",
+                    return_value=("usb-mic",),
+                ),
+            ):
+                result = config_management.run_setup(
+                    paths=paths,
+                    input_fn=lambda prompt: "1" if "Capture source" in prompt else "",
+                    print_fn=lambda _message: None,
+                )
+
+            self.assertEqual(result.config.audio.source, "usb-mic")
+            self.assertEqual(result.config.dictation.source, "usb-mic")
+
+    def test_config_set_audio_source_without_value_picks_and_assigns_dictation(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            paths = self.paths(root)
+            paths.config.parent.mkdir(parents=True)
+            with mock.patch.object(
+                config_management,
+                "_capture_source_choices",
+                return_value=("usb-mic", "headset-mic"),
+            ):
+                result = config_management.commit_config_setting(
+                    "audio.source",
+                    None,
+                    paths=paths,
+                    input_fn=lambda _prompt: "2",
+                    print_fn=lambda _message: None,
+                )
+
+            self.assertEqual(result.config.audio.source, "headset-mic")
+            self.assertEqual(result.config.dictation.source, "headset-mic")
+            self.assertEqual(result.changed_keys, ("audio.source", "dictation.source"))
+
+    def test_config_set_requires_value_for_non_capture_keys(self) -> None:
+        with self.assertRaisesRegex(UserConfigurationError, "requires a value"):
+            config_management.commit_config_setting(
+                "audio.wake_threshold",
+                None,
+                input_fn=lambda _prompt: "",
+                print_fn=lambda _message: None,
             )
 
 

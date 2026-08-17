@@ -232,7 +232,10 @@ voice-harness integrations doctor
 ```
 
 `setup` walks through provider, integration, audio, and compute choices that are
-supported on the current machine. Use `--defaults` for a non-interactive first
+supported on the current machine, including a picker of PipeWire capture
+sources. Omit the value on `voice-harness config set audio.source` to use that
+same picker later; the next dictation command reads the stored source without a
+service restart. Use `--defaults` for a non-interactive first
 write with Venice LLM/TTS and local Parakeet dictation. The equivalent
 `--profile showcase` also migrates an existing `backends.toml` into the unified
 configuration and retains the original as `backends.toml.migrated` so legacy
@@ -255,6 +258,9 @@ Common examples:
 voice-harness config set providers.llm.provider venice
 voice-harness config set providers.tts.provider venice
 voice-harness credentials set
+
+# Pin the microphone from enumerated PipeWire capture devices
+voice-harness config set audio.source
 
 # Tighter wake sensitivity and faster playback drain
 voice-harness config set audio.wake_threshold 0.65
