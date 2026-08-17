@@ -696,6 +696,7 @@ class AppContextTests(unittest.TestCase):
             trusted_utterance="summarize this",
             delivery_claims=mock.ANY,
             allow_tools=False,
+            allow_search=True,
             settings=mock.ANY,
         )
 
@@ -727,6 +728,7 @@ class AppContextTests(unittest.TestCase):
             trusted_utterance="fork this repo and add Venice",
             delivery_claims=mock.ANY,
             allow_tools=False,
+            allow_search=True,
             settings=mock.ANY,
         )
 
@@ -754,6 +756,7 @@ class AppContextTests(unittest.TestCase):
             "what does this issue say",
         )
         self.assertFalse(qwen.call_args.kwargs["allow_tools"])
+        self.assertTrue(qwen.call_args.kwargs["allow_search"])
 
     def test_unclear_pull_request_request_does_not_write(self) -> None:
         with (

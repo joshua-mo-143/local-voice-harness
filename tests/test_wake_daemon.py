@@ -723,6 +723,7 @@ class ProcessUtteranceTests(unittest.TestCase):
             trusted_utterance="what time is it",
             delivery_claims=mock.ANY,
             allow_tools=False,
+            allow_search=True,
             settings=daemon.providers,
         )
         transcribe.assert_called_once_with(AUDIO_GENERATION, woke=False)
@@ -3659,6 +3660,7 @@ class ProcessUtteranceTests(unittest.TestCase):
             trusted_utterance: str,
             delivery_claims: list[DeliveryClaim],
             allow_tools: bool = True,
+            allow_search: bool = False,
             settings: object | None = None,
         ) -> tuple[str, str]:
             self.assertEqual(trusted_utterance, "question")
@@ -6461,6 +6463,7 @@ class ComponentSynchronizationTests(unittest.TestCase):
         qwen_turn.assert_called_once_with(
             "Reply with only OK. Do not call a tool.",
             allow_tools=False,
+            allow_search=False,
             settings=daemon.providers,
         )
 

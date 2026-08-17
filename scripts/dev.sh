@@ -42,8 +42,9 @@ case "$command" in
     ;;
 esac
 
+official_config_home="${XDG_CONFIG_HOME:-"$HOME/.config"}"
 if [[ -z "${GH_CONFIG_DIR:-}" ]]; then
-  export GH_CONFIG_DIR="${XDG_CONFIG_HOME:-"$HOME/.config"}/gh"
+  export GH_CONFIG_DIR="$official_config_home/gh"
 fi
 export XDG_CONFIG_HOME="$PROJECT_DIR/.dev/config"
 export XDG_STATE_HOME="$PROJECT_DIR/.dev/state"
@@ -52,6 +53,19 @@ export VOICE_HARNESS_BRANCH_RUNTIME="$PROJECT_DIR/.dev/runtime"
 export TMPDIR="$PROJECT_DIR/.dev/runtime/tmp"
 unset STATE_DIRECTORY
 mkdir -p -- "$XDG_CONFIG_HOME" "$XDG_STATE_HOME" "$VOICE_HARNESS_BRANCH_RUNTIME" "$TMPDIR"
+
+checkout_harness_config="$XDG_CONFIG_HOME/voice-harness"
+official_harness_config="$official_config_home/voice-harness"
+if [[ ! -e "$checkout_harness_config/config.toml" && ! -e "$checkout_harness_config/backends.toml" ]]; then
+  if [[ -d "$official_harness_config" ]]; then
+    mkdir -p -- "$checkout_harness_config"
+    for name in config.toml backends.toml; do
+      if [[ -f "$official_harness_config/$name" ]]; then
+        cp -- "$official_harness_config/$name" "$checkout_harness_config/$name"
+      fi
+    done
+  fi
+fi
 
 if [[ "$command" == "text" || "$command" == "pronounce" ]]; then
   exec uv run --project "$PROJECT_DIR" --python "$python_version" --extra wake voice-harness "$command" "$@"
