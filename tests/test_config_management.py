@@ -247,6 +247,10 @@ class ConfigManagementTests(unittest.TestCase):
             root / "cfg" / "dictation" / "backend.env",
         )
 
+    def test_available_llm_and_tts_providers_are_venice_only(self) -> None:
+        self.assertEqual(config_management._available_llm_providers(), ("venice",))
+        self.assertEqual(config_management._available_tts_providers(), ("venice",))
+
     def test_setup_defaults_is_non_interactive(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -271,12 +275,12 @@ class ConfigManagementTests(unittest.TestCase):
                 mock.patch.object(
                     config_management,
                     "_available_llm_providers",
-                    return_value=("local", "venice"),
+                    return_value=("venice",),
                 ),
                 mock.patch.object(
                     config_management,
                     "_available_tts_providers",
-                    return_value=("local", "venice"),
+                    return_value=("venice",),
                 ),
                 mock.patch.object(
                     config_management,

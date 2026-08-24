@@ -9,19 +9,18 @@
 #   PYTHON_VERSION      Python for the harness envs (default 3.11)
 #   CHATTERBOX_DIR      TTS env location (default $HOME/chatterbox-audition)
 #   PROFILE             Installation profile: showcase or local-cuda
-#   LLM_PROVIDER        LLM backend: local or venice (prompts when unset)
-#   TTS_PROVIDER        TTS backend: local or venice (prompts when unset)
-#   LLM_DEVICE          Local LLM compute: auto, cpu, or cuda
-#   TTS_DEVICE          Local TTS compute: auto, cpu, or cuda
+#   LLM_PROVIDER        LLM backend (venice only)
+#   TTS_PROVIDER        TTS backend (venice only)
 #   DICTATION_DEVICE    Dictation compute: auto, cpu, or cuda
 #   SKIP_SYSTEM_PACKAGES=1   Skip distro package installation
-#   SKIP_MODELS=1            Skip Qwen/Chatterbox downloads
+#   SKIP_MODELS=1            Skip optional model downloads
 #   SKIP_AUTH=1              Skip the interactive gh/cursor/linear logins
 #
 # Showcase (Venice LLM/TTS + CPU dictation) installs no CUDA or NVIDIA
-# packages and omits local LLM/TTS extras, models, and the local LLM service:
+# packages. local-cuda is Venice LLM/TTS plus CUDA dictation:
 #   PROFILE=showcase ./scripts/install.sh
 #   ./scripts/install.sh --profile showcase
+#   ./scripts/install.sh --profile local-cuda
 set -euo pipefail
 
 PYTHON_VERSION="${PYTHON_VERSION:-3.11}"
@@ -45,30 +44,14 @@ info() { printf '    %s\n' "$*"; }
 warn() { printf '\033[1;33m warn:\033[0m %s\n' "$*" >&2; }
 have() { command -v "$1" >/dev/null 2>&1; }
 
-select_provider() {
-  local label="$1" selected="$2"
-  while true; do
-    if [[ -z "$selected" ]]; then
-      if [[ -t 0 ]]; then
-        read -r -p "$label provider (local/venice) [local]: " selected
-      fi
-      selected="${selected:-local}"
-    fi
-    selected="${selected,,}"
-    case "$selected" in
-      local|venice)
-        printf '%s\n' "$selected"
-        return
-        ;;
-      *)
-        warn "$label provider must be 'local' or 'venice'."
-        if [[ ! -t 0 ]]; then
-          return 1
-        fi
-        selected=""
-        ;;
-    esac
-  done
+require_venice_provider() {
+  local label="$1" selected="${2:-venice}"
+  selected="${selected,,}"
+  if [[ "$selected" != "venice" ]]; then
+    warn "$label provider must be venice."
+    return 1
+  fi
+  printf '%s\n' "$selected"
 }
 
 require() {
@@ -199,13 +182,14 @@ info "Project directory: $PROJECT_DIR"
 bootstrap_installer_python
 
 step "Selecting AI providers"
+LLM_PROVIDER="$(require_venice_provider "LLM" "${LLM_PROVIDER:-venice}")"
+TTS_PROVIDER="$(require_venice_provider "TTS" "${TTS_PROVIDER:-venice}")"
 if [[ "${PROFILE,,}" == "showcase" ]]; then
-  LLM_PROVIDER="venice"
-  TTS_PROVIDER="venice"
   info "Showcase profile selected: Venice LLM/TTS with CPU dictation"
+elif [[ "${PROFILE,,}" == "local-cuda" ]]; then
+  info "local-cuda profile selected: Venice LLM/TTS with CUDA dictation"
 else
-  LLM_PROVIDER="$(select_provider "LLM" "${LLM_PROVIDER:-}")"
-  TTS_PROVIDER="$(select_provider "TTS" "${TTS_PROVIDER:-}")"
+  info "Venice is the only supported LLM and TTS provider"
 fi
 mapfile -t CUDA_CAPABILITY_ARGS < <(cuda_capability_args)
 eval "$(resolve_install_plan --format env --profile "$PROFILE" --llm "$LLM_PROVIDER" --tts "$TTS_PROVIDER" --llm-device "${LLM_DEVICE:-}" --tts-device "${TTS_DEVICE:-}" --dictation-device "${DICTATION_DEVICE:-}" "${CUDA_CAPABILITY_ARGS[@]}")"

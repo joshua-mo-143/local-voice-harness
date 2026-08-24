@@ -191,10 +191,10 @@ The lifecycle policy for every `config.toml` setting is:
 
 | Settings | Snapshot owner | Apply changes by |
 | --- | --- | --- |
-| `providers.llm.provider`, `model`, `endpoint`, `timeout` | Wake process and local LLM service | Restart `voice-harness-wake.service` and `voice-harness-llm.service`; the local LLM service is stopped when the selected provider is remote |
+| `providers.llm.provider`, `model`, `endpoint`, `timeout` | Wake process | Restart `voice-harness-wake.service` |
 | `providers.tts.provider`, `model`, `voice`, `speed`, `endpoint`, `timeout` | Wake process and TTS service | Restart `voice-harness-wake.service` and `voice-harness-tts.service` |
 | `integrations.github`, `zendesk`, `linear` | Wake process integration registry | Restart `voice-harness-wake.service` |
-| `compute.cuda_device` | Local LLM service | Restart `voice-harness-llm.service` |
+| `compute.cuda_device` | Unused for Venice LLM/TTS | No restart for the supported Venice path |
 | `compute.dictation_device`, `dictation_backend`, `dictation_model`, `dictation_quantization`, `dictation_compute`, `dictation_language` | Dictation service | Restart `dictation.service` |
 | Every `audio.*` setting | Wake process | Restart `voice-harness-wake.service` |
 | `dictation.prompt`, `dictation.replacements` | Dictation service | Restart `dictation.service` |
@@ -276,9 +276,8 @@ voice-harness integrations doctor
 
 ## AI backends
 
-LLM and TTS providers are selected independently in `[providers.llm]` and
-`[providers.tts]` in `config.toml`. Both default to `venice`; select `local` for
-offline inference. Existing values in
+Venice is the only supported LLM and TTS provider in `[providers.llm]` and
+`[providers.tts]`. Both default to `venice`. Existing values in
 `~/.config/voice-harness/backends.toml` continue to override `config.toml` until
 that legacy file is removed:
 
@@ -296,7 +295,7 @@ speed = 1.25
 
 The optional `endpoint` and positive `timeout` keys may be set in either section.
 Venice TTS defaults to pitch-preserving `1.25` speed, applied locally through
-FFmpeg so the result is consistent across models. Local TTS defaults to `1.0`.
+FFmpeg so the result is consistent across models.
 TTS `speed` accepts values from `0.25` to `4.0`. Environment overrides are
 available as `VOICE_HARNESS_LLM_PROVIDER`, `VOICE_HARNESS_LLM_MODEL`,
 `VOICE_HARNESS_LLM_ENDPOINT`, `VOICE_HARNESS_LLM_TIMEOUT`, and their corresponding
@@ -344,7 +343,7 @@ voice-harness plan-approval ask
 | --- | --- | --- | --- |
 | `VOICE_HARNESS_SOURCE` | PipeWire microphone source; empty uses the system default | System default | Process environment override |
 | `VOICE_HARNESS_SINK` | PipeWire playback sink; empty uses the system default | System default | Process environment override |
-| `VOICE_HARNESS_VOICE` | Absolute Chatterbox reference WAV path | Built-in voice | Process environment override |
+| `VOICE_HARNESS_VOICE` | Venice TTS voice id, or leftover local reference WAV path | Built-in voice | Process environment override |
 | `VOICE_HARNESS_WAKE_THRESHOLD` | OpenWakeWord activation threshold (`0`–`1`) | `0.55` | Process environment override |
 | `VOICE_HARNESS_MIN_SPEECH_RMS` | Non-negative speech energy gate | `1100` | Process environment override |
 | `VOICE_HARNESS_BARGE_IN_MODE` | Playback interruption (`wake`, `vad`, or `off`) | `wake` | Process environment override |
@@ -386,15 +385,6 @@ voice-harness plan-approval ask
 | `DICTATION_QUANTIZATION` | Parakeet ONNX quantization (`none` disables it) | `int8` | Environment override; legacy `backend.env` input |
 | `DICTATION_COMPUTE` | faster-whisper compute type | `float16` | Environment override; legacy `backend.env` input |
 | `DICTATION_LANGUAGE` | Spoken language to transcribe (`en`, `zh`, `english`, `chinese`, or `auto`) | `auto` | Environment override; legacy `backend.env` input |
-
-Local LLM and TTS use the same typed `auto`, `cpu`, and `cuda` selectors through
-`compute.llm_device` and `compute.tts_device`. CPU paths never probe or call CUDA:
-llama.cpp is launched with `--n-gpu-layers 0` and no `--device`, and Chatterbox
-loads on `device="cpu"` without `torch.cuda` synchronization. Explicit `cuda`
-fails at service start when the device is unavailable. `auto` prefers CUDA when
-the launcher can prove it and otherwise uses CPU. Installation and `voice-harness
-doctor` report the configured modes and skip CUDA packages/tools when every local
-component is CPU.
 
 `cpu` is a strict CPU path: Parakeet receives only ONNX Runtime's CPU provider,
 faster-whisper receives `device="cpu"`, incompatible half-precision Whisper compute

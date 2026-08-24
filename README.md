@@ -8,8 +8,8 @@ task.
 
 - **Voice-driven coding delegation** — hand off GitHub issues, pull requests, Linear
   tickets, and repository tasks to Cursor agents.
-- **Local or hosted inference** — run the LLM and TTS locally, use Venice AI for
-  either service, or mix the two. Wake-word detection and speech-to-text remain local.
+- **Hosted LLM and TTS, local speech** — Venice AI generates replies and speech.
+  Wake-word detection and speech-to-text remain local.
 - **Focused context** — refer to a focused GitHub, pull request, or enabled Zendesk
   tab, selected editor text, or an uncommitted diff.
 - **Streaming speech and interruption** — hear the first clause while later clauses
@@ -28,28 +28,25 @@ granting it access to repositories or external integrations.
 
 ## Deployment profiles
 
-LLM and TTS providers are selected independently:
+Venice is the only supported LLM and TTS provider. Wake-word detection and
+speech-to-text stay local:
 
 | Profile | LLM | TTS | Speech-to-text | Notes |
 | --- | --- | --- | --- | --- |
-| All local | Qwen through llama.cpp | Chatterbox Turbo | Parakeet or faster-whisper | Private model inference; requires a capable NVIDIA GPU for the tested configuration |
-| Hosted | Venice AI | Venice AI | Local | Lower local model requirements; transcripts sent to the LLM and replies sent to TTS leave the machine |
-| Mixed | Local or Venice | Local or Venice | Local | Choose where text generation and speech synthesis run separately |
+| Hosted (`showcase`) | Venice AI | Venice AI | Local CPU Parakeet | GPU-free path; transcripts and replies leave the machine |
+| Hosted plus CUDA dictation (`local-cuda`) | Venice AI | Venice AI | Local CUDA Parakeet | Uses an NVIDIA GPU for dictation only |
 
-Cursor, GitHub, Linear, and Venice are external services when enabled. “All local”
-describes the voice-model pipeline, not delegated Cursor work or optional
-integrations.
+Cursor, GitHub, Linear, and Venice are external services when enabled. Local Qwen
+and Chatterbox are no longer a supported product path.
 
 ## Requirements
 
-The supported platform is Linux x86-64 with systemd user services and PipeWire. The
-one-shot Arch/CachyOS installer currently provisions CUDA dictation and therefore
-expects an NVIDIA GPU. The tested all-local machine has an RTX 5070 Ti Laptop GPU
-with 12 GB VRAM and 32 GB system RAM.
+The supported platform is Linux x86-64 with systemd user services and PipeWire.
+Venice is the only supported LLM and TTS provider. The `local-cuda` installer
+profile provisions CUDA dictation and therefore expects an NVIDIA GPU. The
+`showcase` profile is the GPU-free Venice LLM/TTS plus CPU dictation path.
 
-CPU dictation and hosted LLM/TTS configurations are available through the
-[manual installation guide](docs/installation.md). The showcase installer
-profile is a GPU-free Venice LLM/TTS plus CPU dictation path. See the guide for
+See the [manual installation guide](docs/installation.md) for
 [compute requirements](docs/installation.md#compute-requirements) and
 [external prerequisites](docs/installation.md#external-prerequisites).
 
@@ -69,26 +66,24 @@ cd "$HOME/local-voice-harness"
 ```
 
 Do not pipe the installer over standard input. It finds the repository from its own
-path and may pause for interactive authentication. It asks whether the LLM and TTS
-should use `local` or `venice`; the choices can also be supplied non-interactively:
+path and may pause for interactive authentication. LLM and TTS are always Venice.
+Choose CPU or CUDA dictation with a profile:
 
 ```bash
-LLM_PROVIDER=venice TTS_PROVIDER=venice ./scripts/install.sh
 PROFILE=showcase ./scripts/install.sh
 ./scripts/install.sh --profile showcase
+./scripts/install.sh --profile local-cuda
 ```
 
-`PROFILE=showcase` selects Venice LLM/TTS and CPU dictation, installs no CUDA or
-NVIDIA packages, and omits local LLM/TTS extras, models, and the local LLM
-service. The existing local CUDA path remains the default when a local provider
-is selected.
+`PROFILE=showcase` selects Venice LLM/TTS and CPU dictation and installs no CUDA
+or NVIDIA packages. `PROFILE=local-cuda` keeps Venice LLM/TTS and installs CUDA
+dictation only.
 
 After installation, override PipeWire's system-selected microphone only when
-needed. When using the local LLM, also confirm the llama.cpp CUDA device:
+needed:
 
 ```console
 voice-harness config set audio.source
-voice-harness config set compute.cuda_device CUDA0
 ```
 
 Use `voice-harness config set` rather than systemd environment drop-ins for
@@ -126,9 +121,7 @@ It is idempotent and installs system packages, uv environments, models, and
 systemd user services. Pause for me to complete any interactive GitHub, Cursor,
 or credential prompts. After installation, run `voice-harness config set
 audio.source` and pick my microphone from the listed capture devices.
-If I selected the local LLM, confirm its CUDA device with `llama-server
---list-devices` and configure `compute.cuda_device`. Finally run
-`voice-harness doctor`, `voice-harness services status`, and
+Finally run `voice-harness doctor`, `voice-harness services status`, and
 `voice-harness services audit`.
 ```
 
@@ -230,8 +223,8 @@ See the [configuration reference](docs/configuration.md),
 
 Use `voice-harness services <command>` with `install`, `start`, `stop`, `restart`,
 `status`, `audit`, `logs`, or `uninstall`. systemd supervises the services and keeps
-journal logs. `start` launches dictation and the wake listener; local Qwen and
-Chatterbox services remain on demand. Herdr is left running unless
+journal logs. `start` launches dictation and the wake listener. Herdr is left
+running unless
 `--include-herdr` is explicitly supplied. See
 [Service management](docs/service-management.md).
 

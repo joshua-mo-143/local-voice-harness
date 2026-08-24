@@ -15,7 +15,6 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 
 from .config import PROJECT_ROOT, SERVICE_FILES, backend_config_path, xdg_config_home
-from .credentials import CredentialError, get_venice_api_key, secret_service_available
 from .integrations.registry import capability_statuses
 from .platform_services import user_services
 from .user_config import (
@@ -972,24 +971,11 @@ def _choice(
 
 
 def _available_llm_providers() -> tuple[str, ...]:
-    options: list[str] = []
-    if shutil.which("llama-server") is not None:
-        options.append("local")
-    if _venice_available():
-        options.append("venice")
-    return tuple(options or ("local", "venice"))
+    return ("venice",)
 
 
 def _available_tts_providers() -> tuple[str, ...]:
     return _available_llm_providers()
-
-
-def _venice_available() -> bool:
-    try:
-        get_venice_api_key()
-        return True
-    except CredentialError:
-        return secret_service_available()
 
 
 def _available_dictation_backends() -> tuple[str, ...]:

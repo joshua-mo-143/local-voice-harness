@@ -1,11 +1,10 @@
 # Manual installation
 
 The [Quick start](../README.md#quick-start) path runs `scripts/install.sh`, which
-supports Arch, Ubuntu/Debian, and Fedora. It installs only the packages required
-by the selected providers, audio stack, and compute profile, then pauses for
-interactive choices or logins when needed. Hosted-only (showcase) installs skip
-CUDA packages and local model downloads on every supported family. Re-running the
-installer is idempotent.
+supports Arch, Ubuntu/Debian, and Fedora. It installs Venice LLM/TTS plus the
+packages required by the audio stack and dictation compute profile, then pauses
+for interactive logins when needed. Showcase installs skip CUDA packages on every
+supported family. Re-running the installer is idempotent.
 
 The installer discovers the checkout, `~/.local/bin`, and the systemd user
 directory from its own path and XDG locations. If the checkout is not
@@ -17,52 +16,43 @@ distro package is still too old.
 
 ## Compute requirements
 
-The project supports an all-local voice-model pipeline, hosted Venice LLM/TTS, or a
-mix of local and hosted providers. Wake detection and dictation are always local.
-Cursor, GitHub, Linear, and Venice are external services when enabled.
+Venice is the only supported LLM and TTS provider. Wake detection and dictation
+are always local. Cursor, GitHub, Linear, and Venice are external services when
+enabled.
 
-The tested all-local configuration is:
+The tested hosted configuration is:
 
 - Linux x86-64 with systemd user services and PipeWire.
-- NVIDIA GeForce RTX 5070 Ti Laptop GPU with 12 GB VRAM.
-- 32 GB system RAM and swap.
-- CUDA-capable NVIDIA driver plus a CUDA-enabled llama.cpp build.
-- Python 3.11 for the management, wake, TTS, and bundled dictation environments.
+- Python 3.11 for the management, wake, TTS proxy, and bundled dictation
+  environments.
+- An NVIDIA GPU only when using the `local-cuda` dictation profile.
 
-Practical requirements for the included model choices:
+Practical requirements:
 
 | Resource | Minimum | Recommended |
 | --- | ---: | ---: |
-| GPU VRAM | 10 GB | 12 GB |
-| System RAM | 16 GB | 32 GB |
-| Free disk | 20 GB | 25+ GB |
+| GPU VRAM | none for showcase | 4 GB for CUDA dictation |
+| System RAM | 8 GB | 16 GB |
+| Free disk | 10 GB | 15+ GB |
 | CPU | Modern 4-core x86-64 | 8+ cores |
 
-With all models warm, expect roughly 8-10 GB of GPU memory. The main disk consumers
-are:
+The main disk consumers are:
 
-- Qwen3.5-4B Q4_K_M GGUF: approximately 2.5 GB.
-- Chatterbox Turbo cache: 3.8 GB.
 - Parakeet TDT 0.6B v2 ONNX cache: less than 1 GB.
-- Current Python environments: approximately 13 GB combined.
+- Current Python environments: several gigabytes combined.
 
-The tested configuration uses CUDA for Parakeet and Chatterbox, but dictation can
-run independently on CPU. CPU dictation has substantially higher latency. The
-optional faster-whisper backend supports the same `auto`, `cpu`, and `cuda` device
-selection. Hosted LLM/TTS with CPU dictation can avoid local model inference on the
-GPU. The showcase installer profile is that GPU-free path:
+Dictation can run on CPU or CUDA. CPU dictation has substantially higher latency.
+The optional faster-whisper backend supports the same `auto`, `cpu`, and `cuda`
+device selection. The showcase installer profile is the GPU-free path:
 
 ```bash
 PROFILE=showcase ./scripts/install.sh
 ./scripts/install.sh --profile showcase
 ```
 
-It installs no CUDA or NVIDIA packages, uses the CPU `dictation` extra, and
-omits local LLM/TTS extras, Qwen/Chatterbox downloads, and the local LLM
-service. With local providers, the default `auto` compute mode installs CUDA
-artifacts only when a bounded `nvidia-smi` probe confirms usable CUDA; otherwise it
-installs the CPU dictation and llama.cpp artifacts. Setting a device or the
-`local-cuda` profile explicitly is a strict CUDA requirement.
+It installs no CUDA or NVIDIA packages and uses the CPU `dictation` extra.
+`PROFILE=local-cuda` keeps Venice LLM/TTS and installs CUDA packages for
+dictation only.
 
 ## External prerequisites
 
@@ -76,12 +66,9 @@ Install these before setting up Python environments:
   `wl-clipboard` for Hyprland/Sway focused-window automation.
 - Rofi for repository selection and pasteable clone-URL prompts.
 - [uv](https://docs.astral.sh/uv/) for reproducible Python versions/environments.
-- A recent [llama.cpp](https://github.com/ggml-org/llama.cpp) build with CUDA and
-  `llama-server`. The server runs with `--jinja` so it uses the model's native chat
-  template, which llama.cpp requires for Qwen3.5 tool calling.
 - The [Cursor CLI](https://cursor.com/docs/cli/installation).
 - [Herdr](https://herdr.dev).
-- A working NVIDIA driver.
+- A working NVIDIA driver when using CUDA dictation.
 
 On Arch/CachyOS, the base packages are approximately:
 
@@ -93,17 +80,16 @@ paru -S --needed pipewire libnotify git curl github-cli xdotool xclip \
 On Ubuntu/Debian, the installer maps those names to `apt-get` packages such as
 `libnotify-bin`, `gh`, `libsecret-tools`, and `gnome-keyring`, and bootstraps
 `uv` when the distro does not package it. On Fedora it uses `dnf` with the
-same mapping (`gh`, `libsecret`, `gnome-keyring`). Hosted-only installs do not
-install CUDA packages on any family. Local CUDA llama.cpp packages remain
-Arch-specific. An explicit CUDA plan on Ubuntu/Debian or Fedora fails before
-package installation because those adapters cannot currently satisfy `cuda` and
-`llama.cpp-cuda`; use the supported Arch adapter or select CPU/hosted compute.
+same mapping (`gh`, `libsecret`, `gnome-keyring`). Showcase installs do not
+install CUDA packages on any family. An explicit CUDA dictation plan on
+Ubuntu/Debian or Fedora fails before package installation because those adapters
+cannot currently satisfy `cuda`; use the supported Arch adapter or the showcase
+profile.
 
-On Arch/CachyOS, install the CUDA-enabled llama.cpp AUR package (it conflicts with
-`llama.cpp-vulkan` and other non-CUDA variants):
+On Arch/CachyOS, CUDA dictation needs the distro CUDA package:
 
 ```bash
-paru -S --needed cuda llama.cpp-cuda
+paru -S --needed cuda
 ```
 
 Verify the required commands:
@@ -112,10 +98,9 @@ Verify the required commands:
 pw-record --version
 pw-play --version
 ffmpeg -version
-llama-server --version
-llama-server --list-devices   # expect CUDA0: NVIDIA GeForce ...
-nvidia-smi
 ```
+
+For CUDA dictation, also confirm `nvidia-smi`.
 
 Authenticate the GitHub CLI to let focused issue pages include repository details and
 to create forks explicitly requested through the harness:
@@ -191,42 +176,10 @@ device, model, language, compute, and quantization selectors. Socket, CUDA/Huggi
 cache, temporary, home, and XDG path variables are service-owned and cannot be
 overridden by that file. New configuration commands never create or update it.
 
-## 3. Create the Chatterbox environment
+## 3. Configure Venice LLM and TTS
 
-The existing service uses `$HOME/chatterbox-audition/.venv`:
-
-```bash
-mkdir -p "$HOME/chatterbox-audition"
-UV_PROJECT_ENVIRONMENT="$HOME/chatterbox-audition/.venv" \
-  uv sync --python 3.11 --extra tts --no-dev
-```
-
-The tested TTS environment used `chatterbox-tts 0.1.7` and CUDA-enabled
-`torch 2.10.0`. The project-level uv overrides preserve those `torch` and
-`torchaudio` versions despite Chatterbox's older metadata. If those wheels do not
-support a future GPU/driver combination, update `[tool.uv].override-dependencies`
-using the [PyTorch selector](https://pytorch.org/get-started/locally/).
-
-Download Chatterbox before enabling its offline systemd service:
-
-```bash
-HF_HUB_OFFLINE=0 "$HOME/chatterbox-audition/.venv/bin/python" - <<'PY'
-from chatterbox.tts_turbo import ChatterboxTurboTTS
-ChatterboxTurboTTS.from_pretrained(device="cuda")
-print("Chatterbox Turbo cached")
-PY
-```
-
-## Optional Venice LLM and TTS backends
-
-The LLM and TTS providers can be selected independently. The installer prompts for
-each provider and skips the corresponding local environment or model download when
-Venice is selected. Its choices can also be supplied non-interactively:
-
-```bash
-env LLM_PROVIDER=venice TTS_PROVIDER=venice ./scripts/install.sh
-PROFILE=showcase ./scripts/install.sh
-```
+Venice is the only supported LLM and TTS provider. Local Qwen and Chatterbox
+are not a supported product path.
 
 Venice credentials are stored through libsecret in the desktop Secret Service, not
 in a file, command argument, environment variable, or systemd unit. For a manual
@@ -252,42 +205,7 @@ case-sensitive and model-specific; confirm the pair in the
 See [Configuration](configuration.md#ai-backends) for model, voice, endpoint, timeout,
 and speed options.
 
-## 4. Download Qwen
-
-Install the Hugging Face CLI and download the expected filename:
-
-```bash
-uv tool install huggingface_hub
-mkdir -p models
-hf download \
-  unsloth/Qwen3.5-4B-GGUF \
-  Qwen3.5-4B-Q4_K_M.gguf \
-  --local-dir models
-```
-
-Confirm the model exists at:
-
-```text
-~/local-voice-harness/models/Qwen3.5-4B-Q4_K_M.gguf
-```
-
-List llama.cpp devices:
-
-```bash
-llama-server --list-devices
-```
-
-Configure the llama.cpp device if it is not `CUDA0`:
-
-```bash
-voice-harness config set compute.cuda_device '<LLAMA_CPP_DEVICE>'
-```
-
-The shipped launcher expects `llama-server` at `/usr/sbin/llama-server`. If it is
-installed elsewhere, changing that operational executable path requires a reviewed
-unit/package adjustment rather than a user-choice environment override.
-
-## 5. Install Cursor and Herdr
+## 4. Install Cursor and Herdr
 
 ```bash
 curl https://cursor.com/install -fsS | bash
@@ -326,7 +244,7 @@ reading or logging token content. See [Configuration](configuration.md) for the
 normalization and collision rules. If Linear is unavailable, ordinary repository
 tasks still work.
 
-## 6. Configure audio
+## 5. Configure audio
 
 Capture and playback default to PipeWire's system-selected source and sink.
 To pin a microphone, pick from the devices the harness enumerates:
@@ -342,12 +260,6 @@ you need to override playback:
 
 ```console
 voice-harness config set audio.sink '<PIPEWIRE_SINK_NAME>'
-```
-
-Optional Chatterbox voice cloning accepts a reference WAV:
-
-```bash
-voice-harness config set audio.voice /absolute/path/to/reference.wav
 ```
 
 The default playback interruption mode is `wake`: saying “Hey Jarvis” while the
@@ -384,7 +296,7 @@ configuration after validating it interactively. Select `off` for
 also exposes `StreamingPlayback.cancel()` for an explicit stop control in local
 integrations.
 
-## 7. Install and enable services
+## 6. Install and enable services
 
 Use the packaged CLI to install the units, reload systemd, and enable the two
 always-on services:
@@ -410,15 +322,10 @@ means the effective installed unit or a drop-in still differs from the shipped
 policy; do not treat installation as complete.
 
 The shipped units do not embed user-selected providers, models, CUDA devices,
-dictation selectors, or wake/integration settings. The dictation and local-LLM
-launchers resolve those values from the same typed `config.toml` model at process
-start. Keep service drop-ins limited to operational policy; the audit rejects
+dictation selectors, or wake/integration settings. The dictation launcher
+resolves those values from the same typed `config.toml` model at process start.
+Keep service drop-ins limited to operational policy; the audit rejects
 user-choice `Environment=` overrides and all `EnvironmentFile=` directives.
-
-Qwen and Chatterbox are intentionally not enabled at login. The wake daemon starts
-them on demand and stops them when a conversation closes. It also stops them after a
-failed turn when no earlier conversation remains active. Manual text turns hold a
-cross-process usage lease so daemon cleanup cannot stop their models mid-response.
 
 ## Existing standalone dictation installations
 

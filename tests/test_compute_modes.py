@@ -119,58 +119,49 @@ class LocalTtsComputeTests(unittest.TestCase):
 class InstallAndDiagnosticComputeTests(unittest.TestCase):
     def test_auto_install_uses_cpu_artifacts_without_confirmed_cuda(self) -> None:
         plan = resolve_installation_plan(
-            llm_provider="local",
-            tts_provider="local",
-            llm_device="auto",
-            tts_device="auto",
+            llm_provider="venice",
+            tts_provider="venice",
             dictation_device="auto",
             cuda_available=False,
         )
 
         self.assertEqual(plan.cuda_packages, ())
-        self.assertIn("llama.cpp", plan.system_packages)
+        self.assertNotIn("llama.cpp", plan.system_packages)
         self.assertEqual(plan.dictation_extra, "dictation")
 
     def test_auto_install_uses_cuda_artifacts_when_probe_succeeds(self) -> None:
         plan = resolve_installation_plan(
-            llm_provider="local",
-            tts_provider="local",
-            llm_device="auto",
-            tts_device="auto",
+            llm_provider="venice",
+            tts_provider="venice",
             dictation_device="auto",
             cuda_available=True,
         )
 
-        self.assertIn("llama.cpp-cuda", plan.cuda_packages)
-        self.assertNotIn("llama.cpp", plan.system_packages)
+        self.assertEqual(plan.cuda_packages, ("cuda",))
+        self.assertNotIn("llama.cpp-cuda", plan.cuda_packages)
         self.assertEqual(plan.dictation_extra, "dictation-cuda")
 
-    def test_cpu_local_install_omits_cuda_packages(self) -> None:
+    def test_cpu_install_omits_cuda_packages(self) -> None:
         plan = resolve_installation_plan(
-            llm_provider="local",
-            tts_provider="local",
-            llm_device="cpu",
-            tts_device="cpu",
+            llm_provider="venice",
+            tts_provider="venice",
             dictation_device="cpu",
         )
 
         self.assertEqual(plan.cuda_packages, ())
-        self.assertIn("llama.cpp", plan.system_packages)
+        self.assertNotIn("llama.cpp", plan.system_packages)
         self.assertEqual(plan.dictation_extra, "dictation")
-        self.assertEqual(plan.llm_device, "cpu")
-        self.assertEqual(plan.tts_device, "cpu")
 
-    def test_cpu_llm_uses_cuda_build_when_another_component_needs_cuda(self) -> None:
+    def test_cuda_dictation_does_not_install_llama_cpp(self) -> None:
         plan = resolve_installation_plan(
-            llm_provider="local",
-            tts_provider="local",
-            llm_device="cpu",
-            tts_device="cuda",
-            dictation_device="cpu",
+            llm_provider="venice",
+            tts_provider="venice",
+            dictation_device="cuda",
         )
 
         self.assertNotIn("llama.cpp", plan.system_packages)
-        self.assertIn("llama.cpp-cuda", plan.cuda_packages)
+        self.assertEqual(plan.cuda_packages, ("cuda",))
+        self.assertNotIn("llama.cpp-cuda", plan.cuda_packages)
 
     def test_diagnostics_report_configured_and_effective_cpu_modes(self) -> None:
         config = default_user_config()

@@ -15,7 +15,7 @@ from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 from enum import StrEnum
 
-PROVIDERS = frozenset({"local", "venice"})
+PROVIDERS = frozenset({"venice"})
 PROFILES = frozenset({"showcase", "local-cuda"})
 COMPUTE_DEVICES = frozenset({"auto", "cpu", "cuda"})
 NVIDIA_PACKAGE_MARKERS = ("cuda", "nvidia-", "llama.cpp-cuda")
@@ -36,10 +36,7 @@ BASE_PACKAGES = (
     "ffmpeg",
 )
 VENICE_PACKAGES = ("libsecret", "oo7")
-CUDA_PACKAGES = ("cuda", "llama.cpp-cuda")
-LOCAL_CPU_LLM_PACKAGES = ("llama.cpp",)
-LOCAL_LLM_SERVICES = ("voice-harness-llm.service",)
-LOCAL_TTS_EXTRAS = ("tts",)
+CUDA_PACKAGES = ("cuda",)
 
 
 class InstallProfile(StrEnum):
@@ -84,7 +81,7 @@ class InstallationPlan:
 def _provider(value: str | None, *, label: str) -> str:
     selected = (value or "").strip().casefold()
     if selected not in PROVIDERS:
-        raise InstallProfileError(f"{label} provider must be local or venice")
+        raise InstallProfileError(f"{label} provider must be venice")
     return selected
 
 
@@ -95,26 +92,8 @@ def _compute_device(value: str | None, *, label: str, default: str) -> str:
     return selected
 
 
-def _needs_cuda_packages(
-    *,
-    llm_provider: str,
-    tts_provider: str,
-    llm_device: str,
-    tts_device: str,
-    dictation_device: str,
-    cuda_available: bool,
-) -> bool:
-    if dictation_device == "cuda" or (dictation_device == "auto" and cuda_available):
-        return True
-    if llm_provider == "local" and (
-        llm_device == "cuda" or (llm_device == "auto" and cuda_available)
-    ):
-        return True
-    if tts_provider == "local" and (
-        tts_device == "cuda" or (tts_device == "auto" and cuda_available)
-    ):
-        return True
-    return False
+def _needs_cuda_packages(*, dictation_device: str, cuda_available: bool) -> bool:
+    return dictation_device == "cuda" or (dictation_device == "auto" and cuda_available)
 
 
 def _profile(value: str | None) -> str | None:
@@ -143,19 +122,17 @@ def resolve_installation_plan(
     """Return the packages and local assets required by one install choice."""
 
     selected_profile = _profile(profile)
+    llm = _provider(llm_provider or "venice", label="LLM")
+    tts = _provider(tts_provider or "venice", label="TTS")
     if selected_profile == InstallProfile.SHOWCASE:
-        llm = "venice"
-        tts = "venice"
         llm_compute = "cpu"
         tts_compute = "cpu"
         dictation_compute = "cpu"
     else:
-        llm = _provider(llm_provider or "local", label="LLM")
-        tts = _provider(tts_provider or "local", label="TTS")
         default_device = (
             "cuda" if selected_profile == InstallProfile.LOCAL_CUDA else "auto"
         )
-        if selected_profile is None and llm == "venice" and tts == "venice":
+        if selected_profile is None:
             default_device = "cpu"
         llm_compute = _compute_device(
             llm_device, label="LLM device", default=default_device
@@ -169,15 +146,11 @@ def resolve_installation_plan(
         if selected_profile is None:
             selected_profile = (
                 InstallProfile.SHOWCASE
-                if llm == "venice" and tts == "venice" and dictation_compute == "cpu"
+                if dictation_compute == "cpu"
                 else InstallProfile.LOCAL_CUDA
             )
 
     needs_cuda = _needs_cuda_packages(
-        llm_provider=llm,
-        tts_provider=tts,
-        llm_device=llm_compute,
-        tts_device=tts_compute,
         dictation_device=dictation_compute,
         cuda_available=cuda_available,
     )
@@ -186,14 +159,8 @@ def resolve_installation_plan(
     )
     dictation_extra = "dictation-cuda" if dictation_uses_cuda else "dictation"
     cuda_packages = CUDA_PACKAGES if needs_cuda else ()
-    venice_packages = VENICE_PACKAGES if "venice" in {llm, tts} else ()
-    local_llm_packages = (
-        LOCAL_CPU_LLM_PACKAGES if llm == "local" and not needs_cuda else ()
-    )
-    install_tts_extra = tts == "local"
+    venice_packages = VENICE_PACKAGES
     python_extras = ("wake", dictation_extra)
-    if install_tts_extra:
-        python_extras += LOCAL_TTS_EXTRAS
     return InstallationPlan(
         profile=selected_profile,
         llm_provider=llm,
@@ -202,14 +169,14 @@ def resolve_installation_plan(
         tts_device=tts_compute,
         dictation_extra=dictation_extra,
         dictation_device=dictation_compute,
-        system_packages=BASE_PACKAGES + venice_packages + local_llm_packages,
+        system_packages=BASE_PACKAGES + venice_packages,
         cuda_packages=cuda_packages,
         venice_packages=venice_packages,
         python_extras=python_extras,
-        download_qwen=llm == "local",
-        download_chatterbox=install_tts_extra,
-        install_llm_service=llm == "local",
-        install_tts_extra=install_tts_extra,
+        download_qwen=False,
+        download_chatterbox=False,
+        install_llm_service=False,
+        install_tts_extra=False,
     )
 
 

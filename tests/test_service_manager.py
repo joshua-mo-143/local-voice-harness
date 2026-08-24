@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import importlib.metadata
-import re
 import subprocess
 import sys
 import tempfile
@@ -161,7 +160,6 @@ class ServiceManagementTests(unittest.TestCase):
     def test_llm_unit_defers_model_and_device_to_typed_launcher(self) -> None:
         project_root = service_manager.PROJECT_ROOT
         unit = (project_root / "systemd/user/voice-harness-llm.service").read_text()
-        installation = (project_root / "docs/installation.md").read_text()
         snapshot = default_user_config()
         configured = replace(
             snapshot,
@@ -182,10 +180,6 @@ class ServiceManagementTests(unittest.TestCase):
         self.assertIn("voice-harness-llm", unit)
         self.assertEqual(command[command.index("--alias") + 1], "configured-model")
         self.assertEqual(command[command.index("--device") + 1], "CUDA7")
-        self.assertEqual(
-            set(re.findall(r"Qwen3\.5-[A-Za-z0-9_.-]+\.gguf", installation)),
-            {llm_launcher.MODEL_FILE.name},
-        )
 
     def test_dictation_defaults_have_documented_installable_backends(self) -> None:
         project_root = service_manager.PROJECT_ROOT

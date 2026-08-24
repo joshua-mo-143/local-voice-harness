@@ -135,7 +135,7 @@ class DistroPackageAdapterTests(unittest.TestCase):
                 checkout.mkdir()
                 with self.assertRaisesRegex(
                     DistroError,
-                    "no supported package adapter.*cuda, llama.cpp-cuda",
+                    "no supported package adapter.*cuda",
                 ):
                     _plan(family, profile="local-cuda", checkout=checkout)
 
